@@ -233,15 +233,26 @@ async fn table_object_renders_selects_and_toggles_source(cx: &mut TestAppContext
         Some((1, 0)),
         "单击命中的是第一条数据行第一格"
     );
-    assert_eq!(snapshots[0].editing_cell, None, "单击只选中，不进入编辑");
+    assert_eq!(
+        snapshots[0].editing_cell,
+        Some((1, 0)),
+        "单击单元格直接进入原地编辑（表格仍是 Object）"
+    );
     assert_eq!(
         caret_of(&view, cx),
         (0, 0),
         "单击单元格不得移动正文 caret（也不把 caret 放进格子里）"
     );
     assert!(
+        cx.debug_bounds("object-toolbar").is_none(),
+        "原地编辑期间悬浮工具条隐藏（避免遮挡 cell 输入框）"
+    );
+    // Esc 取消这次编辑（没输入 → 零请求），选中态保留 → 工具条重新出现。
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
         cx.debug_bounds("object-toolbar").is_some(),
-        "选中表格必须显示悬浮工具条"
+        "退出编辑后选中表格必须显示悬浮工具条"
     );
     assert!(
         cx.debug_bounds("object-toolbar-edit").is_some(),
@@ -282,19 +293,25 @@ async fn table_object_renders_selects_and_toggles_source(cx: &mut TestAppContext
     );
 
     // 5) 表格对象上 F2 同样进入源码模式；点击块外（标题行）退出。
-    //    注意：有**单元格选中态**时 F2 的语义是“进入单元格编辑”（S3b2），
-    //    所以先 Esc 清掉单元格选中态再按 F2。
+    //    单击单元格会直接进入原地编辑（ADR 0019 S3b2 修正）：先 Esc 取消这次
+    //    未输入的编辑（选中态保留），再按 F2 —— F2 的语义是**整表源码**，
+    //    不再被单元格编辑抢占。
     let rect = object_rect(TABLE_LINE, &view, cx);
     cx.simulate_click(rect.center(), Modifiers::default());
     cx.run_until_parked();
     let snapshots = cx.update(|_window, app| view.read(app).table_snapshots());
     assert_eq!(snapshots[0].selected_cell, Some((1, 1)), "中心点落在第二列");
+    assert_eq!(
+        snapshots[0].editing_cell,
+        Some((1, 1)),
+        "单击单元格直接进入原地编辑"
+    );
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     let snapshots = cx.update(|_window, app| view.read(app).table_snapshots());
     assert_eq!(
-        snapshots[0].selected_cell, None,
-        "Esc 退出单元格选中态（整表仍选中）"
+        snapshots[0].editing_cell, None,
+        "Esc 退出原地编辑（整表仍选中）"
     );
     cx.simulate_keystrokes("f2");
     cx.run_until_parked();
@@ -443,9 +460,11 @@ async fn deleting_a_table_removes_the_whole_source_span(cx: &mut TestAppContext)
     let view = active_view(&host, cx);
     let rect = object_rect(TABLE_LINE, &view, cx);
 
-    // 单击选中整块 → Backspace 直接删**完整源码跨度**（对象已被点选，不再是
-    // “先选块”那一步；与图片对象的行为一致，见 headless_images）。
+    // 单击选中整块（同时进入原地编辑）→ Esc 退出编辑（选中态保留）→ Backspace
+    // 直接删**完整源码跨度**（对象已被点选，不再是“先选块”那一步；与图片一致）。
     cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     let snapshots = cx.update(|_window, app| view.read(app).table_snapshots());
     assert!(snapshots[0].selected);

@@ -1207,6 +1207,62 @@ impl EditorController {
         Ok((request, entered))
     }
 
+    /// 用一段完整文本替换某个单元格（app 表格浮层就地编辑的**提交**路径）。
+    ///
+    /// 与 [`Self::begin_table_cell_edit`] 的区别：**不进入**控制器内部的 cell 编辑态，
+    /// 因此表格始终是 Object 投影（display 不会塌缩成一行 cell 文本）。浮层自己持有
+    /// 草稿文本，提交时调用这里一次性构造“替换整个 cell 源码区间”的 `EditRequest`。
+    ///
+    /// 契约：
+    ///
+    /// - 文本先经 [`table_cell_edit::sanitize_cell_text`]（换行 → 空格、未转义 `|` → `\|`）；
+    /// - 与当前 cell 源码逐字相同 → `Ok(None)`（空 op 不会推进 `live_rev`）；
+    /// - 一次调用只有**一条** `ScalarEdit`（两侧 `|`、对齐、其它 cell、行尾换行不变），
+    ///   会话里就是一个撤销组，caret 落到整表末尾（对象内部没有文本落点）；
+    /// - 缺列补出来的空区间（cell 起点在行内容末尾之外）拒绝 → `Ok(None)`，不写坏表格；
+    /// - 表格/单元格不存在或行列越界 → `Ok(None)`（陈旧帧不猜）。
+    pub fn replace_table_cell_text(
+        &mut self,
+        line: usize,
+        row: usize,
+        column: usize,
+        text: &str,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(None);
+        };
+        let Some(cell) = table.cell(row, column) else {
+            return Ok(None);
+        };
+        let Some(row_span) = table.row_span(row) else {
+            return Ok(None);
+        };
+        if cell.start() >= row_span.end() {
+            // 缺列补出来的空区间：行里没有这一格的 `|` 边界，插字会把表格写坏。
+            return Ok(None);
+        }
+        let source = self.mirror.to_string();
+        let start_byte = cell.start().get();
+        let end_byte = cell.end().get();
+        let original = source.get(start_byte..end_byte).unwrap_or_default();
+        let replacement = table_cell_edit::sanitize_cell_text(text);
+        if replacement == original {
+            return Ok(None);
+        }
+        let start = SourceByte::new(start_byte).to_scalar(&source)?;
+        let end = SourceByte::new(end_byte).to_scalar(&source)?;
+        let request = self.compose_edits(vec![ScalarEdit {
+            start,
+            end,
+            replacement,
+        }])?;
+        self.move_caret_to_object_end(line);
+        self.refresh_projection();
+        Ok(Some(request))
+    }
+
     /// 单元格编辑期间放弃草稿（远端 delta / 撤销 / 重做要按会话坐标改镜像之前调用）。
     ///
     /// 恢复镜像到基线文本（= 会话当前文本），因此随后的 `splice` 坐标重新合法。

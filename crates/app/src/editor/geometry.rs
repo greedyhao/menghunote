@@ -174,8 +174,8 @@ pub struct ImagePaint {
 pub enum ObjectPaintContent {
     /// 图片（已解码像素或占位框 + alt/状态文案）。
     Image(Box<ImagePaint>),
-    /// GFM 表格（表格内不做富文本；单元格可就地编辑 —— 编辑态下整表不再投影成
-    /// 这个分支，display 只显示该 cell 文本，见 ADR 0019 S3b2）。
+    /// GFM 表格（表格内不做富文本）。单元格原地编辑时**仍然**走这个分支：
+    /// 编辑输入框是浮在这个矩形上的独立元素，表格其它行列照常绘制（ADR 0019 §12.6）。
     Table(Box<TablePaint>),
 }
 
@@ -248,6 +248,33 @@ impl TablePaint {
             point(self.rect.origin.x, px(top)),
             size(self.rect.size.width, px(self.row_height)),
         ))
+    }
+
+    /// 整行/整列的矩形（窗口坐标）：**选中高亮、拖拽 ghost、headless 断言同源**。
+    ///
+    /// - [`TableDragAxis::Column`]：整列（表头 + **全部**数据行；按固定列宽/行高算出，
+    ///   被视口裁剪掉的行也算在内），`index` = 列下标；
+    /// - [`TableDragAxis::Row`]：一条**数据行**（不含表头），`index` = 数据行下标
+    ///   （0 起，与行把手同一套寻址）。
+    ///
+    /// 越界 / 几何不可用 → `None`（调用方不画）。
+    #[must_use]
+    pub fn axis_rect(&self, axis: TableDragAxis, index: usize) -> Option<Bounds<Pixels>> {
+        match axis {
+            TableDragAxis::Column => {
+                if index >= self.columns || self.column_width <= 0.0 {
+                    return None;
+                }
+                Some(Bounds::new(
+                    point(
+                        px(self.rect.origin.x.as_f32() + self.column_width * index as f32),
+                        self.rect.origin.y,
+                    ),
+                    size(px(self.column_width), self.rect.size.height),
+                ))
+            }
+            TableDragAxis::Row => self.data_row_rect(index),
+        }
     }
 
     /// 列把手（表头顶部的小胶囊）的绘制矩形；表头不在本帧可见范围时返回 `None`。

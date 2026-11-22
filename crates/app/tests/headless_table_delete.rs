@@ -162,7 +162,9 @@ fn cell_rect(
     })
 }
 
-/// 点击一个单元格（单击 = 选中该格，不移动正文 caret）。
+/// 点击一个单元格并退出原地编辑（单击 = 直接编辑；Esc 后保留该格选中态）。
+///
+/// 删除行/列按钮在编辑期间隐藏，所以这些“选中某格再点删除按钮”的用例统一先按 Esc。
 fn click_cell(
     line: usize,
     row: usize,
@@ -172,6 +174,8 @@ fn click_cell(
 ) {
     let rect = cell_rect(line, row, column, view, cx);
     cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
     cx.run_until_parked();
 }
 
@@ -563,9 +567,17 @@ async fn caret_never_lands_inside_the_table_after_deleting_a_row(cx: &mut TestAp
     let (host, cx) = open_shell(cx, vault);
     let view = active_view(&host, cx);
 
-    // 先进入单元格编辑再 Enter 提交（无改动）：caret 落到整表末尾（S3b2 契约）。
-    click_cell(TABLE_LINE, 1, 0, &view, cx);
-    cx.simulate_keystrokes("f2");
+    // 单击单元格 → 原地编辑（表格仍是 Object）；输入后 Enter 提交：
+    // caret 落到整表末尾（单元格提交契约）。这次改动写在**即将被删除**的那条数据行里，
+    // 所以删除后的源码仍与 `ROWS_SOURCE_AFTER_DELETE` 逐字节一致。
+    let rect = cell_rect(TABLE_LINE, 1, 0, &view, cx);
+    cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).is_editing_table_cell()),
+        "单击单元格进入原地编辑"
+    );
+    cx.simulate_input("改");
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
@@ -582,13 +594,6 @@ async fn caret_never_lands_inside_the_table_after_deleting_a_row(cx: &mut TestAp
         (before_end, before_end),
         "提交后 caret 在整表末尾"
     );
-
-    // 退出单元格编辑的那一帧，浮层还按“表格被压成一行”的旧几何定位：动一下鼠标
-    // （真实用户总会动一下）让浮层拿到表格重新变成 Object 的几何。
-    let rect = cell_rect(TABLE_LINE, 1, 0, &view, cx);
-    cx.simulate_mouse_move(rect.center(), None, Modifiers::default());
-    cx.run_until_parked();
-
     // 删除选中的那条数据行：caret 必须跟着到新表格末尾（绝不落进表格内部）。
     assert_eq!(selected_cell(&view, cx), Some((TABLE_LINE, 1, 0)));
     click_selector(cx, "table-delete-row");

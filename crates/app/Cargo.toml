@@ -53,6 +53,18 @@ image = { version = "=0.25.10", default-features = false, features = [
     "gif",
     "bmp",
 ] }
+# Mermaid 渲染底座（M1，ADR 0019 §15 / docs/notes/editor-backlog-links-mermaid.md）。
+# 纯 Rust，无 Node/Chromium/WebView、无远程渲染；`merman` 对齐 Mermaid 12.3。
+# **精确 pin**（`=0.10.0`）：图渲染输出会进 Object Block 缓存/黄金测试，次版本升级
+# 可能改变 SVG 结构，必须显式评审后再动。features：
+# - `all-diagrams`：解析并渲染全部 Mermaid 图族（M1 只做底座，不按图族裁剪）；
+# - `complete-svg` = `svg` + `layout-cytoscape`（缺省默认还含 `layout-elk`，那是 EPL
+#   组件且体积大；M1 明确**不启用** ELK，行内写 `complete-svg` 以便一眼看出意图）。
+# 调用封装在 `src/mermaid.rs`：输入/输出上限、`catch_unwind`、SVG 形状校验都在那里。
+merman = { version = "=0.10.0", default-features = false, features = [
+    "all-diagrams",
+    "complete-svg",
+] }
 
 [dev-dependencies]
 # 原生 headless UI 测试（`#[gpui::test]` + `TestAppContext`）。

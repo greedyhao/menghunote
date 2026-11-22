@@ -11,10 +11,16 @@
 //!    按槽位移动，表头与分隔行固定；两者都只改顺序（表格总字节数不变，逐字节断言）；
 //! 4. `Esc` / 拖出表格取消：**零请求**、源码逐字节不变；
 //! 5. caret 全程不变（拖拽期间不移动正文 caret），表格仍是 Object（不展开源码）；
-//! 6. 重开 vault 后重排结果都在，表格仍是 Object。
+//! 6. 重开 vault 后重排结果都在，表格仍是 Object；
+//! 7. **整行/整列选中（ADR 0019 S3b6）**：点击把手即选中（不落 caret、不选格、零请求），
+//!    高亮矩形与 cell 范围逐像素一致（`table-axis-selection` 与 accessor 同源）；
+//! 8. **拖拽反馈（ADR 0019 S3b6）**：按下只选中、移动超过阈值才出现 ghost（跟随指针的
+//!    整行/整列半透明预览 + “移动第 N 列/行 → 第 M 列/行”文案），与插入指示线同步；
+//!    释放后选中**移动到新下标**；`Esc` / 点表格外 / 点单元格清除选中且零请求。
 //!
-//! 像素级外观（把手大小/颜色/手形光标、DPI、真实窗口）仍必须真机验证；这里证明
-//! “几何 → 按下/拖动/释放 → 一次 `EditRequest` → 源码/undo/持久化”链路。
+//! 像素级外观（把手大小/颜色/抓取光标、ghost/高亮透明度、DPI、真实窗口）仍必须真机
+//! 验证；这里证明“几何 → 按下/拖动/释放 → 选中/ghost → 一次 `EditRequest` →
+//! 源码/undo/持久化”链路。
 
 use std::path::Path;
 
@@ -23,7 +29,7 @@ use gpui::{
     MouseButton, ParentElement as _, Pixels, Point, Styled as _, TestAppContext, VisualTestContext,
 };
 use menghunote_app::editor::geometry::TableDragAxis;
-use menghunote_app::editor::view::{EditorView, TableDragState};
+use menghunote_app::editor::view::{EditorView, TableAxisSelection, TableDragState};
 use menghunote_app::shell::AppShell;
 use menghunote_storage::{append_updates, load_body_doc, StructureWriter, UpdateRecord, Vault};
 use tempfile::{Builder as TempDirBuilder, TempDir};
@@ -225,6 +231,101 @@ fn drag_handle(
     release_at(target, cx);
 }
 
+/// 当前整行/整列选中状态（ADR 0019 S3b6）。
+fn axis_selection(
+    view: &Entity<EditorView>,
+    cx: &mut VisualTestContext,
+) -> Option<TableAxisSelection> {
+    cx.update(|_window, app| view.read(app).table_axis_selection())
+}
+
+/// 选中高亮的窗口矩形（应为 `None` = 没画）。
+fn axis_selection_rect(
+    view: &Entity<EditorView>,
+    cx: &mut VisualTestContext,
+) -> Option<Bounds<Pixels>> {
+    cx.update(|_window, app| view.read(app).table_axis_selection_rect())
+}
+
+/// 拖动 ghost 的窗口矩形（应为 `None` = 没画）。
+fn ghost_rect(view: &Entity<EditorView>, cx: &mut VisualTestContext) -> Option<Bounds<Pixels>> {
+    cx.update(|_window, app| view.read(app).table_drag_ghost_rect())
+}
+
+/// 拖动 ghost 的文案（“移动第 N 列/行 → 第 M 列/行”）。
+fn ghost_label(view: &Entity<EditorView>, cx: &mut VisualTestContext) -> Option<String> {
+    cx.update(|_window, app| view.read(app).table_drag_ghost_label())
+}
+
+/// 当前所有可见表格 cell 的窗口矩形（绘制/命中/测试同源）。
+fn cell_rects(
+    view: &Entity<EditorView>,
+    cx: &mut VisualTestContext,
+) -> Vec<(usize, usize, usize, Bounds<Pixels>)> {
+    cx.update(|_window, app| view.read(app).table_cell_rects())
+}
+
+/// 某个 cell 的矩形（不存在直接失败，避免假通过）。
+fn cell_rect(
+    line: usize,
+    row: usize,
+    column: usize,
+    view: &Entity<EditorView>,
+    cx: &mut VisualTestContext,
+) -> Bounds<Pixels> {
+    cell_rects(view, cx)
+        .into_iter()
+        .find(|(object_line, cell_row, cell_column, _)| {
+            *object_line == line && *cell_row == row && *cell_column == column
+        })
+        .map(|(_, _, _, rect)| rect)
+        .unwrap_or_else(|| panic!("cell（行 {line} 的 row={row} col={column}）必须可见"))
+}
+
+/// 一组 cell 矩形的并集（用于断言“高亮覆盖对应 cell 范围”）。
+fn union_cells<'a>(
+    cells: impl Iterator<Item = &'a (usize, usize, usize, Bounds<Pixels>)>,
+) -> Option<Bounds<Pixels>> {
+    let mut union: Option<Bounds<Pixels>> = None;
+    for (_, _, _, rect) in cells {
+        union = Some(match union {
+            Some(current) => current.union(rect),
+            None => *rect,
+        });
+    }
+    union
+}
+
+/// 像素级近似相等（f32 累加顺序可能差 1 ulp，但不接受 > 0.5px 的偏差）。
+fn assert_px_close(actual: Pixels, expected: Pixels, what: &str) {
+    assert!(
+        (actual.as_f32() - expected.as_f32()).abs() <= 0.5,
+        "{what}：actual={actual:?} expected={expected:?}"
+    );
+}
+
+/// 矩形近似相等（原点 + 尺寸）。
+fn assert_rect_close(actual: Bounds<Pixels>, expected: Bounds<Pixels>, what: &str) {
+    assert_px_close(actual.origin.x, expected.origin.x, what);
+    assert_px_close(actual.origin.y, expected.origin.y, what);
+    assert_px_close(actual.size.width, expected.size.width, what);
+    assert_px_close(actual.size.height, expected.size.height, what);
+}
+
+/// inner 完全落在 outer 内（0.5px 容差）。
+fn assert_contains(outer: Bounds<Pixels>, inner: Bounds<Pixels>, what: &str) {
+    let eps = 0.5;
+    assert!(
+        inner.origin.x.as_f32() >= outer.origin.x.as_f32() - eps
+            && inner.origin.y.as_f32() >= outer.origin.y.as_f32() - eps
+            && inner.origin.x.as_f32() + inner.size.width.as_f32()
+                <= outer.origin.x.as_f32() + outer.size.width.as_f32() + eps
+            && inner.origin.y.as_f32() + inner.size.height.as_f32()
+                <= outer.origin.y.as_f32() + outer.size.height.as_f32() + eps,
+        "{what}：inner={inner:?} 必须完全落在 outer={outer:?} 内"
+    );
+}
+
 /// 表格表头行号（0 起）。
 const TABLE_LINE: usize = 2;
 
@@ -331,7 +432,7 @@ async fn handles_show_only_when_hovered_and_never_cover_cell_text(cx: &mut TestA
         }
     }
 
-    // 把手不抢单元格点击：点单元格中心仍是“选中该格”，caret 不动。
+    // 把手不抢单元格点击：点单元格中心仍是“选中该格并原地编辑”（把手不得抢命中）。
     let cell = cx
         .update(|_window, app| view.read(app).table_cell_rects())
         .into_iter()
@@ -345,7 +446,13 @@ async fn handles_show_only_when_hovered_and_never_cover_cell_text(cx: &mut TestA
         Some((TABLE_LINE, 1, 1)),
         "点单元格仍然只能选中该格（把手不得抢命中）"
     );
+    assert!(
+        cx.update(|_window, app| view.read(app).is_editing_table_cell()),
+        "点单元格进入原地编辑"
+    );
     assert_eq!(caret_of(&view, cx), (0, 0), "点单元格不移动正文 caret");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
 
     close_shell(&host, cx);
 }
@@ -637,6 +744,9 @@ async fn selected_cell_follows_the_dragged_content(cx: &mut TestAppContext) {
     cx.simulate_click(cell.center(), Modifiers::default());
     cx.run_until_parked();
     assert_eq!(selected_cell(&view, cx), Some((TABLE_LINE, 1, 1)));
+    // 单击会直接进入原地编辑；编辑期间把手隐藏，先 Esc 退出（选中态保留）。
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
 
     // 首列拖到末列：被让位的列整体左移一格 → 选中的「数量」落到第 0 列。
     let last = handle_rect(TableDragAxis::Column, 2, &view, cx);
@@ -686,7 +796,7 @@ async fn handles_are_hidden_while_a_cell_is_being_edited(cx: &mut TestAppContext
         "悬浮时应该有列把手"
     );
 
-    // 进入单元格就地编辑：整表被压成一行 cell 文本，把手必须一起消失。
+    // 单击单元格直接进入原地编辑：表格仍是 Object，但把手必须隐藏（避免坐标冲突）。
     let cell = cx
         .update(|_window, app| view.read(app).table_cell_rects())
         .into_iter()
@@ -695,17 +805,21 @@ async fn handles_are_hidden_while_a_cell_is_being_edited(cx: &mut TestAppContext
         .expect("数据行（1,0）必须可见");
     cx.simulate_click(cell.center(), Modifiers::default());
     cx.run_until_parked();
-    cx.simulate_keystrokes("f2");
-    cx.run_until_parked();
     assert!(
         cx.update(|_window, app| view.read(app).is_editing_table_cell()),
-        "F2 必须进入单元格编辑"
+        "单击单元格必须进入原地编辑"
+    );
+    // 编辑期间整表仍在绘制（不是“压成一行 cell 文本”）。
+    assert!(
+        !cx.update(|_window, app| view.read(app).table_paint_rows())
+            .is_empty(),
+        "编辑期间表格必须仍是 Object（继续绘制）"
     );
     assert_eq!(
         cx.update(|_window, app| view.read(app).table_drag_handles())
             .len(),
         0,
-        "单元格编辑期间没有拖拽把手（表格已不是 Object）"
+        "单元格编辑期间没有拖拽把手"
     );
     assert!(
         cx.debug_bounds("table-drag-column-0").is_none()
@@ -716,7 +830,13 @@ async fn handles_are_hidden_while_a_cell_is_being_edited(cx: &mut TestAppContext
     assert!(
         !cx.update(|_window, app| {
             view.update(app, |view, cx| {
-                view.begin_table_drag(TABLE_LINE, TableDragAxis::Column, 0, cx)
+                view.begin_table_drag(
+                    TABLE_LINE,
+                    TableDragAxis::Column,
+                    0,
+                    point(px(0.0), px(0.0)),
+                    cx,
+                )
             })
         }),
         "单元格编辑期间不得开始拖拽"
@@ -730,6 +850,515 @@ async fn handles_are_hidden_while_a_cell_is_being_edited(cx: &mut TestAppContext
         cx.debug_bounds("table-drag-column-0").is_some(),
         "退出单元格编辑后列把手必须回来"
     );
+
+    close_shell(&host, cx);
+}
+
+#[gpui::test]
+async fn clicking_handles_selects_whole_column_and_row(cx: &mut TestAppContext) {
+    let dir = temp_vault_dir();
+    let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+    seed_note(&vault, "选中整行整列", COLUMNS_SOURCE);
+
+    let (host, cx) = open_shell(cx, vault);
+    let view = active_view(&host, cx);
+    hover_table(TABLE_LINE, &view, cx);
+
+    // 单击列把手（按下即选中；原位抬起 = 不产生请求）。
+    let column_center = handle_rect(TableDragAxis::Column, 1, &view, cx).center();
+    cx.simulate_click(column_center, Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Column,
+            index: 1,
+        }),
+        "点列把手必须选中整列"
+    );
+    assert_eq!(drag_state(&view, cx), None, "单击后手势已经结束");
+    assert_eq!(selected_cell(&view, cx), None, "轴选中不是单元格选中");
+    assert_eq!(caret_of(&view, cx), (0, 0), "选中整列不移动正文 caret");
+    assert_eq!(
+        source_of(&view, cx),
+        COLUMNS_SOURCE,
+        "选中整列不产生任何编辑"
+    );
+
+    // 高亮矩形 = 该列所有 cell（表头 + 2 条数据行）的并集；debug selector 与 accessor 同源。
+    let rect = axis_selection_rect(&view, cx).expect("选中整列必须给出高亮矩形");
+    let bounds = cx
+        .debug_bounds("table-axis-selection")
+        .expect("选中整列必须画出 table-axis-selection");
+    assert_rect_close(bounds, rect, "table-axis-selection 与 accessor 必须同源");
+    let cells = cell_rects(&view, cx);
+    let expected = union_cells(
+        cells
+            .iter()
+            .filter(|(line, _, column, _)| *line == TABLE_LINE && *column == 1),
+    )
+    .expect("列 1 必须有 cell");
+    assert_rect_close(rect, expected, "整列高亮必须覆盖该列全部 cell（含表头）");
+    assert_eq!(
+        cells
+            .iter()
+            .filter(|(line, _, column, _)| *line == TABLE_LINE && *column == 1)
+            .count(),
+        3,
+        "1 行表头 + 2 条数据行"
+    );
+    // 相邻列的 cell 不得被这一列的选中高亮盖住。
+    let neighbor = cell_rect(TABLE_LINE, 1, 0, &view, cx);
+    assert!(
+        !rect.contains(&neighbor.center()),
+        "列 1 的高亮不得覆盖列 0（neighbor={neighbor:?} rect={rect:?}）"
+    );
+
+    // 单击行把手（数据行 0 = 显示行 1）：整行选中替换掉整列选中。
+    let row_center = handle_rect(TableDragAxis::Row, 0, &view, cx).center();
+    cx.simulate_click(row_center, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Row,
+            index: 0,
+        }),
+        "点行把手必须选中整行"
+    );
+    assert_eq!(selected_cell(&view, cx), None, "整行选中不是单元格选中");
+    let row_rect = axis_selection_rect(&view, cx).expect("选中整行必须给出高亮矩形");
+    let row_bounds = cx
+        .debug_bounds("table-axis-selection")
+        .expect("选中整行必须画出 table-axis-selection");
+    assert_rect_close(row_bounds, row_rect, "整行高亮同样走同一份几何");
+    let cells = cell_rects(&view, cx);
+    let expected = union_cells(
+        cells
+            .iter()
+            .filter(|(line, row, _, _)| *line == TABLE_LINE && *row == 1),
+    )
+    .expect("数据行 0（显示 row 1）必须有 cell");
+    assert_rect_close(row_rect, expected, "整行高亮必须覆盖该行全部 cell");
+    // 表头行与下一条数据行不得被盖住。
+    for (row, text) in [(0, "表头"), (2, "第二条数据行")] {
+        let other = cell_rect(TABLE_LINE, row, 0, &view, cx);
+        assert!(
+            !row_rect.contains(&other.center()),
+            "{text}不得被整行选中高亮覆盖（other={other:?} rect={row_rect:?}）"
+        );
+    }
+
+    // 再点另一个列把手：选中移动（同一时间只有一个轴选中）。
+    let other = handle_rect(TableDragAxis::Column, 2, &view, cx).center();
+    cx.simulate_click(other, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Column,
+            index: 2,
+        }),
+        "点其它把手必须把选中移过去"
+    );
+    assert_eq!(caret_of(&view, cx), (0, 0));
+    assert_eq!(
+        source_of(&view, cx),
+        COLUMNS_SOURCE,
+        "一路只选中，不产生任何编辑"
+    );
+
+    close_shell(&host, cx);
+}
+
+#[gpui::test]
+async fn dragging_shows_ghost_and_moves_selection_to_drop_target(cx: &mut TestAppContext) {
+    let dir = temp_vault_dir();
+    let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+    seed_note(&vault, "ghost 拖列", COLUMNS_SOURCE);
+
+    let (host, cx) = open_shell(cx, vault);
+    let view = active_view(&host, cx);
+    hover_table(TABLE_LINE, &view, cx);
+
+    // 按下列把手：先只有选中（ghost 必须等指针真正移动）。
+    let press = handle_rect(TableDragAxis::Column, 0, &view, cx).center();
+    cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Column,
+            index: 0,
+        }),
+        "按下列把手即选中整列"
+    );
+    assert!(
+        ghost_rect(&view, cx).is_none(),
+        "还没移动：不允许闪 ghost（单击只看选中反馈）"
+    );
+    assert!(
+        cx.debug_bounds("table-drag-ghost").is_none(),
+        "还没移动：不画 table-drag-ghost"
+    );
+    assert!(
+        cx.debug_bounds("table-axis-selection").is_some(),
+        "选中高亮在按下时就出现"
+    );
+
+    // 拖到末列右半：ghost + 指示线 + 文案同时出现。
+    let last = handle_rect(TableDragAxis::Column, 2, &view, cx);
+    let drop = point(last.center().x + px(6.0), last.center().y);
+    drag_to(drop, cx);
+    let drag = drag_state(&view, cx).expect("拖动中必须有拖拽状态");
+    assert_eq!((drag.slot, drag.target), (Some(3), Some(2)));
+    let rect = ghost_rect(&view, cx).expect("移动后必须出现 ghost");
+    let bounds = cx
+        .debug_bounds("table-drag-ghost")
+        .expect("移动后必须画出 table-drag-ghost");
+    assert_rect_close(bounds, rect, "table-drag-ghost 与 accessor 必须同源");
+    let editor = cx
+        .debug_bounds("editor-current-doc")
+        .expect("编辑器根视图必须可见");
+    assert_contains(editor, rect, "ghost 不得画到编辑区之外");
+    // ghost 只画表头顶线上的一个小块，不复制整列。
+    let table = table_rect(TABLE_LINE, &view, cx);
+    assert_px_close(
+        rect.size.width,
+        px(menghunote_app::editor::theme::TABLE_DRAG_GHOST_COLUMN_WIDTH),
+        "列 ghost 是固定宽的小块",
+    );
+    assert_px_close(
+        rect.size.height,
+        px(menghunote_app::editor::theme::TABLE_DRAG_GHOST_COLUMN_HEIGHT),
+        "列 ghost 高度 = 小条高度",
+    );
+    assert_px_close(rect.origin.y, table.origin.y, "列 ghost 贴表头顶线");
+    assert!(
+        rect.size.height.as_f32() < table.size.height.as_f32() / 4.0,
+        "列 ghost 不能覆盖整列（当前 {} vs 表高 {}）",
+        rect.size.height.as_f32(),
+        table.size.height.as_f32()
+    );
+    // 文案带序号与目标；指示线同时存在（落点 slot 高亮与 ghost 同步）。
+    let label = ghost_label(&view, cx).expect("移动后必须有 ghost 文案");
+    assert!(
+        label.contains("第 1 列") && label.contains("第 3 列"),
+        "ghost 文案必须说明拖的是哪一列、将落到哪一列：{label:?}"
+    );
+    assert!(
+        cx.debug_bounds("table-drag-ghost-label").is_some(),
+        "必须画出 ghost 文案浮层"
+    );
+    assert!(
+        cx.debug_bounds("table-drop-indicator").is_some(),
+        "ghost 出现时插入指示线仍在"
+    );
+    assert!(
+        cx.debug_bounds("table-axis-selection").is_some(),
+        "拖动期间原位置的轴选中高亮保留（用户知道在拖哪一项）"
+    );
+
+    // ghost 跟随指针：拖回表格中间偏右（仍是同一列的右半 → 没有有效落点），
+    // 位置跟着变、文案退回“移动第 1 列”。
+    let cell = cell_rect(TABLE_LINE, 1, 0, &view, cx);
+    let middle = point(
+        table.origin.x + cell.size.width * 0.75 + px(8.0),
+        table.origin.y + px(30.0),
+    );
+    drag_to(middle, cx);
+    let middle_ghost = ghost_rect(&view, cx).expect("表格内移动时 ghost 仍在");
+    assert!(
+        (middle_ghost.origin.x.as_f32() - rect.origin.x.as_f32()).abs() > 1.0,
+        "ghost 必须跟着指针移动：first={rect:?} middle={middle_ghost:?}"
+    );
+    let middle_label = ghost_label(&view, cx).expect("移动后必须有文案");
+    assert!(
+        !middle_label.contains('→'),
+        "落点仍在原列（无效槽位）时文案只说明被拖项：{middle_label:?}"
+    );
+    assert_eq!(
+        caret_of(&view, cx),
+        (0, 0),
+        "拖动全程（含 ghost 跟随）caret 一动不动"
+    );
+
+    // 再拖回末列右半并释放：一次请求、选中跟到新下标。
+    drag_to(drop, cx);
+    release_at(drop, cx);
+    assert_eq!(
+        source_of(&view, cx),
+        COLUMNS_SOURCE_AFTER_FIRST_TO_LAST,
+        "ghost 只是视觉反馈：释放仍是一次等长重排"
+    );
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Column,
+            index: 2,
+        }),
+        "拖拽结束后选中移动到新下标"
+    );
+    assert!(
+        ghost_rect(&view, cx).is_none() && cx.debug_bounds("table-drag-ghost").is_none(),
+        "释放后 ghost 必须消失"
+    );
+    assert!(
+        cx.debug_bounds("table-drop-indicator").is_none(),
+        "释放后插入指示线必须消失"
+    );
+    assert!(
+        cx.debug_bounds("table-axis-selection").is_some(),
+        "释放后选中高亮仍在新位置"
+    );
+
+    // 一次拖拽释放 = 一个撤销组。
+    cx.simulate_keystrokes("ctrl-z");
+    cx.run_until_parked();
+    assert_eq!(source_of(&view, cx), COLUMNS_SOURCE, "一次撤销回到原顺序");
+    cx.simulate_keystrokes("ctrl-shift-z");
+    cx.run_until_parked();
+    assert_eq!(
+        source_of(&view, cx),
+        COLUMNS_SOURCE_AFTER_FIRST_TO_LAST,
+        "重做恢复同一次重排"
+    );
+
+    close_shell(&host, cx);
+}
+
+#[gpui::test]
+async fn dragging_rows_shows_vertical_ghost_and_moves_selection(cx: &mut TestAppContext) {
+    let dir = temp_vault_dir();
+    let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+    seed_note(&vault, "ghost 拖行", ROWS_SOURCE);
+
+    let (host, cx) = open_shell(cx, vault);
+    let view = active_view(&host, cx);
+    hover_table(TABLE_LINE, &view, cx);
+
+    let press = handle_rect(TableDragAxis::Row, 0, &view, cx).center();
+    cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Row,
+            index: 0,
+        }),
+        "按住行把手即选中整行"
+    );
+    assert!(ghost_rect(&view, cx).is_none(), "还没移动：没有 ghost");
+
+    let last = handle_rect(TableDragAxis::Row, 2, &view, cx);
+    let drop = point(last.center().x, last.center().y + px(3.0));
+    drag_to(drop, cx);
+    let drag = drag_state(&view, cx).expect("拖动中必须有状态");
+    assert_eq!((drag.slot, drag.target), (Some(3), Some(2)));
+    let rect = ghost_rect(&view, cx).expect("移动后必须有 ghost");
+    let bounds = cx
+        .debug_bounds("table-drag-ghost")
+        .expect("移动后必须画出 table-drag-ghost");
+    assert_rect_close(bounds, rect, "行 ghost 与 accessor 同源");
+    // 行 ghost 只画表格左边线上的一个小块，不复制整行。
+    let table = table_rect(TABLE_LINE, &view, cx);
+    assert_px_close(
+        rect.size.width,
+        px(menghunote_app::editor::theme::TABLE_DRAG_GHOST_ROW_WIDTH),
+        "行 ghost 是固定宽的小块",
+    );
+    assert_px_close(
+        rect.size.height,
+        px(menghunote_app::editor::theme::TABLE_DRAG_GHOST_ROW_HEIGHT),
+        "行 ghost 高度 = 小条高度",
+    );
+    assert_px_close(rect.origin.x, table.origin.x, "行 ghost 贴表格左线");
+    assert!(
+        rect.size.width.as_f32() < table.size.width.as_f32() / 4.0,
+        "行 ghost 不能覆盖整行"
+    );
+    let label = ghost_label(&view, cx).expect("移动后必须有文案");
+    assert!(
+        label.contains("第 1 行") && label.contains("第 3 行"),
+        "行 ghost 文案必须说明拖的是哪一行、将落到哪一行：{label:?}"
+    );
+    // 纵向位移跟手（从第 0 行拖到最后一行下方）。
+    assert!(
+        rect.origin.y.as_f32() > table.origin.y.as_f32() + 30.0,
+        "ghost 必须跟随指针下移：ghost={rect:?} 表格顶={:?}",
+        table.origin.y
+    );
+
+    release_at(drop, cx);
+    assert_eq!(
+        source_of(&view, cx),
+        ROWS_SOURCE_AFTER_FIRST_TO_LAST,
+        "行重排逐字节正确（ghost 不改变重排语义）"
+    );
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Row,
+            index: 2,
+        }),
+        "释放后整行选中移动到末行"
+    );
+    assert!(ghost_rect(&view, cx).is_none(), "释放后 ghost 消失");
+    assert_eq!(caret_of(&view, cx), (0, 0));
+
+    cx.simulate_keystrokes("ctrl-z");
+    cx.run_until_parked();
+    assert_eq!(source_of(&view, cx), ROWS_SOURCE, "一次撤销恢复原行顺序");
+
+    close_shell(&host, cx);
+}
+
+#[gpui::test]
+async fn escape_click_outside_and_cell_click_clear_axis_selection_without_requests(
+    cx: &mut TestAppContext,
+) {
+    let dir = temp_vault_dir();
+    let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+    seed_note(&vault, "清除轴选中", COLUMNS_SOURCE);
+
+    let (host, cx) = open_shell(cx, vault);
+    let view = active_view(&host, cx);
+    hover_table(TABLE_LINE, &view, cx);
+
+    // 1) Esc：清除选中，零请求、caret 不动。
+    let column = handle_rect(TableDragAxis::Column, 1, &view, cx).center();
+    cx.simulate_click(column, Modifiers::default());
+    cx.run_until_parked();
+    assert!(axis_selection(&view, cx).is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(axis_selection(&view, cx), None, "Esc 必须清除整行/整列选中");
+    assert!(
+        axis_selection_rect(&view, cx).is_none()
+            && cx.debug_bounds("table-axis-selection").is_none(),
+        "Esc 后高亮必须消失"
+    );
+    assert_eq!(source_of(&view, cx), COLUMNS_SOURCE, "Esc 不产生请求");
+    assert_eq!(caret_of(&view, cx), (0, 0), "Esc 不移动正文 caret");
+
+    // 2) 点表格外的正文：清除选中并落 caret，但零请求。
+    let row = handle_rect(TableDragAxis::Row, 0, &view, cx).center();
+    cx.simulate_click(row, Modifiers::default());
+    cx.run_until_parked();
+    assert!(axis_selection(&view, cx).is_some());
+    let table = table_rect(TABLE_LINE, &view, cx);
+    let outside = point(table.origin.x + px(40.0), table.origin.y - px(24.0));
+    cx.simulate_click(outside, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        axis_selection(&view, cx),
+        None,
+        "点表格外的正文必须清除整行/整列选中"
+    );
+    assert!(
+        axis_selection_rect(&view, cx).is_none()
+            && cx.debug_bounds("table-axis-selection").is_none(),
+        "点表格外后高亮必须消失"
+    );
+    assert_eq!(
+        source_of(&view, cx),
+        COLUMNS_SOURCE,
+        "点表格外只挪 caret，不产生编辑"
+    );
+
+    // 3) 点单元格：单元格选中优先，轴选中退出。
+    hover_table(TABLE_LINE, &view, cx);
+    let column = handle_rect(TableDragAxis::Column, 1, &view, cx).center();
+    cx.simulate_click(column, Modifiers::default());
+    cx.run_until_parked();
+    assert!(axis_selection(&view, cx).is_some());
+    let cell = cell_rect(TABLE_LINE, 1, 1, &view, cx);
+    cx.simulate_click(cell.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        axis_selection(&view, cx),
+        None,
+        "点单元格必须让单元格选中接管（轴选中退出）"
+    );
+    assert_eq!(selected_cell(&view, cx), Some((TABLE_LINE, 1, 1)));
+    assert!(
+        cx.update(|_window, app| view.read(app).is_editing_table_cell()),
+        "点单元格进入原地编辑"
+    );
+    assert_eq!(
+        source_of(&view, cx),
+        COLUMNS_SOURCE,
+        "选中/退出选中全程不产生编辑"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    close_shell(&host, cx);
+}
+
+#[gpui::test]
+async fn dragging_out_of_the_table_hides_ghost_and_cancels_without_requests(
+    cx: &mut TestAppContext,
+) {
+    let dir = temp_vault_dir();
+    let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+    seed_note(&vault, "拖出 ghost", ROWS_SOURCE);
+
+    let (host, cx) = open_shell(cx, vault);
+    let view = active_view(&host, cx);
+    hover_table(TABLE_LINE, &view, cx);
+
+    // 拖出表格：ghost / 指示线 / 文案一起消失，原表不变。
+    let press = handle_rect(TableDragAxis::Row, 0, &view, cx).center();
+    cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let rect = table_rect(TABLE_LINE, &view, cx);
+    let outside = point(rect.center().x, rect.origin.y - px(400.0));
+    drag_to(outside, cx);
+    let drag = drag_state(&view, cx).expect("拖动中必须有状态");
+    assert_eq!(drag.slot, None, "拖出表格后没有插入槽位");
+    assert!(ghost_rect(&view, cx).is_none(), "拖出表格后 ghost 必须消失");
+    assert!(ghost_label(&view, cx).is_none(), "拖出表格后文案必须消失");
+    assert!(
+        cx.debug_bounds("table-drag-ghost").is_none()
+            && cx.debug_bounds("table-drag-ghost-label").is_none(),
+        "拖出表格后不得画出 ghost 元素"
+    );
+    assert!(
+        cx.debug_bounds("table-drop-indicator").is_none(),
+        "拖出表格后指示线必须消失"
+    );
+    release_at(outside, cx);
+    assert_eq!(
+        source_of(&view, cx),
+        ROWS_SOURCE,
+        "拖出表格释放必须取消（逐字节不变）"
+    );
+    assert_eq!(
+        axis_selection(&view, cx),
+        Some(TableAxisSelection {
+            line: TABLE_LINE,
+            axis: TableDragAxis::Row,
+            index: 0,
+        }),
+        "取消重排后仍选着原来的行（没有移动）"
+    );
+    assert!(ghost_rect(&view, cx).is_none(), "释放后 ghost 仍不存在");
+
+    // 再按 Esc：选中态也清掉。
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(axis_selection(&view, cx), None, "Esc 清除取消后的残留选中");
+    assert_eq!(source_of(&view, cx), ROWS_SOURCE);
+    assert_eq!(caret_of(&view, cx), (0, 0));
 
     close_shell(&host, cx);
 }

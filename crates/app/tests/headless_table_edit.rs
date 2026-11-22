@@ -25,7 +25,6 @@ use gpui::{
 use menghunote_app::editor::theme;
 use menghunote_app::editor::view::EditorView;
 use menghunote_app::shell::AppShell;
-use menghunote_editor::SourceByte;
 use menghunote_storage::{append_updates, load_body_doc, StructureWriter, UpdateRecord, Vault};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
@@ -155,6 +154,15 @@ fn object_rect(
     })
 }
 
+/// 单击表格中心并**退出**原地编辑：表格保持选中，浮层可用（编辑期间浮层隐藏）。
+fn select_table(line: usize, view: &Entity<EditorView>, cx: &mut VisualTestContext) {
+    let rect = object_rect(line, view, cx);
+    cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+}
+
 /// 点击一个 debug selector 目标（找不到就失败：按钮必须真实画出来）。
 fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx
@@ -162,12 +170,6 @@ fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
         .unwrap_or_else(|| panic!("`{selector}` 必须可见"));
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
-}
-
-/// 表格源码末尾的 scalar（`TABLE_SOURCE` 里表格之后是空行 + `后文`）。
-fn table_end_scalar(source: &str) -> usize {
-    let byte = source.find("\n\n后文").expect("后文位置");
-    source[..byte].chars().count()
 }
 
 /// 2 列 / 1 行数据 + 两种对齐的表格。
@@ -198,8 +200,9 @@ async fn corner_buttons_add_a_row_then_a_column(cx: &mut TestAppContext) {
     );
     assert!(cx.debug_bounds("table-insert-row").is_none());
 
-    // 单击表格（落在某个单元格上）：表格是当前选中对象、浮层出现，且整体落在表格
-    // **外面**（不遮挡单元格文本）。单元格选中本身由 S3b2 的 headless 覆盖。
+    // 单击表格（落在某个单元格上）：表格是当前选中对象，同时**直接进入原地编辑**
+    // （ADR 0019 S3b2 的 2026-11-17 交互修正）。编辑期间表格仍是 Object，
+    // 但工具条/加行加列浮层必须隐藏（避免遮挡 cell 输入框/坐标冲突）。
     let rect = object_rect(TABLE_LINE, &view, cx);
     cx.simulate_click(rect.center(), Modifiers::default());
     cx.run_until_parked();
@@ -207,7 +210,21 @@ async fn corner_buttons_add_a_row_then_a_column(cx: &mut TestAppContext) {
     assert!(table.selected, "单击后表格必须处于选中态");
     assert_eq!((table.rows, table.columns), (1, 2));
     assert!(!table.editing_source && table.display.is_some());
+    assert!(table.editing_cell.is_some(), "单击单元格直接进入原地编辑");
+    assert!(
+        cx.debug_bounds("table-actions").is_none(),
+        "单元格编辑期间不得显示加行加列浮层"
+    );
+    assert_eq!(caret_of(&view, cx), (0, 0), "单击单元格不移动正文 caret");
 
+    // Esc 取消这次编辑（没输入 → 零请求），选中态保留 → 浮层重新出现。
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).is_editing_table_cell()),
+        "Esc 退出单元格编辑"
+    );
+    assert_eq!(caret_of(&view, cx), (0, 0), "取消不移动 caret");
     let actions = cx
         .debug_bounds("table-actions")
         .expect("选中表格必须显示右下角浮层");
@@ -234,27 +251,7 @@ async fn corner_buttons_add_a_row_then_a_column(cx: &mut TestAppContext) {
         "必须有「+ 列」"
     );
 
-    // 单击单元格不移动正文 caret（ADR 0019 S3b2）；进 cell 编辑再 Esc 退出后
-    // caret 才落到整表末尾 —— 用这条路径验证 S3b1 的“caret 不落进表格”契约。
-    assert_eq!(caret_of(&view, cx), (0, 0), "单击单元格不移动正文 caret");
-    cx.simulate_keystrokes("f2");
-    cx.run_until_parked();
-    assert!(
-        cx.update(|_window, app| view.read(app).is_editing_table_cell()),
-        "F2 必须进入单元格编辑"
-    );
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    assert_eq!(
-        caret_of(&view, cx),
-        (
-            table_end_scalar(TABLE_SOURCE),
-            table_end_scalar(TABLE_SOURCE)
-        ),
-        "退出单元格编辑后 caret 落在整表之后（不落进表格源码内部）"
-    );
-    // 悬浮/工具条按**上一帧几何**定位：退出 cell 编辑的那一帧几何还是“表格被压成一行”，
-    // 再来一次鼠标移动（真实用户总会动一下）让浮层拿到 表格重新变成 Object 的几何。
+    // 悬浮/工具条按**上一帧几何**定位：退出编辑后动一下鼠标，让浮层拿到最新几何。
     let rect = object_rect(TABLE_LINE, &view, cx);
     cx.simulate_mouse_move(rect.center(), None, Modifiers::default());
     cx.run_until_parked();
@@ -278,14 +275,11 @@ async fn corner_buttons_add_a_row_then_a_column(cx: &mut TestAppContext) {
         display.contains(placeholder) && !display.contains("| 苹果 |"),
         "加行后仍投影成对象占位符：{display:?}"
     );
-    // caret：文本位置不变（表格末尾 → 新表格末尾），绝不落进表格源码内部。
-    let expected = SourceByte::new(table.span.1)
-        .to_scalar(TABLE_ROW_ADDED)
-        .expect("新表格末尾是 scalar 边界");
+    // caret：点浮层按钮不移动正文 caret（本用例 caret 一直在文档开头）。
     assert_eq!(
         caret_of(&view, cx),
-        (expected.get(), expected.get()),
-        "点按钮后 caret 必须停在新表格末尾（不能落进表格内部）"
+        (0, 0),
+        "点浮层按钮不移动正文 caret（更不能落进表格内部）"
     );
     // 几何按新行数刷新：矩形高度 +1 行。
     let grown = object_rect(TABLE_LINE, &view, cx);
@@ -312,13 +306,10 @@ async fn corner_buttons_add_a_row_then_a_column(cx: &mut TestAppContext) {
     assert_eq!((table.rows, table.columns), (2, 3), "列数 +1、行数不变");
     assert!(table.selected, "加列后表格必须保持选中态");
     assert!(!table.editing_source);
-    let expected = SourceByte::new(table.span.1)
-        .to_scalar(TABLE_ROW_AND_COLUMN_ADDED)
-        .expect("新表格末尾是 scalar 边界");
     assert_eq!(
         caret_of(&view, cx),
-        (expected.get(), expected.get()),
-        "加列后 caret 也必须停在新表格末尾"
+        (0, 0),
+        "加列后正文 caret 仍然不动（表格内部不接受文本落点）"
     );
     let display = display_of(&view, cx);
     assert!(
@@ -376,9 +367,7 @@ async fn one_click_is_one_undo_group(cx: &mut TestAppContext) {
 
     let (host, cx) = open_shell(cx, vault);
     let view = active_view(&host, cx);
-    let rect = object_rect(TABLE_LINE, &view, cx);
-    cx.simulate_click(rect.center(), Modifiers::default());
-    cx.run_until_parked();
+    select_table(TABLE_LINE, &view, cx);
 
     click_selector(cx, "table-insert-row");
     assert_eq!(source_of(&view, cx), TABLE_ROW_ADDED);
@@ -400,9 +389,7 @@ async fn one_click_is_one_undo_group(cx: &mut TestAppContext) {
     assert_eq!(source_of(&view, cx), TABLE_ROW_ADDED, "重做恢复空数据行");
 
     // 加列同样是一个撤销组。
-    let rect = object_rect(TABLE_LINE, &view, cx);
-    cx.simulate_click(rect.center(), Modifiers::default());
-    cx.run_until_parked();
+    select_table(TABLE_LINE, &view, cx);
     click_selector(cx, "table-insert-column");
     assert_eq!(source_of(&view, cx), TABLE_ROW_AND_COLUMN_ADDED);
     cx.simulate_keystrokes("ctrl-z");
@@ -426,9 +413,7 @@ async fn inserted_rows_and_columns_survive_reopen(cx: &mut TestAppContext) {
 
     let (host, cx) = open_shell(cx, vault);
     let view = active_view(&host, cx);
-    let rect = object_rect(TABLE_LINE, &view, cx);
-    cx.simulate_click(rect.center(), Modifiers::default());
-    cx.run_until_parked();
+    select_table(TABLE_LINE, &view, cx);
     click_selector(cx, "table-insert-row");
     // 浮层几何在加行后变了，重新取一次再点「+ 列」。
     click_selector(cx, "table-insert-column");
@@ -497,9 +482,7 @@ async fn corner_buttons_are_table_only_and_hidden_in_source_mode(cx: &mut TestAp
     );
 
     // 表格：浮层出现；进入源码模式后浮层与按钮一起消失（源码模式不是 Object）。
-    let table_rect = object_rect(2, &view, cx);
-    cx.simulate_click(table_rect.center(), Modifiers::default());
-    cx.run_until_parked();
+    select_table(2, &view, cx);
     assert!(
         cx.debug_bounds("table-insert-row").is_some(),
         "选中表格后必须有「+ 行」"
@@ -516,9 +499,7 @@ async fn corner_buttons_are_table_only_and_hidden_in_source_mode(cx: &mut TestAp
     // Esc 回到表格对象：浮层重新可用。
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    let table_rect = object_rect(2, &view, cx);
-    cx.simulate_click(table_rect.center(), Modifiers::default());
-    cx.run_until_parked();
+    select_table(2, &view, cx);
     assert!(
         cx.debug_bounds("table-insert-row").is_some(),
         "退出源码模式后浮层必须恢复"
@@ -540,6 +521,8 @@ async fn narrow_window_keeps_the_corner_buttons_inside_the_viewport(cx: &mut Tes
     cx.run_until_parked();
     let rect = object_rect(TABLE_LINE, &view, cx);
     cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     let actions = cx
         .debug_bounds("table-actions")

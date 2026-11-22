@@ -17,8 +17,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use gpui::{
-    div, AppContext as _, Entity, InteractiveElement as _, Modifiers, ParentElement as _,
-    Styled as _, TestAppContext, VisualTestContext,
+    div, point, px, AppContext as _, Entity, InteractiveElement as _, Modifiers,
+    ParentElement as _, ScrollDelta, ScrollEvent, ScrollSource, Styled as _, TestAppContext,
+    TouchPhase, VisualTestContext,
 };
 use menghunote_app::editor::theme;
 use menghunote_app::editor::view::{EditorView, ObjectImageState};
@@ -622,6 +623,139 @@ async fn image_object_zoom_button_and_second_click_open_overlay(cx: &mut TestApp
     assert!(
         cx.debug_bounds("image-zoom-overlay").is_some(),
         "已选中的图片再次单击必须放大"
+    );
+    close_shell(&host, cx);
+}
+
+#[gpui::test]
+async fn image_zoom_overlay_wheel_scales_within_bounds_and_does_not_scroll_the_editor(
+    cx: &mut TestAppContext,
+) {
+    let dir = temp_vault_dir();
+    let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+    let png = png_bytes();
+    let hash = asset_content_hash(&png);
+    insert_asset(&vault, &hash, png.len() as u64, Some("image/png"), &png).expect("写入资产失败");
+    let hash = hash_hex(&hash);
+    // 图片在顶部，后面接一段长正文：底层编辑器确实**可滚动**，穿透才会被检测到。
+    let body = (0..120)
+        .map(|index| format!("行{index}\n"))
+        .collect::<String>();
+    let text = format!("![示意](asset://{hash})\n\n{body}");
+    seed_note(&vault, "遮罩滚轮", &text);
+
+    let (host, cx) = open_shell(cx, vault);
+    let view = active_view(&host, cx);
+    settle_images(&view, cx);
+
+    let rects = cx.update(|_window, app| view.read(app).object_rects());
+    let (_, rect) = rects.first().expect("图片对象必须可见");
+    cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    let zoom = cx
+        .debug_bounds("object-toolbar-zoom")
+        .expect("「放大」按钮必须可见");
+    cx.simulate_click(zoom.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("image-zoom-overlay").is_some(),
+        "放大按钮必须打开遮罩"
+    );
+    let before_scale = cx
+        .update(|_window, app| view.read(app).image_zoom_scale())
+        .expect("遮罩打开时必须有缩放倍率");
+    assert!((before_scale - 1.0).abs() < 1e-4, "默认倍率是 1.0");
+    let before_scroll = cx.update(|_window, app| view.read(app).scroll_y());
+    assert_eq!(before_scroll, 0.0, "起始滚动位置在顶部");
+
+    // 滚轮向下（内容下移 = 编辑器会尝试向下滚）：遮罩只缩小图片，底层不得滚动。
+    let canvas = cx
+        .debug_bounds("image-zoom-overlay")
+        .expect("遮罩")
+        .center();
+    for _ in 0..3 {
+        cx.simulate_event(ScrollEvent {
+            position: canvas,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
+        });
+    }
+    cx.run_until_parked();
+    let zoomed_out = cx
+        .update(|_window, app| view.read(app).image_zoom_scale())
+        .expect("遮罩仍打开");
+    assert!(zoomed_out < before_scale, "滚轮必须缩放图片：{zoomed_out}");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).scroll_y()),
+        before_scroll,
+        "图片遮罩的滚轮不得穿透到底层编辑器"
+    );
+    assert!(
+        cx.debug_bounds("image-zoom-overlay").is_some(),
+        "滚轮缩放不能关闭遮罩"
+    );
+
+    // 上界 4.0 / 下界 0.5：滚多少都不越界。
+    for _ in 0..120 {
+        cx.simulate_event(ScrollEvent {
+            position: canvas,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(120.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
+        });
+    }
+    cx.run_until_parked();
+    let max = cx
+        .update(|_window, app| view.read(app).image_zoom_scale())
+        .expect("遮罩仍打开");
+    assert!((max - 4.0).abs() < 1e-4, "放大上限必须夹在 4.0：{max}");
+    for _ in 0..240 {
+        cx.simulate_event(ScrollEvent {
+            position: canvas,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
+        });
+    }
+    cx.run_until_parked();
+    let min = cx
+        .update(|_window, app| view.read(app).image_zoom_scale())
+        .expect("遮罩仍打开");
+    assert!((min - 0.5).abs() < 1e-4, "缩小下限必须夹在 0.5：{min}");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).scroll_y()),
+        before_scroll,
+        "连续缩放后底层编辑器仍然没有滚动"
+    );
+
+    // Esc 仍然关闭遮罩；图片仍是选中态，再点一次图片可以重新打开。
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("image-zoom-overlay").is_none(),
+        "Esc 必须关闭遮罩"
+    );
+    cx.simulate_click(rect.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("image-zoom-overlay").is_some(),
+        "已选中的图片再次单击必须重新打开遮罩"
+    );
+    let reopened_scale = cx
+        .update(|_window, app| view.read(app).image_zoom_scale())
+        .expect("重开后仍有倍率");
+    assert!((reopened_scale - 1.0).abs() < 1e-4, "重开倍率重置为 1.0");
+
+    // 点击仍然关闭遮罩。
+    cx.simulate_click(canvas, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("image-zoom-overlay").is_none(),
+        "点击遮罩必须关闭"
     );
     close_shell(&host, cx);
 }

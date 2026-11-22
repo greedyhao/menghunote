@@ -45,8 +45,8 @@ use std::time::{Duration, Instant};
 use gpui::prelude::*;
 use gpui::{
     div, img, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, ImageSource, KeyDownEvent, MouseButton,
-    MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Window,
+    Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, ImageSource, KeyDownEvent,
+    MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Window,
 };
 use menghunote_editor::{
     Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, MarkdownImage,
@@ -63,6 +63,8 @@ use menghunote_storage::session::{
     RejectReason, ScalarEdit, SessionDriver,
 };
 use menghunote_storage::MaterializeOutcome;
+
+use crate::sidebar_rename::{RenameEvent, RenameInput};
 
 use super::clipboard::{
     choose_paste, AssetRefSummary, ImportPayload, ImportReport, ImportSource, ImportedSummary,
@@ -82,6 +84,9 @@ use super::theme;
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
 /// 关闭窗口时的有界排空上限（ADR 0002 §9：`close` 必须有界）。
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 图片放大遮罩的缩放上下限（有界，滚轮再猛也不越界）。
+const IMAGE_ZOOM_MIN: f32 = 0.5;
+const IMAGE_ZOOM_MAX: f32 = 4.0;
 
 /// 状态栏右侧的固定提示。
 const HINT: &str =
@@ -260,8 +265,32 @@ pub struct TableDragState {
     pub slot: Option<usize>,
     /// 槽位换算出的**最终下标**（`None` = 原地/越界，释放也不产生编辑）。
     pub target: Option<usize>,
-    /// 最近一次指针位置（窗口坐标）；刚开始拖拽时是 `(0, 0)`，第一次移动后更新。
+    /// 最近一次指针位置（窗口坐标）；刚开始拖拽时等于按下位置。
     pub position: Point<Pixels>,
+    /// 按下把手的指针位置（窗口坐标）：ghost 的锚点（偏移 = `position - press`）。
+    pub press: Point<Pixels>,
+    /// 指针是否已离开按下点超过 [`theme::TABLE_DRAG_GHOST_MIN_MOVE`]：只影响 ghost
+    /// 是否出现（单击把手只看选中反馈，不闪 ghost）。
+    pub moved: bool,
+}
+
+/// 选中的整行/整列（ADR 0019 S3b6：Obsidian 式选中反馈；headless/诊断可读）。
+///
+/// 与 [`TableDragState`]（一次鼠标手势的生命周期）**分开保存**：
+/// - 按下把手即选中（按下本身已经是“选中这一列/行”，不管随后有没有拖动）；
+/// - 拖拽释放后选中**移动到新下标**；原地/无效槽位释放保持原下标；
+/// - `Esc` / 点表格外 / 点单元格才清除（见 `EditorView::commit_selection` /
+///   `cancel_table_drag` / `click_table_cell`）。
+///
+/// `index` 与把手同一套寻址：列 = 列下标（0 起）；行 = **数据行**下标（0 起、不含表头）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableAxisSelection {
+    /// 表格对象行（表头源码行号）。
+    pub line: usize,
+    /// 选中的轴（列 / 数据行）。
+    pub axis: TableDragAxis,
+    /// 选中项下标（列 / 数据行，0 起）。
+    pub index: usize,
 }
 
 /// 一个可见视觉行的度量快照（headless/诊断用）。
@@ -311,6 +340,37 @@ pub fn is_search_shortcut(keystroke: &gpui::Keystroke) -> bool {
 
 impl gpui::EventEmitter<EditorEvent> for EditorView {}
 
+/// 表格单元格的**原地编辑浮层**（ADR 0019 S3b2，2026-11-17 交互修正）。
+///
+/// 与控制器内部的 `begin_table_cell_edit` 不同：浮层**不进** cell 编辑态，表格始终
+/// 是 Object 投影（其它行列可见），输入框只覆盖被点的那一格。提交时一次性调用
+/// [`EditorController::replace_table_cell_text`] 产生唯一一条 `EditRequest`。
+struct CellEditOverlay {
+    /// 表格对象行（表头源码行号，0 起）。
+    line: usize,
+    /// 行下标（0 = 表头）。
+    row: usize,
+    /// 列下标（0 起）。
+    column: usize,
+    /// 复用侧栏重命名的单行 IME 输入框（光标在末尾）。
+    input: Entity<RenameInput>,
+    /// 输入框 → 宿主的提交/取消/跳格事件（Drop = 取消订阅）。
+    _events: gpui::Subscription,
+    /// 本帧输入框的窗口矩形（`None` = 这一帧没画出来，例如表格滚出视口）。
+    bounds: Option<Bounds<Pixels>>,
+    /// 最近一次输入框文本（关闭/切换文档时没有 `Window`，不能现场读实体）。
+    draft: String,
+}
+
+/// 图片放大预览的运行态（`scale` 由滚轮调整，0.5–4.0 有界）。
+#[derive(Clone)]
+struct ImageZoom {
+    /// 已解码图片。
+    image: Arc<gpui::RenderImage>,
+    /// 显示倍率（相对遮罩可用区域的基准框）。
+    scale: f32,
+}
+
 pub struct EditorView {
     controller: EditorController,
     driver: SessionDriver,
@@ -335,9 +395,6 @@ pub struct EditorView {
     /// 本次 Enter 已由 key_down 落成编辑：平台随后送来的同一个 `\n` 文本输入要消费掉，
     /// 否则一次按键会变成两个 EditRequest（结构编辑 + 普通换行）。
     pending_enter_text_input: bool,
-    /// 本次 Tab 已由 key_down 用来“提交 + 跳到下一格”：平台随后送来的 `\t` 文本输入
-    /// 要消费掉，否则制表符会被插进下一格（ADR 0019 S3b2）。
-    pending_tab_text_input: bool,
     /// 下一次绘制选区时是否把几何明细打到 stderr（拖拽/点击时置位，task-19 诊断用）。
     dump_selection: bool,
     /// 上一次观察到的「外部提交闸门持有中」状态（ADR 0009 切片 3b）。
@@ -362,10 +419,15 @@ pub struct EditorView {
     selected_object_line: Option<usize>,
     /// 单击选中的表格单元格 `(表格对象行, row, column)`（ADR 0019 S3b2）。
     ///
-    /// `row` 与控制器同一套寻址（0 = 表头）。选中单元格**不移动正文 caret**；再次单击
-    /// 同一格 / 双击 / Enter / F2 进入就地编辑（编辑态在控制器里，见
-    /// `EditorController::is_editing_table_cell`）。
+    /// `row` 与控制器同一套寻址（0 = 表头）。选中单元格**不移动正文 caret**；
+    /// 单击（含双击）即在 cell 矩形上浮出编辑输入框，表格其余行列仍然可见。
     selected_table_cell: Option<(usize, usize, usize)>,
+    /// 表格单元格原地编辑浮层（`None` = 不在编辑）。
+    cell_edit: Option<CellEditOverlay>,
+    /// 下一帧把焦点交给单元格输入框（事件回调里拿不到 `&mut Window`）。
+    pending_cell_focus: bool,
+    /// 下一帧把焦点还给正文编辑器（提交/取消浮层后）。
+    pending_focus_editor: bool,
     /// 本帧悬浮工具条的**窗口坐标**矩形（元素层用它避免把点击误当成正文命中）。
     toolbar_rect: Option<Bounds<Pixels>>,
     /// 本帧表格右下角「加行/加列」浮层的**窗口坐标**矩形（与 `toolbar_rect` 同样
@@ -373,6 +435,9 @@ pub struct EditorView {
     table_actions_rect: Option<Bounds<Pixels>>,
     /// 表格行列拖拽（ADR 0019 S3b5）：进行中的一次拖拽；`None` = 没有拖拽。
     table_drag: Option<TableDragState>,
+    /// 选中的整行/整列（ADR 0019 S3b6）：与拖拽手势分开保存，点击把手即选中，
+    /// 拖拽结束后移动到新下标；`Esc` / 点表格外 / 点单元格清除。
+    table_axis_selection: Option<TableAxisSelection>,
     /// 本帧表格拖拽把手的**命中矩形**（窗口坐标）：元素层据此放行把手上的点击，
     /// 避免同一次按下又被当成“选中单元格 / 整表选中 / 落 caret”。
     table_handle_rects: Vec<Bounds<Pixels>>,
@@ -381,7 +446,7 @@ pub struct EditorView {
     /// 本帧右键菜单面板的**窗口坐标**矩形（点击落在这里时元素层不挪正文 caret）。
     context_menu_rect: Option<Bounds<Pixels>>,
     /// 放大预览的图片（点击图片/放大按钮后显示；`None` = 关闭）。
-    zoomed_image: Option<Arc<gpui::RenderImage>>,
+    zoomed_image: Option<ImageZoom>,
     /// 已被驱动受理的**本地**编辑代数（ADR 0012 S3 自动同步的触发源）。
     ///
     /// 只在 `EditOutcome::Applied` 上自增：远端 adopt 不经过 `submit_request`，
@@ -414,7 +479,6 @@ impl EditorView {
             composition: Composition::default(),
             request_seq: 0,
             pending_enter_text_input: false,
-            pending_tab_text_input: false,
             dump_selection: false,
             held: false,
             images: ImageService::new(asset_provider),
@@ -424,9 +488,13 @@ impl EditorView {
             hovered_object_line: None,
             selected_object_line: None,
             selected_table_cell: None,
+            cell_edit: None,
+            pending_cell_focus: false,
+            pending_focus_editor: false,
             toolbar_rect: None,
             table_actions_rect: None,
             table_drag: None,
+            table_axis_selection: None,
             table_handle_rects: Vec::new(),
             context_menu: None,
             context_menu_rect: None,
@@ -684,6 +752,12 @@ impl EditorView {
                 *selected_line == line && *row < table.total_rows() && *column < columns
             })
             .map(|(_, row, column)| (row, column));
+        // 原 cell 文本必须隐藏，否则浮层输入框会与表格旧数据叠成重影。
+        let editing_cell = self
+            .cell_edit
+            .as_ref()
+            .filter(|state| state.line == line)
+            .map(|state| (state.row, state.column));
         let mut paint = TablePaint {
             rect,
             columns,
@@ -706,12 +780,11 @@ impl EditorView {
                 );
                 cells.push(TableCellPaint {
                     rect: cell_rect,
-                    text: table_cell_paint(
-                        window,
-                        &source,
-                        table.header().cell(column),
-                        inner_width,
-                    ),
+                    text: if editing_cell == Some((0, column)) {
+                        None
+                    } else {
+                        table_cell_paint(window, &source, table.header().cell(column), inner_width)
+                    },
                     align: table.alignment(column),
                 });
             }
@@ -739,7 +812,11 @@ impl EditorView {
                 );
                 cells.push(TableCellPaint {
                     rect: cell_rect,
-                    text: table_cell_paint(window, &source, row.cell(column), inner_width),
+                    text: if editing_cell == Some((index + 1, column)) {
+                        None
+                    } else {
+                        table_cell_paint(window, &source, row.cell(column), inner_width)
+                    },
                     align: table.alignment(column),
                 });
             }
@@ -771,7 +848,7 @@ impl EditorView {
     /// 悬浮工具条当前针对的对象行（显式源码模式时没有工具条）。
     fn toolbar_target_line(&self) -> Option<usize> {
         // 源码模式 / 单元格就地编辑：都不是 Object（工具条与边缘浮层一起隐藏）。
-        if self.controller.is_editing_object_source() || self.controller.is_editing_table_cell() {
+        if self.controller.is_editing_object_source() || self.is_editing_table_cell() {
             return None;
         }
         if let Some(line) = self.hovered_object_line {
@@ -1044,7 +1121,7 @@ impl EditorView {
             eprintln!("[menghunote] IME 组合中：忽略任务框点击 item={item}");
             return false;
         }
-        if self.controller.is_editing_table_cell() {
+        if self.is_editing_table_cell() {
             eprintln!("[menghunote] 单元格编辑中：先提交/取消再点任务框 item={item}");
             return false;
         }
@@ -1163,10 +1240,10 @@ impl EditorView {
                         })
                         .map(|(_, row, column)| (row, column)),
                     editing_cell: self
-                        .controller
-                        .table_cell_edit_target()
-                        .filter(|target| target.line == table.line())
-                        .map(|target| (target.row, target.column)),
+                        .cell_edit
+                        .as_ref()
+                        .filter(|state| state.line == table.line())
+                        .map(|state| (state.row, state.column)),
                     source_visible,
                 }
             })
@@ -1296,39 +1373,61 @@ impl EditorView {
         cx.notify();
     }
 
-    // ---- 表格单元格选择 / 就地编辑（ADR 0019 S3b2）----
+    // ---- 表格单元格原地编辑（ADR 0019 S3b2；2026-11-17 改为浮层）----
 
-    /// 是否正在就地编辑表格单元格（编辑态由控制器持有）。
+    /// 是否正在原地编辑表格单元格（浮层输入框存在）。
+    ///
+    /// 编辑期间表格**仍然是 Object**（其它行列照常绘制），与控制器内部的
+    /// `begin_table_cell_edit`（会把 display 压成一行 cell 文本）无关。
     #[must_use]
     pub fn is_editing_table_cell(&self) -> bool {
-        self.controller.is_editing_table_cell()
+        self.cell_edit.is_some()
     }
 
     /// 正在编辑的单元格 `(表格对象行, row, column)`（row 0 = 表头）。
     #[must_use]
     pub fn table_cell_edit_target(&self) -> Option<(usize, usize, usize)> {
-        self.controller
-            .table_cell_edit_target()
-            .map(|target| (target.line, target.row, target.column))
+        self.cell_edit
+            .as_ref()
+            .map(|state| (state.line, state.row, state.column))
     }
 
-    /// 正在编辑的 cell 在 display 上的落点字节（空 cell 也有；供元素层判断“点在不在这一行”）。
+    /// 单元格输入框当前是否持有键盘焦点（headless 诊断用）。
     #[must_use]
-    pub fn table_cell_edit_display_anchor(&self) -> Option<usize> {
-        self.controller.table_cell_edit_display_anchor()
+    pub fn table_cell_edit_input_focused(&self, window: &Window, cx: &App) -> bool {
+        let Some(state) = self.cell_edit.as_ref() else {
+            return false;
+        };
+        let handle = state.input.read(cx).focus_handle(cx);
+        window.focused(cx) == Some(handle)
     }
 
-    /// 单击选中的单元格 `(表格对象行, row, column)`（不进编辑；不移动正文 caret）。
+    /// 本帧编辑输入框的**窗口坐标**矩形（`None` = 不在编辑 / 这一帧没画出来）。
+    ///
+    /// 输入框矩形就是被点 cell 的矩形（`table_cell_rects()` 同一份几何），
+    /// headless 用它断言“输入框只覆盖该 cell、没有遮挡整表”。
+    #[must_use]
+    pub fn table_cell_edit_input_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.cell_edit.as_ref().and_then(|state| state.bounds)
+    }
+
+    /// 单击选中的单元格 `(表格对象行, row, column)`（不移动正文 caret）。
     #[must_use]
     pub fn selected_table_cell(&self) -> Option<(usize, usize, usize)> {
         self.selected_table_cell
+    }
+    /// 清空单元格选中态（点击表格以外的区域、表格结构变化时用）。
+    pub(crate) fn clear_table_cell_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selected_table_cell.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// 本帧所有可见表格单元格的窗口矩形 `(对象行, row, column, 矩形)`。
     ///
     /// 几何来自 `table_paint` 的 `TableCellPaint.rect`（绘制/命中/测试同源），
-    /// 长表格按视口裁剪时只有可见行；不在 Object 模式（源码模式 / 单元格编辑中）
-    /// 时表格没有网格，这里也就没有矩形。
+    /// 长表格按视口裁剪时只有可见行。原地编辑**不会**改变表格投影，所以编辑期间
+    /// 这里仍然返回完整网格（输入框就浮在其中一个矩形上）。
     #[must_use]
     pub fn table_cell_rects(&self) -> Vec<(usize, usize, usize, Bounds<Pixels>)> {
         let Some(geometry) = self.shared.geometry() else {
@@ -1348,10 +1447,30 @@ impl EditorView {
         rects
     }
 
-    /// 单击表格单元格：**只选中这一格**（高亮），表格仍是 Object，**不移动正文 caret**。
+    /// 某个单元格的**可编辑显示文本**（源码去掉 `\|` 转义；空 cell = 空串）。
     ///
-    /// 再次单击同一格 / 双击 / `Enter` / `F2` 才进入就地编辑（[`Self::begin_table_cell_edit`]）。
-    /// 点击表格的非单元格区域（内边距/边框）仍然走 S3a 的整块选中（[`Self::select_object_at`]）。
+    /// 缺列补出来的空区间（cell 起点在行内容末尾之外）返回 `None`：往那里插字会写坏
+    /// 表格结构，所以单击只选中、不进入编辑。
+    fn editable_cell_text(&self, line: usize, row: usize, column: usize) -> Option<String> {
+        let object = self
+            .controller
+            .object_at_line(line)
+            .filter(|object| object.kind().is_table())?;
+        let table = self.controller.table_of(object)?;
+        let cell = table.cell(row, column)?;
+        let row_span = table.row_span(row)?;
+        if cell.start() >= row_span.end() {
+            return None;
+        }
+        let source = self.controller.source_text();
+        Some(table_cell_display_text(&source, cell))
+    }
+
+    /// 单击表格单元格：**直接进入原地编辑**（双击同义）。
+    ///
+    /// 表格仍是 Object（其余行列可见），输入框只覆盖该 cell 矩形；单击**不移动正文
+    /// caret**。点击表格的非单元格区域（内边距/边框）仍然走整块选中
+    /// （[`Self::select_object_at`]）。
     pub fn click_table_cell(
         &mut self,
         line: usize,
@@ -1377,35 +1496,23 @@ impl EditorView {
             eprintln!("[menghunote] 单元格点击已过期（行 {line} 的 {row},{column}）：忽略");
             return false;
         }
-        if click_count >= 2 {
-            // 双击 = 选中 + 进入编辑（一次手势里完成，不需要先选一次）。
-            self.selected_object_line = Some(line);
-            self.selected_table_cell = Some((line, row, column));
-            return self.begin_table_cell_edit(line, row, column, window, cx);
-        }
-        let already = self.selected_table_cell == Some((line, row, column));
-        if already {
-            // 再次单击已选中的格子 → 进入编辑。
-            return self.begin_table_cell_edit(line, row, column, window, cx);
-        }
-        // 第一次单击：选中该格，不碰正文 caret（caret 可能正在别处打字）。
         self.selected_object_line = Some(line);
         self.selected_table_cell = Some((line, row, column));
+        // 单元格点击优先于整行/整列选中：先退出轴选中，再进入该格编辑（两者不叠加）。
+        self.table_axis_selection = None;
         self.preferred_x = None;
-        if let Some(window) = window {
-            window.focus(&self.focus_handle, cx);
-        }
         eprintln!(
-            "[menghunote] 选中表格单元格（行 {line} 的 row={row} col={column}）：不进入编辑、不移动 caret"
+            "[menghunote] 单击表格单元格（行 {line} 的 row={row} col={column}，click_count={click_count}）：原地编辑，表格仍为 Object"
         );
+        self.begin_table_cell_edit(line, row, column, window, cx);
         cx.notify();
         true
     }
 
-    /// 进入单元格就地编辑（`Enter` / `F2` / 再次单击 / 双击）。
+    /// 进入单元格原地编辑：在 cell 矩形上创建输入框（**不产生** `EditRequest`）。
     ///
-    /// 只有控制器能改正文：这里只调用 [`EditorController::begin_table_cell_edit`]，随后
-    /// 把 caret 拉进视口。进入编辑本身**不产生** `EditRequest`。
+    /// 输入框复用侧栏重命名的 [`RenameInput`]（IME / 选区 / 光标同一套实现），
+    /// 光标在 cell 文本末尾；表格保持 Object 投影，整表数据仍可见。
     pub fn begin_table_cell_edit(
         &mut self,
         line: usize,
@@ -1426,51 +1533,130 @@ impl EditorView {
         if self.controller.is_editing_object_source() {
             return false;
         }
-        match self.controller.begin_table_cell_edit(line, row, column) {
-            Ok(true) => {
-                self.selected_object_line = Some(line);
-                self.selected_table_cell = Some((line, row, column));
-                self.preferred_x = None;
+        // 已在同一格编辑：只把焦点交回输入框（不重建，避免丢弃 IME 组合）。
+        if let Some(state) = self.cell_edit.as_ref() {
+            if (state.line, state.row, state.column) == (line, row, column) {
+                let input = state.input.clone();
                 if let Some(window) = window {
-                    window.focus(&self.focus_handle, cx);
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                } else {
+                    self.pending_cell_focus = true;
                 }
-                self.ensure_caret_visible(self.controller.selection().head());
-                eprintln!(
-                    "[menghunote] 进入单元格编辑（行 {line} 的 row={row} col={column}）：display 只显示该 cell"
-                );
-                cx.notify();
-                true
+                self.pending_focus_editor = false;
+                return true;
             }
-            Ok(false) => false,
-            Err(error) => {
-                eprintln!("[menghunote] 进入单元格编辑被拒：{error}");
-                false
+            // 从另一格切过来：先提交当前格（一次请求），再开新格。
+            self.commit_table_cell_edit(None, cx);
+        }
+        let Some(text) = self.editable_cell_text(line, row, column) else {
+            eprintln!(
+                "[menghunote] 单元格不可编辑（行 {line} 的 {row},{column}：缺列补出的空区间或已失效）"
+            );
+            return false;
+        };
+        let input = cx.new(|cx| RenameInput::new_cell_at_end(&text, cx));
+        let events = cx.subscribe(&input, |view, _input, event: &RenameEvent, cx| {
+            view.on_cell_input_event(event.clone(), cx);
+        });
+        self.cell_edit = Some(CellEditOverlay {
+            line,
+            row,
+            column,
+            input: input.clone(),
+            _events: events,
+            bounds: None,
+            draft: text.clone(),
+        });
+        self.selected_object_line = Some(line);
+        self.selected_table_cell = Some((line, row, column));
+        // 进入单元格编辑即退出整行/整列选中（Enter/直接调用路径也不叠加）。
+        self.table_axis_selection = None;
+        self.preferred_x = None;
+        self.pending_focus_editor = false;
+        if let Some(window) = window {
+            self.pending_cell_focus = false;
+            input.update(cx, |input, cx| input.focus(window, cx));
+            // 正文 surface 自己也 `track_focus`：它的自动聚焦监听在祖先层、晚于本监听
+            // 执行，会把焦点抢回 EditorView。这里用 prevent_default 抑制那次自动聚焦
+            // （只影响这一次鼠标按下，不改变输入法/文本事件）。
+            window.prevent_default();
+        } else {
+            self.pending_cell_focus = true;
+        }
+        eprintln!(
+            "[menghunote] 进入单元格原地编辑（行 {line} 的 row={row} col={column}）：表格仍为 Object，输入框只覆盖该 cell"
+        );
+        cx.notify();
+        true
+    }
+
+    /// 输入框事件：Enter 提交 / Tab 跳格 / Esc 取消（事件回调没有 `&mut Window`）。
+    fn on_cell_input_event(&mut self, event: RenameEvent, cx: &mut Context<Self>) {
+        match event {
+            RenameEvent::Commit(text) => {
+                self.commit_table_cell_edit_with(text, cx);
+            }
+            RenameEvent::Advance { forward, text } => {
+                self.advance_table_cell_edit_from_input(forward, text, cx);
+            }
+            RenameEvent::Cancel => {
+                self.cancel_table_cell_edit(cx);
+            }
+            // Cell 模式不会发 Blank（空串是合法提交）。
+            RenameEvent::Blank => {}
+            RenameEvent::Changed => {
+                let text = self
+                    .cell_edit
+                    .as_ref()
+                    .map(|state| state.input.read(cx).text().to_owned());
+                if let (Some(state), Some(text)) = (self.cell_edit.as_mut(), text) {
+                    state.draft = text;
+                }
             }
         }
     }
 
-    /// 提交当前单元格编辑：控制器给出**唯一**一条 `EditRequest`（没有改动则为 `None`）。
+    /// 提交当前单元格编辑：读取输入框文本 → 控制器唯一一条 `EditRequest`。
     pub fn commit_table_cell_edit(
         &mut self,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.controller.is_editing_table_cell() {
+        let Some(text) = self
+            .cell_edit
+            .as_ref()
+            .map(|state| state.input.read(cx).text().to_owned())
+        else {
             return false;
+        };
+        let committed = self.commit_table_cell_edit_with(text, cx);
+        if let Some(window) = window {
+            window.focus(&self.focus_handle, cx);
+            self.pending_focus_editor = false;
         }
-        // 组合中按 Enter/Tab：先取消组合（preedit 的基准在提交后失效），再提交这一格。
-        if self.is_composing() {
-            self.cancel_composition(cx);
-        }
+        committed
+    }
+
+    /// 用给定文本提交当前格（输入框事件与点击别处共用）。
+    ///
+    /// 只走 [`EditorController::replace_table_cell_text`]：一次调用一条 `ScalarEdit`
+    /// （一个撤销组）；文本没变时返回 `None`、不产生请求。
+    fn commit_table_cell_edit_with(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        let Some((line, row, column)) = self.table_cell_edit_target() else {
+            return false;
+        };
+        self.cell_edit = None;
+        self.pending_cell_focus = false;
+        self.pending_focus_editor = true;
         if self.frozen_by_external_commit() {
-            // 持闸时请求会被丢弃，而草稿已经写在镜像里 → 放弃草稿，绝不留分叉镜像。
-            self.controller.cancel_table_cell_edit();
             eprintln!("[menghunote] 同步持闸中：放弃未提交的单元格编辑");
             cx.notify();
             return false;
         }
-        let target = self.table_cell_edit_target();
-        match self.controller.commit_table_cell_edit() {
+        match self
+            .controller
+            .replace_table_cell_text(line, row, column, &text)
+        {
             Ok(request) => {
                 let edits = request.as_ref().map(|request| request.edits.len());
                 let command_id = request
@@ -1479,12 +1665,8 @@ impl EditorView {
                     .unwrap_or_default();
                 let accepted = self.submit_request(request).is_some();
                 eprintln!(
-                    "[menghunote] 提交单元格编辑（{:?}）edits={edits:?} command_id={command_id} accepted={accepted}",
-                    target
+                    "[menghunote] 提交单元格编辑（行 {line} 的 {row},{column}）edits={edits:?} command_id={command_id} accepted={accepted}"
                 );
-                if let Some(window) = window {
-                    window.focus(&self.focus_handle, cx);
-                }
                 self.ensure_caret_visible(self.controller.selection().head());
                 cx.notify();
                 true
@@ -1497,15 +1679,12 @@ impl EditorView {
         }
     }
 
-    /// `Esc`：取消当前单元格编辑（恢复进入编辑前的 cell 文本，**不产生请求**）。
+    /// `Esc`：取消当前单元格编辑（**不产生请求**；没人写过正文，丢草稿即可）。
     pub fn cancel_table_cell_edit(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.is_composing() {
-            self.cancel_composition(cx);
-        }
-        if self.controller.cancel_table_cell_edit() {
-            eprintln!("[menghunote] 取消单元格编辑：cell 文本已恢复");
-            self.preferred_x = None;
-            self.ensure_caret_visible(self.controller.selection().head());
+        if self.cell_edit.take().is_some() {
+            self.pending_cell_focus = false;
+            self.pending_focus_editor = true;
+            eprintln!("[menghunote] 取消单元格编辑：未提交的文本已丢弃（正文未改动）");
             cx.notify();
             true
         } else {
@@ -1523,92 +1702,71 @@ impl EditorView {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.controller.is_editing_table_cell() {
+        let Some(text) = self
+            .cell_edit
+            .as_ref()
+            .map(|state| state.input.read(cx).text().to_owned())
+        else {
             return false;
+        };
+        self.advance_table_cell_edit_from_input(forward, text, cx);
+        if let (Some(window), Some(state)) = (window, self.cell_edit.as_ref()) {
+            let input = state.input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+            self.pending_cell_focus = false;
+            self.pending_focus_editor = false;
         }
-        if self.is_composing() {
-            self.cancel_composition(cx);
-        }
-        if self.frozen_by_external_commit() {
-            self.controller.cancel_table_cell_edit();
-            eprintln!("[menghunote] 同步持闸中：放弃未提交的单元格编辑");
-            cx.notify();
-            return false;
-        }
-        match self.controller.advance_table_cell_edit(forward) {
-            Ok((request, still_editing)) => {
-                let edits = request.as_ref().map(|request| request.edits.len());
-                let accepted = self.submit_request(request).is_some();
-                let target = self.table_cell_edit_target();
-                if still_editing {
-                    if let Some(target) = target {
-                        self.selected_object_line = Some(target.0);
-                        self.selected_table_cell = Some(target);
-                    }
-                } else {
-                    self.selected_table_cell = None;
-                }
-                if let Some(window) = window {
-                    window.focus(&self.focus_handle, cx);
-                }
-                self.ensure_caret_visible(self.controller.selection().head());
-                eprintln!(
-                    "[menghunote] Tab 提交单元格 edits={edits:?} accepted={accepted} → 目标={target:?} 仍在编辑={still_editing}"
-                );
-                cx.notify();
-                true
-            }
-            Err(error) => {
-                eprintln!("[menghunote] 单元格 Tab 失败：{error}");
-                cx.notify();
-                false
-            }
-        }
+        true
     }
 
-    /// 点击 cell 外：先提交（一次 `EditRequest`），再把这次点击落成 caret。
+    /// Tab/Shift+Tab 的实现（事件回调没有窗口）：先提交，再按最新表格算下一格。
     ///
-    /// 提交会让表格重新投影成**一个占位符**（display 由“cell 文本”变成 3 字节占位符），
-    /// 所以点击的 display 字节要先按这个差值换算到新的 display，再换回 source：
-    /// 否则“点下面那一段文字”会落到错行。
-    pub(crate) fn commit_table_cell_edit_and_place_caret(
+    /// `text` 是**按键当时**的输入框文本：平台随后补发的 `\t` 文本输入会落到
+    /// 已经关闭的输入框上，不能算进这次提交。
+    fn advance_table_cell_edit_from_input(
         &mut self,
-        display_byte: usize,
-        bias: Bias,
-        window: &mut Window,
+        forward: bool,
+        text: String,
         cx: &mut Context<Self>,
     ) {
-        let editing_range = self.controller.table_cell_edit_display_range();
-        let anchor = self.controller.table_cell_edit_display_anchor();
-        self.commit_table_cell_edit(Some(window), cx);
-        self.selected_table_cell = None;
-        let placeholder = menghunote_editor::OBJECT_PLACEHOLDER_LEN;
-        let target = match (editing_range, anchor) {
-            (Some(range), _) => {
-                if display_byte <= range.start {
-                    display_byte
-                } else if display_byte >= range.end {
-                    range
-                        .start
-                        .saturating_add(placeholder)
-                        .saturating_add(display_byte - range.end)
-                } else {
-                    range.start
-                }
-            }
-            // 空 cell：显示宽度为 0，点击落到“那一行的落点” → caret 停在表格起点。
-            (None, Some(anchor)) => {
-                if display_byte <= anchor {
-                    display_byte
-                } else {
-                    anchor.saturating_add(placeholder)
-                }
-            }
-            (None, None) => display_byte,
+        let Some((line, row, column)) = self.table_cell_edit_target() else {
+            return;
         };
-        let target = target.min(self.controller.display_len().get());
-        self.place_caret_from_display(target, bias, window, cx);
-        cx.notify();
+        // 先提交（唯一一条请求；没改动就是 `None`）。
+        self.commit_table_cell_edit_with(text, cx);
+        // 用**最新解析**的表格算下一格（加行/加列后的新格子也能到达）。
+        let next = self
+            .controller
+            .object_at_line(line)
+            .filter(|object| object.kind().is_table())
+            .and_then(|object| self.controller.table_of(object))
+            .and_then(|table| {
+                if forward {
+                    menghunote_editor::next_cell(row, column, table.row_count(), table.columns())
+                } else {
+                    menghunote_editor::previous_cell(
+                        row,
+                        column,
+                        table.row_count(),
+                        table.columns(),
+                    )
+                }
+            });
+        match next {
+            Some(next) => {
+                let entered = self.begin_table_cell_edit(line, next.row, next.column, None, cx);
+                eprintln!(
+                    "[menghunote] Tab 提交单元格（行 {line}）→ 下一格 row={} col={} entered={entered}",
+                    next.row, next.column
+                );
+            }
+            None => {
+                // 表头之前 / 末格之后：退出编辑，caret 在整表末尾（控制器已处理）。
+                self.selected_table_cell = None;
+                eprintln!("[menghunote] Tab：已到表格边界，退出单元格编辑");
+                cx.notify();
+            }
+        }
     }
 
     /// 表格「加行」（ADR 0019 S3b）：在最后一条数据行之后插入一条空数据行。
@@ -1668,7 +1826,7 @@ impl EditorView {
             // 源码模式里表格不是 Object（工具条/浮层本来也不显示）：不做结构动作。
             return false;
         }
-        if self.controller.is_editing_table_cell() {
+        if self.is_editing_table_cell() {
             // 单元格编辑期间镜像领先于会话，结构插入的坐标只在提交后才对齐。
             eprintln!(
                 "[menghunote] 单元格编辑中：忽略表格{}（行 {line}）",
@@ -1786,7 +1944,7 @@ impl EditorView {
             // 源码模式里表格不是 Object（浮层本来也不显示）：不做结构动作。
             return false;
         }
-        if self.controller.is_editing_table_cell() {
+        if self.is_editing_table_cell() {
             // 单元格编辑期间镜像领先于会话，结构删除的坐标只在提交后才对齐。
             eprintln!(
                 "[menghunote] 单元格编辑中：忽略表格{}（行 {line}）",
@@ -1899,6 +2057,111 @@ impl EditorView {
     #[must_use]
     pub fn table_drag_active(&self) -> bool {
         self.table_drag.is_some()
+    }
+
+    /// 当前选中的整行/整列（`None` = 没有轴选中；headless/诊断用）。
+    ///
+    /// 这是**状态真值**：即使表格被滚出视口、投影失效，也照实返回（绘制侧会
+    /// 通过 [`Self::table_axis_selection_rect`] 的几何校验决定画不画）。
+    #[must_use]
+    pub fn table_axis_selection(&self) -> Option<TableAxisSelection> {
+        self.table_axis_selection
+    }
+
+    /// 选中行/列的**窗口坐标**矩形（绘制与 headless 断言**同源**）。
+    ///
+    /// 几何来自本帧 `TablePaint`（`axis_rect`：固定列宽/行高），不另算一套坐标；
+    /// 结果裁剪到编辑器可见区（浮层 div 不会被宿主布局裁剪，必须自己裁）。
+    /// 单元格原地编辑 / 表格源码模式 / 表格不可见 / 下标越界 → `None`（不画）。
+    #[must_use]
+    pub fn table_axis_selection_rect(&self) -> Option<Bounds<Pixels>> {
+        let selection = self.table_axis_selection?;
+        if self.is_editing_table_cell() || self.controller.is_editing_object_source() {
+            return None;
+        }
+        let geometry = self.shared.geometry()?;
+        let object = geometry
+            .objects()
+            .iter()
+            .find(|object| object.line == selection.line)?;
+        let table = object.table()?;
+        let rect = table.axis_rect(selection.axis, selection.index)?;
+        self.clip_to_editor_viewport(&geometry, rect)
+    }
+
+    /// 拖动中的整行/整列 ghost 矩形（窗口坐标）；未移动 / 拖出表格 → `None`。
+    ///
+    /// ghost = 被拖项（整列 / 整条数据行）的矩形按 `position - press` 平移，
+    /// 再裁剪到编辑器可见区：跟随指针、但不越出编辑区压到宿主 UI。
+    #[must_use]
+    pub fn table_drag_ghost_rect(&self) -> Option<Bounds<Pixels>> {
+        let drag = self.table_drag?;
+        if !drag.moved || drag.slot.is_none() {
+            return None;
+        }
+        let geometry = self.shared.geometry()?;
+        let object = geometry
+            .objects()
+            .iter()
+            .find(|object| object.line == drag.line)?;
+        let table = object.table()?;
+        // Obsidian 式小把手：不复制整行/整列，只在表头顶线 / 表格左线上画一个小块：
+        // - 列块：y 恒贴表头顶边、x 跟指针（水平拖动）；
+        // - 行块：x 恒贴表格左边、y 跟指针（垂直拖动）。
+        // 这样既省绘制，也不会在拖到视口外时整块消失。
+        let table_left = table.rect.origin.x.as_f32();
+        let table_top = table.rect.origin.y.as_f32();
+        let table_right = table_left + table.rect.size.width.as_f32();
+        let table_bottom = table_top + table.rect.size.height.as_f32();
+        let ghost = match drag.axis {
+            TableDragAxis::Column => {
+                let width = theme::TABLE_DRAG_GHOST_COLUMN_WIDTH;
+                let height = theme::TABLE_DRAG_GHOST_COLUMN_HEIGHT;
+                let x = (drag.position.x.as_f32() - width / 2.0)
+                    .clamp(table_left, (table_right - width).max(table_left));
+                Bounds::new(point(px(x), px(table_top)), size(px(width), px(height)))
+            }
+            TableDragAxis::Row => {
+                let width = theme::TABLE_DRAG_GHOST_ROW_WIDTH;
+                let height = theme::TABLE_DRAG_GHOST_ROW_HEIGHT;
+                let y = (drag.position.y.as_f32() - height / 2.0).clamp(
+                    table_top + table.header_height,
+                    (table_bottom - height).max(table_top + table.header_height),
+                );
+                Bounds::new(point(px(table_left), px(y)), size(px(width), px(height)))
+            }
+        };
+        self.clip_to_editor_viewport(&geometry, ghost)
+    }
+
+    /// ghost 浮层文案（“移动第 N 列/行 → 第 M 列/行”）；未移动 / 拖出表格 → `None`。
+    ///
+    /// 与 [`Self::table_drag_ghost_rect`] 同一套可见性条件；`target` 与插入指示线
+    /// （`table_drop_indicator`）来自同一个 [`TableDragState`]，三者永远同步。
+    #[must_use]
+    pub fn table_drag_ghost_label(&self) -> Option<String> {
+        let drag = self.table_drag?;
+        if !drag.moved || drag.slot.is_none() {
+            return None;
+        }
+        let unit = table_axis_unit(drag.axis);
+        let from = drag.from + 1;
+        Some(match drag.target {
+            Some(to) if to + 1 != from => format!("移动第 {from} {unit} → 第 {} {unit}", to + 1),
+            _ => format!("移动第 {from} {unit}"),
+        })
+    }
+
+    /// 把浮层矩形裁剪到编辑器可见区；裁剪后为空 → `None`。
+    fn clip_to_editor_viewport(
+        &self,
+        geometry: &super::geometry::EditorGeometry,
+        rect: Bounds<Pixels>,
+    ) -> Option<Bounds<Pixels>> {
+        let (width, height) = self.shared.viewport();
+        let viewport = Bounds::new(geometry.origin, size(px(width), px(height)));
+        let clipped = rect.intersect(&viewport);
+        (clipped.size.width.as_f32() > 0.0 && clipped.size.height.as_f32() > 0.0).then_some(clipped)
     }
 
     /// 本帧可见的表格拖拽把手（窗口坐标；绘制/命中/headless 断言**同源**）。
@@ -2036,15 +2299,19 @@ impl EditorView {
         })
     }
 
-    /// 按下列手：开始一次表格行列拖拽。
+    /// 按下列手：**选中**这一列/行，并开始一次表格行列拖拽（ADR 0019 S3b6）。
     ///
-    /// **不产生任何编辑**（真正的重排在释放时一次提交）；只记下“拖的是哪张表的哪一项”。
+    /// 选中反馈与拖拽是两件事：按下即选中（`table_axis_selection`），但 ghost 只在
+    /// 指针移动超过 [`theme::TABLE_DRAG_GHOST_MIN_MOVE`] 后出现 —— 单击把手只看选中，
+    /// 拖动才进入“预览 + 落点”。**不产生任何编辑**（真正的重排在释放时一次提交）；
+    /// 只记下“拖的是哪张表的哪一项”。
     /// 持闸 / IME 组合 / 单元格就地编辑 / 表格源码模式 → 拒绝（不进入拖拽）。
     pub fn begin_table_drag(
         &mut self,
         line: usize,
         axis: TableDragAxis,
         index: usize,
+        position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> bool {
         self.pending_enter_text_input = false;
@@ -2056,7 +2323,7 @@ impl EditorView {
             eprintln!("[menghunote] IME 组合中：不开始表格行列拖拽（行 {line}）");
             return false;
         }
-        if self.controller.is_editing_object_source() || self.controller.is_editing_table_cell() {
+        if self.controller.is_editing_object_source() || self.is_editing_table_cell() {
             // 源码模式里表格不是 Object；单元格编辑期间镜像领先于会话。
             return false;
         }
@@ -2067,23 +2334,30 @@ impl EditorView {
             return false;
         }
         self.selected_object_line = Some(line);
+        self.table_axis_selection = Some(TableAxisSelection { line, axis, index });
         self.table_drag = Some(TableDragState {
             line,
             axis,
             from: index,
             slot: None,
             target: None,
-            position: point(px(0.0), px(0.0)),
+            position,
+            press: position,
+            moved: false,
         });
         eprintln!(
-            "[menghunote] 开始表格{}拖拽（行 {line} 的 #{index}）：拖到目标位置释放，Esc/拖出表格取消",
-            table_drag_axis_label(axis)
+            "[menghunote] 选中第 {} {}（行 {line}）并开始拖拽：拖到目标位置释放，Esc/拖出表格取消",
+            index + 1,
+            table_axis_unit(axis)
         );
         cx.notify();
         true
     }
 
-    /// 拖动中：按指针位置更新插入槽位（并重绘指示线）。**不产生任何编辑**。
+    /// 拖动中：按指针位置更新插入槽位（并重绘指示线/ghost）。**不产生任何编辑**。
+    ///
+    /// ghost 只在指针离开按下点超过 [`theme::TABLE_DRAG_GHOST_MIN_MOVE`] 后出现
+    /// （`moved` 一旦为真就保持到手势结束），因此“点一下把手”不会闪 ghost。
     pub(crate) fn update_table_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(mut drag) = self.table_drag else {
             return;
@@ -2093,10 +2367,14 @@ impl EditorView {
         let target = slot
             .zip(count)
             .and_then(|(slot, count)| menghunote_editor::drop_target(drag.from, slot, count));
-        let changed = drag.slot != slot || drag.target != target;
+        let dx = position.x.as_f32() - drag.press.x.as_f32();
+        let dy = position.y.as_f32() - drag.press.y.as_f32();
+        let moved = drag.moved || (dx * dx + dy * dy).sqrt() >= theme::TABLE_DRAG_GHOST_MIN_MOVE;
+        let changed = drag.slot != slot || drag.target != target || drag.moved != moved;
         drag.slot = slot;
         drag.target = target;
         drag.position = position;
+        drag.moved = moved;
         self.table_drag = Some(drag);
         if changed {
             cx.notify();
@@ -2104,6 +2382,9 @@ impl EditorView {
     }
 
     /// 释放：槽位有效 → **一次** `EditRequest` 重排（一次 undo）；否则取消、零请求。
+    ///
+    /// 重排被接受后，整行/整列选中**跟到新下标**（与插入指示线同一口径）；原地/
+    /// 无效槽位释放保持原选中（只是结束手势，不产生请求）。
     pub fn finish_table_drag(
         &mut self,
         position: Point<Pixels>,
@@ -2127,22 +2408,50 @@ impl EditorView {
             cx.notify();
             return false;
         };
-        self.move_table_structure(drag.axis, drag.line, drag.from, to, window, cx)
+        let accepted = self.move_table_structure(drag.axis, drag.line, drag.from, to, window, cx);
+        if accepted {
+            self.table_axis_selection = Some(TableAxisSelection {
+                line: drag.line,
+                axis: drag.axis,
+                index: to,
+            });
+            eprintln!(
+                "[menghunote] 整{}选中跟到新位置：第 {} {}（行 {line}）",
+                table_axis_unit(drag.axis),
+                to + 1,
+                table_axis_unit(drag.axis),
+                line = drag.line
+            );
+        }
+        accepted
     }
 
-    /// 取消拖拽（`Esc` / 拖出表格 / 拖拽中按了别的键）：丢弃状态，**不产生任何请求**。
+    /// 取消拖拽（`Esc` / 拖出表格 / 拖拽中按了别的键 / 丢失抬起的陈旧手势）：
+    /// 丢弃状态，**不产生任何请求**。
+    ///
+    /// 取消同时清除整行/整列选中：`Esc` 的用户语义就是“退出这次选中/拖拽”，
+    /// 而陈旧手势路径意味着用户已经在别处按下了鼠标（等同点表格外）。
     pub fn cancel_table_drag(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(drag) = self.table_drag.take() else {
             return false;
         };
+        let had_selection = self.table_axis_selection.take().is_some();
         eprintln!(
-            "[menghunote] 取消表格{}拖拽（行 {line} 的 #{from}）：未产生任何请求",
+            "[menghunote] 取消表格{}拖拽（行 {line} 的 #{from}）：未产生任何请求（清除轴选中={had_selection}）",
             table_drag_axis_label(drag.axis),
             line = drag.line,
             from = drag.from
         );
         cx.notify();
         true
+    }
+
+    /// 清除整行/整列选中（`Esc` / 正文 caret 变动 / 点单元格）。**不产生任何请求**。
+    pub(crate) fn clear_table_axis_selection(&mut self, cx: &mut Context<Self>) {
+        if self.table_axis_selection.take().is_some() {
+            eprintln!("[menghunote] 清除整行/整列选中（表格仍是 Object）");
+            cx.notify();
+        }
     }
 
     /// 表格重排动作的统一入口（拖拽释放）：一次 `EditRequest` + 选中格修正。
@@ -2172,7 +2481,7 @@ impl EditorView {
             cx.notify();
             return false;
         }
-        if self.controller.is_editing_object_source() || self.controller.is_editing_table_cell() {
+        if self.controller.is_editing_object_source() || self.is_editing_table_cell() {
             cx.notify();
             return false;
         }
@@ -2267,7 +2576,7 @@ impl EditorView {
     /// - 已在别处打开时直接挪到新落点（同一个菜单，不叠两个面板）。
     pub(crate) fn open_context_menu_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         self.pending_enter_text_input = false;
-        if self.controller.is_editing_table_cell() {
+        if self.is_editing_table_cell() {
             eprintln!("[menghunote] 单元格编辑中：不打开正文右键菜单（先提交该格）");
             return;
         }
@@ -2317,7 +2626,7 @@ impl EditorView {
             cx.notify();
             return false;
         }
-        if self.controller.is_editing_table_cell() {
+        if self.is_editing_table_cell() {
             eprintln!("[menghunote] 单元格编辑中：忽略插入表格（不产生请求）");
             cx.notify();
             return false;
@@ -2359,7 +2668,10 @@ impl EditorView {
         let ImageState::Ready(decoded) = self.images.state(hash) else {
             return;
         };
-        self.zoomed_image = Some(Arc::clone(&decoded.image));
+        self.zoomed_image = Some(ImageZoom {
+            image: Arc::clone(&decoded.image),
+            scale: 1.0,
+        });
         self.selected_object_line = Some(line);
         cx.notify();
     }
@@ -2369,6 +2681,32 @@ impl EditorView {
         if self.zoomed_image.take().is_some() {
             cx.notify();
         }
+    }
+    /// 遮罩滚轮缩放：按滚轮增量乘一个指数因子（围绕居中锚点），夹在 0.5–4.0。
+    ///
+    /// 返回是否真的改变了倍率（NaN / 0 增量 / 已经在边界都返回 `false`）。
+    pub fn zoom_image_by(&mut self, delta_y: f32, cx: &mut Context<Self>) -> bool {
+        let Some(zoom) = self.zoomed_image.as_mut() else {
+            return false;
+        };
+        if !delta_y.is_finite() || delta_y == 0.0 {
+            return false;
+        }
+        // 指数因子：一次 60px 滚动约 1.16×；大增量先夹到可计算范围，避免溢出/NaN。
+        let factor = (delta_y / 400.0).clamp(-2.0, 2.0).exp();
+        let next = (zoom.scale * factor).clamp(IMAGE_ZOOM_MIN, IMAGE_ZOOM_MAX);
+        if (next - zoom.scale).abs() < f32::EPSILON {
+            return false;
+        }
+        zoom.scale = next;
+        cx.notify();
+        true
+    }
+
+    /// 当前遮罩缩放倍率（`None` = 遮罩没开；headless 断言用）。
+    #[must_use]
+    pub fn image_zoom_scale(&self) -> Option<f32> {
+        self.zoomed_image.as_ref().map(|zoom| zoom.scale)
     }
 
     /// 工具条「编辑源码」：把目标对象切换到源码模式（ADR 0019 §1，图片/表格通用）。
@@ -2391,6 +2729,8 @@ impl EditorView {
     pub fn enter_object_source_edit(&mut self, line: usize, cx: &mut Context<Self>) {
         // 源码模式与单元格编辑互斥：进入源码模式先丢掉单元格选中/编辑态。
         self.selected_table_cell = None;
+        // 表格变成源码后不再有“整行/整列”的绘制几何，选中态一并退出。
+        self.table_axis_selection = None;
         let kind = self
             .controller
             .object_at_line(line)
@@ -2504,12 +2844,6 @@ impl EditorView {
         let mut marker_widths: HashMap<(u32, bool, String), f32> = HashMap::new();
 
         let object_edit_line = self.controller.object_source_edit_line();
-        // 单元格就地编辑：该行 display 是 cell 文本（不是表格网格），行高必须按普通文本
-        // 度量 —— 否则表头格会撑成整张表的高度，caret/选区/点击全部错位。
-        let cell_edit_line = self
-            .controller
-            .table_cell_edit_target()
-            .map(|target| target.line);
         let metrics: Vec<super::layout::LineMetric> = display
             .split_inclusive('\n')
             .scan(0usize, |display_byte, raw| {
@@ -2529,7 +2863,7 @@ impl EditorView {
                 let source_line = source_lines.get(index).copied().unwrap_or("");
                 // 整块 Object（且不在源码模式）：行高 = 图片/表格高度 + 内边距。
                 // 这是布局、绘制、命中三处**唯一**的高度来源（不在这里估字符宽度）。
-                if object_edit_line != Some(index) && cell_edit_line != Some(index) {
+                if object_edit_line != Some(index) {
                     if let Some(object) = self.controller.object_at_line(index) {
                         let line_height = match object.kind() {
                             menghunote_editor::ObjectKind::Image => {
@@ -3006,14 +3340,20 @@ impl EditorView {
         if let Some(report) = &self.close_report {
             return report.clone();
         }
-        // 关闭/切换前先把未提交的单元格编辑落成一条请求（持闸中则放弃草稿）：
-        // 草稿只活在镜像里，不提交就等于静默丢掉用户刚打的字。
-        if self.controller.is_editing_table_cell() {
+        // 关闭/切换前先把未提交的单元格编辑落成一条请求（持闸中则丢弃草稿）：
+        // 浮层草稿只活在内存里，不提交就等于静默丢掉用户刚打的字。
+        if let Some(state) = self.cell_edit.take() {
+            self.pending_cell_focus = false;
+            self.pending_focus_editor = false;
             if self.frozen_by_external_commit() {
-                self.controller.cancel_table_cell_edit();
                 eprintln!("[menghunote] 关闭/切换前放弃未提交的单元格编辑（同步持闸中）");
             } else {
-                match self.controller.commit_table_cell_edit() {
+                match self.controller.replace_table_cell_text(
+                    state.line,
+                    state.row,
+                    state.column,
+                    &state.draft,
+                ) {
                     Ok(request) => {
                         let edits = request.as_ref().map(|request| request.edits.len());
                         self.submit_request(request);
@@ -3245,10 +3585,6 @@ impl EditorView {
             // 平台没有补发 Enter 文本输入时，标记不能留到下一次普通输入。
             self.pending_enter_text_input = false;
         }
-        if event.keystroke.key.as_str() != "tab" {
-            // 同理：Tab 的 `\t` 回声没来也不能留到下一次输入。
-            self.pending_tab_text_input = false;
-        }
         // 表格行列拖拽（ADR 0019 S3b5）：`Esc` 取消这次拖拽（**不产生任何请求**）；
         // 其它按键先取消拖拽再继续处理（拖拽不接受键盘改目标，也不能和输入抢状态）。
         if self.table_drag.is_some() {
@@ -3288,56 +3624,28 @@ impl EditorView {
             return;
         }
 
-        // 单元格就地编辑（ADR 0019 S3b2）：Enter 提交 / Tab 下一格 / Esc 取消。
-        //
-        // 这三个键在编辑态里**优先**于一切正文语义（Enter 不再换行、Tab 不再缩进、
-        // Esc 不再退对象源码模式）：否则用户按 Enter 想提交，结果把表格行切断。
-        if self.controller.is_editing_table_cell() && !modifiers.alt && !modifiers.platform {
-            match (event.keystroke.key.as_str(), modifiers.control) {
-                ("enter", false) => {
-                    // 平台可能仍补发一次 `\n` 文本输入：标记一下让 insert_text 消费掉。
-                    self.pending_enter_text_input = true;
-                    window.prevent_default();
-                    self.commit_table_cell_edit(Some(window), cx);
-                    return;
-                }
-                ("tab", false) => {
-                    // 平台可能仍补发一次 `\t` 文本输入：标记一下让 insert_text 消费掉。
-                    self.pending_tab_text_input = true;
-                    window.prevent_default();
-                    self.advance_table_cell_edit(!modifiers.shift, Some(window), cx);
-                    return;
-                }
-                ("escape", false) => {
-                    window.prevent_default();
-                    self.cancel_table_cell_edit(cx);
-                    return;
-                }
-                // Ctrl+Z / Ctrl+Shift+Z：撤销的是“这次未提交的编辑”（= 取消），
-                // 不能把会话的历史撤销按 live 坐标套到领先于会话的镜像上。
-                ("z", true) => {
-                    window.prevent_default();
-                    eprintln!("[menghunote] 单元格编辑中收到撤销：取消本次未提交的编辑");
-                    self.cancel_table_cell_edit(cx);
-                    return;
-                }
-                _ => {}
+        // 单元格原地编辑期间焦点在浮层输入框上（Enter/Tab/Esc 由 `RenameInput` 处理）。
+        // 只有异常情况下正文会拿到按键：Esc 取消浮层，其余按键全部吞掉，绝不让它们
+        // 变成正文编辑（否则会把表格行切断/插入换行）。
+        if self.is_editing_table_cell() {
+            if event.keystroke.key.as_str() == "escape"
+                && !modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform
+            {
+                self.cancel_table_cell_edit(cx);
             }
+            window.prevent_default();
+            return;
         }
 
-        // F2：选中表格单元格 → 进入单元格编辑；有图片对象可编辑 → 该块源码模式；
-        // 否则请宿主重命名侧栏项。
+        // F2：有图片对象可编辑 → 该块源码模式；否则请宿主重命名侧栏项。
+        // 单元格编辑不再需要 F2（单击表格单元格即进入原地编辑）。
         if !modifiers.control
             && !modifiers.alt
             && !modifiers.platform
             && event.keystroke.key.as_str() == "f2"
         {
-            if let Some((line, row, column)) = self.selected_table_cell {
-                if self.begin_table_cell_edit(line, row, column, Some(window), cx) {
-                    window.prevent_default();
-                    return;
-                }
-            }
             if self.toolbar_target_line().is_some() {
                 self.enter_selected_object_source_edit(cx);
             } else {
@@ -3355,6 +3663,19 @@ impl EditorView {
             && self.controller.is_editing_object_source()
         {
             self.exit_object_source_edit(cx);
+            window.prevent_default();
+            return;
+        }
+
+        // Esc：退出整行/整列选中（ADR 0019 S3b6）。拖拽中的 Esc 已在最前面取消，
+        // 这里只处理“选中还在、但没在拖”的状态；清完直接返回，不落到正文/单元格分支。
+        if event.keystroke.key.as_str() == "escape"
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && self.table_axis_selection.is_some()
+        {
+            self.clear_table_axis_selection(cx);
             window.prevent_default();
             return;
         }
@@ -3460,7 +3781,7 @@ impl EditorView {
             // `prevent_default` 阻止平台随后把 Enter 再当文本输入插一个 `\n`
             // （否则一次按键会落两个 EditRequest：结构编辑 + 普通换行）。
             "enter" => {
-                // 选着某个单元格时 Enter = 进入该格编辑（与 F2 / 再次单击同义）。
+                // 选着某个单元格（编辑被取消后仍保留选中态）时 Enter = 重新进入该格编辑。
                 if let Some((line, row, column)) = self.selected_table_cell {
                     if self.begin_table_cell_edit(line, row, column, Some(window), cx) {
                         self.pending_enter_text_input = true;
@@ -3655,7 +3976,7 @@ impl EditorView {
     /// 组合提交：`text` 是平台给的最终文本，**只产生一个 `EditRequest`**。
     pub(crate) fn commit_composition(&mut self, text: &str, cx: &mut Context<Self>) {
         self.pending_enter_text_input = false;
-        if !self.controller.is_editing_table_cell() {
+        if !self.is_editing_table_cell() {
             self.selected_object_line = None;
         }
         if self.frozen_by_external_commit() {
@@ -3724,6 +4045,16 @@ impl EditorView {
 
     /// 普通文本输入（无组合：打字 / 粘贴）。
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        // 兜底：单元格浮层编辑期间文本属于输入框。正常路径焦点在输入框、不会走到这里；
+        // 万一平台把文本送给了正文，也不能把它插进表格/正文（那会写坏结构）。
+        if self.is_editing_table_cell() {
+            if let Some(state) = self.cell_edit.as_ref() {
+                state.input.update(cx, |input, cx| {
+                    input.insert_from_host(text, cx);
+                });
+            }
+            return;
+        }
         // 平台回声必须先消费，**不能**顺手清掉选中态：单元格编辑提交后 Enter/Tab 仍可能
         // 补发一次 `\n` / `\t` 文本输入，那会把刚提交的表格选中态清掉、或把制表符
         // 插进下一格。
@@ -3733,18 +4064,12 @@ impl EditorView {
             eprintln!("[menghunote] 已消费平台重复的 Enter 文本输入（避免双换行）");
             return;
         }
-        if text == "\t" && self.pending_tab_text_input {
-            self.pending_tab_text_input = false;
-            eprintln!("[menghunote] 已消费平台重复的 Tab 文本输入（避免把制表符插进单元格）");
-            return;
-        }
         // 单元格就地编辑期间打的是这一格：整表仍是当前对象（工具条/加行加列在提交后
         // 还要用），不能因为一次按键就把选中态清掉。
-        if !self.controller.is_editing_table_cell() {
+        if !self.is_editing_table_cell() {
             self.selected_object_line = None;
         }
         self.pending_enter_text_input = false;
-        self.pending_tab_text_input = false;
         if self.frozen_by_external_commit() {
             // Held：打字/粘贴一律忽略（控制器镜像也不能先乐观改动，否则之后无法对齐）。
             return;
@@ -3786,7 +4111,7 @@ impl EditorView {
         if self.is_composing() {
             return Some("输入法组合中：请先上屏或按 Esc".to_owned());
         }
-        if !allow_cell_text && self.controller.is_editing_table_cell() {
+        if !allow_cell_text && self.is_editing_table_cell() {
             return Some("单元格编辑中：请先提交（Enter）或取消（Esc）".to_owned());
         }
         None
@@ -4150,7 +4475,7 @@ impl EditorView {
         // - 块已被点选 → 直接删整个源跨度；
         // - 折叠 caret 紧贴对象 → **先选块**（本次按键不删）；
         // - 文本选区跨过对象 → 走普通“删选区”（source 区间已包含完整 Markdown）。
-        if !self.controller.is_editing_object_source() && !self.controller.is_editing_table_cell() {
+        if !self.controller.is_editing_object_source() && !self.is_editing_table_cell() {
             if let Some(line) = self.selected_object_line {
                 if self.controller.object_at_line(line).is_some() {
                     self.delete_object_block(line, cx);
@@ -4601,6 +4926,9 @@ impl EditorView {
         // 单元格选中态同理：正文 caret 动了就不再是“选着某一格”（Enter/F2 的入口
         // 必须跟着可见的高亮走，不能留着一个看不见的目标）。
         self.selected_table_cell = None;
+        // 整行/整列选中同样只属于“点击表格把手”这一种上下文：caret 一动（点正文/
+        // 表格内边距/键盘移动）就清掉，不允许高亮停在一个已经离开的目标上。
+        self.table_axis_selection = None;
         match self.controller.set_selection(selection) {
             Ok(()) => {
                 self.ensure_caret_visible(selection.head());
@@ -4927,12 +5255,56 @@ impl Focusable for EditorView {
 }
 
 impl EditorView {
+    /// 表格单元格原地编辑输入框：浮在**被点 cell 的矩形**上，只覆盖那一格。
+    ///
+    /// 矩形来自 `table_cell_rects()`（与表格绘制/命中共用同一份几何）；表格本身仍是
+    /// Object，所以其它行列在这一帧照常可见。cell 滚出视口时这一帧不画（`bounds=None`），
+    /// 但编辑态不丢，滚回来继续。
+    fn render_table_cell_editor(&mut self, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (line, row, column) = {
+            let state = self.cell_edit.as_ref()?;
+            (state.line, state.row, state.column)
+        };
+        let rect = self
+            .table_cell_rects()
+            .into_iter()
+            .find(|(object_line, r, c, _)| *object_line == line && *r == row && *c == column)
+            .map(|(_, _, _, rect)| rect);
+        let Some(rect) = rect else {
+            if let Some(state) = self.cell_edit.as_mut() {
+                state.bounds = None;
+            }
+            return None;
+        };
+        let origin = self.shared.geometry().map(|geometry| geometry.origin)?;
+        let local_left = (rect.origin.x - origin.x).as_f32();
+        let local_top = (rect.origin.y - origin.y).as_f32();
+        let width = rect.size.width.as_f32();
+        let height = rect.size.height.as_f32();
+        let state = self.cell_edit.as_mut()?;
+        state.bounds = Some(rect);
+        let input = state.input.clone();
+        Some(
+            div()
+                .id("table-cell-editor")
+                .debug_selector(|| "table-cell-editor".to_string())
+                .absolute()
+                .left(px(local_left))
+                .top(px(local_top))
+                .w(px(width))
+                .h(px(height))
+                // 只覆盖这一格：超长文本（或 IME preedit）裁在 cell 内，不压到邻格。
+                .overflow_hidden()
+                .child(input)
+                .into_any_element(),
+        )
+    }
+
     /// 图片放大预览遮罩（点击图片/工具条放大按钮打开；点击任意处关闭）。
-    fn render_image_zoom(
-        &self,
-        image: Arc<gpui::RenderImage>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_image_zoom(&self, zoom: ImageZoom, cx: &mut Context<Self>) -> AnyElement {
+        // 基准框 = 遮罩的 90%；滚轮倍率直接乘在这个比例上（居中 flex 缩放）。
+        // 上限 4.0 时仍是一个有限比例，配合 `overflow_hidden` 裁剪，不会把布局撑爆。
+        let fraction = (0.9 * zoom.scale).clamp(0.1, 4.0);
         div()
             .id("image-zoom-overlay")
             .debug_selector(|| "image-zoom-overlay".to_string())
@@ -4942,6 +5314,9 @@ impl EditorView {
             .items_center()
             .justify_center()
             .bg(gpui::rgba(0x000000cc))
+            .overflow_hidden()
+            // 覆盖层语义：滚轮/点击都不许漏给下面的编辑器。
+            .occlude()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
                 if event.keystroke.key == "escape" {
@@ -4955,17 +5330,22 @@ impl EditorView {
                     view.close_object_zoom(cx);
                 }),
             )
+            .on_scroll(cx.listener(|view, event: &gpui::ScrollEvent, _window, cx| {
+                let delta_y = event.delta.pixel_delta(px(20.0)).y.as_f32();
+                view.zoom_image_by(delta_y, cx);
+                // **阻断穿透**：遮罩是模态预览，滚轮只缩放图片；底层编辑器不得滚动。
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .id("image-zoom-image")
                     .debug_selector(|| "image-zoom-image".to_string())
-                    .max_w(gpui::relative(0.9))
-                    .max_h(gpui::relative(0.9))
+                    .w(gpui::relative(fraction))
+                    .h(gpui::relative(fraction))
                     .child(
-                        img(ImageSource::Render(image))
+                        img(ImageSource::Render(zoom.image))
                             .object_fit(ObjectFit::Contain)
-                            .max_w(gpui::relative(0.9))
-                            .max_h(gpui::relative(0.9)),
+                            .size_full(),
                     ),
             )
             .into_any_element()
@@ -5006,6 +5386,29 @@ impl EditorView {
                 TableDragAxis::Column => "column",
                 TableDragAxis::Row => "row",
             };
+            // 选中反馈的一部分：被选中的行/列，其把手换成强调色（普通把手仍是灰色）。
+            let axis_selected = self.table_axis_selection.is_some_and(|selection| {
+                selection.line == line && selection.axis == axis && selection.index == index
+            });
+            // 正在拖的就是这个把手 → 抓取中的指针状态。
+            let dragging_this = self
+                .table_drag
+                .is_some_and(|drag| drag.line == line && drag.axis == axis && drag.from == index);
+            let background = if axis_selected {
+                theme::table_drag_handle_selected_bg()
+            } else {
+                theme::table_drag_handle_bg()
+            };
+            let hover_background = if axis_selected {
+                theme::table_drag_handle_selected_bg()
+            } else {
+                theme::table_drag_handle_hover_bg()
+            };
+            let cursor = if dragging_this {
+                CursorStyle::ClosedHand
+            } else {
+                CursorStyle::OpenHand
+            };
             let selector = format!("table-drag-{axis_name}-{index}");
             let element_id = SharedString::from(format!("{selector}-{line}"));
             elements.push(
@@ -5018,16 +5421,16 @@ impl EditorView {
                     .w(px(width))
                     .h(px(height))
                     .rounded(px(3.0))
-                    .bg(theme::table_drag_handle_bg())
-                    .hover(|style| style.bg(theme::table_drag_handle_hover_bg()))
+                    .bg(background)
+                    .hover(move |style| style.bg(hover_background))
                     // 抓取手势的指针（gpui 原生：命中链变化时自动切换）。
-                    .cursor(CursorStyle::OpenHand)
+                    .cursor(cursor)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |view, _event: &MouseDownEvent, window, cx| {
+                        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
                             // 把键盘焦点留在正文：拖拽中按 Esc 取消要靠编辑器的 key down。
                             window.focus(&view.focus_handle, cx);
-                            view.begin_table_drag(line, axis, index, cx);
+                            view.begin_table_drag(line, axis, index, event.position, cx);
                         }),
                     )
                     .into_any_element(),
@@ -5056,6 +5459,101 @@ impl EditorView {
                 .h(px(rect.size.height.as_f32()))
                 .rounded(px(1.0))
                 .bg(theme::table_drag_indicator())
+                .into_any_element(),
+        )
+    }
+
+    /// 拖动中的整行/整列 ghost + “移动第 N 列/行”浮层（ADR 0019 S3b6）。
+    ///
+    /// ghost = 被拖项矩形按 `position - press` 平移（几何见 [`Self::table_drag_ghost_rect`]），
+    /// 半透明填充 + 强调色边框；旁边跟着一条深色文案浮层，告诉用户“正在拖第几列/行、
+    /// 将落到第几列/行”。两个 div **都没有鼠标监听 / hitbox**：绝不拦截鼠标、不改 caret，
+    /// 也没有 `cursor`/`hover`，纯绘制；拖出表格 / `Esc` 取消时状态清空 → 一起消失。
+    ///
+    /// debug selector：预览条 `table-drag-ghost`、文案 `table-drag-ghost-label`。
+    fn render_table_drag_ghost(&self) -> Vec<AnyElement> {
+        let Some(geometry) = self.shared.geometry() else {
+            return Vec::new();
+        };
+        let Some(rect) = self.table_drag_ghost_rect() else {
+            return Vec::new();
+        };
+        let Some(text) = self.table_drag_ghost_label() else {
+            return Vec::new();
+        };
+        let Some(drag) = self.table_drag else {
+            return Vec::new();
+        };
+        let local_left = (rect.origin.x - geometry.origin.x).as_f32();
+        let local_top = (rect.origin.y - geometry.origin.y).as_f32();
+        let body = div()
+            .id("table-drag-ghost")
+            .debug_selector(|| "table-drag-ghost".to_string())
+            .absolute()
+            .left(px(local_left))
+            .top(px(local_top))
+            .w(px(rect.size.width.as_f32()))
+            .h(px(rect.size.height.as_f32()))
+            .rounded(px(4.0))
+            .border(px(theme::TABLE_DRAG_GHOST_BORDER))
+            .border_color(theme::table_drag_ghost_border())
+            .bg(theme::table_drag_ghost_bg())
+            .into_any_element();
+        // 文案贴着指针（窗口坐标 → 元素局部坐标），不挡被拖项本身；靠近编辑区
+        // 右/下边缘时夹住，避免浮层画到状态栏/宿主 UI 上（尺寸取保守上限）。
+        let (viewport_width, viewport_height) = self.shared.viewport();
+        let label_left = ((drag.position.x - geometry.origin.x).as_f32()
+            + theme::TABLE_DRAG_GHOST_LABEL_OFFSET_X)
+            .clamp(
+                0.0,
+                (viewport_width - theme::TABLE_DRAG_GHOST_LABEL_MAX_WIDTH).max(0.0),
+            );
+        let label_top = ((drag.position.y - geometry.origin.y).as_f32()
+            + theme::TABLE_DRAG_GHOST_LABEL_OFFSET_Y)
+            .clamp(
+                0.0,
+                (viewport_height - theme::TABLE_DRAG_GHOST_LABEL_HEIGHT).max(0.0),
+            );
+        let label = div()
+            .id("table-drag-ghost-label")
+            .debug_selector(|| "table-drag-ghost-label".to_string())
+            .absolute()
+            .left(px(label_left))
+            .top(px(label_top))
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(theme::table_drag_ghost_label_bg())
+            .text_color(theme::table_drag_ghost_label_text())
+            .text_size(px(12.0))
+            .line_height(px(16.0))
+            .child(SharedString::from(text))
+            .into_any_element();
+        vec![body, label]
+    }
+
+    /// 整行/整列选中的高亮（ADR 0019 S3b6；debug selector `table-axis-selection`）。
+    ///
+    /// 低透明度填充 + 2px 强调色边框：画在表格之上（文字仍然透出来），因此**不会**
+    /// 被单元格选中描边盖住（点单元格会先清除轴选中，两者不叠加）。几何来自本帧
+    /// `TablePaint`（[`Self::table_axis_selection_rect`]），不另算坐标。
+    fn render_table_axis_selection(&self) -> Option<AnyElement> {
+        let geometry = self.shared.geometry()?;
+        let rect = self.table_axis_selection_rect()?;
+        let local_left = (rect.origin.x - geometry.origin.x).as_f32();
+        let local_top = (rect.origin.y - geometry.origin.y).as_f32();
+        Some(
+            div()
+                .id("table-axis-selection")
+                .debug_selector(|| "table-axis-selection".to_string())
+                .absolute()
+                .left(px(local_left))
+                .top(px(local_top))
+                .w(px(rect.size.width.as_f32()))
+                .h(px(rect.size.height.as_f32()))
+                .border(px(theme::TABLE_AXIS_SELECTION_BORDER))
+                .border_color(theme::table_axis_selection_border())
+                .bg(theme::table_axis_selection_bg())
                 .into_any_element(),
         )
     }
@@ -5473,6 +5971,21 @@ impl Render for EditorView {
             // 比在 render 里直接 `window.focus` 更稳（首帧就能收到方向键）。
             cx.focus_self(window);
         }
+        // 浮层是独立实体：焦点在下一帧补（事件回调里没有 `&mut Window`）。
+        // 关闭浮层后把焦点还给正文，否则键盘会继续落到已销毁的输入框上。
+        if self.cell_edit.is_some() {
+            self.pending_focus_editor = false;
+            if self.pending_cell_focus {
+                self.pending_cell_focus = false;
+                if let Some(state) = self.cell_edit.as_ref() {
+                    let input = state.input.clone();
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                }
+            }
+        } else if self.pending_focus_editor {
+            self.pending_focus_editor = false;
+            window.focus(&self.focus_handle, cx);
+        }
 
         let status = SharedString::from(self.status_text());
         // 每帧请求加载当前文档的图片（幂等；解码完成由 pump 触发重绘）。
@@ -5483,6 +5996,8 @@ impl Render for EditorView {
         self.table_actions_rect = None;
         self.context_menu_rect = None;
         self.table_handle_rects.clear();
+        // 单元格原地编辑输入框：浮在 cell 矩形上，绘制在正文之上、其它浮层之下。
+        let cell_editor = self.render_table_cell_editor(cx);
         let toolbar = self.render_object_toolbar(cx);
         let table_actions = self.render_table_actions(cx);
         let context_menu = self.render_context_menu(cx);
@@ -5490,6 +6005,10 @@ impl Render for EditorView {
         // 悬浮工具条与浮层之下（后者更靠近边缘，不能被把手压住）。
         let drag_handles = self.render_table_drag_handles(cx);
         let drop_indicator = self.render_table_drop_indicator();
+        // 整行/整列选中高亮 + 拖拽 ghost（ADR 0019 S3b6）：选中在正文之上、输入框之下；
+        // ghost 跟着指针、在把手/指示线之上、工具条之下（都不拦截鼠标）。
+        let axis_selection = self.render_table_axis_selection();
+        let drag_ghost = self.render_table_drag_ghost();
         let element = EditorElement::new(cx.entity(), Rc::clone(&self.shared));
 
         div()
@@ -5525,8 +6044,11 @@ impl Render for EditorView {
                         }),
                     )
                     .child(element)
+                    .when_some(axis_selection, |this, selection| this.child(selection))
+                    .when_some(cell_editor, |this, editor| this.child(editor))
                     .children(drag_handles)
                     .when_some(drop_indicator, |this, indicator| this.child(indicator))
+                    .children(drag_ghost)
                     .when_some(toolbar, |this, toolbar| this.child(toolbar))
                     .when_some(table_actions, |this, actions| this.child(actions))
                     .when_some(context_menu, |this, menu| this.child(menu)),
@@ -5565,6 +6087,14 @@ const fn table_drag_axis_label(axis: TableDragAxis) -> &'static str {
     match axis {
         TableDragAxis::Column => "列重排",
         TableDragAxis::Row => "行重排",
+    }
+}
+
+/// 表格拖拽轴的中文单位（“第 N 列/行”文案与日志用）。
+const fn table_axis_unit(axis: TableDragAxis) -> &'static str {
+    match axis {
+        TableDragAxis::Column => "列",
+        TableDragAxis::Row => "行",
     }
 }
 

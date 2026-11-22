@@ -3,7 +3,9 @@
 > 2026-11-16 记录。**L1 已实现**（2026-11-17）：`[[...]]` 解析/投影/点击/
 > 未解析灰色样式；**L2a 已实现**（2026-11-17）：links 物化 + 反向链接面板；
 > **L2b 已实现**（2026-11-17）：笔记重命名联动改写解析到该笔记的 wiki 链接；
-> 图谱仍未做。
+> **G0 + G1 已实现**（2026-11-17）：`GraphModel` 纯模型 + 全库 canvas 图谱覆盖层
+> （侧栏「图谱」→ 全屏覆盖层；平移/缩放/悬停高亮/点节点打开笔记）。细节见下节
+> 「G0+G1 已实现」。
 > 图谱是 `links` 表的派生视图，不改同步协议、不改 schema。
 
 ## L1 已实现（2026-11-17）
@@ -110,6 +112,99 @@
 - 失败注入：某篇写入失败时结构已改、该篇可重试、其余篇不回滚；
 - 远端并发编辑合并后 `links` 与正文一致。
 
+## G0+G1 已实现（2026-11-17）
+
+写作用域：`crates/app/src/graph.rs`（新）、`crates/app/src/shell.rs`（覆盖层与入口）、
+`crates/app/src/editor/theme.rs`（配色）、`crates/app/tests/headless_graph.rs`（新）。
+**没动** `crates/storage`/`editor`/`markdown`/`sync`，没加依赖，没改 schema。
+
+### 模型口径（`crates/app/src/graph.rs`，测试钉住）
+
+- 节点 = 未删除笔记：`tree t JOIN notes n ON n.note_id=t.note_id
+  WHERE t.deleted=0 AND n.deleted=0`（`vault.query` 直读，不新增 storage API）；
+- 边 = `links WHERE kind='wiki' AND to_note_id IS NOT NULL`；
+- **自环排除并计数**：`[[#标题]]` 解析到自己 → `self_links`，不成边、不进度数；
+- **未解析不画边**：`to_note_id IS NULL` → `unresolved_links`（只统计）；
+- **悬空只统计**：`to_note_id` 指向已删除/不存在的笔记 → `dangling_links`；
+  来源已删除的 `links` 行整行跳过（不参与任何统计）；
+- **去重 + 权重**：同一对 `(from, to)` 的多条链接合并成一条 `GraphEdge`，
+  `weight` = 条数；`A→B` 与 `B→A` 是两条不同的边；
+- 节点字段：`note_id/node_id/title/path/folder/depth/in_degree/out_degree/pos`；
+  `path` 按结构树父链拼（`文件夹/子文件夹/标题`），`folder` 取顶层文件夹（根级空串）；
+- 顺序固定：`(folder, path, title, note_id)` 升序；边按 `(from, to)` 升序；
+  邻接表升序——同一输入两次构建结果逐字节一致（输入行顺序也不影响）；
+- **确定性布局**：排序后铺在圆周上（第 i 个节点角度 = `-π/2 + 2π·i/n`，
+  半径 = `max(96, n·76/2π)`，单节点在原点）——无随机、无时钟、不落库；
+- **上限**：`max_nodes = 800` / `max_edges = 3000`（`GraphLimits::default()`）；
+  节点取排序后的前 N 个（前缀），边取 `(from, to)` 最小的前 M 条；
+  截断时 `truncation` 给出"整库总数 / 实显数"，头部提示写清楚；
+  度数只用保留下来的边算（画面与数字一致）；
+- 只计算榜：`unresolved_links / self_links / dangling_links` 都是统计，不进画面。
+
+### 视口（绘制/命中/测试共用）
+
+`GraphViewport { pan, zoom }`：`screen = 视口中心 + pan + model·zoom`。
+
+- `screen_pos` / `model_pos` 互为逆运算；**绘制节点、画边、命中、headless 断言
+  全走它**，没有第二份几何；
+- 缩放缓动有界 `0.2–3.0`；`zoom_by(factor, anchor, viewport)` 保持锚点下的
+  模型坐标不动（滚轮缩放围绕鼠标）；缩放为 0 不会出现（除零防护）；
+- `fit_to` 自适应：`usable = min(w,h) - 2·72`，`zoom = usable/(2·半径)`，
+  夹进 `0.2–3.0`；空图/单节点（半径≈0）取 `zoom = 1`，不 panic；
+- `hit_test`：屏幕点到节点圆心的距离 ≤ `节点半径 + 4px`，后画的节点优先（重叠时上层胜）。
+
+### App 视图
+
+- 入口：侧栏底部「图谱」按钮（`sidebar-graph`），位于 `AppRoot` 的「⚙ 设置」
+  （绝对定位 `bottom: 30`）**正上方**；dev-sync 构建预留 40px 底部留白，两个入口不重叠；
+- 覆盖层：全屏 `absolute inset_0`（不挤压编辑器）——半透明底 + 舞台 `graph-canvas`
+  （`occlude()`：挡住下层编辑器的鼠标命中，点图谱不会误移 caret）；
+- 自绘：边用 `gpui::canvas` + `PathBuilder::stroke` + `window.paint_path` 画；
+  节点 = 绝对定位圆点（`rounded_full`）+ 固定宽度单行省略标签（无 hitbox，
+  命中统一由舞台的 `hit_test` 决定）；
+- 交互：拖拽平移（>4px 才算拖拽，抬手不算点击）、滚轮缩放（围绕鼠标、有界）、
+  悬停高亮节点 + 邻居（其余压暗）、点节点打开笔记（按 `note_id` 找 tree 行 →
+  关覆盖层 → 复用 `open_entry`）、点空白（遮罩）关闭、`Esc` 关闭、「关闭」按钮关闭、
+  「复位」按钮重新自适应；
+- 焦点：打开时抢到覆盖层（Esc 生效），关闭时还给当前编辑器——编辑器文档/滚动/
+  撤销状态原样保留（覆盖层只挂渲染层，不重建 `EditorView`）；
+- 头部统计行：`节点 N · 边 M · 未解析 K`（+ `自环/悬空`，+ 超上限时
+  `只画前 X 个节点 / Y 条边（整库 A / B）`）。
+
+### 性能与已知限制（首版）
+
+- 模型在**打开时**同步构建一次（只读 SQL + O(n log n) 排序 + O(E) 去重），
+  800 节点/3000 边量级是毫秒级；关闭即丢弃，不缓存、不落库（G3 再做）；
+- 每帧重建节点层（≤800 个圆点 + 标签）与边（视口裁剪后绘制）；悬停变化才重绘，
+  但窗口缩放/其它状态通知也会重绘——大库交互的实测与优化属于 G3；
+- **不做**局部 depth/过滤/搜索/LOD/力导向/拖拽改结构（G2/G3）；标签在低缩放时
+  可能互相压住（固定 11px、不随缩放），节点重叠时命中取上层；
+- 平移不设边界（可把图拖出视口，用「复位」找回）；缩放不重排（位置固定）；
+- 布局只在打开时算一次：窗口放大/缩小后不重新自适应（节点仍按新视口居中）；
+- 图谱不写库：不改 `links`、不建笔记、不做未解析占位节点。
+
+### 回归测试
+
+- `crates/app/src/graph.rs` 单测 15 个（纯模型，不建库）：空图/单节点/环/多边去重
+  加权/自环排除/未解析+悬空统计/已删来源忽略/确定性布局与输入顺序无关/
+  path-folder-depth/上限截断/命中与绘制一致/缩放下界与锚点/平移/滚轮因子有界/
+  空模型不 panic；
+- `crates/app/tests/headless_graph.rs` 8 个（真实 `AppShell` + 临时 vault，
+  `CARGO_TARGET_TMPDIR`，无 sleep）：打开→Esc 关闭（编辑器状态不变）、
+  点节点打开笔记并关闭、空图占位 + 点遮罩关闭、拖拽只平移不关闭 / 点空白关闭、
+  「复位」「关闭」按钮、悬停高亮 + 缩放夹在 0.2–3.0（缩放后圆心仍命中）、
+  未解析/自环只统计不画边、窗口尺寸变化后覆盖层尺寸跟手（命中坐标仍有限）；
+- 命令：`cargo test -p menghunote-app`（默认 265 passed）、`--features dev-sync`
+  （496 passed）；`cargo clippy -p menghunote-app --lib/--test headless_graph
+  --features dev-sync -- -D warnings` 干净。
+
+### 后续（G2/G3）
+
+- 局部图（depth 1–3）、按文件夹/标签/未解析过滤、搜索定位、LOD、方向箭头；
+- 大库性能（后台布局/主线程只读位置）、布局缓存（本地表或文件，另议）、
+  暗色/DPI 验收；
+- 待定问题 1–5 仍未拍板（默认全库图已按"临时约定"落地，G2 再定默认视图）。
+
 ## 图谱目标
 
 ### 数据
@@ -138,8 +233,8 @@
 
 ### 切片
 
-- **G0**：`GraphModel`（节点/边/度数/过滤）+ 纯单元测试（含 unresolved、孤立、环）；
-- **G1**：全库 canvas + 确定性布局 + 点击打开 + 悬停高亮 + 平移缩放；
+- **G0** ✅（2026-11-17）：`GraphModel`（节点/边/度数/过滤）+ 纯单元测试（含 unresolved、孤立、环）；
+- **G1** ✅（2026-11-17）：全库 canvas + 确定性布局 + 点击打开 + 悬停高亮 + 平移缩放；
 - **G2**：局部图 depth、过滤（文件夹/标签/未解析）、搜索定位、LOD；
 - **G3**：大库性能、后台布局、布局缓存（本地表/文件另议）、暗色/DPI 验收。
 

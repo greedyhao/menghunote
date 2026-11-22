@@ -3,6 +3,7 @@
 //! 本 crate 是**唯一允许依赖 GPUI** 的层：
 //!
 //! - [`editor`]：单 `Element` 的源码视图（软折行绘制、命中、选区、滚动）；
+//! - [`mermaid`]：Mermaid 源码 → SVG 字符串（M1 渲染底座；不含编辑器预览/缓存）；
 //! - [`dev_vault`]：开发用 vault 的路径约定与演示笔记播种；
 //! - `dev_sync`（仅 `dev-sync` feature）：dev-only 同步面板与串行 worker（ADR 0009）；
 //! - [`platform`]：平台小工具（目前只有 Windows DPI 感知的读回校验）。
@@ -25,6 +26,13 @@ pub mod attachment;
 pub mod dev_sync;
 pub mod editor;
 pub mod export;
+// Wiki 关系图谱（ADR 0019 backlog `backlog-wiki-links-graph.md` 的 G0+G1）：
+// **纯模型 + 视口数学**，只读 `tree`/`notes`/`links`，不改 schema、不参与同步。
+// 默认构建也编进来：图谱不依赖 dev-sync。
+pub mod graph;
+// Mermaid 渲染底座（M1，ADR 0019 §15）：纯函数 `render_svg`，不接编辑器、不做缓存；
+// 依赖 `merman` 精确 pin（见 crates/app/Cargo.toml）。M2 才接 Object Block 预览。
+pub mod mermaid;
 // relay 模式/URL 的构建期能力闸（ADR 0013 §1）：`sync` feature 下存在；
 // 只有 `dev-sync` 构建才把 `local_dev` 视为可接受模式。
 #[cfg(feature = "sync")]

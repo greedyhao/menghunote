@@ -2,7 +2,9 @@
 
 > 2026-11-16 记录。**外部链接基础打开已实现（2026-11-17）**：普通 `[text](url)` 单击
 > 打开 http/https/mailto，悬停手形；Ctrl+单击/右键菜单/Zotero/file 确认尚未做。
-> Mermaid 仍未实现、未加依赖。
+> **Mermaid M1 渲染底座已完成（2026-11-17）**：`merman =0.10.0` + 纯
+> `render_svg` + 资源上限/panic 兜底/SVG 校验 + 11 个单测；**M2（编辑器预览/源码切换）
+> 未做**，编辑器行为零变化。详见 ADR 0019 §15 与本文件 §2 的状态。
 
 ## 1. 外部链接打开（含 Zotero）
 
@@ -41,45 +43,57 @@
 
 ## 2. Mermaid 渲染
 
-### 候选依赖（2026-11-16 更新：优先 Merman）
+### M1 状态（2026-11-17，已完成）
 
-- **首选 `merman = "=0.10.0"`**，`default-features = false`：
-  - `features = ["all-diagrams", "complete-svg"]`（全图 + SVG + layout-cytoscape，
-    避开默认的 `layout-elk`/EPL 组件；实际编译时再按需收窄）；
-  - 纯 Rust，无 Node/Chromium/WebView；官方对齐 Mermaid 12.3，Zed 已采用；
-  - Rust 1.95+，当前工具链满足；MIT/Apache-2.0；
-  - API：`Renderer::new().render(RenderRequest::svg(source, OperationControl::new(), SvgRequest::default()))`
-    → `RenderOutput::Svg(Some(svg))` → `svg.svg()` 字符串；
-  - GPUI 用 `ImageFormat::Svg` 显示，和之前方案相同。
-- 备选 `mermaid-rs-renderer = "=0.3.1"`（default-features=false，更轻、23 图），
-  但成熟度/对齐度不如 Merman；只在 Merman 集成受阻时回退。
-- 不引 Node/Chromium/WebView，不走远程渲染服务。
+- 依赖：`crates/app/Cargo.toml` 增加
+  `merman = { version = "=0.10.0", default-features = false, features = ["all-diagrams", "complete-svg"] }`
+  （精确 pin；`complete-svg` = `svg` + `layout-cytoscape`，**不启用** EPL 的 `layout-elk`）。
+  该组合一次编译通过，无需再收窄；无 Node/WebView/远程渲染。
+- 模块：`crates/app/src/mermaid.rs`（新文件，未动 editor 现有 view/element/geometry/
+  controller/markdown）。公开 API：
+  - `render_svg(source) -> Result<String, MermaidError>`（同步纯函数，可后台线程调用）；
+  - `MAX_MERMAID_SOURCE_BYTES` = 256 KiB、`MAX_MERMAID_SVG_BYTES` = 8 MiB；
+  - `MermaidError::{Empty, TooLarge, Render, Panic, InvalidSvg}`（merman 把“没有图”
+    也报成解析错误，因此统一落在 `Render`）；
+  - 源码超限在进渲染器前拒绝；SVG 超限同时写进 merman 的 `max_svg_bytes` 与返回后复核；
+  - 解析/渲染包 `catch_unwind`；输出必须以 `<svg` 根元素开头且含 `</svg>`；
+  - 确定性：`SvgEnvironment::deterministic()`（不读系统字体）+ 每次新建 `Renderer`，
+    同输入字节级一致。
+- 测试：模块内 11 个单测（flowchart/sequence 成功、空/非图/截断语法、源码与输出超限、
+  SVG 形状校验、重复与跨线程确定性、panic 兜底）；文档示例写成 `text` 块
+  （本机 app doctest 链接缺 `zed_font_kit` rlib，是环境限制）。
+- **失败回退**：任何错误都由调用方显示原始 fenced code + 失败状态，不写回正文；
+  M1 不做超时/子进程隔离（M3）。
 
-### 交互
+### M2（未做，编辑器预览）
 
-- ` ```mermaid ` fenced code 仍是源码真源；
-- 渲染块是 Object Block：单击/选中只选块，**不直接展开源码**（Obsidian 式）；
-- 悬浮工具条：「编辑源码」「重新渲染」「复制源码」；点「编辑」/F2 才进入源码模式，
-  Esc/点击块外/Ctrl+Enter 退出；
-- 失败/渲染中显示状态，不阻塞编辑；
+- 把 ` ```mermaid ` fenced code 识别成 Object Block：单击/选中只选块，不直接展开源码；
+- 悬浮工具条「编辑源码」「重新渲染」「复制源码」；点「编辑」/F2 进入源码模式，
+  Esc/点击块外/Ctrl+Enter 退出并提交；失败/渲染中显示状态，不阻塞编辑；
 - 缓存 key = hash(source + crate 版本 + 主题 + 缩放)，LRU，不同步；
-- Markdown 导出保留 fenced code；HTML/PDF 导出再接渲染器。
+- 渲染调用放后台线程或 `cx.spawn`，主线程只读结果（M1 的 API 已可跨线程调用）。
 
-### 风险
+### M3（未做）
 
-- 0.3.x 仍是早期项目，视觉质量可能不完全等同 mermaid-cli；必须保留源码回退；
-- 不可信 Mermaid 输入可能 panic/超时/OOM：输入/节点上限、`catch_unwind`、后台线程；
-  更稳的是独立 helper 子进程 + 超时/资源限制；
-- 新依赖需 pin 版本、依赖评审、黄金图测试；Merman 的 Mermaid 12.3 对齐不等于逐像素一致，仍需样本回归；
-- 暗色主题、CJK 字体、导出、SVG 安全校验后续处理。
+- 暗色主题、CJK 字体、SVG 导出/HTML/PDF 导出、缓存失效；
+- 独立 helper 子进程 + 超时/资源限制（比 `catch_unwind` 更稳的隔离）；
+- 黄金图/样本回归（Merman 对齐 Mermaid 12.3 ≠ 逐像素一致）。
 
-### 切片（未排期）
+### 早期候选与风险评估（历史，2026-11-16）
 
-- M1：Merman 依赖 pin + SVG 渲染封装 + 黄金/失败回退测试；
-- M2：fenced code 预览/源码切换 + 缓存；
-- M3：暗色/导出/子进程隔离。
+- 首选 `merman = "=0.10.0"`（已采用）：纯 Rust，无 Node/Chromium/WebView；官方对齐
+  Mermaid 12.3，Zed 已采用；Rust 1.95+；MIT/Apache-2.0；
+  API 即 `Renderer::new().render(RenderRequest::svg(...))` / `render_svg_data`。
+- 备选 `mermaid-rs-renderer = "=0.3.1"`（default-features=false，更轻、23 图），
+  成熟度/对齐度不如 Merman；未采用。
+- 风险（仍成立）：不可信输入可能 panic/超时/OOM，M1 已做输入/输出上限 +
+  `catch_unwind`，仍保留“源码回退”；暗色主题/CJK/导出/SVG 安全校验留给 M2/M3。
+
 
 ## 优先级
 
 这两项排在当前 **S1 解析/列表 → S2 粘贴/图片 → S3 表格/任务/GC** 之后；
 外部链接优先于 Mermaid（成本低、日常影响大）。实施前分别补 ADR。
+
+**2026-11-17 更新**：外部链接基础打开与 Mermaid M1 渲染底座均已落地；
+下一步是 Mermaid M2（编辑器预览）与外部链接的 Ctrl+单击/右键/Zotero。

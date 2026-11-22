@@ -725,6 +725,10 @@
 
 ## 12. S3b2 实施记录（2026-11-17，表格单元格选择与就地编辑）
 
+> **2026-11-17 交互修正（用户实测反馈）**：编辑态不再把整表投影成一行 cell 文本；
+> **单击单元格直接进入原地浮层编辑**。当前实现以 §12.6 为准，§12.1–§12.5 保留为
+> 当时（控制器内 cell 编辑态）的实现记录。
+
 > 范围：**单击选中单元格 / 再次单击（或双击 / Enter / F2）进入该 cell 的就地编辑 /
 > Enter 提交 / Tab 下一格 / Esc 取消 / 点击 cell 外提交**。表格源码仍是唯一真源。
 > 明确**未做**：行列删除、行列拖拽重排、合并单元格、嵌套表格、表格内图片、表格排序、
@@ -843,6 +847,44 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
     选中/编辑它；跨格连续输入请用 `Tab`；
   - `\|` 在编辑态按**源码**显示（`|` 的转义形态），只读态仍显示为 `|`；
   - 表格源码被改坏（表格/该格消失）时自动退出编辑，不猜新坐标。
+
+### 12.6 交互修正：cell 矩形上的原地浮层编辑（2026-11-17）
+
+> 触发：用户实测反馈「表格编辑时其它行列必须仍然可见；单击单元格直接编辑，不要 F2」。
+> 结论：§12.1 的“display 只显示该 cell 文本”交互**废弃**（控制器内的 cell 编辑态/
+> 投影显现仍保留在 `menghunote-editor` 并继续由纯模型测试钉住，但 app 不再使用）。
+
+- **状态**：`EditorView` 持 `CellEditOverlay { line, row, column, input, draft }`；
+  `input` 就是侧栏重命名复用的 `RenameInput`（新增 `RenameMode::Cell` 与
+  `RenameState::at_end`：光标在末尾、Enter 提交原始文本、Tab/Shift+Tab 发
+  `Advance{forward,text}`、`Ctrl+V` 走平台剪贴板、F9 模拟 IME 上屏）。
+  **没有第二套 IME 实现**；Title 模式的侧栏行为逐字不变。
+- **绘制**：表格始终是完整 Object（`table_paint` 照常画表头/所有数据行/网格线），
+  输入框是一个绝对定位 div，矩形 = 被点 cell 的 `TableCellPaint.rect`（与
+  `table_cell_rects()` 同源），只覆盖这一格；超长文本/IME preedit 在 cell 内裁剪。
+- **单击 / 双击**：`click_table_cell` 直接 `begin_table_cell_edit`，不再要求先选中、
+  也不需要 F2；`F2` 现在只表示**整表源码模式**（有图片对象时仍是图片源码）。
+- **提交**：新增 `EditorController::replace_table_cell_text(line,row,column,text)`：
+  一次调用 = 一条 `ScalarEdit`（替换整个 cell 源码区间）+ 一个撤销组；文本先经
+  `sanitize_cell_text`（换行→空格、未转义 `|`→`\|`）；与当前源码相同 → `Ok(None)`
+  （不发空 op）；caret 提交后落到整表末尾。编辑期间正文源码**一个字节都不提前改**。
+- **取消/点外/切格**：`Esc` 丢弃浮层草稿（零请求，无 undo 垃圾）；点击浮层外先提交，
+  再继续按正常命中处理（点另一格 = 提交并直接开始编辑新格；点正文 = 落 caret）。
+  `Tab` 提交后按最新表格行列进入下一格，末格退出。
+- **结构闸门**：编辑期间整表工具条、加行/加列/删除浮层、行列拖拽把手全部隐藏
+  （按钮路径同时 API 级拒绝）；`drain_and_close` 用浮层里最近一次的 `draft` 提交，
+  持闸中则丢弃草稿。
+- **坐标简化**：因为表格不再被压成一行文本，提交前后 display 长度/布局不变，
+  点击位置不需要再做 “cell 文本 ↔ 占位符” 的字节换算。
+- **滚轮（同轮反馈）**：图片放大遮罩 `on_scroll` 以 0.5–4.0 有界倍率缩放并
+  `stop_propagation()`；图谱覆盖层 `.on_scroll` 缩放后同样 `stop_propagation()`，
+  底层 `EditorView` 的窗口级滚动监听不再收到这两类滚轮事件。
+- **测试**：`headless_table_cell.rs` 11 个用例（单击即编辑 + 整表仍绘制/输入框 bounds
+  在 cell 内、输入/Enter 单请求单撤销、Esc 零请求、点外提交、直接点另一格切格、
+  Tab/双击、IME(F9)+退格+多行粘贴、加行加列新格、持久化重开、空串清格、`|` 转义、
+  Enter 不破结构）；`headless_images.rs` 新增滚轮缩放/阻断穿透/上下界用例；
+  `headless_graph.rs` 新增“图谱滚轮不滚动底层编辑器”用例；其余表格拖拽/加删/任务/
+  图片/图谱用例全部保留并按新交互调整入口（编辑期先 `Esc` 再点浮层）。
 
 ## 13. S3b3 实施记录（2026-11-17，表格删除行 / 删除列）
 
@@ -1005,6 +1047,91 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 - 未做真机像素验收：菜单观感/阴影/DPI、真实鼠标右键在 Windows 上的行为仍需
   `ui_smoke.ps1`；本环境只证明“右键 → 菜单 → 一次 `EditRequest` → 源码/undo/Object”。
 
+## 15. M1 实施记录（2026-11-17，Mermaid 渲染底座）
+
+> 范围：**依赖 pin + 纯 SVG 渲染封装 + 资源上限/panic 兜底/SVG 形状校验 + 单测 + 文档**。
+> 明确**未做**：编辑器里的 fenced `mermaid` 识别、Object Block 投影、源码切换/工具条、
+> 缓存、暗色主题、导出、子进程隔离（那是 M2/M3；见 [`docs/notes/editor-backlog-links-mermaid.md`](../notes/editor-backlog-links-mermaid.md)）。
+> 本切片没有改任何 editor 现有文件（`view.rs`/`element.rs`/`geometry.rs`/`controller.rs`/
+> `markdown.rs`），只新增 `crates/app/src/mermaid.rs` + 模块声明 + 依赖 + 文档。
+
+### 15.1 依赖与特性（精确 pin）
+
+- `crates/app/Cargo.toml`：`merman = "=0.10.0"`，`default-features = false`，
+  `features = ["all-diagrams", "complete-svg"]`。
+- `all-diagrams`：解析并渲染 Mermaid 12.3 的全部内置图族；M1 不做按图族裁剪。
+- `complete-svg` = `svg` + `layout-cytoscape`；**不启用**默认特性里的 `layout-elk`
+  （ELK 是 EPL-2.0 组件、体积也大）。显式要求 ELK 布局的图不保证渲染结果
+  （本切片只保证 Cytoscape/内置布局的图）。
+- 无 Node / Chromium / WebView / 远程渲染；`SvgEnvironment::deterministic()` 固定文本
+  度量（不读系统字体），同一输入在同一 crate 版本上输出字节级一致。
+- 实际编译：该 feature 组合**一次通过**，无需再收窄；`Cargo.lock` 新增 **42** 个包
+  （merman / merman-core/model/render/theme-contract/markup、dugong、cssparser、
+  quick-xml 等；`phf_codegen` 有两个版本，所以 `+name` 记录是 43 条）。merman 的
+  `analysis`/`ascii`/`editor` 包出现在 lock 里是 optional 依赖记录，**不在实际编译图**
+  （`cargo tree -i` 为空）；ELK 根本没进 lock。
+- 许可证：merman 及其渲染后端 MIT/Apache-2.0；未引入 EPL 的 ELK。传递依赖里
+  `cssparser`/`dtoa-short` 是 MPL-2.0（文件级 copyleft，不是 GPL/AGPL），其余为
+  MIT/Apache-2.0/BSD 系；无 GPL/AGPL。
+
+> 注：`crates/app/Cargo.toml` 在基线 blob 里是 CRLF（`git ls-files --eol` =
+> `i/crlf`，与 `.gitattributes` 的 `eol=lf` 不一致）。按 LF 写回后 `git diff` 会把
+> 整个文件显示成改写，**语义改动只有新增 `merman` 的 12 行**；
+> `git diff --ignore-cr-at-eol` 可核对。
+
+### 15.2 API（`menghunote-app::mermaid`）
+
+- `pub fn render_svg(source: &str) -> Result<String, MermaidError>`：同步纯函数；
+  每次调用新建 `Renderer`，无跨调用全局状态，可在当前线程或后台线程调用（M1 不替
+  调用方选线程）。
+- `MAX_MERMAID_SOURCE_BYTES = 256 KiB`、`MAX_MERMAID_SVG_BYTES = 8 MiB`。
+- `MermaidError::{Empty, TooLarge { what: MermaidLimit, actual, limit }, Render(String),
+  Panic(String), InvalidSvg(String)}`；实现 `Display` + `std::error::Error`。
+  merman 0.10 把“没有图类型”也报成解析错误（`No Mermaid diagram type detected`），
+  因此统一落在 `Render`，不额外造一个实际不可达的 `NoDiagram` 变体。
+- `MermaidLimit::{Source, Svg}`：区分超的是哪一侧预算（错误文案用）。
+- 成功只返回 SVG 字符串，**不做**任何 HTML/SVG 内容改写或执行。
+
+### 15.3 资源上限与失败语义
+
+| 边界 | 上限 | 实现 |
+| --- | --- | --- |
+| 源码 | 256 KiB（UTF-8 字节） | `render_svg` 入口先查，超限直接 `TooLarge`，不进渲染器 |
+| 输出 SVG | 8 MiB | merman 资源策略 `max_svg_bytes` 在序列化阶段拒绝 + 返回后复核 |
+
+- 空/纯空白源码 → `Empty`；不是图/语法/布局/输出错误 → `Render(msg)`（文案来自 merman）；
+  渲染器 panic → `Panic(msg)`；去掉 BOM/前导空白后不是以 `<svg` 根元素开头或不含
+  `</svg>` → `InvalidSvg(prefix)`（错误文案只带前 32 个字符，不倾倒整段输出）。
+- 解析/布局/序列化整体包在 `catch_unwind` 里；**不安装全局 panic hook**，不把 panic
+  文案拼进 SVG。失败**不 panic、不返回半成品**。
+- 回退语义（写给 M2）：任何 `MermaidError` 都显示原始 fenced code + 失败状态，
+  **不写回正文**、不阻塞编辑；源码仍是唯一真源。
+- M1 不做超时/子进程隔离：最坏情况由源码 256 KiB、输出 8 MiB 与 merman 自带的
+  布局工作预算共同限制；独立 helper 子进程 + 超时留到 M3。
+
+### 15.4 验证
+
+- `crates/app/src/mermaid.rs` 模块内单测 **11** 个：简单 flowchart/sequenceDiagram
+  成功且含 `<svg>`；空/纯空白拒绝；非图源码拒绝；截断语法（`A[未闭合`、缺 `end` 的
+  `loop`）拒绝不 panic；源码超限（上限 +1 字节）在渲染前拒绝；SVG 输出超限复核；
+  SVG 形状校验（BOM/前导空白/`<svgfoo>`/未闭合/非 SVG）；重复渲染字节级一致且中间
+  渲染别的图不污染；跨线程渲染一致；`catch_unwind` 把字符串/非字符串 panic 载荷
+  都转成 `Panic`。
+- 文档示例写成 `text` 块而非 doctest：本机 app crate 的 doctest 链接缺
+  `zed_font_kit` rlib（环境限制，与本切片无关），同一路径由
+  `flowchart_renders_svg` 单测覆盖。
+- 命令与数字（本机 Linux，`CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`；
+  app 测试链接需要 `LIBRARY_PATH`/`LD_LIBRARY_PATH` 指向本机 xkbcommon 开发库的
+  本地 shim `/tmp/xkblib`，这是环境限制、与代码无关）：
+  - `cargo test -p menghunote-app --lib mermaid` = **11 passed / 0 failed**；
+  - `cargo test -p menghunote-app` = **273 passed / 0 failed**（35 个 suite；交接快照，
+    计数含本切片以外的并行功能，本切片只占其中 11 个）；
+  - `cargo test -p menghunote-app --features dev-sync` = **504 passed / 0 failed**
+    （35 个 suite，lib 单测 271）；
+  - `cargo fmt --all -- --check` = 通过；
+  - `cargo clippy -p menghunote-app --all-targets --features dev-sync -- -D warnings`：
+    本切片新增/修改的文件没有告警（全仓 clippy 由 Lead 集成时复跑）。
+
 ## 16. S3b5 实施记录（2026-11-17，表格拖拽重排行 / 列）
 
 > 范围：**表格 Object 的行 / 列拖拽重排**（把手、拖拽状态机、插入指示线、源码重排、
@@ -1121,6 +1248,96 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 - 缺列的行（GFM 隐式补空列在行尾）不能做列重排（整次放弃，不猜列边界）；
 - 行重排把行尾换行视为**槽位**属性（末行没有换行时不会凭空补），因此极端混用行尾的
   文档里换行字节留在原槽位（表格语义不变，但换行样式不跟着行走）。
+
+## 17. S3b6 实施记录（2026-11-17，表格整行/整列选中与拖拽 ghost）
+
+> 范围：**表格行列拖拽的选中/拖动反馈**（Obsidian 式：点击把手选中整行/整列、
+> 低透明度高亮 + 把手强调色、跟随指针的整行/整列 ghost + “移动第 N 列/行”文案）。
+> 只加视觉与选择状态，**不改**重排算法、源码写入、undo 语义、schema / 同步 wire / tag。
+> 明确**未做**：直接点表格内容选中整行/整列、多行/多列范围选择、拖拽自动滚动、
+> 列宽调整、合并单元格。
+
+### 17.1 交互与选中状态机（写死，headless 钉住）
+
+- **按下把手 = 选中**：列把手 → 选中整列；行把手 → 选中整行。按下同时进入 S3b5 的
+  拖拽状态（保持原状态机不变），但**选中是独立状态**（`TableAxisSelection`），
+  不随一次手势的结束而消失：
+  - 单击（按下 → 原位释放）：选中保留、**零请求**（`finish_table_drag` 的 no-op 分支）；
+  - 拖拽释放（有效槽位）：选中**移动到新下标**（与插入指示线同一个 `target`）；
+  - 拖出表格释放（取消重排）：原表不变，选中留在原下标（用户没移动成功，仍选着它）；
+  - `Esc`：取消拖拽并清除轴选中；不在拖拽时 `Esc` 也清除轴选中；
+  - 点表格外 / 移动正文 caret（`commit_selection`）：清除轴选中；
+  - 点单元格：**单元格选中优先**，轴选中退出，随后进入该格原地编辑；
+  - 进入表格源码模式：清除轴选中（源码模式下没有“整行/整列”的绘制几何）。
+- **互斥**：同一时间只有一个轴选中；选中与拖拽不产生任何 `EditRequest`，
+  一次释放仍然只有一条 `EditRequest` / 一个撤销组（沿用 S3b5）。
+- **快捷感知**：被选中的行/列，其把手换成主题强调色（普通把手仍是灰色）；
+  拖动中正文指针从 I-beam 换成“抓紧”（`ClosedHand`），不改变任何命中/caret 行为。
+
+### 17.2 绘制与几何（`crates/app/src/editor/{geometry,view,theme}.rs`）
+
+- 几何仍是**一份**：`TablePaint::axis_rect(axis, index)` 给出整列（表头 + 全部数据行）
+  或整条数据行（不含表头）的窗口矩形；选中高亮与 ghost 都从它算，不另算一套坐标。
+  整列/整行高亮矩形因此与 `table_cell_rects()` 的并集逐像素一致（headless 断言）。
+- **选中高亮**：`table-axis-selection` 浮层 div —— 低透明度填充（约 12%）+ 2px 强调色
+  边框，画在表格之上、单元格输入框/把手之下；因此文字透出、不被单元格描边盖住
+  （点单元格会先清轴选中，两者不叠加）。表头行不参与行选中（与行把手同一寻址）。
+- **ghost**：`table-drag-ghost` 浮层 div = 被拖项矩形按 `position - press` 平移，
+  半透明填充（约 20%）+ 1px 强调色边框；旁边 `table-drag-ghost-label` 深色文案
+  “移动第 N 列/行 → 第 M 列/行”（没有有效落点时只写“移动第 N 列/行”）。
+  - 指针离开按下点超过 `TABLE_DRAG_GHOST_MIN_MOVE`（3px）后才出现 → 单击把手
+    只看选中、不闪 ghost；`moved` 一旦为真保持到手势结束；
+  - 拖出表格（`slot == None`）→ ghost/文案与插入指示线一起消失；
+  - 两个 div **都没有鼠标监听 / hitbox**：不拦截鼠标、不改 caret；矩形裁剪到编辑器
+    可见区，不越出编辑区压到宿主 UI；
+  - ghost 与插入指示线/文案来自**同一个** `TableDragState`（`target` / `slot`），
+    落点高亮与 ghost 永远同步。
+- **可测状态**：`table_axis_selection()`、`table_axis_selection_rect()`、
+  `table_drag_ghost_rect()`、`table_drag_ghost_label()`；debug selector
+  `table-axis-selection` / `table-drag-ghost` / `table-drag-ghost-label`。
+  `TableDragState` 增加 `press`（ghost 锚点）与 `moved`（ghost 可见阈值）。
+
+### 17.3 验证
+
+- `crates/app/tests/headless_table_drag.rs`：原 **8** 个用例全部保留并通过，新增 **5** 个
+  （共 **13** 个真实 `AppShell` 用例）：
+  1. `clicking_handles_selects_whole_column_and_row`：点列/行把手选中整列/整行，
+     高亮矩形 = 对应 cell 并集（含表头/不含表头边界）、debug selector 与 accessor
+     同源、相邻列/行不被盖住、点其它把手移动选中、全程零请求且 caret 不动；
+  2. `dragging_shows_ghost_and_moves_selection_to_drop_target`：按下只选中不闪 ghost →
+     移动后 ghost + 文案 + 指示线同时出现（尺寸 = 列宽 × 表格高、跟随指针、文案带
+     起止序号）→ 释放后逐字节重排、选中到新下标、ghost/指示线消失、一次撤销/重做；
+  3. `dragging_rows_shows_vertical_ghost_and_moves_selection`：行 ghost 尺寸（表格宽 ×
+     行高）、纵向跟手、文案“第 1 行 → 第 3 行”、释放后选中到末行、一次撤销；
+  4. `escape_click_outside_and_cell_click_clear_axis_selection_without_requests`：
+     `Esc` / 点表格外正文 / 点单元格三种清除路径，全部零请求；单元格点击优先；
+  5. `dragging_out_of_the_table_hides_ghost_and_cancels_without_requests`：拖出表格 →
+     ghost/文案/指示线消失、原表逐字节不变、选中留在原下标；随后 `Esc` 清除选中。
+- 命令与计数（本机 Linux，环境变量见 AGENTS §6）：见 §17.4。
+
+### 17.4 计数（本机 Linux，S3b6 完成时）
+
+- `cargo fmt --all -- --check` = 通过；
+- `cargo clippy -p menghunote-editor -p menghunote-app --all-targets --features dev-sync
+  -- -D warnings` = 通过（0 warning）；
+- `cargo test -p menghunote-app --features dev-sync` = **510 passed / 0 failed**
+  （`headless_table_drag` +5：8 → 13）；
+- `cargo test -p menghunote-app` = **279 passed / 0 failed**（同上 +5）；
+- 未做真机像素验收：高亮/ghost 的透明度与观感、把手强调色、抓取光标、DPI、真实窗口
+  的按下-拖动-释放仍需 Windows `ui_smoke.ps1` 人工确认；本环境只证明
+  “几何 → 按下/选中/拖动/释放 → 选中/ghost → 一次 `EditRequest` → 源码/undo/Object”。
+
+### 17.5 已知限制（本切片写死）
+
+- 只能通过**把手**选中整行/整列；直接点单元格仍是单元格选中（单元格优先）；
+- 长表格滚动时**不自动滚动**（沿用 S3b5）：只能拖到当前可见的数据行位置，整列 ghost
+  会被裁剪到编辑器可见区；
+- 表头固定、不参与行选中/行重排（与行把手同一口径）；
+- 一次只有一个轴选中；不提供多行/多列范围选择；
+- 表格在单元格就地编辑 / 源码模式 / 同步持闸 / IME 组合期间不显示把手，也不能开始拖拽；
+- 点**编辑器以外**（侧栏 / 状态栏 / 设置页）不会立刻清除轴选中：编辑器收不到那次点击，
+  回到编辑器后任意点击（正文/单元格/表格）会按上面的清除路径处理；
+- 轴选中不参与 Ctrl+C 复制（复制语义仍是图片对象/正文选区，未扩展到整行/整列）。
 
 ## 非目标
 

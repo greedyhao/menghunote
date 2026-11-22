@@ -4,7 +4,7 @@
 //! 的可见验收只要肉眼能确认绘制与命中）。所有像素值都用 `f32` 存，
 //! 在用到的地方再包一层 `px()`，避免常量求值依赖 GPUI 的构造器。
 
-use gpui::{rgb, Font, Rgba};
+use gpui::{rgb, rgba, Font, Rgba};
 
 /// 等宽字体族（Windows 自带 Consolas；缺失时由 GPUI 的平台回退链接管）。
 pub const FONT_FAMILY: &str = "Consolas";
@@ -446,6 +446,80 @@ pub fn table_drag_indicator() -> Rgba {
 }
 
 // ---------------------------------------------------------------------------
+// 表格整行/整列选中 + 拖拽 ghost（ADR 0019 S3b6：Obsidian 式选中/拖动反馈）
+// ---------------------------------------------------------------------------
+
+/// 整行/整列选中的填充色：**低透明度**（约 12%），压在表格上文字仍然清晰可读。
+#[must_use]
+pub fn table_axis_selection_bg() -> Rgba {
+    rgba(0x0969da1f)
+}
+
+/// 整行/整列选中的边框色（强调色）。
+#[must_use]
+pub fn table_axis_selection_border() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 整行/整列选中的边框宽度（像素）。
+pub const TABLE_AXIS_SELECTION_BORDER: f32 = 2.0;
+
+/// 被选中的行/列把手底色：强调色，与普通灰把手区分（选中反馈的一部分）。
+#[must_use]
+pub fn table_drag_handle_selected_bg() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 拖拽 ghost（跟随指针的整行/整列半透明预览）填充色（约 20%）。
+#[must_use]
+pub fn table_drag_ghost_bg() -> Rgba {
+    rgba(0x0969da33)
+}
+
+/// 拖拽 ghost 的边框色。
+#[must_use]
+pub fn table_drag_ghost_border() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 拖拽 ghost 的边框宽度（像素）。
+pub const TABLE_DRAG_GHOST_BORDER: f32 = 1.0;
+
+/// 指针离开按下点超过该像素才显示 ghost：单击把手只看选中反馈，不闪 ghost。
+pub const TABLE_DRAG_GHOST_MIN_MOVE: f32 = 3.0;
+
+/// 拖动 ghost 的列块尺寸：只画表头顶线上的一个小块，不复制整列（省绘制、
+/// 也不会拖到哪都铺满一屏）。`u` 轴固定贴表头顶边，`x` 跟指针。
+pub const TABLE_DRAG_GHOST_COLUMN_WIDTH: f32 = 28.0;
+/// 拖动 ghost 的列块高度。
+pub const TABLE_DRAG_GHOST_COLUMN_HEIGHT: f32 = 8.0;
+/// 拖动 ghost 的行块尺寸：只画左边线上的一个小块，`y` 跟指针。
+pub const TABLE_DRAG_GHOST_ROW_WIDTH: f32 = 8.0;
+/// 拖动 ghost 的行块高度。
+pub const TABLE_DRAG_GHOST_ROW_HEIGHT: f32 = 22.0;
+
+/// ghost 上“移动第 N 列/行”浮层的底色（深色半透明，压在任何表格内容上都可读）。
+#[must_use]
+pub fn table_drag_ghost_label_bg() -> Rgba {
+    rgba(0x1f2328e6)
+}
+
+/// ghost 浮层的文字色。
+#[must_use]
+pub fn table_drag_ghost_label_text() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// ghost 浮层与指针的横向间距（像素）。
+pub const TABLE_DRAG_GHOST_LABEL_OFFSET_X: f32 = 14.0;
+/// ghost 浮层与指针的纵向间距（像素）。
+pub const TABLE_DRAG_GHOST_LABEL_OFFSET_Y: f32 = 16.0;
+/// ghost 浮层的宽度上限（像素）：靠近编辑区右边缘时按它夹住，不压到宿主其它 UI。
+pub const TABLE_DRAG_GHOST_LABEL_MAX_WIDTH: f32 = 220.0;
+/// ghost 浮层的高度上限（像素）：靠近编辑区下边缘时按它夹住。
+pub const TABLE_DRAG_GHOST_LABEL_HEIGHT: f32 = 24.0;
+
+// ---------------------------------------------------------------------------
 // 正文右键菜单（ADR 0019 S3b4：「插入 → 表格」）
 // ---------------------------------------------------------------------------
 
@@ -487,3 +561,80 @@ pub fn table_cell_selected_border() -> Rgba {
 
 /// 选中单元格的描边宽度（像素）。
 pub const TABLE_CELL_SELECTED_BORDER: f32 = 2.0;
+
+// ---------------------------------------------------------------------------
+// 图谱覆盖层（G1）：全屏 canvas 自绘的背景/节点/边/标签颜色。
+// 与编辑器共用同一套中性灰 + 强调蓝，避免出现第二套配色。
+// ---------------------------------------------------------------------------
+
+/// 图谱覆盖层的背景（近不透明的窗口底色：盖住编辑器但仍能透出一点层次）。
+#[must_use]
+pub fn graph_backdrop() -> Rgba {
+    gpui::rgba(0xf6f8faf7)
+}
+
+/// 图谱顶部工具条的底色（不透明，压住下面的边线）。
+#[must_use]
+pub fn graph_toolbar_bg() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// 节点填充色（未悬停）。
+#[must_use]
+pub fn graph_node_bg() -> Rgba {
+    rgb(0xdbeafe)
+}
+
+/// 节点描边色（未悬停）。
+#[must_use]
+pub fn graph_node_border() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 悬停节点/邻居节点的填充色（强调态）。
+#[must_use]
+pub fn graph_node_active_bg() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 悬停时的节点文字色（深底白字）。
+#[must_use]
+pub fn graph_node_active_text() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// 与悬停节点无关的节点被压暗后的填充色。
+#[must_use]
+pub fn graph_node_dim_bg() -> Rgba {
+    rgb(0xf0f3f6)
+}
+
+/// 与悬停节点无关的节点被压暗后的描边色。
+#[must_use]
+pub fn graph_node_dim_border() -> Rgba {
+    rgb(0xd0d7de)
+}
+
+/// 节点标签文字色（未悬停）。
+#[must_use]
+pub fn graph_label_text() -> Rgba {
+    rgb(0x1f2328)
+}
+
+/// 边线颜色（未高亮）。
+#[must_use]
+pub fn graph_edge() -> Rgba {
+    rgb(0xc3ccd6)
+}
+
+/// 悬停高亮时的边线颜色。
+#[must_use]
+pub fn graph_edge_active() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 悬停时被压暗的边线颜色（只突出与被悬停节点相连的边）。
+#[must_use]
+pub fn graph_edge_dim() -> Rgba {
+    rgb(0xe4e8ec)
+}

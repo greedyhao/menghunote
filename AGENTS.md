@@ -395,7 +395,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 356 / sync 605 / app `--features dev-sync` 462 / 默认 231 / storage 187 / editor 240 / markdown 28。
+> 测试：relay 356 / sync 605 / app `--features dev-sync` 510 / 默认 279 / storage 195 / editor 265 / markdown 28。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
@@ -434,6 +434,26 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **交互修复（2026-11-17）**：设置页按窗口高度限高并可滚动；wiki 链接悬停手形、
 > 末尾边界不跳转、点击仅命中 display 可见区间（修复上一行误跳）；右键菜单动作后
 > 吞掉同一次手势的 mouse-up，修复根目录笔记/文件夹右键重命名被立刻提交。
+> **表格拖拽反馈（2026-11-17，S3b6）**：点列/行把手立即选中整列/整行（半透明填充+
+> 强调边框，把手变色）；拖动超过 3px 只在表头顶线/表格左线显示一个跟随指针的小块
+> ghost +「第 N → 第 M」文案（不复制整行/整列），插入线/落点同步；Esc/点外清除选中，
+> 单元格点击优先；drop 后选中移动到新下标。
+> **实测修正（2026-11-17）**：单元格改为单击即进入**原地浮层编辑**，表格始终完整
+> 显示、不再压成一行 cell 文本；复用 RenameInput 的 IME，Enter/Esc/点外/Tab 走同一
+> 提交路径；编辑时隐藏原 cell 文字与正文选区/光标，避免重影/双光标。
+> 图片遮罩支持滚轮 0.5–4.0 缩放并阻断底层滚动；图谱滚轮也阻断穿透。
+> **S3b5 表格拖拽重排（2026-11-17）**：悬浮/选中表格显示列顶部 / 数据行左侧把手，
+> 拖动按槽位重排行/列，插入线提示，Esc/拖出取消；一次释放一个 EditRequest + undo，
+> caret 不变、表格仍为 Object；行尾换行留在槽位，列重排对齐一起移动。
+> **图谱 G0+G1（2026-11-17）**：`GraphModel`（tree+notes 节点、已解析 wiki 边、去重权重、
+> 自环/未解析/悬空统计、确定性圆周布局、800/3000 上限）+ 侧栏「图谱」全屏覆盖层；
+> 平移/缩放/悬停邻居/点节点打开笔记。局部深度/过滤/搜索/LOD 仍是 G2/G3。
+> **Mermaid M1（2026-11-17）**：`merman 0.10.0` 精确 pin（all-diagrams+complete-svg，
+> 不引 ELK/Node/WebView）；`render_svg` 输入/输出上限 + catch_unwind + SVG 形状校验；
+> 11 个渲染测试。**编辑器 Object 预览/缓存仍待 M2。**
+> **资产 GC dry-run（2026-11-17）**：storage 只读扫描候选，保护根=正文引用/历史版本/
+> 同步 outbox/无本地字节/baseline journal；保护根解析不确定时整次 fail-closed；
+> 只报告，不物理删除、不改 orphan_since/schema。
 > **S3b3/S3b4 表格删除与右键插入（2026-11-17）**：表格浮层增删行/删列
 >（表头不删、至少保留 1 列、删除后修正选中格）；编辑器右键「插入 → 表格」，
 > 默认 2 列 × 1 数据行，一条 EditRequest，右键不移动 caret。拖拽重排仍未做。

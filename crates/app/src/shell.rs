@@ -22,8 +22,9 @@ use std::collections::HashSet;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, AnyElement, App, Context, Entity, FocusHandle, FontWeight, MouseButton, Pixels, Point,
-    Render, SharedString, Size, Window,
+    canvas, div, point, px, AnyElement, App, Context, Entity, FocusHandle, FontWeight, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, SharedString,
+    Size, Window,
 };
 use menghunote_editor::EditorController;
 use menghunote_storage::rename_links::{
@@ -42,6 +43,9 @@ use menghunote_storage::{
 use menghunote_storage::{load_head, STRUCTURE_DOC_ID};
 
 use crate::editor::view::EditorEvent;
+// 图谱（G1）：模型/视口数学全在 `graph` 模块，这里只做覆盖层与交互。
+// `hint_line` / `scroll_zoom_factor` 是纯函数，UI 与测试共用同一份口径。
+use crate::graph::{hint_line, scroll_zoom_factor, GraphLimits, GraphModel, GraphViewport};
 use crate::sidebar_rename::{RenameEvent, RenameInput};
 
 /// 新建笔记的默认标题（与现有标题重名时自动加序号）。
@@ -111,6 +115,26 @@ const SWITCH_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 #[cfg(feature = "dev-sync")]
 const NO_ACTIVE_DOC: &str = "dev-sync：当前没有打开的笔记，闸门/adopt 无处转发";
 
+// ---- 图谱覆盖层（G1）----
+
+/// 图谱节点标签盒子的宽度（逻辑像素）：标签在圆点下方、固定宽度单行省略，
+/// 这样节点层的布局不会随标题长度抖动（绘制/命中只用圆点本身）。
+const GRAPH_NODE_BOX_WIDTH: f32 = 116.0;
+/// 图谱顶部工具条高度（逻辑像素）。
+const GRAPH_HEADER_HEIGHT: f32 = 40.0;
+/// 滚轮 `Lines` 增量换算成像素时用的行高（与编辑器行高量级一致）。
+const GRAPH_SCROLL_LINE_HEIGHT: f32 = 20.0;
+/// 侧栏「图谱」入口的底部留白（像素）。
+///
+/// dev-sync 构建里 `AppRoot` 的「⚙ 设置」是绝对定位（`bottom: 30`、高约 24），
+/// 这段留白把「图谱」顶到它正上方，两个入口不重叠；默认构建没有那个按钮，
+/// 留一点内边距贴底即可。
+#[cfg(feature = "dev-sync")]
+const GRAPH_ENTRY_BOTTOM_GAP: f32 = 40.0;
+/// 默认构建（没有 `AppRoot` 设置按钮）的底部留白。
+#[cfg(not(feature = "dev-sync"))]
+const GRAPH_ENTRY_BOTTOM_GAP: f32 = 8.0;
+
 /// 当前打开的笔记。
 /// 正在编辑的行。
 struct Editing {
@@ -130,6 +154,35 @@ struct OpenNote {
     /// 编辑器事件的订阅（切换文档时 drop = 取消订阅）。
     /// 字段本身不读，靠 **Drop** 生效。
     _events: gpui::Subscription,
+}
+
+/// 图谱覆盖层的运行态（`None` = 没打开）。
+///
+/// **坐标只存在内存里**（`model` 里的布局 + `view` 的平移缩放），不写库、不进同步；
+/// 关闭即丢弃，下次打开重新构建（G3 才考虑布局缓存）。
+struct GraphOverlay {
+    /// 打开时构建的只读模型（节点/边/度数/布局坐标）。
+    model: GraphModel,
+    /// 平移/缩放：绘制、命中、点击共用这一份映射。
+    view: GraphViewport,
+    /// 最近一帧的画布尺寸（窗口坐标；命中与绘制必须用同一个值）。
+    viewport: Size<Pixels>,
+    /// 左键按下的手势（用来区分"点击"与"拖拽平移"）。
+    drag: Option<GraphDrag>,
+    /// 悬停节点下标（高亮它和邻居；`None` = 没悬停）。
+    hovered: Option<usize>,
+}
+
+/// 图谱里的一次左键手势。
+struct GraphDrag {
+    /// 按下时的屏幕位置。
+    start: Point<Pixels>,
+    /// 按下时的平移量：拖拽 = 从它加总增量，不累积浮点误差。
+    origin_pan: Point<f32>,
+    /// 按下瞬间命中的节点（点击时用它决定"打开笔记"还是"点遮罩关闭"）。
+    pressed_node: Option<usize>,
+    /// 已经超过拖拽阈值（此时抬手不算点击）。
+    moved: bool,
 }
 
 /// 重命名联动改写后的汇总（UI 提示用）。
@@ -182,6 +235,10 @@ pub struct AppShell {
     search_auto_used: bool,
     /// 搜索浮层（`None` = 关闭）。
     search: Option<Entity<crate::search_overlay::SearchOverlay>>,
+    /// 图谱覆盖层（`None` = 关闭）。打开时不销毁编辑器：只盖一层 canvas。
+    graph: Option<GraphOverlay>,
+    /// 图谱覆盖层的焦点（接 `Esc`；打开时抢焦点，关闭后还给编辑器）。
+    graph_focus: FocusHandle,
     /// 正在行内重命名的节点（含输入框实体）。
     editing: Option<Editing>,
     /// 下一帧需要把焦点给新的输入框（订阅回调里没有 `&mut Window`）。
@@ -347,6 +404,254 @@ impl AppShell {
         cx.notify();
     }
 
+    // ---- 图谱覆盖层（G1）：打开/关闭/交互 ----
+
+    /// 打开全库图谱覆盖层（侧栏底部「图谱」）。
+    ///
+    /// 打开前先按现有表构建一次模型（`tree`/`notes`/`links` 只读查询，几毫秒级）；
+    /// 失败只写侧栏提示，**不 panic、不改编辑器**。打开时把焦点交给覆盖层，
+    /// 编辑器的文档/滚动/撤销状态原样保留（覆盖层只是盖在上面）。
+    fn open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.graph.is_some() {
+            return;
+        }
+        let viewport = window.bounds().size;
+        match GraphModel::build_with_limits(&self.vault, GraphLimits::default()) {
+            Ok(model) => {
+                let mut view = GraphViewport::default();
+                view.fit_to(&model, viewport);
+                eprintln!(
+                    "[menghunote] 打开图谱：节点 {} 边 {} 未解析 {} 自环 {} 悬空 {}（zoom={:.2}）",
+                    model.node_count(),
+                    model.edge_count(),
+                    model.unresolved_links(),
+                    model.self_links(),
+                    model.dangling_links(),
+                    view.zoom
+                );
+                self.graph = Some(GraphOverlay {
+                    model,
+                    view,
+                    viewport,
+                    drag: None,
+                    hovered: None,
+                });
+                self.graph_focus.focus(window, cx);
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!("[menghunote] 构建图谱失败：{error:?}");
+                self.notice = Some(format!("图谱构建失败：{error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 关闭图谱覆盖层，并把焦点还给当前编辑器。
+    fn close_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.graph.take().is_none() {
+            return;
+        }
+        eprintln!("[menghunote] 关闭图谱");
+        self.focus_active_editor(window, cx);
+        cx.notify();
+    }
+
+    /// 点中图谱节点：按 `note_id` 找结构树行 → 关覆盖层 → 复用 [`Self::open_entry`]。
+    ///
+    /// 找不到（笔记已删/结构树还没刷新）时只提示，不猜、不自动建。
+    fn open_graph_node(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note_id) = self
+            .graph
+            .as_ref()
+            .and_then(|state| state.model.nodes().get(index))
+            .map(|node| node.note_id.clone())
+        else {
+            return;
+        };
+        let Some(tree_index) = self
+            .tree
+            .iter()
+            .position(|entry| entry.note_id.as_deref() == Some(note_id.as_str()))
+        else {
+            eprintln!("[menghunote] 图谱节点已失效 note={note_id}（结构树里找不到）");
+            self.notice = Some("笔记已不存在".to_owned());
+            self.close_graph(window, cx);
+            return;
+        };
+        eprintln!("[menghunote] 图谱点开 note={note_id}（树节点 #{tree_index}）");
+        self.close_graph(window, cx);
+        self.open_entry(tree_index, cx);
+    }
+
+    /// 左键按下：记录手势（是否命中节点 + 起始平移量）。
+    fn graph_mouse_down(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        let pressed_node = state.view.hit_test(&state.model, position, state.viewport);
+        state.drag = Some(GraphDrag {
+            start: position,
+            origin_pan: state.view.pan,
+            pressed_node,
+            moved: false,
+        });
+        cx.notify();
+    }
+
+    /// 鼠标移动：拖拽平移 + 悬停高亮（同一个几何：`hit_test`）。
+    fn graph_mouse_move(
+        &mut self,
+        position: Point<Pixels>,
+        pressed: Option<MouseButton>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        let mut changed = false;
+        let mut pan_to = None;
+        if let Some(drag) = state.drag.as_mut() {
+            if pressed == Some(MouseButton::Left) {
+                let dx = position.x.as_f32() - drag.start.x.as_f32();
+                let dy = position.y.as_f32() - drag.start.y.as_f32();
+                if !drag.moved && (dx * dx + dy * dy).sqrt() > crate::graph::DRAG_THRESHOLD {
+                    drag.moved = true;
+                }
+                if drag.moved {
+                    pan_to = Some(point(drag.origin_pan.x + dx, drag.origin_pan.y + dy));
+                }
+            }
+        }
+        if let Some(pan) = pan_to {
+            state.view.pan = pan;
+            changed = true;
+        }
+        let dragging = state.drag.as_ref().is_some_and(|drag| drag.moved);
+        let hovered = if dragging {
+            None
+        } else {
+            state.view.hit_test(&state.model, position, state.viewport)
+        };
+        if hovered != state.hovered {
+            state.hovered = hovered;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// 左键抬起：没拖动才算"点击"——命中节点打开笔记，空白处 = 点遮罩关闭。
+    fn graph_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        let Some(drag) = state.drag.take() else {
+            return;
+        };
+        if drag.moved {
+            // 拖拽结束：只结束手势，不打开/不关闭。
+            cx.notify();
+            return;
+        }
+        match drag.pressed_node {
+            Some(index) => self.open_graph_node(index, window, cx),
+            None => self.close_graph(window, cx),
+        }
+    }
+
+    /// 滚轮缩放（以鼠标位置为锚点，缩放有界 0.2–3.0）。
+    fn graph_scroll(
+        &mut self,
+        position: Point<Pixels>,
+        delta: ScrollDelta,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        let pixels = delta.pixel_delta(px(GRAPH_SCROLL_LINE_HEIGHT));
+        // 平台给的是"内容位移"（正 = 滚轮向上）→ 向上放大。
+        let factor = scroll_zoom_factor(pixels.y.as_f32());
+        state.view.zoom_by(factor, position, state.viewport);
+        cx.notify();
+    }
+
+    /// 复位：重新自适应缩放并居中（图被拖丢时的手动兜底）。
+    fn graph_reset(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        state.view.fit_to(&state.model, state.viewport);
+        state.hovered = None;
+        state.drag = None;
+        cx.notify();
+    }
+
+    /// 图谱覆盖层是否打开（测试/诊断用）。
+    #[must_use]
+    pub fn graph_is_open(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    /// 当前图谱模型（`None` = 未打开）。
+    #[must_use]
+    pub fn graph_model(&self) -> Option<&GraphModel> {
+        self.graph.as_ref().map(|state| &state.model)
+    }
+
+    /// 当前视口（平移/缩放；`None` = 未打开）。
+    #[must_use]
+    pub fn graph_view(&self) -> Option<GraphViewport> {
+        self.graph.as_ref().map(|state| state.view)
+    }
+
+    /// 最近一帧的画布尺寸（命中/绘制共用；`None` = 未打开）。
+    #[must_use]
+    pub fn graph_viewport(&self) -> Option<Size<Pixels>> {
+        self.graph.as_ref().map(|state| state.viewport)
+    }
+
+    /// 图谱头部统计行（`None` = 未打开）。
+    #[must_use]
+    pub fn graph_hint_text(&self) -> Option<String> {
+        self.graph.as_ref().map(|state| hint_line(&state.model))
+    }
+
+    /// 当前悬停节点下标（`None` = 未打开或没悬停）。
+    #[must_use]
+    pub fn graph_hovered(&self) -> Option<usize> {
+        self.graph.as_ref().and_then(|state| state.hovered)
+    }
+
+    /// 图谱节点标题（按模型顺序；headless 断言排序/数量用）。
+    #[must_use]
+    pub fn graph_node_titles(&self) -> Vec<&str> {
+        self.graph
+            .as_ref()
+            .map(|state| {
+                state
+                    .model
+                    .nodes()
+                    .iter()
+                    .map(|node| node.title.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 图谱节点的屏幕中心（窗口坐标；headless 点击用）。
+    ///
+    /// 与绘制共用 [`GraphViewport::screen_pos`]，不是第二份几何。
+    #[must_use]
+    pub fn graph_node_center(&self, note_id: &str) -> Option<Point<Pixels>> {
+        let state = self.graph.as_ref()?;
+        let index = state.model.node_index(note_id)?;
+        let node = state.model.nodes().get(index)?;
+        Some(state.view.screen_pos(node.pos, state.viewport))
+    }
+
     /// 组装根视图：读一次树，并打开第一篇可打开的笔记（默认 peer = 1，行为不变）。
     pub fn new(vault: Vault, vault_label: String, cx: &mut Context<Self>) -> Self {
         Self::new_with_peer(vault, vault_label, DEFAULT_PEER_ID, cx)
@@ -397,6 +702,8 @@ impl AppShell {
             pending_search: false,
             search_auto_used: false,
             search: None,
+            graph: None,
+            graph_focus: cx.focus_handle(),
             pending_focus_rename: false,
             menu_opened_at: None,
             menu_action_at: None,
@@ -963,6 +1270,10 @@ impl AppShell {
                     cx.notify();
                 }
                 RenameEvent::Cancel => shell.cancel_rename(cx),
+                // 标题输入框没有“跳格”语义（只有表格单元格会发）。
+                RenameEvent::Advance { .. } => {}
+                // 逐键变化只给表格浮层同步草稿用，侧栏不需要。
+                RenameEvent::Changed => {}
             },
         )
         .detach();
@@ -2108,6 +2419,35 @@ impl AppShell {
                     .overflow_y_scroll()
                     .children(rows),
             )
+            // 图谱入口：侧栏底部（「⚙ 设置」正上方，见 `GRAPH_ENTRY_BOTTOM_GAP`）。
+            // 用 `on_mouse_down` 而不是 up：与侧栏其它动作行一致，真实右键/快速点击
+            // 都不会因为"上一次 mouse move 的命中链"不满足而被静默跳过。
+            .child(
+                div().w_full().px_2().pb(px(GRAPH_ENTRY_BOTTOM_GAP)).child(
+                    div()
+                        .id("sidebar-graph")
+                        // 测试元数据（只读断言用）：侧栏图谱入口。
+                        .debug_selector(|| "sidebar-graph".to_string())
+                        .h(px(22.0))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .border(px(1.0))
+                        .border_color(theme::sidebar_border())
+                        .text_size(px(12.0))
+                        .text_color(theme::text_color())
+                        .cursor_pointer()
+                        .child(SharedString::from("图谱"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                                shell.open_graph(window, cx);
+                            }),
+                        ),
+                ),
+            )
             // 提示放在按钮**上方**：按钮位置固定，二次确认时不会"跑掉"
             // （踩过：提示出现在按钮下面，按钮被顶上去，第二次点击点空 → 只剩超时复位）。
             .when_some(self.notice.clone(), |this, notice| {
@@ -2304,6 +2644,299 @@ impl AppShell {
                             this.child(item(1, label, theme::danger_text(), MenuAction::Delete))
                         }),
                 )
+                .into_any_element(),
+        )
+    }
+
+    /// 图谱覆盖层（G1）：全屏 canvas 自绘（不引 WebView/JS）。
+    ///
+    /// 层次（后画的在上，也先收到鼠标事件）：
+    ///
+    /// 1. `graph-canvas` 舞台：全屏、半透明底、[`gpui::InteractiveElement::occlude`]
+    ///    挡住后面编辑器的鼠标命中；**平移/缩放/悬停/点击全走
+    ///    [`crate::graph::GraphViewport::hit_test`]**（与绘制同一份坐标）；
+    /// 2. 节点层：圆点 + 标签，位置来自同一个 `screen_pos`，本身不挂鼠标监听
+    ///    （没有 hitbox 就不会挡住舞台）；
+    /// 3. 顶部工具条：统计行 +「复位」「关闭」，自己吞掉鼠标事件——点工具条空白
+    ///    不等于"点遮罩关闭"。
+    fn render_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let viewport = window.bounds().size;
+        let (paint_edges, paint_dim, layer, hint, empty) = {
+            let state = self.graph.as_mut()?;
+            // 每帧同步一次画布尺寸：命中/拖拽/测试与绘制共用这个值（窗口缩放后自动跟上）。
+            state.viewport = viewport;
+            let model = &state.model;
+            let view = state.view;
+            let hovered = state.hovered;
+            let hint = hint_line(model);
+            let empty = model.is_empty();
+            let radius = view.node_radius();
+            let neighbors: HashSet<usize> = hovered
+                .map(|index| model.neighbor_indices_of(index).into_iter().collect())
+                .unwrap_or_default();
+
+            // 边：先做视口裁剪，画布外的边不产生图元。
+            let mut edges: Vec<(Point<Pixels>, Point<Pixels>, bool)> = Vec::new();
+            for edge in model.edges() {
+                let (Some(from), Some(to)) =
+                    (model.nodes().get(edge.from), model.nodes().get(edge.to))
+                else {
+                    continue;
+                };
+                let a = view.screen_pos(from.pos, viewport);
+                let b = view.screen_pos(to.pos, viewport);
+                if edge_offscreen(a, b, viewport) {
+                    continue;
+                }
+                let active = hovered.is_some_and(|index| edge.from == index || edge.to == index);
+                edges.push((a, b, active));
+            }
+
+            // 节点层：圆点位置 = `screen_pos`（命中/绘制/测试共用），标签固定宽度单行省略。
+            let mut layer = div().absolute().inset_0().overflow_hidden();
+            for (index, node) in model.nodes().iter().enumerate() {
+                let center = view.screen_pos(node.pos, viewport);
+                let active = hovered == Some(index);
+                let related = active || (hovered.is_some() && neighbors.contains(&index));
+                let dimmed = hovered.is_some() && !related;
+                let (fill, border, text) = if active {
+                    (
+                        theme::graph_node_active_bg(),
+                        theme::graph_node_active_bg(),
+                        theme::graph_node_active_text(),
+                    )
+                } else if dimmed {
+                    (
+                        theme::graph_node_dim_bg(),
+                        theme::graph_node_dim_border(),
+                        theme::status_bar_text(),
+                    )
+                } else if related {
+                    (
+                        theme::graph_node_bg(),
+                        theme::graph_edge_active(),
+                        theme::graph_label_text(),
+                    )
+                } else {
+                    (
+                        theme::graph_node_bg(),
+                        theme::graph_node_border(),
+                        theme::graph_label_text(),
+                    )
+                };
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .left(px(center.x.as_f32() - GRAPH_NODE_BOX_WIDTH * 0.5))
+                        .top(px(center.y.as_f32() - radius))
+                        .w(px(GRAPH_NODE_BOX_WIDTH))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(
+                            div()
+                                // 测试元数据（只读断言用）：`graph-node-<模型下标>`。
+                                .debug_selector(move || format!("graph-node-{index}"))
+                                .w(px(radius * 2.0))
+                                .h(px(radius * 2.0))
+                                .rounded_full()
+                                .bg(fill)
+                                .border(px(1.0))
+                                .border_color(border),
+                        )
+                        .child(
+                            div()
+                                .w(px(GRAPH_NODE_BOX_WIDTH))
+                                .mt(px(2.0))
+                                .text_size(px(11.0))
+                                .text_color(text)
+                                .text_center()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(SharedString::from(node.title.clone())),
+                        ),
+                );
+            }
+            (
+                std::rc::Rc::new(edges),
+                hovered.is_some(),
+                layer,
+                hint,
+                empty,
+            )
+        };
+
+        let stage = div()
+            .id("graph-canvas")
+            // 测试元数据（只读断言用）：舞台（全窗口）+ 尺寸来源。
+            .debug_selector(|| "graph-canvas".to_string())
+            .absolute()
+            .inset_0()
+            .bg(theme::graph_backdrop())
+            // 覆盖层语义：不挤压编辑器，也不把点击漏给下面的编辑器。
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, event: &MouseDownEvent, _window, cx| {
+                    shell.graph_mouse_down(event.position, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, _window, cx| {
+                shell.graph_mouse_move(event.position, event.pressed_button, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseUpEvent, window, cx| {
+                    shell.graph_mouse_up(window, cx);
+                }),
+            )
+            .on_scroll(
+                cx.listener(|shell, event: &gpui::ScrollEvent, _window, cx| {
+                    shell.graph_scroll(event.position, event.delta, cx);
+                    // **阻断穿透**：图谱覆盖层是模态视图，滚轮只缩放图谱；
+                    // 底层 EditorView 的窗口级滚动监听不得收到这次事件。
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| bounds,
+                    move |_bounds, _prepaint, window, _cx| {
+                        for (a, b, active) in paint_edges.iter() {
+                            let color = if *active {
+                                theme::graph_edge_active()
+                            } else if paint_dim {
+                                theme::graph_edge_dim()
+                            } else {
+                                theme::graph_edge()
+                            };
+                            let width = if *active { 1.8 } else { 1.0 };
+                            let mut builder = gpui::PathBuilder::stroke(px(width));
+                            builder.move_to(*a);
+                            builder.line_to(*b);
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, color);
+                            }
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(layer);
+
+        let header = div()
+            .id("graph-header")
+            .debug_selector(|| "graph-header".to_string())
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(GRAPH_HEADER_HEIGHT))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .bg(theme::graph_toolbar_bg())
+            .border_b(px(1.0))
+            .border_color(theme::sidebar_border())
+            // 工具条自己吞掉鼠标：点标题/点空白既不算"点遮罩关闭"，也不开始拖拽。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|_shell, _event: &MouseUpEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme::text_color())
+                            .child(SharedString::from("图谱")),
+                    )
+                    .child(
+                        div()
+                            // 测试元数据（只读断言用）：节点/边/未解析/截断统计行。
+                            .debug_selector(|| "graph-hint".to_string())
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(11.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(hint.clone())),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(graph_button("graph-reset", "复位", false).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.graph_reset(cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(graph_button("graph-close", "关闭", true).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                            shell.close_graph(window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )),
+            );
+
+        let empty_state = div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    // 测试元数据（只读断言用）：空图占位（不画节点、不 panic）。
+                    .debug_selector(|| "graph-empty".to_string())
+                    .text_size(px(13.0))
+                    .text_color(theme::status_bar_text())
+                    .child(SharedString::from(hint)),
+            );
+
+        Some(
+            div()
+                .id("graph-overlay")
+                // 测试元数据（只读断言用）：覆盖层存在 = 打开；`debug_bounds` 为 `None` = 关闭。
+                .debug_selector(|| "graph-overlay".to_string())
+                .absolute()
+                .inset_0()
+                .track_focus(&self.graph_focus)
+                .on_key_down(
+                    cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            shell.close_graph(window, cx);
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        }
+                    }),
+                )
+                .child(stage)
+                .child(header)
+                .when(empty, |this| this.child(empty_state))
                 .into_any_element(),
         )
     }
@@ -5826,6 +6459,8 @@ impl Render for AppShell {
         let search = self.search.clone();
         // 菜单渲染在**根层**：侧栏是 `overflow_y_scroll`，放里面会被裁掉。
         let popup = self.render_menu(window, cx);
+        // 图谱覆盖层：全屏、盖在编辑器上（不挤压编辑器，也不卸载它）。
+        let graph = self.render_graph(window, cx);
         #[cfg(feature = "dev-sync")]
         let settings = self.render_settings(cx);
         let root = div()
@@ -5869,7 +6504,8 @@ impl Render for AppShell {
         // 同步设置页：只在打开时挂载面板（默认主界面不显示覆盖层）。
         #[cfg(feature = "dev-sync")]
         let root = root.when_some(settings, |this, settings| this.child(settings));
-        root
+        // 图谱在最上层：覆盖层打开时抢焦点，搜索/菜单/设置不可能同时被操作。
+        root.when_some(graph, |this, graph| this.child(graph))
     }
 }
 
@@ -5952,6 +6588,61 @@ impl MenuAction {
 #[must_use]
 fn overlay_click_closes(elapsed_since_open: std::time::Duration) -> bool {
     elapsed_since_open >= OPEN_GUARD
+}
+
+/// 图谱工具条上的小按钮（纯样式；事件由调用方挂，便于每个按钮自己的动作）。
+#[must_use]
+fn graph_button(
+    selector: &'static str,
+    label: &'static str,
+    primary: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(selector)
+        // 测试元数据（只读断言用）：`graph-reset` / `graph-close`。
+        .debug_selector(move || selector.to_string())
+        .h(px(24.0))
+        .px_3()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border(px(1.0))
+        .border_color(if primary {
+            theme::graph_edge_active()
+        } else {
+            theme::sidebar_border()
+        })
+        .bg(if primary {
+            theme::graph_edge_active()
+        } else {
+            theme::graph_toolbar_bg()
+        })
+        .text_size(px(12.0))
+        .text_color(if primary {
+            theme::graph_node_active_text()
+        } else {
+            theme::text_color()
+        })
+        .cursor_pointer()
+        .child(SharedString::from(label))
+}
+
+/// 一条边是否完全落在画布外（视口裁剪；纯几何，绘制前后都不改状态）。
+///
+/// 边的包围盒与画布不相交（含一圈余量）就跳过绘制：大图/远平移时省掉无用图元，
+/// 但**不影响**命中与模型（它们只看节点坐标）。
+#[must_use]
+fn edge_offscreen(a: Point<Pixels>, b: Point<Pixels>, viewport: Size<Pixels>) -> bool {
+    const MARGIN: f32 = 32.0;
+    let min_x = a.x.min(b.x).as_f32();
+    let max_x = a.x.max(b.x).as_f32();
+    let min_y = a.y.min(b.y).as_f32();
+    let max_y = a.y.max(b.y).as_f32();
+    max_x < -MARGIN
+        || max_y < -MARGIN
+        || min_x > viewport.width.as_f32() + MARGIN
+        || min_y > viewport.height.as_f32() + MARGIN
 }
 
 /// 把菜单左上角**夹进窗口内**（纯函数）：`position` 是右键点，`viewport` 是窗口

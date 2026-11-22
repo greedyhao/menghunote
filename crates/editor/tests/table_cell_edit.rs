@@ -177,6 +177,52 @@ fn typing_replaces_only_that_cell_and_commit_is_one_scalar_edit() {
 }
 
 #[test]
+fn overlay_replace_writes_one_edit_and_keeps_the_table_an_object() {
+    // app 的浮层路径：不进入控制器 cell 编辑态，直接给一段完整文本 → 一条 ScalarEdit。
+    let mut controller = open(TABLE_SOURCE);
+    let request = controller
+        .replace_table_cell_text(TABLE_LINE, 1, 0, "苹果派|特价\n第二行")
+        .expect("替换不应失败")
+        .expect("文本有变化 → 必须产生请求");
+    assert_eq!(request.edits.len(), 1, "一次提交只有一条 ScalarEdit");
+    assert!(
+        !controller.is_editing_table_cell(),
+        "浮层路径不进 cell 编辑态"
+    );
+    // 表格始终投影成 Object（display 里没有整表源码），其它 cell/分隔行逐字节不变。
+    let display = controller.display_text().to_string();
+    assert!(display.contains(OBJECT_PLACEHOLDER), "{display:?}");
+    assert!(!display.contains('|'), "{display:?}");
+    assert_eq!(
+        controller.source_text(),
+        "# 表格\n\n| 名称 | 数量 |\n|:--|--:|\n| 苹果派\\|特价 第二行 | 3 |\n\n后文\n",
+        "换行 → 空格、未转义 `|` → `\\|`，其余字节不变"
+    );
+    // 会话确认这次本地回声（单飞行：确认后才能再发下一条请求）。
+    confirm(&mut controller, &request.command_id, 9);
+    // 与当前源码相同 → 不产生空请求。
+    assert!(controller
+        .replace_table_cell_text(TABLE_LINE, 1, 1, "3")
+        .expect("相同文本不应报错")
+        .is_none());
+    // 空 cell 可以提交空串（= 清空该格）。
+    let cleared = controller
+        .replace_table_cell_text(TABLE_LINE, 1, 0, "")
+        .expect("清空不应失败")
+        .expect("从非空清空必须产生请求");
+    assert_eq!(cleared.edits.len(), 1);
+    assert_eq!(
+        controller.source_text(),
+        "# 表格\n\n| 名称 | 数量 |\n|:--|--:|\n|  | 3 |\n\n后文\n"
+    );
+    // caret 落在整表末尾（对象内部没有文本落点）。
+    assert!(controller
+        .projection()
+        .object_display_range(parse(&controller.source_text()).tables()[0].span())
+        .is_some());
+}
+
+#[test]
 fn pipes_are_escaped_and_newlines_never_break_the_row() {
     let mut controller = open(TABLE_SOURCE);
     controller

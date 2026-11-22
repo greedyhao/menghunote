@@ -541,29 +541,25 @@ impl EditorElement {
                 {
                     return;
                 }
-                // 单元格就地编辑（ADR 0019 S3b2）：点在正在编辑的那个 cell 所在的**视觉行**
-                // 上 → 照常落 caret（控制器会把 caret 夹在 cell 文本内）；点在别处 →
-                // 先提交（一次 `EditRequest` = 一个撤销组），再把这次点击落成 caret。
-                let editing_cell = down_view
+                // 单元格原地编辑浮层（ADR 0019 S3b2）：点在浮层**外** → 先提交这次编辑
+                // （一次 `EditRequest` = 一个撤销组），随后继续按正常命中处理这次点击
+                // （选别的格 / 落正文 caret）。浮层内部点击由输入框自己的监听
+                // `stop_propagation` 拦住，不会走到这里。
+                //
+                // 提交后表格仍是 Object、display 长度不变，所以本帧（上一帧）几何算出的
+                // display 字节仍然有效，不需要再做坐标换算。
+                if down_view
                     .update(cx, |view, _| view.is_editing_table_cell())
-                    .unwrap_or(false);
-                if editing_cell {
-                    let cell_row = down_view
-                        .update(cx, |view, _| view.table_cell_edit_display_anchor())
-                        .ok()
-                        .flatten()
-                        .map(|anchor| down_geometry.frame.row_of_byte(anchor));
-                    if cell_row != Some(down_geometry.row_at_y(event.position.y)) {
-                        let (byte, bias) = down_geometry
-                            .byte_at_with_bias(event.position)
-                            .unwrap_or((down_geometry.byte_at(event.position), Bias::Right));
-                        down_view
-                            .update(cx, |view, cx| {
-                                view.commit_table_cell_edit_and_place_caret(byte, bias, window, cx)
-                            })
-                            .ok();
-                        return;
-                    }
+                    .unwrap_or(false)
+                {
+                    down_view
+                        .update(cx, |view, cx| {
+                            view.commit_table_cell_edit(None, cx);
+                            // 这次点击可能落在正文/别的对象上；选中态先清掉，若命中
+                            // 另一个单元格，下面的 `click_table_cell` 会重新设置。
+                            view.clear_table_cell_selection(cx);
+                        })
+                        .ok();
                 }
                 // 任务复选框（ADR 0019 S3）：只切换 source，不落正文 caret、不开始拖选。
                 if let Some((item, source)) = down_geometry
@@ -1025,7 +1021,15 @@ impl Element for EditorElement {
         // gpui 的 `cursor_style` 从后往前取第一个 hover 的 hitbox；主 hitbox 覆盖
         // 正文，必须在**前**注册，链接的 PointingHand 后注册才能压过 IBeam。
         if let Some(hitbox) = &self.hitbox {
-            window.set_cursor_style(CursorStyle::IBeam, hitbox);
+            // 表格行列拖拽中（ADR 0019 S3b6）：指针可能已经离开把手、落在正文上，
+            // 这时再显示 I-beam 会误导；换成“抓紧”指针。drag 状态是可选交互提示，
+            // 不改变任何命中/caret 行为。
+            let cursor = if self.view.read(cx).table_drag_active() {
+                CursorStyle::ClosedHand
+            } else {
+                CursorStyle::IBeam
+            };
+            window.set_cursor_style(cursor, hitbox);
         }
         for hitbox in &self.link_hitboxes {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);

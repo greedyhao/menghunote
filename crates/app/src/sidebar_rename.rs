@@ -33,11 +33,36 @@ use crate::editor::theme;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenameEvent {
     /// 用户按 `Enter`，且标题非空：载荷是**trim 后**的新标题。
+    ///
+    /// [`RenameMode::Cell`] 下载荷是**原始**文本（允许空串，空格不 trim）。
     Commit(String),
-    /// 标题为空/纯空白：宿主应提示并保持编辑。
+    /// 标题为空/纯空白：宿主应提示并保持编辑（仅 [`RenameMode::Title`]）。
     Blank,
     /// 用户取消（`Esc`、外部点击等）。
     Cancel,
+    /// [`RenameMode::Cell`] 下按了 `Tab` / `Shift+Tab`：提交这一格并跳到下一格/上一格。
+    Advance {
+        /// `true` = Tab（向后），`false` = Shift+Tab（向前）。
+        forward: bool,
+        /// 按键**当时**的文本（平台随后补发的 `\t` 不能再算进来）。
+        text: String,
+    },
+    /// 文本变了（键入 / 删除 / 粘贴 / IME 上屏）。宿主用它同步草稿文本，
+    /// 关闭/切换文档时不必再借 `Window` 读取输入框。
+    Changed,
+}
+
+/// 输入框的用途：决定预填光标、Enter 提交语义与 `Tab` 行为。
+///
+/// 侧栏标题与表格单元格共用**同一套** IME/选区/光标本体；差异只在这里，避免复制
+/// 第二份 `EntityInputHandler`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameMode {
+    /// 侧栏标题：预填并全选；`Enter` 提交 trim 后非空标题，空标题拒绝。
+    Title,
+    /// 表格单元格：光标在文本末尾；`Enter` 提交原始文本（空串也合法），
+    /// `Tab`/`Shift+Tab` 提交并跳格。
+    Cell,
 }
 
 /// 行内编辑的纯状态：文本 + 锚点/光标（byte 偏移）。
@@ -68,6 +93,19 @@ impl RenameState {
             text,
             anchor: 0,
             caret: end,
+            marked: None,
+        }
+    }
+
+    /// 新建并把光标放在**末尾**（表格单元格：单击后从格尾继续输入）。
+    #[must_use]
+    pub fn at_end(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let caret = text.len();
+        Self {
+            text,
+            anchor: caret,
+            caret,
             marked: None,
         }
     }
@@ -122,7 +160,7 @@ impl RenameState {
         self.caret = self.text.len();
     }
 
-    /// 把选区（或光标处）替换成 `text`；换行/制表符会被过滤成空格。
+    /// 把选区（或光标处）替换成 `text`；换行/制表符会被**过滤掉**（单行标题）。
     pub fn insert(&mut self, text: &str) {
         let filtered: String = text
             .chars()
@@ -131,8 +169,40 @@ impl RenameState {
         if filtered.is_empty() {
             return;
         }
+        self.replace_selection(&filtered);
+    }
+
+    /// [`Self::insert`] 的表格单元格版本：换行/制表符换成**一个空格**而不是丢弃
+    /// （粘贴多行文本时保留词间分隔；真正的单行/转义由控制器提交时再兜一层）。
+    pub fn insert_cell(&mut self, text: &str) {
+        let filtered: String = text
+            .chars()
+            .map(|ch| {
+                if matches!(ch, '\n' | '\r' | '\t') {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        self.replace_selection(&filtered);
+    }
+
+    /// 把已经清理过的单行文本替换进选区；空串 = 删除选区。
+    fn replace_selection(&mut self, filtered: &str) {
+        if filtered.is_empty() {
+            let range = self.selected_byte_range();
+            if range.start == range.end {
+                return;
+            }
+            self.text.replace_range(range.clone(), "");
+            self.anchor = range.start;
+            self.caret = range.start;
+            self.marked = None;
+            return;
+        }
         let range = self.selected_byte_range();
-        self.text.replace_range(range.clone(), &filtered);
+        self.text.replace_range(range.clone(), filtered);
         let caret = range.start + filtered.len();
         self.anchor = caret;
         self.caret = caret;
@@ -292,6 +362,28 @@ impl RenameState {
         self.anchor = caret;
         self.caret = caret;
     }
+
+    /// [`Self::commit_marked`] 的表格单元格版本：换行/制表符换成空格。
+    pub fn commit_marked_cell(&mut self, text: &str) {
+        let Some(marked) = self.marked.take() else {
+            self.insert_cell(text);
+            return;
+        };
+        let filtered: String = text
+            .chars()
+            .map(|ch| {
+                if matches!(ch, '\n' | '\r' | '\t') {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        self.text.replace_range(marked.start..marked.end, &filtered);
+        let caret = marked.start + filtered.len();
+        self.anchor = caret;
+        self.caret = caret;
+    }
 }
 
 /// 上一个字符边界。
@@ -334,21 +426,53 @@ pub(crate) fn utf16_to_byte(text: &str, utf16: usize) -> Option<usize> {
 pub struct RenameInput {
     state: RenameState,
     focus_handle: FocusHandle,
+    mode: RenameMode,
 }
 
 impl RenameInput {
-    /// 新建输入框：预填 `initial` 并**全选**。
+    /// 新建标题输入框：预填 `initial` 并**全选**。
     pub fn new(initial: &str, cx: &mut Context<Self>) -> Self {
+        Self::new_with_mode(initial, RenameMode::Title, cx)
+    }
+
+    /// 新建表格单元格输入框：预填 `initial`，光标在**末尾**（单击单元格的默认落点）。
+    pub fn new_cell_at_end(initial: &str, cx: &mut Context<Self>) -> Self {
+        Self::new_with_mode(initial, RenameMode::Cell, cx)
+    }
+
+    fn new_with_mode(initial: &str, mode: RenameMode, cx: &mut Context<Self>) -> Self {
+        let state = match mode {
+            RenameMode::Title => RenameState::selecting_all(initial),
+            RenameMode::Cell => RenameState::at_end(initial),
+        };
         Self {
-            state: RenameState::selecting_all(initial),
+            state,
             focus_handle: cx.focus_handle(),
+            mode,
         }
+    }
+
+    /// 输入框用途（绘制尺寸/提交语义都从这里来）。
+    #[must_use]
+    pub fn mode(&self) -> RenameMode {
+        self.mode
     }
 
     /// 当前真实标题（不含 preedit）。
     #[must_use]
     pub fn text(&self) -> &str {
         self.state.text()
+    }
+    /// 宿主转发的文本输入（正常路径不会用到：输入框自己注册了 `EntityInputHandler`）。
+    ///
+    /// 只作为“平台把文本送错焦点”的兜底：仍走同一套单行清理，不产生第二套输入实现。
+    pub fn insert_from_host(&mut self, text: &str, cx: &mut Context<Self>) {
+        match self.mode {
+            RenameMode::Title => self.state.insert(text),
+            RenameMode::Cell => self.state.insert_cell(text),
+        }
+        cx.emit(RenameEvent::Changed);
+        cx.notify();
     }
 
     /// 状态（单测/宿主用）。
@@ -366,6 +490,25 @@ impl RenameInput {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let extend = modifiers.shift;
+
+        // 表格单元格允许粘贴纯文本（GFM 转义在控制器提交时做）；标题输入框仍保持
+        // 既有“剪贴板 v1 不支持”的行为，避免顺手改变侧栏重命名。
+        if self.mode == RenameMode::Cell
+            && self.state.marked_utf16().is_none()
+            && modifiers.control
+            && !modifiers.alt
+            && !modifiers.shift
+            && !modifiers.platform
+            && key == "v"
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.state.insert_cell(&text);
+                cx.emit(RenameEvent::Changed);
+                cx.notify();
+            }
+            window.prevent_default();
+            return;
+        }
 
         // 与搜索框共用同一套快捷键语义（`Ctrl+A` 全选；组合态忽略）。
         match crate::text_shortcuts::shortcut_action(
@@ -385,17 +528,53 @@ impl RenameInput {
             crate::text_shortcuts::ShortcutAction::None => {}
         }
 
+        // 调试入口（仅 debug 构建）：与编辑器正文同一条 IME 语义（组合 → 上屏）。
+        // 只对表格单元格开放，侧栏重命名保持原样。
+        #[cfg(debug_assertions)]
+        if self.mode == RenameMode::Cell
+            && self.state.marked_utf16().is_none()
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && key == "f9"
+        {
+            self.state.set_marked("zhongwen");
+            self.state.commit_marked_cell("中文");
+            cx.emit(RenameEvent::Changed);
+            cx.notify();
+            window.prevent_default();
+            return;
+        }
+
         match key {
             "enter" => {
                 if self.state.marked.is_some() {
                     // 组合中按 Enter 是"上屏"，交给 IME，不当提交。
                     return;
                 }
-                if let Some(title) = self.state.trimmed_title() {
-                    cx.emit(RenameEvent::Commit(title));
-                } else {
-                    cx.emit(RenameEvent::Blank);
+                match self.mode {
+                    RenameMode::Title => {
+                        if let Some(title) = self.state.trimmed_title() {
+                            cx.emit(RenameEvent::Commit(title));
+                        } else {
+                            cx.emit(RenameEvent::Blank);
+                        }
+                    }
+                    // 单元格允许提交空串（清空格子），空格原样保留。
+                    RenameMode::Cell => {
+                        cx.emit(RenameEvent::Commit(self.state.text().to_owned()));
+                    }
                 }
+            }
+            "tab" if self.mode == RenameMode::Cell => {
+                if self.state.marked.is_some() {
+                    // 组合中 Tab 属于输入法（候选选择），不跳格。
+                    return;
+                }
+                cx.emit(RenameEvent::Advance {
+                    forward: !extend,
+                    text: self.state.text().to_owned(),
+                });
             }
             "escape" => {
                 if self.state.marked.is_some() {
@@ -408,10 +587,12 @@ impl RenameInput {
             }
             "backspace" => {
                 self.state.backspace();
+                cx.emit(RenameEvent::Changed);
                 cx.notify();
             }
             "delete" => {
                 self.state.delete_forward();
+                cx.emit(RenameEvent::Changed);
                 cx.notify();
             }
             "left" => {
@@ -496,11 +677,14 @@ impl EntityInputHandler for RenameInput {
         cx: &mut Context<Self>,
     ) {
         oneline_trace("上屏", text);
-        if self.state.marked.is_some() {
-            self.state.commit_marked(text);
-        } else {
-            self.state.insert(text);
+        let marked = self.state.marked.is_some();
+        match (self.mode, marked) {
+            (RenameMode::Title, true) => self.state.commit_marked(text),
+            (RenameMode::Title, false) => self.state.insert(text),
+            (RenameMode::Cell, true) => self.state.commit_marked_cell(text),
+            (RenameMode::Cell, false) => self.state.insert_cell(text),
         }
+        cx.emit(RenameEvent::Changed);
         cx.notify();
     }
 
@@ -623,10 +807,29 @@ impl Element for RenameElement {
         cx: &mut App,
     ) {
         let state = self.input.read(cx).state.clone();
+        let mode = self.input.read(cx).mode();
         let display = state.display();
         let font = theme::font();
-        let font_size = px(theme::FONT_SIZE - 1.0);
-        let line_height = px(theme::LINE_HEIGHT);
+        // 标题与表格单元格只差尺寸：单元格更小，并在 cell 行高里垂直居中
+        // （浮层矩形就是 cell 矩形，不居中会让文字贴顶）。
+        let (font_size, line_height, pad_x, top_pad) = match mode {
+            RenameMode::Title => (
+                px(theme::FONT_SIZE - 1.0),
+                px(theme::LINE_HEIGHT),
+                PAD_X,
+                px(0.0),
+            ),
+            RenameMode::Cell => {
+                let line_height = px(theme::line_height_for(theme::TABLE_FONT_SIZE));
+                let top_pad = ((bounds.size.height - line_height) / 2.0).max(px(0.0));
+                (
+                    px(theme::TABLE_FONT_SIZE),
+                    line_height,
+                    theme::TABLE_CELL_PAD_X,
+                    top_pad,
+                )
+            }
+        };
 
         // 背景：**不透明白底** + 中性边框。输入框必须压住行的选中底色
         // （行可能是蓝色"当前打开"态），否则两层蓝叠在一起看不出哪段是选中。
@@ -651,7 +854,7 @@ impl Element for RenameElement {
             &runs,
             None,
         );
-        let origin = point(bounds.origin.x + px(PAD_X), bounds.origin.y);
+        let origin = point(bounds.origin.x + px(pad_x), bounds.origin.y + top_pad);
 
         // 顺序很重要：**选区底色先画、文字后画**。
         // 反过来的话全选高亮会把文字整块盖住——用户看到的"空输入框只有 caret"
