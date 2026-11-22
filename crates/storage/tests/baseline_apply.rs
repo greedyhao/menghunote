@@ -1585,6 +1585,26 @@ fn marker_blocks_apply_and_finish_and_finishable() {
 /// 判定（事务外看到无 outbox）之后、事务执行期间插进一条 outbox：事务内重判必须把
 /// action 降级为 kept_local_edit，`notes.deleted` 保持 0。
 #[test]
+fn finish_without_journal_rejects_residual_marker_before_not_found() {
+    let (_dir, vault) = fresh_vault();
+    mark_baseline_verify_failed(&vault, "无 journal 的残留 marker").expect("marker");
+
+    let error = finish_baseline_apply(&vault, 5, "c5")
+        .expect_err("无 journal 但有 marker 时 finish 必须先拒绝 marker");
+    assert!(
+        matches!(&error, StorageError::SyncConflict { .. }),
+        "应当是带原因的 SyncConflict，实际 {error:?}"
+    );
+    let message = format!("{error}");
+    assert!(message.contains("无 journal 的残留 marker"));
+    assert!(message.contains("abort_baseline_apply"));
+
+    // abort 是唯一清理入口；清理后 begin 可重新开始。
+    assert!(!abort_baseline_apply(&vault).expect("abort"));
+    assert_eq!(baseline_verify_failure(&vault).expect("read"), None);
+}
+
+#[test]
 fn abort_without_journal_clears_residual_marker() {
     let (_dir, vault) = fresh_vault();
     mark_baseline_verify_failed(&vault, "残留 marker").expect("marker");

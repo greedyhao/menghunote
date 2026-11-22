@@ -24,9 +24,9 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, point, px, svg, AnyElement, App, Context, Entity, FocusHandle, FontWeight,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point,
-    Render, ScrollDelta, SharedString, Size, Window,
+    canvas, div, point, px, svg, AnyElement, App, ClipboardItem, Context, Entity, FocusHandle,
+    FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    Pixels, Point, Render, ScrollDelta, SharedString, Size, Window,
 };
 use menghunote_editor::EditorController;
 use menghunote_storage::rename_links::{
@@ -4231,23 +4231,40 @@ impl AppShell {
         });
 
         // 2) 再排空旧文档：超时则**中止切换**，不许静默丢编辑。
-        let timed_out = if let Some(previous) = &self.active {
-            let report = previous
-                .view
-                .update(cx, |view, _| view.drain_and_close(SWITCH_CLOSE_TIMEOUT));
+        let (blocked, failure_notice) = if let Some(previous) = &self.active {
+            let (report, live_text) = previous.view.update(cx, |view, _| {
+                let text = view.source_text();
+                (view.drain_and_close(SWITCH_CLOSE_TIMEOUT), text)
+            });
             eprintln!(
-                "[menghunote] 切换前排空「{}」：durable={} pending_edits={} pending_materialize={} timed_out={}",
+                "[menghunote] 切换前排空「{}」：durable={} pending_edits={} pending_materialize={} timed_out={} flush_error={}",
                 previous.node_id,
                 report.durable.is_some(),
                 report.pending_edits,
                 report.pending_materialize,
-                report.timed_out
+                report.timed_out,
+                report.flush_error.is_some()
             );
-            report.timed_out
+            if report.needs_reopen() {
+                // 会话已不可恢复，继续编辑只会丢改动；把 live 正文复制到剪贴板，
+                // 让用户至少能手工导出，再重开该文档。
+                cx.write_to_clipboard(ClipboardItem::new_string(live_text));
+                (
+                    true,
+                    Some(
+                        "文档保存已不可恢复，已把当前正文复制到剪贴板；请重开该文档后再切换"
+                            .to_owned(),
+                    ),
+                )
+            } else if report.timed_out || report.flush_error.is_some() {
+                (true, Some("保存未完成，稍后再切换".to_owned()))
+            } else {
+                (false, None)
+            }
         } else {
-            false
+            (false, None)
         };
-        if timed_out {
+        if blocked {
             // 新开的视图没有写入任何东西，直接排空丢弃即可。
             view.update(cx, |view, _| {
                 view.drain_and_close(SWITCH_CLOSE_TIMEOUT);
@@ -4256,7 +4273,7 @@ impl AppShell {
                 "[menghunote] 保存未完成，中止切换到「{}」；当前文档保持不变",
                 entry.title
             );
-            self.notice = Some("保存未完成，稍后再切换".to_owned());
+            self.notice = failure_notice;
             cx.notify();
             return false;
         }
@@ -4570,7 +4587,28 @@ impl AppShell {
         self.title_edit.clone()
     }
 
-    pub fn close_all(&mut self, cx: &mut Context<Self>) {
+    pub fn close_all(&mut self, cx: &mut Context<Self>) -> bool {
+        // 不可恢复的 flush 不能静默关窗：先复制 live 正文并保留窗口，让用户至少能
+        // 手工导出；返回 false 给 `on_window_should_close` 取消关闭。
+        if let Some(active) = &self.active {
+            let unrecoverable = active
+                .view
+                .update(cx, |view, _| view.last_write_error())
+                .filter(|message| message.contains("需要重开文档"));
+            if let Some(message) = unrecoverable {
+                let text = active.view.update(cx, |view, _| view.source_text());
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.notice = Some(
+                    "文档保存已不可恢复，已把当前正文复制到剪贴板；请重开该文档后再关闭".to_owned(),
+                );
+                eprintln!(
+                    "[menghunote] 拒绝关窗：文档「{}」的 flush 不可恢复（{message}）",
+                    active.node_id
+                );
+                cx.notify();
+                return false;
+            }
+        }
         // ADR 0024 §2.2：关窗前 flush 当前笔记的最后一个历史版本（失败只提示）。
         //
         // 生产入口（main.rs / AppRoot Main）已经用 `window.on_window_should_close`
@@ -4584,18 +4622,30 @@ impl AppShell {
         self.drawing = None;
         self.drawing_events = None;
         let Some(active) = self.active.take() else {
-            return;
+            return true;
         };
-        let report = active
-            .view
-            .update(cx, |view, _| view.drain_and_close(SWITCH_CLOSE_TIMEOUT));
+        let (report, live_text) = active.view.update(cx, |view, _| {
+            let text = view.source_text();
+            (view.drain_and_close(SWITCH_CLOSE_TIMEOUT), text)
+        });
         eprintln!(
-            "[menghunote] 关窗前排空「{}」：durable={} pending_edits={} timed_out={}",
+            "[menghunote] 关窗前排空「{}」：durable={} pending_edits={} timed_out={} flush_error={}",
             active.node_id,
             report.durable.is_some(),
             report.pending_edits,
-            report.timed_out
+            report.timed_out,
+            report.flush_error.is_some()
         );
+        if report.needs_reopen() {
+            // 窗口即将关闭，无法再弹交互；至少把 live 正文放进剪贴板，避免用户
+            // 只能从内存里找回（不可恢复时 session 已不能再写库）。
+            cx.write_to_clipboard(ClipboardItem::new_string(live_text));
+            eprintln!(
+                "[menghunote] 关窗时 flush 不可恢复，已把「{}」当前正文复制到剪贴板",
+                active.node_id
+            );
+        }
+        true
     }
 
     /// 常驻同步状态（ADR 0012 S3）：`None` = dev-sync 未启用（整块不渲染）。

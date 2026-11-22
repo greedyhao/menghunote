@@ -1125,6 +1125,12 @@ impl EditorView {
         self.controller.source_text()
     }
 
+    /// 关闭前可见的 flush 失败原因（不可恢复时含「需要重开文档」）。
+    #[must_use]
+    pub fn last_write_error(&self) -> Option<String> {
+        self.driver.last_write_error()
+    }
+
     /// 布局用文本：**display**（Markdown 标记按当前 selection 隐藏/显现）。
     ///
     /// 整行独占的图片在这里是占位符（`U+FFFC`），不是源码；测试用它断言

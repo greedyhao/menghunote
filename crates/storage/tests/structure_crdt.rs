@@ -337,3 +337,23 @@ fn snapshot_is_deterministic_across_replays() {
         second.snapshot().expect("快照")
     );
 }
+
+#[test]
+fn deleted_note_remains_in_snapshot_with_note_identity() {
+    let doc = doc(1);
+    let seed = doc.create_note("删了也不物理移除", 1_000).expect("建笔记");
+    doc.delete_note(&seed.node_id, 2_000).expect("删除笔记");
+
+    // 删除是 grow-only meta 事件，不是 LoroTree::delete；snapshot 仍保留节点与
+    // note/body 身份。baseline verify 因此不会把“本地并发删除”误判成结构缺项。
+    let snapshot = doc.snapshot().expect("树快照");
+    let node = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.node_id == seed.node_id)
+        .expect("删除节点仍在快照");
+    assert!(node.deleted, "有效删除必须反映在 snapshot.deleted");
+    assert!(node.is_note(), "deleted 节点仍有 note/body 身份");
+    assert_eq!(node.note_id.as_deref(), Some(seed.note_id.as_str()));
+    assert_eq!(node.body_doc_id.as_deref(), Some(seed.body_doc_id.as_str()));
+}

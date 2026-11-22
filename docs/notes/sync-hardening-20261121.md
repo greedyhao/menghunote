@@ -91,14 +91,14 @@ cargo test -p menghunote-storage                    274 passed / 0 failed (1 ign
 cargo test -p menghunote-sync                       634 passed / 0 failed (3 ignored manual)
 cargo test -p menghunote-app                        740 passed / 0 failed
 cargo test -p menghunote-app --features dev-sync    891 passed / 0 failed
-cargo test --workspace                             2884 passed / 0 failed
-cargo test --workspace --features menghunote-app/dev-sync 3035 passed / 0 failed
+cargo test --workspace                             2926 passed / 0 failed
+cargo test --workspace --features menghunote-app/dev-sync 3077 passed / 0 failed
 ```
 
 > **最终复跑（2026-11-21 评审收尾）**：review 后新增 P1 门禁/访问器/资产批测试，当前计数
-> workspace **2913 / 0**、`--features menghunote-app/dev-sync` **3064 / 0**；
-> storage **299** / sync **638**。
-> 上面的 2884 / 3035 是本文件收尾时点的批次，差异来自同轮后续新增的测试，两批计数
+> workspace **2926 / 0**、`--features menghunote-app/dev-sync` **3077 / 0**；
+> storage **309** / sync **641** / app **740**。
+> 上面的 2926 / 3077 是本文件收尾时点的批次；同轮后续新增测试已计入
 > 按批次引用，不要把增量当成回归。scan 探针的批次口径：最终 release 复跑
 > **0.428 / 4.039 ms** 与 `sync-phase0-metrics.md` §8.7.4 的初次 3-run
 > **0.479 / 3.796 ms** 是两批，不要混算（详见该文件 §8.7.6）。
@@ -293,3 +293,96 @@ cargo test -p menghunote-sync --test bootstrap \
     夹具 12.8 s（复跑 12.2 s）/峰值 RSS 202 MiB，visitor ≈33 ms。结论：per-page replay 是毫秒级，
     §10.4 的“~2 s/篇”折算不成立；45 s@20MiB 是 verify/attached merge，不是纯 replay。
     4096 页真实成本仍需按 `4096 × RTT + 33 ms` 标定，FakeRelay 不能外推；阈值未改。
+
+
+11. **第二轮评审 P1 修补（2026-11-21）**：
+    - `finish_baseline_apply` 的 marker 检查移到 `load_journal` 之前：无 journal 但残留/损坏
+      marker 时不再先返回 `NotFound`；测试
+      `finish_without_journal_rejects_residual_marker_before_not_found`。
+    - `flush.rs` 将 `StorageError::Corrupt` 分类为永久失败，首次写和重建后重试都直接
+      `Unrecoverable`，不再落无限 `Retryable`；测试
+      `flush_treats_permanent_corrupt_as_unrecoverable_not_retryable`。
+    - `baseline_apply` 的 `head_seq.saturating_add(1)` 改 `checked_add(1)`；现有 schema 的
+      head_seq 来自 SQLite i64，checked_add 分支不可达，真正兜底是随后的 `i64_of(seq)`
+      （返回 `Corrupt`）。保留 checked_add 是防御未来放宽到 u64，**不能**把它报告成
+      “已验证可达的溢出修复”。
+    - `bootstrap::finalize` 与 `validate_remote` 共用 `validate_pin_shape`：`control_hash`
+      无 `control_rev` 在 finalize 也拒绝；finalize 补 `stored.highwater > state.head_seq`
+      的 rollback 检查；测试 `pin_shape_rejects_hash_without_rev_on_both_paths`。
+    - 删除 `session_flush` DurableAck 测试里恒真的 `COUNT(*).len()==1` 死断言，保留真实
+      `count()==2` 断言。
+    - `exactly(3,1)` 的语义已确认：`(index, rows)`，第 3 条 staging journal DELETE 必须
+      恰好 1 行；其余 DELETE 不设守卫；`abort_guard_failure_keeps_marker_for_retry` 已覆盖
+      guard 失败整体回滚 + marker 保留。不是缺陷。
+    - `SyncContext.key_epoch` 的 rotation 衔接已在 App 层存在（`shell.rs` 在 rotation 成功后
+      先更新 `self.sync` 再重建活动视图），无需新增 storage API；但本轮未补跨 crate 接线测试。
+    - 不可恢复 `CloseReport.flush_error` 已有测试；**UI 阻断关闭/切换 + 导出/复制 live 正文
+      → 重开**仍未接。
+    - detached 矩阵仍缺：baseline VV 含本地未知 peer、`from` 超前 doc VV、重复 import、
+      多 peer 物理乱序、大文档 detached merge；结构 verify 对并发删除的产品语义仍未定。
+    - 4096+1 页超限失败、真实 relay RTT、`unrecoverable && pending_len==0` 无 ACK 仍缺测试。
+
+
+12. **第三轮评审 P1/P2 修补（2026-11-21）**：
+    - `SessionDriver::close` 在 `session.flush_is_unrecoverable()` 时立即 break，不再等满
+      timeout 才返回 `CloseReport.flush_error`；测试把 timeout 从 0 改为 5s 并断言
+      `elapsed < 1s`。
+    - `is_permanent_corrupt` 改为**正向白名单** `is_retryable_write_error`：只有
+      `Io`/`Sqlite`/`SnapshotBusy`/`WriteBackpressure` 可重试；`Corrupt`、`Loro`、
+      `LoroEncode`、`Coord`、schema 漂移、通道关闭等一律 fail-closed 到“需要重开文档”，
+      不再形成永久 Retryable。
+    - `apply_selected` 的 `mark_baseline_verify_failed` 写失败不再用 marker 错误覆盖原始
+      verify 错误：返回带根因 + marker 失败 + 必须 abort 的 `StorageError::Corrupt`。
+    - 结构 verify 的并发删除语义已按当前实现定案：`StructureDoc::snapshot()` 返回**全量
+      节点**（含 `deleted`），删除是 grow-only meta 事件而不是 `LoroTree::delete`；因此
+      本地并发删除基线笔记不会让 `merged_notes` 缺项，verify 不会误写 marker。产品语义是
+      “删笔记不删正文，恢复仍可用”；`verify_imported` 已加注释，结构侧新增
+      `deleted_note_remains_in_snapshot_with_note_identity` 钉住“deleted 节点仍保留
+      note/body 身份”。若未来改成物理删节点，必须重新定义 verify。
+    - `auto_rebuilt` 粒度仍是每条 flush 命令一次，不是每批一次；慢盘多批场景可能保守地
+      进入不可恢复，已在 `flush.rs` 注释写明，未改行为。
+    - UI 的关闭/切换阻断 + “导出/复制 live 正文 → 重开”仍未接；detached 五项、4096+1 页、
+      真实 RTT、`unrecoverable && pending_len==0` 无 ACK 仍未补。
+
+
+13. **第四轮评审 P1/P2 修补（2026-11-21）**：
+    - `Sqlite` 不再整类可重试：只有 `DatabaseBusy`/`DatabaseLocked` 进入
+      `is_retryable_write_error`；`ConstraintViolation`/`ReadOnly`/`CannotOpen`/
+      `DatabaseCorrupt`/`NotFound` 等永久错误直接 `Unrecoverable`。新增
+      `flush_treats_permanent_sqlite_error_as_unrecoverable` 与分类单测
+      `retryable_write_error_is_a_positive_whitelist`。
+    - 普通写失败的“可重试”集成用例改用**真实外部写锁**产生 SQLITE_BUSY，不再用
+      `RAISE(ABORT)`（它实际是 `ConstraintViolation`，现在按永久错误处理）。原
+      “重建后重试 Retryable”集成用例因无法用真实 BUSY 精确卡在重建后而移除；
+      分类由单测覆盖，**RebuildOutcome::Retryable 的直接集成覆盖暂时缺一条**。
+    - `apply_selected` 的 marker 写失败改报 `StorageError::SyncConflict`（journal 仍可
+      续跑，不是数据损坏），保留原始 verify 根因。
+    - `read_meta_array` 长度非法改报 `SyncError::LocalCorrupt`，与 pin 结构校验统一；
+      新增 `read_meta_array_rejects_wrong_length_as_local_corrupt`。
+    - `finalize` 在“已有进度、不改写 cursor”时也对 `sync.relay_cursor` 做 CAS 自写回，
+      防止读完 cursor 后被并发改写而静默放过；暂无专门的并发注入用例。
+    - 未处理：`state_from_journal` 的 `finishable` 在计数相等时仍做 O(N) 逐项校验
+      （Phase1B 高频状态查询需缓存/近似）；结构 verify deleted 语义已定案但依赖当前
+      snapshot 实现；UI 救济、detached 五项、真实 RTT、4096+1 页、pending_len==0 无 ACK
+      仍未补。
+
+
+14. **实现收口（2026-11-21，非 RTT）**：
+    - detached 矩阵补齐 5 项：本地未知 peer、`from` 超前本地 VV、同一 update 重复 import、
+      多 peer 物理乱序、大文档 merge；`body_doc_detached_oplog` 现在 **16** 用例。
+    - `coverage_scan_rejects_more_than_max_pages`：S=4096×256+1，validate 用满 4096 页后
+      返回 `未证明覆盖到 S（页数超过上限）`；`PageIndexRelay` 只替换 `log` 为 partition_point
+      切片，避免 FakeRelay 的 O(S²) 夹具。生产文案仍不含数字 4096。
+    - `state_from_journal` 的 `finishable` 改为 O(1) 计数近似；逐项 applied/摘要证明只在
+      `finish_baseline_apply` 做，读状态不再 O(N)。
+    - flusher 在 `unrecoverable` 时即使 `pending_len==0` 也不补发确认 ACK（防御分支，无专门
+      注入用例）。
+    - `RebuildOutcome::Retryable` 的分类抽成 `rebuild_write_error_outcome` 并单测 BUSY /
+      Constraint；完整 flusher 路径的 Retryable 仍无直接集成用例（真实 BUSY 难以精确卡在
+      重建后）。
+    - UI：切换前 `CloseReport.needs_reopen`/`flush_error` 阻断并复制 `source_text`；关窗前
+      `last_write_error` 不可恢复则复制正文并通过 `on_window_should_close` 返回 false 取消关窗。
+      没有单独的“导出”按钮，救济是自动复制到剪贴板 + 保留现场。
+    - 不再把真实 RTT 当本地可测项；机会性追赶启用前必须真实 relay 标定。
+    - 仍未补：`finalize` cursor CAS 的并发注入用例、`unrecoverable && pending_len==0` 的
+      专门测试、Rebuild Retryable 的完整路径集成、UI 真机观感验证。

@@ -228,6 +228,19 @@ pub struct CloseReport {
     pub flush_error: Option<String>,
 }
 
+impl CloseReport {
+    /// 这次关闭是否暴露了需要“重开文档”的不可恢复失败。
+    ///
+    /// 只看 `flush_error` 的统一文案（`reopen_message`）；普通磁盘/SQLite 的瞬时失败
+    /// 也可能带 `flush_error`，但允许下一次再 flush，不应被 UI 当成永久坏状态。
+    #[must_use]
+    pub fn needs_reopen(&self) -> bool {
+        self.flush_error
+            .as_deref()
+            .is_some_and(|message| message.contains("需要重开文档"))
+    }
+}
+
 /// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MaterializeJob {
@@ -782,6 +795,11 @@ impl SessionDriver {
 
             let durable_ok = durable.is_some() || !needs_flush;
             let drained = durable_ok && self.materializer.pending() == 0;
+            // 不可恢复的 flush 不会再有 DurableAck：不要等满 timeout，直接把报告
+            // （含 flush_error）交给调用方。正常磁盘错误不走这里，仍按原超时收敛。
+            if self.session.flush_is_unrecoverable() {
+                break;
+            }
             if drained || Instant::now() >= deadline {
                 // 收尾：把最后一批 B 结果也计入
                 for event in self.pump() {

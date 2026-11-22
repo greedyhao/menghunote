@@ -212,16 +212,6 @@ fn unflushed_edits_are_lost_on_reopen_but_durable_prefix_survives() {
     // 两条 update 各自占一个 seq
     assert_eq!(session.snapshot().durable_head_seq, 2);
     assert_eq!(
-        vault
-            .query(
-                "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-                &[]
-            )
-            .expect("count")
-            .len(),
-        1
-    );
-    assert_eq!(
         count(
             &vault,
             "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
@@ -521,6 +511,89 @@ fn flush_reports_unrecoverable_after_bounded_rebuild() {
 
 /// P1-3 的另一个不可恢复分支：自动重建要读新 head，读不到/解码失败同样必须 fail-closed
 /// （不尝试写、不无限重试），并明确提示需要重开文档。
+/// 永久性 SQLite 错误（约束/ReadOnly/NotFound 等）也不能整类当成 Retryable；
+/// 只有 BUSY/LOCKED 才值得下一次 flush 再试。
+#[test]
+fn flush_treats_permanent_sqlite_error_as_unrecoverable() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let mut session = open_session(&vault, options(PEER_A));
+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
+
+    vault
+        .exec(
+            "CREATE TRIGGER fail_updates BEFORE INSERT ON loro_updates \
+             BEGIN SELECT RAISE(FAIL, 'permanent sqlite failure'); END",
+            &[],
+        )
+        .expect("创建永久失败触发器");
+
+    let ticket = session.flush(FlushReason::Manual);
+    assert!(
+        session
+            .wait_for_durable(ticket.target_live_rev, Duration::from_secs(1))
+            .is_none(),
+        "永久 SQLite 错误不得发 DurableAck"
+    );
+    let message = session.last_write_error().expect("必须有可读失败原因");
+    assert!(
+        message.contains("永久性") || message.contains("需要重开文档"),
+        "永久 SQLite 错误必须 fail-closed：{message}"
+    );
+    assert_eq!(session.pending_len(), 1, "不可恢复时 journal 必须保留");
+    assert_eq!(head(&vault, "doc-1").head_seq, 0, "整笔事务必须回滚");
+
+    vault
+        .exec("DROP TRIGGER fail_updates", &[])
+        .expect("移除触发器");
+    // 不可恢复后不会自动重试；重开会话才能继续。
+    let mut reopened = open_session(&vault, options(PEER_A));
+    reopened.apply(request(&reopened, "c2", 0, vec![edit(0, 0, "重开")]));
+    let ticket = reopened.flush(FlushReason::Manual);
+    assert!(
+        reopened
+            .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
+            .is_some(),
+        "重开会话后应恢复"
+    );
+}
+
+/// 永久性 Corrupt 不能被当成“下次再试”的 Retryable：它不会自愈。
+/// 用 `head_seq = i64::MAX` 构造 `seq = head + 1` 的 `i64_of` 溢出（append_update 返回
+/// Corrupt），断言 flusher 直接进入不可恢复，而不是每次重试同一永久错误。
+#[test]
+fn flush_treats_permanent_corrupt_as_unrecoverable_not_retryable() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    vault
+        .exec(
+            "UPDATE loro_docs SET head_seq = ?1 WHERE doc_id = 'doc-1'",
+            &[Value::Integer(i64::MAX)],
+        )
+        .expect("把 head_seq 推到 i64::MAX");
+    let mut session = open_session(&vault, options(PEER_A));
+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
+
+    let ticket = session.flush(FlushReason::Manual);
+    assert!(
+        session
+            .wait_for_durable(ticket.target_live_rev, Duration::from_secs(1))
+            .is_none(),
+        "永久 Corrupt 不得发 DurableAck"
+    );
+    let message = session.last_write_error().expect("必须有可读失败原因");
+    assert!(
+        message.contains("永久性 Corrupt") || message.contains("需要重开文档"),
+        "必须明确永久失败/重开：{message}"
+    );
+    assert_eq!(session.pending_len(), 1, "不可恢复时 journal 必须保留");
+    // 后续 flush 不再写库/不再发 ACK。
+    let again = session.flush(FlushReason::Manual);
+    assert!(session
+        .wait_for_durable(again.target_live_rev, Duration::from_millis(200))
+        .is_none());
+}
+
 #[test]
 fn flush_reports_unrecoverable_when_new_head_is_unreadable() {
     let (_dir, vault) = fresh_vault();
@@ -708,19 +781,21 @@ fn flush_rebuild_keeps_sync_intent_seq_at_new_head_plus_one() {
 /// 移除注入后同一前缀必须能成功落库。
 #[test]
 fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
-    let (_dir, vault) = fresh_vault();
+    let (dir, vault) = fresh_vault();
     let _seed = seed_note(&vault, "note-1", "doc-1");
     let mut session = open_session(&vault, options_with_sync());
     session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
     assert_eq!(session.pending_len(), 1);
 
-    // 注入非 HeadConflict 的写失败：A 事务在 INSERT 处被 SQLite ABORT。
-    let trigger = SqlTrigger::install(
-        &vault,
-        "injected_flush_disk_failure",
-        "CREATE TRIGGER injected_flush_disk_failure BEFORE INSERT ON loro_updates \
-         BEGIN SELECT RAISE(ABORT, 'injected disk'); END;",
-    );
+    // 真实瞬时错误：外部连接持有写锁，且本 Vault 关闭 busy 等待，A 事务拿到
+    // SQLITE_BUSY（不是约束/只读/损坏等永久错误）。
+    vault
+        .query("PRAGMA busy_timeout=0", &[])
+        .expect("关闭 busy 等待");
+    let blocker = rusqlite::Connection::open(vault_path(&dir)).expect("打开外部连接");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("外部连接占写锁");
 
     let ticket = session.flush(FlushReason::Manual);
     let message = wait_for_write_error(&session, Duration::from_secs(10));
@@ -730,8 +805,8 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
         "普通写失败不得升级成不可恢复：{message}"
     );
     assert!(
-        message.contains("injected disk"),
-        "失败原因必须来自注入的写失败：{message}"
+        message.contains("锁") || message.contains("locked") || message.contains("busy"),
+        "失败原因必须来自 BUSY：{message}"
     );
     assert!(
         session
@@ -739,6 +814,12 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
             .is_none(),
         "普通写失败不得发出 DurableAck"
     );
+
+    blocker.execute_batch("ROLLBACK").expect("释放外部写锁");
+    drop(blocker);
+    vault
+        .query("PRAGMA busy_timeout=5000", &[])
+        .expect("恢复 busy 等待");
 
     // 前缀原样保留；没有 durable/head/intent 被写。
     assert_eq!(session.pending_len(), 1, "失败后必须保留同一前缀");
@@ -756,8 +837,7 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
     assert_eq!(head(&vault, "doc-1").head_seq, 0, "失败事务不得推进 head");
     assert_eq!(outbox_count(&vault), 0, "失败事务不得留下本地 intent");
 
-    // DROP 触发器后重试：同一前缀成功，水位/正文/intent 都补齐。
-    trigger.remove();
+    // 锁释放后重试：同一前缀成功，水位/正文/intent 都补齐。
     let ticket = session.flush(FlushReason::Manual);
     let ack = session
         .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
@@ -798,98 +878,6 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
 ///
 /// 注入点选 `BEFORE INSERT ON loro_updates`：第一次写会在 CAS（第 0 条语句）就因 head
 /// 过期失败，根本到不了 INSERT，因此触发器只命中「重建后的重试」这一次。
-#[test]
-fn flush_rebuild_retryable_write_failure_keeps_prefix_then_recovers() {
-    let (_dir, vault) = fresh_vault();
-    let _seed = seed_note(&vault, "note-1", "doc-1");
-    let mut session = open_session(&vault, options_with_sync());
-
-    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
-    let remote = BodyDoc::create("doc-1", PEER_B).expect("远端副本");
-    remote.insert_scalars(0, "远端").expect("远端编辑");
-    let remote_bytes = remote.export_all_updates().expect("导出远端 update");
-    let remote_update = pending(&remote, &loro::VersionVector::default()).expect("远端增量");
-    session
-        .apply_remote(&remote_bytes)
-        .expect("导入远端 update")
-        .expect("必须有变更");
-
-    // 外部先落同一份 update：head 0→1，让本命令第 1 次写入必然拿到 HeadConflict。
-    append_updates(
-        &vault,
-        "doc-1",
-        0,
-        &[UpdateRecord::new("external-1", remote_update)],
-    )
-    .expect("外部推进 head");
-
-    let trigger = SqlTrigger::install(
-        &vault,
-        "injected_rebuild_retry_disk",
-        "CREATE TRIGGER injected_rebuild_retry_disk BEFORE INSERT ON loro_updates \
-         BEGIN SELECT RAISE(ABORT, 'injected retry disk'); END;",
-    );
-
-    let ticket = session.flush(FlushReason::Manual);
-    let message = wait_for_write_error(&session, Duration::from_secs(10));
-    assert!(
-        message.contains("自动重建后重试前缀失败"),
-        "必须走 RebuildOutcome::Retryable：{message}"
-    );
-    assert!(
-        !message.contains("需要重开文档"),
-        "可重试失败不得升级成不可恢复：{message}"
-    );
-    assert!(
-        session
-            .wait_for_durable(ticket.target_live_rev, Duration::ZERO)
-            .is_none(),
-        "重建后的重试失败不得发出 DurableAck"
-    );
-    assert_eq!(session.pending_len(), 2, "同一前缀必须原样保留");
-    assert_eq!(session.durable_head_seq(), 0);
-    assert_eq!(outbox_count(&vault), 0, "回滚的写事务不得留下 intent");
-    assert_eq!(
-        count(
-            &vault,
-            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-            &[],
-        ),
-        1,
-        "只有外部那条：重建后的重试整笔回滚"
-    );
-    assert_eq!(head(&vault, "doc-1").head_seq, 1);
-
-    // 移除注入后下一次 flush：仍从旧 CAS 基准开始，先冲突、再自动重建，这次成功。
-    trigger.remove();
-    let ticket = session.flush(FlushReason::Manual);
-    let ack = session
-        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
-        .expect("注入移除后必须收敛到 DurableAck");
-    assert_eq!(ack.through_live_rev, LiveRev(2));
-    assert_eq!(ack.head_seq, 3);
-    assert_eq!(session.pending_len(), 0);
-    assert_eq!(
-        session.last_write_error(),
-        None,
-        "成功写入后必须清空失败原因"
-    );
-    assert_eq!(outbox_count(&vault), 1);
-    let row = outbox_row(&vault, &intent_message_id("doc-1", 2, SYNC_CTX))
-        .expect("读 intent")
-        .expect("重建后的本地 intent");
-    assert_eq!(row.seq, 2);
-    assert_eq!(row.key_epoch, SYNC_CTX.key_epoch);
-}
-
-/// 二次冲突门禁：`auto_rebuilt` 用尽后重试仍撞 head 冲突时，必须 fail-closed 进入
-/// 不可恢复态（提示重开），journal/库原样保留，后续 flush 立即失败不再碰数据库。
-///
-/// 注入 `BEFORE UPDATE OF head_seq ON loro_docs ... RAISE(IGNORE)`：第一次写因为 head 已是
-/// 1（外部推进）而天然 CAS 失败，不触发该触发器；重建后的重试 CAS 命中 `head_seq=1` 时
-/// 被 `RAISE(IGNORE)` 跳过（0 行），稳定复现「同一命令内第二次 HeadConflict」的交错。
-/// `head_seq <= CAS 基准` 的回退分支要求第一次写入失败后 head 倒退，公开接口下
-/// `head_seq` 只前进、无法确定性构造，因此本测试只覆盖“二次冲突”这一支。
 #[test]
 fn flush_reports_unrecoverable_on_second_head_conflict() {
     let (_dir, vault) = fresh_vault();
@@ -1081,8 +1069,14 @@ fn close_report_surfaces_unrecoverable_flush_error() {
     let mut driver = open_test_driver(&vault);
     let message = drive_driver_to_unrecoverable(&mut driver, &vault);
 
-    // 不可恢复时 `close` 必然排不空：timeout 0 也必须立刻返回（不挂住 UI）。
-    let report = driver.close(Duration::ZERO);
+    // 不可恢复时 `close` 必然排不空：即使 timeout 5s 也必须立即返回（不挂住 UI）。
+    let started = Instant::now();
+    let report = driver.close(Duration::from_secs(5));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "不可恢复时 close 必须短路，不能等满 timeout：{:?}",
+        started.elapsed()
+    );
     let close_error = report
         .flush_error
         .clone()
@@ -1093,6 +1087,10 @@ fn close_report_surfaces_unrecoverable_flush_error() {
         "CloseReport 的原因必须可执行：{close_error}"
     );
     assert!(report.timed_out, "不可恢复时关闭必然超时：{report:?}");
+    assert!(
+        report.needs_reopen(),
+        "不可恢复报告必须被 UI 识别为需要重开"
+    );
     assert_eq!(report.pending_edits, 1, "未 ACK 条目必须原样保留");
     assert!(
         report.durable.is_none(),

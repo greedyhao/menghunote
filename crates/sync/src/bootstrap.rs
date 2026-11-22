@@ -374,6 +374,19 @@ fn verify_bootstrap_anchor(
     Ok(())
 }
 
+/// 本地 pin 的**结构**校验：`control_hash` 与 `control_rev` 必须成对。
+///
+/// 只有 hash 没有 rev 是本地损坏（无法按 rev 选择同 rev/历史锚视图）；必须在
+/// `validate_remote` 与 `finalize` 两条路径都检查，不能只在前者检查。
+fn validate_pin_shape(pins: &BootstrapPins) -> Result<(), SyncError> {
+    if pins.control_hash.is_some() && pins.control_rev.is_none() {
+        return Err(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 control_rev",
+        ));
+    }
+    Ok(())
+}
+
 /// relay 侧与本地 pins 的写前校验：任何不满足都必须在写库前失败。
 fn validate_remote(
     vault_id: [u8; 16],
@@ -384,6 +397,7 @@ fn validate_remote(
     chain: &[ManagerChainEntry],
     control_hash: &[u8; 32],
 ) -> Result<(), SyncError> {
+    validate_pin_shape(pins)?;
     if state.vault_id != vault_id {
         return Err(SyncError::RelayWire(
             "bootstrap state.vault_id 与本地不一致",
@@ -1144,7 +1158,15 @@ fn apply_selected(
             // 不回滚已 merge 的 Loro/资产，也不改 journal.status（schema CHECK 只有
             // staging/completed）：只写失败标记，让下一次 begin 拒绝续跑，直到 abort。
             if let Err(mark_error) = mark_baseline_verify_failed(vault, &error.to_string()) {
-                return Err(SyncError::Storage(mark_error));
+                // 不能把原始 verify 错误替换成 marker 写错误：调用方需要根因；同时
+                // 明确 marker 未持久化意味着 journal 仍可续跑，必须先 abort。
+                return Err(SyncError::Storage(
+                    menghunote_storage::StorageError::SyncConflict {
+                        context: format!(
+                            "baseline 读回校验失败：{error}；另外写失败标记也失败（{mark_error}），journal 仍可续跑，必须先 abort_baseline_apply"
+                        ),
+                    },
+                ));
             }
             Err(error)
         }
@@ -1209,6 +1231,11 @@ fn verify_imported(
     }
 
     // 结构重放一致性 + 基线声明的每篇笔记都已投影且正文存在。
+    //
+    // `StructureSnapshot` 是**全量节点**（including deleted），删除是 grow-only meta
+    // 事件而不是 LoroTree::delete；因此本地并发删除基线笔记不会让这里缺项，也不会
+    // 误写失败 marker。verify 只要求“基线声明的 note/body 仍存在”，不把 deleted 当作
+    // 结构缺失；这是当前产品语义（删笔记不删正文，恢复仍可用）。
     let (structure, _head) = load_structure(vault, peer_id)?;
     let merged = structure.snapshot()?;
     let merged_notes: BTreeMap<&str, &str> = merged
@@ -1274,6 +1301,7 @@ fn finalize(
         }
     }
     let stored = BootstrapPins::from_vault(vault)?;
+    validate_pin_shape(&stored)?;
     if let Some(instance) = stored.instance_id {
         if instance != state.instance_id {
             return Err(SyncError::Object("bootstrap 不允许更换 relay instance"));
@@ -1295,6 +1323,13 @@ fn finalize(
         }
     }
     if let Some(highwater) = pins.highwater {
+        if highwater > state.head_seq {
+            return Err(SyncError::Paused(
+                crate::relay::PauseReason::RollbackDetected,
+            ));
+        }
+    }
+    if let Some(highwater) = stored.highwater {
         if highwater > state.head_seq {
             return Err(SyncError::Paused(
                 crate::relay::PauseReason::RollbackDetected,
@@ -1326,6 +1361,20 @@ fn finalize(
 
     let mut statements = Vec::new();
     let mut guards = Vec::new();
+    // 已有进度时不改写 cursor，但仍要 CAS 自写回一次：若并发写者在读完
+    // current_cursor 之后改写了 sync.relay_cursor，这里必须 Conflict，而不是静默
+    // 放过一个已经变化的游标。
+    if !write_cursor {
+        if let Some(cursor) = current_cursor.as_deref() {
+            push_meta_cas_bytes(
+                &mut statements,
+                &mut guards,
+                RELAY_CURSOR_META,
+                Some(cursor),
+                cursor,
+            );
+        }
+    }
     if cursor_state.log_id.is_none() {
         push_meta_insert_absent(
             &mut statements,
@@ -1535,7 +1584,7 @@ fn read_meta_array<const N: usize>(vault: &Vault, key: &str) -> Result<Option<[u
         Some(bytes) => bytes
             .try_into()
             .map(Some)
-            .map_err(|_| SyncError::Object("bootstrap 本地 pin 长度非法")),
+            .map_err(|_| SyncError::LocalCorrupt("bootstrap 本地 pin 长度非法")),
     }
 }
 
@@ -1580,6 +1629,33 @@ mod tests {
 
     fn digest(value: &ManifestV1) -> [u8; 32] {
         Sha256::digest(refs_digest_input(&manifest_refs(value)).expect("refs")).into()
+    }
+
+    #[test]
+    fn read_meta_array_rejects_wrong_length_as_local_corrupt() {
+        let (_dir, vault) = fresh_vault();
+        vault
+            .set_meta(META_BOOTSTRAP_EPOCH, b"short")
+            .expect("写坏 pin");
+        let error = BootstrapPins::from_vault(&vault).expect_err("短 pin 必须拒绝");
+        assert!(
+            matches!(error, SyncError::LocalCorrupt(_)),
+            "pin 长度非法必须是 LocalCorrupt，实际 {error:?}"
+        );
+    }
+
+    #[test]
+    fn pin_shape_rejects_hash_without_rev_on_both_paths() {
+        let pins = BootstrapPins {
+            control_hash: Some([0x42; 32]),
+            control_rev: None,
+            ..BootstrapPins::default()
+        };
+        let error = validate_pin_shape(&pins).expect_err("hash 无 rev 必须拒绝");
+        assert!(
+            matches!(error, SyncError::LocalCorrupt(_)),
+            "应当是 LocalCorrupt，实际 {error:?}"
+        );
     }
 
     #[test]

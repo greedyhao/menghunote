@@ -117,8 +117,8 @@ fn run_default_window() -> Result<()> {
                 let weak = shell.downgrade();
                 // 关窗只在这里排空一次，且时长有界（1500ms）；切换文档另有自己的排空。
                 window.on_window_should_close(cx, move |_window, cx| {
-                    weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
-                    true
+                    weak.update(cx, |shell, cx| shell.close_all(cx))
+                        .unwrap_or(true)
                 });
                 shell
             });
@@ -272,8 +272,8 @@ fn run_dev_sync_window(
                 });
                 let weak = shell.downgrade();
                 window.on_window_should_close(cx, move |_window, cx| {
-                    weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
-                    true
+                    weak.update(cx, |shell, cx| shell.close_all(cx))
+                        .unwrap_or(true)
                 });
                 shell
             });

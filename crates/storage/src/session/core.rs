@@ -225,6 +225,11 @@ impl DocumentSession {
         self.journal.last_write_error()
     }
 
+    /// flush 是否已进入不可恢复状态（只有重开文档能继续）。
+    pub fn flush_is_unrecoverable(&self) -> bool {
+        self.journal.is_unrecoverable()
+    }
+
     /// 取走事件队列（Durable / Remote）。
     pub fn events(&self) -> Vec<SessionEvent> {
         self.journal.drain_events()

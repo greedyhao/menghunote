@@ -230,6 +230,14 @@ impl JournalHandle {
             .or_else(|| guard.last_write_error.clone())
     }
 
+    /// 是否已进入不可恢复状态（只有重开文档能继续）。
+    ///
+    /// `SessionDriver::close` 用它短路等待：不可恢复时不会再有 DurableAck，继续等满
+    /// timeout 只会让关闭/切换卡住 UI。
+    pub(crate) fn is_unrecoverable(&self) -> bool {
+        lock(&self.state).unrecoverable.is_some()
+    }
+
     /// 外部提交 adopt / end 之后重定 durable 基准（调用方必须已持锁）。
     ///
     /// `loro_docs.head_*` 已由外部提交（`engine.integrate`）推进；这里把 flusher 的 CAS
@@ -337,6 +345,10 @@ fn flusher_main(
         let mut emitted_max: Option<LiveRev> = None;
         // P1-3：head 过期时同一命令**最多**自动重建 1 次 sink（`load_head` → 新基准 →
         // 重试同一前缀一次）；用尽后进入不可恢复状态，不再自动重试。
+        //
+        // 粒度是“每条 flush 命令”而不是“每个批次”：一条命令拆成多批时，若第一批
+        // 重建成功、第二批再遇 HeadConflict，会直接不可恢复。这是保守取舍（慢盘多批
+        // 场景可能误判），当前不自动扩成每批一次。
         let mut auto_rebuilt = false;
         loop {
             // 1) 取连续前缀（持锁只做内存操作，绝不在锁内写盘）
@@ -370,6 +382,24 @@ fn flusher_main(
                 Ok(seq) => seq,
                 // 普通写失败（磁盘/SQLite 等）：不裁剪、不 ACK，同一前缀下次重试；
                 // 同时记录失败原因：外部提交闸门据此把 "Flushing" 明确升级为 Failed。
+                //
+                // `Corrupt` 是永久性本地状态错误（混文档/OriginMarks 长度不匹配/seq 溢出/
+                // head 快照不可解码等），不能当成瞬时失败无限重试；直接进入不可恢复，
+                // 让 UI 明确要求重开，而不是每次 flush 都撞同一错误。
+                Err(error)
+                    if !matches!(&error, StorageError::HeadConflict { .. })
+                        && !is_retryable_write_error(&error) =>
+                {
+                    let message = reopen_message(
+                        &doc_id,
+                        lock(&state).journal.pending_len(),
+                        format!("前缀写失败（永久性 Corrupt，不再自动重试）：{error}"),
+                    );
+                    let mut guard = lock(&state);
+                    guard.last_write_error = Some(message.clone());
+                    guard.unrecoverable = Some(message);
+                    break;
+                }
                 Err(error) if !matches!(&error, StorageError::HeadConflict { .. }) => {
                     lock(&state).last_write_error = Some(error.to_string());
                     break;
@@ -456,7 +486,10 @@ fn flusher_main(
         // 否则「手动保存」在无脏数据时永远等不到 ACK。
         let confirmation = {
             let guard = lock(&state);
-            if guard.journal.pending_len() == 0
+            // 不可恢复时即使 pending_len==0（防御性状态，正常路径不可达）也不能补发
+            // 确认票据：那会让等待方误以为 durable 成功。
+            if guard.unrecoverable.is_none()
+                && guard.journal.pending_len() == 0
                 && emitted_max.is_none_or(|through| through < command.target_live_rev)
             {
                 Some((
@@ -480,6 +513,28 @@ fn flusher_main(
     }
 }
 
+/// 写失败是否可能靠“下一次 flush 再试”自愈。
+///
+/// **正向白名单**：只有 IO / SQLite 瞬时错误 / 读快照 BUSY / 背压值得重试；其余
+///（`Corrupt`、`Loro`、`LoroEncode`、`Coord`、schema 漂移、通道关闭等）都是永久性
+/// 本地状态错误，重试不会自愈，必须 fail-closed 到“需要重开文档”。
+fn is_retryable_write_error(error: &StorageError) -> bool {
+    match error {
+        StorageError::Io(_)
+        | StorageError::SnapshotBusy { .. }
+        | StorageError::WriteBackpressure { .. } => true,
+        // SQLite 错误不能整类重试：ConstraintViolation/ReadOnly/CannotOpen/
+        // DatabaseCorrupt/NotFound/Misuse 等都是永久错误，重试只会无限撞同一面墙。
+        // 只有 BUSY/LOCKED 这类并发等待值得下一次 flush 再试。
+        StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ),
+        StorageError::Sqlite(_) => false,
+        _ => false,
+    }
+}
+
 /// head 冲突后自动重建 sink 的结果（P1-3 生产接线）。
 #[derive(Debug)]
 enum RebuildOutcome {
@@ -489,6 +544,24 @@ enum RebuildOutcome {
     Unrecoverable(String),
     /// 重建后重试遇到普通写失败（磁盘/SQLite 等）：journal 保留，下一次 flush 再试。
     Retryable(String),
+}
+
+/// 重建后重试失败的分类（独立出来便于单测 `RebuildOutcome::Retryable` 分支）。
+fn rebuild_write_error_outcome(
+    doc_id: &str,
+    pending: usize,
+    error: StorageError,
+) -> RebuildOutcome {
+    if !is_retryable_write_error(&error) {
+        return RebuildOutcome::Unrecoverable(reopen_message(
+            doc_id,
+            pending,
+            format!("自动重建后重试前缀遇到永久性 Corrupt，不再自动重试：{error}"),
+        ));
+    }
+    RebuildOutcome::Retryable(format!(
+        "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
+    ))
 }
 
 /// `HeadConflict` 后的有界自动重建：`load_head` → 新 CAS 基准 sink → 重试同一前缀一次。
@@ -593,9 +666,7 @@ fn retry_prefix_after_rebuild(
             pending,
             format!("自动重建后再发生 head 冲突（基准 {expected}，实际 {actual}）"),
         )),
-        Err(error) => RebuildOutcome::Retryable(format!(
-            "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
-        )),
+        Err(error) => rebuild_write_error_outcome(doc_id, pending, error),
     }
 }
 
@@ -607,4 +678,52 @@ fn reopen_message(doc_id: &str, pending: usize, reason: String) -> String {
          请关闭并重开该文档，从 durable 前缀重新加载后再继续编辑；\
          重开前未 durable 的本地改动不会自动落库"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_error(code: rusqlite::ErrorCode, extended_code: i32) -> StorageError {
+        StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            None,
+        ))
+    }
+
+    #[test]
+    fn retryable_write_error_is_a_positive_whitelist() {
+        assert!(is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::DatabaseBusy,
+            5
+        )));
+        assert!(is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::DatabaseLocked,
+            6
+        )));
+        assert!(!is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::ConstraintViolation,
+            1811
+        )));
+        assert!(!is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::ReadOnly,
+            8
+        )));
+        assert!(!is_retryable_write_error(&StorageError::Corrupt {
+            context: "test".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn rebuild_write_error_outcome_maps_busy_to_retryable_and_permanent_to_unrecoverable() {
+        let busy = sqlite_error(rusqlite::ErrorCode::DatabaseBusy, 5);
+        let retryable = rebuild_write_error_outcome("doc-1", 2, busy);
+        assert!(matches!(retryable, RebuildOutcome::Retryable(_)));
+        let permanent = sqlite_error(rusqlite::ErrorCode::ConstraintViolation, 1811);
+        let unrecoverable = rebuild_write_error_outcome("doc-1", 2, permanent);
+        assert!(matches!(unrecoverable, RebuildOutcome::Unrecoverable(_)));
+    }
 }

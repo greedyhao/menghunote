@@ -845,7 +845,14 @@ pub fn apply_baseline_batch(
         };
 
         if let Some(head) = &prepared.expected_head {
-            let seq = head.head_seq.saturating_add(1);
+            let Some(seq) = head.head_seq.checked_add(1) else {
+                return Err(StorageError::Corrupt {
+                    context: format!(
+                        "baseline 文档 {} 的 head_seq 已到 u64::MAX，无法追加新 seq",
+                        prepared.doc_id
+                    ),
+                });
+            };
             let cas_index = statements.len();
             statements.push(Statement::new(
                 "UPDATE loro_docs SET head_seq=?2,head_frontier=?3,head_vv=?4 \
@@ -1155,16 +1162,15 @@ pub fn finish_baseline_apply(
     chosen_baseline_s: u64,
     cursor: &str,
 ) -> Result<BaselineApplyFinish, StorageError> {
+    // marker 检查必须先于 journal 查询：无 journal 但残留/损坏 marker 时，不能先
+    // 返回 `NotFound` 把失败状态掩盖掉；abort 是唯一清理入口。
+    if let Some(reason) = baseline_verify_failure(vault)? {
+        return Err(verify_failed_conflict(&reason, "finish_baseline_apply"));
+    }
     let journal = match load_journal(vault)? {
         None => return Ok(BaselineApplyFinish::NotFound),
         Some(journal) => journal,
     };
-    // 失败标记必须在任何写之前拒绝，且不能退化成不带原因的 `Ok(Conflict)`：
-    // journal 仍是 staging（schema 不允许 failed），但 finish 只会推进水位/cursor，
-    // 在"导入读回校验已失败"时推进等于把未证明完整的基线当成已消费。
-    if let Some(reason) = baseline_verify_failure(vault)? {
-        return Err(verify_failed_conflict(&reason, "finish_baseline_apply"));
-    }
     if journal.status != BaselineApplyStatus::Staging || journal.baseline_s != chosen_baseline_s {
         return Ok(BaselineApplyFinish::Conflict);
     }
@@ -1631,17 +1637,22 @@ fn state_from_journal(
         Some(expected) => (Some(expected.doc_count()), Some(expected.asset_count())),
         None => (None, None),
     };
-    // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
-    // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
+    // finishable 是 **O(1) 近似**：只校验 status 与「已应用计数 == 预期计数」。
+    // 逐项 `applied=1`/摘要的精确证明只在 `finish_baseline_apply` 里做：
+    //   - 这样 Phase1B 的 catchup 循环每次 batch 后读 state 不会做 O(N) 查询；
+    //   - 代价是计数相等但底层行损坏时 finishable 可能短暂为 true，finish 会
+    //     `Conflict` 且零写，不会误推进水位。
     //
     // 失败标记存在时 journal 仍是 staging（schema v3 的 CHECK 只允许 staging/completed），
-    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false，否则 UI/续跑逻辑
-    // 会把"读回校验失败"当成"可以 finish"。标记损坏返回 Corrupt，同样是 fail-closed。
+    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false。
     let verify_failed = baseline_verify_failure(vault)?.is_some();
     let finishable = !verify_failed
         && journal.status == BaselineApplyStatus::Staging
         && match &expected {
-            Some(expected) => expected_is_complete(vault, journal, expected)?,
+            Some(expected) => {
+                journal.applied_docs == expected.doc_count()
+                    && journal.applied_assets == expected.asset_count()
+            }
             None => false,
         };
     Ok(BaselineApplyState {

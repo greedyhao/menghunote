@@ -18,6 +18,10 @@
 //! 只打印页数/墙钟，不 assert 时间。1M 档 = 4096 页，是生产
 //! `COVERAGE_SCAN_MAX_PAGES` 的上限，只跑 1 次（常规档 3 次取中位数）。
 //!
+//! 同一上限还有一个**常规测试** [`coverage_scan_rejects_more_than_max_pages`]：覆盖日志
+//! 4097 页时 validate 必须以「页数超过上限」失败，不能静默截断/当成完整覆盖
+//! （FakeRelay 日志 + 真实 `CheckpointWriter::validate`，不跑网络）。
+//!
 //! 第三个探针 [`large_doc_per_page_replay_cost`]（M3 标定）测 **一篇 1 MiB 大正文的
 //! per-page replay 成本**：每次 aggregate 页都会为每个 touched doc 全量
 //! `load_body_doc`；该探针连续重放 5 次并打印 raw/中位数，另测 snapshot 导出/恢复与
@@ -50,8 +54,8 @@ use menghunote_sync::engine::RELAY_CURSOR_META;
 use menghunote_sync::genesis;
 use menghunote_sync::relay::{
     BootstrapBundle, BootstrapLease, CheckpointLease, CheckpointPublish, CheckpointRef,
-    ObjectSubmission, PublishedCheckpoint, RelayClient, RelayLogKind, RelayLogPage, RelayState,
-    SlotRecord, SlotUpload, UpdateOutcome, UpdateSubmission,
+    ObjectSubmission, PublishedCheckpoint, RelayClient, RelayLogEvent, RelayLogKind, RelayLogPage,
+    RelayState, SlotRecord, SlotUpload, UpdateOutcome, UpdateSubmission,
 };
 use menghunote_sync::{DeviceId, ObjectId, SyncError};
 use menghunote_sync_proto::DeviceCertV1;
@@ -954,6 +958,304 @@ fn fragmented_doc_per_page_replay_cost() {
 fn checkpoint_validate_scan_cost() {
     for total_events in SCAN_COST_S {
         run_scan_cost(total_events);
+    }
+}
+
+// ============================================================ coverage 扫描页数上限（常规测试）
+//
+// 生产 `scan_coverage_log` 的循环上界是 `COVERAGE_SCAN_MAX_PAGES = 4096` 页
+// （`crates/sync/src/checkpoint.rs` 私有常量；每页 `COVERAGE_SCAN_PAGE_LIMIT = 256` 条）。
+// 覆盖日志一旦超过 4096 页，扫描必须**失败**，不能把"没扫完"当成"已证明覆盖到 S"。
+//
+// 构造：S = 4096 × 256 + 1 = 1_048_577 条日志（4096 个满页 + 1 条尾页）。本地
+// integrated 前缀 = S-1（1..=S-1 已消费），唯一缺口是第 S 条，持久游标是 c0，
+// 于是 validate 必须从 c0 连续扫到 S：需要 4097 页，而第 4096 页结束时只到 S-1。
+//
+// prepare 侧：`try_record_coverage_receipt` 在"本地没有 relay 游标"时直接返回（不写
+// pending receipt），所以夹具在 prepare 前**不写** `sync.relay_cursor`，prepare 成功
+// 之后才写 c0。否则 prepare 会先撞同一上限，测到的就不是 validate 的守卫。
+//
+// 页请求次数必须正好是 4096（= `COVERAGE_SCAN_MAX_PAGES`）：守卫按**页数**生效，
+// 与每页事件数无关；这也是"上限是 4096 页"的可执行证据（生产错误文案本身不带数字）。
+
+/// 生产 `COVERAGE_SCAN_MAX_PAGES`（私有常量）。生产上限改动时这里必须同步。
+const PAGE_LIMIT_MAX_PAGES: u64 = 4096;
+/// 覆盖日志事件总数：4096 个满页（每页 `SCAN_COST_PAGE_LIMIT` 条）+ 1 条尾页 = 4097 页。
+const PAGE_LIMIT_S: usize = (PAGE_LIMIT_MAX_PAGES as usize) * SCAN_COST_PAGE_LIMIT + 1;
+/// 夹具正文文档 id（与 coverage 无关，只给 prepare 提供可导出的本地快照）。
+const PAGE_LIMIT_NOTE_ID: &str = "coverage-page-limit-note";
+
+/// `log()` 的 O(page) 实现：FakeRelay 的 `log` 每页都全量扫描 `self.log`
+/// （O(S²/256) 夹具 artifact，1M 事件下不可接受）；真实 relay 分页是索引查找。
+/// 其余方法全部委托给 FakeRelay，事件仍来自同一个 `log`。
+struct PageIndexRelay {
+    inner: FakeRelay,
+    log_calls: u64,
+}
+
+impl PageIndexRelay {
+    fn new(inner: FakeRelay) -> Self {
+        Self {
+            inner,
+            log_calls: 0,
+        }
+    }
+}
+
+impl RelayClient for PageIndexRelay {
+    fn state(&mut self) -> Result<RelayState, SyncError> {
+        self.inner.state()
+    }
+
+    fn log(&mut self, cursor: Option<&str>, limit: u32) -> Result<RelayLogPage, SyncError> {
+        self.log_calls += 1;
+        let after = cursor
+            .ok_or(SyncError::RelayWire("缺少游标"))?
+            .strip_prefix('c')
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(SyncError::RelayWire("游标格式非法"))?;
+        let start = self
+            .inner
+            .log
+            .partition_point(|event| event.relay_seq <= after);
+        let end = start
+            .saturating_add(usize::try_from(limit).expect("页大小溢出 usize"))
+            .min(self.inner.log.len());
+        let events = self.inner.log[start..end].to_vec();
+        let last = events.last().map_or(after, |event| event.relay_seq);
+        Ok(RelayLogPage {
+            events,
+            next_cursor: self.inner.cursor_for(last),
+            through_seq: last,
+            query_head: self.inner.head_seq,
+            epoch: self.inner.epoch,
+            gc_floor: self.inner.gc_floor,
+        })
+    }
+
+    fn part(&mut self, object_id: &ObjectId, part_no: u32) -> Result<Vec<u8>, SyncError> {
+        self.inner.part(object_id, part_no)
+    }
+
+    fn put_part(
+        &mut self,
+        object_id: &ObjectId,
+        part_no: u32,
+        envelope: &[u8],
+    ) -> Result<(), SyncError> {
+        self.inner.put_part(object_id, part_no, envelope)
+    }
+
+    fn submit_updates(
+        &mut self,
+        items: Vec<UpdateSubmission>,
+    ) -> Result<Vec<UpdateOutcome>, SyncError> {
+        self.inner.submit_updates(items)
+    }
+
+    fn submit_object(&mut self, item: ObjectSubmission) -> Result<UpdateOutcome, SyncError> {
+        self.inner.submit_object(item)
+    }
+
+    fn ack(&mut self, received_seq: u64, integrated_seq: u64, epoch: u64) -> Result<(), SyncError> {
+        self.inner.ack(received_seq, integrated_seq, epoch)
+    }
+
+    fn device_cert(&mut self, device_id: &DeviceId) -> Result<Option<DeviceCertV1>, SyncError> {
+        self.inner.device_cert(device_id)
+    }
+
+    fn put_key_slot(&mut self, upload: SlotUpload) -> Result<SlotRecord, SyncError> {
+        self.inner.put_key_slot(upload)
+    }
+
+    fn list_key_slots(&mut self) -> Result<Vec<SlotRecord>, SyncError> {
+        self.inner.list_key_slots()
+    }
+
+    fn activate_password_slot(
+        &mut self,
+        expected_slot_set_rev: u64,
+        slot_id: ObjectId,
+        signed_message: Vec<u8>,
+        signature: [u8; 64],
+    ) -> Result<u64, SyncError> {
+        self.inner
+            .activate_password_slot(expected_slot_set_rev, slot_id, signed_message, signature)
+    }
+
+    fn create_checkpoint(
+        &mut self,
+        estimated_bytes: u64,
+        epoch: Option<u64>,
+    ) -> Result<CheckpointLease, SyncError> {
+        self.inner.create_checkpoint(estimated_bytes, epoch)
+    }
+
+    fn add_checkpoint_refs(
+        &mut self,
+        checkpoint_id: [u8; 16],
+        refs: Vec<CheckpointRef>,
+    ) -> Result<u64, SyncError> {
+        self.inner.add_checkpoint_refs(checkpoint_id, refs)
+    }
+
+    fn publish_checkpoint(
+        &mut self,
+        publish: CheckpointPublish,
+    ) -> Result<PublishedCheckpoint, SyncError> {
+        self.inner.publish_checkpoint(publish)
+    }
+
+    fn bootstrap(&mut self) -> Result<BootstrapBundle, SyncError> {
+        self.inner.bootstrap()
+    }
+
+    fn renew_bootstrap_lease(&mut self, lease_id: [u8; 16]) -> Result<BootstrapLease, SyncError> {
+        self.inner.renew_bootstrap_lease(lease_id)
+    }
+}
+
+/// 一次性夹具：真实 SQLite vault + S 条合成日志 + 已 prepare 的 checkpoint。
+struct PageLimitFixture {
+    _dir: tempfile::TempDir,
+    vault: Vault,
+    materials: genesis::GenesisMaterials,
+    relay: PageIndexRelay,
+    prepared: PreparedCheckpoint,
+}
+
+fn build_page_limit_fixture() -> PageLimitFixture {
+    let total = u64::try_from(PAGE_LIMIT_S).expect("S 溢出 u64");
+    let (dir, vault) = fresh_vault();
+    ensure_structure_row(&vault).expect("structure 行");
+    let materials = genesis::build_materials(
+        VAULT_ID,
+        [0x45; 16],
+        "pw",
+        1_700_000_000,
+        &mut TestRandom::new(0x88_15),
+    )
+    .expect("genesis 材料");
+    let mut relay = FakeRelay::new(&[]);
+    relay
+        .certs
+        .insert(materials.device_id, materials.certificate().clone());
+    vault
+        .set_meta(META_SYNC_LOG_ID, &relay.log_id)
+        .expect("写 log_id");
+
+    // 一篇真实正文：prepare 需要可导出的本地快照/head VV（与 coverage 无关）。
+    let doc = seed_doc(&vault, PAGE_LIMIT_NOTE_ID, materials.peer_id_u64());
+    create_note_slot(
+        &vault,
+        PAGE_LIMIT_NOTE_ID,
+        PAGE_LIMIT_NOTE_ID,
+        PAGE_LIMIT_NOTE_ID,
+        1_700_000_000,
+    )
+    .expect("notes 行");
+    doc.insert_scalars(0, "checkpoint coverage scan page limit")
+        .expect("正文");
+    commit_with_intent(&vault, &doc, &uuid_like(9_101), [0x92; 32], EPOCH);
+
+    // S 条 UPDATE 日志。扫描只核对序号/epoch/游标连续性；缺口在 S 之前一律被
+    // visitor 跳过，事件负载不参与判定，因此不物化 32B 的 `event` 控制夹具内存。
+    relay.log.reserve(PAGE_LIMIT_S);
+    for seq in 1..=total {
+        relay.log.push(RelayLogEvent {
+            relay_seq: seq,
+            kind: RelayLogKind::Update,
+            object_id: Some([0x15; 32]),
+            epoch: EPOCH,
+            event: Vec::new(),
+            signature: None,
+        });
+    }
+    relay.head_seq = total;
+
+    // 本地已消费 1..=S-1：唯一缺口是第 S 条（prepare 因此不写 receipt）。
+    let consumed = total - 1;
+    vault
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &consumed.to_be_bytes())
+        .expect("写 integrated 前缀");
+    vault
+        .set_meta(META_SYNC_RECEIVED_SEQ, &consumed.to_be_bytes())
+        .expect("写 received 前缀");
+
+    // prepare 前**不**写 relay 游标：`try_record_coverage_receipt` 会跳过 pending
+    // receipt 记录（否则 prepare 自己就会先撞 4096 页上限，测不到 validate 的守卫）。
+    let mut relay = PageIndexRelay::new(relay);
+    let prepared = {
+        let mut writer = CheckpointWriter::new(
+            &vault,
+            &mut relay,
+            VAULT_ID,
+            materials.device_id,
+            materials.signing_key.clone(),
+            materials.root.clone(),
+            materials.peer_id_u64(),
+        );
+        writer.prepare(&EmptyAssets).expect("prepare")
+    };
+    assert_eq!(
+        prepared.report.covered_seq, total,
+        "S 必须等于日志条数（relay head）"
+    );
+    assert_eq!(
+        relay.log_calls, 0,
+        "prepare 不应扫描 coverage 日志（夹具在 prepare 前不写游标）"
+    );
+
+    // validate 的扫描起点：持久游标 c0（1..=S 全在游标之后）。
+    vault
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("写 relay 游标");
+
+    PageLimitFixture {
+        _dir: dir,
+        vault,
+        materials,
+        relay,
+        prepared,
+    }
+}
+
+#[test]
+fn coverage_scan_rejects_more_than_max_pages() {
+    let mut fixture = build_page_limit_fixture();
+    let error = {
+        let mut writer = CheckpointWriter::new(
+            &fixture.vault,
+            &mut fixture.relay,
+            VAULT_ID,
+            fixture.materials.device_id,
+            fixture.materials.signing_key.clone(),
+            fixture.materials.root.clone(),
+            fixture.materials.peer_id_u64(),
+        );
+        writer
+            .validate(&fixture.prepared)
+            .expect_err("超过 4096 页必须失败，不能静默截断/当成完整覆盖")
+    };
+    // 守卫按页数生效：正好 4096 次页请求（= COVERAGE_SCAN_MAX_PAGES），
+    // 第 4096 页结束时 through_seq = S-1 < S，循环耗尽后必须报错。
+    assert_eq!(
+        fixture.relay.log_calls, PAGE_LIMIT_MAX_PAGES,
+        "coverage scan 必须正好用满 {PAGE_LIMIT_MAX_PAGES} 页上限（页大小 {SCAN_COST_PAGE_LIMIT}）"
+    );
+    match error {
+        SyncError::Object(message) => {
+            assert!(
+                message.contains("页数超过上限"),
+                "错误文案必须指出页数超限：{message}"
+            );
+            assert!(
+                message.contains("未证明覆盖到 S"),
+                "错误文案必须说明覆盖未证明：{message}"
+            );
+        }
+        other => panic!("期望 SyncError::Object（页数超限），实际 {other:?}"),
     }
 }
 
