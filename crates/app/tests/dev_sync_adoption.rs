@@ -216,7 +216,13 @@ async fn editor_view_applies_adopted_delta_and_freezes_typing_while_held(cx: &mu
     let driver = SessionDriver::open(&vault, "doc-1", options).expect("打开驱动");
     let controller = EditorController::open(driver.session().snapshot()).expect("初始化控制器");
     let (view, cx) = cx.add_window_view(move |_, cx| {
-        EditorView::new(controller, driver, "dev-sync-adoption".to_owned(), cx)
+        EditorView::new(
+            controller,
+            driver,
+            "dev-sync-adoption".to_owned(),
+            menghunote_app::editor::object_image::empty_asset_provider(),
+            cx,
+        )
     });
     cx.run_until_parked();
 

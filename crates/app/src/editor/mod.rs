@@ -22,6 +22,7 @@ pub mod glyph;
 pub mod ime_map;
 pub mod input;
 pub mod layout;
+pub mod object_image;
 pub mod shared;
 pub mod theme;
 pub mod view;

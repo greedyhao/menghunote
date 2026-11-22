@@ -53,6 +53,7 @@
 //! 因显现/隐藏构造而改变 `display_len`，app 必须按 `display_len` 变化决定重排。
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use menghunote_storage::session::{
     Applied, CommandId, DeltaSplice, DurableAck, EditOutcome, EditRequest, Generation, LiveDelta,
@@ -64,7 +65,7 @@ use ropey::Rope;
 use crate::model::block::BlockRun;
 use crate::model::error::EditorError;
 use crate::model::input::InputDocument;
-use crate::model::markdown::MarkdownDocument;
+use crate::model::markdown::{MarkdownDocument, MarkdownImage};
 use crate::model::projection::ProjectionMap;
 use crate::model::selection::Selection;
 use crate::model::style::StyleRun;
@@ -120,6 +121,11 @@ pub struct EditorController {
     ///
     /// app 逐行算 gutter 时按行 O(1) 查询，不能对每个 item 重新换算 selection。
     list_marker_revealed: Vec<bool>,
+    /// 显式进入源码模式的图片对象所在源码行（ADR 0019 S2a）。
+    ///
+    /// 普通单击 / 文本选区相交**不会**设置它 —— 对象显现源码只由工具条「编辑源码」
+    /// 或 `F2` 触发，`Esc` / 点击块外 / `Ctrl+Enter` 清空（ADR 0019 §1）。
+    object_edit_line: Option<usize>,
     preedit: Option<PreeditState>,
     next_command_seq: u64,
     pending: Option<CommandId>,
@@ -149,6 +155,7 @@ impl EditorController {
             style_runs,
             block_runs,
             list_marker_revealed,
+            object_edit_line: None,
             preedit: None,
             next_command_seq: 0,
             pending: None,
@@ -175,6 +182,7 @@ impl EditorController {
         self.style_runs = style_runs;
         self.block_runs = block_runs;
         self.list_marker_revealed = list_marker_revealed;
+        self.object_edit_line = None;
         self.preedit = None;
         self.pending = None;
         self.needs_resync = false;
@@ -298,6 +306,121 @@ impl EditorController {
             .get(index)
             .copied()
             .unwrap_or(false)
+    }
+
+    // ---- 图片对象（ADR 0019 S2a）----
+
+    /// 全部图片构造（含混排/行内图片；app 只把 `is_block()` 的当对象渲染）。
+    #[must_use]
+    pub fn images(&self) -> &[MarkdownImage] {
+        self.markdown.images()
+    }
+
+    /// 指定源码行上的整行独占图片（Object Block 候选）。
+    #[must_use]
+    pub fn block_image_at_line(&self, line: usize) -> Option<&MarkdownImage> {
+        self.markdown.block_image_at_line(line)
+    }
+
+    /// 全部整行独占图片（可投影成 Object Block；按文档顺序）。
+    pub fn block_images(&self) -> impl Iterator<Item = &MarkdownImage> + '_ {
+        self.markdown.block_images()
+    }
+
+    /// 整行独占图片在当前投影里的 display 区间（未投影成对象时 `None`）。
+    #[must_use]
+    pub fn object_display_range(&self, line: usize) -> Option<Range<usize>> {
+        let image = self.markdown.block_image_at_line(line)?;
+        self.projection.object_display_range(image.span())
+    }
+
+    /// 当前**显式源码模式**的图片行；普通点选/选区相交不会设置它。
+    #[must_use]
+    pub const fn object_source_edit_line(&self) -> Option<usize> {
+        self.object_edit_line
+    }
+
+    /// 是否正在编辑某个图片对象的源码。
+    #[must_use]
+    pub const fn is_editing_object_source(&self) -> bool {
+        self.object_edit_line.is_some()
+    }
+
+    /// 进入某个整行独占图片的**源码模式**（工具条「编辑源码」/ `F2`）。
+    ///
+    /// 效果：该行不再投影成 Object（源码原样显示），caret 落到图片源码起点。
+    /// 行上没有整行独占图片时返回 `Ok(false)`（不改状态）。
+    pub fn begin_object_source_edit(&mut self, line: usize) -> Result<bool, EditorError> {
+        let Some(image) = self.markdown.block_image_at_line(line).cloned() else {
+            return Ok(false);
+        };
+        let text = self.mirror.to_string();
+        let caret = SourceByte::new(image.span().start().get()).to_scalar(&text)?;
+        self.object_edit_line = Some(line);
+        self.selection = Selection::caret(caret);
+        self.refresh_projection();
+        Ok(true)
+    }
+
+    /// 退出图片源码模式（`Esc` / 点击块外 / `Ctrl+Enter`）。
+    ///
+    /// 退出后对象重新显示为图片；caret 放到对象源码末尾（图片之后），避免停在
+    /// 已被占位符覆盖的源码中间。返回是否真的退出过（未在编辑时 `false`）。
+    pub fn end_object_source_edit(&mut self) -> bool {
+        let Some(line) = self.object_edit_line.take() else {
+            return false;
+        };
+        if let Some(image) = self.markdown.block_image_at_line(line).cloned() {
+            let text = self.mirror.to_string();
+            if let Ok(caret) = SourceByte::new(image.span().end().get()).to_scalar(&text) {
+                self.selection = Selection::caret(caret);
+            }
+        }
+        self.refresh_projection();
+        true
+    }
+
+    /// 删除一个整行独占图片的**完整源码跨度**（一次 `ScalarEdit` 事务）。
+    ///
+    /// 这是 ADR 0019「Delete/Backspace 先选块、再删整个源跨度」的落点：先选中对象
+    /// 再由本方法删除；编辑器内部仍走 `compose_edits` 的同一条路径。
+    pub fn delete_object(&mut self, line: usize) -> Result<Option<EditRequest>, EditorError> {
+        let Some(image) = self.markdown.block_image_at_line(line).cloned() else {
+            return Ok(None);
+        };
+        let text = self.mirror.to_string();
+        let start = SourceByte::new(image.span().start().get()).to_scalar(&text)?;
+        let end = SourceByte::new(image.span().end().get()).to_scalar(&text)?;
+        self.selection = Selection::new(start, end);
+        if self.object_edit_line == Some(line) {
+            self.object_edit_line = None;
+        }
+        self.refresh_projection();
+        self.delete_backward()
+    }
+
+    /// 与当前（非空）文本选区相交的图片对象行号（按文档顺序）。
+    ///
+    /// 折叠 caret 不算相交（边界上的 caret 是普通的文本落点）；对象**内部**没有
+    /// 文本 caret，所以只有跨过对象的选区才会命中这里。
+    #[must_use]
+    pub fn object_lines_in_display_selection(&self) -> Vec<usize> {
+        let Some((start, end)) = self.selection_in_display() else {
+            return Vec::new();
+        };
+        if start == end {
+            return Vec::new();
+        }
+        let (start, end) = (start.get(), end.get());
+        self.markdown
+            .block_images()
+            .filter(|image| {
+                self.projection
+                    .object_display_range(image.span())
+                    .is_some_and(|range| range.start < end && start < range.end)
+            })
+            .map(MarkdownImage::line)
+            .collect()
     }
 
     /// 列表 Enter：同级新建 item；空项退出列表。返回 `None` 时调用方按普通换行处理。
@@ -875,6 +998,12 @@ impl EditorController {
     fn refresh_markdown(&mut self) -> Result<(), EditorError> {
         let text = self.mirror.to_string();
         self.markdown = MarkdownDocument::parse(&text).map_err(EditorError::Markdown)?;
+        // 图片语法被改坏 / 行被删掉时，源码模式自动退出（不再有对应对象）。
+        if let Some(line) = self.object_edit_line {
+            if self.markdown.block_image_at_line(line).is_none() {
+                self.object_edit_line = None;
+            }
+        }
         // 块级语义只依赖 source：与投影一起在 source 变化时重建。
         self.block_runs = self.markdown.block_runs()?;
         self.refresh_projection();
@@ -886,7 +1015,12 @@ impl EditorController {
     /// 投影 / 样式构造都不会失败（选区非法时 `ProjectionMap::from_markdown_with_lists`
     /// 保守退回 identity）；列表 marker 的显现状态与投影一起在这里一次性刷新。
     fn refresh_projection(&mut self) {
-        self.projection = ProjectionMap::from_markdown_with_lists(&self.markdown, self.selection);
+        let revealed: Vec<usize> = self.object_edit_line.into_iter().collect();
+        self.projection = ProjectionMap::from_markdown_with_lists_and_objects(
+            &self.markdown,
+            self.selection,
+            &revealed,
+        );
         let style_runs = self.markdown.style_runs(&self.projection);
         self.style_runs = style_runs;
         self.list_marker_revealed = self

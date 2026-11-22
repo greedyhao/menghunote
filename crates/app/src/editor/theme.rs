@@ -231,3 +231,71 @@ pub fn search_toggle_active_text() -> Rgba {
 pub fn search_group_selected() -> Rgba {
     rgb(0xe8f0fb)
 }
+
+// ---------------------------------------------------------------------------
+// 图片 Object Block（ADR 0019 S2a）
+// ---------------------------------------------------------------------------
+
+/// 图片/占位框的上下内边距（像素）：行高 = 内容高度 + 2 × 该值。
+pub const OBJECT_PADDING: f32 = 6.0;
+/// 图片尚未就绪（加载中 / 缺失 / 失败）时的占位框高度（像素）。
+pub const OBJECT_PLACEHOLDER_HEIGHT: f32 = 34.0;
+/// 占位框里 alt/状态文案的字号（像素）。
+pub const OBJECT_LABEL_FONT_SIZE: f32 = 12.0;
+/// 占位文案与框左边界的内边距（像素）。
+pub const OBJECT_LABEL_PAD_X: f32 = 10.0;
+/// 图片/占位框的圆角（像素）。
+pub const OBJECT_CORNER_RADIUS: f32 = 4.0;
+/// 选中态描边宽度（像素）。
+pub const OBJECT_SELECTED_BORDER: f32 = 2.0;
+/// 未选中时图片边框宽度（像素；0 = 不描边）。
+pub const OBJECT_BORDER: f32 = 0.0;
+
+/// 占位框底色（浅灰，与正文区分但不抢眼）。
+#[must_use]
+pub fn object_placeholder_bg() -> Rgba {
+    rgb(0xf3f4f6)
+}
+
+/// 占位框边框色。
+#[must_use]
+pub fn object_placeholder_border() -> Rgba {
+    rgb(0xd0d7de)
+}
+
+/// 占位文案颜色。
+#[must_use]
+pub fn object_label_color() -> Rgba {
+    rgb(0x59636e)
+}
+
+/// 选中态描边色（与光标同族的蓝，明确"选中了整块"）。
+#[must_use]
+pub fn object_selected_border() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 悬浮工具条高度（像素）。
+pub const OBJECT_TOOLBAR_HEIGHT: f32 = 24.0;
+/// 悬浮工具条按钮（单个）宽度（像素）。
+pub const OBJECT_TOOLBAR_BUTTON_WIDTH: f32 = 92.0;
+/// 悬浮工具条与图片顶部的间距（像素）。
+pub const OBJECT_TOOLBAR_GAP: f32 = 4.0;
+
+/// 悬浮工具条底色（不透明，压住图片也看得清）。
+#[must_use]
+pub fn object_toolbar_bg() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// 悬浮工具条边框色。
+#[must_use]
+pub fn object_toolbar_border() -> Rgba {
+    rgb(0xd0d7de)
+}
+
+/// 悬浮工具条按钮文字色。
+#[must_use]
+pub fn object_toolbar_text() -> Rgba {
+    rgb(0x1f2328)
+}

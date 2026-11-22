@@ -38,16 +38,18 @@
 
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, Pixels, Render, SharedString, Window,
+    div, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString,
+    Window,
 };
 use menghunote_editor::{
-    Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, Selection,
-    SourceByte, SourceRange, StyleKind, UnicodeScalar,
+    Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, MarkdownImage,
+    Selection, SourceByte, SourceRange, StyleKind, UnicodeScalar,
 };
 #[cfg(feature = "dev-sync")]
 use menghunote_storage::session::{
@@ -59,7 +61,9 @@ use menghunote_storage::session::{
 };
 
 use super::element::EditorElement;
+use super::geometry::{ObjectPaint, ObjectPaintState};
 use super::layout::LayoutFrame;
+use super::object_image::{parse_asset_hash, ImageService, ImageState, SharedAssetProvider};
 use super::shared::EditorShared;
 use super::theme;
 
@@ -100,6 +104,40 @@ pub enum EditorEvent {
     PointerDown,
     /// 按了 `Ctrl+K` / `Ctrl+F`：请宿主打开搜索浮层。
     SearchRequested,
+}
+
+/// 图片对象的状态（只读快照，测试/诊断用；不参与绘制决策）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectImageState {
+    /// 资产不存在 / 只有元数据（待同步）。
+    Missing,
+    /// 正在后台解码。
+    Loading,
+    /// 已解码。
+    Ready,
+    /// 解码失败（损坏 / 超预算 / 不支持）。
+    Failed,
+}
+
+/// 一个图片 Object Block 的只读快照（headless 测试断言状态/几何用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectSnapshot {
+    /// 源码行号（0 起）。
+    pub line: usize,
+    /// 完整源码跨度 `(start, end)`（UTF-8 bytes）。
+    pub span: (usize, usize),
+    /// Markdown 目标 URL（`asset://<hex>` 等）。
+    pub dest: String,
+    /// 资产/解码状态。
+    pub state: ObjectImageState,
+    /// 当前投影里的 display 区间（`None` = 没有投影成对象，源码可见）。
+    pub display: Option<(usize, usize)>,
+    /// 是否处于选中态（单击选中 / 选区相交）。
+    pub selected: bool,
+    /// 是否在显式源码模式。
+    pub editing_source: bool,
+    /// 源码是否直接可见（源码模式 / 未投影）。
+    pub source_visible: bool,
 }
 
 /// 这个按键是不是"打开搜索"的快捷键（**纯函数**，便于单测）。
@@ -149,6 +187,14 @@ pub struct EditorView {
     /// 只用于**探测状态变化**（变化时重绘一次，让 `editor-sync-held` 标记与状态栏文案
     /// 跟上）；真正的冻结判定每次都直接问驱动，绝不用这份缓存。
     held: bool,
+    /// 图片资产加载 / 解码 / LRU 缓存（ADR 0019 S2a；后台单线程解码）。
+    images: ImageService,
+    /// 当前悬停的图片对象源码行（悬浮工具条的触发源）。
+    hovered_object_line: Option<usize>,
+    /// 单击选中的图片对象源码行（描边/工具条/F2 的目标；选区变化会清空）。
+    selected_object_line: Option<usize>,
+    /// 本帧悬浮工具条的**窗口坐标**矩形（元素层用它避免把点击误当成正文命中）。
+    toolbar_rect: Option<Bounds<Pixels>>,
     /// 已被驱动受理的**本地**编辑代数（ADR 0012 S3 自动同步的触发源）。
     ///
     /// 只在 `EditOutcome::Applied` 上自增：远端 adopt 不经过 `submit_request`，
@@ -163,6 +209,7 @@ impl EditorView {
         controller: EditorController,
         driver: SessionDriver,
         vault_label: String,
+        asset_provider: SharedAssetProvider,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = Self {
@@ -181,6 +228,10 @@ impl EditorView {
             pending_enter_text_input: false,
             dump_selection: false,
             held: false,
+            images: ImageService::new(asset_provider),
+            hovered_object_line: None,
+            selected_object_line: None,
+            toolbar_rect: None,
             #[cfg(feature = "dev-sync")]
             local_edit_seq: 0,
         };
@@ -251,6 +302,10 @@ impl EditorView {
         if self.sync_held_state() {
             changed = true;
         }
+        // 图片后台解码完成：重绘一次，图片/占位与行高在下一次 prepaint 生效。
+        if self.images.take_completed() > 0 {
+            changed = true;
+        }
         changed
     }
 
@@ -299,8 +354,370 @@ impl EditorView {
     }
 
     /// 布局用文本：**display**（Markdown 标记按当前 selection 隐藏/显现）。
-    pub(crate) fn display_text(&self) -> String {
+    ///
+    /// 整行独占的图片在这里是占位符（`U+FFFC`），不是源码；测试用它断言
+    /// “选中对象不出现源码”。
+    #[must_use]
+    pub fn display_text(&self) -> String {
         self.controller.display_text().into_owned()
+    }
+
+    // ---- 图片 Object Block（ADR 0019 S2a）----
+
+    /// 图片在编辑区里的内容高度（像素）：已解码按内容宽度等比，否则占位框高度。
+    fn object_content_height(&self, image: &MarkdownImage, content_width: f32) -> f32 {
+        let Some(hash) = parse_asset_hash(image.dest()) else {
+            return theme::OBJECT_PLACEHOLDER_HEIGHT;
+        };
+        match self.images.state(hash) {
+            ImageState::Ready(decoded) => {
+                super::object_image::fit_size(decoded.width, decoded.height, content_width)
+                    .map_or(theme::OBJECT_PLACEHOLDER_HEIGHT, |(_, height)| height)
+            }
+            ImageState::Loading | ImageState::Missing | ImageState::Failed(_) => {
+                theme::OBJECT_PLACEHOLDER_HEIGHT
+            }
+        }
+    }
+
+    /// 图片行的**行高**（内容高度 + 上下内边距）。布局度量与绘制共用这一个函数。
+    fn object_row_height(&self, image: &MarkdownImage, content_width: f32) -> f32 {
+        self.object_content_height(image, content_width) + theme::OBJECT_PADDING * 2.0
+    }
+
+    /// 图片 alt 文案（源码原样，去掉首尾空白；过长截断，避免占位框里溢出）。
+    fn object_alt_text(&self, image: &MarkdownImage) -> String {
+        let source = self.controller.source_text();
+        let alt = source
+            .get(image.alt().start().get()..image.alt().end().get())
+            .unwrap_or_default()
+            .trim();
+        if alt.is_empty() {
+            return String::new();
+        }
+        let mut text: String = alt.chars().take(80).collect();
+        if alt.chars().count() > 80 {
+            text.push('…');
+        }
+        text
+    }
+
+    /// 占位文案：优先 alt，否则给状态说明（ADR 0019：加载失败显示 alt/名称占位）。
+    fn object_placeholder_label(&self, image: &MarkdownImage, state: ImageState) -> String {
+        let alt = self.object_alt_text(image);
+        if !alt.is_empty() {
+            return alt;
+        }
+        match state {
+            ImageState::Loading => "图片加载中…".to_owned(),
+            ImageState::Missing => "图片缺失或待同步".to_owned(),
+            ImageState::Failed(_) => "图片无法预览".to_owned(),
+            ImageState::Ready(_) => String::new(),
+        }
+    }
+
+    /// 当前应画描边的对象行（显式点选 + 文本选区相交；不含源码模式）。
+    fn highlighted_object_lines(&self) -> Vec<usize> {
+        let mut lines = self.controller.object_lines_in_display_selection();
+        if let Some(line) = self.selected_object_line {
+            if self.controller.block_image_at_line(line).is_some() && !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// 悬浮工具条当前针对的对象行（显式源码模式时没有工具条）。
+    fn toolbar_target_line(&self) -> Option<usize> {
+        if self.controller.is_editing_object_source() {
+            return None;
+        }
+        if let Some(line) = self.hovered_object_line {
+            if self.controller.block_image_at_line(line).is_some() {
+                return Some(line);
+            }
+        }
+        self.highlighted_object_lines().first().copied()
+    }
+
+    /// 本帧要绘制的图片对象（只含可见行；元素层把它们转成窗口坐标）。
+    ///
+    /// `scroll` 是本帧实际使用的（已夹取的）滚动量；矩形在**元素局部坐标**里，
+    /// 由调用方加上 `bounds.origin`。行高已经等于 `内容高 + 2 × OBJECT_PADDING`，
+    /// 所以这里的矩形与 `LayoutFrame` 的行顶/行高几何完全一致。
+    pub(crate) fn object_paints(
+        &self,
+        window: &Window,
+        frame: &LayoutFrame,
+        scroll: f32,
+        content_width: f32,
+        visible: Range<usize>,
+    ) -> Vec<ObjectPaint> {
+        let projection = self.controller.projection();
+        let highlighted = self.highlighted_object_lines();
+        let mut objects = Vec::new();
+        for (index, image) in self.controller.images().iter().enumerate() {
+            if !image.is_block() {
+                continue;
+            }
+            let Some(display_range) = projection.object_display_range(image.span()) else {
+                continue;
+            };
+            let row = frame.row_of_byte(display_range.start);
+            if row < visible.start || row >= visible.end {
+                continue;
+            }
+            let content_height = self.object_content_height(image, content_width);
+            let state = parse_asset_hash(image.dest())
+                .map_or(ImageState::Missing, |hash| self.images.state(hash));
+            let display_width = match &state {
+                ImageState::Ready(decoded) => {
+                    super::object_image::fit_size(decoded.width, decoded.height, content_width)
+                        .map_or(content_width, |(width, _)| width)
+                }
+                ImageState::Loading | ImageState::Missing | ImageState::Failed(_) => {
+                    content_width.min(theme::OBJECT_PLACEHOLDER_HEIGHT * 8.0)
+                }
+            };
+            let left = theme::PAD_X + frame.row_indent(row);
+            let top = theme::PAD_Y - scroll + frame.row_top_offset(row) + theme::OBJECT_PADDING;
+            let rect = Bounds::new(
+                point(px(left), px(top)),
+                size(px(display_width), px(content_height)),
+            );
+            let (paint_image, paint_state, label) = match state {
+                ImageState::Ready(decoded) => (
+                    Some(Arc::clone(&decoded.image)),
+                    ObjectPaintState::Ready,
+                    None,
+                ),
+                ImageState::Loading => (
+                    None,
+                    ObjectPaintState::Loading,
+                    Some(self.object_placeholder_label(image, ImageState::Loading)),
+                ),
+                ImageState::Missing => (
+                    None,
+                    ObjectPaintState::Missing,
+                    Some(self.object_placeholder_label(image, ImageState::Missing)),
+                ),
+                ImageState::Failed(error) => (
+                    None,
+                    ObjectPaintState::Failed,
+                    Some(self.object_placeholder_label(image, ImageState::Failed(error))),
+                ),
+            };
+            let label = label.filter(|text| !text.is_empty()).map(|text| {
+                let spans = [(text.len(), StyleKind::Plain)];
+                super::glyph::shape_row_styled_at(
+                    window,
+                    &text,
+                    &spans,
+                    theme::OBJECT_LABEL_FONT_SIZE,
+                    false,
+                )
+            });
+            objects.push(ObjectPaint {
+                index,
+                line: image.line(),
+                row,
+                rect,
+                image: paint_image,
+                label,
+                state: paint_state,
+                selected: highlighted.contains(&image.line()),
+            });
+        }
+        objects
+    }
+
+    /// 请求加载当前文档里所有整行独占图片的资产（render 每帧调用，幂等）。
+    fn request_object_images(&self) {
+        for image in self.controller.block_images() {
+            if let Some(hash) = parse_asset_hash(image.dest()) {
+                self.images.request(hash);
+            }
+        }
+    }
+
+    /// 测试/诊断用：等后台解码收敛（有界）。生产路径由 pump + `take_completed` 驱动。
+    pub fn settle_images(&mut self, timeout: Duration, cx: &mut Context<Self>) -> bool {
+        let settled = self.images.wait_idle(timeout);
+        if settled {
+            cx.notify();
+        }
+        settled
+    }
+
+    /// 当前可见图片对象的**窗口坐标**矩形（`(源码行, 矩形)`，诊断/headless 测试用）。
+    ///
+    /// 几何来自上一帧 `LayoutFrame`（与绘制/命中同源）；图片滚出可见范围时不在列表里。
+    #[must_use]
+    pub fn object_rects(&self) -> Vec<(usize, Bounds<Pixels>)> {
+        self.shared.geometry().map_or_else(Vec::new, |geometry| {
+            geometry
+                .objects()
+                .iter()
+                .map(|object| (object.line, object.rect))
+                .collect()
+        })
+    }
+
+    /// 图片对象的只读快照（headless 测试断言几何/状态用）。
+    #[must_use]
+    pub fn object_snapshots(&self) -> Vec<ObjectSnapshot> {
+        let projection = self.controller.projection();
+        let highlighted = self.highlighted_object_lines();
+        self.controller
+            .images()
+            .iter()
+            .filter(|image| image.is_block())
+            .map(|image| {
+                let state = parse_asset_hash(image.dest())
+                    .map_or(ImageState::Missing, |hash| self.images.state(hash));
+                let display = projection.object_display_range(image.span());
+                let source_visible = display.is_none();
+                ObjectSnapshot {
+                    line: image.line(),
+                    span: (image.span().start().get(), image.span().end().get()),
+                    dest: image.dest().to_owned(),
+                    state: match state {
+                        ImageState::Missing => ObjectImageState::Missing,
+                        ImageState::Loading => ObjectImageState::Loading,
+                        ImageState::Ready(_) => ObjectImageState::Ready,
+                        ImageState::Failed(_) => ObjectImageState::Failed,
+                    },
+                    display: display.map(|range| (range.start, range.end)),
+                    selected: highlighted.contains(&image.line()),
+                    editing_source: self.controller.object_source_edit_line() == Some(image.line()),
+                    source_visible,
+                }
+            })
+            .collect()
+    }
+
+    /// 是否能命中对象层（元素层的鼠标事件在工具条上不应改光标）。
+    pub(crate) fn point_in_toolbar(&self, position: Point<Pixels>) -> bool {
+        self.toolbar_rect
+            .is_some_and(|rect| rect.contains(&position))
+    }
+
+    /// 鼠标移动：维护“当前悬停的图片对象行”，变化时重绘（工具条随之出现/消失）。
+    pub(crate) fn hover_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.point_in_toolbar(position) {
+            return;
+        }
+        let line = self
+            .shared
+            .geometry()
+            .and_then(|geometry| geometry.object_line_at(position));
+        if line != self.hovered_object_line {
+            self.hovered_object_line = line;
+            cx.notify();
+        }
+    }
+
+    /// 单击图片对象：**只选中块**（描边），不展开源码，也不产生对象内部 caret。
+    pub fn select_object_at(
+        &mut self,
+        line: usize,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(image) = self.controller.block_image_at_line(line).cloned() else {
+            return;
+        };
+        let text = self.controller.source_text();
+        let Ok(caret) = SourceByte::new(image.span().end().get()).to_scalar(&text) else {
+            return;
+        };
+        if let Some(window) = window {
+            window.focus(&self.focus_handle, cx);
+        }
+        // caret 落在图片之后（对象内部不产生文本 caret）。
+        self.commit_selection(Selection::caret(caret), cx);
+        self.selected_object_line = Some(line);
+        self.preferred_x = None;
+        cx.notify();
+    }
+
+    /// 工具条「编辑源码」：把目标对象切换到源码模式（ADR 0019 §1）。
+    pub fn enter_selected_object_source_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(line) = self
+            .selected_object_line
+            .filter(|line| self.controller.block_image_at_line(*line).is_some())
+            .or_else(|| self.highlighted_object_lines().first().copied())
+            .or_else(|| {
+                self.hovered_object_line
+                    .filter(|line| self.controller.block_image_at_line(*line).is_some())
+            })
+        else {
+            return;
+        };
+        self.enter_object_source_edit(line, cx);
+    }
+
+    /// 进入指定图片行的源码模式。
+    pub fn enter_object_source_edit(&mut self, line: usize, cx: &mut Context<Self>) {
+        match self.controller.begin_object_source_edit(line) {
+            Ok(true) => {
+                self.selected_object_line = None;
+                self.hovered_object_line = None;
+                eprintln!("[menghunote] 图片对象 → 源码模式（行 {line}）");
+                self.ensure_caret_visible(self.controller.selection().head());
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("[menghunote] 进入图片源码模式失败：{error}"),
+        }
+    }
+
+    /// 退出图片源码模式（`Esc` / 点击块外 / `Ctrl+Enter`）。
+    pub fn exit_object_source_edit(&mut self, cx: &mut Context<Self>) {
+        if self.controller.end_object_source_edit() {
+            eprintln!("[menghunote] 图片对象 ← 退出源码模式（恢复图片/占位）");
+            self.ensure_caret_visible(self.controller.selection().head());
+            cx.notify();
+        }
+    }
+
+    /// 工具条「复制 Markdown」：复制对象的**完整源码跨度**。
+    pub fn copy_object_markdown(&mut self, line: usize, cx: &mut Context<Self>) {
+        let Some(image) = self.controller.block_image_at_line(line) else {
+            return;
+        };
+        let source = self.controller.source_text();
+        let Some(markdown) = source
+            .get(image.span().start().get()..image.span().end().get())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+        eprintln!(
+            "[menghunote] 复制图片 Markdown（{} 字节，hash 前缀 {}）",
+            image.dest().chars().count(),
+            image.dest().chars().take(16).collect::<String>()
+        );
+    }
+
+    /// 工具条「复制 Markdown」：作用于当前工具条目标对象。
+    pub fn copy_selected_object_markdown(&mut self, cx: &mut Context<Self>) {
+        if let Some(line) = self.toolbar_target_line() {
+            self.copy_object_markdown(line, cx);
+        }
+    }
+
+    /// 当前文本选区在 **source** 坐标下的区间（复制用；对象行会包含完整源码跨度）。
+    #[must_use]
+    pub fn selected_source_text(&self) -> Option<String> {
+        let (start, end) = self.controller.selection_in_display()?;
+        let source = self.controller.projection().source_range_of_display_range(
+            DisplayByte::new(start.get())..DisplayByte::new(end.get()),
+        )?;
+        let text = self.controller.source_text();
+        text.get(source.start().get()..source.end().get())
+            .map(str::to_owned)
     }
 
     /// 逐**源码行**的度量（字号/行高/是否等宽/缩进），来自块级语义 + 列表块树。
@@ -313,7 +730,11 @@ impl EditorView {
     /// - marker 显示宽度用**真实 shaping**（与绘制同一字体/字号）测量，不用字符数估算；
     ///   caret 进入 marker、显示源码 `- ` 时宽度会变，`WrapCache` 的度量键包含
     ///   `indent/wrap_indent`，因此会自动重排。
-    pub(crate) fn block_metrics(&self, window: &Window) -> Vec<super::layout::LineMetric> {
+    pub(crate) fn block_metrics(
+        &self,
+        window: &Window,
+        content_width: f32,
+    ) -> Vec<super::layout::LineMetric> {
         use menghunote_editor::{BlockKind, MarkdownLineKind};
         use std::collections::HashMap;
 
@@ -325,12 +746,27 @@ impl EditorView {
         // 键包含字号与等宽标记：同一个 "• " 在标题行/正文行宽度不同，不能混用。
         let mut marker_widths: HashMap<(u32, bool, String), f32> = HashMap::new();
 
+        let object_edit_line = self.controller.object_source_edit_line();
         self.controller
             .block_runs()
             .iter()
             .enumerate()
             .map(|(index, run)| {
                 let source_line = source_lines.get(index).copied().unwrap_or("");
+                // 整行独占的图片（且不在源码模式）：行高 = 图片/占位高度 + 内边距。
+                // 这是布局、绘制、命中三处**唯一**的高度来源（不在这里估字符宽度）。
+                if object_edit_line != Some(index) {
+                    if let Some(image) = self.controller.block_image_at_line(index) {
+                        return super::layout::LineMetric {
+                            font_size: theme::FONT_SIZE,
+                            line_height: self.object_row_height(image, content_width),
+                            mono: false,
+                            indent: 0.0,
+                            wrap_indent: 0.0,
+                            quote_depth: 0,
+                        };
+                    }
+                }
                 let quote_depth = super::layout::quote_depth(source_line);
                 let quote = super::layout::quote_indent(quote_depth);
                 let line_info = line_infos.get(index);
@@ -587,6 +1023,8 @@ impl EditorView {
     }
 
     /// 关闭窗口时**有界**排空（沿用 5a 的固定上限）。
+    ///
+    /// 图片解码线程随视图 Drop 关闭（worker 收到 `Shutdown` 后退出，不等待未完成的解码）。
     pub fn close_session(&mut self) {
         self.drain_and_close(CLOSE_TIMEOUT);
     }
@@ -602,6 +1040,21 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.pending_enter_text_input = false;
+        // 点击块外：正在编辑图片源码时先退出（ADR 0019：Esc / 点击块外 / Ctrl+Enter）。
+        if let Some(editing) = self.controller.object_source_edit_line() {
+            let clicked_line = self.shared.geometry().map(|geometry| {
+                let row = geometry.frame.row_of_byte(display_byte);
+                geometry.frame.lines[row].source_line
+            });
+            if clicked_line != Some(editing) {
+                self.exit_object_source_edit(cx);
+                // 退出后 display 变短，旧几何给出的字节需要夹回新 display 长度。
+                let display_byte = display_byte.min(self.controller.display_len().get());
+                let display_byte = self.snap_display_byte(display_byte);
+                self.place_caret_from_display(display_byte, bias, window, cx);
+                return;
+            }
+        }
         // 入参是**布局（display）字节**：先在 display 空间吸附 grapheme，
         // 再经投影回到 source scalar（隐藏标记后 display 比 source 短）。
         let display_byte = self.snap_display_byte(display_byte);
@@ -623,6 +1076,28 @@ impl EditorView {
         self.preferred_x = None;
         window.focus(&self.focus_handle, cx);
         self.request_selection_dump();
+        self.commit_selection(Selection::caret(scalar), cx);
+    }
+
+    /// 把 display 字节落成 caret（带偏置；点击路径的公共尾巴）。
+    fn place_caret_from_display(
+        &mut self,
+        display_byte: usize,
+        bias: Bias,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(scalar) = self.scalar_at_display_byte_biased(display_byte, bias) else {
+            return;
+        };
+        let text = self.controller.source_text();
+        let byte = self.snap_byte(self.source_byte_of_scalar(scalar).unwrap_or(0), &text);
+        let Some(scalar) = scalar_of_byte(&text, byte) else {
+            return;
+        };
+        self.drag_anchor = Some(scalar);
+        self.preferred_x = None;
+        window.focus(&self.focus_handle, cx);
         self.commit_selection(Selection::caret(scalar), cx);
     }
 
@@ -695,13 +1170,29 @@ impl EditorView {
             return;
         }
 
-        // F2：请宿主重命名侧栏选中项（编辑器自己不管侧栏，只发事件）。
+        // F2：有图片对象可编辑时切换到**该块的源码模式**；否则请宿主重命名侧栏项。
         if !modifiers.control
             && !modifiers.alt
             && !modifiers.platform
             && event.keystroke.key.as_str() == "f2"
         {
-            cx.emit(EditorEvent::RenameRequested);
+            if self.toolbar_target_line().is_some() {
+                self.enter_selected_object_source_edit(cx);
+            } else {
+                cx.emit(EditorEvent::RenameRequested);
+            }
+            window.prevent_default();
+            return;
+        }
+
+        // Esc：正在编辑图片源码时先退出源码模式（对象内部没有文本 caret）。
+        if event.keystroke.key.as_str() == "escape"
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && self.controller.is_editing_object_source()
+        {
+            self.exit_object_source_edit(cx);
             window.prevent_default();
             return;
         }
@@ -747,6 +1238,24 @@ impl EditorView {
             match (event.keystroke.key.as_str(), modifiers.shift) {
                 ("z", false) => self.undo(cx),
                 ("z", true) => self.redo(cx),
+                // Ctrl+C：选中图片对象时复制完整 Markdown；否则复制选区的源码。
+                ("c", false) => {
+                    if let Some(line) = self.selected_object_line {
+                        self.copy_object_markdown(line, cx);
+                        return;
+                    }
+                    if let Some(text) = self.selected_source_text() {
+                        if !text.is_empty() {
+                            eprintln!("[menghunote] 复制选区源码（{} 字节）", text.len());
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    }
+                }
+                // Ctrl+Enter：退出图片源码模式（与 Esc 等价）。
+                ("enter", _) if self.controller.is_editing_object_source() => {
+                    self.exit_object_source_edit(cx);
+                    window.prevent_default();
+                }
                 _ => {}
             }
             return;
@@ -948,6 +1457,7 @@ impl EditorView {
     /// 组合提交：`text` 是平台给的最终文本，**只产生一个 `EditRequest`**。
     pub(crate) fn commit_composition(&mut self, text: &str, cx: &mut Context<Self>) {
         self.pending_enter_text_input = false;
+        self.selected_object_line = None;
         if self.frozen_by_external_commit() {
             // Held：既不结束组合闸门（3a 的状态优先），也不产生编辑请求。
             eprintln!("[menghunote] Held 期间收到 IME 上屏：已忽略（不落库）");
@@ -1014,6 +1524,7 @@ impl EditorView {
 
     /// 普通文本输入（无组合：打字 / 粘贴）。
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.selected_object_line = None;
         if text == "\n" && self.pending_enter_text_input {
             // Enter 已经由 key_down 处理（结构编辑或普通换行），这里只消费平台的回声。
             self.pending_enter_text_input = false;
@@ -1224,6 +1735,37 @@ impl EditorView {
             .unwrap_or(range)
     }
 
+    /// 折叠 caret 是否紧贴某个图片对象（Backspace 在对象之后 / Delete 在对象之前）。
+    fn adjacent_object_line(&self, step: GraphemeStep) -> Option<usize> {
+        let caret = self.display_caret()?;
+        self.controller.block_images().find_map(|image| {
+            let range = self.controller.object_display_range(image.line())?;
+            let hit = match step {
+                GraphemeStep::Backward => caret == range.end,
+                GraphemeStep::Forward => caret == range.start,
+            };
+            hit.then_some(image.line())
+        })
+    }
+
+    /// 删除一个图片对象的完整源跨度（一次 `EditRequest`），并清空对象选中态。
+    fn delete_object_block(&mut self, line: usize, cx: &mut Context<Self>) {
+        match self.controller.delete_object(line) {
+            Ok(Some(request)) => {
+                self.selected_object_line = None;
+                self.hovered_object_line = None;
+                eprintln!("[menghunote] 删除图片对象（行 {line}）：整段源码一次删除");
+                self.submit_request(Some(request));
+            }
+            Ok(None) => {
+                self.selected_object_line = None;
+                eprintln!("[menghunote] 删除图片对象（行 {line}）：没有可删区间，忽略");
+            }
+            Err(error) => eprintln!("[menghunote] 删除图片对象失败：{error}"),
+        }
+        cx.notify();
+    }
+
     /// 退格 / Delete：走与普通输入**完全相同**的一条路径。
     ///
     /// 删哪一段由 [`EditorController::delete_backward`] / [`EditorController::delete_forward`]
@@ -1238,6 +1780,28 @@ impl EditorView {
         }
         if self.is_composing() {
             self.cancel_composition(cx);
+        }
+        // 图片对象（ADR 0019 §1）：对象内部没有文本 caret。
+        // - 块已被点选 → 直接删整个源跨度；
+        // - 折叠 caret 紧贴对象 → **先选块**（本次按键不删）；
+        // - 文本选区跨过对象 → 走普通“删选区”（source 区间已包含完整 Markdown）。
+        if !self.controller.is_editing_object_source() {
+            if let Some(line) = self.selected_object_line {
+                if self.controller.block_image_at_line(line).is_some() {
+                    self.delete_object_block(line, cx);
+                    return;
+                }
+            }
+            if self.controller.selection().is_empty() {
+                if let Some(line) = self.adjacent_object_line(step) {
+                    self.selected_object_line = Some(line);
+                    eprintln!(
+                        "[menghunote] 删除（{step:?}）：先选中图片对象（行 {line}），再按一次删除"
+                    );
+                    cx.notify();
+                    return;
+                }
+            }
         }
         // 先按 **display** 定位要删的那一段，再映射回 source 最小区间。
         // 直接走 source 的 `delete_*` 会在构造边界啃掉隐藏标记（S2-5 的 bug）。
@@ -1651,6 +2215,8 @@ impl EditorView {
 
     /// 提交选区：控制器校验通过后滚动到光标可见并重绘。
     fn commit_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        // 选区一变，图片对象的“点选态”就结束（工具条/描边随之消失）。
+        self.selected_object_line = None;
         match self.controller.set_selection(selection) {
             Ok(()) => {
                 self.ensure_caret_visible(selection.head());
@@ -1726,6 +2292,14 @@ impl EditorView {
     /// 而不是退回"字符数 × 平均宽度"。
     fn byte_at_row_x(&self, frame: &LayoutFrame, row: usize, x: Pixels, window: &Window) -> usize {
         let bytes = frame.row_bytes(row);
+        // 对象行没有字形：上下移动一律落到占位符末尾（= 图片之后），不落进源码中间。
+        if self
+            .shared
+            .geometry()
+            .is_some_and(|geometry| geometry.object_row(row).is_some())
+        {
+            return bytes.end;
+        }
         let slice = &frame.text[bytes.clone()];
         if slice.is_empty() {
             return bytes.start;
@@ -1961,6 +2535,89 @@ impl Focusable for EditorView {
     }
 }
 
+impl EditorView {
+    /// 悬浮工具条（ADR 0019 §1）：至少「编辑源码」「复制 Markdown」。
+    ///
+    /// 位置来自**上一帧几何**里该对象的矩形（窗口坐标减去元素原点 = 元素局部坐标），
+    /// 因此滚动/重排后一帧内自动跟随；图片滚出可见范围时不渲染。
+    fn render_object_toolbar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let line = self.toolbar_target_line()?;
+        let geometry = self.shared.geometry()?;
+        let object = geometry
+            .objects()
+            .iter()
+            .find(|object| object.line == line)?;
+        let (viewport_width, _) = self.shared.viewport();
+        let toolbar_width = theme::OBJECT_TOOLBAR_BUTTON_WIDTH * 2.0 + 8.0;
+        let toolbar_height = theme::OBJECT_TOOLBAR_HEIGHT;
+        let local_left = (object.rect.origin.x - geometry.origin.x).as_f32()
+            + object.rect.size.width.as_f32()
+            - toolbar_width;
+        let local_left = local_left.clamp(
+            theme::PAD_X,
+            (viewport_width - toolbar_width - theme::PAD_X).max(theme::PAD_X),
+        );
+        let local_top = ((object.rect.origin.y - geometry.origin.y).as_f32()
+            + theme::OBJECT_TOOLBAR_GAP)
+            .max(theme::PAD_Y);
+        // 元素层用窗口坐标判“点击是否落在工具条上”，避免同一次点击又挪光标。
+        self.toolbar_rect = Some(Bounds::new(
+            point(
+                geometry.origin.x + px(local_left),
+                geometry.origin.y + px(local_top),
+            ),
+            size(px(toolbar_width), px(toolbar_height)),
+        ));
+
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(theme::OBJECT_TOOLBAR_BUTTON_WIDTH))
+                .h_full()
+                .text_size(px(12.0))
+                .text_color(theme::object_toolbar_text())
+                .child(SharedString::from(label))
+        };
+
+        let edit = button("object-toolbar-edit", "编辑源码").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                view.enter_selected_object_source_edit(cx);
+            }),
+        );
+        let copy = button("object-toolbar-copy", "复制 Markdown").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                view.copy_selected_object_markdown(cx);
+            }),
+        );
+
+        Some(
+            div()
+                .id("object-toolbar")
+                .debug_selector(|| "object-toolbar".to_string())
+                .absolute()
+                .left(px(local_left))
+                .top(px(local_top))
+                .flex()
+                .flex_row()
+                .h(px(toolbar_height))
+                .bg(theme::object_toolbar_bg())
+                .border(px(1.0))
+                .border_color(theme::object_toolbar_border())
+                .rounded(px(theme::OBJECT_CORNER_RADIUS))
+                .overflow_hidden()
+                .child(edit)
+                .child(copy)
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.focused_once {
@@ -1971,6 +2628,11 @@ impl Render for EditorView {
         }
 
         let status = SharedString::from(self.status_text());
+        // 每帧请求加载当前文档的图片（幂等；解码完成由 pump 触发重绘）。
+        self.request_object_images();
+        // 工具条每帧重建：目标对象/几何变化时自动跟随，None 时清空命中矩形。
+        self.toolbar_rect = None;
+        let toolbar = self.render_object_toolbar(cx);
         let element = EditorElement::new(cx.entity(), Rc::clone(&self.shared));
 
         div()
@@ -1999,7 +2661,8 @@ impl Render for EditorView {
                             cx.emit(EditorEvent::PointerDown);
                         }),
                     )
-                    .child(element),
+                    .child(element)
+                    .when_some(toolbar, |this, toolbar| this.child(toolbar)),
             )
             .child(
                 div()

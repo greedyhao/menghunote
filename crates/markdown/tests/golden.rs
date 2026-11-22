@@ -303,3 +303,46 @@ fn list_and_heading_markers_require_a_following_space() {
         );
     }
 }
+
+#[test]
+fn image_construct_records_dest_alt_and_span_without_rewriting() {
+    // ADR 0019 S2a：图片除 Construct（S1 起就有）外，还记录目标 URL。
+    let source = "前言\n\n![示意图](asset://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)\n";
+    let doc = parse(source);
+    assert_eq!(doc.images.len(), 1, "必须解析出一个图片：{source:?}");
+    let image = &doc.images[0];
+    assert_eq!(slice(source, image.content), "示意图");
+    assert_eq!(
+        image.dest,
+        "asset://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    // span 与 Construct 完全一致：投影层用同一段源码，不得重新序列化。
+    let construct = construct(source, ConstructKind::Image);
+    assert_eq!(image.span, construct.span);
+    assert_eq!(
+        slice(source, image.span),
+        "![示意图](asset://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)"
+    );
+}
+
+#[test]
+fn reference_style_image_resolves_dest_but_keeps_source_bytes() {
+    // 引用式图片：源码里没有 URL，dest 从定义处解析；span 仍是 `![alt][label]`。
+    let source = "![图][logo]\n\n[logo]: asset://deadbeef\n";
+    let doc = parse(source);
+    assert_eq!(doc.images.len(), 1);
+    let image = &doc.images[0];
+    assert_eq!(slice(source, image.span), "![图][logo]");
+    assert_eq!(slice(source, image.content), "图");
+    assert_eq!(image.dest, "asset://deadbeef");
+}
+
+#[test]
+fn image_inside_link_only_reports_the_image_span() {
+    // 图片套在链接里（`[![a](b)](c)`）：图片的事件范围只覆盖 `![a](b)`。
+    let source = "[![a](asset://aa)](asset://bb)\n";
+    let doc = parse(source);
+    assert_eq!(doc.images.len(), 1);
+    assert_eq!(slice(source, doc.images[0].span), "![a](asset://aa)");
+    assert_eq!(doc.images[0].dest, "asset://aa");
+}

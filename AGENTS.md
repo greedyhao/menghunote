@@ -393,13 +393,16 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 356 / sync 605 / app `--features dev-sync` 378 / 默认 145 / editor 137。
+> 测试：relay 356 / sync 605 / app `--features dev-sync` 393 / 默认 160 / editor 148 / markdown 15。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
-> gutter/hanging indent/Enter 同级与空项退出；markdown 12 / editor 137 测试。
+> gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
 > 回归：无空格 `-`/`1.`/`#` 不成块、列表缩进不画引用条、空列表 Backspace 只删空格、
 > 删到纯数字后不残留惰性续行缩进/空缩进行、空白行不继承列表缩进。
-> 图片/Mermaid/表格 Object 与粘贴/拖放仍后置（S2/S3）。
+> 图片粘贴/拖放、引用对账、Mermaid/表格 Object 仍后置（S2b/S3）。
+> S2a：整行图片 Object 投影（占位符 U+FFFC）、后台受控解码（PNG/JPEG/WebP/GIF、
+> 边长≤8192/16MP/128MiB、LRU 128MiB）、选中不展开源码、工具条编辑/复制、
+> 缺失/损坏降级占位；headless 7 个图片集成测试。
 > 历史整理：整理前 97 个提交完整保留在 `backup/dev-before-cleanup-20261116`；
 > `v0.4-sync` tag 未移动；`v0.5-sync-web` 打在整理后的 12 组 tip `bcb20e8`。
 > **Windows 真机（Web 管理/claim/App 粘贴）与真实 TLS relay 未验；S4d1c 客户端管理 UI、

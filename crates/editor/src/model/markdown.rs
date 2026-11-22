@@ -189,6 +189,68 @@ impl MarkdownConstruct {
     }
 }
 
+/// 一个图片构造（ADR 0019 S2a）。
+///
+/// 图片在 S1 里只是一个 `ConstructKind::Image`（editor **不**把它放进
+/// `constructs`，避免被当成行内标记投影）。S2a 把它单独建模：
+///
+/// - [`Self::span`]：完整源码跨度 `![alt](dest)`（半开区间）；
+/// - [`Self::alt`]：alt 内容区间（不含方括号），占位/缺失时显示它；
+/// - [`Self::dest`]：`pulldown-cmark` 解析出的目标 URL（引用式图片也解析成真实
+///   URL）；**只读**，正文逐字节保留；
+/// - [`Self::line`]：图片起点所在源码行（0 起），app 用它把对象行映射到布局行；
+/// - [`Self::block`]：是否**整行独占**（可以投影成 Object Block）。
+///
+/// 判定 `block` 的规则（写死，测试钉住）：
+///
+/// 1. 图片 span 必须从行内容起点开始（行首缩进/列表 marker/引用前缀都会破坏它）；
+/// 2. 图片 span 之后到行内容结尾只能是空白（行尾空格/Tab 允许，不产生错位）；
+/// 3. 该行必须是普通段落（不是标题/引用/列表/围栏/缩进代码/表格/HTML/分隔线），
+///    且不在 `code_spans`/`unsupported_spans` 里。
+///
+/// 不满足时 `block = false`：**首版保持源码原样显示**（混排/行内图片），
+/// 绝不原子替换半行内容（否则会产生错位）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownImage {
+    span: SourceRange,
+    alt: SourceRange,
+    dest: String,
+    line: usize,
+    block: bool,
+}
+
+impl MarkdownImage {
+    /// 完整源码跨度（含 `![` / `](…)`）。
+    #[must_use]
+    pub const fn span(&self) -> SourceRange {
+        self.span
+    }
+
+    /// alt 内容区间（不含方括号）。
+    #[must_use]
+    pub const fn alt(&self) -> SourceRange {
+        self.alt
+    }
+
+    /// 解析后的目标 URL（`asset://<hex>` 等）。
+    #[must_use]
+    pub fn dest(&self) -> &str {
+        &self.dest
+    }
+
+    /// 图片起点所在源码行（0 起）。
+    #[must_use]
+    pub const fn line(&self) -> usize {
+        self.line
+    }
+
+    /// 是否整行独占、可投影成 Object Block。
+    #[must_use]
+    pub const fn is_block(&self) -> bool {
+        self.block
+    }
+}
+
 /// Markdown 扫描 + 显现计算的全部错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkdownError {
@@ -241,6 +303,8 @@ impl From<CoordError> for MarkdownError {
 pub struct MarkdownDocument {
     source: String,
     constructs: Vec<MarkdownConstruct>,
+    /// 图片构造（S2a）：object 投影与 app 的图片加载都从这里取。
+    images: Vec<MarkdownImage>,
     /// 新解析器的完整语义（列表/行信息），即使行内投影回退到旧 scanner 也保留。
     semantic: ParsedMarkdown,
     /// 行内投影是否退回旧 scanner（只影响 inline 构造，不影响列表/块级）。
@@ -251,14 +315,37 @@ impl MarkdownDocument {
     /// 解析源码。空文档、纯文本都返回空构造表（不报错）。
     pub fn parse(source: &str) -> Result<Self, MarkdownError> {
         let semantic = semantic::parse(source);
+        let images = collect_images(source, &semantic);
         let legacy = legacy_constructs(source)?;
         let (constructs, inline_fallback) = merge_constructs(source, &semantic, legacy);
         Ok(Self {
             source: source.to_owned(),
             constructs,
+            images,
             semantic,
             inline_fallback,
         })
+    }
+
+    /// 全部图片构造（按文档顺序；含无法成为 Object Block 的混排/行内图片）。
+    #[must_use]
+    pub fn images(&self) -> &[MarkdownImage] {
+        &self.images
+    }
+
+    /// 只返回整行独占的图片（可投影成 Object Block）。
+    pub fn block_images(&self) -> impl Iterator<Item = &MarkdownImage> + '_ {
+        self.images.iter().filter(|image| image.block)
+    }
+
+    /// 指定源码行上的整行独占图片；没有则 `None`。
+    ///
+    /// 同一行不可能有两个 Object Block（要求覆盖整行内容），所以这里返回第一个匹配。
+    #[must_use]
+    pub fn block_image_at_line(&self, line: usize) -> Option<&MarkdownImage> {
+        self.images
+            .iter()
+            .find(|image| image.block && image.line == line)
     }
 
     /// 新解析器的完整语义模型（列表块树 / 行信息）。
@@ -386,9 +473,32 @@ impl MarkdownDocument {
     /// - 列表 marker 未显现 → `Replace` 成 `list_marker_text`；
     /// - 列表行前导空白（布局缩进由 app 提供）→ 永远 `Hidden`；
     /// - 返回片段有序、不重叠、非空。
+    ///
+    /// 图片对象不在这里显现：显式源码模式由
+    /// [`Self::projection_pieces_with_objects`] 的 `revealed_object_lines` 控制。
     pub fn projection_pieces(
         &self,
         selection: Selection,
+    ) -> Result<Vec<ProjectionPiece>, MarkdownError> {
+        self.projection_pieces_with_objects(selection, &[])
+    }
+
+    /// 列表 + 图片对象感知的投影片段（ADR 0019 S2a，生产路径）。
+    ///
+    /// 在 [`Self::projection_pieces`] 的规则之上追加：
+    ///
+    /// - **整行独占的图片**（[`MarkdownImage::is_block`]）且其源码行**不在**
+    ///   `revealed_object_lines` 里 → `ProjectionPiece::Object`（完整 source 跨度，
+    ///   display 是占位符）；
+    /// - 该行在 `revealed_object_lines` 里（工具条「编辑源码」/`F2` 进入源码模式）→
+    ///   不产生 Object 片段，源码原样显示；
+    /// - 混排/行内图片永远不产生 Object 片段（首版保持源码，选择写死在这里）；
+    /// - 万一对象区间与隐藏/替换片段重叠（防御：不重叠是 block 判定的前提），
+    ///   跳过该对象 —— 宁可不投影，也不产生错位。
+    pub fn projection_pieces_with_objects(
+        &self,
+        selection: Selection,
+        revealed_object_lines: &[usize],
     ) -> Result<Vec<ProjectionPiece>, MarkdownError> {
         let mut hidden = self.hidden_ranges_for_selection_filtered(selection, false)?;
         let revealed = self.list_marker_reveals(selection)?;
@@ -452,9 +562,25 @@ impl MarkdownDocument {
         }
         hidden = kept;
         let hidden = merge_ranges(&self.source, hidden)?;
+        // 图片对象：整行独占 + 不在显式源码模式里 → 原子对象片段。
+        let mut objects: Vec<SourceRange> = Vec::new();
+        for image in &self.images {
+            if !image.block || revealed_object_lines.contains(&image.line) {
+                continue;
+            }
+            // 防御：对象不能和隐藏/替换片段重叠（block 判定已排除列表/引用/标题行）。
+            let overlaps = hidden.iter().chain(replacement_ranges.iter()).any(|range| {
+                range.start().get() < image.span.end().get()
+                    && image.span.start().get() < range.end().get()
+            });
+            if !overlaps {
+                objects.push(image.span);
+            }
+        }
         let mut pieces: Vec<ProjectionPiece> =
             hidden.into_iter().map(ProjectionPiece::Hidden).collect();
         pieces.extend(replacements);
+        pieces.extend(objects.into_iter().map(ProjectionPiece::Object));
         pieces.sort_by_key(|piece| (piece.source().start().get(), piece.source().end().get()));
         // 相邻 hidden 合并（Replace 不合并：文本可能不同）。
         let mut merged: Vec<ProjectionPiece> = Vec::with_capacity(pieces.len());
@@ -639,6 +765,72 @@ fn legacy_constructs(source: &str) -> Result<Vec<MarkdownConstruct>, MarkdownErr
         )
     });
     Ok(constructs)
+}
+
+/// 新解析器的图片构造 → editor 的 [`MarkdownImage`]（ADR 0019 S2a）。
+///
+/// 只做**区间换算 + block 判定**，不写任何新文本。定位不合法（坐标越界）的图片
+/// 直接跳过（保守：原样显示）。
+fn collect_images(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownImage> {
+    let mut images = Vec::new();
+    for image in &semantic.images {
+        let (Some(span), Some(alt)) = (
+            convert_span(source, image.span),
+            convert_span(source, image.content),
+        ) else {
+            continue;
+        };
+        let line = source
+            .as_bytes()
+            .get(..image.span.start.min(source.len()))
+            .map_or(0, |prefix| {
+                prefix.iter().filter(|byte| **byte == b'\n').count()
+            });
+        let block = is_block_image(source, semantic, line, &image.span);
+        images.push(MarkdownImage {
+            span,
+            alt,
+            dest: image.dest.clone(),
+            line,
+            block,
+        });
+    }
+    images
+}
+
+/// 判定图片是否**整行独占**（可投影成 Object Block）。
+///
+/// 条件（见 [`MarkdownImage`] 文档）：
+/// 1. 不在代码块 / 未支持块（表格、HTML）里；
+/// 2. 所在行是普通段落（不是标题/引用/列表/围栏/缩进代码/分隔线/表格/HTML）；
+/// 3. 图片 span 恰好从行内容起点开始；
+/// 4. 图片 span 之后到行内容结尾只有空白（行尾空格/Tab 允许）。
+fn is_block_image(
+    source: &str,
+    semantic: &ParsedMarkdown,
+    line: usize,
+    image: &SemanticSpan,
+) -> bool {
+    if inside_any(
+        image.start,
+        image.end,
+        &semantic.code_spans,
+        &semantic.unsupported_spans,
+    ) {
+        return false;
+    }
+    let Some(info) = semantic.lines.get(line) else {
+        return false;
+    };
+    if info.kind != semantic::LineKind::Paragraph || info.list.is_some() || !info.quote.is_empty() {
+        return false;
+    }
+    if image.start != info.content.start || image.end > info.content.end {
+        return false;
+    }
+    source
+        .get(image.end..info.content.end)
+        .is_some_and(|tail| tail.bytes().all(|byte| byte == b' ' || byte == b'\t'))
 }
 
 /// 新解析器 + 旧 scanner 的构造合并（规则见模块文档与 ADR 0019 S1 实施记录）。

@@ -1252,7 +1252,19 @@ impl AppShell {
                 return;
             }
         };
-        let view = cx.new(|cx| EditorView::new(controller, driver, self.vault_label.clone(), cx));
+        // ADR 0019 S2a：图片预览要按 `asset://<hash>` 取本地字节。EditorView 不依赖
+        // storage，这里注入一个只读闭包（`Vault` 是 Clone + Send + Sync，后台解码线程
+        // 可以安全调用 storage 的只读 API）。
+        let asset_provider = vault_asset_provider(&self.vault);
+        let view = cx.new(|cx| {
+            EditorView::new(
+                controller,
+                driver,
+                self.vault_label.clone(),
+                asset_provider,
+                cx,
+            )
+        });
         // 编辑器 → 宿主：F2 请重命名侧栏选中项；点正文则取消行内编辑。
         // 订阅挂在 `OpenNote` 上，切换文档时随之 drop。
         let events = cx.subscribe(&view, |shell, _view, event: &EditorEvent, cx| match event {
@@ -1336,6 +1348,15 @@ impl AppShell {
     }
 
     /// 关窗前排空当前文档（`on_window_should_close` 里调用）。
+    /// 当前活动文档的编辑器视图（`None` = 没有打开的笔记）。
+    ///
+    /// 与 `dev_sync_active_view` 同一个实体，但**不依赖 dev-sync feature**：
+    /// headless 图片/列表测试用它断言编辑器内部状态。
+    #[must_use]
+    pub fn active_editor_view(&self) -> Option<Entity<EditorView>> {
+        self.active.as_ref().map(|active| active.view.clone())
+    }
+
     pub fn close_all(&mut self, cx: &mut Context<Self>) {
         // dev-only 同步面板：先请求停止（非阻塞，GUI 不 join）。
         #[cfg(feature = "dev-sync")]
@@ -4779,6 +4800,44 @@ impl AppShell {
             .as_ref()
             .map(|active| active.view.update(cx, |view, cx| f(view, cx)))
     }
+}
+
+/// ADR 0019 S2a：给 `EditorView` 的图片预览注入“按 hash 读 asset 字节”的能力。
+///
+/// 依赖方向：app → storage 的**只读** API（`asset_bytes`）；EditorView 只认
+/// `AssetBytesProvider` trait，不认识 `Vault`。读取发生在解码线程上（慢盘不阻塞主线程），
+/// 资产不存在 / `data IS NULL` 都返回 `None`（占位显示“缺失/待同步”）。
+fn vault_asset_provider(vault: &Vault) -> crate::editor::object_image::SharedAssetProvider {
+    let vault = vault.clone();
+    std::sync::Arc::new(move |hash: &str| -> Option<Vec<u8>> {
+        let hash = asset_hash_bytes(hash)?;
+        match menghunote_storage::asset_bytes(&vault, hash) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // 读取失败不是致命错误：图片降级为占位，正文照常编辑。
+                eprintln!("[menghunote] 读取图片资产失败（降级占位）：{error}");
+                None
+            }
+        }
+    })
+}
+
+/// `asset://` 里的 64 个小写 hex → 32 字节哈希（非法长度/字符返回 `None`）。
+fn asset_hash_bytes(hash: &str) -> Option<[u8; 32]> {
+    if hash.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let (chunks, remainder) = hash.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for (index, chunk) in chunks.iter().enumerate() {
+        let high = (chunk[0] as char).to_digit(16)?;
+        let low = (chunk[1] as char).to_digit(16)?;
+        out[index] = u8::try_from((high << 4) | low).ok()?;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------

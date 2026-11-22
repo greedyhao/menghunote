@@ -13,8 +13,9 @@
 
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use gpui::{px, Pixels, Point, ShapedLine};
+use gpui::{px, Bounds, Pixels, Point, RenderImage, ShapedLine};
 use menghunote_editor::{Bias, StyleKind};
 
 use super::glyph;
@@ -42,6 +43,53 @@ pub struct EditorGeometry {
     /// 绘制与命中都从这里取"这一行怎么分段"，保证两边 shaping 完全一致
     /// （粗体会让字变宽，命中若用无样式 shaping 会偏）。
     pub styles: Rc<Vec<(Range<usize>, StyleKind)>>,
+    /// 本帧可见的图片对象（按视觉行顺序；只覆盖可见范围）。
+    pub objects: Vec<ObjectPaint>,
+}
+
+/// 图片对象的绘制状态（占位与图片共用同一块矩形，几何完全一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectPaintState {
+    /// 正在后台解码。
+    Loading,
+    /// 资产不存在 / 只有元数据（待同步）。
+    Missing,
+    /// 解码失败（损坏 / 超预算 / 不支持的格式）。
+    Failed,
+    /// 已解码，可直接绘制。
+    Ready,
+}
+
+/// 一个**可见**的图片 Object 行（ADR 0019 S2a）：绘制、命中、工具条共用它。
+///
+/// `rect` 是**窗口坐标**的图片/占位框矩形；行高在布局度量里已经等于
+/// `rect 高度 + 上下内边距`，所以滚动/命中与 `LayoutFrame` 几何天然一致。
+#[derive(Debug, Clone)]
+pub struct ObjectPaint {
+    /// 该图片在 `MarkdownDocument::images()` 里的下标（整个文档顺序）。
+    pub index: usize,
+    /// 源码行号（0 起）。
+    pub line: usize,
+    /// 视觉行号（0 起）。
+    pub row: usize,
+    /// 图片/占位框矩形（窗口坐标）。
+    pub rect: Bounds<Pixels>,
+    /// 已解码图片（`None` = 占位）。
+    pub image: Option<Arc<RenderImage>>,
+    /// 占位/alt 文本（已 shaping，单行；`None` = 图片已就绪或没有文案）。
+    pub label: Option<ShapedLine>,
+    /// 绘制状态。
+    pub state: ObjectPaintState,
+    /// 是否处于选中态（单击选中 / 文本选区相交）——画描边。
+    pub selected: bool,
+}
+
+impl ObjectPaint {
+    /// 是否已解码（可画图片）。
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self.state, ObjectPaintState::Ready) && self.image.is_some()
+    }
 }
 
 impl EditorGeometry {
@@ -152,6 +200,10 @@ impl EditorGeometry {
         let row = self.row_at_y(position.y);
         let bytes = self.frame.row_bytes(row);
         let shaped = self.shaped.get(row.checked_sub(self.visible_start)?)?;
+        // 对象是原子的：拖选/命中落到对象上时一律给“占位符之后”（选区因此包含对象）。
+        if self.object_row(row).is_some() {
+            return Some((bytes.end, Bias::Right));
+        }
         if bytes.is_empty() {
             return Some((bytes.start, Bias::Right));
         }
@@ -167,11 +219,40 @@ impl EditorGeometry {
     pub fn byte_at_row_x(&self, row: usize, x: Pixels) -> Option<usize> {
         let bytes = self.frame.row_bytes(row);
         let shaped = self.shaped.get(row.checked_sub(self.visible_start)?)?;
+        // 对象行整行是一个原子块：横向位置不影响落点（统一取占位符末尾）。
+        if self.object_row(row).is_some() {
+            return Some(bytes.end);
+        }
         if bytes.is_empty() {
             return Some(bytes.start);
         }
         let index = shaped.closest_index_for_x(x);
         Some(bytes.start + index.min(bytes.len()))
+    }
+
+    /// 本帧可见的图片对象。
+    #[must_use]
+    pub fn objects(&self) -> &[ObjectPaint] {
+        &self.objects
+    }
+
+    /// 第 `row` 行是否是图片对象行。
+    #[must_use]
+    pub fn object_row(&self, row: usize) -> Option<&ObjectPaint> {
+        self.objects.iter().find(|object| object.row == row)
+    }
+
+    /// 窗口坐标命中的图片对象（整行都是对象块的可点击区域）。
+    #[must_use]
+    pub fn object_at(&self, position: Point<Pixels>) -> Option<&ObjectPaint> {
+        let row = self.row_at_y(position.y);
+        self.object_row(row)
+    }
+
+    /// 窗口坐标命中的图片对象**源码行**（工具条/点选用的轻量查询）。
+    #[must_use]
+    pub fn object_line_at(&self, position: Point<Pixels>) -> Option<usize> {
+        self.object_at(position).map(|object| object.line)
     }
 
     /// 第 `row` 行的样式分段 `(字节数, 种类)`（总长等于该行字节数）。
@@ -186,6 +267,15 @@ impl EditorGeometry {
         let row = self.frame.row_of_byte(byte);
         let bytes = self.frame.row_bytes(row);
         let shaped = self.shaped.get(row.checked_sub(self.visible_start)?)?;
+        // 对象行没有字形：caret 只能贴在图片/占位框左右两侧。
+        if let Some(object) = self.object_row(row) {
+            let x = if byte <= bytes.start {
+                object.rect.origin.x
+            } else {
+                object.rect.origin.x + object.rect.size.width
+            };
+            return Some((row, x));
+        }
         if bytes.is_empty() {
             return Some((row, self.text_left_for_row(row)));
         }
@@ -228,6 +318,7 @@ mod tests {
             line_height: px(20.0),
             viewport_height: 220.0,
             styles: Rc::new(Vec::new()),
+            objects: Vec::new(),
         };
         assert!(geometry.visible_rows().is_empty());
         assert_eq!(geometry.row_at_y(px(0.0)), 10);

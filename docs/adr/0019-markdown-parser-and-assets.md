@@ -210,6 +210,116 @@
 - 物理资产 GC 不依赖本切片；但 S2 的引用对账应使用本解析器的完整 span（含引用式链接/
   图片），不要再回到正则。
 
+## 7. S2a 实施记录（2026-11-16）
+
+> 范围：**图片 Object 的投影 / 布局 / 只读预览 / 编辑切换**。
+> 明确**未做**：粘贴/拖放/剪贴板图片、文件系统对话框、引用对账与 GC、Mermaid、
+> 表格与任务列表交互（S2b/S3 的范围）。
+
+### 7.1 选择与判定（写死，测试钉住）
+
+- **Object Block 判定（editor `MarkdownImage::is_block`）**：图片 span 必须
+  1) 从行内容起点开始；2) 之后到行尾只有空白（行尾空格/Tab 允许）；3) 该行是普通
+  段落（不是标题/引用/列表/围栏/缩进代码/表格/HTML/分隔线），且不在
+  `code_spans`/`unsupported_spans` 里。
+- **混排/行内图片首版保持源码原样显示**（不原子替换半行内容，避免错位）：
+  同一行还有别的文字、行首缩进、列表项、引用、标题、表格里的图片都不投影。
+  围栏代码里的 `![...]` 本来就不产生图片事件（字面文本）。
+- 引用式图片（`![alt][label]`）从 `pulldown-cmark` 的 `Tag::Image::dest_url` 取
+  **解析后的真实 URL**，`span` 仍是源码里的 `![alt][label]`；正文零改写。
+  markdown crate 新增 `ParsedMarkdown::images`（`ImageSpan { span, content, dest }`），
+  不重序列化 AST。
+
+### 7.2 投影（`SegmentKind::Object`）
+
+- `ProjectionPiece::Object(SourceRange)`；`SegmentKind::Object` 正式实现：
+  source 是完整 `![alt](dest)`，display 是**占位符** `U+FFFC`（`OBJECT_PLACEHOLDER`，
+  3 字节）。选占位符而非零宽的理由：display 上对象有明确区间，文本选区能"碰到"
+  对象、复制能完整反查 source，不会出现"光标消失"。
+- 偏置规则（editor `projection.rs` 模块文档 + `tests/image_object.rs` 钉住）：
+  - source 落在对象内部（含起点）→ 占位符起点；对象末尾 → 占位符末尾（接缝/文档尾）；
+  - display 落在占位符内部（含起点）→ 对象 source 起点（`Left` 偏置同样不落进源码中间）；
+    占位符末尾 → 对象 source 末尾；
+  - display 区间终点落在占位符内部或末尾 → source 区间**完整包含**对象源码
+    （复制得到完整 Markdown）；终点恰在占位符起点 → 不包含对象。
+- **显现规则**：图片对象**不**参与"caret/选区相交即显现"的普通构造规则。只有
+  `EditorController::begin_object_source_edit(line)`（工具条「编辑源码」/`F2`）显式
+  设置 `object_edit_line` 才展开源码；文本选区跨过对象时保持占位符 + 整块描边。
+- 源码被改坏（图片不再是图片）时 `refresh_markdown` 自动清空源码模式。
+
+### 7.3 app 布局 / 绘制 / 命中
+
+- 行高：`LineMetric::line_height = 内容高 + 2 × OBJECT_PADDING`（`+12px`），
+  内容高 = 已解码图片按内容宽度等比（`fit_size`：`min(原始宽, 内容宽)`），
+  未就绪时用 `OBJECT_PLACEHOLDER_HEIGHT`。`WrapCache` 的度量键包含行高，
+  解码完成后自动重排。
+- 几何：`EditorGeometry::objects: Vec<ObjectPaint>`（窗口坐标矩形 + 图片/占位文案 +
+  选中态）。滚动/命中/选中框与 `LayoutFrame` 的行顶/行高**同一套**坐标；
+  对象行的拖选/方向键统一落到占位符末尾（对象内部不产生 caret）。
+- 绘制：对象行不画字形；已解码用 `Window::paint_image`（BGRA `RenderImage`，首帧），
+  未就绪画占位框 + alt/状态文案（`图片加载中…` / `图片缺失或待同步` / `图片无法预览`）；
+  选中态画 2px 描边。`paint_selection` 跳过对象行（不画占位符的文本选区）。
+- 悬浮工具条：对象被悬停/选中/文本选区相交时出现，「编辑源码」「复制 Markdown」；
+  位置来自上一帧对象矩形，点击由工具条按钮处理，元素层的鼠标监听用
+  `toolbar_rect` 放行（不会同时挪光标）。
+- 键盘：`F2` 有对象目标时进入源码模式（否则仍是侧栏重命名）；`Esc` / `Ctrl+Enter` /
+  点击块外退出；`Backspace/Delete` 在对象被点选时删除**完整源跨度**，折叠 caret 紧贴
+  对象时**先选块**、再按一次才删；`Ctrl+C` 在对象选中时复制完整 Markdown，否则复制
+  选区的 source 区间（对象行同样包含完整源码）。对象内部不产生文本 caret/部分选区。
+
+### 7.4 资产加载（不依赖 storage、不阻塞主线程）
+
+- `crates/app/src/editor/object_image.rs`：
+  - `AssetBytesProvider`（trait + 闭包 blanket impl）是唯一能力面；`AppShell` 用
+    `Vault` 的只读 `asset_bytes` 注入，**EditorView 不依赖 storage**；
+  - 解析只接受 `asset://<64 小写 hex>`；`asset://` 之外不猜、不归一；
+  - **后台单线程**解码（结构性并发 1）：主线程只 `request(hash)`（幂等，登记 inflight）
+    并读状态；worker 读字节 → 校验预算 → 解码 → 写回缓存；`pump` 用
+    `take_completed()` 触发一次重绘。主线程不读 SQLite、不解码；
+  - 预算：边长 ≤ 8192、总像素 ≤ 16MP、单图解码内存 ≤ 128MiB；超限/损坏/不支持的格式
+    （SVG/BMP/TIFF…）只降级占位，不 panic、不删正文；
+  - 只解码 PNG/JPEG/WebP/GIF，EXIF 方向在解码前应用；GIF/WebP 动画**只取首帧**；
+  - 已解码缓存 LRU ≤ 128MiB（`Ready` 项按最近使用淘汰，`Missing/Failed` 是零字节终态，
+    不触发淘汰）；`image = "=0.25.10"`（`default-features = false` + png/jpeg/webp/gif），
+    与 gpui-pre 的传递依赖同版本，lockfile 只多一行。
+- `EditorView::new` 增加一个 `SharedAssetProvider` 参数（`AppShell` 注入）；
+  `AppShell::active_editor_view()` 提供不依赖 dev-sync feature 的测试入口。
+
+### 7.5 测试
+
+- `cargo test -p menghunote-markdown`：**15**（新增 3 个图片 golden：dest/alt/span、
+  引用式解析、嵌套在链接里）；
+- `cargo test -p menghunote-editor`：**148**（新增 `tests/image_object.rs` 11 个：
+  block 判定/混排保持源码/Object 段/端点偏置/复制源文/选区不显现/源码模式往返/
+  删除整段/语法改坏自动退出）；
+- `cargo test -p menghunote-app --test headless_images`：**7**（真实临时 vault + 真实
+  PNG 资产：打开不 panic/不重写源码、对象可选中、选中不出现源码、工具条编辑/Esc 往返、
+  Backspace 先选块再删整段、宽图等比缩到内容宽度、选区跨对象复制完整 Markdown、
+  缺失/损坏资产降级占位且正文不动）；
+- 回归：S1 列表/标题 headless（`headless_lists` 6、`headless_ui` 8）全绿；
+  app 默认 **153**、app `--features dev-sync`、editor/markdown 如上；
+  `cargo fmt --all` 与 markdown/editor/app（含 `--features dev-sync`）的
+  `clippy --all-targets -D warnings` 通过。
+
+### 7.6 已知限制与 S2b 接口建议
+
+- **未做 S2b**：粘贴/拖放/剪贴板图片、引用对账（`asset_refs`）、资产 GC；S2a 只**读**
+  资产字节，不写 `assets`/`asset_refs`。
+- 像素级外观（DPI、真实窗口里的图片清晰度/工具条位置）**未在 Windows 真机验证**；
+  headless 测试只证明几何/事务/状态链路。
+- 行内/混排图片首版保持源码；后续要做"原子缩略图"时应复用
+  `ProjectionPiece::Object` + `SegmentKind::Object`（display 已是占位符），只需在
+  `is_block_image` 的判定与布局里允许行内对象，不必再改映射语义。
+- `ImageService` 的接口已预留 S2b 需要的点：
+  - `ImageService::request(hash)` / `state(hash)` / `display_size(hash, max_width)`；
+  - 缺字节的 `Missing` 是终态（不重试）：S2b 资产同步完成后调用方应能清缓存重试，
+    建议加 `ImageService::forget(hash)` / 按 vault 事件失效（本次未加，等对账切片给
+    明确的"资产字节已到达"事件再接线）；
+  - provider 只认 `&str` hex，S2b 的导入/去重逻辑在 storage 侧完成后无需改这里。
+- `asset://` 解析是**严格** `asset://<64 小写 hex>`；S2b 若要支持带 title 的
+  `![alt](asset://hash "title")`，应在 markdown crate 的 `ImageSpan::dest` 已解析的前提
+  下扩展（当前 `dest_url` 已去掉 title，无需改 editor）。
+
 ## 非目标
 
 不换富文本真源、不自动远程取图、不做 SVG/动画/图像编辑器、不首版做脚注/数学/alerts、

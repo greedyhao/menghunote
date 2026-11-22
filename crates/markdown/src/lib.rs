@@ -302,6 +302,25 @@ pub struct LineInfo {
     pub list: Option<ListLineInfo>,
 }
 
+/// 一个图片构造的**读取用**元数据（ADR 0019 S2a）。
+///
+/// 只记录“源码里这一段是图片、它的 alt/目标是什么”，**不产生任何新文本**：
+/// [`Self::dest`] 来自 `pulldown-cmark` 的 `Tag::Image::dest_url`（已解码的语义
+/// 目标，引用式图片也解析成真实 URL），正文仍然逐字节保留在源码里。
+///
+/// 与 [`Construct`] 的关系：图片仍然是一个 `ConstructKind::Image` 构造（S1 语义
+/// 不变），本类型补充“目标 URL”这一投影层之外的信息，供 editor/app 判断能否作为
+/// Object Block（是否整行独占由 editor 用 [`LineInfo`] 判断）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageSpan {
+    /// 整段 `![alt](dest)` 的源码区间（含定界符）。
+    pub span: Span,
+    /// alt 内容区间（`[...]` 内部，不含方括号）。
+    pub content: Span,
+    /// 解析后的目标 URL（`asset://<hex>` 等原样字符串，不重新序列化）。
+    pub dest: String,
+}
+
 /// 解析结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMarkdown {
@@ -311,6 +330,11 @@ pub struct ParsedMarkdown {
     pub lists: Vec<ListBlock>,
     /// 列表项（按出现顺序）。
     pub items: Vec<ListItem>,
+    /// 图片构造（含 inline / 引用式；按 `span` 起点排序）。
+    ///
+    /// 每个图片同时也出现在 [`Self::constructs`] 里（`ConstructKind::Image`）；
+    /// 这里额外给出目标 URL，投影层据此判断能否渲染成 Object Block。
+    pub images: Vec<ImageSpan>,
     /// 可投影构造（块级 + 行内；按 span/kind 稳定排序）。
     pub constructs: Vec<Construct>,
     /// 代码块区间（围栏/缩进；editor 用它抑制旧 scanner 在代码内部的构造）。
@@ -413,6 +437,10 @@ struct Builder<'a> {
     items_stack: Vec<ItemFrame>,
     code_stack: Vec<CodeFrame>,
     inline_stack: Vec<InlineFrame>,
+    /// 当前打开的图片事件 `(起点, 目标 URL)`（`TagEnd::Image` 时与 `finish_inline` 配对）。
+    image_stack: Vec<(usize, String)>,
+    /// 解析出的图片元数据（按 `span` 起点排序后写进 [`ParsedMarkdown::images`]）。
+    images: Vec<ImageSpan>,
     quote_stack: Vec<Span>,
     table_stack: Vec<Span>,
     html_stack: Vec<Span>,
@@ -439,6 +467,8 @@ impl<'a> Builder<'a> {
             items_stack: Vec::new(),
             code_stack: Vec::new(),
             inline_stack: Vec::new(),
+            image_stack: Vec::new(),
+            images: Vec::new(),
             quote_stack: Vec::new(),
             table_stack: Vec::new(),
             html_stack: Vec::new(),
@@ -519,7 +549,12 @@ impl<'a> Builder<'a> {
             Tag::Emphasis => self.push_inline(InlineKind::Emphasis, range.start),
             Tag::Strikethrough => self.push_inline(InlineKind::Strike, range.start),
             Tag::Link { .. } => self.push_inline(InlineKind::Link, range.start),
-            Tag::Image { .. } => self.push_inline(InlineKind::Image, range.start),
+            Tag::Image { dest_url, .. } => {
+                // `dest_url` 是 pulldown-cmark 解析后的语义目标（引用式图片也在这里
+                // 变成真实 URL）。**只读取、不重写正文**：源码逐字节保留。
+                self.image_stack.push((range.start, dest_url.to_string()));
+                self.push_inline(InlineKind::Image, range.start);
+            }
             Tag::Paragraph
             | Tag::TableHead
             | Tag::TableRow
@@ -596,6 +631,15 @@ impl<'a> Builder<'a> {
             return;
         }
         let span = Span::new(frame.start, end);
+        // 图片的事件开始处记录了目标 URL；配对检查起点，防止不平衡的事件流错位。
+        let image_dest = if matches!(kind, InlineKind::Image) {
+            self.image_stack
+                .pop()
+                .filter(|(start, _)| *start == frame.start)
+                .map(|(_, dest)| dest)
+        } else {
+            None
+        };
         let construct = match kind {
             InlineKind::Bold => self
                 .analyze_delimited(span, b'*', 2, ConstructKind::Bold)
@@ -608,7 +652,16 @@ impl<'a> Builder<'a> {
             InlineKind::Image => self.analyze_link(span, true),
         };
         match construct {
-            Some(construct) => self.constructs.push(construct),
+            Some(construct) => {
+                if let Some(dest) = image_dest {
+                    self.images.push(ImageSpan {
+                        span: construct.span,
+                        content: construct.content,
+                        dest,
+                    });
+                }
+                self.constructs.push(construct);
+            }
             None => self.uncertain_inline = true,
         }
     }
@@ -1008,6 +1061,7 @@ impl<'a> Builder<'a> {
             lines,
             mut list_blocks,
             mut items,
+            mut images,
             constructs,
             headings,
             mut code_spans,
@@ -1110,6 +1164,8 @@ impl<'a> Builder<'a> {
         code_spans.dedup();
         unsupported_spans.sort_by_key(|span| (span.start, span.end));
         unsupported_spans.dedup();
+        images.sort_by_key(|image| (image.span.start, image.span.end));
+        images.dedup();
 
         // list block 按文档顺序（嵌套 list 的 End 是内层先到），排序后要重映射 list_index。
         let mut order: Vec<usize> = (0..list_blocks.len()).collect();
@@ -1139,6 +1195,7 @@ impl<'a> Builder<'a> {
             lines: line_infos,
             lists: list_blocks,
             items,
+            images,
             constructs: all,
             code_spans,
             unsupported_spans,

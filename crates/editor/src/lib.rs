@@ -94,9 +94,12 @@ pub use menghunote_markdown::{
 pub use model::controller::{EditorController, GraphemeStep, OutcomeEffect};
 pub use model::error::EditorError;
 pub use model::input::InputDocument;
-pub use model::markdown::{ConstructKind, MarkdownConstruct, MarkdownDocument, MarkdownError};
+pub use model::markdown::{
+    ConstructKind, MarkdownConstruct, MarkdownDocument, MarkdownError, MarkdownImage,
+};
 pub use model::projection::{
-    Bias, BoundaryBias, ProjectionError, ProjectionMap, Segment, SegmentKind,
+    Bias, BoundaryBias, ProjectionError, ProjectionMap, ProjectionPiece, Segment, SegmentKind,
+    OBJECT_PLACEHOLDER, OBJECT_PLACEHOLDER_LEN,
 };
 pub use model::selection::Selection;
 pub use model::style::{StyleKind, StyleRun};

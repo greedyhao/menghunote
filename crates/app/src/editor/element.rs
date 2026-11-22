@@ -17,10 +17,11 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element,
-    ElementId, ElementInputHandler, Entity, Focusable as _, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    ScrollEvent, ShapedLine, Style, TextAlign, Window,
+    fill, point, px, quad, relative, size, transparent_black, App, BorderStyle, Bounds,
+    ContentMask, Corners, CursorStyle, DispatchPhase, Edges, Element, ElementId,
+    ElementInputHandler, Entity, Focusable as _, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent,
+    ShapedLine, Style, TextAlign, Window,
 };
 use menghunote_editor::{units, Bias, Selection};
 
@@ -90,6 +91,10 @@ impl EditorElement {
         }
         for (offset, shaped) in geometry.shaped.iter().enumerate() {
             let row = geometry.visible_start + offset;
+            // 对象行由 `paint_objects` 画整块描边/高亮，不在这里画文本选区（占位符不是文字）。
+            if geometry.object_row(row).is_some() {
+                continue;
+            }
             let line = &geometry.frame.lines[row];
             let span = selection_span(line, shaped, selected.clone());
             if dump {
@@ -212,6 +217,10 @@ impl EditorElement {
     fn paint_text(&self, geometry: &EditorGeometry, window: &mut Window, cx: &mut App) {
         for (offset, shaped) in geometry.shaped.iter().enumerate() {
             let row = geometry.visible_start + offset;
+            // 图片对象行不画字形（display 里只有占位符）：整行由 `paint_objects` 覆盖。
+            if geometry.object_row(row).is_some() {
+                continue;
+            }
             // 引用行有缩进：文字原点用该行自己的左边界（PAD_X 与 indent 只在这里加一次）。
             let origin = point(geometry.text_left_for_row(row), geometry.row_top(row));
             // 引用块左侧竖条：只按 quote depth 画；列表 gutter 不是引用。
@@ -246,6 +255,67 @@ impl EditorElement {
         }
     }
 
+    /// 画图片对象（ADR 0019 S2a）：已解码画图片；加载中/缺失/失败画占位框 + alt/状态文案。
+    ///
+    /// 矩形来自 [`EditorGeometry::objects`]（prepaint 已经按 `LayoutFrame` 的行顶/行高算好），
+    /// 因此滚动、命中、选中框与文本几何是**同一套**坐标。
+    fn paint_objects(
+        &self,
+        bounds: Bounds<Pixels>,
+        geometry: &EditorGeometry,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        for object in geometry.objects() {
+            let rect = object.rect;
+            if let Some(image) = &object.image {
+                // `bounds` 是视口裁剪框：图片可能被滚出视口，交给 gpui 裁剪。
+                if let Err(error) = window.paint_image(
+                    bounds,
+                    rect,
+                    Corners::default(),
+                    std::sync::Arc::clone(image),
+                    0,
+                    false,
+                ) {
+                    eprintln!("[menghunote] 绘制图片失败（降级为空白）：{error}");
+                }
+            } else {
+                window.paint_quad(quad(
+                    rect,
+                    Corners::default(),
+                    theme::object_placeholder_bg(),
+                    Edges::all(px(1.0)),
+                    theme::object_placeholder_border(),
+                    BorderStyle::default(),
+                ));
+                if let Some(label) = &object.label {
+                    let line_height = px(theme::OBJECT_LABEL_FONT_SIZE * 1.5);
+                    let origin = point(
+                        rect.origin.x + px(theme::OBJECT_LABEL_PAD_X),
+                        rect.origin.y + (rect.size.height - line_height) / 2.0,
+                    );
+                    if let Err(error) =
+                        label.paint(origin, line_height, TextAlign::Left, None, window, cx)
+                    {
+                        eprintln!("[menghunote] 绘制图片占位文案失败：{error}");
+                    }
+                }
+            }
+            if object.selected {
+                // 选中态 = 整块描边（不展开源码、不显示文本 caret）。
+                window.paint_quad(quad(
+                    rect,
+                    Corners::default(),
+                    transparent_black(),
+                    Edges::all(px(theme::OBJECT_SELECTED_BORDER)),
+                    theme::object_selected_border(),
+                    BorderStyle::default(),
+                ));
+            }
+        }
+    }
+
     /// 注册本帧的鼠标监听（每帧重建，跟随最新 `bounds` 与几何）。
     fn register_handlers(
         &self,
@@ -266,6 +336,21 @@ impl EditorElement {
                 {
                     return;
                 }
+                // 悬浮工具条上的点击由工具条自己的按钮处理：这里必须放行，否则会同时挪光标。
+                let toolbar_hit = down_view
+                    .update(cx, |view, _| view.point_in_toolbar(event.position))
+                    .unwrap_or(false);
+                if toolbar_hit {
+                    return;
+                }
+                // 图片对象：单击只选中块（描边），不展开源码、不产生对象内部 caret。
+                if let Some(object) = down_geometry.object_at(event.position) {
+                    let line = object.line;
+                    down_view
+                        .update(cx, |view, cx| view.select_object_at(line, Some(window), cx))
+                        .ok();
+                    return;
+                }
                 // 命中带偏置：点字形右半 → 停在隐藏标记之前（构造内），左半 → 之后。
                 let (byte, bias) = down_geometry
                     .byte_at_with_bias(event.position)
@@ -282,6 +367,10 @@ impl EditorElement {
         let move_geometry = Rc::clone(&geometry);
         window.on_mouse_event(
             move |event: &MouseMoveEvent, _phase: DispatchPhase, _: &mut Window, cx: &mut App| {
+                // 悬停 → 图片对象工具条（不依赖元素级 hover 命中链）。
+                move_view
+                    .update(cx, |view, cx| view.hover_at(event.position, cx))
+                    .ok();
                 if !event.dragging() {
                     return;
                 }
@@ -383,8 +472,9 @@ impl Element for EditorElement {
         let line_height = px(theme::DEFAULT_LINE_HEIGHT);
         let wrap_width =
             (bounds.size.width.as_f32() - theme::PAD_X * 2.0).max(super::layout::MIN_WRAP_WIDTH);
-        // 块级度量（标题字号 / 代码块等宽）：连同文本一起进 `WrapCache` 的键。
-        let metrics = self.view.read(cx).block_metrics(window);
+        let content_width = wrap_width;
+        // 块级度量（标题字号 / 代码块等宽 / 图片对象行高）：连同文本一起进 `WrapCache` 的键。
+        let metrics = self.view.read(cx).block_metrics(window, content_width);
 
         let frame = self.shared.frame(super::shared::WrapRequest {
             text: &text,
@@ -416,9 +506,27 @@ impl Element for EditorElement {
         // 注意：样式随 caret 变化（进入/离开构造），所以**每帧**都要按当前 runs 重新
         // shaping；`WrapCache` 只缓存折行（纯文本函数），不会把样式缓存住。
         let styles = Rc::new(self.view.read(cx).style_runs_display());
+        // 图片对象：几何矩形按 LayoutFrame 的行顶/行高算（元素局部坐标，下面再加 origin）。
+        let objects_local =
+            self.view
+                .read(cx)
+                .object_paints(window, &frame, scroll, content_width, first..last);
+        let object_rows: std::collections::HashSet<usize> =
+            objects_local.iter().map(|object| object.row).collect();
         let shaped = frame.lines[first..last]
             .iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(offset, line)| {
+                // 对象行只含 display 占位符：不 shaping 字形（占位符永不绘制成豆腐块）。
+                if object_rows.contains(&(first + offset)) {
+                    return super::glyph::shape_row_styled_at(
+                        window,
+                        "",
+                        &[],
+                        line.font_size,
+                        line.mono,
+                    );
+                }
                 let spans = super::glyph::line_spans(&styles, line.bytes.clone());
                 super::glyph::shape_row_styled_at(
                     window,
@@ -427,6 +535,20 @@ impl Element for EditorElement {
                     line.font_size,
                     line.mono,
                 )
+            })
+            .collect();
+        // 局部坐标 → 窗口坐标（元素原点）。
+        let objects = objects_local
+            .into_iter()
+            .map(|mut object| {
+                object.rect = Bounds::new(
+                    point(
+                        object.rect.origin.x + bounds.origin.x,
+                        object.rect.origin.y + bounds.origin.y,
+                    ),
+                    object.rect.size,
+                );
+                object
             })
             .collect();
 
@@ -439,6 +561,7 @@ impl Element for EditorElement {
             line_height,
             viewport_height: bounds.size.height.as_f32(),
             styles,
+            objects,
         });
         self.shared.set_geometry(Rc::clone(&geometry));
         // 正文 hitbox：prepaint 阶段插入（与绘制矩形一致），paint 阶段绑定光标样式。
@@ -479,6 +602,7 @@ impl Element for EditorElement {
             // 顺序：选区底色 → 正文 → IME 组合串 → 光标（光标永远压在最上面）。
             self.paint_selection(&geometry, selection, display_selection, window, cx);
             self.paint_text(&geometry, window, cx);
+            self.paint_objects(bounds, &geometry, window, cx);
             self.paint_preedit(&geometry, display_caret, window, cx);
             self.paint_caret(&geometry, display_caret, window);
         });

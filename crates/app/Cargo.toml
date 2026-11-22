@@ -41,6 +41,17 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 # 秘密缓冲（setup secret / 恢复码）：drop 时清零，ADR 0011「缓冲用 Zeroizing」。
 zeroize = { version = "1", optional = true }
+# ADR 0019 §2 / S2a：图片预览的受控解码。`0.25.10` 早已在 lockfile 里（gpui-pre 的
+# 传递依赖），这里只是显式声明并**精确 pin** 同一个版本，不引入新的版本/构建脚本；
+# 只开首版支持的四种格式（PNG/JPEG/WebP/GIF），不加 SVG/BMP 等。
+# 解码跑在 app 自己的后台线程上（见 `editor::object_image`），不走 gpui 的
+# HTTP/file 资产加载器。
+image = { version = "=0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+] }
 
 [dev-dependencies]
 # 原生 headless UI 测试（`#[gpui::test]` + `TestAppContext`）。

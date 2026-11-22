@@ -5,9 +5,22 @@
 //! - [`SegmentKind::Copy`]：可见段，source 与 display 逐字节相同（等宽）；
 //! - [`SegmentKind::Elide`]：省略段，source 非空、display 宽度为 0
 //!   （Markdown 标记被隐藏）；
-//! - `Object` 仍为后续切片预留，本层不生成，查询遇到时返回 `None`；
+//! - `Object` 在 ADR 0019 S2a 启用：整行独占的图片是一个**原子对象**，source 是完整
+//!   `![alt](dest)`，display 是**一个占位符** [`OBJECT_PLACEHOLDER`]（宽 3 字节）；
 //! - `Replace` 在 ADR 0019 S1 启用：列表 marker 的 display 是 bullet/编号，source 是
 //!   `- ` / `1. `。端点偏置见下文。
+//!
+//! ## Object 段（图片）的映射语义（写死，测试钉住）
+//!
+//! 对象是**原子**的：正文里没有“对象内部”的文本位置，只有占位符前/后两个落点。
+//!
+//! - **source → display**：source 落在对象区间内部（含起点）→ 占位符起点；
+//!   正好在对象末尾 → 下一可见段起点（= 占位符末尾）。
+//! - **display → source**：display 落在占位符内部（含起点）→ 对象 source 起点
+//!   （`Right` 偏置）；占位符末尾 → 对象 source 末尾（由接缝/文档尾规则给出）。
+//!   `Left` 偏置在占位符内部同样取对象起点（不会落进源码中间）。
+//! - **display 区间 → source 区间**：终点落在占位符内部或末尾时，区间**完整包含**
+//!   对象的 source（复制得到完整 Markdown，而不是被省略掉 `![...](...)`）。
 //!
 //! 段表**完整、有序、无重叠**地覆盖 `[0, source_len)`，且 display 区间连续；
 //! 查询一律先在段表里定位、再段内换算，绝不用"display = source + 常数偏移"。
@@ -79,11 +92,16 @@ pub enum SegmentKind {
     Elide,
     /// 转义 / 换行显示替代等：display 文本与 source 不同（后续切片）。
     Replace,
-    /// widget / 图片等对象，对应完整源码范围（后续切片）。
+    /// 原子对象（ADR 0019 S2a：整行独占的图片），source 是完整源码跨度，
+    /// display 是占位符 [`OBJECT_PLACEHOLDER`]（宽 3 字节）。
+    ///
+    /// 对象内部没有可停的文本位置：`source → display` 收敛到占位符起点，
+    /// `display → source` 只给出对象两端。
     Object,
 }
 
-/// 一个投影片段：要么整段隐藏（Elide），要么替换成另一段 display 文本（Replace）。
+/// 一个投影片段：整段隐藏（Elide）/ 替换成另一段 display 文本（Replace）/
+/// 原子对象（Object）。
 ///
 /// `Replace` 的 source 区间是**完整 marker**（`- ` / `1. `），display 文本是 bullet /
 /// 右对齐编号；两段都在源码里真实存在，不是 AST 重新序列化。
@@ -93,6 +111,9 @@ pub enum ProjectionPiece {
     Hidden(SourceRange),
     /// 用 `display` 文本替换该 source 区间。
     Replace(SourceRange, String),
+    /// 原子对象：source 是完整源码跨度（如图片 `![alt](dest)`），display 是
+    /// [`OBJECT_PLACEHOLDER`]（宽度 3 字节，绘制层用图片覆盖它）。
+    Object(SourceRange),
 }
 
 impl ProjectionPiece {
@@ -100,10 +121,22 @@ impl ProjectionPiece {
     #[must_use]
     pub const fn source(&self) -> SourceRange {
         match self {
-            Self::Hidden(range) | Self::Replace(range, _) => *range,
+            Self::Hidden(range) | Self::Replace(range, _) | Self::Object(range) => *range,
         }
     }
 }
+
+/// 对象段在 display 串里的占位符（U+FFFC OBJECT REPLACEMENT CHARACTER，3 字节）。
+///
+/// 为什么需要占位符而不是零宽：
+/// - display→source 有明确的 display 区间（`[d, d+3)`），文本选区可以“碰到”对象，
+///   不会出现“光标消失 / 无落点”；
+/// - 复制时 display 选区覆盖占位符 → 反查 source **完整包含**对象源码；
+/// - 绘制层对这类行不画字形，改用图片/占位框覆盖（占位符永远不会显示成豆腐块）。
+pub const OBJECT_PLACEHOLDER: &str = "\u{FFFC}";
+
+/// 对象占位符的 display 字节宽度。
+pub const OBJECT_PLACEHOLDER_LEN: usize = OBJECT_PLACEHOLDER.len();
 
 /// 多对一区间的边界取向（ADR 0002 §4：隐藏区间的内部点没有唯一逆像）。
 ///
@@ -192,6 +225,33 @@ impl Segment {
             kind: SegmentKind::Replace,
             bias: BoundaryBias::After,
             text: Some(text),
+        })
+    }
+
+    /// 构造 Object 段：source 是完整源码跨度（图片 `![alt](dest)`），display 是
+    /// [`OBJECT_PLACEHOLDER`]（固定 3 字节）。
+    ///
+    /// 对象是原子的：display 上只有一个占位符，绘制层据此把该行改画成图片。
+    pub fn object(
+        source: SourceRange,
+        display_start: DisplayByte,
+    ) -> Result<Self, ProjectionError> {
+        if source.is_empty() {
+            return Err(ProjectionError::InvalidLayout(
+                "Object 段的 source 区间不能为空",
+            ));
+        }
+        let display_end = display_start
+            .get()
+            .checked_add(OBJECT_PLACEHOLDER_LEN)
+            .ok_or(ProjectionError::Overflow)?;
+        Ok(Self {
+            source,
+            display_start,
+            display_end: DisplayByte::new(display_end),
+            kind: SegmentKind::Object,
+            bias: BoundaryBias::After,
+            text: Some(OBJECT_PLACEHOLDER.to_owned()),
         })
     }
 
@@ -304,8 +364,9 @@ impl ProjectionMap {
     /// 由显式段表构造（结构测试 / 后续 Replace 用）。
     ///
     /// 校验：段按 source 与 display 都从 0 起连续覆盖；Copy 段两侧宽度相等；
-    /// Elide 段 display 宽度为零；端点落在 scalar 边界；空文档只允许空段表。
-    /// 本层接受 `Copy` / `Elide` / `Replace`（`Object` 留给 S2）。
+    /// Elide 段 display 宽度为零；Object 段的 display 是占位符（宽 3 字节）；
+    /// 端点落在 scalar 边界；空文档只允许空段表。
+    /// 本层接受 `Copy` / `Elide` / `Replace` / `Object`。
     pub fn from_segments(source: &str, segments: Vec<Segment>) -> Result<Self, ProjectionError> {
         let source_len = units::byte_len(source);
         if source_len == 0 && !segments.is_empty() {
@@ -363,9 +424,18 @@ impl ProjectionMap {
                     display.push_str(text);
                 }
                 SegmentKind::Object => {
-                    return Err(ProjectionError::InvalidLayout(
-                        "本层不支持 Object 段（ADR 0019 S2 起）",
-                    ));
+                    // display 只能是占位符（宽度固定 3 字节）；绘制层不画这个字形。
+                    if segment.text.as_deref() != Some(OBJECT_PLACEHOLDER) {
+                        return Err(ProjectionError::InvalidLayout(
+                            "Object 段的 display 文本必须是对象占位符",
+                        ));
+                    }
+                    if segment.display_len() != OBJECT_PLACEHOLDER_LEN {
+                        return Err(ProjectionError::InvalidLayout(
+                            "Object 段的 display 宽度必须等于占位符长度",
+                        ));
+                    }
+                    display.push_str(OBJECT_PLACEHOLDER);
                 }
             }
 
@@ -389,7 +459,8 @@ impl ProjectionMap {
         })
     }
 
-    /// 由**投影片段**构造段表（ADR 0019 S1：列表 marker 用 `Replace`）。
+    /// 由**投影片段**构造段表（ADR 0019 S1：列表 marker 用 `Replace`；S2a：图片用
+    /// `Object`）。
     ///
     /// 片段必须按 source 起点有序、互不重叠、非空；片段之间的空隙自动成为 `Copy`。
     pub fn from_pieces(source: &str, pieces: &[ProjectionPiece]) -> Result<Self, ProjectionError> {
@@ -420,6 +491,9 @@ impl ProjectionMap {
                 ProjectionPiece::Replace(_, text) => {
                     Segment::replace(range, text.clone(), DisplayByte::new(display_cursor))?
                 }
+                ProjectionPiece::Object(_) => {
+                    Segment::object(range, DisplayByte::new(display_cursor))?
+                }
             };
             display_cursor = segment.display_end().get();
             segments.push(segment);
@@ -438,7 +512,23 @@ impl ProjectionMap {
     /// 与 [`Self::from_markdown`] 的区别：后者只做 `Copy/Elide`（S2 行为，供旧测试与
     /// 保守回退使用）；本方法是 app 生产路径，`ListItem` marker 走 `Replace`。
     pub fn from_markdown_with_lists(doc: &MarkdownDocument, selection: Selection) -> Self {
-        let pieces = doc.projection_pieces(selection).ok();
+        Self::from_markdown_with_lists_and_objects(doc, selection, &[])
+    }
+
+    /// 列表 + 对象感知的生产投影（ADR 0019 S2a）。
+    ///
+    /// `revealed_object_lines` 是**显式进入源码模式**的对象行号（工具条「编辑源码」/
+    /// `F2` 由 `EditorController` 维护）。普通单击 / 文本选区相交**不**显现源码：
+    /// 对象的显现只由这个白名单决定（ADR 0019 §1：点选不展开源码）。
+    #[must_use]
+    pub fn from_markdown_with_lists_and_objects(
+        doc: &MarkdownDocument,
+        selection: Selection,
+        revealed_object_lines: &[usize],
+    ) -> Self {
+        let pieces = doc
+            .projection_pieces_with_objects(selection, revealed_object_lines)
+            .ok();
         let projection = pieces
             .as_deref()
             .and_then(|pieces| Self::from_pieces(doc.source(), pieces).ok());
@@ -450,6 +540,32 @@ impl ProjectionMap {
                 segments: Vec::new(),
             })
         })
+    }
+
+    /// 全部 Object 段：`(source 区间, display 区间)`（按 display 顺序）。
+    ///
+    /// app 用它把“整行独占的图片”映射到行/几何，并在绘制与命中里区分对象行。
+    #[must_use]
+    pub fn object_segments(&self) -> Vec<(SourceRange, Range<usize>)> {
+        self.segments
+            .iter()
+            .filter(|segment| segment.kind == SegmentKind::Object)
+            .map(|segment| {
+                (
+                    segment.source,
+                    segment.display_start.get()..segment.display_end.get(),
+                )
+            })
+            .collect()
+    }
+
+    /// 给定对象 source 区间，返回它的 display 区间；不是当前投影里的对象时 `None`。
+    #[must_use]
+    pub fn object_display_range(&self, source: SourceRange) -> Option<Range<usize>> {
+        self.segments
+            .iter()
+            .find(|segment| segment.kind == SegmentKind::Object && segment.source == source)
+            .map(|segment| segment.display_start.get()..segment.display_end.get())
     }
 
     /// 由 source + 隐藏区间构造段表；隐藏区间必须有序、非空、在 source 内。
@@ -558,7 +674,8 @@ impl ProjectionMap {
             )),
             // 省略/替换段内部（含段首）：Before 偏置 → 段起点对应的 display 位置。
             SegmentKind::Elide | SegmentKind::Replace => Some(segment.display_start()),
-            SegmentKind::Object => None,
+            // 对象内部（含起点）：只能落在占位符起点；对象末尾由下一段/文档尾规则给出。
+            SegmentKind::Object => Some(segment.display_start()),
         }
     }
 
@@ -617,6 +734,16 @@ impl ProjectionMap {
                 return Some(segment.source.start());
             }
         }
+        // Object 段：占位符内部（含起点）取对象 source 起点 —— 对象内部没有可停的
+        // 文本位置，绝不让 caret 落进 `![alt](dest)` 中间。
+        for segment in &self.segments {
+            if segment.kind == SegmentKind::Object
+                && segment.display_start().get() <= at
+                && at < segment.display_end().get()
+            {
+                return Some(segment.source.start());
+            }
+        }
         // 没有隐藏/替换段：与 Right 等价（可见字符内部无歧义）。
         self.source_byte_at_display(display)
     }
@@ -646,7 +773,9 @@ impl ProjectionMap {
             )),
             // 零宽隐藏段 / 替换段：都取 source 起点（替换文本内部没有可停的 source 位置）。
             SegmentKind::Elide | SegmentKind::Replace => Some(segment.source.start()),
-            SegmentKind::Object => None,
+            // 对象内部（含占位符起点）：取对象 source 起点；占位符末尾不在这里
+            // （`at == display_end` 时定位到下一段或文档尾，得到对象 source 末尾）。
+            SegmentKind::Object => Some(segment.source.start()),
         }
     }
 
@@ -670,6 +799,16 @@ impl ProjectionMap {
             segment.kind == SegmentKind::Replace
                 && segment.display_start().get() < at
                 && at < segment.display_end().get()
+        }) {
+            return Some(segment.source.end());
+        }
+        // Object 段：选区终点落在占位符内部或末尾 → 把对象 source **完整**包含进来
+        // （复制必须得到完整 Markdown）。终点恰在占位符起点时不算“相交”，交给下面
+        // 的接缝规则取对象 source 起点。
+        if let Some(segment) = self.segments.iter().find(|segment| {
+            segment.kind == SegmentKind::Object
+                && segment.display_start().get() < at
+                && at <= segment.display_end().get()
         }) {
             return Some(segment.source.end());
         }
@@ -712,7 +851,9 @@ impl ProjectionMap {
                     Some(segment.source.end())
                 }
             }
-            SegmentKind::Elide | SegmentKind::Object => self.segments[index..]
+            // 选区在对象占位符之前结束：不包含对象 → 取对象 source 起点。
+            SegmentKind::Object => Some(segment.source.start()),
+            SegmentKind::Elide => self.segments[index..]
                 .iter()
                 .find(|next| next.kind == SegmentKind::Copy)
                 .map(|next| next.source.start()),
