@@ -7,11 +7,12 @@
 use std::path::Path;
 
 use menghunote_app::dev_vault::{
-    self, DEMO_FOLDER_TITLE, DEMO_SECOND_TITLE, DEMO_TITLE, LONG_LINE_CHARS, NFD_FIXTURE,
+    self, DEMO_FOLDER_TITLE, DEMO_SECOND_TITLE, DEMO_TITLE, DEV_PEER_ID, LONG_LINE_CHARS,
+    NFD_FIXTURE,
 };
 use menghunote_editor::EditorController;
-use menghunote_storage::list_tree;
 use menghunote_storage::session::{DriverOptions, SessionDriver};
+use menghunote_storage::{list_tree, load_body_doc, StructureWriter};
 
 fn temp_vault(name: &str) -> std::path::PathBuf {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -92,4 +93,67 @@ fn dev_vault_seeds_tree_and_editor_round_trips_it() {
     assert!(!again.seeded, "已有结构树不应重复播种");
     let again_tree = list_tree(&again.vault).expect("重开读树");
     assert_eq!(again_tree.len(), 3, "重开后结构树项数不变");
+}
+
+/// ADR 0009 切片 2a：`open_vault_at_with_peer` 的播种必须真的用传入的 peer。
+///
+/// 断言不看结构体字段，而是读**落库的 CRDT 版本向量**（`VersionVector` 的 peer 键）：
+/// 播种的结构 op 与正文增量都必须出现显式 peer，且不得再出现默认常量 1。
+#[test]
+fn open_vault_at_with_peer_seeds_with_the_given_peer() {
+    const PEER: u64 = 0x0123_4567_89ab_cdef;
+    let path = temp_vault("peer-seed.sqlite3");
+    let _ = std::fs::remove_file(&path);
+
+    let dev = dev_vault::open_vault_at_with_peer(&path, PEER).expect("按显式 peer 打开 dev vault");
+    assert!(dev.seeded, "空库必须播种演示树");
+    let tree = list_tree(&dev.vault).expect("读结构树");
+    assert_eq!(tree.len(), 3, "播种后必须仍是 3 个演示节点");
+    let doc_id = tree[0]
+        .body_doc_id
+        .clone()
+        .expect("第一篇笔记必须有 body_doc_id");
+
+    // 结构 doc：播种的结构 op（建节点/移动）必须带显式 peer。
+    let writer = StructureWriter::open(&dev.vault, PEER).expect("打开结构写入口");
+    let structure_peers: Vec<u64> = writer
+        .head()
+        .version_vector()
+        .expect("解码结构 head_vv")
+        .keys()
+        .copied()
+        .collect();
+    assert!(
+        structure_peers.contains(&PEER),
+        "结构 op 必须由显式 peer 产生，实际 VV peers = {structure_peers:?}"
+    );
+    assert!(
+        !structure_peers.contains(&DEV_PEER_ID),
+        "播种不得再落常量 1 的 op，实际 VV peers = {structure_peers:?}"
+    );
+    drop(writer);
+
+    // 正文 doc：正文增量同样带显式 peer，正文内容正常可读。
+    let (doc, head) = load_body_doc(&dev.vault, &doc_id, PEER, None).expect("重放第一篇正文");
+    assert!(doc.text().contains(NFD_FIXTURE), "正文必须包含冻结夹具");
+    let body_peers: Vec<u64> = head
+        .version_vector()
+        .expect("解码正文 head_vv")
+        .keys()
+        .copied()
+        .collect();
+    assert!(
+        body_peers.contains(&PEER),
+        "正文增量必须由显式 peer 产生，实际 VV peers = {body_peers:?}"
+    );
+    assert!(
+        !body_peers.contains(&DEV_PEER_ID),
+        "正文播种不得再落常量 1 的 op，实际 VV peers = {body_peers:?}"
+    );
+    drop(doc);
+
+    // 默认入口（peer = 1）重开：不重复播种、树不变——默认行为不受影响。
+    let again = dev_vault::open_vault_at(&path).expect("默认路径重开");
+    assert!(!again.seeded, "已有结构树不应重复播种");
+    assert_eq!(list_tree(&again.vault).expect("重开读树").len(), 3);
 }

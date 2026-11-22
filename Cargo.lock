@@ -5306,11 +5306,25 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
+ "menghunote-dev-relay",
  "menghunote-editor",
  "menghunote-search",
  "menghunote-storage",
+ "menghunote-sync",
+ "serde",
+ "serde_json",
  "tempfile",
  "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "menghunote-dev-relay"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "menghunote-relay",
+ "tokio",
 ]
 
 [[package]]
@@ -5372,7 +5386,6 @@ name = "menghunote-sync"
 version = "0.1.0"
 dependencies = [
  "argon2",
- "axum",
  "bech32",
  "chacha20poly1305 0.10.1",
  "ed25519-dalek",
@@ -5381,6 +5394,7 @@ dependencies = [
  "hmac 0.12.1",
  "hpke",
  "loro",
+ "menghunote-dev-relay",
  "menghunote-relay",
  "menghunote-storage",
  "menghunote-sync-proto",
@@ -5392,7 +5406,6 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
- "tokio",
  "windows-sys 0.61.2",
  "zeroize",
 ]

@@ -365,15 +365,19 @@ pub fn append_updates(
     append_updates_inner(vault, doc_id, expected_head_seq, records, &[])
 }
 
-/// A 事务内同时写出站同步意图（一 update 一 intent）。
-pub(crate) fn append_updates_with_sync_intents(
+/// A 事务内同时写出站同步意图（按位置一一对应；`None` = 该条不产生意图）。
+///
+/// 与 [`append_updates_with_sync_intents`] 相比，这里允许"某些 update 没有意图"：
+/// 一次 flush 的前缀可能混本地编辑与 remote 导入，而 remote 导入**绝不能**产生
+/// 出站意图（ADR 0009）。仍然只有**一条** A 事务，失败即整笔回滚。
+pub(crate) fn append_updates_with_intent_slots(
     vault: &Vault,
     doc_id: &str,
     expected_head_seq: u64,
     records: &[UpdateRecord],
-    intents: &[crate::sync_bridge::SyncIntent],
+    slots: &[Option<crate::sync_bridge::SyncIntent>],
 ) -> Result<HeadState, StorageError> {
-    append_updates_inner(vault, doc_id, expected_head_seq, records, intents)
+    append_updates_inner(vault, doc_id, expected_head_seq, records, slots)
 }
 
 fn append_updates_inner(
@@ -381,22 +385,22 @@ fn append_updates_inner(
     doc_id: &str,
     expected_head_seq: u64,
     records: &[UpdateRecord],
-    intents: &[crate::sync_bridge::SyncIntent],
+    slots: &[Option<crate::sync_bridge::SyncIntent>],
 ) -> Result<HeadState, StorageError> {
     if records.is_empty() {
-        if !intents.is_empty() {
+        if !slots.is_empty() {
             return Err(StorageError::Corrupt {
                 context: "空 update 批次不能带 sync intent".to_owned(),
             });
         }
         return load_head(vault, doc_id);
     }
-    if !intents.is_empty() && intents.len() != records.len() {
+    if !slots.is_empty() && slots.len() != records.len() {
         return Err(StorageError::Corrupt {
             context: format!(
                 "append_updates: records={} intents={} 必须一对一",
                 records.len(),
-                intents.len()
+                slots.len()
             ),
         });
     }
@@ -409,7 +413,7 @@ fn append_updates_inner(
         .update;
     let head_seq = expected_head_seq + records.len() as u64;
 
-    let mut statements = Vec::with_capacity(records.len() + 2 + intents.len());
+    let mut statements = Vec::with_capacity(records.len() + 2 + slots.len());
 
     // 第 0 条就是 CAS：head_seq 必须还是调用方看到的那个值。
     // 放在最前面，过期基准会在碰到任何唯一约束之前就被守卫拦下，报 HeadConflict 而不是 UNIQUE。
@@ -452,7 +456,11 @@ fn append_updates_inner(
         ],
     ));
 
-    for (index, intent) in intents.iter().enumerate() {
+    for (index, slot) in slots.iter().enumerate() {
+        // `None`：这条 update 不产生出站意图（remote 导入 / adopt 等），同事务里跳过。
+        let Some(intent) = slot else {
+            continue;
+        };
         if intent.message_id.is_empty() || intent.batch_id.is_empty() || intent.key_epoch == 0 {
             return Err(StorageError::Corrupt {
                 context: "sync intent message/batch/epoch 非法".to_owned(),

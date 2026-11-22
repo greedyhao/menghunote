@@ -22,6 +22,19 @@
 //!
 //! 调用方线程只做内存操作：`apply` / `flush` / `pump` 都不等待 SQLite；只有 `close`
 //! 与显式 `materialize_now` 会有界等待。
+//!
+//! ## 切片 3b：外部提交闸门 / adopt 的驱动转发
+//!
+//! [`SessionDriver`] 不重新实现闸门语义，只把 [`DocumentSession`] 的 3a API 原样转发，
+//! 并把 adopt 的结果变成**驱动事件**：
+//!
+//! - `adopt` 成功后把 `AdoptOutcome.delta` 作为 [`DriverEvent::Remote`]、把 `ack` 作为
+//!   [`DriverEvent::Durable`] 推入事件队列（顺序固定：先 Remote 再 Durable），
+//!   这样 UI 的 pump 就能在不重开文档的情况下更新镜像与 durable 水位；
+//! - **绝不**调用会 journal 的 `apply_remote`：那份 update 已经 durable，
+//!   再走一次会让 flusher 重复写库并产生多余的出站意图；
+//! - Held 期间 `apply` 的拒绝（[`super::protocol::RejectReason::NotReady`]）原样透传，
+//!   驱动不额外吞错、也不替调用方兜底。
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -32,6 +45,10 @@ use std::time::{Duration, Instant};
 use rusqlite::types::Value;
 
 use super::core::{DocumentSession, SessionOptions};
+use super::gate::{
+    AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease, ExternalCommitTicket, GateError,
+    GateState, PreparedCommittedDelta,
+};
 use super::protocol::{
     DurableAck, EditOutcome, EditRequest, FlushReason, FlushTicket, HistoryState, LiveDelta,
     LiveRev, PortError, SessionEvent,
@@ -499,12 +516,91 @@ impl SessionDriver {
     }
 
     /// 远端导入：同样计入 dirty（远端 op 也要落 durable）。
+    ///
+    /// **已 durable** 的外部增量不要走这里（见 [`Self::adopt_committed_delta`]）：
+    /// 这条路径会 journal 并产生出站意图。
     pub fn apply_remote(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
         let delta = self.session.apply_remote(update)?;
         if delta.is_some() {
             self.mark_dirty();
         }
         Ok(delta)
+    }
+
+    // ---- 外部提交闸门 / adopt（ADR 0009 切片 3b：只转发 3a 的存储层语义）----
+
+    /// Held 期间本地写入是否被冻结（= 外部提交闸门持有中）。
+    #[must_use]
+    pub fn is_external_commit_held(&self) -> bool {
+        self.session.is_external_commit_held()
+    }
+
+    /// 当前外部提交租约（`None` = 不在 Held）。
+    #[must_use]
+    pub fn external_commit_lease(&self) -> Option<&ExternalCommitLease> {
+        self.session.external_commit_lease()
+    }
+
+    /// 登记一次外部提交（只建立票据；重复 begin 由会话拒绝）。
+    pub fn begin_external_commit(&mut self) -> Result<ExternalCommitTicket, GateError> {
+        self.session.begin_external_commit()
+    }
+
+    /// 非阻塞推进闸门：`WaitingIME` → `Flushing` → `Held(lease)`。
+    ///
+    /// 进入 Held 时顺手把调度器自己的水位对齐：闸门的成立条件就是「目标已 durable 且
+    /// journal 空闲」，因此这里不再欠这次 flush（否则下一次 pump 会为已经不脏的数据
+    /// 再投一张空票据）。
+    pub fn poll_external_commit(&mut self, ticket: &ExternalCommitTicket) -> GateState {
+        let state = self.session.poll_external_commit(ticket);
+        if let GateState::Held(lease) = &state {
+            self.dirty_since = None;
+            self.flushed_live_rev = self.flushed_live_rev.max(lease.target_live_rev());
+        }
+        state
+    }
+
+    /// adopt 一份**已 durable** 的外部增量（必须 Held 且租约匹配）。
+    ///
+    /// 成功后把增量与 ACK 变成驱动事件（**先 Remote 再 Durable**），`pump` / `tick`
+    /// 立刻能取到；失败时 live 与 durable 水位都不变（3a 保证）。
+    pub fn adopt_committed_delta(
+        &mut self,
+        lease: &ExternalCommitLease,
+        prepared: PreparedCommittedDelta,
+    ) -> Result<AdoptOutcome, AdoptError> {
+        let outcome = self.session.adopt_committed_delta(lease, prepared)?;
+        // 不调用 `apply_remote`：这份 CRDT 已经 durable，再 journal 一次会重复写库 + 产生意图。
+        self.events
+            .push_back(DriverEvent::Remote(outcome.delta.clone()));
+        self.push_durable(outcome.ack.clone());
+        // adopt 要求 journal 空闲，因此"欠一次 flush"的水位到此为止。
+        self.dirty_since = None;
+        self.flushed_live_rev = self.flushed_live_rev.max(outcome.ack.through_live_rev);
+        Ok(outcome)
+    }
+
+    /// 结束外部提交并释放闸门（`applied` 必须就是库中当前 head）。
+    ///
+    /// 失败/取消路径下 3a 会把 Held 期间已 durable 的变化交付进 live 并作为
+    /// `SessionEvent::Remote` 入队，驱动会在下一次 `pump` 转发成 [`DriverEvent::Remote`]。
+    pub fn end_external_commit(
+        &mut self,
+        lease: ExternalCommitLease,
+        applied: AppliedHeads,
+    ) -> Result<(), GateError> {
+        self.session.end_external_commit(lease, applied)
+    }
+
+    /// 放弃一次外部提交（失败/取消），同样先交付已 durable 的变化。
+    ///
+    /// 返回的错误原样来自会话（例如仍 `pending` 时 [`GateError::Pending`]）；交付的增量
+    /// 会作为会话事件由下一次 `pump` 转发，这里不重复推送，避免同一份 delta 应用两次。
+    pub fn cancel_external_commit(
+        &mut self,
+        ticket: &ExternalCommitTicket,
+    ) -> Result<(), GateError> {
+        self.session.cancel_external_commit(ticket).map(|_| ())
     }
 
     /// **固定窗口**：只在首次 dirty 时记录起点，后续输入不重置。
@@ -594,13 +690,19 @@ impl SessionDriver {
     fn collect_session_events(&mut self) {
         for event in self.session.events() {
             match event {
-                SessionEvent::Durable(ack) => {
-                    self.events.push_back(DriverEvent::Durable(ack.clone()));
-                    self.enqueue_materialize(&ack);
-                }
+                SessionEvent::Durable(ack) => self.push_durable(ack),
                 SessionEvent::Remote(delta) => self.events.push_back(DriverEvent::Remote(delta)),
             }
         }
+    }
+
+    /// 推入一条 `Durable` 事件，并按既有约定入队 B 物化。
+    ///
+    /// 两条来源共用：flush 线程的 ACK，以及 adopt 之后由外部提交推进的 head（3b）。
+    fn push_durable(&mut self, ack: DurableAck) {
+        // DurableAck 之后才入队 B（用 ACK 的固定 head_seq，不碰 live doc）。
+        self.enqueue_materialize(&ack);
+        self.events.push_back(DriverEvent::Durable(ack));
     }
 
     /// DurableAck 之后才入队 B（用 ACK 的固定 head_seq，不碰 live doc）。

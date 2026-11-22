@@ -40,6 +40,164 @@ pub struct SyncIntent {
     pub object_id: [u8; 32],
 }
 
+/// 本地写入的**同步上下文**：本机 peer + 当前加密 epoch。
+///
+/// ADR 0009 切片 2b：真实本地写入（正文 session flush、结构提交）在 A 事务里
+/// 顺手写 `sync_outbox` 意图。这里只放"派生意图所需的常量"：
+///
+/// - `peer_id`：来自持久设备身份（`LocalIdentityV1::loro_peer_id()`），**不是**常量 1；
+/// - `key_epoch`：Phase 1 恒为 `1`（ADR 0006 genesis 初始代），**禁止**写成 0
+///   （0 在 `validate_intent` 里就是非法值，会让整笔 A 事务失败）。
+///
+/// `None` 表示不产生意图（默认路径 / remote 导入路径），行为与切片 2a 之前逐字节一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyncContext {
+    /// 本机 Loro peer id（`0` 非法：Loro 不接受 0 peer）。
+    pub peer_id: u64,
+    /// 当前加密 epoch（Phase 1 = 1；必须 > 0）。
+    pub key_epoch: u64,
+}
+
+impl SyncContext {
+    /// 构造上下文（调用方保证两个值都 > 0；不做隐式回退）。
+    #[must_use]
+    pub const fn new(peer_id: u64, key_epoch: u64) -> Self {
+        Self { peer_id, key_epoch }
+    }
+
+    /// 校验：peer / epoch 都必须 > 0，否则明确报错（不静默替换成常量）。
+    pub fn validate(self) -> Result<(), StorageError> {
+        if self.peer_id == 0 {
+            return Err(StorageError::Corrupt {
+                context: "SyncContext.peer_id 必须 >0（0 不是合法 Loro peer）".to_owned(),
+            });
+        }
+        if self.key_epoch == 0 {
+            return Err(StorageError::Corrupt {
+                context: "SyncContext.key_epoch 必须 >0（Phase 1 = 1，禁止常量 0）".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// 本地意图 ID 的确定性派生域（版本化；改算法必须换常量）。
+///
+/// 三个派生都从这里起头：message id / object id 必须**纯函数**地由
+/// `(doc_id, seq, peer, epoch)` 决定，重试才不会产生新 ID（ADR 0009）。
+pub const SYNC_INTENT_ID_DOMAIN: &[u8] = b"MN/dev-sync-intent/v1\0";
+
+/// 确定性 message id（32 位小写 hex = 16B wire id）。
+///
+/// **为什么不是可读串**：`crates/sync` 的 `engine::decode_message_id` 只接受
+/// 16 字节的 hax/UUID 文本（32 个 hex 字符，允许带 `-`），可读的
+/// `doc#seq@epoch` 会让 engine 直接报 `LocalCorrupt`。所以这里取
+/// `sha256(domain‖"message"‖doc_id‖NUL‖seq_be‖peer_be‖epoch_be)` 的前 16B。
+///
+/// 纯函数语义：同一 `(doc_id, seq, peer_id, key_epoch)` 永远得到同一个 id；
+/// 不同 seq / epoch 必然不同（hash 输入不同）。
+#[must_use]
+pub fn intent_message_id(doc_id: &str, seq: u64, ctx: SyncContext) -> String {
+    let digest = intent_digest(
+        b"message\0",
+        &[
+            doc_id.as_bytes(),
+            &[0],
+            &seq.to_be_bytes(),
+            &ctx.peer_id.to_be_bytes(),
+            &ctx.key_epoch.to_be_bytes(),
+        ],
+    );
+    hex_lower(&digest[..16])
+}
+
+/// 确定性 object id（32B）。
+///
+/// `sha256(domain‖"object"‖message_id‖peer_be‖epoch_be)`：对象名与 message 一一对应，
+/// 重试/重打包时同样的 message 得到同样的对象名。
+#[must_use]
+pub fn intent_object_id(message_id: &str, ctx: SyncContext) -> [u8; 32] {
+    intent_digest(
+        b"object\0",
+        &[
+            message_id.as_bytes(),
+            &ctx.peer_id.to_be_bytes(),
+            &ctx.key_epoch.to_be_bytes(),
+        ],
+    )
+}
+
+/// 为一条**本地** update 派生一条出站意图。
+///
+/// `seq` 必须是这次 A 事务里该 update 真正落库的 `loro_updates.seq`
+/// （= `expected_head_seq + 1 + index`），否则意图与数据对不上。
+pub fn local_sync_intent(
+    doc_id: &str,
+    seq: u64,
+    batch_id: &str,
+    ctx: SyncContext,
+) -> Result<SyncIntent, StorageError> {
+    ctx.validate()?;
+    if doc_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "sync intent doc_id 不能为空".to_owned(),
+        });
+    }
+    let message_id = intent_message_id(doc_id, seq, ctx);
+    validate_intent(&message_id, batch_id, seq, ctx.key_epoch)?;
+    Ok(SyncIntent {
+        batch_id: batch_id.to_owned(),
+        object_id: intent_object_id(&message_id, ctx),
+        message_id,
+        key_epoch: ctx.key_epoch,
+    })
+}
+
+/// 同事务写入「一 update 一**可选**意图」：`None` = 该条不产生意图（remote 导入）。
+///
+/// 一次 flush 的连续前缀可能**混**本地编辑与远端导入（`JournalOrigin`），而
+/// remote/import/adopt **绝不能**产生出站意图（否则会把刚收到的数据再推回 relay）。
+/// 这里仍是一条 A 事务、按位置一一对应，只是允许某些位置为空。
+pub(crate) fn append_updates_with_intent_slots(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[store::UpdateRecord],
+    slots: &[Option<SyncIntent>],
+) -> Result<store::HeadState, StorageError> {
+    if !slots.is_empty() && slots.len() != records.len() {
+        return Err(StorageError::Corrupt {
+            context: format!(
+                "append_updates_with_intent_slots: records={} slots={} 必须一对一",
+                records.len(),
+                slots.len()
+            ),
+        });
+    }
+    store::append_updates_with_intent_slots(vault, doc_id, expected_head_seq, records, slots)
+}
+
+fn intent_digest(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(SYNC_INTENT_ID_DOMAIN);
+    hasher.update(tag);
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 /// outbox 状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncOutboxState {
@@ -177,7 +335,8 @@ pub fn append_updates_with_sync_intents(
             ),
         });
     }
-    store::append_updates_with_sync_intents(vault, doc_id, expected_head_seq, records, intents)
+    let slots: Vec<Option<SyncIntent>> = intents.iter().cloned().map(Some).collect();
+    store::append_updates_with_intent_slots(vault, doc_id, expected_head_seq, records, &slots)
 }
 
 /// 单独记录一条出站意图（调用方已确认 update 落库）。
@@ -873,6 +1032,25 @@ pub fn take_inbox_ready(vault: &Vault, limit: usize) -> Result<Vec<SyncInboxRow>
         ],
     )?;
     rows.iter().map(row_to_inbox).collect()
+}
+
+/// 统计「已验证、落在 durable 连续接收前缀内、尚未集成」的 inbox 行数。
+///
+/// 语义（ADR 0012 S2b）：这些行不是"丢失"——它们要么依赖未就绪（deferred），要么被
+/// 批次预算留在本轮之后。调用方用它上报"已接收·待应用 N"，并据此判断"还有没有
+/// 可继续的工作"，而不是循环刷最早的一批。
+pub fn count_inbox_ready(vault: &Vault) -> Result<u64, StorageError> {
+    let received = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
+    let rows = vault.query(
+        "SELECT COUNT(*) FROM sync_inbox WHERE state='verified' AND relay_seq<=?1",
+        &[Value::Integer(i64_of(received)?)],
+    )?;
+    rows.first()
+        .map(|row| u64_of(row, 0, "sync_inbox.count"))
+        .transpose()?
+        .ok_or_else(|| StorageError::Corrupt {
+            context: "sync_inbox 计数缺失".to_owned(),
+        })
 }
 
 /// 带调用方依赖判断的 ready 选择器；不满足的项保持 durable verified。

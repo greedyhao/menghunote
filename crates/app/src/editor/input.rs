@@ -95,7 +95,9 @@ impl EntityInputHandler for EditorView {
     /// 提交 / 普通输入：**一次调用只产生一个 `EditRequest`**。
     ///
     /// - 有组合：先把组合文本作为一次替换提交（等价于 IME 上屏）；
-    /// - 没有组合：在光标处插入 / 替换选区（普通打字、粘贴走同一条路径）。
+    /// - 没有组合：在光标处插入 / 替换选区（普通打字、粘贴走同一条路径）；
+    /// - **Held（外部提交闸门持有）**：整段忽略。这是 IME 上屏与粘贴（含 Windows 的
+    ///   `Ctrl+V` 走平台文本输入）的唯一入口，冻结在这里就能保证一次都不落到驱动。
     fn replace_text_in_range(
         &mut self,
         _range_utf16: Option<Range<usize>>,
@@ -103,6 +105,13 @@ impl EntityInputHandler for EditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_sync_held() {
+            eprintln!(
+                "[menghunote] Held 期间收到平台文本输入（{} 字）：已忽略",
+                text.chars().count()
+            );
+            return;
+        }
         if self.is_composing() {
             self.commit_composition(text, cx);
         } else {

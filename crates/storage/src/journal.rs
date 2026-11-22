@@ -18,7 +18,30 @@ use std::collections::VecDeque;
 use crate::body_doc::PendingUpdate;
 use crate::error::StorageError;
 use crate::store::{self, UpdateRecord};
+use crate::sync_bridge::{self, SyncContext, SyncIntent};
 use crate::Vault;
+
+/// 一条 update 的**来源**（ADR 0009：只有本地提交才产生出站意图）。
+///
+/// - [`JournalOrigin::Local`]：真实本地写入 —— 用户输入 / IME / undo / redo / 结构提交，
+///   启用同步上下文时在同一个 A 事务里写一条 `sync_outbox` 意图；
+/// - [`JournalOrigin::Remote`]：远端导入 / adopt，**必须不产生任何意图**，否则会把刚
+///   收到的数据原样推回 relay（自激循环，且破坏 epoch/ACK 语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JournalOrigin {
+    /// 本机产生的更新（本地输入、undo/redo）。
+    Local,
+    /// 从远端导入的更新（`DocumentSession::apply_remote`）。
+    Remote,
+}
+
+impl JournalOrigin {
+    /// 是否应该产生出站同步意图。
+    #[must_use]
+    pub const fn produces_sync_intent(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
 
 /// 一条待落库的 update。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +52,40 @@ pub struct JournalEntry {
     pub batch_id: String,
     /// 增量本身。
     pub update: PendingUpdate,
+    /// 来源（决定 flush 时是否产生出站意图）。
+    pub origin: JournalOrigin,
+}
+
+impl JournalEntry {
+    /// 本地提交（会产生同步意图）。
+    #[must_use]
+    pub fn local(
+        doc_id: impl Into<String>,
+        batch_id: impl Into<String>,
+        update: PendingUpdate,
+    ) -> Self {
+        Self {
+            doc_id: doc_id.into(),
+            batch_id: batch_id.into(),
+            update,
+            origin: JournalOrigin::Local,
+        }
+    }
+
+    /// 远端导入（**不**产生同步意图）。
+    #[must_use]
+    pub fn remote(
+        doc_id: impl Into<String>,
+        batch_id: impl Into<String>,
+        update: PendingUpdate,
+    ) -> Self {
+        Self {
+            doc_id: doc_id.into(),
+            batch_id: batch_id.into(),
+            update,
+            origin: JournalOrigin::Remote,
+        }
+    }
 }
 
 /// 只可追加的未 ACK journal。
@@ -215,21 +272,33 @@ impl<S: DurableSink> JournalWriter<S> {
 }
 
 /// 生产用 sink：把前缀写进 [`crate::store::append_updates`] 的 A 事务。
+///
+/// 带 [`SyncContext`] 时（`with_sync_context`），**本地**条目在同一 A 事务里各写一条
+/// `sync_outbox` 意图（与 records 一一对应）；未启用时行为与切片 2a 之前完全一致。
 #[derive(Debug, Clone)]
 pub struct VaultJournalSink {
     vault: Vault,
     doc_id: String,
     head_seq: u64,
+    sync: Option<SyncContext>,
 }
 
 impl VaultJournalSink {
-    /// 以库中当前 head_seq 作为 CAS 基准。
+    /// 以库中当前 head_seq 作为 CAS 基准（默认**不**产生同步意图）。
     pub fn new(vault: Vault, doc_id: impl Into<String>, head_seq: u64) -> Self {
         Self {
             vault,
             doc_id: doc_id.into(),
             head_seq,
+            sync: None,
         }
+    }
+
+    /// 启用本地意图：每次 flush 为本地条目生成确定性 `SyncIntent`（同事务落库）。
+    #[must_use]
+    pub fn with_sync_context(mut self, sync: SyncContext) -> Self {
+        self.sync = Some(sync);
+        self
     }
 
     /// 当前已 durable 的 seq。
@@ -260,7 +329,41 @@ impl DurableSink for VaultJournalSink {
             .iter()
             .map(|entry| UpdateRecord::new(entry.batch_id.clone(), entry.update.clone()))
             .collect();
-        let head = store::append_updates(&self.vault, &self.doc_id, self.head_seq, &records)?;
+        let head = match self.sync {
+            // 默认路径（未启用同步）：与切片 2a 之前逐字节一致。
+            None => store::append_updates(&self.vault, &self.doc_id, self.head_seq, &records)?,
+            Some(ctx) => {
+                // 一 update 一意图（remote 条目为空位）；seq 必须与 A 事务写进
+                // `loro_updates.seq` 的值完全一致，否则意图会指向别人的 update。
+                let mut slots: Vec<Option<SyncIntent>> = Vec::with_capacity(entries.len());
+                for (index, entry) in entries.iter().enumerate() {
+                    if !entry.origin.produces_sync_intent() {
+                        slots.push(None);
+                        continue;
+                    }
+                    let seq = self
+                        .head_seq
+                        .checked_add(1)
+                        .and_then(|value| value.checked_add(index as u64))
+                        .ok_or_else(|| StorageError::Corrupt {
+                            context: format!("{} 本地 seq 溢出", self.doc_id),
+                        })?;
+                    slots.push(Some(sync_bridge::local_sync_intent(
+                        &self.doc_id,
+                        seq,
+                        &entry.batch_id,
+                        ctx,
+                    )?));
+                }
+                sync_bridge::append_updates_with_intent_slots(
+                    &self.vault,
+                    &self.doc_id,
+                    self.head_seq,
+                    &records,
+                    &slots,
+                )?
+            }
+        };
         self.head_seq = head.head_seq;
         Ok(head.head_seq)
     }

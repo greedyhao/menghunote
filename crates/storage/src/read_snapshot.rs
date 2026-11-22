@@ -112,3 +112,50 @@ pub(crate) fn map_read_error(error: rusqlite::Error, context: &'static str) -> S
     }
     StorageError::Sqlite(error)
 }
+
+/// 已存在的库文件里是否有内容（ADR 0009「旧/非空开发库拒绝启用 dev-sync」）。
+///
+/// **只读、不建库、不迁移、不写**：
+///
+/// - 文件不存在 → `Ok(false)`（全新实例，可以直接创建身份/库）；
+/// - 文件存在但不是 SQLite / 打不开 → `Err`（调用方必须 fail-closed 拒绝，不能当成空库）；
+/// - 存在 `loro_updates` / `tree` / `notes` 任一行 → `Ok(true)`；
+/// - 表都在但全空（含刚建好 schema 的空库）→ `Ok(false)`。
+///
+/// 用只读连接而不是 `Vault::open`：后者会跑迁移，在"决定是否拒绝"之前就改写了旧库。
+/// 打开走 `SQLITE_OPEN_READ_ONLY`，因此 WAL 里只有未 checkpoint 数据、或残留 `-wal`
+/// 需要恢复的场景会返回错误 —— 这正是"来历不明的旧库"应有的失败方向。
+pub fn existing_vault_has_content(path: &Path) -> Result<bool, StorageError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .map_err(|error| map_read_error(error, "以只读方式打开已存在的库（旧库探测）"))?;
+
+    // 只查**固定名单**里的表（不拼接任何外部输入），旧库可能缺表。
+    let mut statement = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' \
+             AND name IN ('loro_updates','tree','notes')",
+        )
+        .map_err(|error| map_read_error(error, "准备旧库探测查询"))?;
+    let names: Vec<String> = statement
+        .query_map([], |row| row.get::<usize, String>(0))
+        .map_err(|error| map_read_error(error, "执行旧库探测查询"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| map_read_error(error, "读取旧库表名"))?;
+    drop(statement);
+
+    for name in names {
+        let count: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM \"{name}\""), [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| map_read_error(error, "统计旧库行数"))?;
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}

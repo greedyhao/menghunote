@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# dev-only 同步面板（ADR 0009 Phase 1 / 切片 1）。
+# **默认关闭**：默认构建不引入 `menghunote-sync`（它带 rustls/Argon2/hpke 等依赖树），
+# 面板与 worker 的代码也全部 `#[cfg(feature = "dev-sync")]`，默认产物零行为变化。
+# 运行时还有第二道门禁（`--dev-sync` / `MENGHUNOTE_DEV_SYNC=1` + localhost relay），
+# 见 `crates/app/src/dev_sync/gate.rs`。
+# `serde_json`/`serde`：公开配置 `dev-sync.json` 的读写（ADR 0011）。只在 feature 下
+# 引入；两者在 workspace 依赖图里早已存在（relay/sync-proto 用），不是新的重依赖。
+# `zeroize`：Create 的 setup secret 与一次性恢复码用 `Zeroizing` 缓冲（ADR 0011 要求）。
+dev-sync = ["dep:menghunote-sync", "dep:serde", "dep:serde_json", "dep:zeroize"]
+
 [dependencies]
 # 应用层错误汇总（库层用 thiserror，见 AGENTS.md §4）
 anyhow = "1"
@@ -16,6 +27,15 @@ menghunote-editor = { path = "../editor" }
 # 检索（S4-2b）：UI 只拿类型（Hit/SearchStatus），真正的 IndexManager 在后台线程里
 menghunote-search = { path = "../search" }
 menghunote-storage = { path = "../storage" }
+# 同步（ADR 0009）：**可选依赖**，只有 `dev-sync` feature 打开才进依赖图。
+# 切片 1 只用它做 relay URL 策略校验与传输超时配置（`StdTcpTransport`），
+# 不做任何真实 Create/Join/SyncOnce（那是切片 4）。
+menghunote-sync = { path = "../sync", optional = true }
+# 公开配置（ADR 0011）：只有 `dev-sync` feature 才需要序列化 JSON。
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+# 秘密缓冲（setup secret / 恢复码）：drop 时清零，ADR 0011「缓冲用 Zeroizing」。
+zeroize = { version = "1", optional = true }
 
 [dev-dependencies]
 # 原生 headless UI 测试（`#[gpui::test]` + `TestAppContext`）。
@@ -24,6 +44,10 @@ menghunote-storage = { path = "../storage" }
 gpui = { package = "gpui-kit", version = "=0.9.1", features = ["test-support"] }
 # 每个测试一个独立临时库；目录建在 `CARGO_TARGET_TMPDIR` 下（AGENTS.md §6 禁止用 %TEMP%）。
 tempfile = "3"
+# ADR 0009 切片 4c-1：app 的 dev-sync 启动生命周期测试需要真实进程内 relay
+# （`prepare(Create/Join)` 走真实 HTTP + genesis/bootstrap）。纯测试脚手架，
+# 放行验签、只绑 loopback，**非生产**。
+menghunote-dev-relay = { path = "../dev-relay" }
 
 [target.'cfg(windows)'.dependencies]
 # 启动时读回进程 DPI 感知级别（GetThreadDpiAwarenessContext / GetDpiForSystem）。

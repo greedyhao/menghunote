@@ -69,12 +69,14 @@ tempfile = "3"
 # ring 后端与 rustls 共用同一套 crypto provider，不额外引入 C 编译。
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
-# task-120：examples/e2e_rotation_two_rounds 的**进程内** relay（不再依赖外部 dev_server 脚本）。
-# 只用于 example/测试脚手架；生产 sync 依然只经 HTTP 访问 relay，不链接 relay crate。
-# 版本与 relay 保持一致（axum 0.8 / tokio 1），避免同一 crates 出现两份解析版本。
+# task-120：e2e example 的**进程内** relay（临时 SQLite + FakeClock + loopback 放行验签 hook +
+# `127.0.0.1:0` + 独立线程 axum），已抽成独立、仅测试使用的 crate `menghunote-dev-relay`
+# （crates/dev-relay）。它只允许出现在 [dev-dependencies]；生产 sync 依然只经 HTTP 访问 relay。
+menghunote-dev-relay = { path = "../dev-relay" }
+# e2e_rotation_two_rounds 会直接断言 relay 的 checkpoint 行（`CheckpointState`/prune 骨架），
+# 因此本 crate 的 example 仍需要 relay 的类型；tokio/axum 只被 harness 使用，随之移到
+# dev-relay crate，避免在每个使用方重复声明。
 menghunote-relay = { path = "../relay" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
-axum = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI（CryptProtectData/CryptUnprotectData，CurrentUser，ADR 0006 §3）。

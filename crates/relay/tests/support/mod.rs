@@ -19,6 +19,7 @@ pub use menghunote_relay as relay;
 
 use ed25519_dalek::{Signer, SigningKey};
 use menghunote_sync_proto as proto;
+use rusqlite::OptionalExtension;
 
 use relay::auth::{self, AuthContext, Realm};
 use relay::checkpoints;
@@ -247,6 +248,17 @@ impl Drop for DbCleanup {
             cleanup_db_dir(&self.path);
         }
     }
+}
+
+/// `devices` 行的测试快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSnapshot {
+    pub status: String,
+    pub revoked_at: Option<i64>,
+    pub certificate: Vec<u8>,
+    pub sign_pk: Vec<u8>,
+    pub hpke_pk: Vec<u8>,
+    pub certificate_signature: Option<Vec<u8>>,
 }
 
 impl Fixture {
@@ -1298,22 +1310,90 @@ impl Fixture {
 
     /// 插入一台已批准设备（模拟管理设备 approve 之后的状态）。
     pub fn add_device(&self, device_id: Id16) {
+        self.add_device_with(device_id, &[0x00], "active");
+    }
+
+    /// 插入一台设备行（指定证书与状态；pending 用空证书，模拟 redeem 后的占位）。
+    pub fn add_device_with(&self, device_id: Id16, certificate: &[u8], status: &str) {
         let now = self.clock_now();
+        let certificate = certificate.to_vec();
+        let status = status.to_owned();
         self.db
             .write_blocking(move |conn| {
                 conn.execute(
                     "INSERT INTO devices(device_id, sign_pk, hpke_pk, certificate, status, created_at)
-                     VALUES (?1, ?2, ?3, X'00', 'active', ?4)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     (
                         device_id.as_slice(),
                         [4u8; 32].as_slice(),
                         [5u8; 32].as_slice(),
+                        certificate,
+                        status,
                         now,
                     ),
                 )?;
                 Ok(())
             })
             .expect("add device");
+    }
+
+    /// 设备行快照（吊销用例要断言"只改 status/revoked_at，证书/公钥保留"）。
+    pub fn device_snapshot(&self, device_id: &Id16) -> Option<DeviceSnapshot> {
+        let device_id = *device_id;
+        self.db
+            .read(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT status, revoked_at, certificate, sign_pk, hpke_pk,
+                                certificate_signature
+                         FROM devices WHERE device_id = ?1",
+                        [device_id.as_slice()],
+                        |row| {
+                            Ok(DeviceSnapshot {
+                                status: row.get(0)?,
+                                revoked_at: row.get(1)?,
+                                certificate: row.get(2)?,
+                                sign_pk: row.get(3)?,
+                                hpke_pk: row.get(4)?,
+                                certificate_signature: row.get(5)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .expect("device snapshot")
+    }
+
+    /// 当前 ACTIVE 设备集合（排序，等价于成员规划集合）。
+    pub fn active_device_ids(&self) -> Vec<Id16> {
+        self.db
+            .read(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT device_id FROM devices WHERE status = 'active' ORDER BY device_id",
+                )?;
+                let rows: Vec<Vec<u8>> = stmt
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                rows.into_iter()
+                    .map(|bytes| {
+                        bytes
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| Error::Invariant("device_id"))
+                    })
+                    .collect()
+            })
+            .expect("active devices")
+    }
+
+    /// 控制链记录条数（断言"吊销不追加控制记录"）。
+    pub fn control_count(&self) -> i64 {
+        self.db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM control_commits", [], |row| row.get(0))?)
+            })
+            .expect("control count")
     }
 
     pub fn bootstrap(&self) -> Result<checkpoints::BootstrapOutcome> {

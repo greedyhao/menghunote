@@ -1,21 +1,27 @@
-//! **DEV ONLY**：进程内起一个真实 axum relay，供 `e2e_rotation_two_rounds` 自包含运行。
+//! **DEV ONLY**：进程内起一个真实 axum relay，供 sync 的 e2e example 自包含运行。
 //!
-//! 评审 0003 T13 要求"同一 durable E1 旧 B 跨两轮"必须能在**真实 HTTP + 真实 relay**
-//! 上验证，并且中间要有一次 90 天 `FakeClock` 推进 + 多轮 GC。外部 `dev_server` 进程
-//! 看不到客户端的假时钟、也没有 GC 入口，所以本文件把 relay 直接**编进 example**：
+//! 本 crate 是**纯测试脚手架**，不是生产组件：
+//!
+//! - 只允许出现在其它 crate 的 `[dev-dependencies]`，**不得**被任何生产 crate 的
+//!   `[dependencies]` 引用；
+//! - 内置的 `DevPermissiveHook` 对**任何签名一律放行**（验签全放行），只绑定 loopback；
+//!   因此**不得用于生产，也不得把基于它的结果当作鉴权/验签验收的结论**——验签相关的
+//!   验收必须走 relay 生产路径（`relay::Ed25519Hook`）。
+//!
+//! 背景（评审 0003 T13）："同一 durable E1 旧 B 跨两轮"必须能在**真实 HTTP + 真实 relay**
+//! 上验证，并且中间要有一次 90 天 `FakeClock` 推进 + 多轮 GC。外部 `dev_server` 进程看不到
+//! 客户端的假时钟、也没有 GC 入口，所以这里把 relay 直接**编进测试进程**：
 //!
 //! - 临时 SQLite（`target/tmp/...`，每次运行唯一目录，`Drop` 时删）；
 //! - `relay::time::FakeClock` 注入 `Db::open`（relay 所有 TTL/GC 只看这个时钟）；
-//! - 只用 loopback 的**放行验签 hook**（复制 `relay/examples/dev_server.rs` 的
-//!   `DevPermissiveHook`；放行 hook 只属于 example，绝不进 relay lib）；
+//! - 只用 loopback 的**放行验签 hook**（与 `relay/examples/dev_server.rs` 同一个实现；
+//!   放行 hook 只属于测试脚手架，绝不进 relay lib）；
 //! - `127.0.0.1:0` 绑定临时端口，独立线程 + tokio multi-thread runtime 跑 `axum::serve`；
-//! - 暴露 `advance(secs)` / `run_gc()` / 只读 checkpoint 事实，供 e2e 断言。
+//! - 暴露 `advance_secs(secs)` / `run_gc()` / 只读 checkpoint 事实，供 e2e 断言。
 //!
-//! 本文件同时被 cargo 当作独立 example 编译（`examples/*.rs` 都会），因此保留一个
-//! 只打印提示的 `main`；真正的 harness 由 `e2e_rotation_two_rounds` 通过
-//! `#[path = "dev_relay.rs"] mod dev_relay;` 引入。
-
-#![allow(dead_code)]
+//! 历史：本文件的代码原先内联在 `crates/sync/examples/dev_relay.rs`，由三个 e2e example
+//! 用 `#[path = "..."] mod` 引入；抽成独立 crate 后，example 只依赖
+//! `menghunote-dev-relay`，不再各自编译一份 harness，也不需要 `#[path]` 黑魔法。
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -33,10 +39,13 @@ use relay::ids::{b64url_encode, random_bytes};
 use relay::sig::{SignatureCheck, SignatureHook};
 use relay::time::{Clock, FakeClock};
 
-/// 本 harness 的错误类型（example 里统一用 `Box<dyn Error>`）。
+/// 本 harness 的错误类型（沿用 example 里统一的 `Box<dyn Error>` 口径）。
 pub type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// 只允许开发使用的验签实现：**全部放行**（与 `relay/examples/dev_server.rs` 同一个 10 行）。
+///
+/// **DEV ONLY**：任何签名都接受，仅用于 loopback 的进程内 e2e；生产用
+/// `relay::Ed25519Hook`。不要把它接进任何面向真实用户的路径。
 #[derive(Debug, Default)]
 struct DevPermissiveHook;
 
@@ -261,8 +270,4 @@ fn system_now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
-}
-
-fn main() {
-    println!("dev_relay 是 e2e_rotation_two_rounds 的进程内 relay 脚手架，请直接运行该示例。");
 }

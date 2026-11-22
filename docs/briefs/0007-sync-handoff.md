@@ -2,8 +2,10 @@
 
 > 状态：**v0.4-sync 已由 GPT 复审 APPROVE，并打 annotated tag**（非生产，仅 localhost 开发验收）。
 > 复审锚点：整理前 `321f732`（等价新提交 `61d8de4`；APPROVE，无必修项）。
+> **tag 前移（2026-11-13）**：`v0.4-sync` 现指 `d16f6fe`（含 e2e 去脚本化 / 8 条 headless UI 测试 / 文档）；
+> 旧锚点保存在 `v0.4-sync-backup-20261113`（→ `738f3f0`）。产品 `crates/*/src` 逻辑与 `61d8de4` 一致（新增仅 `debug_selector`）。
 > **Windows 实机已验证**：用户于 2026-11-13 用 `5538344` 源码包（`menghunote-v0.4-sync-5538344.zip`）实测通过；
-> 该包与 `v0.4-sync` tag 的 `crates/*/src`、`Cargo.toml/lock` **完全一致**，差异仅为 tag 后的 e2e 驱动/文档/脚本（命令细节未逐条留档）。
+> 该包与 tag 的 `crates/*/src`、`Cargo.toml/lock` **完全一致**，差异仅为 e2e 驱动/文档/脚本（命令细节未逐条留档）。
 > **历史整理（2026-11-13）**：`dev` 已重建为 12 个语义提交（tree 与整理前 `3c69f16`（backup tip）一致）；
 > 文中旧哈希（含 `321f732`）只在 `backup/dev-20261113` 可达，见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
 > 代码 HEAD：`61d8de4`（整理后；整理前 `321f732`）。本机（Linux）基线：
@@ -12,6 +14,23 @@
 > two-round e2e `EXIT=0` 且打印 `TWO_ROUND_EXIT=0`。
 >
 > **v0.4 只支持修复后新建的 vault/身份/控制链**；旧开发 vault 不得复用（原因见 §3）。
+
+> **ADR 0009 Phase 1（dev-only app 集成）完成（2026-11-13，HEAD `7f0e4fe`）**：
+> 切片 1（面板/状态机/worker）→ 2（身份/peer/intents）→ 3a（外部提交闸门 + adopt）→
+> 3b（EditorView/AppShell 转发）→ 4b（GPUI-free `DevLocal` 编排）→ 4c-1（启动期
+> Create/Join）→ 4c-2（持闸 SyncOnce）→ 4c-3（create 一次性输出 vault_id/恢复码、
+> `--dev-sync-publish` / `--dev-sync-info` CLI）全部落地。
+> UI 先持外部提交闸门 → worker 线程里跑完整 `push/pull/integrate/ack` → 活动文档
+> `prepare_committed_delta → adopt → end` → 编辑器**不重开**就看到远端文字；面板
+> 「同步」按钮走同一条路径（面板只发请求，持闸由 `AppShell` 做）。
+> dev-only 简化：**整段 sync 期间持闸**（不只 integrate）、只 adopt 活动文档、结构树仅在
+> 结构 head 变化时重投影（做不到的部分见 ADR 0009 的「已知边界」）。
+> 验收：`cargo test -p menghunote-app --features dev-sync --test dev_sync_sync_once`
+> （真实进程内 relay + 两个 AppShell 双向文字 / 失败释放闸门 / 面板按钮）；
+> app 默认 134 / feature 193 / sync 432+1；手工双实例步骤见
+> [`docs/notes/dev-sync-manual-test.md`](../notes/dev-sync-manual-test.md)。
+> **Windows 真机手工闭环尚未跑**（本机 Linux 缺 `libxcb-xkb.so.1`，只到 headless 集成测试）；
+> Create/Join/Publish 仍 CLI，轮换/metadata 对账属 Phase 2。
 
 ## 1. 一句话结论
 
@@ -125,7 +144,7 @@ Windows 重点：DPAPI identity 往返与跨 SID 失败语义、`dpapi.rs` 零�
 - `crates/sync/src/engine.rs`：`pull` / `persist_skipped_asset` v3 / `RelayHistoryRewritten`。
 - `crates/sync/src/rotation_apply.rs`：`AuthenticatedCheckpoint` / `verify_checkpoint_authorization` / `verify_activation_t_gate` / I 阶段入口。
 - `crates/sync/src/rotation_stage.rs` / `rotation_restart.rs`：`coverage_root`、restart 基线、verified receipt 门禁。
-- `crates/sync/examples/dev_relay.rs` + `e2e_rotation_two_rounds.rs`：自包含 T13 e2e。
+- `crates/dev-relay/src/lib.rs`（原 `crates/sync/examples/dev_relay.rs`，DEV ONLY、仅 `[dev-dependencies]`）+ `crates/sync/examples/e2e_rotation_two_rounds.rs`：自包含 T13 e2e。
 - `crates/sync/examples/e2e_rotation_verify.rs`（调用 `e2e_localhost.rs` / `e2e_rotation.rs` 的 `run` 入口）+ `e2e_rotation_two_devices.rs`：tag 后迁移的三条自包含 e2e。
 - `crates/relay/src/{checkpoints,rotations,quota,control,log}.rs`；ADR 0006 §31–§36；ADR 0008。
 
@@ -145,4 +164,5 @@ Windows 重点：DPAPI identity 往返与跨 SID 失败语义、`dpapi.rs` 零�
 1. ~~GPT 收尾复审~~（已完成：APPROVE，tag `v0.4-sync`；整理前锚点 `321f732`，等价新提交 `61d8de4`）。
 2. Windows 实机按 §5 复跑，把结果补进本文。
 3. `task-121`（relay reservation 复用）/ `task-122`（验证修订 2 与 receipt HMAC、GC 版本门禁）。
+4. `task-123`（默认「仅删凭证」吊销端点 + 客户端/UI；轮换改为显式 opt-in）/ `task-124`（metadata 事件认证对账与 cursor 续读）。
 4. 历史/回收站 `task-115/116/117` 按 `docs/briefs/0006-history-and-trash.md` 排期。

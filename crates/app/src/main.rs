@@ -1,13 +1,18 @@
-//! menghunote 桌面端入口（ADR 0003 §7 切片 5a：第一次把编辑器接进 GPUI 窗口）。
+//! menghunote 桌面端入口（ADR 0003 §7 切片 5a；ADR 0011 起带同步向导入口）。
 //!
-//! 启动顺序（每步失败都带上下文，不 `unwrap`）：
+//! 启动有三条互不混淆的路径（顺序 = 优先级）：
 //!
-//! 0. 读回 DPI 感知级别（`app.manifest` 里的 PerMonitorV2 是否生效的唯一客观证据）；
-//! 1. 打开 dev vault（`target/tmp/menghunote-dev/vault.sqlite3`，可用
-//!    `MENGHUNOTE_DEV_VAULT` 覆盖），需要时播种演示笔记；
-//! 2. 开窗，根视图是 `AppShell`（切片 7b：左侧结构树 + 右侧编辑器）；
-//!    `AppShell` 自己按 `list_tree` 的结果打开第一篇笔记（`SessionDriver` → `EditorController`），
-//!    关窗时做一次**有界**排空。
+//! 1. **显式 dev-sync CLI**（`--dev-sync*` / `MENGHUNOTE_DEV_SYNC=1`，含 Create/Join/
+//!    Info/Publish）：沿用 ADR 0009 的启动生命周期，开窗后根视图是 `AppShell`
+//!    ——自动化/测试兼容，行为不变。
+//! 2. **默认构建**（无 `dev-sync` feature）：打开 dev vault（`target/tmp/menghunote-dev/`，
+//!    可用 `MENGHUNOTE_DEV_VAULT` 覆盖），根视图 `AppShell`，行为完全不变。
+//! 3. **带 `dev-sync` feature 且没有显式 CLI 模式**（ADR 0011 新增）：**不再要求**任何
+//!    env/flag——先开窗，根视图是 [`AppRoot`]（Welcome/Create 表单/备份页/错误页/主界面），
+//!    已有有效公开配置 + 身份时启动直接进 Main。
+//!
+//! 第 3 条是 ADR 0011 的产品入口：真实用户不再需要 `MENGHUNOTE_DEV_VAULT`、`--dev-sync`
+//! 或命令行就能创建同步实例。CLI/env 只保留给自动化。
 
 use anyhow::Result;
 use gpui::{
@@ -25,6 +30,37 @@ fn main() -> Result<()> {
     // 后面 `scale_factor` / 显示器尺寸的数值就是它的下游表现。
     platform::log_startup_dpi_report();
 
+    // ---- dev-sync：编译期门禁 + 运行时门禁（ADR 0009 / ADR 0011）----
+    //
+    // 编译期门禁是 `--features dev-sync`；`gate::resolve` 是第二道运行时闸，但它的语义
+    // 在 ADR 0011 后分成两支：
+    // - **请求启用**（显式 `--dev-sync*` 或 `MENGHUNOTE_DEV_SYNC=1`）→ 旧 CLI 生命周期，
+    //   配置不合法（缺 vault / relay 非 loopback）仍然**明确报错退出**，不静默回退；
+    // - **没有请求启用** → 不是错误：进入 ADR 0011 的 GUI 向导（`AppRoot`），由公开配置
+    //   （而不是环境变量）决定打开哪个实例。
+    #[cfg(feature = "dev-sync")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        let gate = menghunote_app::dev_sync::gate::resolve(args.iter().cloned(), |key| {
+            std::env::var(key).ok()
+        })
+        .map_err(|error| anyhow::anyhow!("dev-sync 门禁拒绝：{error}"))?;
+        match gate {
+            menghunote_app::dev_sync::gate::Gate::Disabled => run_onboarding_window(),
+            menghunote_app::dev_sync::gate::Gate::Enabled(config) => {
+                run_dev_sync_window(config, &args)
+            }
+        }
+    }
+    #[cfg(not(feature = "dev-sync"))]
+    {
+        run_default_window()
+    }
+}
+
+/// 默认路径（无 `dev-sync` feature）：打开 dev vault → `AppShell`（与迁移前逐字节一致）。
+#[cfg(not(feature = "dev-sync"))]
+fn run_default_window() -> Result<()> {
     let dev = dev_vault::open_dev_vault()?;
     println!(
         "[menghunote] dev vault = {}（{}）",
@@ -35,50 +71,23 @@ fn main() -> Result<()> {
             "复用已有内容"
         }
     );
-    // 状态栏只放"文件所在目录 + 文件名"，完整路径在启动日志里；否则长路径会把提示挤掉。
     let vault_label = short_vault_label(&dev.path);
-    // 切片 7b：根视图（侧栏 + 编辑器）与侧栏共用同一个 vault 句柄；
-    // 具体打开哪篇笔记由结构树决定，不再硬编码文档 ID。
     let vault = dev.vault.clone();
-
     gpui::platform::application().run(move |cx: &mut App| {
-        // gpui-component 的组件（Input / List）依赖主题与全局状态，
-        // 必须先 `gpui::init(cx)`（= gpui-kit 的门面初始化，内部调 gpui_component::init）。
-        // 漏掉这一步组件不会报错，只会"什么都不显示"。
         gpui::init(cx);
         let window_bounds = initial_window_bounds(cx);
-        if let Some(display) = cx.primary_display() {
-            // 修复前后对比用：DPI 未感知时这里是**物理像素**且窗口 scale=1.0；
-            // 清单生效后这里是**逻辑像素**（物理 / scale）。
-            println!(
-                "[menghunote] 显示器 bounds = {:?}，visible = {:?}，初始窗口 = {:?}",
-                display.bounds(),
-                display.visible_bounds(),
-                window_bounds
-            );
-        }
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(window_bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some(SharedString::from("menghunote · 切片 7b dev vault")),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let options = window_options("menghunote · 切片 7b dev vault", window_bounds);
         let opened = cx.open_window(options, move |window, cx| {
-            // 期望 1.5（150% 缩放，清单生效）；若仍是 1.0，说明 exe 没有清单。
             println!("[menghunote] 窗口 scale_factor = {}", window.scale_factor());
             let shell = cx.new(|cx| AppShell::new(vault.clone(), vault_label.clone(), cx));
-            // 关窗只在这里排空一次，且时长有界（1500ms）；切换文档另有自己的排空。
             let weak = shell.downgrade();
+            // 关窗只在这里排空一次，且时长有界（1500ms）；切换文档另有自己的排空。
             window.on_window_should_close(cx, move |_window, cx| {
                 weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
                 true
             });
             shell
         });
-
         if let Err(error) = opened {
             eprintln!("[menghunote] 无法创建主窗口：{error}");
             return;
@@ -86,6 +95,185 @@ fn main() -> Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+/// ADR 0011 GUI 入口：先开窗，根视图 `AppRoot`（不需要 env/flag）。
+///
+/// 目录解析失败（HOME/LOCALAPPDATA 都没有）是**错误**：不静默回退 cwd/tmp。此时还没
+/// 有窗口，直接带着明确原因退出。
+#[cfg(feature = "dev-sync")]
+fn run_onboarding_window() -> Result<()> {
+    use menghunote_app::onboarding::{AppRoot, AppRootOptions};
+    let options = AppRootOptions::discover(|key| std::env::var(key).ok()).map_err(|error| {
+        anyhow::anyhow!("同步向导无法确定数据目录（不静默回退临时目录）：{error}")
+    })?;
+    println!(
+        "[menghunote] 同步向导：配置 = {}；实例目录 = {}（DEV ONLY / localhost）",
+        options.layout.config_path.display(),
+        options.layout.instances_dir.display()
+    );
+    gpui::platform::application().run(move |cx: &mut App| {
+        gpui::init(cx);
+        let window_bounds = initial_window_bounds(cx);
+        let options_for_window = options.clone();
+        let window_options = window_options("menghunote · 同步", window_bounds);
+        let opened = cx.open_window(window_options, move |window, cx| {
+            let root = cx.new(|cx| AppRoot::new(options_for_window, cx));
+            // 关窗分派：Working 拦截、Main 有界排空（见 `AppRoot::should_close`）。
+            AppRoot::install_close_handler(window, root.clone(), cx);
+            root
+        });
+        if let Err(error) = opened {
+            eprintln!("[menghunote] 无法创建主窗口：{error}");
+            return;
+        }
+        cx.activate(true);
+    });
+    Ok(())
+}
+
+/// 显式 dev-sync CLI 路径（ADR 0009 切片 4c-1/4c-3）：沿用既有启动生命周期。
+///
+/// 顺序是硬约束：
+/// 1. 五种模式互斥：`--dev-sync-create`（新路径 + env setup secret）、
+///    `--dev-sync-join`（env vault_id + 恢复码）、普通 `--dev-sync`（**只 load** 身份），
+///    以及 `--dev-sync-info` / `--dev-sync-publish`（打印完即退出，不开窗）；
+/// 2. secret/恢复码只从 env 读；启动日志只报模式/路径/是否已存在；
+///    **例外**：Create 成功后把一次性恢复码块打到 stdout（切片 4c-3），
+///    不写日志/文件/配置/meta；
+/// 3. `prepare` 在 Create/Join 成功后已把身份**受保护落盘**；失败会清掉本次新建的
+///    库/身份文件并 fail-fast；
+/// 4. 窗口句柄必须用身份映射出的 peer 重建（`open_vault_at_with_peer`）。
+#[cfg(feature = "dev-sync")]
+fn run_dev_sync_window(
+    config: menghunote_app::dev_sync::gate::DevSyncConfig,
+    args: &[String],
+) -> Result<()> {
+    let mode = menghunote_app::dev_sync::setup::resolve_mode(args.iter().cloned())
+        .map_err(|error| anyhow::anyhow!("dev-sync 启动模式非法：{error:#}"))?;
+    let secrets = menghunote_app::dev_sync::setup::secrets_from_env(|key| std::env::var(key).ok());
+    println!(
+        "[menghunote] dev-sync 模式 = {}；实例库 = {}（启动前{}）",
+        mode.label(),
+        config.vault.display(),
+        if config.vault.exists() {
+            "已存在"
+        } else {
+            "不存在"
+        }
+    );
+    // 切片 4c-3：`--dev-sync-info` / `--dev-sync-publish` 是**不开窗**的子命令。
+    if let Some(cli_mode) = mode.cli_mode() {
+        run_dev_sync_cli(&config, cli_mode, secrets)
+            .map_err(|error| anyhow::anyhow!("dev-sync {} 失败：{error:#}", mode.label()))?;
+        return Ok(());
+    }
+    let outcome = menghunote_app::dev_sync::setup::prepare(&config, mode, secrets)
+        .map_err(|error| anyhow::anyhow!("dev-sync 启动初始化失败：{error:#}"))?;
+    // 切片 4c-3：Create 是恢复码**唯一一次**可见的机会（不落盘、不写日志/配置/meta）。
+    if mode == menghunote_app::dev_sync::setup::SetupMode::Create {
+        if let Some(recovery_code) = outcome.recovery_code.as_deref() {
+            println!(
+                "{}",
+                menghunote_app::dev_sync::cli::create_handoff_block(
+                    &outcome.vault_id,
+                    recovery_code
+                )
+            );
+        }
+    }
+    let peer = outcome.identity.loro_peer_id();
+    let epoch = outcome.identity.current_epoch;
+    // 打印完立即丢弃：恢复码不随 outcome 继续持有，也不进任何后续输出。
+    drop(outcome.recovery_code);
+    // `prepare` 的库句柄只用于启动阶段；窗口句柄由生产入口重建。
+    // dev-sync 路径**不得**播种演示树。
+    drop(outcome.vault);
+    let dev = dev_vault::open_vault_at_with_peer_opts(&config.vault, peer, false)?;
+    println!(
+        "[menghunote] dev vault = {}（{}）",
+        dev.path.display(),
+        if dev.seeded {
+            "本次已播种演示笔记"
+        } else {
+            "复用已有内容"
+        }
+    );
+    let vault_label = short_vault_label(&dev.path);
+    let vault = dev.vault.clone();
+    let sync_context = menghunote_storage::SyncContext::new(peer, epoch);
+    gpui::platform::application().run(move |cx: &mut App| {
+        gpui::init(cx);
+        let window_bounds = initial_window_bounds(cx);
+        if let Some(display) = cx.primary_display() {
+            println!(
+                "[menghunote] 显示器 bounds = {:?}，visible = {:?}，初始窗口 = {:?}",
+                display.bounds(),
+                display.visible_bounds(),
+                window_bounds
+            );
+        }
+        let options = window_options("menghunote · 切片 7b dev vault", window_bounds);
+        let config_for_window = config.clone();
+        let opened = cx.open_window(options, move |window, cx| {
+            println!("[menghunote] 窗口 scale_factor = {}", window.scale_factor());
+            let shell = cx.new(|cx| {
+                AppShell::new_with_dev_sync_with_autosync(
+                    vault.clone(),
+                    vault_label.clone(),
+                    config_for_window.clone(),
+                    sync_context,
+                    cx,
+                )
+            });
+            let weak = shell.downgrade();
+            window.on_window_should_close(cx, move |_window, cx| {
+                weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
+                true
+            });
+            shell
+        });
+        if let Err(error) = opened {
+            eprintln!("[menghunote] 无法创建主窗口：{error}");
+            return;
+        }
+        cx.activate(true);
+    });
+    Ok(())
+}
+
+/// 切片 4c-3：两个**不开窗**的 dev-sync 子命令（打印公开事实后由 `main` 直接退出）。
+#[cfg(feature = "dev-sync")]
+fn run_dev_sync_cli(
+    config: &menghunote_app::dev_sync::gate::DevSyncConfig,
+    mode: menghunote_app::dev_sync::setup::CliMode,
+    secrets: menghunote_app::dev_sync::setup::SetupSecrets,
+) -> Result<()> {
+    use menghunote_app::dev_sync::cli;
+    use menghunote_app::dev_sync::setup::CliMode;
+    match mode {
+        CliMode::Info => {
+            let info = cli::inspect(config)?;
+            println!("{}", cli::info_block(&info));
+        }
+        CliMode::Publish => {
+            let summary = cli::publish_baseline(config, secrets.recovery_code)?;
+            println!("{}", cli::publish_block(&summary));
+        }
+    }
+    Ok(())
+}
+
+/// 统一的窗口选项（标题 + 初始 bounds）。
+fn window_options(title: &'static str, bounds: Bounds<gpui::Pixels>) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(SharedString::from(title)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// 状态栏用的短标签：`<父目录>/<文件名>`（不打印完整绝对路径）。

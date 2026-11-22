@@ -672,7 +672,12 @@ fn cbor_empty() -> Vec<u8> {
     crate::cbor::encode(fields).unwrap_or_default()
 }
 
-fn sign_management(
+/// 管理写签名（`POST=2` + 完整 path + instance/vault/request_id/expected_control_rev +
+/// `SHA256(CDE{method,path,body})`）。
+///
+/// `pub(crate)`：ADR 0010 的 `device_management::revoke_device` 复用同一实现，避免复制
+/// 签名输入拼接（wire 变更必须只有一处）。
+pub(crate) fn sign_management(
     manager: &ManagementKey,
     instance_id: &[u8; 16],
     vault_id: VaultId,

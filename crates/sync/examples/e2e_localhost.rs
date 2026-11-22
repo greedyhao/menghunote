@@ -657,6 +657,7 @@ fn print_round(label: &str, report: &menghunote_sync::engine::SyncReport) {
     let IntegrateReport {
         integrated,
         deferred,
+        ..
     } = report.integrate;
     let AckReport {
         received_seq,

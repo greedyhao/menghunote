@@ -19,6 +19,7 @@ use menghunote_text::UnicodeScalar;
 use rusqlite::types::Value;
 
 use super::flush::{lock, JournalHandle};
+use super::gate::ExternalCommitGate;
 use super::protocol::{
     Applied, ChangeSource, CommandId, DeltaSplice, DocId, DurableAck, EditOutcome, EditRequest,
     FlushReason, FlushTicket, Generation, HistoryState, LiveDelta, LiveRev, MergeInfo,
@@ -32,7 +33,9 @@ use crate::Vault;
 
 /// 会话配置。
 ///
-/// `flush_delay` 是**测试/故障注入**用的可控慢盘延迟，生产用 `None`。
+/// `flush_delay` 是**测试/故障注入**用的可控慢盘延迟，生产用 `None`；
+/// `sync` 是 ADR 0009 切片 2b 的本地意图上下文，`None` = 不产生 `sync_outbox`
+/// 行（默认构建与既有调用点行为完全不变）。
 #[derive(Debug, Clone, Copy)]
 pub struct SessionOptions {
     /// 本机 peer id（每设备唯一）。
@@ -45,6 +48,8 @@ pub struct SessionOptions {
     pub flush_batch: usize,
     /// 注入的 flush 延迟（模拟慢盘）。
     pub flush_delay: Option<Duration>,
+    /// 本地写入的同步上下文；`None` = 不产生出站意图（默认）。
+    pub sync: Option<crate::sync_bridge::SyncContext>,
 }
 
 impl Default for SessionOptions {
@@ -55,22 +60,28 @@ impl Default for SessionOptions {
             journal_capacity: 64,
             flush_batch: 8,
             flush_delay: None,
+            sync: None,
         }
     }
 }
 
 /// 一个正文文档的会话（串行 reducer）。
+///
+/// 字段对 `super::gate` 开放（`pub(crate)`）：外部提交闸门与 adopt 必须直接操作**同一份**
+/// live 文档、journal 与水位，复制状态只会制造撕裂。对外部 crate 仍然是完全私有的。
 pub struct DocumentSession {
-    vault: Vault,
-    doc_id: DocId,
+    pub(crate) vault: Vault,
+    pub(crate) doc_id: DocId,
+    /// 本机 peer id（重放 scratch 副本时用；不影响 import）。
+    pub(crate) peer_id: u64,
     generation: Generation,
-    session_epoch: SessionEpoch,
-    doc: BodyDoc,
-    live_rev: LiveRev,
-    live_frontier: Vec<u8>,
+    pub(crate) session_epoch: SessionEpoch,
+    pub(crate) doc: BodyDoc,
+    pub(crate) live_rev: LiveRev,
+    pub(crate) live_frontier: Vec<u8>,
     /// 上一次写入 journal 的 VV：增量导出的起点（不在 durable 前推进）。
-    journal_base_vv: VersionVector,
-    journal: JournalHandle,
+    pub(crate) journal_base_vv: VersionVector,
+    pub(crate) journal: JournalHandle,
     undo: UndoManager,
     /// command_id 幂等缓存（只缓存终态：Applied；背压/过期不缓存）。
     command_cache: HashMap<CommandId, EditOutcome>,
@@ -78,6 +89,8 @@ pub struct DocumentSession {
     composition_depth: u32,
     /// composition 期间延后的远端 update（按到达顺序；结束后串行合并，不丢）。
     deferred_remote: Vec<Vec<u8>>,
+    /// 外部提交闸门（ADR 0009 切片 3a）；无新线程/新全局状态。
+    pub(crate) gate: ExternalCommitGate,
 }
 
 impl std::fmt::Debug for DocumentSession {
@@ -95,6 +108,11 @@ impl std::fmt::Debug for DocumentSession {
 impl DocumentSession {
     /// 打开会话：从库里的 snapshot + updates 重放出 live 文档。
     pub fn open(vault: &Vault, doc_id: &str, options: SessionOptions) -> Result<Self, PortError> {
+        // 同步上下文在打开时校验一次：epoch/peer 非法要尽早报错，
+        // 而不是让之后每一次 flush 都因非法 intent 失败、journal 永远重试。
+        if let Some(sync) = options.sync {
+            sync.validate().map_err(port)?;
+        }
         let generation = load_generation(vault, doc_id)?;
         let (doc, head) =
             store::load_body_doc(vault, doc_id, options.peer_id, None).map_err(port)?;
@@ -108,11 +126,13 @@ impl DocumentSession {
             options.journal_capacity,
             options.flush_batch,
             options.flush_delay,
+            options.sync,
         );
         let undo = doc.undo_manager();
         Ok(Self {
             vault: vault.clone(),
             doc_id: doc_id.to_owned(),
+            peer_id: options.peer_id,
             generation,
             session_epoch: options.session_epoch,
             doc,
@@ -124,6 +144,7 @@ impl DocumentSession {
             command_cache: HashMap::new(),
             composition_depth: 0,
             deferred_remote: Vec::new(),
+            gate: ExternalCommitGate::default(),
         })
     }
 
@@ -236,9 +257,11 @@ impl DocumentSession {
     ///
     /// 1. 校验 `doc_id` / `generation` / `session_epoch`；
     /// 2. 按 `command_id` 幂等（终态直接返回首次结果）；
-    /// 3. 校验 `edits`：升序、互不重叠、`end <= scalar_len`；`base_live_rev` 不匹配 → `Stale`；
-    /// 4. journal 容量准入（满了 → `Rejected{Backpressure}`，此时 Loro 未被触碰）；
-    /// 5. 才允许改 Loro：按**逆序** `delete + insert`，导出增量、进 journal、推进 live_rev。
+    /// 3. 外部提交闸门 Held → `Rejected{NotReady}`（ADR 0009：Held 期间禁写，fail-closed）；
+    /// 4. composition 进行中 → `Rejected{CompositionActive}`；
+    /// 5. 校验 `edits`：升序、互不重叠、`end <= scalar_len`；`base_live_rev` 不匹配 → `Stale`；
+    /// 6. journal 容量准入（满了 → `Rejected{Backpressure}`，此时 Loro 未被触碰）；
+    /// 7. 才允许改 Loro：按**逆序** `delete + insert`，导出增量、进 journal、推进 live_rev。
     pub fn apply(&mut self, request: EditRequest) -> EditOutcome {
         // 1. 身份与代际
         if request.doc_id != self.doc_id {
@@ -254,6 +277,12 @@ impl DocumentSession {
         // 2. 幂等：只命中终态（背压会随 flush 解除，不能缓存）
         if let Some(cached) = self.command_cache.get(&request.command_id) {
             return cached.clone();
+        }
+
+        // 2.5 外部提交闸门 Held：一律拒绝新的本地正文改动（fail-closed，不碰 Loro）。
+        //     3b 负责让界面在 Held 期间禁写；存储层这里必须自己兜底。
+        if self.gate.is_held() {
+            return rejected(request.command_id, RejectReason::NotReady);
         }
 
         // 3. composition 闸门：组合期间拒绝其它本地正文改动（**不碰 Loro**）
@@ -351,7 +380,16 @@ impl DocumentSession {
 
         let rev = LiveRev(self.live_rev.0 + 1);
         // 持锁且已准入：这里不可能失败（见上面的注释），失败只可能是内部不一致
-        if JournalHandle::append(&mut guard, &self.doc_id, "session", update, rev).is_err() {
+        if JournalHandle::append(
+            &mut guard,
+            &self.doc_id,
+            "session",
+            crate::journal::JournalOrigin::Local,
+            update,
+            rev,
+        )
+        .is_err()
+        {
             debug_assert!(false, "持锁且已准入时 journal 追加失败");
             drop(guard);
             return rejected(request.command_id, RejectReason::NotReady);
@@ -389,9 +427,27 @@ impl DocumentSession {
     ///
     /// preedit **不经过本层**：会话只记录「组合是否在进行」，不接收 preedit 文本，
     /// 也不因 preedit 更新而阻塞。返回当前嵌套深度。
+    ///
+    /// 外部提交闸门 Held 期间**不进入组合**（fail-closed）并返回当前深度；需要显式
+    /// 错误请用 [`DocumentSession::try_begin_composition`]（3b 用）。
     pub fn begin_composition(&mut self) -> u32 {
+        match self.try_begin_composition() {
+            Ok(depth) => depth,
+            Err(_) => self.composition_depth,
+        }
+    }
+
+    /// 开始一次 IME composition 的**可报错**版本：Held 期间返回 [`PortError`]。
+    ///
+    /// Held 期间通道已冻结，这里再开组合只会让 preedit 与提交竞争，因此直接拒绝。
+    pub fn try_begin_composition(&mut self) -> Result<u32, PortError> {
+        if self.gate.is_held() {
+            return Err(PortError::Storage(
+                "外部提交闸门 Held：拒绝开始 IME 组合".to_owned(),
+            ));
+        }
         self.composition_depth += 1;
-        self.composition_depth
+        Ok(self.composition_depth)
     }
 
     /// 结束一次 composition；只有**最外层**结束才合并延后的远端导入。
@@ -451,13 +507,20 @@ impl DocumentSession {
     }
 
     fn can_accept_remote(&self) -> bool {
-        !self.journal.is_full()
+        // Held 期间不合并延后的远端：闸门要求 live 水位静止，等 end 之后再合并
+        !self.journal.is_full() && !self.gate.is_held()
     }
 
     /// 远端导入：把 update 合进 live 文档，返回驱动镜像的 [`LiveDelta`]。
     ///
     /// 容量不足时拒绝（返回 `PortError::Storage`），保证「背压时 Loro 未被修改」对远端路径同样成立。
+    /// Held 期间一律拒绝（fail-closed）：调用方应在 `end_external_commit` 之后重试。
     pub fn apply_remote(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
+        if self.gate.is_held() {
+            return Err(PortError::Storage(
+                "外部提交闸门 Held：暂不接受远端导入".to_owned(),
+            ));
+        }
         if self.is_composing() {
             // 组合期间延后：进队列（不丢、不报错），结束后按到达顺序串行合并
             self.deferred_remote.push(update.to_vec());
@@ -485,20 +548,20 @@ impl DocumentSession {
         }
 
         let mut guard = lock(self.journal.state_ref());
-        let before = self.doc.text();
-        let before_vv = self.doc.vv();
-        if let Err(error) = self.doc.import(update) {
-            drop(guard);
-            return Err(port(error));
-        }
-        let after_vv = self.doc.vv();
-        if after_vv == before_vv {
+        let diff = match import_updates(&self.doc, std::iter::once(update)) {
+            Ok(diff) => diff,
+            Err(error) => {
+                drop(guard);
+                return Err(port(error));
+            }
+        };
+        if !diff.changed() {
             drop(guard);
             return Ok(None);
         }
 
-        let after = self.doc.text();
-        let splice = diff_splice(&before, &after);
+        let splice = diff.splice();
+        let after_vv = diff.after_vv;
         let from_rev = self.live_rev;
         let to_rev = LiveRev(self.live_rev.0 + 1);
 
@@ -510,7 +573,17 @@ impl DocumentSession {
                 return Err(port(error));
             }
         };
-        if JournalHandle::append(&mut guard, &self.doc_id, "remote", pending, to_rev).is_err() {
+        if JournalHandle::append(
+            &mut guard,
+            &self.doc_id,
+            "remote",
+            // 远端导入**绝不**产生出站意图（ADR 0009）；否则会把刚收到的数据推回 relay。
+            crate::journal::JournalOrigin::Remote,
+            pending,
+            to_rev,
+        )
+        .is_err()
+        {
             drop(guard);
             return Err(PortError::Storage("journal 追加失败".to_owned()));
         }
@@ -544,8 +617,16 @@ impl DocumentSession {
     /// 返回：
     /// - `Ok(Some(Applied))`：已撤销并进 journal；
     /// - `Ok(None)`：没有可撤销项（no-op undo，应提示调用方消费该项）；
-    /// - `Ok(Some(Rejected{Backpressure}))`：journal 满，**未 undo**（Loro 未被修改）。
+    /// - `Ok(Some(Rejected{Backpressure}))`：journal 满，**未 undo**（Loro 未被修改）；
+    /// - `Ok(Some(Rejected{NotReady}))`：外部提交闸门 Held，**未 undo**（fail-closed）。
     pub fn undo(&mut self) -> Result<Option<EditOutcome>, PortError> {
+        // Held 期间 undo 也会改 Loro/journal：fail-closed，等 end 之后重试
+        if self.gate.is_held() {
+            return Ok(Some(rejected(
+                CommandId::from("undo"),
+                RejectReason::NotReady,
+            )));
+        }
         // composition 期间 undo/redo 也属于「其它本地正文改动」：拒绝且不碰 Loro
         if self.is_composing() {
             return Ok(Some(rejected(
@@ -583,6 +664,12 @@ impl DocumentSession {
 
     /// 重做：与 [`DocumentSession::undo`] 对称。
     pub fn redo(&mut self) -> Result<Option<EditOutcome>, PortError> {
+        if self.gate.is_held() {
+            return Ok(Some(rejected(
+                CommandId::from("redo"),
+                RejectReason::NotReady,
+            )));
+        }
         if self.is_composing() {
             return Ok(Some(rejected(
                 CommandId::from("redo"),
@@ -629,7 +716,17 @@ impl DocumentSession {
         {
             let mut guard = lock(self.journal.state_ref());
             // 外层已做容量准入，且持锁期间容量只增不减 → 这里不会失败
-            if JournalHandle::append(&mut guard, &self.doc_id, label, update, rev).is_err() {
+            // undo/redo 是本机产生的新 op（不是远端回放），因此同样产生出站意图。
+            if JournalHandle::append(
+                &mut guard,
+                &self.doc_id,
+                label,
+                crate::journal::JournalOrigin::Local,
+                update,
+                rev,
+            )
+            .is_err()
+            {
                 debug_assert!(false, "持锁且已准入时 journal 追加失败");
                 return Err(PortError::Storage("journal 追加失败".to_owned()));
             }
@@ -727,6 +824,59 @@ fn load_generation(vault: &Vault, doc_id: &str) -> Result<Generation, PortError>
         Some(Value::Text(kind)) if kind == "body" => Ok(generation),
         _ => Err(PortError::NotOpen(doc_id.to_owned())),
     }
+}
+
+/// 一批 update 导入后的文本/版本变化（**不推进任何水位、不碰 journal**）。
+pub(crate) struct ImportDiff {
+    /// 导入前的正文。
+    pub(crate) before_text: String,
+    /// 导入后的正文（没有新 op 时与 `before_text` 相同）。
+    pub(crate) after_text: String,
+    /// 导入后的版本向量。
+    pub(crate) after_vv: VersionVector,
+    /// 是否真的产生了新的 op（以 VV 为准：文本相同也可能有纯格式 op）。
+    changed: bool,
+}
+
+impl ImportDiff {
+    /// 是否产生了新的 op。
+    pub(crate) fn changed(&self) -> bool {
+        self.changed
+    }
+
+    /// 本次变化的最小 splice（驱动调用方镜像与选区变换）。
+    pub(crate) fn splice(&self) -> DeltaSplice {
+        diff_splice(&self.before_text, &self.after_text)
+    }
+}
+
+/// 把一批 update 合进 live 文档，返回前后文本与 VV。
+///
+/// **只做 Loro 导入**：journal、水位、事件全部由调用方决定——
+/// `apply_remote` 走 journal（会产生 A 事务条目），`adopt_committed_delta` 走已 durable
+/// 路径（不进 journal、不产生 sync intent）。两条路径共用同一份导入/选区变换逻辑。
+pub(crate) fn import_updates<'a, I>(doc: &BodyDoc, updates: I) -> Result<ImportDiff, StorageError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let before_text = doc.text();
+    let before_vv = doc.vv();
+    for update in updates {
+        doc.import(update)?;
+    }
+    let after_vv = doc.vv();
+    let changed = after_vv != before_vv;
+    let after_text = if changed {
+        doc.text()
+    } else {
+        before_text.clone()
+    };
+    Ok(ImportDiff {
+        before_text,
+        after_text,
+        after_vv,
+        changed,
+    })
 }
 
 /// 以 scalar 为单位求「最小差异」splice（公共前缀 + 公共后缀）。

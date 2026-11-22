@@ -88,6 +88,77 @@ selector 只是测试元数据：`debug_selector` 只在 `debug_assertions` + `t
 下记录，release 构建里是 no-op；**不要**让业务逻辑依赖它。修改 selector 名属于破坏测试
 契约，和改行为一样要看一遍本文件的表。
 
+## dev-sync 面板（`dev-sync` feature，ADR 0009 切片 1）
+
+面板只在 `--features dev-sync` **且**运行时门禁通过（`--dev-sync` 或 `MENGHUNOTE_DEV_SYNC=1`，
+外加显式 `MENGHUNOTE_DEV_VAULT` 与 localhost relay）时挂到 `AppShell` 右上角（覆盖层，
+不挤压编辑器）；未启用时这些 selector **全部不存在**（不渲染、不占布局）。通用命令要带 feature：
+
+```bash
+cargo test -p menghunote-app --features dev-sync --test dev_sync_ui
+cargo test -p menghunote-app --features dev-sync           # Linux 链接依赖见上一节
+```
+
+| selector | 挂在哪个元素 | 用途 |
+| --- | --- | --- |
+| `dev-sync-panel` | 面板根（绝对定位覆盖层） | 面板存在 / 尺寸非零 |
+| `dev-sync-state` | 状态行（状态 + 在途 op + 关闭门禁） | 断言存在（`debug_bounds` 读不到文本） |
+| `dev-sync-relay` | relay 行 | 只显示公开地址（不含 secret） |
+| `dev-sync-error` | 最近错误行 | 未实现/失败的明确原因 |
+| `dev-sync-notice` | 最近一次按钮操作的结果 | 排队 / 被拒绝 / 同步完成 |
+| `dev-sync-sync-state` | 持闸同步行（切片 4c-2） | 空闲 / 已持闸 / 完成（N 条变化） |
+| `dev-sync-create` / `-join` / `-sync` / `-publish` / `-stop` | 5 个按钮 | `-sync` → 面板请求（见下）；其余 → `SyncService::try_command` |
+| `dev-sync-devices` | 设备列表区域（ADR 0010 切片 2a-2） | 区域存在；内含固定警告文案（文本靠 `REVOKE_WARNING` 单测固定） |
+| `dev-sync-refresh-devices` | 刷新设备按钮 | 点击 → `Command::ListDevices` |
+| `dev-sync-member-<i>` / `-id` / `-status` | 第 i 行设备（i = `MemberView` 的稳定升序下标） | 行存在；本机标记写在 `-status` 的文案里（单测固定） |
+| `dev-sync-remove-<i>` | 该行移除按钮 | **只**在 Active 且非本机时渲染；Join 设备置灰（点了只给原因） |
+| `dev-sync-confirm-revoke` / `dev-sync-cancel-revoke` | 二次确认的确认/取消 | 确认才发 `Command::RevokeDevice` |
+
+设备行 selector 带下标：`debug_bounds` 只接受 `&'static str`，测试侧用 `probe()`（`Box::leak`）
+把 `format!` 出来的名字变成静态串；不要为此改生产 selector 的形状。
+
+服务层（纯状态机、运行时门禁、worker、关闭票据）用 `crates/app/tests/dev_sync_service.rs`：
+**不 sleep**，收敛点只有状态机的同步返回与 `SyncService::reap_worker()`（join 建立
+happens-before，之后 `poll()` 必然拿到 worker 已发出的全部事件）。
+
+### 持闸同步（切片 4c-2）：`crates/app/tests/dev_sync_sync_once.rs`
+
+「同步」按钮**不直接**对 service 发 `SyncOnce`：面板只 `emit` 一个
+`DevSyncPanelEvent::SyncRequested`，`AppShell` 在下一拍 `dev_sync_pump` 里走
+`begin_external_commit → Held → try_command_with_gate(SyncOnce) → prepare/adopt/end`。
+测试入口与判据（没有真实时钟，全部是**状态收敛**）：
+
+- `shell.dev_sync_sync_once(cx)`：登记一次持闸同步（面板按钮走同一条路径）；
+- `shell.dev_sync_pump(cx)`：泵一拍（面板/服务事件 → 闸门推进 → 活动视图）。它是
+  headless 的"单步收敛点"，**不是** sleep 的替代；
+- 收敛判据：`shell.dev_sync_sync_in_progress()` 转 `false`；
+  `shell.dev_sync_last_sync()` 给出的 `SyncOnceReport`（`dispatched_under_gate` /
+  `changes` / `error` / `structure_refreshed`）；
+- 闸门可见性：`editor-sync-held` selector 只在 Held 时存在；
+  `EditorView::dev_sync_is_held()` / `dev_sync_durable_head_seq()` / `dev_sync_doc_id()`
+  是只读断言入口；
+- 两个实例：同一 `TestAppContext` 里开**两个 window**（各自的 `AppShell` + 独立
+  vault/身份/服务，同一进程/同一 relay），用 `VisualTestContext::from_window(handle)`
+  切到各自窗口；工作目录/临时库纪律同上。
+
+四条测试覆盖：A/B 双向文字（不重开文档）、传输失败 → 闸门释放 + 可重试 + 重复命令被拒、
+面板按钮走同一路径、远端结构变更 → 同步后重投影 + 侧栏出现新行（验证不是假刷新）。
+
+### 设备列表与移除设备（ADR 0010 切片 2a-2）：`crates/app/tests/dev_sync_devices.rs`
+
+列表/移除的命令与事件（`ListDevices` / `RevokeDevice` → `DevicesListed` / `DeviceRevoked`）
+仍走**同一个单操作 worker**，所以测试的收敛判据是"目标 op 收尾"：
+`service.snapshot().in_flight.is_none()` **且** 列表内容满足预期（列表事件在 `Completed`
+之前就发出，只看"设备变了"会把在途 op 当成已收尾，下一条命令会被 `Busy` 拒绝）。
+
+- 面板打开/同步完成后的**自动刷新**由 40 ms 事件泵派发；headless 下 GPUI 定时器不会自己
+  走时，测试用 `executor().advance_clock(SYNC_PUMP_INTERVAL)` 显式推进测试时钟再泵；
+- 两个真实 `AppShell`（真实 dev relay）+ `VisualTestContext` 切窗口，覆盖：A 面板列出 A/B、
+  A 标「本机」无按钮、B 行移除 → 二次确认（含取消）→ 确认 → B=已移除 + notice、
+  Join 设备按钮点不动、被移除设备同步 `REVOKED`、重复移除不谎称「认证已刷新」。
+**仍然测不到**真实 relay/TLS/多进程/真实时钟下的 UX；这些留在真机 `ui_smoke.ps1`
+与 relay 生产路径的正负例。
+
 ## 如何新增一条测试
 
 1. **测试放哪**：只涉及 `crates/app` 视图/启动路径的，加进 `crates/app/tests/headless_ui.rs`

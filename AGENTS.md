@@ -350,11 +350,21 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > 三个阻断已修：ASSET 来源认证/覆盖实证 + post-activation + Linux 封装（`2c88f72`）；
 > 同一 durable E1 跨两轮 e2e 与三条 e2e 去脚本化（`61d8de4`）。
 > 本机（Linux）基线：`cargo test --workspace --exclude menghunote-app` = **1006 passed**；sync = **417 passed**。
-> **`v0.4-sync` 已由 GPT 复审 APPROVE（锚点 `61d8de4`；整理前 `321f732`，无必修项）并打 annotated tag**；非生产，仅 localhost 开发验收。
+> **`v0.4-sync` 已由 GPT 复审 APPROVE（原锚点 `61d8de4`；整理前 `321f732`，无必修项）并打 annotated tag**；2026-11-13 前移至 `d16f6fe`（旧锚点 `v0.4-sync-backup-20261113` → `738f3f0`）；非生产，仅 localhost 开发验收。
 > **Windows 实机已由用户于 2026-11-13 在 `5538344` 包上实测通过**（产品代码与 `v0.4-sync` tag 树一致；命令/计数未逐条留档，复跑命令见 0007 §5）。
 > v0.4 **只支持修复后新建的 vault/身份**，旧开发 vault 失效（旧签名 checkpoint 无法仅靠本地版本拒绝隔离）。
-> 后置：`task-121`（relay reservation 复用）、`task-122`（`validation_version=2`/receipt HMAC/GC 版本门禁）。
+> 后置：`task-121`（relay reservation 复用）、`task-122`（`validation_version=2`/receipt HMAC/GC 版本门禁）、`task-123`（默认删凭证吊销 + 轮换 opt-in）、`task-124`（metadata 事件认证对账/续读）。
 > Linux 开发适配见 ADR 0008（0600 裸主钥，安全弱于 DPAPI，不宣称等价）。
+> **dev-only 同步 UI（ADR 0009）Phase 1 已完成**：真实 AppShell 内面板 + 持闸 SyncOnce +
+> 活动文档 adopt；面板「发布基线」、设备列表/「移除设备（不轮换）」已接通。
+> **UI 初始化（ADR 0011 S1–S3，2026-11-14，HEAD `b63b541`）**：`AppRoot` 同窗根视图；
+> Create/Join 向导（恢复码一次性展示+备份确认、失败恢复、实例目录锁/公开配置），
+> 真实用户不再需要 CLI/env；命令行仅保留自动化/恢复兼容。
+> **自动同步（ADR 0012 S1–S3，2026-11-13，HEAD `ce31854`）**：两阶段（网络不持闸、
+> integrate/adopt 短持闸）+ 编辑 debounce 2s/周期 45s/退避 + 状态栏 + 重启待应用恢复；
+> 手动同步与发布/设备命令优先。并行测试改为显式事件收敛（连续 10 次全绿）。
+> 手工步骤见 [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md)；
+> app feature 300 / 默认 134 / sync 451+1 / storage 171。**Windows 真机未验**；轮换/metadata 属后续。
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
 - **版本管理**：当前开发分支 **`dev`**（2026-11-11 重建：折叠全部 `wip:`，0 wip，36 条提交）；

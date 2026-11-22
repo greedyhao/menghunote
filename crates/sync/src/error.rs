@@ -218,6 +218,21 @@ pub enum SyncError {
     #[error("同步暂停：{0}")]
     Paused(crate::relay::PauseReason),
 
+    /// 取消/授权复核在**首次外部集成前**赢得竞争：本轮**没有**追加任何外部行（ADR 0012 S1）。
+    ///
+    /// 只在 `integrate` 之前的那道门返回；一旦进入 integrate 就不会再用它中断事务
+    /// （已开始的真实事务必须跑完并交付）。**不可重试**：重试是用户/调度器的决定，
+    /// 不能让自动路径悄悄再来一遍。
+    #[error("同步已取消：在外部集成前停止（未追加任何本地行）")]
+    CancelledBeforeIntegrate,
+
+    /// 结构投影失败（ADR 0012 S2b）。
+    ///
+    /// 结构 CRDT 与 inbox 水位都已 durable；失败的是本地 `tree/notes` 投影。调用方必须
+    /// **明确报错并保持写禁用**（不得假装侧栏已刷新），并保留重试入口。
+    #[error("结构投影失败：{0}")]
+    StructureProjection(String),
+
     /// head CAS 冲突（并发本地写入把 head 推进了）。**可重试**：重读 head 后重放，
     /// 不得把它当成"数据丢了"而丢弃 outbox/inbox 行。
     #[error("head CAS 冲突：{doc_id} 期望 {expected}，实际 {actual}")]

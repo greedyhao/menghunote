@@ -5,6 +5,7 @@ use crate::error::StorageError;
 use crate::projector::{project, ProjectionReport};
 use crate::store::{self, HeadState, UpdateRecord};
 use crate::structure::{StructureDoc, STRUCTURE_DOC_ID};
+use crate::sync_bridge::{self, SyncContext};
 use crate::Vault;
 use rusqlite::types::Value;
 
@@ -50,22 +51,44 @@ pub fn load_structure(
 ///
 /// `commit` 做两件事：A 事务（结构 update + head + outbox），随后一次投影。
 /// 投影幂等，所以即使中途崩溃，下一次 `commit`/[`crate::projector::project`] 也能追平。
+///
+/// 带 [`SyncContext`] 时（[`StructureWriter::open_with_sync`]），新结构 op 在**同一个**
+/// A 事务里额外写一条 `sync_outbox` 意图（ADR 0009 切片 2b）。
 #[derive(Debug)]
 pub struct StructureWriter {
     vault: Vault,
     doc: StructureDoc,
     head: HeadState,
+    sync: Option<SyncContext>,
 }
 
 impl StructureWriter {
-    /// 打开（或创建）结构文档。
+    /// 打开（或创建）结构文档；默认**不**产生出站同步意图。
     pub fn open(vault: &Vault, peer_id: u64) -> Result<Self, StorageError> {
+        Self::open_with_sync(vault, peer_id, None)
+    }
+
+    /// 打开（或创建）结构文档，并显式指定同步上下文。
+    ///
+    /// `None` 与 [`StructureWriter::open`] 等价；`Some` 时每次产生新结构 op 的
+    /// `commit` 都会在同事务里写一条 `sync_outbox` 意图（`STRUCTURE_DOC_ID`、seq=head+1、
+    /// batch_id 来自调用方）。
+    pub fn open_with_sync(
+        vault: &Vault,
+        peer_id: u64,
+        sync: Option<SyncContext>,
+    ) -> Result<Self, StorageError> {
+        if let Some(sync) = sync {
+            // 非法上下文（peer/epoch = 0）在打开时就要明确报错，而不是等到 commit。
+            sync.validate()?;
+        }
         ensure_structure_row(vault)?;
         let (doc, head) = load_structure(vault, peer_id)?;
         Ok(Self {
             vault: vault.clone(),
             doc,
             head,
+            sync,
         })
     }
 
@@ -86,12 +109,34 @@ impl StructureWriter {
         // 用 VV 判断「有没有新 op」：空的 frontier 编码不是零字节，直接比 bytes 会误判
         if self.doc.vv() != base {
             let update = self.doc.pending_update(&base)?;
-            let new_head = store::append_updates(
-                &self.vault,
-                STRUCTURE_DOC_ID,
-                self.head.head_seq,
-                &[UpdateRecord::new(batch_id, update)],
-            )?;
+            let records = [UpdateRecord::new(batch_id, update)];
+            let new_head =
+                match self.sync {
+                    // 默认路径：与切片 2a 之前逐字节一致（无 intent）。
+                    None => store::append_updates(
+                        &self.vault,
+                        STRUCTURE_DOC_ID,
+                        self.head.head_seq,
+                        &records,
+                    )?,
+                    Some(ctx) => {
+                        // 结构提交是真实本地写入：结构与 intent 同一个 A 事务。
+                        let seq = self.head.head_seq.checked_add(1).ok_or_else(|| {
+                            StorageError::Corrupt {
+                                context: format!("{STRUCTURE_DOC_ID} 本地 seq 溢出"),
+                            }
+                        })?;
+                        let intent =
+                            sync_bridge::local_sync_intent(STRUCTURE_DOC_ID, seq, batch_id, ctx)?;
+                        sync_bridge::append_updates_with_sync_intents(
+                            &self.vault,
+                            STRUCTURE_DOC_ID,
+                            self.head.head_seq,
+                            &records,
+                            std::slice::from_ref(&intent),
+                        )?
+                    }
+                };
             self.head = new_head;
         }
 

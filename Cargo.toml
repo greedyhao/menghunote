@@ -9,6 +9,8 @@ members = [
     "crates/sync-proto",
     "crates/sync",
     "crates/relay",
+    # 仅测试使用的进程内 relay harness（publish = false）；只允许出现在 [dev-dependencies]。
+    "crates/dev-relay",
 ]
 
 [workspace.package]

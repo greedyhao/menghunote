@@ -18,11 +18,15 @@
 //! 完整性：响应必须自洽（`Content-Length` 不足即报错，超出按长度截断）；不支持
 //! `Transfer-Encoding: chunked`（relay 的 wire 是 CBOR/octet-stream，不依赖它）。
 //! 请求永远带 `Connection: close`，响应读到 EOF（TLS 下容忍对端不发 close_notify）。
+//!
+//! 超时（ADR 0009「传输超时」）：连接逐个地址 `connect_timeout`（默认 30s）、单次读写 30s、
+//! 可选整次请求总 deadline（默认关）；全部可配，超时错误一律 [`SyncError::Transport`]，
+//! 不 panic、不改 TLS/重定向语义。
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -34,6 +38,50 @@ pub const ALLOW_PLAINTEXT_HTTP_ENV: &str = "MENGHUNOTE_ALLOW_PLAINTEXT_HTTP";
 
 /// 同 origin 重定向最多跟随的跳数（防止恶意 relay 用无限 30x 拖死客户端）。
 pub const MAX_REDIRECTS: usize = 4;
+
+/// 默认连接超时（与既有的读写 30s 语义一致；见 [`StdTcpTransport::with_connect_timeout`]）。
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 默认单次读写超时（本模块从第一版起就是 30s，保持不变）。
+pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 允许配置的最小超时。
+///
+/// `std::net::TcpStream::connect_timeout` **遇到 0 会 panic**，`set_read_timeout` 对 0 返回
+/// `InvalidInput`；这里统一夹到 1ms，保证"超时配置错误"只会失败、不会崩（ADR 0009 要求
+/// 超时错误映射成既有 [`SyncError::Transport`]，不 panic）。
+const MIN_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// [`StdTcpTransport`] 当前生效的超时配置（诊断/测试用；不参与 wire）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportTimeouts {
+    /// 连接超时（每个候选地址）。
+    pub connect: Duration,
+    /// 单次读写超时。
+    pub io: Duration,
+    /// 整次请求的总预算；`None` = 不额外限制。
+    pub request_deadline: Option<Duration>,
+}
+
+/// 历史默认预算（手动同步 / CLI / create / join 沿用）：连接/读写各 30s，无整次请求预算。
+///
+/// 与 [`StdTcpTransport::new_local_dev`] 的默认值**逐项相同**，所以把它显式传进去
+/// 不会改变任何既有行为（ADR 0012 S1 的向后兼容入口）。
+pub const DEFAULT_TRANSPORT_TIMEOUTS: TransportTimeouts = TransportTimeouts {
+    connect: DEFAULT_CONNECT_TIMEOUT,
+    io: DEFAULT_IO_TIMEOUT,
+    request_deadline: None,
+};
+
+/// ADR 0012 建议的**自动同步**预算：连接 5s / 读写 10s / 整次请求 30s。
+///
+/// 只描述"自动同步场景"该用什么；**S1 不启用自动同步**，手动路径仍用
+/// [`DEFAULT_TRANSPORT_TIMEOUTS`]。S3 接线时由 `ServiceConfig` 显式选中它。
+pub const AUTOSYNC_TRANSPORT_TIMEOUTS: TransportTimeouts = TransportTimeouts {
+    connect: Duration::from_secs(5),
+    io: Duration::from_secs(10),
+    request_deadline: Some(Duration::from_secs(30)),
+};
 
 /// 一个 HTTP 请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,11 +195,28 @@ struct ParsedUrl {
 ///
 /// 构造时只做 URL/策略校验；TLS 信任根在第一次 https 请求时装配（系统证书存储的加载
 /// 失败只在该次请求上体现为 [`SyncError::Tls`]，不阻止 http 本地开发）。
+///
+/// ## 超时（ADR 0009「传输超时」）
+///
+/// 三层，全部可配、默认保持既有行为（连接/读写各 30s、无总 deadline）：
+///
+/// 1. **连接**（[`StdTcpTransport::with_connect_timeout`]）：解析出的**每个**地址都用
+///    `TcpStream::connect_timeout` 尝试，任一成功即用；超时/拒绝都映射成
+///    [`SyncError::Transport`]（不 panic、不暴露底层地址）。
+/// 2. **单次读写**（[`StdTcpTransport::with_io_timeout`]）：沿用第一版的 30s。
+/// 3. **整次请求**（[`StdTcpTransport::with_request_deadline`]）：`send` 的总预算，覆盖
+///    重定向的各跳、连接与全部读写；每跳的 socket 超时取 `min(剩余预算, 读写超时)`，
+///    预算耗尽立即返回 [`SyncError::Transport`]。
 pub struct StdTcpTransport {
     scheme: Scheme,
     host: String,
     port: u16,
+    /// 单次读写超时。
     timeout: Duration,
+    /// 连接超时（逐个地址尝试时每个地址的上限）。
+    connect_timeout: Duration,
+    /// 整次 `send` 的总预算；`None` = 不额外限制（默认，保持第一版行为）。
+    request_deadline: Option<Duration>,
     policy: TransportPolicy,
     extra_roots: Vec<CertificateDer<'static>>,
     tls_config: Option<Arc<ClientConfig>>,
@@ -169,6 +234,27 @@ impl StdTcpTransport {
     /// [`StdTcpTransport::new`] + https。
     pub fn new_local_dev(base_url: &str) -> Result<Self, SyncError> {
         Self::new_with_policy(base_url, TransportPolicy::localhost_development())
+    }
+
+    /// 本机开发构造 + **显式传输预算**（ADR 0012 S1：预算由调用方/配置决定，不在这里硬编）。
+    ///
+    /// `timeouts = None` 时与 [`Self::new_local_dev`] 完全一致（历史默认，向后兼容）；
+    /// `Some` 时逐项应用连接 / 读写 / 整次请求预算。0 仍会被夹到 1ms（配置错误不 panic）。
+    pub fn new_local_dev_with(
+        base_url: &str,
+        timeouts: Option<TransportTimeouts>,
+    ) -> Result<Self, SyncError> {
+        let transport = Self::new_local_dev(base_url)?;
+        let Some(timeouts) = timeouts else {
+            return Ok(transport);
+        };
+        let transport = transport
+            .with_connect_timeout(timeouts.connect)
+            .with_io_timeout(timeouts.io);
+        Ok(match timeouts.request_deadline {
+            Some(deadline) => transport.with_request_deadline(deadline),
+            None => transport,
+        })
     }
 
     /// 按显式策略构造。
@@ -200,11 +286,48 @@ impl StdTcpTransport {
             scheme: parsed.scheme,
             host: parsed.host,
             port: parsed.port,
-            timeout: Duration::from_secs(30),
+            timeout: DEFAULT_IO_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_deadline: None,
             policy,
             extra_roots: Vec::new(),
             tls_config: None,
         })
+    }
+
+    /// 设置连接超时（每个候选地址的上限；默认 [`DEFAULT_CONNECT_TIMEOUT`]）。
+    ///
+    /// 0 会被夹到 1ms（`connect_timeout` 对 0 会 panic，这里不允许把配置错误变成崩溃）。
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout.max(MIN_TIMEOUT);
+        self
+    }
+
+    /// 设置单次读写超时（默认 [`DEFAULT_IO_TIMEOUT`]，与第一版一致）。
+    #[must_use]
+    pub fn with_io_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.max(MIN_TIMEOUT);
+        self
+    }
+
+    /// 设置整次 `send` 的总 deadline（含重定向各跳、连接与所有读写）。
+    ///
+    /// 默认 `None`（只受连接/读写超时约束）。0 会被夹到 1ms。
+    #[must_use]
+    pub fn with_request_deadline(mut self, deadline: Duration) -> Self {
+        self.request_deadline = Some(deadline.max(MIN_TIMEOUT));
+        self
+    }
+
+    /// 当前配置的超时（诊断/测试用）。
+    #[must_use]
+    pub fn timeouts(&self) -> TransportTimeouts {
+        TransportTimeouts {
+            connect: self.connect_timeout,
+            io: self.timeout,
+            request_deadline: self.request_deadline,
+        }
     }
 
     /// 注入额外信任根（DER 编码的 CA 证书）。系统根证书仍然生效。
@@ -233,15 +356,72 @@ impl StdTcpTransport {
         self.policy
     }
 
+    /// 建立 TCP 连接：解析出全部地址后逐个 `connect_timeout`，任一成功即可。
+    ///
+    /// 失败一律映射成 [`SyncError::Transport`]（不 panic、不把底层地址/原因拼进消息：
+    /// relay 地址不是秘密，但错误文本要能被上层稳定分类）。
+    fn connect(&self, deadline: Option<Instant>) -> Result<TcpStream, SyncError> {
+        let mut timeout = self.connect_timeout;
+        if let Some(at) = deadline {
+            let remaining = at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(SyncError::Transport(
+                    "连接 relay 超时（请求总 deadline 已耗尽）",
+                ));
+            }
+            timeout = timeout.min(remaining);
+        }
+        // `connect_timeout` 对 0 会 panic，统一夹到 1ms。
+        let timeout = timeout.max(MIN_TIMEOUT);
+        let addrs = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .map_err(|_| SyncError::Transport("解析 relay 地址失败"))?;
+        let mut timed_out = false;
+        let mut attempted = 0usize;
+        for addr in addrs {
+            attempted += 1;
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    timed_out |= matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock);
+                }
+            }
+        }
+        if attempted == 0 {
+            return Err(SyncError::Transport("relay 地址解析结果为空"));
+        }
+        if timed_out {
+            Err(SyncError::Transport("连接 relay 超时"))
+        } else {
+            Err(SyncError::Transport("连接 relay 失败"))
+        }
+    }
+
     /// 单独完成一次 HTTP 交换（不处理重定向）。
-    fn exchange(&mut self, request: &HttpRequest) -> Result<RawResponse, SyncError> {
-        let stream = TcpStream::connect((self.host.as_str(), self.port))
-            .map_err(|_| SyncError::Transport("连接 relay 失败"))?;
+    ///
+    /// `deadline` 是整次 `send` 的预算截止点：socket 读写超时取 `min(读写超时, 剩余预算)`，
+    /// 预算耗尽时直接返回 [`SyncError::Transport`]，不再碰 socket。
+    fn exchange(
+        &mut self,
+        request: &HttpRequest,
+        deadline: Option<Instant>,
+    ) -> Result<RawResponse, SyncError> {
+        let io_timeout = match deadline {
+            None => self.timeout,
+            Some(at) => {
+                let remaining = at.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(SyncError::Transport("请求超时（总 deadline 已耗尽）"));
+                }
+                remaining.min(self.timeout).max(MIN_TIMEOUT)
+            }
+        };
+        let stream = self.connect(deadline)?;
         stream
-            .set_read_timeout(Some(self.timeout))
+            .set_read_timeout(Some(io_timeout))
             .map_err(|_| SyncError::Transport("设置读超时失败"))?;
         stream
-            .set_write_timeout(Some(self.timeout))
+            .set_write_timeout(Some(io_timeout))
             .map_err(|_| SyncError::Transport("设置写超时失败"))?;
         let host_header = self.host_header();
         let raw = match self.scheme {
@@ -382,10 +562,12 @@ impl StdTcpTransport {
 
 impl HttpTransport for StdTcpTransport {
     fn send(&mut self, request: &HttpRequest) -> Result<HttpResponse, SyncError> {
+        // 总预算在**整次 send** 上计时（含重定向各跳），不是每跳重置。
+        let deadline = self.request_deadline.map(|total| Instant::now() + total);
         let mut current = request.clone();
         let mut hops = 0usize;
         loop {
-            let raw = self.exchange(&current)?;
+            let raw = self.exchange(&current, deadline)?;
             if !matches!(raw.status, 301..=303 | 307 | 308) {
                 return Ok(HttpResponse {
                     status: raw.status,
@@ -667,6 +849,179 @@ mod tests {
     fn transport(base_url: &str) -> StdTcpTransport {
         StdTcpTransport::new_with_policy(base_url, TransportPolicy::production())
             .expect("transport")
+    }
+
+    fn ping() -> HttpRequest {
+        HttpRequest {
+            method: "GET",
+            path: "/v1/ping".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// 起一个**只 accept、只读不写**的本地 listener：客户端只能等到自己的超时。
+    ///
+    /// 确定性：对端一个字节都不写，所以"多久返回"完全由客户端超时配置决定
+    /// （不依赖网络抖动、不 sleep；线程在客户端关闭后自然结束）。
+    fn silent_peer() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // 读到客户端关闭为止，**一个字节都不回**：连接保持打开，客户端只能等超时。
+            let mut buffer = [0_u8; 256];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn request_deadline_cuts_off_a_silent_peer() {
+        let (addr, handle) = silent_peer();
+        let mut transport = StdTcpTransport::new_with_policy(
+            &format!("http://{addr}"),
+            TransportPolicy::localhost_development(),
+        )
+        .expect("loopback 明文开发策略")
+        .with_request_deadline(Duration::from_millis(200));
+
+        let started = Instant::now();
+        let error = transport.send(&ping()).expect_err("对端不回包必须超时");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, SyncError::Transport(_)),
+            "超时错误必须映射成既有 Transport（不 panic、不混成 Tls）：{error:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "必须在 read 上真的等到超时，不能立刻返回：{elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "总 deadline 必须生效（默认读写超时是 30s，不能真等满）：{elapsed:?}"
+        );
+        handle.join().expect("silent peer 线程应正常退出");
+    }
+
+    #[test]
+    fn explicit_budget_is_applied_and_none_keeps_history() {
+        // ADR 0012 S1：预算由调用方传入，`new_local_dev_with` 只是逐项应用。
+        let with_budget = StdTcpTransport::new_local_dev_with(
+            "http://127.0.0.1:18080",
+            Some(AUTOSYNC_TRANSPORT_TIMEOUTS),
+        )
+        .expect("loopback dev");
+        assert_eq!(with_budget.timeouts(), AUTOSYNC_TRANSPORT_TIMEOUTS);
+        assert_eq!(with_budget.timeouts().connect, Duration::from_secs(5));
+        assert_eq!(with_budget.timeouts().io, Duration::from_secs(10));
+        assert_eq!(
+            with_budget.timeouts().request_deadline,
+            Some(Duration::from_secs(30))
+        );
+
+        // 历史默认：`None` 与不带预算构造逐项一致（手动/CLI 现状不变）。
+        let historical =
+            StdTcpTransport::new_local_dev_with("http://127.0.0.1:18080", None).expect("loopback");
+        assert_eq!(historical.timeouts(), DEFAULT_TRANSPORT_TIMEOUTS);
+        assert_eq!(
+            historical.timeouts(),
+            StdTcpTransport::new_local_dev("http://127.0.0.1:18080")
+                .expect("loopback")
+                .timeouts()
+        );
+    }
+
+    #[test]
+    fn injected_request_budget_cuts_off_a_silent_peer() {
+        // 复用 silent peer 模式：不引入真实网络/抖动，超时由预算决定。
+        let (addr, handle) = silent_peer();
+        let mut transport = StdTcpTransport::new_local_dev_with(
+            &format!("http://{addr}"),
+            Some(TransportTimeouts {
+                connect: Duration::from_millis(200),
+                io: Duration::from_secs(5),
+                request_deadline: Some(Duration::from_millis(200)),
+            }),
+        )
+        .expect("loopback 明文开发策略");
+
+        let started = Instant::now();
+        let error = transport.send(&ping()).expect_err("对端不回包必须超时");
+        let elapsed = started.elapsed();
+        assert!(matches!(error, SyncError::Transport(_)), "{error:?}");
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "必须在 read 上真的等到超时：{elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "注入的 200ms 总预算必须生效（读写默认 5s，不能真等满）：{elapsed:?}"
+        );
+        handle.join().expect("silent peer 线程应正常退出");
+    }
+
+    #[test]
+    fn timeout_config_is_applied_and_zero_is_clamped() {
+        let transport = StdTcpTransport::new_local_dev("http://127.0.0.1:18080")
+            .expect("loopback dev")
+            .with_connect_timeout(Duration::from_millis(150))
+            .with_io_timeout(Duration::from_millis(250))
+            .with_request_deadline(Duration::from_millis(350));
+        assert_eq!(
+            transport.timeouts(),
+            TransportTimeouts {
+                connect: Duration::from_millis(150),
+                io: Duration::from_millis(250),
+                request_deadline: Some(Duration::from_millis(350)),
+            }
+        );
+        // 默认值保持既有语义（连接/读写各 30s，无总 deadline）。
+        let defaults =
+            StdTcpTransport::new_local_dev("http://127.0.0.1:18080").expect("loopback dev");
+        assert_eq!(defaults.timeouts().connect, Duration::from_secs(30));
+        assert_eq!(defaults.timeouts().io, Duration::from_secs(30));
+        assert_eq!(defaults.timeouts().request_deadline, None);
+
+        // 0 一律夹到 1ms：配置错误不能变成 panic（`connect_timeout(0)` 会 panic）。
+        let clamped = StdTcpTransport::new_local_dev("http://127.0.0.1:18080")
+            .expect("loopback dev")
+            .with_connect_timeout(Duration::ZERO)
+            .with_io_timeout(Duration::ZERO)
+            .with_request_deadline(Duration::ZERO);
+        assert_eq!(clamped.timeouts().connect, Duration::from_millis(1));
+        assert_eq!(clamped.timeouts().io, Duration::from_millis(1));
+        assert_eq!(
+            clamped.timeouts().request_deadline,
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    #[ignore = "需要真正不可达的地址才会等满连接超时；容器/CI 里常立刻返回网络不可达（避免 flaky），本地手工跑"]
+    fn connect_timeout_to_unreachable_address_is_a_transport_error() {
+        // 192.0.2.0/24 是 RFC 5737 的 TEST-NET-1（保留、不可路由）；明文非 loopback 会被
+        // 策略拒绝，所以这里用 https（构造只做 URL 校验，不发起连接）。
+        let mut transport = StdTcpTransport::new("https://192.0.2.1:443")
+            .expect("https 构造只做 URL 校验")
+            .with_connect_timeout(Duration::from_millis(200))
+            .with_request_deadline(Duration::from_millis(500));
+        let started = Instant::now();
+        let error = transport.send(&ping()).expect_err("不可达地址必须失败");
+        assert!(
+            matches!(error, SyncError::Transport(_)),
+            "连接超时必须映射成 Transport：{error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "连接超时必须受 200ms 配置与 500ms 总 deadline 约束：{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

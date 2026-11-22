@@ -13,11 +13,26 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::journal::{DurableSink, JournalEntry, PendingJournal, VaultJournalSink};
+use crate::journal::{DurableSink, JournalEntry, JournalOrigin, PendingJournal, VaultJournalSink};
 use crate::store::HeadState;
-use crate::Vault;
+use crate::sync_bridge::SyncContext;
+use crate::{StorageError, Vault};
 
+use super::gate::AppliedHeads;
 use super::protocol::{BatchId, DurableAck, FlushTicketId, LiveRev, SessionEvent};
+
+/// 闸门判定用的水位快照（见 [`JournalHandle::gate_progress`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateProgress {
+    /// 未 ACK 条数。
+    pub(crate) pending: usize,
+    /// 已 durable 到的 live 修订号。
+    pub(crate) durable_through: LiveRev,
+    /// 已 durable 的 head seq（外部提交的 CAS 基准）。
+    pub(crate) durable_head_seq: u64,
+    /// 最近一次前缀写失败原因（成功写入后清空）。
+    pub(crate) last_write_error: Option<String>,
+}
 
 /// 取锁；锁被毒化也继续用内部值（清理路径不允许 panic）。
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -54,6 +69,10 @@ pub(crate) struct PendingState {
     pub(crate) durable_batch: Option<BatchId>,
     /// 已 durable 到的 live 修订号。
     pub(crate) durable_through: LiveRev,
+    /// 最近一次前缀写失败的原因；下一次成功写入后清空。
+    ///
+    /// 外部提交闸门据此把「还在 Flushing」明确升级成 `Failed`，不静默等一个永远不来的 ACK。
+    pub(crate) last_write_error: Option<String>,
 }
 
 /// journal 句柄：会话侧投递命令，后台线程负责写。
@@ -68,7 +87,8 @@ pub(crate) struct JournalHandle {
 impl JournalHandle {
     /// 启动后台 flush 线程。
     ///
-    /// `flush_delay` 是**测试/故障注入**用的可控延迟（模拟慢盘），生产传 `None`。
+    /// `flush_delay` 是**测试/故障注入**用的可控延迟（模拟慢盘），生产传 `None`；
+    /// `sync` 是 ADR 0009 切片 2b 的本地意图上下文（`None` = 不写 `sync_outbox`）。
     pub(crate) fn spawn(
         vault: Vault,
         doc_id: String,
@@ -76,6 +96,7 @@ impl JournalHandle {
         capacity: usize,
         max_batch: usize,
         flush_delay: Option<Duration>,
+        sync: Option<SyncContext>,
     ) -> Self {
         let state = Arc::new(Mutex::new(PendingState {
             journal: PendingJournal::new(capacity),
@@ -87,24 +108,23 @@ impl JournalHandle {
             durable: head,
             durable_batch: None,
             durable_through: LiveRev(0),
+            last_write_error: None,
         }));
         let events: Arc<Mutex<VecDeque<SessionEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let (sender, receiver) = channel::<FlushCommand>();
 
         let worker_state = Arc::clone(&state);
         let worker_events = Arc::clone(&events);
+        let config = FlusherConfig {
+            doc_id,
+            max_batch: max_batch.max(1),
+            flush_delay,
+            sync,
+        };
         let worker = thread::Builder::new()
             .name("menghunote-flush".to_owned())
             .spawn(move || {
-                flusher_main(
-                    vault,
-                    doc_id,
-                    worker_state,
-                    worker_events,
-                    receiver,
-                    max_batch.max(1),
-                    flush_delay,
-                );
+                flusher_main(vault, worker_state, worker_events, receiver, config);
             });
 
         // 线程起不来时退化为「没有后台 flush」：票据照发，但不会有 ACK（调用方可重启会话）。
@@ -168,6 +188,42 @@ impl JournalHandle {
         lock(&self.state).durable_through
     }
 
+    /// 外部提交闸门判定用的**一次性快照**：一次取锁同时读 pending / durable 水位 /
+    /// 最近一次写失败原因，避免分多次取锁看到互相矛盾的组合。
+    pub(crate) fn gate_progress(&self) -> GateProgress {
+        let guard = lock(&self.state);
+        GateProgress {
+            pending: guard.journal.pending_len(),
+            durable_through: guard.durable_through,
+            durable_head_seq: guard.durable.head_seq,
+            last_write_error: guard.last_write_error.clone(),
+        }
+    }
+
+    /// 外部提交 adopt / end 之后重定 durable 基准（调用方必须已持锁）。
+    ///
+    /// `loro_docs.head_*` 已由外部提交（`engine.integrate`）推进；这里把 flusher 的 CAS
+    /// 基准与 durable 水位对齐，避免下一次本地 flush 报 `HeadConflict`。
+    ///
+    /// **只允许在 journal `pending == 0` 时调用**：journal 条目的 `end_vv` / `end_frontier`
+    /// 是追加那一刻的快照，有在途条目时重定基准会让水位于条目自相矛盾（前瞻 head 回退）。
+    pub(crate) fn rebase_locked(
+        guard: &mut PendingState,
+        heads: &AppliedHeads,
+        through: LiveRev,
+    ) -> Result<(), StorageError> {
+        if guard.journal.pending_len() != 0 {
+            return Err(StorageError::Corrupt {
+                context: "有未 ACK 条目时不能重定 durable 基准".to_owned(),
+            });
+        }
+        guard.durable.head_seq = heads.head_seq;
+        guard.durable.head_frontier = heads.frontier.clone();
+        guard.durable.head_vv = heads.vv.clone();
+        guard.durable_through = through;
+        Ok(())
+    }
+
     /// 取走全部待推送事件。
     pub(crate) fn drain_events(&self) -> Vec<SessionEvent> {
         let mut queue = lock(&self.events);
@@ -175,10 +231,13 @@ impl JournalHandle {
     }
 
     /// 在 journal 里登记一条未 ACK 条目（调用方必须已通过容量准入）。
+    ///
+    /// `origin` 决定 flush 时是否产生出站同步意图：只有本地更新才产生。
     pub(crate) fn append(
         guard: &mut PendingState,
         doc_id: &str,
         batch_label: &str,
+        origin: JournalOrigin,
         update: crate::body_doc::PendingUpdate,
         rev: LiveRev,
     ) -> Result<BatchId, crate::StorageError> {
@@ -189,6 +248,7 @@ impl JournalHandle {
             doc_id: doc_id.to_owned(),
             batch_id: format!("{batch_label}-{}", batch.0),
             update,
+            origin,
         };
         guard.journal.append(entry)?;
         guard.revs.push_back(rev);
@@ -208,16 +268,37 @@ impl Drop for JournalHandle {
     }
 }
 
+/// flush 线程的一次性配置（与可变状态分开，避免 `flusher_main` 参数过多）。
+#[derive(Debug, Clone)]
+struct FlusherConfig {
+    /// 归属文档（一次 flush 里不允许混文档）。
+    doc_id: String,
+    /// 一次 A 事务最多合并多少条。
+    max_batch: usize,
+    /// 注入的慢盘延迟（生产 `None`）。
+    flush_delay: Option<Duration>,
+    /// 本地意图上下文（`None` = 不写 `sync_outbox`）。
+    sync: Option<SyncContext>,
+}
+
 /// flush 线程主体：一条命令 = 至少一次前缀写，直到覆盖 `target_live_rev` 或 journal 空。
 fn flusher_main(
     vault: Vault,
-    doc_id: String,
     state: Arc<Mutex<PendingState>>,
     events: Arc<Mutex<VecDeque<SessionEvent>>>,
     receiver: Receiver<FlushCommand>,
-    max_batch: usize,
-    flush_delay: Option<Duration>,
+    config: FlusherConfig,
 ) {
+    let FlusherConfig {
+        doc_id,
+        max_batch,
+        flush_delay,
+        sync,
+    } = &config;
+    let doc_id = doc_id.clone();
+    let max_batch = *max_batch;
+    let flush_delay = *flush_delay;
+    let sync = *sync;
     while let Ok(command) = receiver.recv() {
         if let Some(delay) = flush_delay {
             thread::sleep(delay);
@@ -245,15 +326,23 @@ fn flusher_main(
 
             // 2) A 事务（在锁外，慢盘不会阻塞会话线程）
             let mut sink = VaultJournalSink::new(vault.clone(), doc_id.clone(), head_seq);
+            if let Some(sync) = sync {
+                sink = sink.with_sync_context(sync);
+            }
             let written = match sink.write_prefix(&entries) {
                 Ok(seq) => seq,
-                // 不裁剪、不 ACK：同一前缀留着下次重试，已 ACK 部分不受影响
-                Err(_) => break,
+                // 不裁剪、不 ACK：同一前缀留着下次重试，已 ACK 部分不受影响。
+                // 同时记录失败原因：外部提交闸门据此把 "Flushing" 明确升级为 Failed。
+                Err(error) => {
+                    lock(&state).last_write_error = Some(error.to_string());
+                    break;
+                }
             };
 
             // 3) durable 之后才裁剪并推进水位
             let (batch, head_frontier) = {
                 let mut guard = lock(&state);
+                guard.last_write_error = None;
                 let _ = guard.journal.ack_prefix(count);
                 for _ in 0..count {
                     guard.revs.pop_front();

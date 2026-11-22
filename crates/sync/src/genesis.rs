@@ -89,12 +89,13 @@ impl GenesisMaterials {
     }
 
     /// 用于 Loro 的 peer id（u64；high bit 清零避免超出 Loro 的 i64 计数器域）。
+    ///
+    /// 规则与 [`crate::identity::LocalIdentityV1::loro_peer_id`] **同一条**：唯一实现是
+    /// [`PeerId::loro_u64`]。app 的 dev-sync 身份与真实 genesis 身份因此不会给出两套
+    /// peer 口径（ADR 0009 切片 2）。
     #[must_use]
     pub fn peer_id_u64(&self) -> u64 {
-        let bytes = self.peer_id.as_bytes();
-        let mut head = [0u8; 8];
-        head.copy_from_slice(&bytes[..8]);
-        u64::from_be_bytes(head) & 0x7fff_ffff_ffff_ffff
+        self.peer_id.loro_u64()
     }
 
     /// 构造本地身份（instance_id/control_rev 由 genesis 响应填入）。

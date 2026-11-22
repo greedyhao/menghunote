@@ -92,6 +92,7 @@ fn session_options(capacity: usize, flush_delay: Option<Duration>) -> SessionOpt
         journal_capacity: capacity,
         flush_batch: 8,
         flush_delay,
+        sync: None,
     }
 }
 

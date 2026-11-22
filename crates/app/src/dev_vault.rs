@@ -31,7 +31,11 @@ pub const DEMO_TITLE: &str = "menghunote · dev 演示笔记";
 pub const DEMO_FOLDER_TITLE: &str = "示例目录";
 /// 目录里的第二篇笔记标题（depth = 1）。
 pub const DEMO_SECOND_TITLE: &str = "目录里的第二篇";
-/// 本机 peer id（切片 7 只有一个编辑器实例，固定 1 即可）。
+/// 默认本机 peer id（默认构建/既有测试保持常量 1，行为不变）。
+///
+/// dev-sync（ADR 0009 切片 2）**不再用它**：两个实例必须各自从
+/// `LocalIdentityV1::loro_peer_id()` 取持久 peer，见 [`open_vault_at_with_peer`]。
+/// 默认（feature off / 未启用）路径仍然传 1。
 pub const DEV_PEER_ID: u64 = 1;
 /// ADR 0002 §11.1 的冻结夹具：`é` 是 **分解形式**（`e` + U+0301）。
 pub const NFD_FIXTURE: &str = "中😀e\u{301}";
@@ -61,7 +65,32 @@ pub fn open_dev_vault() -> anyhow::Result<DevVault> {
 ///
 /// 幂等判据是**结构树是否为空**（`list_tree`）：7b 之前的老库只有 `notes`/`loro_docs`
 /// 行、没有结构节点，那种演示行会在播种时被清掉并重建（见 [`wipe_legacy_demo_rows`]）。
+///
+/// 默认 peer 是 [`DEV_PEER_ID`]（= 1），与切片 7 的既有行为逐字节一致；dev-sync 走
+/// [`open_vault_at_with_peer`] 传持久身份映射出来的 peer。
 pub fn open_vault_at(path: &Path) -> anyhow::Result<DevVault> {
+    open_vault_at_with_peer(path, DEV_PEER_ID)
+}
+
+/// 打开指定路径的 dev vault，并**显式指定本机 peer**（ADR 0009 切片 2a）。
+///
+/// `peer_id` 必须是调用方从持久身份（`LocalIdentityV1::loro_peer_id()`）取来的值：
+/// 播种（结构 op + 正文增量）与之后的读回都统一用它，**不再**出现常量 1 的硬编码。
+/// 已经有结构树的库不会被重新播种，所以 peer 只影响"本次新建的 op"。
+pub fn open_vault_at_with_peer(path: &Path, peer_id: u64) -> anyhow::Result<DevVault> {
+    open_vault_at_with_peer_opts(path, peer_id, true)
+}
+
+/// 打开指定路径的 dev vault，可显式关闭**空树自动播种**。
+///
+/// dev-sync 的 Create/Join 必须用 `seed_demo: false`：身份/基线已经由 `DevLocal`
+/// 建好，再播种演示树会把 3 个 demo 节点混进用户库里（Create 后空树由用户点
+/// 「＋ 笔记」创建；Join 后树来自 bootstrap 基线）。
+pub fn open_vault_at_with_peer_opts(
+    path: &Path,
+    peer_id: u64,
+    seed_demo: bool,
+) -> anyhow::Result<DevVault> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("创建 dev vault 目录失败：{}", parent.display()))?;
@@ -69,11 +98,11 @@ pub fn open_vault_at(path: &Path) -> anyhow::Result<DevVault> {
     let vault =
         Vault::open(path).with_context(|| format!("打开 dev vault 失败：{}", path.display()))?;
     let has_tree = !list_tree(&vault).context("读取结构树失败")?.is_empty();
-    let seeded = if has_tree {
-        false
-    } else {
-        seed_demo_tree(&vault)?;
+    let seeded = if !has_tree && seed_demo {
+        seed_demo_tree(&vault, peer_id)?;
         true
+    } else {
+        false
     };
     Ok(DevVault {
         vault,
@@ -195,11 +224,13 @@ fn wipe_legacy_demo_rows(vault: &Vault) -> anyhow::Result<()> {
 }
 
 /// 播种演示树：结构 op（笔记 / 目录 / 嵌套）→ `commit`（A 事务 + 投影）→ 写正文。
-fn seed_demo_tree(vault: &Vault) -> anyhow::Result<()> {
+///
+/// `peer_id` 是本次播种的 Loro peer（结构 doc 与正文 doc 都用它）。
+fn seed_demo_tree(vault: &Vault, peer_id: u64) -> anyhow::Result<()> {
     wipe_legacy_demo_rows(vault)?;
 
     let now = 1_i64;
-    let mut writer = StructureWriter::open(vault, DEV_PEER_ID).context("打开结构写入口失败")?;
+    let mut writer = StructureWriter::open(vault, peer_id).context("打开结构写入口失败")?;
     let demo = writer
         .doc()
         .create_note(DEMO_TITLE, now)
@@ -219,8 +250,8 @@ fn seed_demo_tree(vault: &Vault) -> anyhow::Result<()> {
     // commit：A 事务写入结构增量 + 投影（tree / notes / loro_docs 等行）
     writer.commit("dev-seed").context("提交结构并投影失败")?;
 
-    write_body(vault, &demo.body_doc_id, &demo_markdown())?;
-    write_body(vault, &second.body_doc_id, &second_note_markdown())?;
+    write_body(vault, &demo.body_doc_id, &demo_markdown(), peer_id)?;
+    write_body(vault, &second.body_doc_id, &second_note_markdown(), peer_id)?;
     Ok(())
 }
 
@@ -228,8 +259,8 @@ fn seed_demo_tree(vault: &Vault) -> anyhow::Result<()> {
 ///
 /// 注意：`loro_docs` 行是结构投影建的，所以这里用 `load_body_doc` 而**不是**
 /// `create_body_doc`（后者是裸 INSERT，会撞主键）。
-fn write_body(vault: &Vault, doc_id: &str, text: &str) -> anyhow::Result<()> {
-    let (doc, head) = load_body_doc(vault, doc_id, DEV_PEER_ID, None)
+fn write_body(vault: &Vault, doc_id: &str, text: &str, peer_id: u64) -> anyhow::Result<()> {
+    let (doc, head) = load_body_doc(vault, doc_id, peer_id, None)
         .with_context(|| format!("加载正文文档失败：{doc_id}"))?;
     doc.insert_scalars(0, text)
         .with_context(|| format!("写入正文失败：{doc_id}"))?;

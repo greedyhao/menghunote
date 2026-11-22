@@ -15,7 +15,8 @@
 //! 1. challenge→token 认证（600s，提前 60s 刷新）；
 //! 2. state/log/objects/updates/acks 全走 CBOR；
 //! 3. **log 事件读签名**（事件 map 键 5），交给引擎按 ADR §2 验 `ObjectCommit`；
-//! 4. `GET P/control?after_rev` 拉控制链 + 成员证书，**按 `control_rev` 缓存/失效**；
+//! 4. `GET P/control?after_rev` 拉控制链 + 成员证书，**按 `control_rev` + `auth_rev`
+//!    缓存/失效**（ADR 0010：独立吊销只推进 `auth_rev`、不动控制链，缓存必须跟着作废）；
 //!    成员证书按 §17.1 用管理公钥验签；**active 集合只由已签控制链推导**
 //!    （genesis/approve 加入事件 − begin/revoked-more 吊销），relay 的 `member.status`
 //!    只做 fail-closed 否决、不能授权，见 [`parse_control`]。**消费 `/control` 必须带
@@ -202,6 +203,59 @@ fn is_local_dev_base_url(base_url: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
+/// 控制链成员的访问状态（ADR 0010 成员语义；**只读投影**，不是授权来源）。
+///
+/// 唯一的授权事实仍是 [`ControlState::active_certs`]（已签加入 − 已签吊销 − relay
+/// `member.status` 否决）。本枚举只描述"该成员当前处于什么访问状态"，不参与任何
+/// active 集合 / 成员摘要 / grant 规划。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemberStatus {
+    /// 当前 active：与 `active_certs` **同谓词**（已签加入、未被已签吊销、relay status 未否决）。
+    Active,
+    /// 已签吊销（永久事实，优先于 relay status）、relay 标记 revoked，或无法证明 active
+    /// 的成员（fail-closed：恶意 relay 把已签吊销证书 `status` 翻回 `active` 也不会显示 Active）。
+    Revoked,
+    /// relay 里尚未批准的**空证书占位**（`certificate` 为 X''），没有指纹/管理 rev。
+    Pending,
+    /// relay 标记 `expired`（不进入 active 集合；证书仍留在 `history_certs` 供 ≤S 验签）。
+    Expired,
+}
+
+/// 已验证控制链的**只读成员视图**（ADR 0010 切片 2a-1；设备列表 UI 的数据源）。
+///
+/// 它是 [`ControlState`] 的投影：`status == Active` 当且仅当该设备进入 `active_certs`，
+/// 不改变任何 active 集合、成员摘要或 grant 规划，也不新增/删除成员。
+///
+/// `sign_pk`/`hpke_pk` 是**公开**密钥；但 `Debug` 有意只打印
+/// `device_id`/`status`/`fingerprint`，避免设备列表与日志意外带出完整密钥材料或证书字节。
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemberView {
+    /// 设备 ID（16 字节，公开标识）。
+    pub device_id: DeviceId,
+    /// 当前访问状态（见 [`MemberStatus`]）。
+    pub status: MemberStatus,
+    /// 设备指纹（32 位小写 hex）：成员证书可解析且 §17.1 验签通过时为 `Some`；
+    /// pending 的空证书占位为 `None`。
+    pub fingerprint: Option<String>,
+    /// 设备 Ed25519 签名公钥（公开；`Debug` 不打印）。
+    pub sign_pk: [u8; 32],
+    /// 设备 X25519 HPKE 公钥（公开；`Debug` 不打印）。
+    pub hpke_pk: [u8; 32],
+    /// 证书里的 `issued_manager_rev`（历史证书保留其签发管理版本）；pending 空证书为 `None`。
+    pub issued_manager_rev: Option<u64>,
+}
+
+impl core::fmt::Debug for MemberView {
+    /// 只打印 `device_id`/`status`/`fingerprint`：不含 `sign_pk`/`hpke_pk` 与证书原字节。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MemberView")
+            .field("device_id", &crate::ids::hex_of(&self.device_id))
+            .field("status", &self.status)
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
 /// `/control` 的验证后缓存。
 #[derive(Debug, Clone)]
 struct ControlState {
@@ -209,6 +263,13 @@ struct ControlState {
     instance_id: [u8; 16],
     control_rev: u64,
     epoch: u64,
+    /// 拉取/验证这条控制链时 `/state` 报的 `auth_rev`（ADR 0010 缓存失效的锚点）。
+    ///
+    /// `auth_rev` 是全 vault 的鉴权版本（吊销/轮换推进），与 `control_rev` 无关：
+    /// 独立吊销只推进 `auth_rev`，控制链/成员证书的**签名事实**不变，但 `active` 集合
+    /// 的 relay 侧否决（`member.status`）变了。因此缓存必须同时按 `auth_rev` 失效，
+    /// 不能只比较 `control_rev`/`epoch`——否则吊销后会用旧缓存把已移除设备当成 active。
+    auth_rev: u64,
     /// 通过 §17.1 验签的**全部**成员证书（active + 已吊销/过期）。
     ///
     /// 历史吊销设备的 ≤S 记录仍需用它的旧证书验签，因此保留；它**不是** active 集合。
@@ -232,6 +293,21 @@ struct ControlState {
     verified_activation_t: HashMap<[u8; 16], VerifiedActivationT>,
     /// activation T 所在控制记录的 rev（`T.expected_control_rev`，用于定位链上位置）。
     activation_revs: HashMap<[u8; 16], u64>,
+    /// **只读**成员投影（`device_id` 稳定升序；ADR 0010 切片 2a-1 设备列表用）。
+    ///
+    /// 与 `active_certs`/`history_certs` 由同一轮 `/control` 解析得出，但**不参与**
+    /// 授权判定：成员的 `Active` 当且仅当它进入 `active_certs`。
+    members: Vec<MemberView>,
+}
+
+impl ControlState {
+    /// 已验证控制链的只读成员投影（按 `device_id` 稳定升序）。
+    ///
+    /// 只是投影：active 授权仍只看 `active_certs`，本方法不改变任何成员事实。
+    #[must_use]
+    pub fn members(&self) -> &[MemberView] {
+        &self.members
+    }
 }
 
 /// 控制链复算出的**已签成员事实**：active 集合的唯一授权来源（评审 0002 P0-2）。
@@ -274,6 +350,14 @@ impl SignedMemberFacts {
                 .get(device_id)
                 .map(Vec::as_slice)
                 .is_some_and(|joined| joined == certificate)
+    }
+
+    /// 该设备是否命中**已签吊销**（永久事实；与 relay 的 `member.status` 无关）。
+    ///
+    /// 只供成员视图做 fail-closed 投影：已签吊销是永久事实，relay 把 status 翻回
+    /// `active` 也不能把设备显示成 Active（授权集合同理）。
+    fn is_revoked(&self, device_id: &DeviceId) -> bool {
+        self.revoked.contains(device_id)
     }
 }
 
@@ -378,6 +462,15 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
     /// 已缓存的 control_rev（测试/诊断用）。
     pub fn cached_control_rev(&self) -> Option<u64> {
         self.control.as_ref().map(|control| control.control_rev)
+    }
+
+    /// 已缓存控制链对应的 `auth_rev`（测试/诊断用）。
+    ///
+    /// `None` = 没有已验证的控制成员缓存；`Some(rev)` = 这条缓存是在 `/state.auth_rev == rev`
+    /// 时拉取/验证的。吊销后 `auth_rev` 前进而 `control_rev` 不变，`state()` 会比对这个值
+    /// 并丢弃缓存（ADR 0010）。
+    pub fn cached_auth_rev(&self) -> Option<u64> {
+        self.control.as_ref().map(|control| control.auth_rev)
     }
 
     /// 已完成链校验的控制链链尾 `(rev, record_hash)`。
@@ -546,6 +639,35 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         Ok(Sha256::digest(&input).into())
     }
 
+    /// ADR 0010 切片 2a-1：已验证控制链的**只读成员视图**（设备列表 UI 用）。
+    ///
+    /// 返回按 `device_id` 稳定升序的 [`MemberView`]。语义与授权集合严格一致：
+    /// - `Active` 当且仅当该设备进入 `active_certs`（已签加入 − 已签吊销 − relay status 否决），
+    ///   因此**不会**把已签吊销、或 relay 单方面标 active 的设备显示成 Active；
+    /// - `Revoked` 覆盖"relay status-only 撤销"（ADR 0010 默认的仅删凭证）与已签吊销；
+    ///   历史证书保留，所以被吊销设备仍有指纹；
+    /// - `Pending` 只来自 relay 的空证书占位，`fingerprint`/`issued_manager_rev` 为 `None`。
+    ///
+    /// 只读投影：不新增/删除成员，也不影响 active 集合、成员摘要与 grant 规划。
+    /// 缓存缺失或 `auth_rev` 前进（独立吊销）时，先按既有 pin 规则重新拉取并验证
+    /// `/control`，绝不把吊销前的旧成员缓存当作事实返回。
+    pub fn members(&mut self) -> Result<Vec<MemberView>, SyncError> {
+        // 有缓存时先读 `/state` 比对 `auth_rev`：独立吊销只推进 `auth_rev`（控制链签名
+        // 事实与 `control_rev` 都不变），不看它就会把旧缓存里的 B 继续当成 active。
+        // 无缓存时 `refresh_control` 自己会读 `/state`，这里不重复请求。
+        if self.control.is_some() {
+            let _ = self.state()?;
+        }
+        if self.control.is_none() {
+            self.refresh_control()?;
+        }
+        let control = self
+            .control
+            .as_ref()
+            .ok_or(SyncError::RelayWire("control 缓存为空"))?;
+        Ok(control.members().to_vec())
+    }
+
     /// §35.4：完整 staged/active grant leaf 集合（设备 realm 可读）。
     ///
     /// 对 `GET P/rotations/{r}/grants/leaves` 的结果做三重校验：
@@ -625,7 +747,10 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         Ok(Some(evidence))
     }
 
-    /// rotation begin 会 bump `auth_rev` 使全部旧 token 失效；调用方必须清缓存重认证。
+    /// rotation begin / 设备吊销会 bump `auth_rev` 使全部旧 token 失效；调用方必须清缓存重认证。
+    ///
+    /// 清的是内部的 token 与 control 两处缓存：`auth_rev` 是全 vault 的，旧 token 和它
+    /// 对应的成员/链缓存必须一起作废（ADR 0010）。
     pub fn clear_auth_cache(&mut self) {
         self.token = None;
         self.control = None;
@@ -767,6 +892,25 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         content_type: Option<&str>,
         body: Vec<u8>,
     ) -> Result<HttpResponse, SyncError> {
+        let response = self.send_once(method, &path, content_type, body.clone())?;
+        if !is_revoked_response(&response) {
+            return Ok(response);
+        }
+        // ADR 0010：吊销推进的是**全 vault** 的 `auth_rev`，连调用者的旧 token 与
+        // 控制成员缓存一起失效（relay 在鉴权阶段就拒绝，请求本身没有副作用）。
+        // 这里清缓存后只重新认证重试**一次**：被吊销设备即使重认证也会继续 REVOKED，
+        // 因此不会形成重认证环；活跃设备则能透明地跨过别人吊销带来的版本推进。
+        self.clear_auth_cache();
+        self.send_once(method, &path, content_type, body)
+    }
+
+    fn send_once(
+        &mut self,
+        method: &'static str,
+        path: &str,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, SyncError> {
         let token = self.ensure_token()?;
         let mut headers = vec![("authorization".to_owned(), format!("Bearer {token}"))];
         if let Some(content_type) = content_type {
@@ -774,7 +918,7 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         }
         self.transport.send(&HttpRequest {
             method,
-            path,
+            path: path.to_owned(),
             headers,
             body,
         })
@@ -903,6 +1047,8 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
             &self.config.vault_id,
             &state.instance_id,
             &manager_pub,
+            // 缓存锚点：这条控制链是在 `/state.auth_rev == state.auth_rev` 时验证的。
+            state.auth_rev,
         )?;
         // `/state` 先于 `/control` 读取：并发追加只会让控制链更新，不能反而更旧。
         if control.control_rev < state.control_rev {
@@ -972,17 +1118,27 @@ fn verify_control_pin(
 impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
     fn state(&mut self) -> Result<RelayState, SyncError> {
         let state = self.read_state()?;
-        if let Some(control) = &self.control {
-            // 已认证的 head 只能前进：`/state` 更低即 relay 回滚，fail-stop。
-            if state.control_rev < control.control_rev {
-                return Err(SyncError::RelayWire(
-                    "relay control_rev 低于已认证缓存（回滚）",
-                ));
-            }
-            // control_rev 前进 → 旧成员证书缓存失效。
-            if state.control_rev > control.control_rev || state.epoch != control.epoch {
-                self.control = None;
-            }
+        let Some(control) = &self.control else {
+            return Ok(state);
+        };
+        // 已认证的 head 只能前进：`/state` 更低即 relay 回滚，fail-stop。
+        if state.control_rev < control.control_rev {
+            return Err(SyncError::RelayWire(
+                "relay control_rev 低于已认证缓存（回滚）",
+            ));
+        }
+        // control_rev/epoch 前进 → 旧成员证书缓存失效（token 仍按自身 auth_rev 有效）。
+        let rev_moved = state.control_rev > control.control_rev || state.epoch != control.epoch;
+        // ADR 0010：**还必须看 `auth_rev`**。独立吊销只推进 `auth_rev`（`control_rev`
+        // 与签名链完全不变），但 relay 的 `member.status` 已把目标改成 revoked；只比较
+        // `control_rev` 会把旧缓存里的 active 集合/成员摘要继续当成事实。`auth_rev` 是
+        // 全 vault 的鉴权版本，所以 token 与成员缓存必须一起作废、重新认证。
+        let auth_moved = state.auth_rev != control.auth_rev;
+        if rev_moved {
+            self.control = None;
+        }
+        if auth_moved {
+            self.clear_auth_cache();
         }
         Ok(state)
     }
@@ -1914,6 +2070,20 @@ fn decode_ok(response: &HttpResponse) -> Result<cbor::Fields, SyncError> {
     cbor::decode(&response.body)
 }
 
+/// 响应是否是 relay 的 `403 REVOKED`（`auth_rev` 前进导致的旧 token 失效，ADR 0010）。
+///
+/// 只认 CBOR 错误体的 `code == "REVOKED"`：其它 403（`FORBIDDEN`/`MANAGEMENT_REQUIRED`）
+/// 不是"版本推进"，不能触发清缓存重认证。
+fn is_revoked_response(response: &HttpResponse) -> bool {
+    if response.status < 400 {
+        return false;
+    }
+    match cbor::decode(&response.body) {
+        Ok(fields) => matches!(cbor::text_field(&fields, 0).as_deref(), Ok("REVOKED")),
+        Err(_) => false,
+    }
+}
+
 /// 把 relay 的错误体映射成 [`SyncError::RelayApi`]。
 pub(crate) fn error_from_response(response: &HttpResponse) -> SyncError {
     if let Ok(fields) = cbor::decode(&response.body) {
@@ -2003,6 +2173,7 @@ fn parse_control(
     vault_id: &VaultId,
     instance_id: &[u8; 16],
     manager_pub: &[u8; 32],
+    auth_rev: u64,
 ) -> Result<ControlState, SyncError> {
     let first = pages
         .first()
@@ -2054,6 +2225,8 @@ fn parse_control(
     let mut history_certs = HashMap::new();
     let mut active_certs = HashMap::new();
     let mut member_cert_inputs = Vec::new();
+    // 只读成员投影（ADR 0010 切片 2a-1）：与授权集合同源解析，但不回写任何授权事实。
+    let mut members = Vec::new();
     let last = pages.last().ok_or(SyncError::RelayWire("控制链分页为空"))?;
     for member in cbor::array_field(last, 3).map_err(|_| SyncError::RelayWire("control members"))? {
         let member =
@@ -2086,6 +2259,16 @@ fn parse_control(
                 return Err(SyncError::RelayWire("成员证书为空但带管理签名"));
             }
             if status == "pending" {
+                // 成员视图保留这条 pending 记录（无指纹/无管理 rev），供设备列表显示
+                // "待批准"；它仍然不构成任何授权事实。
+                members.push(MemberView {
+                    device_id,
+                    status: MemberStatus::Pending,
+                    fingerprint: None,
+                    sign_pk,
+                    hpke_pk,
+                    issued_manager_rev: None,
+                });
                 continue;
             }
             return Err(SyncError::RelayWire("非待批准成员证书为空"));
@@ -2128,6 +2311,38 @@ fn parse_control(
         let signed_active = verifier
             .members
             .signed_active(&device_id, &certificate_bytes);
+        // 成员视图是同一轮解析的**只读投影**：`Active` 与 `active_certs` 用同一个谓词，
+        // 已签吊销（永久事实）优先于 relay status；其余无法证明 active 的一律 fail-closed
+        // （不显示 Active，避免设备列表把恶意 relay 的 status 翻转当事实）。
+        let member_status = if verifier.members.is_revoked(&device_id) || status == "revoked" {
+            MemberStatus::Revoked
+        } else if status == "pending" {
+            // 带真实证书的 pending（当前 relay 不会产生）仍按待批准显示。
+            MemberStatus::Pending
+        } else if status == "expired" {
+            // `expired` 按既有语义保留：证书进 `history_certs`，但不进 active 集合。
+            MemberStatus::Expired
+        } else if status == "active" && signed_active {
+            MemberStatus::Active
+        } else {
+            MemberStatus::Revoked
+        };
+        members.push(MemberView {
+            device_id,
+            status: member_status,
+            fingerprint: Some(
+                crate::device::device_fingerprint(
+                    vault_id,
+                    &device_id,
+                    &cert.sign_ed25519_pub,
+                    &cert.hpke_x25519_pub,
+                )
+                .to_hex(),
+            ),
+            sign_pk,
+            hpke_pk,
+            issued_manager_rev: Some(cert.issued_manager_rev),
+        });
         if status == "active" && signed_active {
             member_cert_inputs.push(menghunote_sync_proto::MemberCertDigestInputV1 {
                 device_id,
@@ -2138,12 +2353,15 @@ fn parse_control(
         }
         // 否则：证书留在 history_certs（供 ≤S 历史验签），但不进 active。
     }
+    // 按 `device_id` 稳定排序（HashMap 的遍历序随机；设备列表/测试都需要确定性）。
+    members.sort_by_key(|member| member.device_id);
     Ok(ControlState {
         instance_id: *instance_id,
         control_rev: head_rev,
         epoch: verifier
             .epoch
             .ok_or(SyncError::RelayWire("控制链分页缺少 epoch"))?,
+        auth_rev,
         history_certs,
         active_certs,
         kinds: verifier.kinds,
@@ -2153,6 +2371,7 @@ fn parse_control(
         manager_chain,
         verified_activation_t: verifier.verified_activation_t,
         activation_revs: verifier.activation_revs,
+        members,
     })
 }
 
@@ -2962,6 +3181,11 @@ mod tests {
     }
 
     fn state_fields(control_rev: u64, head_seq: u64) -> cbor::Fields {
+        state_fields_auth(control_rev, head_seq, 1)
+    }
+
+    /// 与 [`state_fields`] 相同，但显式给 `auth_rev`（ADR 0010 缓存失效测试用）。
+    fn state_fields_auth(control_rev: u64, head_seq: u64, auth_rev: u64) -> cbor::Fields {
         vec![
             (0, cbor::bytes([0x5a; 16])),
             (1, cbor::bytes([0x11; 16])),
@@ -2969,7 +3193,7 @@ mod tests {
             (3, cbor::text("active")),
             (4, cbor::uint(1)),
             (5, cbor::uint(control_rev)),
-            (6, cbor::uint(1)),
+            (6, cbor::uint(auth_rev)),
             (7, cbor::uint(head_seq)),
             (8, cbor::uint(0)),
             (9, cbor::uint(0)),
@@ -3028,6 +3252,17 @@ mod tests {
             fields.push((5, cbor::bytes(signature)));
         }
         cbor::CdeValue::Map(fields)
+    }
+
+    /// relay 的 pending 成员条目：空证书占位（`certificate` X''、无管理签名）。
+    fn pending_member_fields(device: &TestDevice) -> cbor::CdeValue {
+        cbor::CdeValue::Map(vec![
+            (0, cbor::bytes(device.id)),
+            (1, cbor::bytes(Vec::new())),
+            (2, cbor::text("pending")),
+            (3, cbor::bytes(device.cert.sign_ed25519_pub)),
+            (4, cbor::bytes(device.cert.hpke_x25519_pub)),
+        ])
     }
 
     /// 控制链构造器：模拟 relay `vault::initialize` + `control::append`。
@@ -3779,6 +4014,64 @@ mod tests {
         );
         assert!(client.device_cert(&device_b.id).unwrap().is_some());
         assert_eq!(client.cached_control_rev(), Some(2));
+    }
+
+    #[test]
+    fn control_cache_invalidates_when_auth_rev_moves_without_control_rev() {
+        // ADR 0010：独立吊销只推进 `auth_rev`，`control_rev`/控制链不变。
+        // 只比较 control_rev 会把吊销前的 active 集合继续当成事实，因此必须同时看 auth_rev，
+        // 并且在 auth_rev 前进时连 token 一起作废（全 vault 鉴权版本）。
+        let manager = DeviceSigningKey::generate(&mut TestRng::new(81)).expect("管理密钥");
+        let device_a = test_device(0x1a);
+        let chain = ControlChainBuilder::new(manager.clone());
+        let mut responses = auth_responses(1200);
+        responses.push(cbor_response(state_fields(1, 0)));
+        responses.push(cbor_response(state_fields(1, 0)));
+        responses.push(cbor_response(
+            chain.fields(vec![member_fields(&device_a, true, &manager)]),
+        ));
+        let mut client = client_with(responses, FakeClock::new(900), Some(manager.public_key()));
+
+        client.state().unwrap();
+        assert!(client.device_cert(&device_a.id).unwrap().is_some());
+        assert_eq!(client.cached_control_rev(), Some(1));
+        assert_eq!(client.cached_auth_rev(), Some(1));
+
+        // 同 control_rev、auth_rev=2：`state()` 必须清掉成员缓存与 token。
+        client
+            .transport
+            .responses
+            .push_back(cbor_response(state_fields_auth(1, 0, 2)));
+        // 清缓存后重新取成员：先重认证（旧 token 已作废）+ 重新读 state/control。
+        client.transport.responses.extend(auth_responses(1500));
+        client
+            .transport
+            .responses
+            .push_back(cbor_response(state_fields_auth(1, 0, 2)));
+        client.transport.responses.push_back(cbor_response(
+            chain.fields(vec![member_fields(&device_a, true, &manager)]),
+        ));
+
+        let state = client.state().unwrap();
+        assert_eq!(state.auth_rev, 2, "/state 的 auth_rev 必须被观察到");
+        assert_eq!(state.control_rev, 1, "独立吊销不改变 control_rev");
+        assert_eq!(
+            client.cached_control_rev(),
+            None,
+            "auth_rev 前进必须清控制缓存"
+        );
+        assert_eq!(
+            client.cached_auth_rev(),
+            None,
+            "auth_rev 前进必须清 token 锚点"
+        );
+        assert!(client.device_cert(&device_a.id).unwrap().is_some());
+        assert_eq!(client.cached_control_rev(), Some(1));
+        assert_eq!(
+            client.cached_auth_rev(),
+            Some(2),
+            "刷新后的缓存锚点必须是新 auth_rev"
+        );
     }
 
     #[test]
@@ -4595,6 +4888,8 @@ mod tests {
         let mut responses = auth_responses(1200);
         responses.push(cbor_response(state_fields(chain.rev, 0)));
         responses.push(cbor_response(chain.fields(members)));
+        // `members()` 自己会先读一次 /state 比对 auth_rev（ADR 0010 缓存失效锚点）。
+        responses.push(cbor_response(state_fields(chain.rev, 0)));
         let mut client = client_with(responses, FakeClock::new(900), Some(manager.public_key()));
 
         RelayClient::control_kinds(&mut client).expect("控制链必须通过");
@@ -4615,6 +4910,104 @@ mod tests {
             active_digest_for(&manager, &genesis),
             "已签吊销设备不得进入 active digest"
         );
+
+        // 成员视图同样 fail-closed：已签吊销优先于 relay status，历史证书保留 → 指纹仍在。
+        let views = client.members().expect("成员视图必须成功");
+        let view_of = |device: DeviceId| {
+            views
+                .iter()
+                .find(|view| view.device_id == device)
+                .expect("成员视图缺少设备")
+        };
+        assert_eq!(view_of(genesis.id).status, MemberStatus::Active);
+        assert_eq!(
+            view_of(revoked.id).status,
+            MemberStatus::Revoked,
+            "relay 把已签吊销证书的 status 翻回 active 不得显示为 Active"
+        );
+        assert!(
+            view_of(revoked.id).fingerprint.is_some(),
+            "已签吊销设备的历史证书保留，指纹仍可解析"
+        );
+    }
+
+    /// 成员视图的状态投影：Active 与 active_certs 同谓词、pending 无指纹、
+    /// expired 按既有语义保留、Debug 不泄漏密钥材料。
+    #[test]
+    fn member_view_projects_statuses_and_hides_key_material() {
+        let manager = DeviceSigningKey::generate(&mut TestRng::new(211)).expect("管理密钥");
+        let genesis = test_device(0xc1);
+        let expired = test_device(0xc2);
+        let pending = test_device(0xc3);
+        let mut chain = ControlChainBuilder::with_genesis_cert(manager.clone(), &genesis);
+        chain.push_join(&expired);
+
+        let members = vec![
+            member_fields(&genesis, true, &manager),
+            member_fields_with_status(&expired, "expired", true, &manager),
+            pending_member_fields(&pending),
+        ];
+        let mut responses = auth_responses(1200);
+        responses.push(cbor_response(state_fields(chain.rev, 0)));
+        responses.push(cbor_response(chain.fields(members)));
+        // `members()` 自己会先读一次 /state 比对 auth_rev。
+        responses.push(cbor_response(state_fields(chain.rev, 0)));
+        let mut client = client_with(responses, FakeClock::new(900), Some(manager.public_key()));
+
+        let views = client.members().expect("成员视图必须成功");
+        assert_eq!(
+            views.iter().map(|view| view.device_id).collect::<Vec<_>>(),
+            vec![genesis.id, expired.id, pending.id],
+            "成员视图必须按 device_id 稳定升序"
+        );
+
+        // genesis：Active + 指纹 + 签发管理版本。
+        assert_eq!(views[0].status, MemberStatus::Active);
+        assert_eq!(
+            views[0].fingerprint.as_deref(),
+            Some(
+                crate::device::device_fingerprint(
+                    &[0x5a; 16],
+                    &genesis.id,
+                    &genesis.cert.sign_ed25519_pub,
+                    &genesis.cert.hpke_x25519_pub,
+                )
+                .to_hex()
+                .as_str()
+            )
+        );
+        assert_eq!(views[0].issued_manager_rev, Some(1));
+
+        // expired：relay 标记过期，不进 active 集合，但证书仍解析（有指纹）。
+        assert_eq!(views[1].status, MemberStatus::Expired);
+        assert!(views[1].fingerprint.is_some());
+        assert_eq!(views[1].issued_manager_rev, Some(1));
+
+        // pending：空证书占位 → 无指纹 / 无管理 rev，但公钥字段照常投影。
+        assert_eq!(views[2].status, MemberStatus::Pending);
+        assert_eq!(views[2].fingerprint, None);
+        assert_eq!(views[2].issued_manager_rev, None);
+        assert_eq!(views[2].sign_pk, pending.cert.sign_ed25519_pub);
+        assert_eq!(views[2].hpke_pk, pending.cert.hpke_x25519_pub);
+
+        // 视图不改变 active 集合：pending/expired 都不进。
+        assert_eq!(
+            RelayClient::active_member_hpke_keys(&mut client).expect("active 集合"),
+            vec![(genesis.id, genesis.cert.hpke_x25519_pub)],
+            "成员视图不得影响 active 集合"
+        );
+
+        // Debug 只打 device_id/status/fingerprint，不含完整 sign_pk/hpke_pk。
+        let debug = format!("{:?}", views[0]);
+        assert!(debug.contains("MemberView") && debug.contains("Active"));
+        assert!(debug.contains(&crate::ids::hex_of(&genesis.id)));
+        assert!(debug.contains(&views[0].fingerprint.clone().expect("genesis 指纹")));
+        assert!(!debug.contains(&crate::ids::hex_of(&genesis.cert.sign_ed25519_pub)));
+        assert!(!debug.contains(&crate::ids::hex_of(&genesis.cert.hpke_x25519_pub)));
+        let debug = format!("{:?}", views[2]);
+        assert!(debug.contains("Pending"));
+        assert!(!debug.contains(&crate::ids::hex_of(&pending.cert.sign_ed25519_pub)));
+        assert!(!debug.contains(&crate::ids::hex_of(&pending.cert.hpke_x25519_pub)));
     }
 
     #[test]
@@ -4757,6 +5150,8 @@ mod tests {
         responses.push(cbor_response(
             chain.fields(vec![member_fields(&forged, true, &manager)]),
         ));
+        // `members()` 自己会先读一次 /state 比对 auth_rev。
+        responses.push(cbor_response(state_fields(chain.rev, 0)));
         let mut client = client_with(responses, FakeClock::new(900), Some(manager.public_key()));
         RelayClient::control_kinds(&mut client).expect("控制链通过");
         assert!(
@@ -4765,6 +5160,17 @@ mod tests {
                 .is_empty(),
             "没有已签加入事件的 member.status=active 不得成为 active"
         );
+
+        // 成员视图同样 fail-closed：无法证明 active 的成员不得显示为 Active。
+        let views = client.members().expect("成员视图");
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].device_id, forged.id);
+        assert_eq!(
+            views[0].status,
+            MemberStatus::Revoked,
+            "没有已签加入事件的 active 成员不得在视图里显示为 Active"
+        );
+        assert!(views[0].fingerprint.is_some(), "证书验签通过 → 指纹可解析");
     }
 
     #[test]

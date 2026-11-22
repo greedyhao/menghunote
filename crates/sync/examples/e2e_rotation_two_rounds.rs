@@ -38,8 +38,6 @@
 //! 参数形态不变），但外部 relay 没有可控假时钟/GC 入口，因此该模式会跳过 90d/GC 段并以
 //! `TWO_ROUND_EXIT=2` 退出（SKIP，不是通过）——T13 的完整验收必须用缺省的进程内模式。
 
-#[path = "dev_relay.rs"]
-mod dev_relay;
 #[path = "e2e_rotation_rounds.rs"]
 mod e2e_rotation_rounds;
 
@@ -48,12 +46,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use dev_relay::DevRelay;
 use e2e_rotation_rounds::e2e_common::{self as common, AnyResult};
 use e2e_rotation_rounds::{
     apply_round_for_device, audit_epoch_chain, run_a_restart_round, run_a_rotation_round,
     ARoundParams,
 };
+use menghunote_dev_relay::DevRelay;
 use menghunote_relay::checkpoints::CheckpointState;
 use menghunote_storage::{
     outbox_parts, outbox_row, repack_required, set_repack_required, sync_cursor_state,

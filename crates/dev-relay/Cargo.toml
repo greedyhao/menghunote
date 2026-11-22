@@ -1,0 +1,18 @@
+[package]
+name = "menghunote-dev-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# 纯测试脚手架：不发布到 registry，也不得被任何生产 crate 的 [dependencies] 引用
+# （只允许出现在 [dev-dependencies]，见 crates/sync/Cargo.toml）。
+publish = false
+
+[dependencies]
+# 进程内 relay 就是真实 relay 实现，不复制、不裁剪任何生产代码。
+menghunote-relay = { path = "../relay" }
+# 与 crates/sync 原 [dev-dependencies] 完全一致的版本/特性：
+# - axum 0.8 与 relay 内部同版本线，避免同一 crates 出现两份解析版本；
+# - tokio 需要 rt（new_current_thread + rt-multi-thread 运行时）、net（127.0.0.1:0）、
+#   time/sync（graceful shutdown oneshot + enable_all）。
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }

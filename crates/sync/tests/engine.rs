@@ -14,7 +14,7 @@ use menghunote_storage::{
     load_body_doc, load_head, outbox_parts, outbox_row, sync_cursor_state, StorageError,
     SyncOutboxState, Vault, META_SYNC_LOG_ID,
 };
-use menghunote_sync::engine::{EngineIdentity, SyncEngine, RELAY_CURSOR_META};
+use menghunote_sync::engine::{EngineIdentity, IntegrateConfig, SyncEngine, RELAY_CURSOR_META};
 use menghunote_sync::relay::{PauseReason, RelayLogKind};
 use menghunote_sync::SyncError;
 use menghunote_sync_proto::{
@@ -520,9 +520,15 @@ fn integrate_defers_unknown_document() {
     {
         let mut sync = engine(&vault_a, &mut relay, &device_a);
         sync.pull().expect("拉取");
-        let report = sync.integrate(16).expect("集成");
+        // ADR 0012 S2b：无进展只重试一批就停（不循环刷最早一批）。
+        let outcome = sync
+            .integrate_dependency_ordered(IntegrateConfig::default())
+            .expect("集成");
+        let report = outcome.report;
         assert_eq!(report.integrated, 0);
         assert_eq!(report.deferred, 1);
+        assert_eq!(report.batches, 2, "无进展：重试一批后必须停止");
+        assert!(!report.projected, "没有结构更新就不投影");
         assert_eq!(received(&vault_a), 1, "durable 保存但仍 verified");
     }
     // 建好本地文档行后可以继续集成。
@@ -557,6 +563,68 @@ fn sync_once_covers_all_phases() {
     }
     assert_eq!(relay.head_seq, 1, "push 后 relay 水位推进");
     assert_eq!(load_head(&vault, "doc-1").expect("head").head_seq, 1);
+}
+
+#[test]
+fn integrate_guard_blocks_appends_and_a_later_round_finishes_the_job() {
+    // ADR 0012 S1：取消/授权复核在首次外部事务边界（integrate 前）赢得竞争时，
+    // 本轮**不得 append**；已推送的对象与已拉取的 inbox 仍是 durable 事实。
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(31);
+    let mut relay = FakeRelay::new(&[&device]);
+    let doc = seed_doc(&vault, "doc-1", device.identity.peer_id);
+    doc.insert_scalars(0, "guard").expect("正文");
+    commit_with_intent(&vault, &doc, &uuid_like(131), [0xd1; 32], EPOCH);
+    seed_cursor(&vault);
+    let head_before = load_head(&vault, "doc-1").expect("head").head_seq;
+
+    let mut calls = 0usize;
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        let mut cancel = || {
+            calls += 1;
+            Err(SyncError::CancelledBeforeIntegrate)
+        };
+        let error = sync
+            .sync_once_with_guard(&mut cancel)
+            .expect_err("取消赢时本轮必须中止");
+        assert!(
+            matches!(error, SyncError::CancelledBeforeIntegrate),
+            "守卫错误必须原样上抛：{error:?}"
+        );
+    }
+    assert_eq!(calls, 1, "守卫只在 integrate 之前调用一次");
+    assert_eq!(
+        load_head(&vault, "doc-1").expect("head").head_seq,
+        head_before,
+        "取消赢时不得追加任何本地行（head 必须停在同步前）"
+    );
+    assert_eq!(
+        sync_cursor_state(&vault).expect("游标").integrated_seq,
+        0,
+        "没 integrate 就不能推进 integrated 水位"
+    );
+    assert_eq!(relay.head_seq, 1, "推送已经完成（不因取消丢已上传对象）");
+
+    // 守卫放行后，同一份 durable 事实可以补完集成（没有重复 push、没有丢事件）。
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        let mut allow = || Ok(());
+        let report = sync
+            .sync_once_with_guard(&mut allow)
+            .expect("守卫放行后必须成功");
+        assert_eq!(
+            report.integrate.integrated, 1,
+            "上一轮拉到的 inbox 必须被集成"
+        );
+    }
+    assert_eq!(load_head(&vault, "doc-1").expect("head").head_seq, 1);
+    assert_eq!(
+        sync_cursor_state(&vault).expect("游标").integrated_seq,
+        1,
+        "集成水位必须推进"
+    );
 }
 
 #[test]

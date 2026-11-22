@@ -417,7 +417,55 @@ impl LocalIdentityV1 {
         }
         Ok(identity)
     }
+
+    /// Loro peer id：把 16B [`PeerId`] **确定性**映射到 `u64`（ADR 0009 切片 2a）。
+    ///
+    /// 这是 app 侧 dev-sync 取 peer 的**唯一入口**：不允许另造随机 peer，也不允许继续
+    /// 用常量 `1`（两个实例会撞 CRDT peer）。映射规则（前 8 字节大端、清最高位、
+    /// `0 → 1`、碰撞边界）全部写在 [`PeerId::loro_u64`] 的文档里；映射本身随身份
+    /// 持久化，重启不变。
+    #[must_use]
+    pub fn loro_peer_id(&self) -> u64 {
+        self.peer_id.loro_u64()
+    }
+
+    /// dev-only：生成一份**自包含**的本地身份（不连 relay、不含管理信任锚）。
+    ///
+    /// 仅供 app 的 `DevIdentityStore` 在 dev-sync 首次启动时造身份用（ADR 0009
+    /// 「dev-only，无恢复码备份」）。字段语义：
+    ///
+    /// - `peer_id` / `ed25519_seed` / `x25519_secret` / `current_root`：OS 随机；
+    /// - `current_epoch` = [`DEV_EPOCH`]（与 genesis 初始代一致）；
+    /// - `manager_seed` = `None`、`pinned_instance`/`pinned_manager` 全 0、
+    ///   `control_rev` = 0：**没有**接触过任何 relay，pin 与信任锚必须为空，
+    ///   等到切片 4 的 Create 才由 genesis/Join 正式填充。
+    ///
+    /// 不复制任何 crypto 逻辑：随机数与密钥材料全部走 [`crate::random`] /
+    /// [`Secret32::generate`]；真实身份仍必须走 [`crate::genesis`] / 恢复码路径。
+    pub fn generate_dev(vault_id: VaultId, device_id: DeviceId) -> Result<Self, SyncError> {
+        let mut rng = crate::random::OsRandom;
+        Ok(Self {
+            vault_id,
+            device_id,
+            peer_id: PeerId::from_bytes(crate::random::array::<16>(&mut rng)?),
+            ed25519_seed: Secret32::generate(&mut rng)?,
+            x25519_secret: Secret32::generate(&mut rng)?,
+            current_epoch: DEV_EPOCH,
+            current_root: Secret32::generate(&mut rng)?,
+            manager_seed: None,
+            pinned_instance: [0u8; 16],
+            pinned_manager: [0u8; 32],
+            control_rev: 0,
+            pending_rotation: None,
+        })
+    }
 }
+
+/// dev 身份的占位 epoch（与 [`crate::genesis::GENESIS_EPOCH`] 一致）。
+///
+/// dev 身份没有 key slot / 管理信任锚，这个代只用于让字段自洽；切片 4 建真实 vault 时
+/// 整个身份会被 genesis/Join 的结果替换。
+pub const DEV_EPOCH: u64 = 1;
 
 impl core::fmt::Debug for LocalIdentityV1 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -716,6 +764,80 @@ mod tests {
                 .expect("stale")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn loro_peer_id_is_deterministic_and_persists_through_codec() {
+        let identity = fixture(false, false, 82);
+        // 同一身份恒定（多次调用/不同字段不影响 peer）。
+        let peer = identity.loro_peer_id();
+        assert_eq!(peer, identity.loro_peer_id());
+        assert_eq!(peer, identity.peer_id.loro_u64());
+        assert_ne!(peer, 0, "0 不是合法 Loro peer");
+        // 落盘再读回（encode/decode 是 `protect`/`unprotect` 的内层）仍一致。
+        let bytes = identity.encode().unwrap();
+        let back = LocalIdentityV1::decode(&bytes).unwrap();
+        assert_eq!(back.loro_peer_id(), peer);
+        // 只改后 8 字节（映射不看后半段）：u64 相同但 16B 身份不同 → 碰撞边界的实证。
+        let mut same_head = fixture(false, false, 82);
+        same_head.peer_id = PeerId::from_bytes({
+            let mut bytes = *identity.peer_id.as_bytes();
+            bytes[8..].copy_from_slice(&[0xee; 8]);
+            bytes
+        });
+        assert_eq!(same_head.loro_peer_id(), peer);
+        assert_ne!(same_head.peer_id, identity.peer_id);
+    }
+
+    #[test]
+    fn loro_peer_id_differs_across_random_identities() {
+        // 至少两个**随机**身份（generate_dev 走 OS 随机）：peer 必须不同。
+        let first = LocalIdentityV1::generate_dev([0x10; 16], [0x01; 16]).expect("身份 1");
+        let second = LocalIdentityV1::generate_dev([0x10; 16], [0x02; 16]).expect("身份 2");
+        assert_ne!(first.peer_id, second.peer_id);
+        assert_ne!(first.loro_peer_id(), second.loro_peer_id());
+        // 多于两个也两两不同（dev 场景的碰撞概率 ~2^-63，不靠运气）。
+        let mut peers = vec![first.loro_peer_id(), second.loro_peer_id()];
+        for device in 3..6u8 {
+            let other = LocalIdentityV1::generate_dev([0x10; 16], [device; 16]).expect("身份 N");
+            let peer = other.loro_peer_id();
+            assert!(!peers.contains(&peer), "随机身份的 peer 撞了：{peer}");
+            peers.push(peer);
+        }
+    }
+
+    #[test]
+    fn generate_dev_is_self_contained_and_varies() {
+        let identity = LocalIdentityV1::generate_dev([0x11; 16], [0x22; 16]).expect("dev 身份");
+        assert_eq!(identity.vault_id, [0x11; 16]);
+        assert_eq!(identity.device_id, [0x22; 16]);
+        assert_eq!(identity.current_epoch, DEV_EPOCH);
+        // 没有接触 relay：无管理材料、无 pin、无控制链、无轮换残留。
+        assert!(identity.manager_seed.is_none());
+        assert_eq!(identity.pinned_instance, [0u8; 16]);
+        assert_eq!(identity.pinned_manager, [0u8; 32]);
+        assert_eq!(identity.control_rev, 0);
+        assert!(identity.pending_rotation.is_none());
+        assert_ne!(identity.loro_peer_id(), 0);
+        // 两次生成除 vault/device 外全部不同（OS 随机，不复制固定夹具）。
+        let other = LocalIdentityV1::generate_dev([0x11; 16], [0x22; 16]).expect("dev 身份 2");
+        assert_ne!(other.peer_id, identity.peer_id);
+        assert!(!other.ed25519_seed.ct_eq(&identity.ed25519_seed));
+        assert!(!other.x25519_secret.ct_eq(&identity.x25519_secret));
+        assert!(!other.current_root.ct_eq(&identity.current_root));
+        // 落盘格式自洽（编码/解码不改 peer）。
+        let decoded = LocalIdentityV1::decode(&identity.encode().unwrap()).unwrap();
+        assert_eq!(decoded.loro_peer_id(), identity.loro_peer_id());
+        // Debug 不得泄露任何私钥材料。
+        let text = format!("{identity:?}");
+        assert!(text.contains("<redacted>"));
+        for secret in [
+            &identity.ed25519_seed,
+            &identity.x25519_secret,
+            &identity.current_root,
+        ] {
+            assert!(!text.contains(&crate::ids::hex_of(secret.expose_slice())));
+        }
     }
 
     #[test]

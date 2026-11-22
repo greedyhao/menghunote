@@ -33,10 +33,11 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use loro::VersionVector;
 use menghunote_storage::{
-    append_updates, load_body_doc, load_head, mark_acked, mark_integrated, mark_sent, outbox_parts,
-    outbox_rows, pending_encryption, repack_required, set_confirmed_highwater, set_sync_log_id,
-    store_encrypted_parts, store_inbox_verified, sync_cursor_state, take_inbox_ready,
-    SyncEncryptedPart, SyncOutboxState, UpdateRecord, Vault,
+    append_updates, count_inbox_ready, load_body_doc, load_head, mark_acked, mark_integrated,
+    mark_sent, outbox_parts, outbox_rows, pending_encryption, repack_required,
+    set_confirmed_highwater, set_sync_log_id, store_encrypted_parts, store_inbox_verified,
+    sync_cursor_state, take_inbox_ready, SyncContext, SyncEncryptedPart, SyncInboxRow,
+    SyncOutboxState, UpdateRecord, Vault, STRUCTURE_DOC_ID,
 };
 use menghunote_sync_proto::{
     cap_plain, expected_part_plain_len, object_commit_signing_input, object_digest_input,
@@ -76,6 +77,14 @@ const SKIPPED_ASSET_MAX_COMMIT: usize = 512;
 const MESSAGE_ID_LEN: usize = 16;
 /// 单批 `POST /updates` 上限（ADR §5）。
 const MAX_UPDATES_PER_BATCH: usize = 256;
+/// 集成批次的对象上限（ADR 0012 S2b：每批最多 32 对象）。
+pub const INTEGRATE_BATCH_OBJECTS: usize = 32;
+/// 集成批次的明文负载软上限（约 1 MiB；单个超大对象仍允许单独成批）。
+pub const INTEGRATE_BATCH_BYTES: usize = 1024 * 1024;
+/// 集成批次的选取时间软预算（50ms；到点先停手，下一批继续）。
+pub const INTEGRATE_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(50);
+/// 一次 integrate 最多跑多少批（防止病态库把持闸窗口拖到不可控）。
+pub const INTEGRATE_MAX_BATCHES: usize = 32;
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: u16 = 196;
 const PROTOCOL_VERSION: u16 = 1;
@@ -147,13 +156,85 @@ pub struct PullReport {
     pub next_cursor: String,
 }
 
-/// 集成报告。
+/// 集成（Integrate）阶段的批次预算与上限（ADR 0012 S2b）。
+///
+/// 语义：
+/// - 结构文档优先，正文按 **doc 轮转** 公平取批（不循环刷最早一批）；
+/// - 每批最多 [`IntegrateConfig::batch_objects`] 个对象 / 约
+///   [`IntegrateConfig::batch_bytes`] 字节 / [`IntegrateConfig::batch_time`] 的**软**预算；
+/// - 到事务边界（每个对象自己的 A 事务 + `mark_integrated`）交付，**不跨批提前 ACK**；
+/// - 有进展才继续下一批；连续无进展就停，并把剩余 deferred 如实上报。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrateConfig {
+    /// 单批对象上限（1 个超大对象仍允许单独成批）。
+    pub batch_objects: usize,
+    /// 单批明文负载软上限（字节）。
+    pub batch_bytes: usize,
+    /// 单批选取时间软预算。
+    pub batch_time: std::time::Duration,
+    /// 一次 integrate 的批数上限（结构批 + 正文批）。
+    pub max_batches: usize,
+}
+
+impl Default for IntegrateConfig {
+    fn default() -> Self {
+        Self {
+            batch_objects: INTEGRATE_BATCH_OBJECTS,
+            batch_bytes: INTEGRATE_BATCH_BYTES,
+            batch_time: INTEGRATE_BATCH_TIME,
+            max_batches: INTEGRATE_MAX_BATCHES,
+        }
+    }
+}
+
+impl IntegrateConfig {
+    /// 按"本次最多集成多少个对象"折算批次（旧 `integrate(limit)` 入口的兼容语义）。
+    ///
+    /// `limit` 是**本次调用的对象预算**，不是单批上限：批次大小仍受 32 对象/1MiB/50ms
+    /// 约束，批数按需折算（至少一批）。
+    #[must_use]
+    pub fn with_object_budget(limit: usize) -> Self {
+        let batch_objects = INTEGRATE_BATCH_OBJECTS.min(limit.max(1));
+        let max_batches = limit
+            .saturating_add(batch_objects.saturating_sub(1))
+            .checked_div(batch_objects)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        Self {
+            batch_objects,
+            max_batches,
+            ..Self::default()
+        }
+    }
+}
+
+/// 集成（Integrate）阶段的可见事实（ADR 0012 S2b）。
+///
+/// `deferred` 是**本轮结束时仍 durable verified、且落在已接收连续前缀内**的对象数：
+/// 它们没有被丢弃，依赖就绪/下一次同步会继续。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IntegrateReport {
-    /// 已 import 并推进本地 seq 的对象数。
+    /// 已 import 并推进本地 seq 的对象数（含"已应用过、只标记"的幂等对象）。
     pub integrated: usize,
     /// 依赖未就绪/未知文档，保持 durable verified 的对象数。
     pub deferred: usize,
+    /// 其中结构文档的对象数。
+    pub structure_integrated: usize,
+    /// 其中正文文档的对象数。
+    pub body_integrated: usize,
+    /// 本轮实际跑了多少批（结构批 + 正文批）。
+    pub batches: usize,
+    /// 结构 head 真的前进了、并且**只做投影**重建了 body 行 / notes 视图。
+    pub projected: bool,
+}
+
+/// 依赖有序集成的完整结果（`changed_heads` 供 UI 判断要不要交付/刷新）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegrateOutcome {
+    /// 集成计数（含 deferred / 批次 / 是否投影）。
+    pub report: IntegrateReport,
+    /// 本轮 head **真的前进**的文档（结构 + 正文，按首次出现稳定序；去重）。
+    pub changed_heads: Vec<String>,
 }
 
 /// ACK 报告。
@@ -949,70 +1030,253 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         Ok(report)
     }
 
-    /// 阶段 4：把 verified inbox 中依赖就绪的对象集成进本地库。
+    /// 阶段 4：把 verified inbox 中依赖就绪的对象集成进本地库（旧入口）。
+    ///
+    /// 等价于 [`Self::integrate_dependency_ordered`] + [`IntegrateConfig::with_object_budget`]：
+    /// 保留"一次调用最多处理 `limit` 个对象"的兼容语义，但内部已按 ADR 0012 S2b 的
+    /// 结构→投影→正文顺序收敛（不再需要调用方再发一轮网络）。
     pub fn integrate(&mut self, limit: usize) -> Result<IntegrateReport, SyncError> {
+        let config = IntegrateConfig::with_object_budget(limit);
+        self.integrate_dependency_ordered(config)
+            .map(|outcome| outcome.report)
+    }
+
+    /// 阶段 4（ADR 0012 S2b）：**依赖有序**地把 verified inbox 集成进本地库。
+    ///
+    /// 顺序是硬约束：
+    ///
+    /// 1. 先集成 [`STRUCTURE_DOC_ID`] 的 durable inbox 行；
+    /// 2. 只有结构 head **真的前进**才用 [`menghunote_storage::StructureWriter`] 做一次
+    ///    **纯投影**（`commit` 在没有新 op 时只重建 `tree/notes` 与 body 行）；
+    /// 3. 再按 doc 轮转公平集成正文；若仍有 deferred，在**同一次调用**内重试一批
+    ///    （不要求调用方再发一轮网络）。
+    ///
+    /// 批预算见 [`IntegrateConfig`]；无进展就停（不循环刷最早一批），`deferred` 如实上报。
+    pub fn integrate_dependency_ordered(
+        &mut self,
+        config: IntegrateConfig,
+    ) -> Result<IntegrateOutcome, SyncError> {
+        // 结构行是 vault 的长期不变量；但 engine 的单元测试会用"没有结构文档"的裸库，
+        // 因此这里把它当**可选**前置：没有结构行 → 不投影（结构 update 会按未知文档
+        // deferred，和旧行为一致）。
+        let structure_before = self.structure_head_seq()?;
+        let mut outcome = IntegrateOutcome::default();
+        // 扫描窗口要明显大于单批上限：否则 `(log_id, relay_seq)` 顺序会让后面的 doc
+        // 永远进不了候选（公平取批就无从谈起）。
+        let scan_limit = config
+            .batch_objects
+            .saturating_mul(16)
+            .clamp(64, 1024)
+            .max(1);
+
+        // 1) 结构阶段：结构行优先，绝不因正文 backlog 饿死。
+        let mut batches = 0usize;
+        while batches < config.max_batches {
+            let pending = self.scan_ready_rows(scan_limit)?;
+            let selected = select_structure_batch(&pending, &config);
+            if selected.is_empty() {
+                break;
+            }
+            batches += 1;
+            if self.integrate_selected(&pending, &selected, &mut outcome)? == 0 {
+                // 结构文档行一定存在；真无进展就停（不循环刷同一批）。
+                break;
+            }
+        }
+
+        // 2) 投影：只有结构 head 真变才做，且**只做投影**（无新 op）。
+        //    失败 → 明确错误（调用方必须保持写禁用/不假刷新）；结构 CRDT 已 durable。
+        if let Some(before) = structure_before {
+            let after = self.structure_head_seq()?.unwrap_or(before);
+            if after != before {
+                self.project_structure_only()?;
+                outcome.report.projected = true;
+                outcome.changed_heads.push(STRUCTURE_DOC_ID.to_owned());
+            }
+        }
+
+        // 3) 正文阶段：按 doc 轮转公平取批；有进展才继续；无进展先重试一批再停。
+        let mut retried_without_progress = false;
+        while batches < config.max_batches {
+            let pending = self.scan_ready_rows(scan_limit)?;
+            let selected = select_body_batch(&pending, &config, batches);
+            if selected.is_empty() {
+                break;
+            }
+            batches += 1;
+            let progressed = self.integrate_selected(&pending, &selected, &mut outcome)?;
+            if progressed == 0 {
+                if retried_without_progress {
+                    // 连续两批零进展：依赖确实没就绪，停止并上报剩余 deferred。
+                    break;
+                }
+                // 同一次 integrate 内对剩余 deferred 重试一次（结构投影可能刚建立 body 行）。
+                retried_without_progress = true;
+            } else {
+                retried_without_progress = false;
+            }
+        }
+
+        outcome.report.batches = batches;
+        // 剩余 verified 行：依赖未就绪或被本次批数上限留下，都不是丢失。
+        let remaining = count_inbox_ready(self.vault)?;
+        outcome.report.deferred = usize::try_from(remaining).unwrap_or(usize::MAX);
+        Ok(outcome)
+    }
+
+    /// 结构文档的当前 head seq（没有结构行 = `None`）。
+    fn structure_head_seq(&self) -> Result<Option<u64>, SyncError> {
+        if !storage_view::doc_exists(self.vault, STRUCTURE_DOC_ID)? {
+            return Ok(None);
+        }
+        Ok(Some(load_head(self.vault, STRUCTURE_DOC_ID)?.head_seq))
+    }
+
+    /// 扫一批「已接收连续前缀内、verified、未集成」的 inbox 行，并解码出 doc id。
+    fn scan_ready_rows(&self, limit: usize) -> Result<Vec<PendingInboxRow>, SyncError> {
         let rows = take_inbox_ready(self.vault, limit)?;
-        let mut report = IntegrateReport::default();
+        let mut pending = Vec::with_capacity(rows.len());
         for row in rows {
             let payload = row
                 .verified_payload
-                .clone()
+                .as_deref()
                 .ok_or(SyncError::LocalCorrupt("verified inbox 缺 payload"))?;
-            let update = UpdateV1::decode(&payload)?;
-            if !storage_view::doc_exists(self.vault, &update.doc_id)? {
-                report.deferred += 1;
-                continue;
+            let update = UpdateV1::decode(payload)?;
+            pending.push(PendingInboxRow {
+                doc_id: update.doc_id,
+                size: payload.len(),
+                row,
+            });
+        }
+        Ok(pending)
+    }
+
+    /// 集成选中的行；返回**真的有进展**（integrated）的对象数。
+    fn integrate_selected(
+        &self,
+        pending: &[PendingInboxRow],
+        selected: &[usize],
+        outcome: &mut IntegrateOutcome,
+    ) -> Result<usize, SyncError> {
+        let mut progressed = 0usize;
+        for &index in selected {
+            let item = &pending[index];
+            match self.integrate_inbox_row(&item.row)? {
+                InboxRowOutcome::Integrated { changed } => {
+                    outcome.report.integrated += 1;
+                    if item.doc_id == STRUCTURE_DOC_ID {
+                        outcome.report.structure_integrated += 1;
+                    } else {
+                        outcome.report.body_integrated += 1;
+                    }
+                    if changed
+                        && !outcome
+                            .changed_heads
+                            .iter()
+                            .any(|head| head == &item.doc_id)
+                    {
+                        outcome.changed_heads.push(item.doc_id.clone());
+                    }
+                    progressed += 1;
+                }
+                // 依赖未就绪：保持 durable verified，最终由 `count_inbox_ready` 统一上报。
+                InboxRowOutcome::Deferred => {}
             }
-            let head = load_head(self.vault, &update.doc_id)?;
-            let local_vv = head.version_vector()?;
-            // 本地已覆盖 end_vv → 这个 update 已经应用过（典型是自己产生的 update 从 relay
-            // 回环回来，或同 ops 的重复投递）。不 import、不分配新 seq，只标记已集成。
-            let end_vv = if update.end_vv.is_empty() {
-                VersionVector::new()
-            } else {
-                VersionVector::decode(&update.end_vv)
-                    .map_err(|_| SyncError::Object("end_vv 解码失败"))?
-            };
-            if vv_includes(&local_vv, &end_vv) {
-                mark_integrated(self.vault, &row.log_id, row.relay_seq)?;
-                report.integrated += 1;
-                continue;
-            }
-            let base_vv = if update.base_vv.is_empty() {
-                VersionVector::new()
-            } else {
-                VersionVector::decode(&update.base_vv)
-                    .map_err(|_| SyncError::Object("base_vv 解码失败"))?
-            };
-            if !vv_includes(&local_vv, &base_vv) {
-                // 依赖未齐：保持 durable verified，等前面的对象到达。
-                report.deferred += 1;
-                continue;
-            }
+        }
+        Ok(progressed)
+    }
+
+    /// 集成**一个** inbox 行（每个对象自己的 A 事务 + `mark_integrated`）。
+    ///
+    /// `HeadConflict` 是可重放的并发冲突（别的 writer 把 head 推进了）：不覆盖 head、
+    /// 不丢 inbox/outbox，重读 head 后按新基准**有界重放一次**；再冲突就如实报错。
+    fn integrate_inbox_row(&self, row: &SyncInboxRow) -> Result<InboxRowOutcome, SyncError> {
+        let payload = row
+            .verified_payload
+            .as_deref()
+            .ok_or(SyncError::LocalCorrupt("verified inbox 缺 payload"))?;
+        let update = UpdateV1::decode(payload)?;
+        if !storage_view::doc_exists(self.vault, &update.doc_id)? {
+            return Ok(InboxRowOutcome::Deferred);
+        }
+        let head = load_head(self.vault, &update.doc_id)?;
+        let local_vv = head.version_vector()?;
+        // 本地已覆盖 end_vv → 这个 update 已经应用过（典型是自己产生的 update 从 relay
+        // 回环回来，或同 ops 的重复投递）。不 import、不分配新 seq，只标记已集成。
+        let end_vv = if update.end_vv.is_empty() {
+            VersionVector::new()
+        } else {
+            VersionVector::decode(&update.end_vv)
+                .map_err(|_| SyncError::Object("end_vv 解码失败"))?
+        };
+        if vv_includes(&local_vv, &end_vv) {
+            mark_integrated(self.vault, &row.log_id, row.relay_seq)?;
+            return Ok(InboxRowOutcome::Integrated { changed: false });
+        }
+        let base_vv = if update.base_vv.is_empty() {
+            VersionVector::new()
+        } else {
+            VersionVector::decode(&update.base_vv)
+                .map_err(|_| SyncError::Object("base_vv 解码失败"))?
+        };
+        if !vv_includes(&local_vv, &base_vv) {
+            // 依赖未齐：保持 durable verified，等前面的对象到达。
+            return Ok(InboxRowOutcome::Deferred);
+        }
+        let mut conflict_retries = 0usize;
+        loop {
             let (doc, current) =
                 load_body_doc(self.vault, &update.doc_id, self.identity.peer_id, None)?;
             let before = doc.vv();
             doc.import(&update.loro_update_bytes)?;
             let pending = doc.pending_update(&before)?;
-            if !pending.payload.is_empty() {
-                // head CAS 冲突是可重试的并发冲突（调用方重读 head 后重放），
-                // 必须映射成可重试错误，不能当成数据丢失。
-                let head_after = append_updates(
-                    self.vault,
-                    &update.doc_id,
-                    current.head_seq,
-                    &[UpdateRecord::new(update.batch_id.clone(), pending)],
-                )
-                .map_err(storage_view::map_storage_error)?;
-                // 本地 seq 只能由 head+1 分配（禁止 sender_seq）。
-                if head_after.head_seq != current.head_seq.saturating_add(1) {
-                    return Err(SyncError::LocalCorrupt("本地 seq 未按 head+1 分配"));
-                }
+            if pending.payload.is_empty() {
+                break;
             }
-            mark_integrated(self.vault, &row.log_id, row.relay_seq)?;
-            report.integrated += 1;
+            match append_updates(
+                self.vault,
+                &update.doc_id,
+                current.head_seq,
+                &[UpdateRecord::new(update.batch_id.clone(), pending)],
+            ) {
+                Ok(head_after) => {
+                    // 本地 seq 只能由 head+1 分配（禁止 sender_seq）。
+                    if head_after.head_seq != current.head_seq.saturating_add(1) {
+                        return Err(SyncError::LocalCorrupt("本地 seq 未按 head+1 分配"));
+                    }
+                    mark_integrated(self.vault, &row.log_id, row.relay_seq)?;
+                    return Ok(InboxRowOutcome::Integrated { changed: true });
+                }
+                // ADR 0012 S2b：并发本地写入把 head 推进了 → 重读 head 后重放一次。
+                Err(menghunote_storage::StorageError::HeadConflict { .. })
+                    if conflict_retries == 0 =>
+                {
+                    conflict_retries += 1;
+                    continue;
+                }
+                Err(error) => return Err(storage_view::map_storage_error(error)),
+            }
         }
-        Ok(report)
+        mark_integrated(self.vault, &row.log_id, row.relay_seq)?;
+        Ok(InboxRowOutcome::Integrated { changed: false })
+    }
+
+    /// 只做投影：没有新结构 op 时 `commit` 仅重建 `tree/notes` 与 body 行（幂等）。
+    ///
+    /// 失败返回 [`SyncError::StructureProjection`]：结构 CRDT 已 durable，但本地投影
+    /// **没有**追上，调用方必须明确报错并保持写禁用（不得假刷新）。
+    fn project_structure_only(&self) -> Result<(), SyncError> {
+        let sync = SyncContext::new(self.identity.peer_id, self.root.key_epoch);
+        let mut writer = menghunote_storage::StructureWriter::open_with_sync(
+            self.vault,
+            self.identity.peer_id,
+            Some(sync),
+        )
+        .map_err(|error| SyncError::StructureProjection(error.to_string()))?;
+        writer
+            .commit("s2b-project")
+            .map_err(|error| SyncError::StructureProjection(error.to_string()))?;
+        Ok(())
     }
 
     /// 上报 received/integrated 游标。
@@ -1038,9 +1302,26 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
 
     /// 一轮完整同步（加密 → 推送 → 拉取 → 集成 → ACK）。
     pub fn sync_once(&mut self) -> Result<SyncReport, SyncError> {
+        self.sync_once_with_guard(&mut || Ok(()))
+    }
+
+    /// 同 [`Self::sync_once`]，但在**首次外部集成之前**调用一次 `guard`（ADR 0012 S1）。
+    ///
+    /// 语义（安全优先）：
+    ///
+    /// - `guard` 返回 `Err` → 本轮**不 append**：在此之前只做了加密/推送/拉取（这些不改
+    ///   本地正文 head），错误原样返回（取消用 [`SyncError::CancelledBeforeIntegrate`]）；
+    /// - `guard` 返回 `Ok` → 正常集成；**进入 integrate 后不再检查**，真实事务必须跑完并
+    ///   交付（已提交的 durable 变化不能被"取消"吞掉）；
+    /// - 只在 `integrate` 之前调用一次，不是每对象回调（S2 才做可暂停的分批握手）。
+    pub fn sync_once_with_guard(
+        &mut self,
+        guard: &mut dyn FnMut() -> Result<(), SyncError>,
+    ) -> Result<SyncReport, SyncError> {
         let encrypted = self.encrypt_pending(self.config.send_batch)?;
         let push = self.push()?;
         let pull = self.pull()?;
+        guard()?;
         let integrate = self.integrate(self.config.integrate_limit)?;
         let ack = self.ack()?;
         Ok(SyncReport {
@@ -1405,6 +1686,105 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         self.vault.set_meta(RELAY_CURSOR_META, cursor.as_bytes())?;
         Ok(())
     }
+}
+
+/// 一条待集成的 inbox 行 + 取出后缓存的 doc id / 负载大小（供公平取批复用）。
+struct PendingInboxRow {
+    row: SyncInboxRow,
+    doc_id: String,
+    size: usize,
+}
+
+/// 单行集成的结果（deferred 时保持 durable verified，不推进任何水位）。
+enum InboxRowOutcome {
+    /// 已标记 integrated；`changed` = 该文档 head 真的前进了。
+    Integrated { changed: bool },
+    /// 依赖未就绪（未知文档 / base_vv 未覆盖）。
+    Deferred,
+}
+
+/// 结构批选取：结构文档优先，最多 `batch_objects` / 约 `batch_bytes` / `batch_time`。
+fn select_structure_batch(pending: &[PendingInboxRow], config: &IntegrateConfig) -> Vec<usize> {
+    let started = std::time::Instant::now();
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    for (index, item) in pending.iter().enumerate() {
+        if item.doc_id != STRUCTURE_DOC_ID {
+            continue;
+        }
+        if !selected.is_empty() {
+            if selected.len() >= config.batch_objects {
+                break;
+            }
+            if bytes.saturating_add(item.size) > config.batch_bytes {
+                break;
+            }
+            if started.elapsed() >= config.batch_time {
+                break;
+            }
+        }
+        bytes = bytes.saturating_add(item.size);
+        selected.push(index);
+    }
+    selected
+}
+
+/// 正文批选取：按 doc 轮转（`rotation` 决定起点），避免只刷最早的一篇。
+fn select_body_batch(
+    pending: &[PendingInboxRow],
+    config: &IntegrateConfig,
+    rotation: usize,
+) -> Vec<usize> {
+    let started = std::time::Instant::now();
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    // (doc_id, 该 doc 的候选下标)。doc 数量很少（参与方按笔记数），线性查找足够。
+    let mut docs: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (index, item) in pending.iter().enumerate() {
+        if item.doc_id == STRUCTURE_DOC_ID {
+            continue;
+        }
+        match docs
+            .iter_mut()
+            .find(|(doc_id, _)| *doc_id == item.doc_id.as_str())
+        {
+            Some((_, indices)) => indices.push(index),
+            None => docs.push((item.doc_id.as_str(), vec![index])),
+        }
+    }
+    if docs.is_empty() {
+        return selected;
+    }
+    let offset = rotation % docs.len();
+    let mut cursors = vec![0usize; docs.len()];
+    'outer: loop {
+        let mut took_any = false;
+        for step in 0..docs.len() {
+            let doc = (offset + step) % docs.len();
+            let Some(&index) = docs[doc].1.get(cursors[doc]) else {
+                continue;
+            };
+            cursors[doc] += 1;
+            if !selected.is_empty() {
+                if selected.len() >= config.batch_objects {
+                    break 'outer;
+                }
+                if bytes.saturating_add(pending[index].size) > config.batch_bytes {
+                    break 'outer;
+                }
+                if started.elapsed() >= config.batch_time {
+                    break 'outer;
+                }
+            }
+            bytes = bytes.saturating_add(pending[index].size);
+            selected.push(index);
+            took_any = true;
+        }
+        if !took_any {
+            break;
+        }
+    }
+    selected
 }
 
 /// 空的 `end_vv`（seq=1 时）规范化为空版本向量的编码，避免接收端解码失败。

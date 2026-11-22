@@ -1,7 +1,7 @@
 //! 双设备轮换 e2e：A genesis + B 恢复码 bootstrap + 冻结/候选/
 //! activate + B 离线编辑/未 ACK outbox + B apply/repack + 旧秘密负例。
 //!
-//! 默认**自包含**：进程内起真实 axum relay（`dev_relay.rs`：临时 SQLite + FakeClock +
+//! 默认**自包含**：进程内起真实 axum relay（`menghunote-dev-relay`：临时 SQLite + FakeClock +
 //! loopback 放行验签 hook + `127.0.0.1:0`），不需要任何外部进程或脚本。命令即验收：
 //!
 //! ```text
@@ -15,8 +15,6 @@
 //! 本地推广/重包）在 [`e2e_rotation_rounds`] 里共享，多轮用例
 //! `e2e_rotation_two_rounds` 复用同一实现。
 
-#[path = "dev_relay.rs"]
-mod dev_relay;
 #[path = "e2e_rotation_rounds.rs"]
 mod e2e_rotation_rounds;
 
@@ -25,9 +23,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use dev_relay::DevRelay;
 use e2e_rotation_rounds::e2e_common::{self as common, AnyResult};
 use e2e_rotation_rounds::{apply_round_for_device, run_a_rotation_round, ARoundParams};
+use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
     outbox_parts, outbox_row, sync_cursor_state, Vault, META_SYNC_RELAY_CURSOR,
 };

@@ -136,6 +136,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/vaults/{vault}/devices/{device}/approve",
             post(approve_device),
         )
+        // ADR 0010：管理端独立吊销（只断访问，不轮换密钥；`control_rev` 不变）。
+        .route(
+            "/v1/vaults/{vault}/devices/{device}/revoke",
+            post(revoke_device),
+        )
         .route("/v1/vaults/{vault}/key-slots", get(list_key_slots))
         .route("/v1/vaults/{vault}/key-slots/{slot}", put(put_key_slot))
         .route(
@@ -1595,6 +1600,66 @@ async fn approve_device(
                     (2, cbor_uint(outcome.epoch)),
                     (3, cbor_uint(outcome.control_rev)),
                     (4, cbor_bytes(outcome.certificate_signature)),
+                ])
+            })
+        })
+        .await?;
+    state.notify();
+    Ok(managed_response(outcome, StatusCode::OK))
+}
+
+/// ADR 0010：管理端**独立**吊销设备访问。
+///
+/// 与 approve 同构（`management::run`：验签 → 幂等 → `control_rev` CAS → 业务 → 同事务缓存
+/// 响应），但业务效果只有 `devices.status/revoked_at` 与 `auth_rev`：`control_rev` 不变、
+/// 不追加控制记录、不换 root/epoch、不冻结 vault（同步是 E2E，删凭证只阻断访问）。
+async fn revoke_device(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, device_id)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    let target = parse_id16(&device_id)?;
+    require_management_realm(&state, &headers)?;
+    let fields = parse_body(&state, &body)?;
+    // §26/ADR 0010：canonical body = `CDE{0: target_device, 1: request_id,
+    // 2: expected_control_rev}`；业务字段**只**从这份被签 body 读。外层 1/2 是同一份事实的
+    // 镜像，出现时必须逐字节一致（否则 403），target 只在 body 里（防跨设备 id 碰撞）。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
+    let request_id = management::id16_field(&fields, 1, &canonical, 1)?;
+    let expected_control_rev = management::u64_field(&fields, 2, &canonical, 2)?;
+    let body_target = canonical.id16(0)?;
+    let path = uri.path().to_string();
+    let hook = state.hook.clone();
+    let scope = management::scope("device-revoke");
+    let outcome = state
+        .write(move |conn, clock| {
+            require_vault(conn, &vault_id)?;
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2, // POST
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                // path 的 target 也被管理签名覆盖（签名输入含完整 path）；与 body 不一致
+                // 说明"签一套、执行另一套" → 按镜像语义 403。检查放在验签之后，避免给
+                // 未授权调用方任何"两份载荷是否一致"的前置 oracle。
+                if body_target != target {
+                    return Err(Error::api(ErrorCode::Forbidden));
+                }
+                let outcome = crate::revocation::revoke_access(conn, clock, &target)?;
+                Ok(vec![
+                    (0, cbor_bytes(outcome.target)),
+                    // 固定状态字面量：wire 契约（ADR 0010 §决策）。
+                    (1, wire::text("revoked")),
+                    (2, wire::boolean(outcome.changed)),
+                    (3, cbor_uint(outcome.auth_rev)),
+                    (4, cbor_uint(outcome.control_rev)),
                 ])
             })
         })

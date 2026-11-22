@@ -49,6 +49,11 @@ use menghunote_editor::{
     Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, Selection,
     SourceByte, StyleKind, UnicodeScalar,
 };
+#[cfg(feature = "dev-sync")]
+use menghunote_storage::session::{
+    AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease, ExternalCommitTicket, GateError,
+    GateState, PreparedCommittedDelta,
+};
 use menghunote_storage::session::{
     CloseReport, DriverEvent, EditOutcome, EditRequest, LiveDelta, RejectReason, SessionDriver,
 };
@@ -136,6 +141,17 @@ pub struct EditorView {
     request_seq: u64,
     /// 下一次绘制选区时是否把几何明细打到 stderr（拖拽/点击时置位，task-19 诊断用）。
     dump_selection: bool,
+    /// 上一次观察到的「外部提交闸门持有中」状态（ADR 0009 切片 3b）。
+    ///
+    /// 只用于**探测状态变化**（变化时重绘一次，让 `editor-sync-held` 标记与状态栏文案
+    /// 跟上）；真正的冻结判定每次都直接问驱动，绝不用这份缓存。
+    held: bool,
+    /// 已被驱动受理的**本地**编辑代数（ADR 0012 S3 自动同步的触发源）。
+    ///
+    /// 只在 `EditOutcome::Applied` 上自增：远端 adopt 不经过 `submit_request`，
+    /// 所以"远端 ACK 不触发自动同步"是结构性的，不依赖调用点自觉。
+    #[cfg(feature = "dev-sync")]
+    local_edit_seq: u64,
 }
 
 impl EditorView {
@@ -160,6 +176,9 @@ impl EditorView {
             composition: Composition::default(),
             request_seq: 0,
             dump_selection: false,
+            held: false,
+            #[cfg(feature = "dev-sync")]
+            local_edit_seq: 0,
         };
         view.spawn_pump(cx);
         view
@@ -223,7 +242,50 @@ impl EditorView {
             // 远端变更可能让内容变短，滚动量必须重新夹取，否则会滚到空白区。
             self.clamp_scroll();
         }
+        // 闸门状态可能在没有事件的情况下变化（begin/poll/end 由 worker/测试驱动）：
+        // 变化时重绘一次，`editor-sync-held` 标记与状态栏文案才不会滞后一帧。
+        if self.sync_held_state() {
+            changed = true;
+        }
         changed
+    }
+
+    // ---- 外部提交闸门（ADR 0009 切片 3b）----
+
+    /// 外部提交闸门是否持有中（Held）：期间输入/撤销/粘贴一律**不落到驱动**。
+    #[must_use]
+    pub fn is_sync_held(&self) -> bool {
+        self.driver.is_external_commit_held()
+    }
+
+    /// 同步缓存的闸门状态；返回**是否发生变化**（仅用于触发一次重绘与一行日志）。
+    fn sync_held_state(&mut self) -> bool {
+        let held = self.driver.is_external_commit_held();
+        if held == self.held {
+            return false;
+        }
+        self.held = held;
+        if held {
+            eprintln!(
+                "[menghunote] 外部提交持有闸门：冻结输入 / 撤销重做 / 粘贴（Held 结束后自动恢复）"
+            );
+        } else {
+            eprintln!("[menghunote] 外部提交闸门已释放：恢复输入");
+        }
+        true
+    }
+
+    /// Held 期间冻结一个写入入口：返回 `true` 表示调用方必须**直接忽略**本次输入。
+    ///
+    /// 冻结放在 app 侧（而不是靠驱动拒绝）是为了避免每按一个键就走一次
+    /// `Rejected{NotReady}` —— 那会把控制器标成 `needs_resync`（见
+    /// [`Self::apply_outcome_guarded`] 的说明），也会刷屏日志。
+    ///
+    /// 这里**只读驱动**、不动 `held` 缓存：状态变化的重绘由 `pump` /
+    /// [`Self::note_gate_state`] 负责（它们变了就 `notify`），否则这条热路径会把
+    /// "需要重绘"的信号吃掉。
+    fn frozen_by_external_commit(&mut self) -> bool {
+        self.driver.is_external_commit_held()
     }
 
     /// 本帧源码快照（绘制入口）。
@@ -734,6 +796,11 @@ impl EditorView {
         selected: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
+        if self.frozen_by_external_commit() {
+            // Held：连接收组合会走到 `driver.begin_composition()`（3a 会拒绝进入组合），
+            // 所以整段忽略；Held 结束后平台会重新发起组合。
+            return;
+        }
         if !self.composition.active {
             let depth = self.driver.begin_composition();
             self.composition.active = true;
@@ -763,6 +830,11 @@ impl EditorView {
 
     /// 组合提交：`text` 是平台给的最终文本，**只产生一个 `EditRequest`**。
     pub(crate) fn commit_composition(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.frozen_by_external_commit() {
+            // Held：既不结束组合闸门（3a 的状态优先），也不产生编辑请求。
+            eprintln!("[menghunote] Held 期间收到 IME 上屏：已忽略（不落库）");
+            return;
+        }
         let preedit = self.controller.preedit_text().map(str::to_owned);
         // 1) 先结束存储侧闸门：延后的远端在这里合并（合并可能让 preedit 失效）
         self.finish_composition_bridge();
@@ -788,6 +860,10 @@ impl EditorView {
 
     /// 普通文本输入（无组合：打字 / 粘贴）。
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.frozen_by_external_commit() {
+            // Held：打字/粘贴一律忽略（控制器镜像也不能先乐观改动，否则之后无法对齐）。
+            return;
+        }
         match self.controller.compose_replace_selection(text) {
             Ok(request) => self.submit_request(request),
             Err(error) => eprintln!("[menghunote] 插入文本失败：{error}"),
@@ -828,6 +904,10 @@ impl EditorView {
     ///
     /// 组合态按删除键：先取消组合（丢弃 overlay，不发请求），不要让编辑请求去撞闸门。
     fn delete_grapheme(&mut self, step: GraphemeStep, cx: &mut Context<Self>) {
+        if self.frozen_by_external_commit() {
+            // Held：退格/Delete 一律忽略（连"先把目标设成选区"这一步也不能做）。
+            return;
+        }
         if self.is_composing() {
             self.cancel_composition(cx);
         }
@@ -954,6 +1034,18 @@ impl EditorView {
     /// **所有** `EditRequest` 的唯一出口：组合期挂起、`CompositionActive` 不污染控制器、
     /// 每次请求打一行日志（`请求#N … edits=M` 就是"一次 commit 只有一个请求"的证据）。
     fn submit_request(&mut self, request: Option<EditRequest>) {
+        if self.frozen_by_external_commit() {
+            // 兜底：任何绕到这里的请求（例如组合结束时重试的挂起请求）在 Held 期间都
+            // 不能被驱动受理。`Rejected{NotReady}` 会让控制器 `needs_resync`，
+            // 因此这里**主动丢弃**而不是让驱动去拒绝。
+            if let Some(request) = request.as_ref() {
+                eprintln!(
+                    "[menghunote] Held 期间丢弃编辑请求 command_id={}（输入已冻结）",
+                    request.command_id
+                );
+            }
+            return;
+        }
         let Some(request) = request else {
             // 空选区 + 空替换是 no-op：不产生请求，但要留痕，避免被误读成"丢请求"。
             eprintln!("[menghunote] 本次输入是 no-op（空选区 + 空文本），不产生 EditRequest");
@@ -986,10 +1078,17 @@ impl EditorView {
             return;
         }
         match &outcome {
-            EditOutcome::Applied(applied) => eprintln!(
-                "[menghunote] 请求#{seq} 受理 command_id={command_id} edits={edits} local_echo={} live_rev={}",
-                applied.local_echo, applied.live_rev.0
-            ),
+            EditOutcome::Applied(applied) => {
+                #[cfg(feature = "dev-sync")]
+                {
+                    // ADR 0012 S3：本地编辑代数（自动同步尾缘 debounce 的触发源）。
+                    self.local_edit_seq = self.local_edit_seq.saturating_add(1);
+                }
+                eprintln!(
+                    "[menghunote] 请求#{seq} 受理 command_id={command_id} edits={edits} local_echo={} live_rev={}",
+                    applied.local_echo, applied.live_rev.0
+                )
+            }
             EditOutcome::Rejected(rejected) => eprintln!(
                 "[menghunote] 请求#{seq} 被拒 command_id={command_id} reason={:?}",
                 rejected.reason
@@ -1024,6 +1123,10 @@ impl EditorView {
 
     /// `Ctrl+Z`：会话唯一 UndoManager 的撤销；组合态下先取消组合。
     fn undo(&mut self, cx: &mut Context<Self>) {
+        if self.frozen_by_external_commit() {
+            // Held：撤销也是正文写入，必须整段忽略（驱动会 fail-closed 拒绝）。
+            return;
+        }
         if self.is_composing() {
             self.cancel_composition(cx);
         }
@@ -1040,6 +1143,10 @@ impl EditorView {
 
     /// `Ctrl+Shift+Z`：重做。
     fn redo(&mut self, cx: &mut Context<Self>) {
+        if self.frozen_by_external_commit() {
+            // Held：同 undo。
+            return;
+        }
         if self.is_composing() {
             self.cancel_composition(cx);
         }
@@ -1339,7 +1446,10 @@ impl EditorView {
 
     /// 状态栏左侧文案：保存状态 / 光标 / 显示行数。
     fn status_text(&self) -> String {
-        let saved = if let Some(preedit) = self.controller.preedit_text() {
+        let saved = if self.driver.is_external_commit_held() {
+            // Held：输入被冻结，明确告诉用户为什么按键没反应（不是卡死）。
+            "外部提交中，输入已冻结".to_owned()
+        } else if let Some(preedit) = self.controller.preedit_text() {
             // 组合期间 preedit 不进 CRDT：明确告诉用户"还没提交"
             format!("输入中，尚未提交（preedit {} 字）", preedit.chars().count())
         } else if self.controller.is_saved() {
@@ -1367,6 +1477,149 @@ impl EditorView {
             self.controller.doc_id(),
             self.vault_label
         )
+    }
+}
+
+/// dev-sync（ADR 0009 切片 3b）：外部提交闸门 / adopt 的**最小转发**。
+///
+/// 这里只做三件事：转发给 [`SessionDriver`]、刷新 `held`（状态栏与 selector 用）、
+/// 让调用方显式 [`Self::dev_sync_pump`]。事件本身由驱动推进队列（`Remote` + `Durable`），
+/// 因此 adopt 之后**不需要重开文档**也能看到远端文字。
+///
+/// 切片 4 的 worker 会从这些方法之上搭（网络/push 都不在这里）。
+#[cfg(feature = "dev-sync")]
+impl EditorView {
+    /// 登记一次外部提交（对当前活动文档）。
+    pub fn dev_sync_begin_external(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<ExternalCommitTicket, GateError> {
+        let ticket = self.driver.begin_external_commit()?;
+        self.note_gate_state(cx);
+        Ok(ticket)
+    }
+
+    /// 非阻塞推进闸门（`WaitingIME` → `Flushing` → `Held`）。
+    pub fn dev_sync_poll_external(
+        &mut self,
+        ticket: &ExternalCommitTicket,
+        cx: &mut Context<Self>,
+    ) -> GateState {
+        let state = self.driver.poll_external_commit(ticket);
+        self.note_gate_state(cx);
+        state
+    }
+
+    /// adopt 一份已 durable 的外部增量（必须 Held）。
+    pub fn dev_sync_adopt_external(
+        &mut self,
+        lease: &ExternalCommitLease,
+        prepared: PreparedCommittedDelta,
+        cx: &mut Context<Self>,
+    ) -> Result<AdoptOutcome, AdoptError> {
+        let outcome = self.driver.adopt_committed_delta(lease, prepared);
+        self.note_gate_state(cx);
+        outcome
+    }
+
+    /// 结束外部提交并释放闸门（`applied` 必须就是库中当前 head）。
+    pub fn dev_sync_end_external(
+        &mut self,
+        lease: ExternalCommitLease,
+        applied: AppliedHeads,
+        cx: &mut Context<Self>,
+    ) -> Result<(), GateError> {
+        let result = self.driver.end_external_commit(lease, applied);
+        self.note_gate_state(cx);
+        result
+    }
+
+    /// 取消/放弃一次外部提交（失败路径；已 durable 的交付仍走事件队列）。
+    pub fn dev_sync_cancel_external(
+        &mut self,
+        ticket: &ExternalCommitTicket,
+        cx: &mut Context<Self>,
+    ) -> Result<(), GateError> {
+        let result = self.driver.cancel_external_commit(ticket);
+        self.note_gate_state(cx);
+        result
+    }
+
+    /// 闸门状态变化时立刻重绘（状态栏文案与 `editor-sync-held` 标记不能滞后）。
+    fn note_gate_state(&mut self, cx: &mut Context<Self>) {
+        if self.sync_held_state() {
+            cx.notify();
+        }
+    }
+
+    /// 把驱动事件推进控制器（测试 / 后续 worker 调用的唯一入口）；返回是否有可视变化。
+    pub fn dev_sync_pump(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = self.pump();
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// 只读：当前镜像正文（测试断言"不重开也能看到远端文字"）。
+    #[must_use]
+    pub fn dev_sync_current_text(&self) -> String {
+        self.controller.source_text()
+    }
+
+    /// 闸门是否持有中（Held）。
+    #[must_use]
+    pub fn dev_sync_is_held(&self) -> bool {
+        self.driver.is_external_commit_held()
+    }
+
+    /// 当前文档 id（切片 4c-2：持闸同步按它取 `prepare_committed_delta` / 派发
+    /// `HeldGate`）。
+    #[must_use]
+    pub fn dev_sync_doc_id(&self) -> &str {
+        self.controller.doc_id()
+    }
+
+    /// 当前会话已 durable 的 head seq（诊断与测试断言用；闸门的 CAS 基准）。
+    #[must_use]
+    pub fn dev_sync_durable_head_seq(&self) -> u64 {
+        self.driver.durable_head_seq()
+    }
+
+    /// 已被受理的**本地**编辑代数（ADR 0012 S3）。
+    ///
+    /// 宿主比较前后两拍的值：变了 = 有新的本地编辑；再等 `dev_sync_is_saved()`
+    /// 为真（`DurableAck` 追上 `live_rev`）才交给调度器做 2s 尾缘 debounce。
+    #[must_use]
+    pub fn dev_sync_local_edit_seq(&self) -> u64 {
+        self.local_edit_seq
+    }
+
+    /// 已确认输入是否全部 durable（`DurableAck` 水位追上 `live_rev`）。
+    #[must_use]
+    pub fn dev_sync_is_saved(&self) -> bool {
+        self.controller.is_saved()
+    }
+
+    /// 当前是否处于 IME 组合中（自动同步要等它自然结束，绝不强行结束组合）。
+    #[must_use]
+    pub fn dev_sync_is_composing(&self) -> bool {
+        self.driver.is_composing()
+    }
+
+    /// 调试：开始一次 IME 组合（只更新 preedit / 会话组合深度，不产生 `EditRequest`）。
+    ///
+    /// 为什么需要：真实平台 IME 事件在 headless 里注入不了，而"自动同步遇到组合中要
+    /// defer、不强行结束组合"只能靠一个真实组合态来验证（ADR 0012 S3 验收）。
+    #[cfg(debug_assertions)]
+    pub fn dev_sync_debug_begin_composition(&mut self, cx: &mut Context<Self>) {
+        self.update_preedit("组合", None, cx);
+    }
+
+    /// 调试：提交当前 IME 组合（走与平台上屏同一条 `commit_composition` 路径）。
+    #[cfg(debug_assertions)]
+    pub fn dev_sync_debug_commit_composition(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.commit_composition(text, cx);
     }
 }
 
@@ -1430,6 +1683,12 @@ impl Render for EditorView {
                     .text_size(px(12.0))
                     .text_color(theme::status_bar_text())
                     .font_weight(FontWeight::NORMAL)
+                    // 测试元数据：`editor-sync-held` **仅** Held 时存在（headless 断言用）。
+                    // 同一个 div 只能记一个 selector，根视图已占用 `editor-current-doc`，
+                    // 所以挂在这层；只加 id 不改任何布局。
+                    .when(self.driver.is_external_commit_held(), |this| {
+                        this.debug_selector(|| "editor-sync-held".to_string())
+                    })
                     .child(status)
                     .child(SharedString::from(HINT)),
             )

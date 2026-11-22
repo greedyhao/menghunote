@@ -16,8 +16,6 @@
 //! 工作目录每次运行重建：`<CARGO_TARGET_TMPDIR>/e2e-rotation-verify/vault`（与旧 ps1 的
 //! `target/tmp/e2e-rot-verify` 同义），vault 必须从全新身份开始，否则会走"重启续传"分支。
 
-#[path = "dev_relay.rs"]
-mod dev_relay;
 #[path = "e2e_localhost.rs"]
 mod e2e_localhost;
 #[path = "e2e_rotation.rs"]
@@ -27,7 +25,7 @@ use std::error::Error as StdError;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use dev_relay::DevRelay;
+use menghunote_dev_relay::DevRelay;
 use menghunote_sync::ids;
 
 type AnyResult<T> = Result<T, Box<dyn StdError>>;
@@ -53,7 +51,7 @@ fn workspace_root() -> PathBuf {
 }
 
 /// 每次运行重置的工作目录；测试临时目录用 `CARGO_TARGET_TMPDIR`（example 未设置时退到
-/// `target/tmp`，与 `dev_relay.rs` 同一回退口径）。
+/// `target/tmp`，与 `menghunote-dev-relay` 同一回退口径）。
 fn work_dir() -> PathBuf {
     let root = match option_env!("CARGO_TARGET_TMPDIR") {
         Some(dir) => PathBuf::from(dir),

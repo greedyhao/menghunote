@@ -22,6 +22,7 @@
 //! | [`verify`] | 真实验签：`sync-proto` 解 CDE + relay 算 SHA/Ed25519 |
 //! | [`wire`] | 控制面 `application/cbor` + CDE 记录适配 |
 //! | [`pairing`] | 一次性邀请 / 设备批准（PENDING → ACTIVE） |
+//! | [`revocation`] | 设备访问吊销（只推进 `auth_rev`，不动控制链/证书；ADR 0010）|
 //! | [`slots`] | key slot 登记、`slot_set_rev` CAS 激活 |
 //!
 //! 服务端**不写业务日志**（canary 审计要求：日志里不得出现正文/口令/root/真实资产 hash）；
@@ -44,6 +45,7 @@ pub mod objects;
 pub mod pairing;
 pub mod quota;
 pub mod refs;
+pub mod revocation;
 pub mod rotations;
 pub mod sig;
 pub mod slots;

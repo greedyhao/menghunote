@@ -6,8 +6,8 @@ use loro::VersionVector;
 use support::*;
 
 use menghunote_storage::{
-    load_body_doc, load_head, DurableSink, FlushReport, JournalEntry, JournalWriter, StorageError,
-    VaultJournalSink,
+    load_body_doc, load_head, DurableSink, FlushReport, JournalEntry, JournalOrigin, JournalWriter,
+    StorageError, VaultJournalSink,
 };
 
 /// 可注入慢盘/失败的 sink：记录每次 flush 的批大小，便于断言「合并」。
@@ -59,6 +59,7 @@ fn entry(tag: &str) -> JournalEntry {
             end_frontier: vec![0],
             end_vv: vec![0],
         },
+        origin: JournalOrigin::Local,
     }
 }
 
@@ -206,6 +207,7 @@ fn unacked_suffix_is_lost_but_acked_prefix_survives_reopen() {
             doc_id: "doc-1".to_owned(),
             batch_id: format!("batch-{index}"),
             update,
+            origin: JournalOrigin::Local,
         });
     }
 
@@ -259,6 +261,7 @@ fn sink_holds_head_watermark_and_rejects_mixed_docs() {
         doc_id: "doc-1".to_owned(),
         batch_id: "b1".to_owned(),
         update: update.clone(),
+        origin: JournalOrigin::Local,
     };
     let seq = sink
         .write_prefix(std::slice::from_ref(&first))
@@ -273,6 +276,7 @@ fn sink_holds_head_watermark_and_rejects_mixed_docs() {
             doc_id: "doc-other".to_owned(),
             batch_id: "b1".to_owned(),
             update,
+            origin: JournalOrigin::Local,
         },
     ];
     let error = sink.write_prefix(&mixed).expect_err("混文档必须拒绝");

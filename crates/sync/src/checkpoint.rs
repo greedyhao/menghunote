@@ -1614,8 +1614,12 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         recovery_slot: &KeySlotV1,
         secrets: &SlotSecrets<'_>,
     ) -> Result<SlotsReport, SyncError> {
-        let password = self.put_slot(password_slot, secrets)?;
-        let recovery = self.put_slot(recovery_slot, secrets)?;
+        // 初始槽是一次性上传（改口令走独立的重包路径），沿用随机 message id；
+        // 需要"可重跑"的发布基线用 [`Self::upload_recovery_slot`] 传入确定性 id。
+        let password_message: [u8; 16] = crate::random::array(&mut crate::random::OsRandom)?;
+        let password = self.put_slot(password_slot, secrets, password_message)?;
+        let recovery_message: [u8; 16] = crate::random::array(&mut crate::random::OsRandom)?;
+        let recovery = self.put_slot(recovery_slot, secrets, recovery_message)?;
         let before = self.client.list_key_slots()?;
         let active = before
             .iter()
@@ -1674,6 +1678,35 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
             recovery: recovery_record,
             active_password_rev: active_rev,
         })
+    }
+
+    /// 只上传**一个 recovery 槽**（staging），返回 relay 的槽记录。
+    ///
+    /// 没有口令的流程（ADR 0009 切片 4b 的 dev-local Create/发布基线）用这条入口：
+    /// 与 [`Self::upload_initial_slots`] 共用同一条 `put_slot` 路径（KEY_SLOT MNE1 加密
+    /// + `PUT key-slots` 登记），但**不触碰** password 槽与 `password:activate`。
+    ///
+    /// `message_id` 由调用方给定而不是随机：它进 MNE1 header/AAD，relay 对同
+    /// `object_id` 换了 `message_id` 会返回 409 ID_CONFLICT。发布基线是**可重跑**的动作，
+    /// 调用方必须按槽材料算出确定性 id（`dev_local` 的 `key_slot_message_id`），
+    /// 否则"第一次传完槽、后面 checkpoint 失败"的重试会被 409 卡死。
+    pub fn upload_recovery_slot(
+        &mut self,
+        recovery_slot: &KeySlotV1,
+        seed: &crate::recovery::RecoverySeed,
+        message_id: [u8; 16],
+    ) -> Result<SlotRecord, SyncError> {
+        if recovery_slot.descriptor.kind != menghunote_sync_proto::SlotKind::Recovery {
+            return Err(SyncError::SlotKind {
+                expected: "recovery",
+                actual: "password",
+            });
+        }
+        let secrets = SlotSecrets {
+            password: None,
+            recovery_seed: Some(seed),
+        };
+        self.put_slot(recovery_slot, &secrets, message_id)
     }
 
     /// 创建并验证一份 checkpoint（`prepare → validate → promote` 的便捷入口）。
@@ -3501,10 +3534,10 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         &mut self,
         slot: &KeySlotV1,
         secrets: &SlotSecrets<'_>,
+        message_id: [u8; 16],
     ) -> Result<SlotRecord, SyncError> {
         let descriptor = slot.descriptor.encode()?;
         let plaintext = slot.wrapped_bytes();
-        let message_id: [u8; 16] = crate::random::array(&mut crate::random::OsRandom)?;
         // ADR §20：KEY_SLOT 不用 root 派生的 K_object，而是 password/recovery IKM 派生的
         // K_slot_mne；恢复设备在拿到 root 之前才能解槽。
         let key = slot.mne_key(secrets.password.map(str::as_bytes), secrets.recovery_seed)?;

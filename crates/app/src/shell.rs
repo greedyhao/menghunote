@@ -26,8 +26,15 @@ use gpui::{
     SharedString, Size, Window,
 };
 use menghunote_editor::EditorController;
+#[cfg(feature = "dev-sync")]
+use menghunote_storage::session::{
+    prepare_committed_delta, AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease,
+    ExternalCommitTicket, GateError, GateState, PreparedCommittedDelta,
+};
 use menghunote_storage::session::{DriverOptions, SessionDriver};
-use menghunote_storage::{list_tree, StructureWriter, TreeEntry, Vault};
+use menghunote_storage::{list_tree, StructureWriter, SyncContext, TreeEntry, Vault};
+#[cfg(feature = "dev-sync")]
+use menghunote_storage::{load_head, STRUCTURE_DOC_ID};
 
 use crate::editor::view::EditorEvent;
 use crate::sidebar_rename::{RenameEvent, RenameInput};
@@ -36,8 +43,12 @@ use crate::sidebar_rename::{RenameEvent, RenameInput};
 const DEFAULT_NOTE_TITLE: &str = "未命名笔记";
 /// 新建目录的默认标题。
 const DEFAULT_FOLDER_TITLE: &str = "未命名文件夹";
-/// 本机 peer id（与 dev 播种一致；多设备同步切片再引入真实 peer 身份）。
-const PEER_ID: u64 = 1;
+/// 默认本机 peer id（与 dev 播种一致）。
+///
+/// **默认构建 / dev-sync 未启用时保持常量 1**，行为与切片 7 完全相同；dev-sync 启用时
+/// `main.rs` 走 [`AppShell::new_with_peer`]，peer 来自持久身份
+/// （`LocalIdentityV1::loro_peer_id()`，ADR 0009 切片 2a），不再用这个常量。
+pub const DEFAULT_PEER_ID: u64 = 1;
 /// 菜单刚打开时的"失焦宽限期"：gpui 的 active 标志在把焦点交给菜单面板后会短暂
 /// 变 false，这段时间内的失焦事件忽略（实测会立刻把菜单关掉）。
 const DEACTIVATE_GUARD: std::time::Duration = std::time::Duration::from_millis(500);
@@ -91,6 +102,9 @@ const INDENT_PER_DEPTH: f32 = 16.0;
 const ROW_HEIGHT: f32 = 24.0;
 /// 切换文档时旧 driver 的有界排空上限（ADR 0002 §9：`close` 必须有界）。
 const SWITCH_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// dev-sync 的转发接口在「没有打开任何笔记」时用的明确失败文案（切片 3b）。
+#[cfg(feature = "dev-sync")]
+const NO_ACTIVE_DOC: &str = "dev-sync：当前没有打开的笔记，闸门/adopt 无处转发";
 
 /// 当前打开的笔记。
 /// 正在编辑的行。
@@ -115,6 +129,12 @@ struct OpenNote {
 pub struct AppShell {
     /// 与侧栏共用同一个 vault 句柄（`Vault` 是 `Clone + Send + Sync`）。
     vault: Vault,
+    /// 本机 Loro peer id（**唯一来源**：dev-sync 走持久身份映射，默认路径是
+    /// [`DEFAULT_PEER_ID`]）。结构写入 / 会话 / 搜索物化全部用它，不得再出现常量。
+    peer_id: u64,
+    /// 本地写入的同步上下文（ADR 0009 切片 2b）：`Some` 时正文 flush 与结构提交在
+    /// 同一个 A 事务里写 `sync_outbox` 意图；`None`（默认构建）行为完全不变。
+    sync: Option<SyncContext>,
     /// 状态栏展示的库路径。
     vault_label: String,
     /// `list_tree` 的最近一次结果（先序 DFS，已展平）。
@@ -156,6 +176,42 @@ pub struct AppShell {
     activation_observed: bool,
     /// 激活变化的订阅（持有到视图销毁；drop 即取消订阅）。
     activation_subscription: Option<gpui::Subscription>,
+    /// dev-only 同步面板（ADR 0009 Phase 1 / 切片 1）。
+    ///
+    /// **只有** `--features dev-sync` + 运行时门禁通过时才存在；默认构建里这个字段
+    /// 连类型都不存在（模块被 cfg 掉），因此结构体布局/渲染分支零变化。
+    #[cfg(feature = "dev-sync")]
+    dev_sync: Option<Entity<crate::dev_sync::DevSyncPanel>>,
+    /// 面板事件订阅（切片 4c-2）：「同步」按钮只发出 `SyncRequested`，由本视图持闸后派发。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_subscription: Option<gpui::Subscription>,
+    /// 在途的持闸同步（ADR 0009 切片 4c-2）；`None` = 没有同步在跑。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_sync: Option<crate::dev_sync::ActiveSyncOnce>,
+    /// 已收到「同步」按钮请求、还没在 `dev_sync_pump` 里消费（事件回调里不重入面板）。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_requested: bool,
+    /// 已收到「发布基线」按钮请求、还没在 `dev_sync_pump` 里消费（切片 4c-4）。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_publish_requested: bool,
+    /// 最近一次持闸同步的报告（面板文案 + 测试断言）。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_last_report: Option<crate::dev_sync::SyncOnceReport>,
+    /// 自动同步接线（ADR 0012 S3）：纯调度器 + 状态投影 + 注入的单调时钟。
+    ///
+    /// `None` = dev-sync 未启用（默认构建/未挂面板）：零自动行为。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_auto: Option<crate::dev_sync::AutoSync>,
+    /// 当前这一轮的来源（自动/手动）。收尾时交给 [`crate::dev_sync::AutoSync`] 记账：
+    /// 自动轮进退避/续批，手动轮清退避但不参与自动续批。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_round_origin: Option<crate::dev_sync::OpOrigin>,
+    /// 本轮自动同步是因为"等不到输入法空闲"主动 defer 的（不算失败、不计退避）。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_auto_deferred: bool,
+    /// 已观测到的活动文档本地编辑代数（自动同步的 debounce 触发源）。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_auto_edit_seq: u64,
 }
 
 /// 右键行弹出的上下文菜单。
@@ -220,8 +276,9 @@ impl AppShell {
                 }
             });
         let vault = self.vault.clone();
+        let peer_id = self.peer_id;
         let overlay = cx.new(|cx| {
-            crate::search_overlay::SearchOverlay::new(vault, PEER_ID, window, cx, on_open, on_close)
+            crate::search_overlay::SearchOverlay::new(vault, peer_id, window, cx, on_open, on_close)
         });
         overlay.update(cx, |overlay, cx| overlay.focus_input(window, cx));
         trace_menu!("[menghunote] 打开搜索浮层");
@@ -244,10 +301,41 @@ impl AppShell {
         cx.notify();
     }
 
-    /// 组装根视图：读一次树，并打开第一篇可打开的笔记。
+    /// 组装根视图：读一次树，并打开第一篇可打开的笔记（默认 peer = 1，行为不变）。
     pub fn new(vault: Vault, vault_label: String, cx: &mut Context<Self>) -> Self {
+        Self::new_with_peer(vault, vault_label, DEFAULT_PEER_ID, cx)
+    }
+
+    /// 组装根视图并显式注入本机 peer（ADR 0009 切片 2a）。
+    ///
+    /// dev-sync 启用时 `main.rs` 传入 `LocalIdentityV1::loro_peer_id()`：结构写入、
+    /// `SessionDriver`（flush/物化）与搜索物化都统一用它。默认路径继续走 [`Self::new`]
+    /// 的常量 1，仓内既有调用点不受影响。
+    pub fn new_with_peer(
+        vault: Vault,
+        vault_label: String,
+        peer_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_peer_and_sync(vault, vault_label, peer_id, None, cx)
+    }
+
+    /// 组装根视图并注入 peer + 同步上下文（ADR 0009 切片 2b）。
+    ///
+    /// `sync = Some(ctx)` 时，**构造期就打开**的第一篇笔记的 session 与之后的每次
+    /// [`Self::write_structure`] 都会用同一个 `SyncContext`；`None` 等价于
+    /// [`Self::new_with_peer`]（零行为变化）。
+    pub fn new_with_peer_and_sync(
+        vault: Vault,
+        vault_label: String,
+        peer_id: u64,
+        sync: Option<SyncContext>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut shell = Self {
             vault,
+            peer_id,
+            sync,
             vault_label,
             tree: Vec::new(),
             active: None,
@@ -268,6 +356,26 @@ impl AppShell {
             menu_focus: cx.focus_handle(),
             activation_observed: false,
             activation_subscription: None,
+            #[cfg(feature = "dev-sync")]
+            dev_sync: None,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_subscription: None,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_sync: None,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_requested: false,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_publish_requested: false,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_last_report: None,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_auto: None,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_round_origin: None,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_auto_deferred: false,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_auto_edit_seq: 0,
         };
         shell.refresh_tree();
         if let Some(index) = shell.tree.iter().position(TreeEntry::is_note) {
@@ -276,6 +384,173 @@ impl AppShell {
             eprintln!("[menghunote] 库里还没有笔记，侧栏为空（不报错）");
         }
         shell
+    }
+
+    /// 组装根视图，并挂上 dev-only 同步面板（ADR 0009 Phase 1 / 切片 1）。
+    ///
+    /// 只有 `--features dev-sync` **且** `main.rs` 的运行时门禁通过才会走到这里；
+    /// 面板是**覆盖层**（绝对定位在右上角），不挤压侧栏/编辑器的布局。
+    ///
+    /// `sync` 是持久身份给出的 `SyncContext { peer_id: loro_peer_id(), key_epoch }`：
+    /// 结构与正文写入都用它，因此 outbox 里的行天然带身份 peer/epoch，而不是常量 1/0。
+    /// 生产 Main 入口（ADR 0012 S3）：与 [`Self::new_with_dev_sync`] 相同，但**启用**自动
+    /// 同步的墙钟 ticker（40ms 一拍推进调度器）。
+    ///
+    /// 为什么不默认开在 [`Self::new_with_dev_sync`]：那条入口同时被大量 headless 测试
+    /// 使用（它们靠显式 `dev_sync_pump`/`dev_sync_auto_tick` 收敛，不该有后台 ticker
+    /// 在真实时间里偷偷启动同步）。生产入口（`main.rs` / `AppRoot` 的 Main）走这一条。
+    #[cfg(feature = "dev-sync")]
+    pub fn new_with_dev_sync_with_autosync(
+        vault: Vault,
+        vault_label: String,
+        dev_sync: crate::dev_sync::gate::DevSyncConfig,
+        sync: SyncContext,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let crate::dev_sync::gate::DevSyncConfig {
+            vault: vault_path,
+            service,
+        } = dev_sync;
+        eprintln!(
+            "[menghunote] dev-sync 已启用（自动同步）：vault = {}，relay = {}（DEV ONLY / localhost）",
+            vault_path.display(),
+            service.relay
+        );
+        let service = crate::dev_sync::service::SyncService::new_dev_local(service, vault_path);
+        let auto = crate::dev_sync::AutoSync::with_system_clock(std::time::Instant::now());
+        Self::new_with_dev_sync_service_auto(vault, vault_label, sync, service, Some(auto), cx)
+    }
+
+    /// dev-only 面板 + worker（**不**启用自动同步 ticker）：headless 测试与确定性复现用。
+    ///
+    /// 生产 Main 请用 [`Self::new_with_dev_sync_with_autosync`]。
+    #[cfg(feature = "dev-sync")]
+    pub fn new_with_dev_sync(
+        vault: Vault,
+        vault_label: String,
+        dev_sync: crate::dev_sync::gate::DevSyncConfig,
+        sync: SyncContext,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let crate::dev_sync::gate::DevSyncConfig {
+            vault: vault_path,
+            service,
+        } = dev_sync;
+        eprintln!(
+            "[menghunote] dev-sync 已启用：vault = {}，relay = {}（DEV ONLY / 非生产 / localhost）",
+            vault_path.display(),
+            service.relay
+        );
+        // 切片 4c-2：生产 runner —— 同步在 worker 线程里真实执行
+        // （自己的 `Vault` 连接 + 第一次同步时解封身份）；UI 线程不碰网络/Argon2。
+        let service = crate::dev_sync::service::SyncService::new_dev_local(service, vault_path);
+        // 这条入口保持确定性（headless 测试）：自动同步接线在，但**没有**墙钟 ticker。
+        let auto = crate::dev_sync::AutoSync::new(
+            crate::dev_sync::AutoSyncConfig::new().no_ticker(),
+            std::sync::Arc::new(crate::dev_sync::SystemOperationClock),
+            std::time::Instant::now(),
+        );
+        Self::new_with_dev_sync_service_auto(vault, vault_label, sync, service, Some(auto), cx)
+    }
+
+    /// 与 [`Self::new_with_dev_sync`] 相同，但注入**已经构造好的** `SyncService`。
+    ///
+    /// 生产路径不用它；测试用它注入 `ControlledRunner`（ADR 0012 S2a 的阶段/超时/
+    /// 授权竞争），从而在真实 `AppShell` 上验证"网络阶段不冻结、Held 只覆盖
+    /// integrate+adopt"这些**窗口**行为，而不是只测纯状态机。
+    #[cfg(feature = "dev-sync")]
+    pub fn new_with_dev_sync_service(
+        vault: Vault,
+        vault_label: String,
+        sync: SyncContext,
+        service: std::sync::Arc<crate::dev_sync::service::SyncService>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // 注入服务的构造保持确定性（headless）：自动同步接线在，但没有墙钟 ticker；
+        // 确定性用例（手动时钟）用 `_auto` 变体显式注入 [`crate::dev_sync::AutoSync`]。
+        let auto = crate::dev_sync::AutoSync::new(
+            crate::dev_sync::AutoSyncConfig::new().no_ticker(),
+            std::sync::Arc::new(crate::dev_sync::SystemOperationClock),
+            std::time::Instant::now(),
+        );
+        Self::new_with_dev_sync_service_auto(vault, vault_label, sync, service, Some(auto), cx)
+    }
+
+    /// 与 [`Self::new_with_dev_sync_service`] 相同，但注入**已经构造好的**自动同步接线。
+    ///
+    /// 测试用 `AutoSyncConfig::no_ticker()` + 手动时钟（`OperationClock`），再显式
+    /// [`Self::dev_sync_auto_tick`]；生产走 [`Self::new_with_dev_sync`] 的系统时钟 + ticker。
+    #[cfg(feature = "dev-sync")]
+    pub fn new_with_dev_sync_service_auto(
+        vault: Vault,
+        vault_label: String,
+        sync: SyncContext,
+        service: std::sync::Arc<crate::dev_sync::service::SyncService>,
+        auto: Option<crate::dev_sync::AutoSync>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut shell =
+            Self::new_with_peer_and_sync(vault, vault_label, sync.peer_id, Some(sync), cx);
+        let panel = cx.new(|cx| crate::dev_sync::panel::DevSyncPanel::with_service(service, cx));
+        // 「同步」按钮不直接发命令：面板只请求，本视图先 Prepare/持闸再派发（顺序在
+        // `dev_sync_sync_once` / `dev_sync_pump` 里，见 dev_sync::sync_once 的模块文档）。
+        let subscription = cx.subscribe(
+            &panel,
+            |shell, _panel, event: &crate::dev_sync::panel::DevSyncPanelEvent, cx| {
+                // 只置标记：事件回调发生在面板实体更新期间，这里不能反过来改面板。
+                // 「同步」与「发布基线」都只表达意图——先 Prepare/持闸、再派发在本视图的状态机里。
+                match event {
+                    crate::dev_sync::panel::DevSyncPanelEvent::SyncRequested => {
+                        shell.dev_sync_requested = true;
+                    }
+                    crate::dev_sync::panel::DevSyncPanelEvent::PublishRequested => {
+                        shell.dev_sync_publish_requested = true;
+                    }
+                }
+                cx.notify();
+            },
+        );
+        shell.dev_sync = Some(panel);
+        shell.dev_sync_subscription = Some(subscription);
+        // ADR 0012 S3：启动合并一次（只有 durable outbox/inbox 有待办才排队）。
+        // 真正的派发在第一拍（生产 ticker 40ms；测试显式 `dev_sync_auto_tick`），
+        // 避免在构造期重入同步状态机。
+        if let Some(mut auto) = auto {
+            let backlog = crate::dev_sync::autosync::durable_backlog(&shell.vault);
+            let now = auto.now();
+            if auto.prime_startup(backlog, now) {
+                eprintln!(
+                    "[menghunote] 自动同步：启动时有 durable 待办（待发送 {} / 待应用 {}），已排队",
+                    backlog.outbox, backlog.inbox
+                );
+            }
+            shell.dev_sync_auto = Some(auto);
+        }
+        shell.spawn_dev_sync_ticker(cx);
+        shell
+    }
+
+    /// dev-only：关窗时**只请求停止 + 查一次关闭门禁**，不 join、不等网络（ADR 0009）。
+    ///
+    /// 在途操作还在跑时门禁是 `Pending`——这是**预期**的：worker 在后台线程里自己退出，
+    /// 关窗不能被同步网络拖住。面板/测试要等明确收敛点时用 `poll_close`（票据）。
+    #[cfg(feature = "dev-sync")]
+    fn shutdown_dev_sync(&mut self, cx: &mut Context<Self>) {
+        // ADR 0012 S3：关窗/切库先停调度器（不再自动启动），再请求 worker 停止；
+        // 二者都**不** join、不等网络（S1/S2 的安全收尾语义不变）。
+        if let Some(auto) = &mut self.dev_sync_auto {
+            auto.stop();
+        }
+        let Some(panel) = &self.dev_sync else {
+            return;
+        };
+        let service = panel.read(cx).service();
+        let ticket = service.request_stop();
+        let close = service.poll_close(&ticket);
+        eprintln!(
+            "[menghunote] dev-sync 关窗：已请求停止，关闭门禁 = {}",
+            close.label()
+        );
     }
 
     /// 折叠/展开一个目录，返回操作后**是否处于折叠态**。
@@ -750,12 +1025,25 @@ impl AppShell {
     ///
     /// 失败只记日志 + 侧栏提示，**不 panic**；`commit` 之后投影表才是准的，
     /// 所以调用方紧接着要 `refresh_tree()`。
+    ///
+    /// dev-sync：**同步在途时冻结结构写入**（新建/重命名/删除/移动都走这里）。没有活动
+    /// 文档的无会话同步也会 integrate 结构更新，此时本地再提交结构 op 会拿同一个
+    /// `head_seq` 基准去 CAS（投影与 CRDT 会被撕开），所以直接拒绝并提示；同步结束后
+    /// 自动恢复（不是永久禁用）。打开/滚动已有内容不受影响。
     fn write_structure(
         &mut self,
         action: &str,
         op: impl FnOnce(&StructureWriter) -> Result<String, menghunote_storage::StorageError>,
     ) -> Option<String> {
-        let mut writer = match StructureWriter::open(&self.vault, PEER_ID) {
+        #[cfg(feature = "dev-sync")]
+        if self.dev_sync_sync.is_some() {
+            eprintln!("[menghunote] {action}被拒绝：dev-sync 同步进行中（结构写入已冻结）");
+            self.notice = Some("同步进行中，稍后再改结构".to_owned());
+            return None;
+        }
+        // dev-sync：结构提交与 intent 同一个 A 事务；默认路径 sync = None（零变化）。
+        let mut writer = match StructureWriter::open_with_sync(&self.vault, self.peer_id, self.sync)
+        {
             Ok(writer) => writer,
             Err(error) => {
                 eprintln!("[menghunote] {action}失败：打开结构写入口出错 {error:?}");
@@ -845,6 +1133,29 @@ impl AppShell {
         {
             return;
         }
+        // dev-sync：NeedGate/持闸之后禁止打开/切换文档（同步的 integrate 会直接追加外部
+        // 行，新会话会拿过期 head 基准；持闸路径 moreover 握着租约）。ADR 0012 S2a：
+        // **网络阶段（Prepare）不冻结切换**——此时还没有闸门、也没有 integrate。
+        // 目录折叠不受影响（上面已经提前返回）：它只改内存里的展开状态。
+        #[cfg(feature = "dev-sync")]
+        if let Some(sync) = &self.dev_sync_sync {
+            if sync.blocks_document_switch() {
+                let kind = if sync.is_no_session() {
+                    "无会话同步"
+                } else if sync.two_phase {
+                    "两阶段同步（已进入持闸阶段）"
+                } else {
+                    "持闸同步"
+                };
+                eprintln!(
+                    "[menghunote] {kind}进行中：暂不打开/切换到「{}」（同步结束后再试）",
+                    entry.title
+                );
+                self.notice = Some("同步进行中，稍后再打开/切换文档".to_owned());
+                cx.notify();
+                return;
+            }
+        }
         let Some(doc_id) = entry.body_doc_id.clone() else {
             eprintln!(
                 "[menghunote] 节点「{}」没有 body_doc_id，跳过（结构投影异常？）",
@@ -854,7 +1165,11 @@ impl AppShell {
         };
 
         // 1) 先开新文档：失败就完全不动当前视图。
-        let driver = match SessionDriver::open(&self.vault, &doc_id, DriverOptions::default()) {
+        // peer 来自身份（dev-sync）或默认常量；sync 上下文让 flush 在同事务里写 intent。
+        let mut options = DriverOptions::default();
+        options.session.peer_id = self.peer_id;
+        options.session.sync = self.sync;
+        let driver = match SessionDriver::open(&self.vault, &doc_id, options) {
             Ok(driver) => driver,
             Err(error) => {
                 eprintln!("[menghunote] 打开文档 {doc_id} 失败：{error:?}");
@@ -929,14 +1244,32 @@ impl AppShell {
             view,
             _events: events,
         });
+        // ADR 0012 S3：编辑代数按视图计（新视图从 0 开始），观测基准一起复位。
+        #[cfg(feature = "dev-sync")]
+        {
+            self.dev_sync_auto_edit_seq = 0;
+        }
         self.notice = None;
         // 3) 切换完成后刷新侧栏（投影表在 commit 之后才是准的）。
         self.refresh_tree();
         cx.notify();
     }
 
+    /// 把键盘焦点还给当前编辑器（设置面板关闭时调用；没有活动文档则 no-op）。
+    ///
+    /// 设置是 `AppRoot` 的覆盖层：它打开时焦点在 relay 输入框，关闭后不重建
+    /// `AppShell`，只把焦点还回来，编辑器的文档/滚动/撤销状态原样保留。
+    pub fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active) = &self.active {
+            active.view.update(cx, |_view, cx| cx.focus_self(window));
+        }
+    }
+
     /// 关窗前排空当前文档（`on_window_should_close` 里调用）。
     pub fn close_all(&mut self, cx: &mut Context<Self>) {
+        // dev-only 同步面板：先请求停止（非阻塞，GUI 不 join）。
+        #[cfg(feature = "dev-sync")]
+        self.shutdown_dev_sync(cx);
         let Some(active) = self.active.take() else {
             return;
         };
@@ -950,6 +1283,20 @@ impl AppShell {
             report.pending_edits,
             report.timed_out
         );
+    }
+
+    /// 常驻同步状态（ADR 0012 S3）：`None` = dev-sync 未启用（整块不渲染）。
+    ///
+    /// 只做投屏：状态由 [`crate::dev_sync::AutoSync`] 决定（`sync-status` / `sync-status-error`
+    /// 两个固定 selector）。每轮成功不弹 toast、不抢焦点；"需要处理"才多一行。
+    fn dev_sync_status_projection(&self) -> Option<(String, Option<String>)> {
+        #[cfg(feature = "dev-sync")]
+        let projection: Option<(String, Option<String>)> = self
+            .dev_sync_status_line()
+            .map(|line| (line, self.dev_sync_status_error_line()));
+        #[cfg(not(feature = "dev-sync"))]
+        let projection: Option<(String, Option<String>)> = None;
+        projection
     }
 
     /// 侧栏面板。
@@ -1114,6 +1461,30 @@ impl AppShell {
                         .child(SharedString::from(notice)),
                 )
             })
+            // ADR 0012 S3：常驻轻量同步状态（不打扰、不抢焦点、不弹 toast）。
+            // dev-sync 未启用时 `dev_sync_status_projection()` 是 `None`，整块不存在。
+            .when_some(self.dev_sync_status_projection(), |this, (line, error)| {
+                this.child(
+                    div()
+                        .debug_selector(|| "sync-status".to_string())
+                        .w_full()
+                        .px_2()
+                        .pb_1()
+                        .text_size(px(11.0))
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(line)),
+                )
+                .children(error.map(|error| {
+                    div()
+                        .debug_selector(|| "sync-status-error".to_string())
+                        .w_full()
+                        .px_2()
+                        .pb_1()
+                        .text_size(px(11.0))
+                        .text_color(theme::caret_color())
+                        .child(SharedString::from(error))
+                }))
+            })
             .child(
                 div()
                     .w_full()
@@ -1127,6 +1498,8 @@ impl AppShell {
                     .child(
                         div()
                             .id("sidebar-new-note")
+                            // 测试元数据：headless 测试要真实点击它验"同步中结构写入被拒"。
+                            .debug_selector(|| "sidebar-new-note".to_string())
                             .flex_1()
                             .h(px(22.0))
                             .flex()
@@ -1145,6 +1518,7 @@ impl AppShell {
                     .child(
                         div()
                             .id("sidebar-new-folder")
+                            .debug_selector(|| "sidebar-new-folder".to_string())
                             .flex_1()
                             .h(px(22.0))
                             .flex()
@@ -1372,6 +1746,2733 @@ impl AppShell {
     }
 }
 
+/// dev-sync（ADR 0009 切片 3b）：对**当前活动文档**转发外部提交闸门 / adopt 的最小接口。
+///
+/// 只做转发，不做网络/push（那是切片 4 的 worker）；所有语义（Held 冻结、adopt 幂等、
+/// 失败不释放闸门）都在 `storage::session` 的 3a 实现里。为什么放在 `AppShell`：
+/// 活动文档的 `SessionDriver` 属于 `EditorView`，而面板/worker/测试只认识 shell。
+///
+/// 没有活动文档时（还没打开任何笔记）：
+/// - `begin` → [`GateError::Storage`]（没有会话就没有闸门，明确失败而不是静默 no-op）；
+/// - `poll` → [`GateState::Stale`]（"票据从未登记"的既有语义）；
+/// - `adopt` → [`AdoptError::Storage`]；`end`/`cancel` → [`GateError::Storage`]。
+#[cfg(feature = "dev-sync")]
+impl AppShell {
+    /// 当前活动文档的编辑器视图（`None` = 没有打开的笔记）。
+    ///
+    /// 测试用它断言"adopt 之后**没有重开**文档"：同一个实体 = 没有重建视图。
+    #[must_use]
+    pub fn dev_sync_active_view(&self) -> Option<Entity<EditorView>> {
+        self.active.as_ref().map(|active| active.view.clone())
+    }
+
+    /// 侧栏底部的临时提示（测试断言"同步中结构写入被拒"的文案）。
+    ///
+    /// 只读投影：`write_structure` 在同步在途时会把"同步进行中，稍后再改结构"写进它。
+    #[must_use]
+    pub fn dev_sync_sidebar_notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// 对当前活动文档登记一次外部提交。
+    pub fn dev_sync_begin_external(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<ExternalCommitTicket, GateError> {
+        self.update_active_view(cx, |view, cx| view.dev_sync_begin_external(cx))
+            .unwrap_or_else(|| Err(GateError::Storage(NO_ACTIVE_DOC.to_owned())))
+    }
+
+    /// 非阻塞推进闸门：`WaitingIME` → `Flushing` → `Held(lease)`。
+    pub fn dev_sync_poll_external(
+        &mut self,
+        ticket: &ExternalCommitTicket,
+        cx: &mut Context<Self>,
+    ) -> GateState {
+        self.update_active_view(cx, |view, cx| view.dev_sync_poll_external(ticket, cx))
+            .unwrap_or(GateState::Stale)
+    }
+
+    /// adopt 一份**已 durable** 的外部增量（必须 Held）。
+    pub fn dev_sync_adopt_external(
+        &mut self,
+        lease: &ExternalCommitLease,
+        prepared: PreparedCommittedDelta,
+        cx: &mut Context<Self>,
+    ) -> Result<AdoptOutcome, AdoptError> {
+        self.update_active_view(cx, |view, cx| {
+            view.dev_sync_adopt_external(lease, prepared, cx)
+        })
+        .unwrap_or_else(|| Err(AdoptError::Storage(NO_ACTIVE_DOC.to_owned())))
+    }
+
+    /// 结束外部提交并释放闸门（`applied` 必须就是库中当前 head）。
+    pub fn dev_sync_end_external(
+        &mut self,
+        lease: ExternalCommitLease,
+        applied: AppliedHeads,
+        cx: &mut Context<Self>,
+    ) -> Result<(), GateError> {
+        self.update_active_view(cx, |view, cx| {
+            view.dev_sync_end_external(lease, applied, cx)
+        })
+        .unwrap_or_else(|| Err(GateError::Storage(NO_ACTIVE_DOC.to_owned())))
+    }
+
+    /// 取消/放弃一次外部提交（失败路径；已 durable 的交付仍由驱动事件推送）。
+    pub fn dev_sync_cancel_external(
+        &mut self,
+        ticket: &ExternalCommitTicket,
+        cx: &mut Context<Self>,
+    ) -> Result<(), GateError> {
+        self.update_active_view(cx, |view, cx| view.dev_sync_cancel_external(ticket, cx))
+            .unwrap_or_else(|| Err(GateError::Storage(NO_ACTIVE_DOC.to_owned())))
+    }
+
+    /// 泵一次 dev-sync（面板请求 → 持闸同步状态机 → 活动视图的 `Remote`）。
+    ///
+    /// 生产路径由本视图的 ticker 每 40 ms 调一次（`spawn_dev_sync_ticker`）；headless
+    /// 测试显式调它（没有真实时钟），因此它是"单步收敛点"，**不是** sleep 的替代。
+    ///
+    /// 顺序：
+    /// 1. 消费「同步」按钮请求（`dev_sync_sync_once`）；
+    /// 2. 推进持闸同步（等 Held / 等 worker / 交付 + 释放）；
+    /// 3. 把活动驱动的队列推进 `EditorView`（adopt 出来的 `Remote` → 镜像正文）。
+    pub fn dev_sync_pump(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        // 0) 面板/服务事件泵：把 worker 线程发来的 Progress/Completed 收进 `SyncState`
+        //    （`snapshot().last_completed` 是下面等待终态的唯一观察点，必须有人 poll）。
+        //    面板自己也有 40 ms 泵；这里是给测试与非阻塞主循环的确定性入口（重复 poll 无副作用）。
+        if let Some(panel) = self.dev_sync.clone() {
+            changed |= panel.update(cx, |panel, cx| {
+                let pumped = panel.pump();
+                if pumped {
+                    cx.notify();
+                }
+                pumped
+            });
+        }
+        // 1) 面板只发请求：真正的"先持闸、再派发"在这里（见 dev_sync::sync_once）。
+        if std::mem::take(&mut self.dev_sync_requested) {
+            // 失败原因已经写进面板/报告；这里只关心"有没有变化"。
+            let _ = self.dev_sync_sync_once(cx);
+            changed = true;
+        }
+        if std::mem::take(&mut self.dev_sync_publish_requested) {
+            // 同一套持闸状态机，只换 worker 命令与报告种类（切片 4c-4）。
+            let _ = self.dev_sync_publish_baseline(cx);
+            changed = true;
+        }
+        // 2) 持闸同步推进（gate + service 事件都在这一步收敛）。
+        changed |= self.dev_sync_advance(cx);
+        // 3) 活动视图泵：adopt 的 Remote 在这里变成编辑器里的文字（不重开文档）。
+        if let Some(active) = &self.active {
+            changed |= active.view.update(cx, |view, cx| view.dev_sync_pump(cx));
+        }
+        // 4) ADR 0012 S3：本地编辑拿到 `DurableAck` 后触发自动同步的 2s 尾缘 debounce
+        //    （远端 adopt 不产生本地编辑代数，因此不会触发）。
+        changed |= self.dev_sync_auto_observe_edits(cx);
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// 面板实体（测试读同步行/notice 用；宿主内部也用它写状态行）。
+    #[must_use]
+    pub fn dev_sync_panel(&self) -> Option<Entity<crate::dev_sync::DevSyncPanel>> {
+        self.dev_sync.clone()
+    }
+
+    /// 持闸同步是否在途（面板按钮置灰 / 测试收敛判据）。
+    #[must_use]
+    pub fn dev_sync_sync_in_progress(&self) -> bool {
+        self.dev_sync_sync.is_some()
+    }
+
+    /// 最近一次**持闸同步**的报告（成功或失败都保留；开始新一轮时不清空）。
+    ///
+    /// 发布基线也写同一个 `dev_sync_last_report`（同一套状态机），这里按任务种类过滤：
+    /// 同步的断言不会被发布覆盖，反之亦然。
+    #[must_use]
+    pub fn dev_sync_last_sync(&self) -> Option<&crate::dev_sync::SyncOnceReport> {
+        self.dev_sync_last_report
+            .as_ref()
+            .filter(|report| report.task == crate::dev_sync::GatedTask::SyncOnce)
+    }
+
+    /// 最近一次「发布基线」的报告（切片 4c-4；成功或失败都保留）。
+    #[must_use]
+    pub fn dev_sync_last_publish(&self) -> Option<&crate::dev_sync::SyncOnceReport> {
+        self.dev_sync_last_report
+            .as_ref()
+            .filter(|report| report.task == crate::dev_sync::GatedTask::PublishBaseline)
+    }
+
+    /// 「发布基线」是否在途（面板按钮置灰 / 测试收敛判据）。
+    #[must_use]
+    pub fn dev_sync_publish_in_progress(&self) -> bool {
+        self.dev_sync_sync
+            .as_ref()
+            .is_some_and(|state| state.task == crate::dev_sync::GatedTask::PublishBaseline)
+    }
+
+    // ---- ADR 0012 S3：自动同步接线（调度/状态 UX/重启恢复/跨操作续批）----
+
+    /// 自动同步接线的只读投影（`None` = dev-sync 未启用）。
+    #[must_use]
+    pub fn dev_sync_auto(&self) -> Option<&crate::dev_sync::AutoSync> {
+        self.dev_sync_auto.as_ref()
+    }
+
+    /// 常驻状态投影（`sync-status` 的文本来源；测试断言用）。
+    #[must_use]
+    pub fn dev_sync_status(&self) -> Option<crate::dev_sync::SyncStatus> {
+        self.dev_sync_auto
+            .as_ref()
+            .map(|auto| auto.status().clone())
+    }
+
+    /// 常驻状态行文案（selector `sync-status`）。
+    #[must_use]
+    pub fn dev_sync_status_line(&self) -> Option<String> {
+        let auto = self.dev_sync_auto.as_ref()?;
+        Some(auto.status().line(auto.now()))
+    }
+
+    /// 「需要处理」行文案（selector `sync-status-error`；`None` = 不渲染）。
+    ///
+    /// 只有"需要人工处理 / 交付失败仍持有闸门"才出现：普通退避与每轮成功都不打扰。
+    #[must_use]
+    pub fn dev_sync_status_error_line(&self) -> Option<String> {
+        let auto = self.dev_sync_auto.as_ref()?;
+        auto.status().error_line()
+    }
+
+    /// 当前这一轮的来源（`None` = 没有登记过在途轮）。
+    #[must_use]
+    pub fn dev_sync_round_origin(&self) -> Option<crate::dev_sync::OpOrigin> {
+        self.dev_sync_round_origin
+    }
+
+    /// 自动同步推进一拍：刷新计数 → 观测本地编辑 → 调度决策 → 派发。
+    ///
+    /// 生产由 [`Self::spawn_dev_sync_ticker`] 每 40ms 调用；headless 测试显式调用
+    /// （时钟可注入，故不需要 sleep，也不需要真的推进 GPUI 定时器）。
+    pub fn dev_sync_auto_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(auto) = self.dev_sync_auto.as_ref() else {
+            return false;
+        };
+        if auto.is_stopped() {
+            return false;
+        }
+        let now = auto.now();
+        let mut changed = false;
+        // 1) durable 计数（节流；状态行与续批判据都读它）。
+        if auto.status_refresh_due(now) {
+            let backlog = crate::dev_sync::autosync::durable_backlog(&self.vault);
+            if let Some(auto) = self.dev_sync_auto.as_mut() {
+                auto.observe_backlog(backlog, now);
+            }
+            changed = true;
+        }
+        // 2) 本地编辑是否已经 DurableAck（尾缘 debounce 的触发源）。
+        changed |= self.dev_sync_auto_observe_edits(cx);
+        // 3) 宿主繁忙（单操作在途 / Hed 之外的设备命令 / worker 停止）：自动不抢占。
+        let busy = self.dev_sync_sync.is_some()
+            || self.dev_sync_service(cx).is_some_and(|service| {
+                let snapshot = service.snapshot();
+                snapshot.in_flight.is_some() || snapshot.worker_stopped
+            });
+        if let Some(auto) = self.dev_sync_auto.as_mut() {
+            auto.set_host_busy(busy);
+        }
+        // 3b) 合并的手动请求（自动轮期间点过「同步」）：空闲时优先补一次。
+        let manual_queued = self
+            .dev_sync_auto
+            .as_ref()
+            .is_some_and(crate::dev_sync::AutoSync::manual_queued);
+        if manual_queued && !busy {
+            if let Some(auto) = self.dev_sync_auto.as_mut() {
+                let _ = auto.take_manual_request();
+            }
+            let _ = self.dev_sync_sync_once(cx);
+            return true;
+        }
+        // 4) 调度决策（启动合并/周期/退避/续批都在纯调度器里）。
+        let decision = match self.dev_sync_auto.as_mut() {
+            Some(auto) => auto.tick(now),
+            None => return changed,
+        };
+        if busy {
+            return changed;
+        }
+        changed | self.dev_sync_auto_handle(decision, cx, now)
+    }
+
+    /// 撤销本轮登记（派发被拒/没有真的跑起来）：不计失败、不退避。
+    fn dev_sync_abort_round(&mut self) {
+        let now = self
+            .dev_sync_auto
+            .as_ref()
+            .map(crate::dev_sync::AutoSync::now)
+            .unwrap_or_else(std::time::Instant::now);
+        if let Some(auto) = self.dev_sync_auto.as_mut() {
+            auto.abort_round(now);
+        }
+        self.dev_sync_round_origin = None;
+        self.dev_sync_auto_deferred = false;
+    }
+
+    /// 观测活动文档的本地编辑：`DurableAck` 后交给调度器做 2s 尾缘 debounce。
+    ///
+    /// 远端 adopt 不产生本地编辑代数（`EditorView` 只在 `EditOutcome::Applied` 上自增），
+    /// 所以"远端 ACK 不触发"是结构性的，不靠调用点自觉。
+    fn dev_sync_auto_observe_edits(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(auto) = self.dev_sync_auto.as_ref() else {
+            return false;
+        };
+        if auto.is_stopped() {
+            return false;
+        }
+        let Some(active) = self.active.as_ref() else {
+            return false;
+        };
+        let (seq, saved) = {
+            let view = active.view.read(cx);
+            (view.dev_sync_local_edit_seq(), view.dev_sync_is_saved())
+        };
+        let mut changed = false;
+        if seq != self.dev_sync_auto_edit_seq {
+            self.dev_sync_auto_edit_seq = seq;
+            if let Some(auto) = self.dev_sync_auto.as_mut() {
+                auto.note_local_edit_pending();
+            }
+            changed = true;
+        }
+        let pending = self
+            .dev_sync_auto
+            .as_ref()
+            .is_some_and(crate::dev_sync::AutoSync::local_edit_pending);
+        if pending && saved {
+            let now = self
+                .dev_sync_auto
+                .as_ref()
+                .map(crate::dev_sync::AutoSync::now)
+                .unwrap_or_else(std::time::Instant::now);
+            if let Some(auto) = self.dev_sync_auto.as_mut() {
+                let _ = auto.on_local_durable(now);
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// 调度器要求启动：派发一轮自动同步（两阶段 / 无会话）。
+    fn dev_sync_auto_handle(
+        &mut self,
+        decision: crate::dev_sync::Decision,
+        cx: &mut Context<Self>,
+        now: std::time::Instant,
+    ) -> bool {
+        let crate::dev_sync::Decision::Start(trigger) = decision else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            self.dev_sync_abort_round();
+            return true;
+        };
+        let snapshot = service.snapshot();
+        if snapshot.worker_stopped || snapshot.in_flight.is_some() {
+            // 单操作/worker 停止（例如面板的自动设备刷新）：退回这次 Start，
+            // 再合并一条"稍后重试"——不抢占已开始的事务，也不留下假的 Running。
+            if let Some(auto) = self.dev_sync_auto.as_mut() {
+                let _ = auto.on_busy_after_start(now);
+            }
+            return true;
+        }
+        let backlog = crate::dev_sync::autosync::durable_backlog(&self.vault);
+        if let Some(auto) = self.dev_sync_auto.as_mut() {
+            auto.begin_auto_round(trigger, backlog);
+        }
+        self.dev_sync_round_origin = Some(crate::dev_sync::OpOrigin::Auto);
+        self.dev_sync_auto_deferred = false;
+        let dispatched = if self.active.is_none() {
+            self.dev_sync_dispatch_no_session(cx, &service)
+        } else {
+            self.dev_sync_start_two_phase(cx, &service)
+        };
+        if let Err(error) = dispatched {
+            if let Some(auto) = self.dev_sync_auto.as_mut() {
+                let _ = auto.on_busy(now);
+            }
+            eprintln!("[menghunote] 自动同步派发被拒（{trigger:?}）：{error}");
+        }
+        true
+    }
+
+    /// 窗口激活变化（失焦 60s；重新聚焦时若有 durable 待办合并一次探测）。
+    fn dev_sync_auto_on_activation(&mut self, active: bool, cx: &mut Context<Self>) {
+        let Some(auto) = self.dev_sync_auto.as_mut() else {
+            return;
+        };
+        if auto.is_stopped() {
+            return;
+        }
+        let now = auto.now();
+        if auto.status_refresh_due(now) {
+            let backlog = crate::dev_sync::autosync::durable_backlog(&self.vault);
+            auto.observe_backlog(backlog, now);
+        }
+        auto.on_activation(active, now);
+        cx.notify();
+    }
+
+    /// 一轮收尾：把结果交回自动同步调度器（退避/续批/状态行）。
+    fn dev_sync_auto_finish_round(&mut self, report: &crate::dev_sync::SyncOnceReport) {
+        if report.task != crate::dev_sync::GatedTask::SyncOnce {
+            // 发布基线不是"同步轮"：不参与自动退避/续批。
+            return;
+        }
+        let deferred_by_gate = std::mem::take(&mut self.dev_sync_auto_deferred);
+        let gate_still_held = self.dev_sync_sync.is_some();
+        let Some(auto) = self.dev_sync_auto.as_mut() else {
+            self.dev_sync_round_origin = None;
+            return;
+        };
+        let now = auto.now();
+        let backlog = crate::dev_sync::autosync::durable_backlog(&self.vault);
+        let Some(origin) = self.dev_sync_round_origin.take() else {
+            // 没有新派发的收尾（例如交付失败后的「重试收尾」）：成功后只恢复状态行。
+            if report.is_ok() {
+                auto.note_recovery(backlog, now);
+            }
+            return;
+        };
+        let frozen = match (&report.error, gate_still_held) {
+            (Some(error), true) => Some(error.clone()),
+            _ => None,
+        };
+        let outcome = crate::dev_sync::RoundOutcome {
+            success: report.is_ok() && !deferred_by_gate,
+            error: report.error.clone(),
+            deferred_by_gate,
+            frozen,
+        };
+        let decision = auto.finish_round(outcome, backlog, now);
+        if decision.is_start() {
+            // 收尾路径**不**重入派发：`finish_round` 已把它退回 pending，下一拍 tick 再启动。
+            eprintln!("[menghunote] 自动同步（{origin:?}）收尾：还有待办，等下一拍继续");
+        } else if !report.is_ok() {
+            eprintln!(
+                "[menghunote] 自动同步（{origin:?}）收尾：{}",
+                report.error.as_deref().unwrap_or("未成功")
+            );
+        }
+    }
+
+    /// 启动一次**持闸同步**（面板「同步」按钮 / 测试入口）。
+    ///
+    /// 只是 [`Self::dev_sync_start_gated`] 的 `SyncOnce` 入口：两条持闸任务（同步 /
+    /// 发布基线）共用同一条状态机，差别只有 worker 命令与报告种类（切片 4c-4）。
+    /// 没有活动文档时走**无会话同步**（空库/还没打开笔记）：
+    /// [`Self::dev_sync_dispatch_no_session`]。
+    pub fn dev_sync_sync_once(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        // 0) 两阶段收尾失败（闸门仍 Held）：再点一次只重试**交付**，不重新 Prepare。
+        //    这是 fail-closed 路径的唯一出口（否则用户只能重启实例）。
+        if let Some(state) = self.dev_sync_sync.as_ref() {
+            if state.two_phase
+                && state.stage == crate::dev_sync::SyncOnceStage::Delivering
+                && state.lease.is_some()
+            {
+                let task = state.task;
+                let error = state
+                    .pending_error
+                    .clone()
+                    .unwrap_or_else(|| "上一轮收尾未完成（闸门仍持有）".to_owned());
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    "重试收尾（闸门仍持有）",
+                    Some(format!("{}：重试收尾（{error}）", task.short_label())),
+                );
+                let _ = self.dev_sync_retry_two_phase_delivery(cx);
+                return Ok(());
+            }
+        }
+        // 0b) ADR 0012 S3：自动轮在跑时，手动点击**合并**（不派发第二条）。
+        //     自动轮收尾后由 `dev_sync_auto_finish_round` 立刻补一次手动轮；
+        //     这里只如实告诉用户"已排队"，不假装本轮是手动触发的。
+        if let Some(state) = self.dev_sync_sync.as_ref() {
+            let auto_in_flight =
+                self.dev_sync_round_origin == Some(crate::dev_sync::OpOrigin::Auto);
+            if auto_in_flight {
+                if let Some(auto) = self.dev_sync_auto.as_mut() {
+                    auto.queue_manual();
+                }
+                let in_flight_task = state.task;
+                self.dev_sync_panel_task_state(
+                    cx,
+                    in_flight_task,
+                    true,
+                    "自动同步中：已合并手动同步",
+                    Some(
+                        "自动同步进行中：手动「同步」已合并到本轮结束后立即执行（单操作串行）"
+                            .to_owned(),
+                    ),
+                );
+                return Ok(());
+            }
+        }
+        // 1) 同一时刻只允许一条同步任务（两阶段三阶段共用同一 slot）。
+        if let Some(state) = self.dev_sync_sync.as_ref() {
+            let in_flight_task = state.task;
+            let message = in_flight_task.busy_label().to_owned();
+            self.dev_sync_panel_task_state(
+                cx,
+                in_flight_task,
+                true,
+                format!("{}已在进行", in_flight_task.label()),
+                Some(message.clone()),
+            );
+            return Err(message);
+        }
+        // 2) 面板/服务可用，且 worker 没有别的命令在跑。
+        let Some(service) = self.dev_sync_service(cx) else {
+            let message = "dev-sync 未启用：没有同步面板/服务，无法同步".to_owned();
+            return Err(message);
+        };
+        let snapshot = service.snapshot();
+        if snapshot.worker_stopped {
+            let message = "同步失败：dev-sync worker 已停止（请重启实例）".to_owned();
+            self.dev_sync_panel_task_state(
+                cx,
+                crate::dev_sync::GatedTask::SyncOnce,
+                false,
+                "worker 已停止",
+                Some(message.clone()),
+            );
+            return Err(message);
+        }
+        if let Some((op_id, kind)) = snapshot.in_flight {
+            let (line, message) = if snapshot.deadline_exceeded == Some(op_id) {
+                (
+                    "上一轮已超时（等待真实收尾）",
+                    format!(
+                        "同步被拒绝：上一轮操作已超时（{op_id}），仍在等待 worker 真实收尾；                         不会派发第二操作（若长期无回执请重启实例）"
+                    ),
+                )
+            } else {
+                (
+                    "已有操作在途",
+                    format!("同步被拒绝：已有操作在途（{} {op_id}）", kind.label()),
+                )
+            };
+            self.dev_sync_panel_task_state(
+                cx,
+                crate::dev_sync::GatedTask::SyncOnce,
+                true,
+                line,
+                Some(message.clone()),
+            );
+            return Err(message);
+        }
+        // 2b) ADR 0012 S3：手动优先——先过调度器（可绕过一次网络退避；不能绕过
+        //     单操作/Held/Paused）。被挡住时把原因如实写回面板，不静默排队。
+        if let Some(auto) = self.dev_sync_auto.as_mut() {
+            // 手动优先：调用方已经确认没有在途 op/worker 停止，这里的 `host_busy` 只可能
+            // 是上一拍 tick 留下的陈旧标记（自动轮刚收尾）——不拿它挡用户。
+            auto.set_host_busy(false);
+            let now = auto.now();
+            let backlog = crate::dev_sync::autosync::durable_backlog(&self.vault);
+            match auto.request_manual(now) {
+                crate::dev_sync::Decision::Start(_) => {
+                    auto.begin_manual_round(backlog);
+                }
+                crate::dev_sync::Decision::Wait(reason) => {
+                    let message = format!("同步被拒绝：调度器当前不可用（{}）", reason.label());
+                    self.dev_sync_panel_task_state(
+                        cx,
+                        crate::dev_sync::GatedTask::SyncOnce,
+                        true,
+                        "调度器暂不启动",
+                        Some(message.clone()),
+                    );
+                    return Err(message);
+                }
+                crate::dev_sync::Decision::Idle => {}
+            }
+        }
+        self.dev_sync_round_origin = Some(crate::dev_sync::OpOrigin::Manual);
+        self.dev_sync_auto_deferred = false;
+        // 3) 没有活动文档 = 旧的无会话同步（S2a 只把**有活动文档**的手动同步改成两阶段）。
+        if self.active.is_none() {
+            return self.dev_sync_dispatch_no_session(cx, &service);
+        }
+        self.dev_sync_start_two_phase(cx, &service)
+    }
+
+    /// 发起一次两阶段同步：**只派发 Prepare**（网络阶段不 begin gate、不冻结输入）。
+    fn dev_sync_start_two_phase(
+        &mut self,
+        cx: &mut Context<Self>,
+        service: &std::sync::Arc<crate::dev_sync::SyncService>,
+    ) -> Result<(), String> {
+        // 结构 head 基线：收尾时只有它真的变了才重投影（不假刷新）。
+        let structure_base_seq = load_head(&self.vault, STRUCTURE_DOC_ID)
+            .map(|head| head.head_seq)
+            .unwrap_or(0);
+        match service.try_command_two_phase() {
+            Ok(op_id) => {
+                let origin = self
+                    .dev_sync_round_origin
+                    .unwrap_or(crate::dev_sync::OpOrigin::Manual);
+                let mut state = crate::dev_sync::ActiveSyncOnce::new_two_phase(
+                    crate::dev_sync::GatedTask::SyncOnce,
+                    structure_base_seq,
+                )
+                .with_origin(origin);
+                state.op_id = Some(op_id);
+                self.dev_sync_sync = Some(state);
+                self.dev_sync_panel_task_state(
+                    cx,
+                    crate::dev_sync::GatedTask::SyncOnce,
+                    true,
+                    "同步中（网络阶段，不冻结输入）",
+                    Some("同步：网络阶段（不持闸，可继续编辑/切换）".to_owned()),
+                );
+                // 第一拍：本地 relay 可能已经 NeedGate；没有就等下一帧。
+                self.dev_sync_advance(cx);
+                Ok(())
+            }
+            Err(busy) => {
+                // 没有真的派发出去：撤回调度登记（不计失败/不退避），自动轮稍后重试。
+                self.dev_sync_abort_round();
+                let message = format!("同步失败：无法派发 Prepare（{}）", busy.reason.label());
+                self.dev_sync_panel_task_state(
+                    cx,
+                    crate::dev_sync::GatedTask::SyncOnce,
+                    false,
+                    "派发失败",
+                    Some(message.clone()),
+                );
+                Err(message)
+            }
+        }
+    }
+
+    /// 启动一次**持闸发布初始基线**（面板「发布基线」按钮 / 测试入口，切片 4c-4）。
+    ///
+    /// 与同步完全同一条持闸状态机（`begin gate → Held → try_command_with_gate →
+    /// Completed → prepare/adopt/end → notice`）：
+    ///
+    /// - 发布读取的是 durable 快照，所以必须先持闸（活动文档 flush 到 durable）；
+    /// - 发布**不需要**额外的 adopt 语义——它不改写正文，只是把已 durable 的外部行按同步的
+    ///   同一套规则交付（没有新行时什么也不做）；
+    /// - 闸门释放前不允许任何本地写入；失败同样先交付再释放（与同步一致）；
+    /// - 发布**没有**无会话路径：没有打开的笔记就没有闸门目标 → 明确拒绝。
+    ///
+    /// 额外前置条件：本机身份必须有管理密钥（Join 设备不能发布）。面板按钮已置灰，这里
+    /// 再兜一次；权威判定在 worker（它重新读身份）。
+    pub fn dev_sync_publish_baseline(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        self.dev_sync_start_gated(crate::dev_sync::GatedTask::PublishBaseline, cx)
+    }
+
+    /// 持闸任务的公共启动路径：登记闸门 → 第一拍推进（不阻塞 UI）。
+    ///
+    /// 返回 `Err(String)` 是**明确拒绝/失败**（面板显示原文），不吞：
+    /// 已在同步/发布（并发）、没有活动文档（仅发布拒绝；同步转无会话路径）、没有面板/
+    /// 服务、闸门已被占用、worker 已停、本机没有管理密钥（仅发布）。
+    ///
+    /// 只做登记与第一拍推进，不阻塞 UI：闸门可能要等 IME 自然结束 / flush 到 durable，
+    /// 那些都在 [`Self::dev_sync_advance`] 里一帧一帧推进（状态机见
+    /// `dev_sync::sync_once` 的模块文档）。
+    fn dev_sync_start_gated(
+        &mut self,
+        task: crate::dev_sync::GatedTask,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let label = task.label();
+        // 发布基线不是"同步轮"：不参与自动同步的退避/续批/状态行记账。
+        self.dev_sync_round_origin = None;
+        self.dev_sync_auto_deferred = false;
+        // 0a) 上一轮"收尾失败"（闸门仍 Held）：再点一次只重试收尾，不 begin 新闸门。
+        //     这是 fail-closed 路径的唯一出口（否则用户只能重启实例）。
+        let retry_delivery = self
+            .dev_sync_sync
+            .as_ref()
+            .is_some_and(|state| state.stage == crate::dev_sync::SyncOnceStage::Delivering);
+        if retry_delivery {
+            // 只允许用**同一个任务**重试收尾：发布在途时点同步不会偷走它的闸门。
+            let same_task = self
+                .dev_sync_sync
+                .as_ref()
+                .is_some_and(|state| state.task == task);
+            if !same_task {
+                let in_flight_task = self
+                    .dev_sync_sync
+                    .as_ref()
+                    .map_or("其它任务", |state| state.task.label());
+                let message = format!(
+                    "{label}被拒绝：{in_flight_task}的收尾还没完成（闸门仍持有），请先点它重试收尾"
+                );
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    "收尾未完成（闸门仍持有）",
+                    Some(message.clone()),
+                );
+                return Err(message);
+            }
+            let finish = self
+                .dev_sync_last_report
+                .as_ref()
+                .and_then(|report| report.error.clone())
+                .map_or_else(
+                    || SyncOnceFinish::Ok("重试收尾".to_owned()),
+                    SyncOnceFinish::Failed,
+                );
+            self.dev_sync_panel_task_state(
+                cx,
+                task,
+                true,
+                "重试收尾（闸门仍持有）",
+                Some(format!("{}：重试收尾", task.short_label())),
+            );
+            self.dev_sync_finish(cx, finish);
+            return Ok(());
+        }
+        // 0b) 同一时刻只允许一条持闸任务（重复命令 = Busy 语义）。
+        if let Some(state) = self.dev_sync_sync.as_ref() {
+            let in_flight_task = state.task;
+            let message = in_flight_task.busy_label().to_owned();
+            self.dev_sync_panel_task_state(
+                cx,
+                task,
+                true,
+                format!("{}已在进行", in_flight_task.label()),
+                Some(message.clone()),
+            );
+            return Err(message);
+        }
+        // 1) 面板/服务必须可用，且 worker 没有正在跑别的命令。
+        let Some(service) = self.dev_sync_service(cx) else {
+            let message = format!("dev-sync 未启用：没有同步面板/服务，无法{label}");
+            return Err(message);
+        };
+        let snapshot = service.snapshot();
+        if snapshot.worker_stopped {
+            let message = format!("{label}失败：dev-sync worker 已停止（请重启实例）");
+            self.dev_sync_panel_task_state(cx, task, false, "worker 已停止", Some(message.clone()));
+            return Err(message);
+        }
+        if let Some((op_id, kind)) = snapshot.in_flight {
+            // 超时后 worker 仍在写边界内：明确告诉用户"在等真实收尾"，不是普通忙。
+            let (line, message) = if snapshot.deadline_exceeded == Some(op_id) {
+                (
+                    "上一轮已超时（等待真实收尾）",
+                    format!(
+                        "{label}被拒绝：上一轮操作已超时（{op_id}），仍在等待 worker 真实收尾；\
+                         不会派发第二操作（若长期无回执请重启实例）"
+                    ),
+                )
+            } else {
+                (
+                    "已有操作在途",
+                    format!("{label}被拒绝：已有操作在途（{} {op_id}）", kind.label()),
+                )
+            };
+            self.dev_sync_panel_task_state(cx, task, true, line, Some(message.clone()));
+            return Err(message);
+        }
+        // 1b) 发布基线需要管理密钥：面板按钮已置灰，这里再兜一次（权威判定在 worker）。
+        //     只在 worker 已经上报过身份时提前拒绝；否则交给 worker 给真正原因。
+        if task == crate::dev_sync::GatedTask::PublishBaseline
+            && snapshot.self_device.is_some()
+            && !snapshot.can_manage_devices
+        {
+            let message =
+                "发布基线被拒绝：本机没有管理密钥（Join 设备）；请用 Create 设备发布".to_owned();
+            self.dev_sync_panel_task_state(cx, task, false, "没有管理密钥", Some(message.clone()));
+            return Err(message);
+        }
+        // 2) 没有活动文档：同步走无会话路径（空库/还没打开笔记也能拿到远端结构与正文）；
+        //    发布必须有活动文档（它读 durable 快照，先持闸 flush）。
+        let Some(active) = self.active.as_ref() else {
+            if task == crate::dev_sync::GatedTask::SyncOnce {
+                return self.dev_sync_dispatch_no_session(cx, &service);
+            }
+            let message = "发布基线失败：当前没有打开的笔记（发布需要先在活动文档上持闸；\
+                 请先打开一篇笔记）"
+                .to_owned();
+            self.dev_sync_panel_task_state(cx, task, false, "没有活动文档", Some(message.clone()));
+            return Err(message);
+        };
+        // 3) 有活动文档：持闸路径（本片只保证活动文档的正文；结构树收尾时按需重投影）。
+        let view = active.view.clone();
+        let doc_id = view.read(cx).dev_sync_doc_id().to_owned();
+        // 记录任务开始前的结构 head：收尾时只有它真的变了才重投影（不假刷新）。
+        let structure_base_seq = load_head(&self.vault, STRUCTURE_DOC_ID)
+            .map(|head| head.head_seq)
+            .unwrap_or(0);
+        // 4) 登记外部提交闸门（Held 之前不派发任何命令）。
+        let ticket = match view.update(cx, |view, cx| view.dev_sync_begin_external(cx)) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                let message = format!("{label}失败：无法持有外部提交闸门（{error}）");
+                self.dev_sync_panel_task_state(cx, task, false, "持闸失败", Some(message.clone()));
+                return Err(message);
+            }
+        };
+        self.dev_sync_sync = Some(crate::dev_sync::ActiveSyncOnce::new(
+            task,
+            doc_id.clone(),
+            view,
+            ticket,
+            structure_base_seq,
+        ));
+        self.dev_sync_panel_task_state(
+            cx,
+            task,
+            true,
+            format!("等待持闸（{doc_id}）"),
+            Some(format!("{}：已提交持闸请求，等待落盘", task.short_label())),
+        );
+        // 5) 第一拍：没有脏数据时直接就 Held 并派发；否则等下一帧继续 poll。
+        self.dev_sync_advance(cx);
+        Ok(())
+    }
+
+    /// 没有活动文档时派发**无会话同步**（空库/还没打开笔记）。
+    ///
+    /// 这里不碰任何 `EditorView`/`DocumentSession`：没有会话可 begin/adopt，所以不持闸；
+    /// 同步期间 [`Self::write_structure`] 会拒绝结构写入（`dev_sync_sync.is_some()`），
+    /// 收尾在 [`Self::dev_sync_finish`] 的无视图路径里重投影 + 自动打开第一篇。
+    fn dev_sync_dispatch_no_session(
+        &mut self,
+        cx: &mut Context<Self>,
+        service: &std::sync::Arc<crate::dev_sync::SyncService>,
+    ) -> Result<(), String> {
+        // 结构 head 基线：收尾时只有它真的变了才重投影（不假刷新）。
+        let structure_base_seq = load_head(&self.vault, STRUCTURE_DOC_ID)
+            .map(|head| head.head_seq)
+            .unwrap_or(0);
+        let origin = self
+            .dev_sync_round_origin
+            .unwrap_or(crate::dev_sync::OpOrigin::Manual);
+        match service.try_command_no_session() {
+            Ok(op_id) => {
+                self.dev_sync_sync = Some(
+                    crate::dev_sync::ActiveSyncOnce::new_no_session(op_id, structure_base_seq)
+                        .with_origin(origin),
+                );
+                self.dev_sync_panel_state(
+                    cx,
+                    true,
+                    format!("无活动文档：已派发无会话同步（{op_id}）"),
+                    Some("同步：没有活动文档，已派发无会话同步".to_owned()),
+                );
+                // 第一拍：worker 可能已经回执（本地 relay 很快）；没有就等下一帧。
+                self.dev_sync_advance(cx);
+                Ok(())
+            }
+            Err(busy) => {
+                self.dev_sync_abort_round();
+                let message = format!("同步失败：无法派发无会话同步（{}）", busy.reason.label());
+                self.dev_sync_panel_state(cx, false, "派发失败", Some(message.clone()));
+                Err(message)
+            }
+        }
+    }
+
+    /// 推进一拍同步；返回是否有可视变化（不阻塞、不做网络）。
+    fn dev_sync_advance(&mut self, cx: &mut Context<Self>) -> bool {
+        let two_phase = self
+            .dev_sync_sync
+            .as_ref()
+            .is_some_and(|state| state.two_phase);
+        match self.dev_sync_sync.as_ref().map(|state| state.stage) {
+            None => false,
+            Some(crate::dev_sync::SyncOnceStage::Preparing) => self.dev_sync_advance_prepare(cx),
+            Some(crate::dev_sync::SyncOnceStage::NeedGate) => self.dev_sync_advance_need_gate(cx),
+            Some(crate::dev_sync::SyncOnceStage::WaitingGate) => {
+                if two_phase {
+                    self.dev_sync_advance_two_phase_gate(cx)
+                } else {
+                    self.dev_sync_advance_gate(cx)
+                }
+            }
+            Some(crate::dev_sync::SyncOnceStage::Integrating) => {
+                self.dev_sync_advance_integrating(cx)
+            }
+            Some(crate::dev_sync::SyncOnceStage::Finishing) => self.dev_sync_advance_finishing(cx),
+            Some(crate::dev_sync::SyncOnceStage::Cancelling) => {
+                self.dev_sync_advance_cancelling(cx)
+            }
+            Some(crate::dev_sync::SyncOnceStage::WorkerRunning) => self.dev_sync_advance_worker(cx),
+            // 收尾失败（闸门仍 Held）：用户再次点「同步」重试；但若之前是"没有可靠回执"
+            // 才留下的 Held，真实回执一到就自动收尾（ADR 0012 S1：迟到回执不能丢）。
+            Some(crate::dev_sync::SyncOnceStage::Delivering) => {
+                self.dev_sync_advance_delivering(cx)
+            }
+        }
+    }
+
+    /// `Delivering` 且**尚未**拿到真实回执时的补收：迟到回执一到就自动收尾一次。
+    ///
+    /// 为什么只做一次：`worker_settled` 一旦置位，后续收尾失败仍是"用户显式重试"路径，
+    /// 不能每 40 ms 重放（否则收尾失败会变成死循环）。
+    fn dev_sync_advance_delivering(&mut self, cx: &mut Context<Self>) -> bool {
+        // 两阶段的 Delivering 是"收尾失败、等用户显式重试"的 fail-closed 状态：
+        // 这里不自动重放（否则失败会变成每帧死循环）。
+        if self
+            .dev_sync_sync
+            .as_ref()
+            .is_some_and(|state| state.two_phase)
+        {
+            return false;
+        }
+        let Some((task, op_id)) = self
+            .dev_sync_sync
+            .as_ref()
+            .filter(|state| !state.worker_settled)
+            .and_then(|state| state.op_id.map(|op| (state.task, op)))
+        else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            return false;
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.worker_settled = true;
+                }
+                return match result.clone() {
+                    crate::dev_sync::OpResult::Ok { summary } => {
+                        self.dev_sync_finish(cx, SyncOnceFinish::Ok(summary))
+                    }
+                    crate::dev_sync::OpResult::Failed { message } => {
+                        self.dev_sync_finish(cx, SyncOnceFinish::Failed(message))
+                    }
+                };
+            }
+        }
+        if snapshot.worker_stopped {
+            if let Some(state) = self.dev_sync_sync.as_mut() {
+                state.worker_settled = true;
+            }
+            return self.dev_sync_finish(
+                cx,
+                SyncOnceFinish::Failed(format!(
+                    "{}失败：worker 已停止，未拿到本次任务的明确终态",
+                    task.short_label()
+                )),
+            );
+        }
+        false
+    }
+
+    /// `Preparing`（ADR 0012 S2a）：等 Prepare 的 `NeedGate`；**不持闸、不冻结输入**。
+    ///
+    /// 观察点是服务快照里的 `two_phase`（阶段）与 `last_completed`（真实终态）。
+    fn dev_sync_advance_prepare(&mut self, cx: &mut Context<Self>) -> bool {
+        let (task, op_id) = match self.dev_sync_sync.as_ref() {
+            Some(state) if state.two_phase => match state.op_id {
+                Some(op_id) => (state.task, op_id),
+                None => return false,
+            },
+            _ => return false,
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：dev-sync 服务已不可用", task.short_label()),
+                },
+            );
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                let Some(mut state) = self.dev_sync_sync.take() else {
+                    return false;
+                };
+                state.worker_settled = true;
+                return self.dev_sync_finish_two_phase_with_state(cx, state, result.clone());
+            }
+        }
+        if snapshot.worker_stopped {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!(
+                        "{}失败：worker 已停止，未拿到 Prepare 的明确终态",
+                        task.short_label()
+                    ),
+                },
+            );
+        }
+        if snapshot.deadline_exceeded == Some(op_id) {
+            let first_time = self
+                .dev_sync_sync
+                .as_ref()
+                .is_some_and(|state| !state.deadline_noted);
+            if first_time {
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.deadline_noted = true;
+                    state.pending_error = Some(format!(
+                        "{}超时：网络阶段（未持闸）已登记取消，等 worker 真实收尾",
+                        task.short_label()
+                    ));
+                }
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    format!("已超时（{op_id}）：网络阶段，未持闸"),
+                    Some(format!(
+                        "{}超时：Prepare 阶段不持闸、编辑器不冻结；worker 会在集成前停手，\
+                         等真实回执（不会派发第二操作）",
+                        task.short_label()
+                    )),
+                );
+                return true;
+            }
+        }
+        let Some(status) = snapshot.two_phase else {
+            return false;
+        };
+        if status.op_id != op_id || status.phase != crate::dev_sync::state::SyncPhase::NeedGate {
+            return false;
+        }
+        let Some(state) = self.dev_sync_sync.as_mut() else {
+            return false;
+        };
+        state.authorization_epoch = status.authorization_epoch;
+        state.stage = crate::dev_sync::SyncOnceStage::NeedGate;
+        // ADR 0012 S3：把 worker 上报的"已接收·待应用"记进常驻状态（收到 ≠ 已应用）。
+        if let Some(auto) = self.dev_sync_auto.as_mut() {
+            auto.note_need_gate(status.stored, status.deferred);
+        }
+        self.dev_sync_panel_task_state(
+            cx,
+            task,
+            true,
+            format!("网络阶段完成，等待持闸授权（{op_id}）"),
+            Some(format!(
+                "{}：Prepare 已完成（网络阶段未冻结输入），准备在当前活动文档上短暂持闸",
+                task.short_label()
+            )),
+        );
+        true
+    }
+
+    /// `NeedGate`：在**当时**的活动文档上 `begin_external_commit`（短持闸窗口从这里开始）。
+    ///
+    /// 没有活动文档 / 超时 / 持闸失败时走取消路径：worker 还在等授权，取消会穿透控制
+    /// 通道；闸门从未授予，所以不会 append。
+    fn dev_sync_advance_need_gate(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((task, op_id)) = self.dev_sync_sync.as_ref().and_then(|state| {
+            (state.two_phase && state.stage == crate::dev_sync::SyncOnceStage::NeedGate)
+                .then(|| state.op_id.map(|op| (state.task, op)))
+                .flatten()
+        }) else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：dev-sync 服务已不可用", task.short_label()),
+                },
+            );
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                let Some(mut state) = self.dev_sync_sync.take() else {
+                    return false;
+                };
+                state.worker_settled = true;
+                return self.dev_sync_finish_two_phase_with_state(cx, state, result.clone());
+            }
+        }
+        if snapshot.worker_stopped {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：worker 已停止，未拿到授权回执", task.short_label()),
+                },
+            );
+        }
+        // 已登记取消（超时/无活动文档/授权失败）：只等真实回执，不再 begin gate。
+        if self
+            .dev_sync_sync
+            .as_ref()
+            .is_some_and(|state| state.cancel_requested)
+        {
+            return false;
+        }
+        let timed_out = snapshot.deadline_exceeded == Some(op_id);
+        let user_cancelled = snapshot.cancel_requested;
+        let Some(active) = self.active.as_ref() else {
+            if let Some(state) = self.dev_sync_sync.as_mut() {
+                state.cancel_requested = true;
+                state.pending_error = Some(
+                    "同步被取消：NeedGate 时没有活动文档（不会在无会话状态下 append）".to_owned(),
+                );
+            }
+            let _ = service.try_command(crate::dev_sync::Command::Cancel);
+            self.dev_sync_panel_task_state(
+                cx,
+                task,
+                true,
+                "没有活动文档：取消本次集成",
+                Some("同步：授权时没有活动文档，已取消（不 append）".to_owned()),
+            );
+            return true;
+        };
+        if timed_out || user_cancelled {
+            if let Some(state) = self.dev_sync_sync.as_mut() {
+                state.cancel_requested = true;
+                state.pending_error = Some(if timed_out {
+                    format!(
+                        "{}超时：Prepare 完成前已登记取消，未持闸",
+                        task.short_label()
+                    )
+                } else {
+                    format!(
+                        "{}已取消：NeedGate 时用户取消，未持闸（不 append）",
+                        task.short_label()
+                    )
+                });
+            }
+            let _ = service.try_command(crate::dev_sync::Command::Cancel);
+            self.dev_sync_panel_task_state(
+                cx,
+                task,
+                true,
+                if timed_out {
+                    "已超时：不持闸、等真实收尾"
+                } else {
+                    "已取消：不持闸、等真实收尾"
+                },
+                Some(if timed_out {
+                    "同步：操作已超时，未持闸，等 worker 真实收尾".to_owned()
+                } else {
+                    "同步：已取消，未持闸，等 worker 真实收尾".to_owned()
+                }),
+            );
+            return true;
+        }
+        let view = active.view.clone();
+        match view.update(cx, |view, cx| view.dev_sync_begin_external(cx)) {
+            Ok(ticket) => {
+                let doc_id = ticket.doc_id().to_owned();
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.target = crate::dev_sync::SyncOnceTarget::TwoPhase {
+                        view: Some(view.clone()),
+                        doc_id: Some(doc_id.clone()),
+                        ticket: Some(ticket),
+                    };
+                    state.stage = crate::dev_sync::SyncOnceStage::WaitingGate;
+                }
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    format!("等待持闸（短暂冻结，{doc_id}）"),
+                    Some(format!(
+                        "{}：已请求持闸，等待落盘/输入法结束",
+                        task.short_label()
+                    )),
+                );
+                true
+            }
+            Err(error) => {
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.cancel_requested = true;
+                    state.pending_error = Some(format!(
+                        "{}失败：无法持有外部提交闸门（{error}）；已取消集成（不 append）",
+                        task.short_label()
+                    ));
+                }
+                let _ = service.try_command(crate::dev_sync::Command::Cancel);
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    "持闸失败：取消集成",
+                    Some(format!(
+                        "{}：持闸失败（{error}），已取消",
+                        task.short_label()
+                    )),
+                );
+                true
+            }
+        }
+    }
+
+    /// 两阶段的 `WaitingGate`：把闸门驱到 Held → 发 `GrantGate` → 进入 `Integrating`。
+    fn dev_sync_advance_two_phase_gate(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((task, op_id, view, doc_id, ticket, epoch)) =
+            self.dev_sync_sync.as_ref().and_then(|state| {
+                if !state.two_phase || state.stage != crate::dev_sync::SyncOnceStage::WaitingGate {
+                    return None;
+                }
+                let parts = state.target.two_phase_parts()?;
+                Some((
+                    state.task,
+                    state.op_id?,
+                    parts.view?,
+                    parts.doc_id?,
+                    parts.ticket?,
+                    state.authorization_epoch?,
+                ))
+            })
+        else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            // 面板被释放：只能 cancel 释放票据，报告失败。
+            let _ = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：dev-sync 服务已不可用", task.short_label()),
+                },
+            );
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                // 授权前就收到真实终态：释放票据（没有 GrantGate，worker 不可能 append）。
+                let _ = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+                let Some(mut state) = self.dev_sync_sync.take() else {
+                    return false;
+                };
+                state.worker_settled = true;
+                return self.dev_sync_finish_two_phase_with_state(cx, state, result.clone());
+            }
+        }
+        if snapshot.worker_stopped {
+            let _ = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：worker 已停止", task.short_label()),
+                },
+            );
+        }
+        match view.update(cx, |view, cx| view.dev_sync_poll_external(&ticket, cx)) {
+            GateState::WaitingIME | GateState::Flushing => {
+                // ADR 0012 S3：自动轮最多等 ~2s 的输入法自然结束/空闲。拿不到就
+                // **defer**（不强制结束组合、不 append），把单操作槽让出来稍后再试；
+                // 手动轮保持既有语义（继续等 IME 结束，不替用户放弃）。
+                let auto_round =
+                    self.dev_sync_round_origin == Some(crate::dev_sync::OpOrigin::Auto);
+                if !auto_round {
+                    return false;
+                }
+                let now = self
+                    .dev_sync_auto
+                    .as_ref()
+                    .map(crate::dev_sync::AutoSync::now)
+                    .unwrap_or_else(std::time::Instant::now);
+                let expired = {
+                    let Some(auto) = self.dev_sync_auto.as_mut() else {
+                        return false;
+                    };
+                    auto.note_gate_wait(now);
+                    auto.gate_wait_remaining(now)
+                        .is_some_and(|remaining| remaining.is_zero())
+                };
+                if !expired {
+                    return false;
+                }
+                // 先释放票据（还没 Held，worker 不可能 append），再取消本轮：
+                // worker 在集成前停手，durable inbox 保留，稍后续批。
+                let _ = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+                let _ = service.try_command(crate::dev_sync::Command::Cancel);
+                let remaining = crate::dev_sync::autosync::durable_backlog(&self.vault).inbox;
+                if let Some(auto) = self.dev_sync_auto.as_mut() {
+                    auto.note_gate_deferred(remaining);
+                }
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.auto_deferred = true;
+                    state.cancel_requested = true;
+                    state.lease = None;
+                    state.pending_error =
+                        Some("自动同步：输入法组合中，稍后再试（未持闸、未追加）".to_owned());
+                    state.stage = crate::dev_sync::SyncOnceStage::Cancelling;
+                }
+                self.dev_sync_auto_deferred = true;
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    "输入法组合中：稍后再试",
+                    Some(
+                        "自动同步：拿不到输入法空闲（约 2s），本轮已 defer（未持闸、未追加）"
+                            .to_owned(),
+                    ),
+                );
+                true
+            }
+            GateState::Held(lease) => {
+                let gate = crate::dev_sync::HeldGate::new(
+                    doc_id.clone(),
+                    lease.durable_head_seq(),
+                    lease.generation().0,
+                )
+                .with_session_epoch(lease.session_epoch().0);
+                match service.grant_gate(op_id, epoch, gate) {
+                    Ok(()) => {
+                        if let Some(state) = self.dev_sync_sync.as_mut() {
+                            state.lease = Some(lease);
+                            state.stage = crate::dev_sync::SyncOnceStage::Integrating;
+                            state.dispatched_under_gate = true;
+                        }
+                        self.dev_sync_panel_task_state(
+                            cx,
+                            task,
+                            true,
+                            format!("已持闸，整合中（{op_id}）"),
+                            Some(format!(
+                                "{}：已授权 integrate（持闸仅覆盖集成+交付）",
+                                task.short_label()
+                            )),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        // 授权没生效：worker 绝不会 append；释放闸门并等真实回执。
+                        let released =
+                            view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+                        let _ = service.try_command(crate::dev_sync::Command::Cancel);
+                        let message = match released {
+                            Ok(()) => format!("授权失败：{error}（闸门已释放，等真实收尾）"),
+                            Err(cancel_error) => format!(
+                                "授权失败：{error}；释放闸门也失败（{cancel_error}），编辑器保持冻结"
+                            ),
+                        };
+                        if let Some(state) = self.dev_sync_sync.as_mut() {
+                            state.cancel_requested = true;
+                            state.pending_error = Some(message.clone());
+                            state.lease = None;
+                            state.stage = crate::dev_sync::SyncOnceStage::Cancelling;
+                        }
+                        self.dev_sync_panel_task_state(
+                            cx,
+                            task,
+                            true,
+                            "授权失败：等真实收尾",
+                            Some(message),
+                        );
+                        true
+                    }
+                }
+            }
+            GateState::Stale => {
+                let _ = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+                let _ = service.try_command(crate::dev_sync::Command::Cancel);
+                let message = format!(
+                    "{}失败：外部提交票据已失效（闸门没有登记），已取消集成",
+                    task.short_label()
+                );
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.cancel_requested = true;
+                    state.pending_error = Some(message.clone());
+                    state.stage = crate::dev_sync::SyncOnceStage::Cancelling;
+                }
+                self.dev_sync_panel_task_state(cx, task, true, "持闸票据失效：取消", Some(message));
+                true
+            }
+            GateState::Failed(error) => {
+                let cancel = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+                let _ = service.try_command(crate::dev_sync::Command::Cancel);
+                let message = match cancel {
+                    Ok(()) => format!(
+                        "{}失败：持闸失败（{error}），已释放闸门并取消集成",
+                        task.short_label()
+                    ),
+                    Err(cancel_error) => format!(
+                        "{}失败：持闸失败（{error}），且释放闸门也失败（{cancel_error}）；\
+                         编辑器保持冻结（fail-closed）",
+                        task.short_label()
+                    ),
+                };
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.cancel_requested = true;
+                    state.pending_error = Some(message.clone());
+                    state.lease = None;
+                    state.stage = crate::dev_sync::SyncOnceStage::Cancelling;
+                }
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    "持闸失败：等真实收尾",
+                    Some(message),
+                );
+                true
+            }
+        }
+    }
+
+    /// `Integrating`（两阶段）：等 `Integrated`；收到后 `adopt → end → Finish`。
+    fn dev_sync_advance_integrating(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((task, op_id)) = self.dev_sync_sync.as_ref().and_then(|state| {
+            (state.two_phase && state.stage == crate::dev_sync::SyncOnceStage::Integrating)
+                .then(|| state.op_id.map(|op| (state.task, op)))
+                .flatten()
+        }) else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_deliver_two_phase_with_state(
+                cx,
+                state,
+                Some(crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：dev-sync 服务已不可用", task.short_label()),
+                }),
+            );
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                let Some(mut state) = self.dev_sync_sync.take() else {
+                    return false;
+                };
+                state.worker_settled = true;
+                // 集成可能已经提交：先交付已 durable 的变化、再 end，最后报告真实结果。
+                return self.dev_sync_deliver_two_phase_with_state(cx, state, Some(result.clone()));
+            }
+        }
+        if snapshot.worker_stopped {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_deliver_two_phase_with_state(
+                cx,
+                state,
+                Some(crate::dev_sync::OpResult::Failed {
+                    message: format!(
+                        "{}失败：worker 已停止（交付已 durable 变化后释放闸门）",
+                        task.short_label()
+                    ),
+                }),
+            );
+        }
+        let integrated = snapshot.two_phase.as_ref().is_some_and(|status| {
+            status.op_id == op_id && status.phase == crate::dev_sync::state::SyncPhase::Integrated
+        });
+        if integrated {
+            let Some(mut state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            if let Some(status) = snapshot.two_phase {
+                // ADR 0012 S3：本轮已应用 / 仍 deferred（续批的"有进展"判据）。
+                if let Some(auto) = self.dev_sync_auto.as_mut() {
+                    auto.note_integrated(status.integrated, status.deferred);
+                }
+                state.integrated_heads = status.changed_heads;
+            }
+            return self.dev_sync_deliver_two_phase_with_state(cx, state, None);
+        }
+        if snapshot.deadline_exceeded == Some(op_id) {
+            let first_time = self
+                .dev_sync_sync
+                .as_ref()
+                .is_some_and(|state| !state.deadline_noted);
+            if first_time {
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.deadline_noted = true;
+                }
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    format!("整合已超时（{op_id}）：保持 Held 等真实回执"),
+                    Some(format!(
+                        "{}超时：worker 仍可能在外写边界内；闸门保持 Held、不会解闸，\
+                         收到真实回执后才交付/释放",
+                        task.short_label()
+                    )),
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 两阶段收尾失败后的重试入口：用**已有**的闸门/租约重新交付，不重新 Prepare。
+    fn dev_sync_retry_two_phase_delivery(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.dev_sync_sync.take() else {
+            return false;
+        };
+        self.dev_sync_deliver_two_phase_with_state(cx, state, None)
+    }
+
+    /// `Finishing`：闸门已释放，等 worker 的 `Completed`（ack/push tail 的真实回执）。
+    fn dev_sync_advance_finishing(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((task, op_id)) = self.dev_sync_sync.as_ref().and_then(|state| {
+            (state.two_phase && state.stage == crate::dev_sync::SyncOnceStage::Finishing)
+                .then(|| state.op_id.map(|op| (state.task, op)))
+                .flatten()
+        }) else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：dev-sync 服务已不可用", task.short_label()),
+                },
+            );
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                let Some(mut state) = self.dev_sync_sync.take() else {
+                    return false;
+                };
+                state.worker_settled = true;
+                return self.dev_sync_finish_two_phase_with_state(cx, state, result.clone());
+            }
+        }
+        if snapshot.worker_stopped {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!(
+                        "{}失败：worker 已停止，未拿到收尾（ack）回执",
+                        task.short_label()
+                    ),
+                },
+            );
+        }
+        if snapshot.deadline_exceeded == Some(op_id) {
+            let first_time = self
+                .dev_sync_sync
+                .as_ref()
+                .is_some_and(|state| !state.deadline_noted);
+            if first_time {
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.deadline_noted = true;
+                }
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    format!("收尾已超时（{op_id}）：等真实回执"),
+                    Some(format!(
+                        "{}超时：闸门已释放（正文可编辑），但 operation slot 仍被占着；\
+                         等 worker 真实收尾，不派发第二操作",
+                        task.short_label()
+                    )),
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `Cancelling`（两阶段）：闸门已释放/从未持有，等 worker 真实回执后收尾。
+    fn dev_sync_advance_cancelling(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((task, op_id)) = self.dev_sync_sync.as_ref().and_then(|state| {
+            (state.two_phase && state.stage == crate::dev_sync::SyncOnceStage::Cancelling)
+                .then(|| state.op_id.map(|op| (state.task, op)))
+                .flatten()
+        }) else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{}失败：dev-sync 服务已不可用", task.short_label()),
+                },
+            );
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                let Some(mut state) = self.dev_sync_sync.take() else {
+                    return false;
+                };
+                state.worker_settled = true;
+                let pending = state.pending_error.take();
+                let result = match pending {
+                    Some(message) => crate::dev_sync::OpResult::Failed {
+                        message: match result {
+                            crate::dev_sync::OpResult::Failed { message: worker } => {
+                                format!("{message}（worker：{worker}）")
+                            }
+                            crate::dev_sync::OpResult::Ok { .. } => message,
+                        },
+                    },
+                    None => result.clone(),
+                };
+                return self.dev_sync_finish_two_phase_with_state(cx, state, result);
+            }
+        }
+        if snapshot.worker_stopped {
+            let Some(state) = self.dev_sync_sync.take() else {
+                return false;
+            };
+            let message = state
+                .pending_error
+                .clone()
+                .unwrap_or_else(|| format!("{}已取消", task.short_label()));
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: format!("{message}（worker 已停止，无终态回执）"),
+                },
+            );
+        }
+        false
+    }
+
+    /// [`Self::dev_sync_deliver_two_phase`] 的实现（状态已从 `dev_sync_sync` 取出）。
+    fn dev_sync_deliver_two_phase_with_state(
+        &mut self,
+        cx: &mut Context<Self>,
+        mut state: crate::dev_sync::ActiveSyncOnce,
+        terminal: Option<crate::dev_sync::OpResult>,
+    ) -> bool {
+        let (view, doc_id) = match state.target.two_phase_parts() {
+            Some(parts) => (parts.view, parts.doc_id),
+            None => {
+                return self.dev_sync_finish_two_phase_with_state(
+                    cx,
+                    state,
+                    terminal.unwrap_or_else(|| crate::dev_sync::OpResult::Failed {
+                        message: "同步内部错误：两阶段目标不可用".to_owned(),
+                    }),
+                );
+            }
+        };
+        let (Some(view), Some(doc_id)) = (view, doc_id) else {
+            // 还没持闸：没有可交付的会话（NeedGate/Cancelling 路径）。
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                terminal.unwrap_or_else(|| crate::dev_sync::OpResult::Failed {
+                    message: "同步内部错误：两阶段交付缺少活动文档".to_owned(),
+                }),
+            );
+        };
+        let Some(lease) = state.lease.clone() else {
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                terminal.unwrap_or_else(|| crate::dev_sync::OpResult::Failed {
+                    message: "同步内部错误：两阶段交付缺少租约".to_owned(),
+                }),
+            );
+        };
+
+        // 0) worker 是否上报过"结构投影失败"：结构 CRDT 已 durable，但本地 tree/notes
+        //    没追上。先照常交付正文，随后**保持写禁用**（见下面的投影复核）。
+        if let Some(crate::dev_sync::OpResult::Failed { message }) = terminal.as_ref() {
+            if message.contains(crate::dev_sync::sync_once::PROJECTION_FAILURE_MARKER) {
+                state.projection_failed = true;
+            }
+        }
+
+        // 1) 已 durable 的外部变化先交付进 live（失败不改头，但也绝不丢弃闸门）。
+        let mut changes = state.delivered_changes;
+        let mut delivery_error: Option<String> = None;
+        let mut heads = AppliedHeads::default();
+        match AppliedHeads::load(&self.vault, &doc_id) {
+            Ok(loaded) => heads = loaded,
+            Err(error) => delivery_error = Some(format!("读取库中 head 失败：{error}")),
+        }
+        if delivery_error.is_none() && heads.head_seq > lease.durable_head_seq() {
+            match prepare_committed_delta(&self.vault, &doc_id, lease.durable_head_seq()) {
+                Ok(prepared) => {
+                    changes = changes.saturating_add(prepared.updates.len());
+                    if let Err(error) = view.update(cx, |view, cx| {
+                        view.dev_sync_adopt_external(&lease, prepared, cx)
+                    }) {
+                        delivery_error = Some(format!("交付已落盘变化失败：{error}"));
+                    }
+                }
+                Err(error) => {
+                    delivery_error = Some(format!("读取已落盘变化失败：{error}"));
+                }
+            }
+        }
+
+        // 2) 释放闸门（end 会补齐 Held 期间新落库的行；applied 必须是库中当前 head）。
+        if delivery_error.is_none() {
+            if let Err(error) = view.update(cx, |view, cx| {
+                view.dev_sync_end_external(lease.clone(), heads, cx)
+            }) {
+                delivery_error = Some(format!("释放闸门失败：{error}"));
+            }
+        }
+
+        // 3) 视图泵：adopt 的 Remote → 镜像正文（不重开文档）。
+        let _ = view.update(cx, |view, cx| view.dev_sync_pump(cx));
+
+        if let Some(error) = delivery_error {
+            // fail-closed：闸门仍 Held，留给用户显式重试收尾。
+            state.stage = crate::dev_sync::SyncOnceStage::Delivering;
+            state.delivered_changes = changes;
+            state.pending_error = Some(error.clone());
+            let task = state.task;
+            let dispatched = state.dispatched_under_gate;
+            self.dev_sync_sync = Some(state);
+            let message = format!(
+                "{}收尾未完成：{error}；闸门仍持有（编辑器保持冻结），可再次点「{}」重试收尾",
+                task.short_label(),
+                task.short_label()
+            );
+            self.dev_sync_finish_report(
+                cx,
+                ReportParts {
+                    task,
+                    doc_id: Some(doc_id),
+                    dispatched_under_gate: dispatched,
+                    changes,
+                    error: Some(message),
+                    ..ReportParts::default()
+                }
+                .report(),
+            );
+            return true;
+        }
+
+        // 2b) 结构投影失败 → 保持写禁用（fail-closed）：正文已交付，但本地侧栏投影
+        //     还没有追上，不能 `end` 解闸、也不能假装刷新。用户再点「同步」会重试收尾
+        //     （先重新投影，成功后才 end/finish）。
+        if state.projection_failed {
+            let head_changed = load_head(&self.vault, STRUCTURE_DOC_ID)
+                .map(|head| head.head_seq != state.structure_base_seq)
+                .unwrap_or(true);
+            let projected = if head_changed {
+                self.dev_sync_refresh_structure_if_needed(cx, state.structure_base_seq)
+            } else {
+                true
+            };
+            if projected {
+                state.projection_failed = false;
+            } else {
+                let task = state.task;
+                let message = format!(
+                    "{}收尾未完成：结构投影失败（已交付 {changes} 条已落盘正文变化）；\
+                     闸门仍持有（编辑器保持冻结），可再次点「{}」重试收尾",
+                    task.short_label(),
+                    task.short_label()
+                );
+                state.stage = crate::dev_sync::SyncOnceStage::Delivering;
+                state.delivered_changes = changes;
+                state.pending_error = Some(message.clone());
+                self.dev_sync_sync = Some(state);
+                self.dev_sync_finish_report(
+                    cx,
+                    ReportParts {
+                        task,
+                        doc_id: Some(doc_id),
+                        dispatched_under_gate: true,
+                        changes,
+                        error: Some(message),
+                        ..ReportParts::default()
+                    }
+                    .report(),
+                );
+                return true;
+            }
+        }
+
+        state.delivered_changes = changes;
+        state.lease = None;
+        state.target = crate::dev_sync::SyncOnceTarget::TwoPhase {
+            view: Some(view),
+            doc_id: Some(doc_id),
+            ticket: None,
+        };
+
+        if let Some(result) = terminal {
+            // worker 已回真实终态：交付完成后照实报告（成功/失败都不再发 Finish）。
+            return self.dev_sync_finish_two_phase_with_state(cx, state, result);
+        }
+
+        // 4) 正常路径：闸门已释放，授权 worker 做 push tail + ack。
+        if state.finish_sent {
+            self.dev_sync_sync = Some(state);
+            return false;
+        }
+        let op_id = state.op_id;
+        let Some(service) = self.dev_sync_service(cx) else {
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: "收尾失败：dev-sync 服务已不可用（闸门已释放）".to_owned(),
+                },
+            );
+        };
+        let Some(op_id) = op_id else {
+            return self.dev_sync_finish_two_phase_with_state(
+                cx,
+                state,
+                crate::dev_sync::OpResult::Failed {
+                    message: "收尾失败：两阶段操作缺少 op id（内部错误）".to_owned(),
+                },
+            );
+        };
+        match service.finish_op(op_id) {
+            Ok(()) => {
+                state.finish_sent = true;
+                state.stage = crate::dev_sync::SyncOnceStage::Finishing;
+                let task = state.task;
+                self.dev_sync_sync = Some(state);
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    format!("已解闸，收尾中（{op_id}）"),
+                    Some(format!(
+                        "{}：已交付 {} 条变化并释放闸门，等待 ack",
+                        task.short_label(),
+                        changes
+                    )),
+                );
+                true
+            }
+            Err(error) => {
+                // 可能 worker 已经先回了真实终态（例如取消竞争）：以终态为准。
+                let snapshot = service.snapshot();
+                if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+                    if *completed_op == op_id {
+                        let mut state = state;
+                        state.worker_settled = true;
+                        return self.dev_sync_finish_two_phase_with_state(
+                            cx,
+                            state,
+                            result.clone(),
+                        );
+                    }
+                }
+                // 投递失败时发一条 Cancel 解开 worker 的 Finish 等待（不再需要授权收尾），
+                // 让它回到真实终态；否则单操作 slot 会一直占着。
+                let _ = service.try_command(crate::dev_sync::Command::Cancel);
+                state.pending_error = Some(format!("收尾授权失败：{error}（闸门已释放）"));
+                state.stage = crate::dev_sync::SyncOnceStage::Finishing;
+                let task = state.task;
+                self.dev_sync_sync = Some(state);
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    "闸门已释放，收尾授权失败",
+                    Some(format!(
+                        "{}：交付完成并解闸，但 Finish 发不出去（{error}）；等 worker 停止/真实回执",
+                        task.short_label()
+                    )),
+                );
+                true
+            }
+        }
+    }
+
+    /// 两阶段最终报告（不碰闸门：调用方已经交付/释放，或从未持闸）。
+    fn dev_sync_finish_two_phase_with_state(
+        &mut self,
+        cx: &mut Context<Self>,
+        state: crate::dev_sync::ActiveSyncOnce,
+        result: crate::dev_sync::OpResult,
+    ) -> bool {
+        let structure_refreshed =
+            self.dev_sync_refresh_structure_if_needed(cx, state.structure_base_seq);
+        let (error, worker_summary) = match result {
+            crate::dev_sync::OpResult::Ok { summary } => (None, Some(summary)),
+            crate::dev_sync::OpResult::Failed { message } => (Some(message), None),
+        };
+        let error = match (error, state.pending_error.clone()) {
+            (Some(message), Some(pending)) if !message.contains(&pending) => {
+                Some(format!("{pending}；{message}"))
+            }
+            (Some(message), _) => Some(message),
+            (None, Some(pending)) => Some(pending),
+            (None, None) => None,
+        };
+        self.dev_sync_finish_report(
+            cx,
+            ReportParts {
+                task: state.task,
+                doc_id: state.document_id().map(str::to_owned),
+                dispatched_under_gate: state.dispatched_under_gate,
+                changes: state.delivered_changes,
+                worker_summary,
+                error,
+                structure_refreshed,
+                ..ReportParts::default()
+            }
+            .report(),
+        );
+        true
+    }
+
+    /// `WaitingGate`：把闸门驱到 Held，然后**只派发一次** `SyncOnce`。
+    ///
+    /// 只有持闸路径会进这个阶段（无会话路径派发即 `WorkerRunning`），所以这里能从
+    /// [`crate::dev_sync::SyncOnceTarget::Held`] 取出活动文档/视图/票据。
+    fn dev_sync_advance_gate(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((
+            task,
+            crate::dev_sync::SyncOnceTarget::Held {
+                view,
+                ticket,
+                doc_id,
+            },
+        )) = self
+            .dev_sync_sync
+            .as_ref()
+            .map(|state| (state.task, state.target.clone()))
+        else {
+            return false;
+        };
+        match view.update(cx, |view, cx| view.dev_sync_poll_external(&ticket, cx)) {
+            GateState::WaitingIME | GateState::Flushing => {
+                // 等 IME 自然结束 / flush 到明确 durable：不改状态，下一帧继续 poll。
+                false
+            }
+            GateState::Held(lease) => {
+                let Some(service) = self.dev_sync_service(cx) else {
+                    return self.dev_sync_finish(
+                        cx,
+                        SyncOnceFinish::Failed(format!(
+                            "{}失败：dev-sync 服务已不可用（面板被释放？）",
+                            task.short_label()
+                        )),
+                    );
+                };
+                let gate = crate::dev_sync::HeldGate::new(
+                    doc_id.clone(),
+                    lease.durable_head_seq(),
+                    lease.generation().0,
+                );
+                // 发布基线也走这条路径：命令不同，持闸证明完全相同（切片 4c-4）。
+                match service.try_command_with_gate(task.command(), gate) {
+                    Ok(op_id) => {
+                        if let Some(state) = self.dev_sync_sync.as_mut() {
+                            state.lease = Some(lease);
+                            state.op_id = Some(op_id);
+                            state.stage = crate::dev_sync::SyncOnceStage::WorkerRunning;
+                            state.dispatched_under_gate = true;
+                        }
+                        self.dev_sync_panel_task_state(
+                            cx,
+                            task,
+                            true,
+                            format!("已持闸，worker {}中（{op_id}）", task.label()),
+                            Some(format!(
+                                "{}：已持闸，worker {}中",
+                                task.short_label(),
+                                task.label()
+                            )),
+                        );
+                        true
+                    }
+                    Err(busy) if busy.reason == crate::dev_sync::BusyReason::Cancelling => {
+                        // 单操作位被一个**已超时但还没真实收尾**的 op 占着：绝不能派发第二条，
+                        // 也绝不能解闸（那会与仍在集成的 worker 竞争）。保持 Held 等收尾。
+                        if let Some(state) = self.dev_sync_sync.as_mut() {
+                            state.lease = Some(lease);
+                            state.stage = crate::dev_sync::SyncOnceStage::Delivering;
+                            state.worker_settled = false;
+                        }
+                        let message = format!(
+                            "{}被拒绝：上一轮已超时、仍在等待 worker 真实收尾（{}）；\
+                             闸门保持持有（ReconcileRequired），不会派发第二操作",
+                            task.short_label(),
+                            busy.reason.label()
+                        );
+                        self.dev_sync_finish_report(
+                            cx,
+                            ReportParts {
+                                task,
+                                doc_id: Some(doc_id),
+                                dispatched_under_gate: false,
+                                error: Some(message),
+                                ..ReportParts::default()
+                            }
+                            .report(),
+                        );
+                        true
+                    }
+                    Err(busy) => {
+                        // 闸门已经 Held，但命令发不出去：仍然要先交付/释放，不能留下冻结的编辑器。
+                        // 这里没有派发任何 op（`op_id = None`），所以解闸是安全的。
+                        if let Some(state) = self.dev_sync_sync.as_mut() {
+                            state.lease = Some(lease);
+                            state.stage = crate::dev_sync::SyncOnceStage::Delivering;
+                        }
+                        self.dev_sync_finish(
+                            cx,
+                            SyncOnceFinish::Failed(format!(
+                                "{}失败：派发命令被拒绝（{}）",
+                                task.short_label(),
+                                busy.reason.label()
+                            )),
+                        )
+                    }
+                }
+            }
+            GateState::Stale => {
+                let message = format!(
+                    "{}失败：外部提交票据已失效（闸门没有登记）",
+                    task.short_label()
+                );
+                self.dev_sync_sync = None;
+                self.dev_sync_finish_report(
+                    cx,
+                    ReportParts {
+                        task,
+                        doc_id: Some(doc_id),
+                        error: Some(message),
+                        ..ReportParts::default()
+                    }
+                    .report(),
+                );
+                true
+            }
+            GateState::Failed(error) => {
+                // 闸门不会静默释放：用 cancel 显式释放（cancel 会先把已 durable 变化交付进 live）。
+                let cancel = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+                let message = match cancel {
+                    Ok(_) => format!("{}失败：持闸失败（{error}）", task.short_label()),
+                    Err(cancel_error) => format!(
+                        "{}失败：持闸失败（{error}），且释放闸门也失败（{cancel_error}）；\
+                         编辑器保持冻结",
+                        task.short_label()
+                    ),
+                };
+                self.dev_sync_sync = None;
+                self.dev_sync_finish_report(
+                    cx,
+                    ReportParts {
+                        task,
+                        doc_id: Some(doc_id),
+                        error: Some(message),
+                        ..ReportParts::default()
+                    }
+                    .report(),
+                );
+                true
+            }
+        }
+    }
+
+    /// `WorkerRunning`：等 worker 的终态（成功或失败），然后收尾。
+    ///
+    /// 观察点是 [`SyncService::snapshot`] 里的 `last_completed`（服务端保留、不被消费），
+    /// 因此面板自己的 40 ms 事件泵不会把这条事件"吃掉"。
+    fn dev_sync_advance_worker(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((task, op_id, no_session, doc_id)) =
+            self.dev_sync_sync.as_ref().and_then(|state| {
+                state.op_id.map(|op| {
+                    (
+                        state.task,
+                        op,
+                        state.is_no_session(),
+                        state.document_id().map(str::to_owned),
+                    )
+                })
+            })
+        else {
+            return false;
+        };
+        let Some(service) = self.dev_sync_service(cx) else {
+            // 面板被释放（窗口关闭）：只能报告，不假装成功。
+            self.dev_sync_sync = None;
+            self.dev_sync_finish_report(
+                cx,
+                ReportParts {
+                    task,
+                    doc_id,
+                    no_session,
+                    // 无会话路径从来没有持闸证明；有会话路径的命令确实在 Held 下派发过。
+                    dispatched_under_gate: !no_session,
+                    error: Some(format!(
+                        "{}失败：dev-sync 服务已不可用（面板被释放）",
+                        task.short_label()
+                    )),
+                    ..ReportParts::default()
+                }
+                .report(),
+            );
+            return true;
+        };
+        let snapshot = service.snapshot();
+        if let Some((completed_op, _heads, result)) = &snapshot.last_completed {
+            if *completed_op == op_id {
+                // 真实 `Completed` = worker 已结束本轮外部写：这是允许解闸的可靠回执。
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.worker_settled = true;
+                }
+                return match result.clone() {
+                    crate::dev_sync::OpResult::Ok { summary } => {
+                        self.dev_sync_finish(cx, SyncOnceFinish::Ok(summary))
+                    }
+                    crate::dev_sync::OpResult::Failed { message } => {
+                        self.dev_sync_finish(cx, SyncOnceFinish::Failed(message))
+                    }
+                };
+            }
+        }
+        if snapshot.worker_stopped {
+            // `Stopped` 回执 = worker 已退出，不会再有未来外部写：同样允许解闸。
+            if let Some(state) = self.dev_sync_sync.as_mut() {
+                state.worker_settled = true;
+            }
+            return self.dev_sync_finish(
+                cx,
+                SyncOnceFinish::Failed(format!(
+                    "{}失败：worker 已停止，未拿到本次任务的明确终态",
+                    task.short_label()
+                )),
+            );
+        }
+        // 看门狗只把 op 标成 `Cancelling`（ADR 0012 S1）：**保持 Held**、不派发第二条，
+        // 等真实终态。这里只把这件事写进面板一次（不每帧重复通知）。
+        if snapshot.deadline_exceeded == Some(op_id) {
+            let first_time = self
+                .dev_sync_sync
+                .as_ref()
+                .is_some_and(|state| !state.deadline_noted);
+            if first_time {
+                if let Some(state) = self.dev_sync_sync.as_mut() {
+                    state.deadline_noted = true;
+                }
+                let label = task.short_label();
+                self.dev_sync_panel_task_state(
+                    cx,
+                    task,
+                    true,
+                    format!("已超时（{op_id}）：等待 worker 真实收尾"),
+                    Some(format!(
+                        "{label}超时：worker 仍可能在外写边界内，闸门保持持有，不会派发第二操作、\
+                         也不会解闸；收到真实回执后才收尾（若长期无回执请重启实例）"
+                    )),
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 收尾：按"有没有活动文档"分叉（见 [`crate::dev_sync::SyncOnceTarget`]）。
+    ///
+    /// - **持闸路径**（有活动文档）：交付已 durable 的变化 → `end` 释放闸门 → 泵视图 →
+    ///   按需重投影结构树（本函数内联的原有语义）；
+    /// - **无会话路径**（没有活动文档）：没有闸门/租约/adopt，只重投影结构树 + 自动打开
+    ///   第一篇（[`Self::dev_sync_finish_no_session`]）。
+    ///
+    /// 失败语义（ADR 0009 切片 3a/4c-2）：
+    /// - 已 durable 的外部行**先交付**再释放（不丢数据）；
+    /// - 交付/释放本身失败 → **保持 Held**（不静默解冻），阶段留在 `Delivering`，
+    ///   用户再点「同步」会重试收尾；
+    /// - 成功释放后才写最终报告（失败时正文不变、闸门无残留）；
+    /// - 无会话路径没有闸门可残留：失败只保留错误并释放 busy 状态。
+    fn dev_sync_finish(&mut self, cx: &mut Context<Self>, finish: SyncOnceFinish) -> bool {
+        let Some(mut state) = self.dev_sync_sync.take() else {
+            return false;
+        };
+        // 两阶段有自己的交付/收尾路径（见 `dev_sync_deliver_two_phase_with_state`）：
+        // 旧路径不能把它当成 `Held` 目标处理。
+        if state.two_phase {
+            let result = match finish {
+                SyncOnceFinish::Ok(summary) => crate::dev_sync::OpResult::Ok { summary },
+                SyncOnceFinish::Failed(message) => crate::dev_sync::OpResult::Failed { message },
+            };
+            return self.dev_sync_deliver_two_phase_with_state(cx, state, Some(result));
+        }
+        // 无会话路径：没有闸门/租约/adopt，只按结构 head 重投影 + 自动打开第一篇
+        //（结构→正文依赖已由 worker 的 Integrate 收敛，UI 不再补轮）。
+        if state.is_no_session() {
+            return self.dev_sync_finish_no_session(cx, state, finish);
+        }
+        let crate::dev_sync::SyncOnceTarget::Held {
+            doc_id,
+            view,
+            ticket,
+        } = state.target.clone()
+        else {
+            // `is_no_session()` 已经拦下另一条路径：走到这里说明目标被换过（内部错误）。
+            self.dev_sync_finish_report(
+                cx,
+                ReportParts {
+                    task: state.task,
+                    error: Some("同步内部错误：在途同步的目标不可用".to_owned()),
+                    ..ReportParts::default()
+                }
+                .report(),
+            );
+            return true;
+        };
+        let Some(lease) = state.lease.clone() else {
+            // 还没 Held 就退出（Stale/Failed/派发前失败）：只能 cancel 释放票据。
+            let cancel = view.update(cx, |view, cx| view.dev_sync_cancel_external(&ticket, cx));
+            let message = match finish {
+                SyncOnceFinish::Ok(summary) => {
+                    format!("{}结束（未进入 Held）：{summary}", state.task.short_label())
+                }
+                SyncOnceFinish::Failed(message) => message,
+            };
+            // 票据释放失败要如实写进报告：否则下一次 begin 会拿到 AlreadyHeld，用户不知道为什么。
+            let message = match cancel {
+                Ok(_) => message,
+                Err(error) => format!("{message}（释放闸门票据失败：{error}）"),
+            };
+            self.dev_sync_finish_report(
+                cx,
+                ReportParts {
+                    task: state.task,
+                    doc_id: Some(doc_id),
+                    error: Some(message),
+                    ..ReportParts::default()
+                }
+                .report(),
+            );
+            return true;
+        };
+
+        // 0) fail-closed 守卫（ADR 0012 S1）：没有真实收尾回执就**绝不**解闸。
+        //
+        //    看门狗只产生 `Cancelling`，不会伪造可解闸的终态；只有收到真实 `Completed`
+        //    （含失败）或 `Stopped`，或本次任务根本没派发过 op，才允许继续交付/`end`。
+        //    不满足时保持 Held，并明确要求对账（重启实例或显式重试收尾）。
+        let receipt_ok =
+            crate::dev_sync::sync_once::release_gate_allowed(state.op_id, state.worker_settled)
+                && (state.op_id.is_some() || self.dev_sync_no_unsettled_worker_op(cx));
+        if !receipt_ok {
+            let task = state.task;
+            let dispatched = state.dispatched_under_gate;
+            let op_id = state.op_id;
+            state.stage = crate::dev_sync::SyncOnceStage::Delivering;
+            self.dev_sync_sync = Some(state);
+            let op = op_id.map_or_else(|| "未知".to_owned(), |op| op.to_string());
+            let message = format!(
+                "{}收尾被拒绝：未收到 worker 真实完成/停止回执（{op}）；\
+                 闸门保持持有（ReconcileRequired），请联系对账：重启实例或显式重试收尾",
+                task.short_label()
+            );
+            self.dev_sync_finish_report(
+                cx,
+                ReportParts {
+                    task,
+                    doc_id: Some(doc_id),
+                    dispatched_under_gate: dispatched,
+                    error: Some(message),
+                    ..ReportParts::default()
+                }
+                .report(),
+            );
+            return true;
+        }
+
+        // 1) 已 durable 的外部变化先交付（正常路径 = prepare → adopt；失败路径同样不丢）。
+        let mut changes = 0usize;
+        let mut delivery_error: Option<String> = None;
+        let mut heads = AppliedHeads::default();
+        match AppliedHeads::load(&self.vault, &doc_id) {
+            Ok(loaded) => heads = loaded,
+            Err(error) => {
+                delivery_error = Some(format!("读取库中 head 失败：{error}"));
+            }
+        }
+        if delivery_error.is_none() && heads.head_seq > lease.durable_head_seq() {
+            match prepare_committed_delta(&self.vault, &doc_id, lease.durable_head_seq()) {
+                Ok(prepared) => {
+                    changes = prepared.updates.len();
+                    if let Err(error) = view.update(cx, |view, cx| {
+                        view.dev_sync_adopt_external(&lease, prepared, cx)
+                    }) {
+                        delivery_error = Some(format!("交付已落盘变化失败：{error}"));
+                    }
+                }
+                Err(error) => {
+                    delivery_error = Some(format!("读取已落盘变化失败：{error}"));
+                }
+            }
+        }
+
+        // 2) 释放闸门（end 会补齐 Held 期间新落库的行；`applied` 必须是库中当前 head）。
+        if delivery_error.is_none() {
+            if let Err(error) =
+                view.update(cx, |view, cx| view.dev_sync_end_external(lease, heads, cx))
+            {
+                delivery_error = Some(format!("释放闸门失败：{error}"));
+            }
+        }
+
+        // 3) 视图泵：adopt 的 `Remote` → 镜像正文（不重开文档）。
+        let _ = view.update(cx, |view, cx| view.dev_sync_pump(cx));
+
+        // 4) 收尾失败：保持 Held（fail-closed），留给用户重试。
+        if let Some(error) = delivery_error {
+            state.stage = crate::dev_sync::SyncOnceStage::Delivering;
+            let task = state.task;
+            let dispatched = state.dispatched_under_gate;
+            self.dev_sync_sync = Some(state);
+            let message = format!(
+                "{}收尾未完成：{error}；闸门仍持有（编辑器保持冻结），可再次点「{}」重试收尾",
+                task.short_label(),
+                task.short_label()
+            );
+            self.dev_sync_finish_report(
+                cx,
+                ReportParts {
+                    task,
+                    doc_id: Some(doc_id),
+                    dispatched_under_gate: dispatched,
+                    changes,
+                    error: Some(message),
+                    ..ReportParts::default()
+                }
+                .report(),
+            );
+            return true;
+        }
+
+        // 5) 结构树：只有结构 head 真的变了才重放 + 重投影 + 刷新侧栏（不假刷新）。
+        let structure_refreshed =
+            self.dev_sync_refresh_structure_if_needed(cx, state.structure_base_seq);
+
+        // 6) 最终报告 + 面板文案。
+        let (error, worker_summary) = match finish {
+            SyncOnceFinish::Ok(summary) => (None, Some(summary)),
+            SyncOnceFinish::Failed(message) => (Some(message), None),
+        };
+        self.dev_sync_finish_report(
+            cx,
+            ReportParts {
+                task: state.task,
+                doc_id: Some(doc_id),
+                dispatched_under_gate: state.dispatched_under_gate,
+                changes,
+                worker_summary,
+                error,
+                structure_refreshed,
+                ..ReportParts::default()
+            }
+            .report(),
+        );
+        true
+    }
+
+    /// 无会话同步的收尾（没有活动文档）：重投影结构树 → 自动打开第一篇。
+    ///
+    /// 没有闸门、没有租约、没有 adopt，所以这里只有两步：
+    ///
+    /// 1. 结构 head 变了才重放 + 重投影 + `refresh_tree`（`dev_sync_refresh_structure_if_needed`
+    ///    是幂等的；没变就**不碰**它——不假刷新）；
+    /// 2. 成功且当前仍没有活动文档时，自动打开树里的第一篇笔记（失败只记日志，不 panic）。
+    ///
+    /// **不再补一轮网络同步**（ADR 0012 S2b）：结构→正文的依赖已在 worker 的 Integrate
+    /// 阶段内收敛（结构先集成 → 只投影建立 body 行 → 正文公平续批/同轮重试 deferred），
+    /// 所以一次点击就同时拿到结构与正文。UI 只保留结构 head 变化时的侧栏刷新。
+    ///
+    /// 失败时也刷新树（integrate 可能已经追加了部分结构行），但不替用户打开文档。
+    fn dev_sync_finish_no_session(
+        &mut self,
+        cx: &mut Context<Self>,
+        state: crate::dev_sync::ActiveSyncOnce,
+        finish: SyncOnceFinish,
+    ) -> bool {
+        // 1) 结构树：head 变了才重放 + 重投影 + 刷新侧栏（不假刷新）。
+        let structure_refreshed =
+            self.dev_sync_refresh_structure_if_needed(cx, state.structure_base_seq);
+        // 2) 树里出现笔记且当前没有活动文档 → 自动打开第一篇（"空库同步完就能直接写"）。
+        let succeeded = matches!(finish, SyncOnceFinish::Ok(_));
+        let opened_note = if succeeded {
+            self.open_first_note_after_sync(cx)
+        } else {
+            None
+        };
+        // 3) 最终报告 + 面板文案（失败只保留错误，不再冻结任何后续操作）。
+        let (error, worker_summary) = match finish {
+            SyncOnceFinish::Ok(summary) => (None, Some(summary)),
+            SyncOnceFinish::Failed(message) => (Some(message), None),
+        };
+        self.dev_sync_finish_report(
+            cx,
+            ReportParts {
+                doc_id: None,
+                no_session: true,
+                changes: 0,
+                worker_summary,
+                error,
+                structure_refreshed,
+                opened_note,
+                ..ReportParts::default()
+            }
+            .report(),
+        );
+        true
+    }
+
+    /// 同步结束后自动打开树里的第一篇笔记（只在没有活动文档时调用）。
+    ///
+    /// 返回被打开的标题；树里没有笔记 / 打开失败返回 `None`（失败只记日志，不 panic）。
+    /// 打开成功时同步把侧栏选中态指到它，`open_entry` 自己负责建会话、读库并刷新树。
+    fn open_first_note_after_sync(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let index = self.tree.iter().position(TreeEntry::is_note)?;
+        let title = self.tree[index].title.clone();
+        let node_id = self.tree[index].node_id.clone();
+        self.selected_node_id = Some(node_id.clone());
+        self.open_entry(index, cx);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.node_id == node_id)
+        {
+            eprintln!("[menghunote] 同步完成后自动打开第一篇笔记「{title}」");
+            Some(title)
+        } else {
+            eprintln!("[menghunote] 同步完成后自动打开「{title}」失败（详见 stderr）");
+            None
+        }
+    }
+
+    /// 写最终报告并更新面板两行（同步行 + 最近操作）。
+    fn dev_sync_finish_report(
+        &mut self,
+        cx: &mut Context<Self>,
+        report: crate::dev_sync::SyncOnceReport,
+    ) -> bool {
+        // 失败但闸门仍 Held（收尾没完成）时不能显示"闸门已释放"——那是假话。
+        let gate_still_held = self.dev_sync_sync.is_some();
+        let task = report.task;
+        let line = if report.is_ok() {
+            if report.no_session {
+                // 无会话路径没有"交付 N 条变化"这回事，别照抄持闸路径的措辞。
+                "完成（无会话同步）".to_owned()
+            } else if task == crate::dev_sync::GatedTask::PublishBaseline {
+                "初始基线已发布".to_owned()
+            } else {
+                format!("完成（{} 条变化）", report.changes)
+            }
+        } else if gate_still_held {
+            "收尾未完成（闸门仍持有）".to_owned()
+        } else if report.no_session {
+            "失败（无会话同步）".to_owned()
+        } else {
+            format!("{}失败（闸门已释放）", task.short_label())
+        };
+        let notice = report.notice.clone();
+        let ok = report.is_ok();
+        // 面板行先写（此时自动轮的来源标记还在，面板显示「自动同步：…」），
+        // 再交回调度器记账（退避/续批/状态行）；发布基线不参与。
+        self.dev_sync_panel_task_state(cx, task, gate_still_held, line, Some(notice));
+        self.dev_sync_auto_finish_round(&report);
+        self.dev_sync_last_report = Some(report);
+        // ADR 0010 切片 2a-2：同步成功后自动刷新一次设备列表（`auth_rev` 可能已被别的
+        // 管理设备推进）。只置待办、由面板的 40 ms 泵在空闲时派发——不在这一帧发命令，
+        // 免得和用户紧接着点的「同步」抢单操作串行位。
+        if ok {
+            if let Some(panel) = self.dev_sync.clone() {
+                panel.update(cx, |panel, _cx| panel.request_device_refresh());
+            }
+        }
+        true
+    }
+
+    /// 结构 head 变了才重放结构文档 + 重投影 + 刷新侧栏。
+    ///
+    /// 为什么能"只补投影"：`StructureWriter::commit` 在没有新 op 时只做一次全量投影
+    /// （幂等），不会凭空改 CRDT。结构没变就**不碰**它（不假刷新）。
+    fn dev_sync_refresh_structure_if_needed(
+        &mut self,
+        cx: &mut Context<Self>,
+        base_seq: u64,
+    ) -> bool {
+        let changed = load_head(&self.vault, STRUCTURE_DOC_ID)
+            .map(|head| head.head_seq != base_seq)
+            .unwrap_or(false);
+        if !changed {
+            return false;
+        }
+        let mut writer = match StructureWriter::open_with_sync(&self.vault, self.peer_id, self.sync)
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                eprintln!("[menghunote] 同步后重放结构文档失败：{error:?}");
+                return false;
+            }
+        };
+        if let Err(error) = writer.commit("dev-sync-refresh") {
+            eprintln!("[menghunote] 同步后结构投影失败：{error:?}");
+            return false;
+        }
+        self.refresh_tree();
+        cx.notify();
+        true
+    }
+
+    /// 服务里是否**没有**在途/超时待收尾的 worker op（解闸守卫的第二个条件）。
+    ///
+    /// 只在"本次任务根本没派发 op"时用到：必须确认不是另一个已超时的 op 仍占着单操作位，
+    /// 否则解闸会与仍在 `integrate` 的 worker 竞争。服务不可用（面板被释放）时按
+    /// fail-closed 返回 `false`。
+    fn dev_sync_no_unsettled_worker_op(&self, cx: &App) -> bool {
+        self.dev_sync_service(cx).is_some_and(|service| {
+            let snapshot = service.snapshot();
+            snapshot.in_flight.is_none() && snapshot.deadline_exceeded.is_none()
+        })
+    }
+
+    /// 面板的服务（`None` = 面板没挂）。
+    fn dev_sync_service(&self, cx: &App) -> Option<std::sync::Arc<crate::dev_sync::SyncService>> {
+        self.dev_sync
+            .as_ref()
+            .map(|panel| panel.read(cx).service().clone())
+    }
+
+    /// 写面板的「同步行 + 最近操作」（只在 tick 上下文调用，不能在面板事件回调里调用）。
+    fn dev_sync_panel_state(
+        &mut self,
+        cx: &mut Context<Self>,
+        busy: bool,
+        line: impl Into<String>,
+        notice: Option<String>,
+    ) {
+        self.dev_sync_panel_task_state(
+            cx,
+            crate::dev_sync::GatedTask::SyncOnce,
+            busy,
+            line,
+            notice,
+        );
+    }
+
+    /// 按任务种类写面板的「持闸任务行 + 最近操作」（同步 / 发布基线共用一行）。
+    fn dev_sync_panel_task_state(
+        &mut self,
+        cx: &mut Context<Self>,
+        task: crate::dev_sync::GatedTask,
+        busy: bool,
+        line: impl Into<String>,
+        notice: Option<String>,
+    ) {
+        let Some(panel) = self.dev_sync.clone() else {
+            return;
+        };
+        let line = line.into();
+        let auto_round = task == crate::dev_sync::GatedTask::SyncOnce
+            && self.dev_sync_round_origin == Some(crate::dev_sync::OpOrigin::Auto);
+        panel.update(cx, |panel, cx| {
+            match task {
+                crate::dev_sync::GatedTask::SyncOnce if auto_round => {
+                    panel.set_auto_sync_state(busy, line);
+                }
+                crate::dev_sync::GatedTask::SyncOnce => panel.set_sync_state(busy, line),
+                crate::dev_sync::GatedTask::PublishBaseline => panel.set_publish_state(busy, line),
+            }
+            if let Some(notice) = notice {
+                panel.set_notice(notice);
+            }
+            cx.notify();
+        });
+    }
+
+    /// 每 40 ms 泵一次持闸同步（只在有同步在途/有请求时才动，空闲不打扰编辑器）。
+    fn spawn_dev_sync_ticker(&self, cx: &mut Context<Self>) {
+        let timers = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| loop {
+            timers
+                .timer(crate::dev_sync::sync_once::SYNC_PUMP_INTERVAL)
+                .await;
+            let updated = this.update(cx, |shell, cx| {
+                // ADR 0012 S3：自动同步的时钟由 `AutoSync` 注入（测试用手动时钟且
+                // `ticker: false`，于是这里完全不跑，只有显式 `dev_sync_auto_tick`）。
+                let auto_ticked = if shell
+                    .dev_sync_auto
+                    .as_ref()
+                    .is_some_and(crate::dev_sync::AutoSync::ticker_enabled)
+                {
+                    shell.dev_sync_auto_tick(cx)
+                } else {
+                    false
+                };
+                if auto_ticked
+                    || shell.dev_sync_sync.is_some()
+                    || shell.dev_sync_requested
+                    || shell.dev_sync_publish_requested
+                {
+                    shell.dev_sync_pump(cx);
+                }
+            });
+            if updated.is_err() {
+                // 视图已释放（窗口关闭）：结束循环。
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// 只读：当前活动文档的镜像正文（测试断言用）。
+    #[must_use]
+    pub fn dev_sync_current_text(&self, cx: &App) -> Option<String> {
+        self.active
+            .as_ref()
+            .map(|active| active.view.read(cx).dev_sync_current_text())
+    }
+
+    /// 对活动视图执行一次需要 `&mut Context<AppShell>` 的转发。
+    fn update_active_view<R>(
+        &self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut EditorView, &mut Context<EditorView>) -> R,
+    ) -> Option<R> {
+        self.active
+            .as_ref()
+            .map(|active| active.view.update(cx, |view, cx| f(view, cx)))
+    }
+}
+
+/// 组装同步报告的材料（notice 由这些字段派生，避免调用点各写一遍）。
+///
+/// 两条路径共用：持闸路径填 `doc_id`/`changes`/`dispatched_under_gate`；无会话路径
+/// `no_session = true`、`doc_id = None`、`changes = 0`（没有视图可交付）。
+#[cfg(feature = "dev-sync")]
+#[derive(Debug, Default)]
+struct ReportParts {
+    /// 本次持闸任务的种类（同步 / 发布基线；无会话同步恒为 `SyncOnce`）。
+    task: crate::dev_sync::GatedTask,
+    /// 本次同步的活动文档（无会话路径 = `None`）。
+    doc_id: Option<String>,
+    /// 是否走无会话路径（没有闸门/没有 adopt）。
+    no_session: bool,
+    /// 是否在 Held 下派发过（无会话路径恒为 `false`）。
+    dispatched_under_gate: bool,
+    /// 交进 live 的已 durable 变化条数（无会话路径恒为 0）。
+    changes: usize,
+    /// worker 摘要（失败时 `None`）。
+    worker_summary: Option<String>,
+    /// 明确失败原因。
+    error: Option<String>,
+    /// 结构 head 变了才为 `true`（不假刷新）。
+    structure_refreshed: bool,
+    /// 同步后自动打开的笔记标题（仅无会话路径 + 树里出现笔记）。
+    opened_note: Option<String>,
+}
+
+#[cfg(feature = "dev-sync")]
+impl ReportParts {
+    /// 派生面板 notice 并产出最终报告。
+    ///
+    /// notice 的措辞按路径分开——无会话路径没有"交付已落盘变化"这回事，不能沿用
+    /// 持闸路径的措辞（否则面板会宣称一件没发生的事）。
+    fn report(self) -> crate::dev_sync::SyncOnceReport {
+        let structure = if self.structure_refreshed {
+            "，结构树已更新"
+        } else {
+            ""
+        };
+        let notice = match (&self.error, self.task) {
+            (None, crate::dev_sync::GatedTask::SyncOnce) if self.no_session => {
+                let opened = self
+                    .opened_note
+                    .as_ref()
+                    .map(|title| format!("，已打开「{title}」"))
+                    .unwrap_or_default();
+                format!("同步完成：无会话同步{structure}{opened}")
+            }
+            (None, crate::dev_sync::GatedTask::SyncOnce) => {
+                format!("同步完成：{} 条变化{structure}", self.changes)
+            }
+            // 发布：worker 的摘要是公开事实（checkpoint 短 id / 覆盖 seq / B 可以 Join），
+            // 直接当 notice；缺摘要时不能编造细节。
+            (None, crate::dev_sync::GatedTask::PublishBaseline) => self
+                .worker_summary
+                .clone()
+                .unwrap_or_else(|| "初始基线已发布（B 现在可以 Join）".to_owned()),
+            (Some(error), _) if self.no_session => format!("同步失败：{error}{structure}"),
+            (Some(error), crate::dev_sync::GatedTask::SyncOnce) => format!(
+                "同步失败：{error}（已交付 {} 条已落盘变化{structure}）",
+                self.changes
+            ),
+            (Some(error), crate::dev_sync::GatedTask::PublishBaseline) => format!(
+                "发布基线失败：{error}（已交付 {} 条已落盘变化{structure}）",
+                self.changes
+            ),
+        };
+        crate::dev_sync::SyncOnceReport {
+            task: self.task,
+            doc_id: self.doc_id,
+            no_session: self.no_session,
+            dispatched_under_gate: self.dispatched_under_gate,
+            changes: self.changes,
+            worker_summary: self.worker_summary,
+            error: self.error,
+            structure_refreshed: self.structure_refreshed,
+            opened_note: self.opened_note,
+            notice,
+        }
+    }
+}
+
+/// 持闸同步的终态（worker 回执；`Ok` 带 worker 摘要，`Failed` 带明确原因）。
+#[cfg(feature = "dev-sync")]
+#[derive(Debug, Clone)]
+enum SyncOnceFinish {
+    /// worker 正常完成。
+    Ok(String),
+    /// worker 明确失败（或命令没派发出去）。
+    Failed(String),
+}
+
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 输入框刚创建时拿不到 `&mut Window`（订阅回调里没有），在这一帧补一次焦点。
@@ -1389,6 +4490,9 @@ impl Render for AppShell {
             self.activation_observed = true;
             self.activation_subscription =
                 Some(cx.observe_window_activation(window, |shell, window, cx| {
+                    // ADR 0012 S3：失焦降到 60s；重新聚焦时若有 durable 待办合并一次探测。
+                    #[cfg(feature = "dev-sync")]
+                    shell.dev_sync_auto_on_activation(window.is_window_active(), cx);
                     if window.is_window_active() || shell.menu.is_none() {
                         return;
                     }
@@ -1432,7 +4536,7 @@ impl Render for AppShell {
         let search = self.search.clone();
         // 菜单渲染在**根层**：侧栏是 `overflow_y_scroll`，放里面会被裁掉。
         let popup = self.render_menu(window, cx);
-        div()
+        let root = div()
             .relative()
             .size_full()
             .flex()
@@ -1469,7 +4573,12 @@ impl Render for AppShell {
             .child(sidebar)
             .child(main)
             .when_some(popup, |this, popup| this.child(popup))
-            .when_some(search, |this, search| this.child(search))
+            .when_some(search, |this, search| this.child(search));
+        // dev-only 同步面板（覆盖层）：只有 feature + 运行时门禁都通过才存在；
+        // 未启用时 `None` → 不渲染、不占布局（默认构建里连字段都不存在）。
+        #[cfg(feature = "dev-sync")]
+        let root = root.when_some(self.dev_sync.clone(), |this, panel| this.child(panel));
+        root
     }
 }
 
