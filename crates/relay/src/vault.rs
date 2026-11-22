@@ -11,6 +11,7 @@ use crate::config::RelayConfig;
 use crate::db::schema;
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{ct_eq, random_hash32, random_id16, sha256, sha256_parts, Hash32, Id16};
+use crate::registry;
 use crate::scope::{ScopeConn, VaultScope};
 use crate::sig::{require, Expectation, SignDomain, SignatureCheck, SignatureHook};
 use crate::time::Clock;
@@ -45,6 +46,36 @@ impl VaultState {
     }
 }
 
+/// vault 授权状态（ADR 0015 §DDL）。schema 12 只做投影，**V2 语义在 S4b**：
+/// - `legacy`：v1 语义（旧 vault 默认值；`authz_rev/authority_rev = 0`）；
+/// - `active`：已完成 UpgradePolicy，V2 控制链与 cap 生效；
+/// - `recovery_only`：可用设备不足两台，只许离线恢复根 Reset。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthzState {
+    Legacy,
+    Active,
+    RecoveryOnly,
+}
+
+impl AuthzState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Active => "active",
+            Self::RecoveryOnly => "recovery_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "legacy" => Some(Self::Legacy),
+            "active" => Some(Self::Active),
+            "recovery_only" => Some(Self::RecoveryOnly),
+            _ => None,
+        }
+    }
+}
+
 /// 单行 vault（某个租户）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vault {
@@ -64,6 +95,21 @@ pub struct Vault {
     pub normal_limit: i64,
     pub maintenance_limit: i64,
     pub created_at: i64,
+    // ---- ADR 0015 S4a2 的授权投影（S4b 才消费；v1 只读前 16 个字段）----
+    /// 授权协议版本：1 = v1 legacy，2 = ManagementCapV2。
+    pub authz_version: u8,
+    /// 授权状态版本（授权变化 +1；cap 自然到期不加）。
+    pub authz_rev: u64,
+    /// 离线恢复根代（换恢复钥/Reset +1）。
+    pub authority_rev: u64,
+    /// 离线恢复根公钥（`recovery_pub`；legacy 为 None）。
+    pub recovery_pub: Option<[u8; 32]>,
+    /// `CDE(PolicyV2)` 原始字节（legacy 为 None）。
+    pub policy_bytes: Option<Vec<u8>>,
+    /// 完成 UpgradePolicy 的控制提交 rev（legacy 为 None）。
+    pub upgrade_control_rev: Option<u64>,
+    /// 授权状态机（legacy/active/recovery_only）。
+    pub authz_state: AuthzState,
 }
 
 /// 资产/对象里的 epoch 宽度是 u64，但 SQLite 存 INTEGER（i64）；统一在这里收口。
@@ -160,7 +206,9 @@ pub fn load_opt(conn: &ScopeConn) -> Result<Option<Vault>> {
     let mut stmt = conn.prepare(
         "SELECT vault_id, instance_id, log_id, log_incarnation, cursor_key, state,
                 active_epoch, next_epoch, manager_rev, control_rev, auth_rev,
-                head_seq, gc_floor, normal_limit, maintenance_limit, created_at
+                head_seq, gc_floor, normal_limit, maintenance_limit, created_at,
+                authz_version, authz_rev, authority_rev, recovery_pub, policy_bytes,
+                upgrade_control_rev, authz_state
          FROM vaults WHERE vault_id = ?1",
     )?;
     let row = stmt
@@ -182,6 +230,13 @@ pub fn load_opt(conn: &ScopeConn) -> Result<Option<Vault>> {
                 row.get::<_, i64>(13)?,
                 row.get::<_, i64>(14)?,
                 row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, i64>(18)?,
+                row.get::<_, Option<Vec<u8>>>(19)?,
+                row.get::<_, Option<Vec<u8>>>(20)?,
+                row.get::<_, Option<i64>>(21)?,
+                row.get::<_, String>(22)?,
             ))
         })
         .optional()?;
@@ -202,9 +257,29 @@ pub fn load_opt(conn: &ScopeConn) -> Result<Option<Vault>> {
         normal_limit,
         maintenance_limit,
         created_at,
+        authz_version,
+        authz_rev,
+        authority_rev,
+        recovery_pub,
+        policy_bytes,
+        upgrade_control_rev,
+        authz_state,
     )) = row
     else {
         return Ok(None);
+    };
+    let recovery_pub = match recovery_pub {
+        None => None,
+        Some(bytes) => Some(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Invariant("vaults.recovery_pub"))?,
+        ),
+    };
+    let upgrade_control_rev = match upgrade_control_rev {
+        None => None,
+        Some(value) => Some(u64_from_i64(value, "vaults.upgrade_control_rev")?),
     };
     Ok(Some(Vault {
         vault_id: id16_from_blob(vault_id, "vaults.vault_id")?,
@@ -223,6 +298,15 @@ pub fn load_opt(conn: &ScopeConn) -> Result<Option<Vault>> {
         normal_limit,
         maintenance_limit,
         created_at,
+        authz_version: u8::try_from(authz_version)
+            .map_err(|_| Error::Invariant("vaults.authz_version"))?,
+        authz_rev: u64_from_i64(authz_rev, "vaults.authz_rev")?,
+        authority_rev: u64_from_i64(authority_rev, "vaults.authority_rev")?,
+        recovery_pub,
+        policy_bytes,
+        upgrade_control_rev,
+        authz_state: AuthzState::parse(&authz_state)
+            .ok_or(Error::Invariant("vaults.authz_state"))?,
     }))
 }
 
@@ -487,7 +571,7 @@ pub fn create_vault_in_scope(
 }
 
 /// `/v2/vaults` 的创建入口：调用方必须**已经在同一个写事务里**消费了创建票据
-/// （`admin::consume_create_ticket`），本函数不再检查 setup secret。
+/// （`registry::claim_reserved` → `admin::claim_create_ticket`），本函数不再检查 setup secret。
 ///
 /// 语义：
 /// - 该 `vault_id` 已存在 → `ALREADY_INITIALIZED`（409；绝不覆盖已有租户），调用方事务回滚
@@ -626,6 +710,10 @@ fn initialize_vault(
             now,
         ),
     )?;
+    // ADR 0018 §2：生命周期权威是 `vault_registry`——genesis 与 vaults 行**同事务**登记
+    // ACTIVE（claim 已在同一事务里 CAS 过则幂等 no-op；终态 ID 禁止复用 → 409）。
+    // 顺序：vaults 行先落，再登记 registry，保证"ACTIVE 必对应 vaults 行"。
+    registry::ensure_active_on_genesis(conn.raw(), &vault_id, now)?;
     conn.execute(
         "INSERT INTO epochs(vault_id, epoch, state, created_at) VALUES (?1, 1, 'active', ?2)",
         (vault_id.as_slice(), now),

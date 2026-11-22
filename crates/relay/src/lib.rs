@@ -9,8 +9,11 @@
 //! 模块地图：
 //! | 模块 | 职责 |
 //! | --- | --- |
-//! | [`admin`] | 运维创建票据（`/v2/vaults` 的一次性凭证；不是公开 HTTP）|
-//! | [`ratelimit`] | v2 auth/create 的有界入口限流（固定窗口，不引新依赖）|
+//! | [`admin`] | 创建票据预留（Web 管理面「创建领取链接」与测试夹具；`/v2/vaults` 的一次性凭证）|
+//! | [`admin_web`] | 内嵌 Web 管理面（ADR 0018 S1）：独立 listener/admin token/session/CSRF/Host 白名单 |
+//! | [`ratelimit`] | v2 auth/create/data 的有界入口限流（固定窗口，不引新依赖）|
+//! | [`registry`] | vault 生命周期权威（schema 13）：预留/claim/cancel 原子、只读列表/详情 |
+//! | [`deletion`] | 在线不可逆删除作业（ADR 0018 S3）：admission fence、WS 关闭、分批 purge、崩溃恢复 |
 //! | [`db`] | 单有界 writer 线程 + 只读连接池 + DDL/PRAGMA（`ScopeConn` 携带显式租户作用域）|
 //! | [`scope`] | 显式 `VaultScope`/`ScopeConn`：禁止隐式默认 vault、按 subject 猜租户 |
 //! | [`cursor`] | 89 字节不可伪造游标（HMAC） |
@@ -27,18 +30,23 @@
 //! | [`pairing`] | 一次性邀请 / 设备批准（PENDING → ACTIVE） |
 //! | [`revocation`] | 设备访问吊销（只推进 `auth_rev`，不动控制链/证书；ADR 0010）|
 //! | [`slots`] | key slot 登记、`slot_set_rev` CAS 激活 |
+//! | [`ticket_link`] | Web 管理面创建领取链接的 `mn-pair://create` 渲染（与 sync 逐字节一致）|
 //!
 //! 服务端**不写业务日志**（canary 审计要求：日志里不得出现正文/口令/root/真实资产 hash）；
 //! 诊断只暴露计数与不透明 ID。
 
 pub mod admin;
+pub mod admin_web;
 pub mod api;
 pub mod auth;
+pub mod authz;
 pub mod checkpoints;
 pub mod config;
 pub mod control;
+pub mod control_v2;
 pub mod cursor;
 pub mod db;
+pub mod deletion;
 pub mod envelope;
 pub mod error;
 pub mod gc;
@@ -50,11 +58,13 @@ pub mod pairing;
 pub mod quota;
 pub mod ratelimit;
 pub mod refs;
+pub mod registry;
 pub mod revocation;
 pub mod rotations;
 pub mod scope;
 pub mod sig;
 pub mod slots;
+pub mod ticket_link;
 pub mod time;
 pub mod vault;
 pub mod verify;

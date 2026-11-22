@@ -254,6 +254,13 @@ pub enum SyncError {
     #[error("relay 响应非法：{0}")]
     RelayWire(&'static str),
 
+    /// `ApprovalEnvelopeV1`（ADR 0016 S4d1b）编解码/导入验证失败。
+    ///
+    /// 只含**公开定位信息**（字段/槽位/角色/次数）：包内证据本就是公开的
+    /// cap/控制链事实，本变体**不**携带私钥、root、seed、邀请 token。
+    #[error("审批包无效：{0}")]
+    Approval(String),
+
     /// HTTP 状态码非预期。
     #[error("relay HTTP 状态 {0}")]
     HttpStatus(u16),

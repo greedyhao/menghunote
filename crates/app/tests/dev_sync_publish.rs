@@ -379,6 +379,53 @@ fn drive_until_idle(cx: &mut VisualTestContext, host: &Entity<ShellHost>, timeou
     }
 }
 
+/// 在面板实体上执行一次宿主/测试动作（`request_publish` 等）。
+fn with_panel<R>(
+    cx: &mut VisualTestContext,
+    host: &Entity<ShellHost>,
+    f: impl FnOnce(
+        &mut menghunote_app::dev_sync::DevSyncPanel,
+        &mut gpui::Context<menghunote_app::dev_sync::DevSyncPanel>,
+    ) -> R,
+) -> R {
+    cx.update(|_window, app| {
+        let panel = host
+            .read(app)
+            .shell
+            .read(app)
+            .dev_sync_panel()
+            .expect("面板必须挂载");
+        panel.update(app, f)
+    })
+}
+
+/// 泵到面板拿到 durable 基线事实（发布成功后刷新设备列表才会带回 `baseline_known`）。
+fn drive_baseline_fact(cx: &mut VisualTestContext, host: &Entity<ShellHost>, present: bool) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        cx.executor()
+            .advance_clock(menghunote_app::dev_sync::SYNC_PUMP_INTERVAL);
+        with_shell(cx, host, |shell, cx| shell.dev_sync_pump(cx));
+        cx.run_until_parked();
+        let ready = read_shell(cx, host, |shell, app| {
+            shell.dev_sync_panel().is_some_and(|panel| {
+                let snapshot = panel.read(app).service().snapshot();
+                snapshot.baseline_known
+                    && snapshot.published_baseline.is_some() == present
+                    && snapshot.in_flight.is_none()
+            })
+        });
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "面板 30s 内没有读到预期的基线事实（present={present}）"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// 泵到面板拿到 worker 上报的设备身份（`can_manage` 只有 worker 能告诉我们）。
 ///
 /// 面板打开时的首次列表刷新由它自己的 40 ms 泵派发，所以这里必须同时**推进测试时钟**
@@ -439,9 +486,11 @@ async fn publish_from_panel_then_b_join_sees_the_note(cx: &mut TestAppContext) {
         cx.debug_bounds("dev-sync-panel").is_some(),
         "dev-sync 面板必须挂载"
     );
+    // Create（CLI 路径）没有基线：读到事实后面板才渲染「重试发布基线」。
+    drive_device_facts(&mut cx, &host);
     assert!(
         cx.debug_bounds("dev-sync-publish").is_some(),
-        "面板必须画出「发布基线」按钮"
+        "基线缺失时面板必须画出「重试发布基线」按钮"
     );
     // Create 之后没有活动文档：发布必须先被明确拒绝（发布需要持闸）。
     let error = with_shell(&mut cx, &host, |shell, cx| {
@@ -503,6 +552,12 @@ async fn publish_from_panel_then_b_join_sees_the_note(cx: &mut TestAppContext) {
     assert!(
         line.contains("初始基线已发布"),
         "面板任务行必须显示发布结果：{line:?}"
+    );
+    // 发布成功后 durable 事实刷新：按钮必须消失（正常实例不显示发布入口）。
+    drive_baseline_fact(&mut cx, &host, true);
+    assert!(
+        cx.debug_bounds("dev-sync-publish").is_none(),
+        "基线已发布后不得再渲染发布按钮"
     );
 
     // 3) durable 基线事实 + notice 里的短 checkpoint id 必须一致。
@@ -587,13 +642,17 @@ async fn publish_without_manager_key_is_refused(cx: &mut TestAppContext) {
             .unwrap_or(true)
     });
     assert!(!can_manage, "Join 设备必须没有管理密钥（按钮置灰的前提）");
+    assert!(
+        cx.debug_bounds("dev-sync-publish").is_none(),
+        "Join 设备不得渲染发布入口（无论基线是否存在）"
+    );
 
-    // 点按钮：只给明确原因，不发请求。
-    click_publish(&mut cx);
-    let notice = panel_notice(&mut cx, &host).expect("点击必须写 notice");
+    // 面板入口仍必须给明确原因（即使按钮不渲染，也要能诊断伪造/过期的调用）。
+    with_panel(&mut cx, &host, |panel, cx| panel.request_publish(cx));
+    let notice = panel_notice(&mut cx, &host).expect("请求必须写 notice");
     assert!(
         notice.contains("没有管理密钥"),
-        "Join 设备点发布必须明确提示缺管理密钥：{notice:?}"
+        "Join 设备请求发布必须明确提示缺管理密钥：{notice:?}"
     );
     assert!(
         !publish_in_progress(&mut cx, &host),
@@ -885,7 +944,11 @@ async fn publish_twice_is_idempotent_and_sync_still_works(cx: &mut TestAppContex
     );
 
     // 第二次发布：4b 幂等语义——成功、checkpoint 不同、durable 事实指向较新那份。
-    click_publish(&mut cx);
+    // 基线已存在时面板**不渲染**发布按钮，所以这里走宿主入口（同一条持闸状态机）。
+    with_shell(&mut cx, &host, |shell, cx| {
+        shell.dev_sync_publish_baseline(cx)
+    })
+    .expect("基线已存在时宿主入口仍可用于重发（幂等）");
     drive_until_idle(&mut cx, &host, DEADLINE);
     let second = last_publish(&mut cx, &host).expect("第二次发布报告");
     assert!(second.is_ok(), "重跑发布必须可重试：{second:?}");

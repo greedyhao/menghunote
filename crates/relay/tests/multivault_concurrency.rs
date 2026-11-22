@@ -49,6 +49,9 @@ fn create_second_vault(fx: &Fixture) -> AuthContext {
         subject: SAME_DEVICE,
         device_id: Some(SAME_DEVICE),
         auth_rev: vault.auth_rev,
+        authz_rev: 0,
+        authority_rev: 0,
+        cap_id: None,
         vault: VaultScope::new(VAULT_B),
     }
 }
@@ -101,6 +104,9 @@ fn concurrent_writes_from_two_vaults_stay_isolated_and_complete() {
         subject: SAME_DEVICE,
         device_id: Some(SAME_DEVICE),
         auth_rev: 1,
+        authz_rev: 0,
+        authority_rev: 0,
+        cap_id: None,
         vault: VaultScope::new(VAULT_B),
     };
 
@@ -205,6 +211,9 @@ fn quota_and_gc_of_one_vault_do_not_block_the_other() {
         subject: SAME_DEVICE,
         device_id: Some(SAME_DEVICE),
         auth_rev: 1,
+        authz_rev: 0,
+        authority_rev: 0,
+        cap_id: None,
         vault: VaultScope::new(VAULT_B),
     };
 
@@ -307,6 +316,9 @@ fn same_object_id_in_two_vaults_is_written_independently() {
         subject: SAME_DEVICE,
         device_id: Some(SAME_DEVICE),
         auth_rev: 1,
+        authz_rev: 0,
+        authority_rev: 0,
+        cap_id: None,
         vault: VaultScope::new(VAULT_B),
     };
     let write = |fx: &Fixture, scope: VaultScope, ctx: AuthContext, vault_id: Id16, len: u64| {

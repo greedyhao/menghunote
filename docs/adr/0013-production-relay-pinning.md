@@ -112,7 +112,7 @@
 
 ## 实施记录
 
-### S1（2026-11-13，`636a118`）
+### S1（2026-11-13，`2124d6a`）
 
 `RelayMode`/URL 唯一权威 parser、`PinStore`（`sync.control_pin` canonical CDE v1）、
 `VerifiedHead`/`commit_verified_head`（事务重读 + CAS）与 `open_pinned_client` 受限入口。

@@ -10,6 +10,8 @@
 
 #![allow(dead_code)]
 
+pub mod v2;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -937,6 +939,9 @@ pub fn manager_ctx_for(fx: &Fixture, vault_id: Id16) -> AuthContext {
         subject: Realm::management_subject(&fx.manager_pub),
         device_id: None,
         auth_rev: fx.vault().auth_rev,
+        authz_rev: 0,
+        authority_rev: 0,
+        cap_id: None,
         vault: VaultScope::new(vault_id),
     }
 }
@@ -1156,6 +1161,9 @@ impl Fixture {
             subject: self.device,
             device_id: Some(self.device),
             auth_rev: self.vault().auth_rev,
+            authz_rev: 0,
+            authority_rev: 0,
+            cap_id: None,
             vault: self.db.scope(),
         }
     }
@@ -1166,6 +1174,9 @@ impl Fixture {
             subject: Realm::management_subject(&self.manager_pub),
             device_id: None,
             auth_rev: self.vault().auth_rev,
+            authz_rev: 0,
+            authority_rev: 0,
+            cap_id: None,
             vault: self.db.scope(),
         }
     }

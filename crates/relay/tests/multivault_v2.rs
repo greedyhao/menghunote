@@ -93,14 +93,10 @@ fn b64(id: &[u8; 16]) -> String {
     relay::ids::b64url_encode(id)
 }
 
-fn ticket_for(fx: &Fixture, vault_id: [u8; 16], ttl_secs: u64, quota: u32) -> [u8; 32] {
-    admin::issue_create_ticket(
-        fx.db.inner(),
-        vault_id,
-        Duration::from_secs(ttl_secs),
-        quota,
-    )
-    .expect("issue create ticket")
+fn ticket_for(fx: &Fixture, vault_id: [u8; 16], ttl_secs: u64) -> [u8; 32] {
+    admin::create_reservation_for(fx.db.inner(), vault_id, Duration::from_secs(ttl_secs))
+        .expect("reserve create ticket")
+        .token
 }
 
 /// 构造一个属主/设备公钥匹配的 `InitRequest`（证书签名由 `TestHook` 放行）。
@@ -169,7 +165,7 @@ async fn ticket_create_is_single_use_and_response_matches_v1_shape() {
     let app = app(&fx);
     let sign_pk = fx.device_signing_key.verifying_key().to_bytes();
     let init = init_request(VAULT_B, DEVICE_B, sign_pk, fx.manager_pub);
-    let ticket = block(|| ticket_for(&fx, VAULT_B, 900, 1));
+    let ticket = block(|| ticket_for(&fx, VAULT_B, 900));
     assert_eq!(vault_count(&fx), 1, "夹具只有 legacy 默认 vault A");
 
     let (status, body) = call(&app, create_request(&ticket, &init)).await;
@@ -243,7 +239,7 @@ async fn ticket_failures_do_not_create_vaults_or_consume_tickets() {
     let app = app(&fx);
     let sign_pk = fx.device_signing_key.verifying_key().to_bytes();
     let init_b = init_request(VAULT_B, DEVICE_B, sign_pk, fx.manager_pub);
-    let ticket_b = block(|| ticket_for(&fx, VAULT_B, 900, 1));
+    let ticket_b = block(|| ticket_for(&fx, VAULT_B, 900));
 
     // 未知票据（32B 随机）→ 403，不建库。
     let (status, body) = call(&app, create_request(&[0x99u8; 32], &init_b)).await;
@@ -276,7 +272,7 @@ async fn ticket_failures_do_not_create_vaults_or_consume_tickets() {
     assert_eq!(row.consumed_at, None);
 
     // 过期：TTL 到点后 403，不建库、不消费。
-    let ticket_expired = block(|| ticket_for(&fx, VAULT_C, 60, 1));
+    let ticket_expired = block(|| ticket_for(&fx, VAULT_C, 60));
     fx.clock.advance_secs(61);
     let (status, _) = call(&app, create_request(&ticket_expired, &init_c)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -293,38 +289,38 @@ async fn ticket_failures_do_not_create_vaults_or_consume_tickets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn quota_is_enforced_and_failed_create_does_not_consume() {
+async fn ticket_is_single_use_and_failed_create_does_not_consume() {
     let fx = block(|| fixture("v2-ticket-quota"));
     let app = app(&fx);
     let sign_pk = fx.device_signing_key.verifying_key().to_bytes();
     let init_d = init_request(VAULT_D, DEVICE_B, sign_pk, fx.manager_pub);
-    let ticket_d = block(|| ticket_for(&fx, VAULT_D, 900, 2));
+    // ADR 0018 §2：新发放票据固定 quota=1（不再有多额度票据）。
+    let ticket_d = block(|| ticket_for(&fx, VAULT_D, 900));
 
     let (status, _) = call(&app, create_request(&ticket_d, &init_d)).await;
     assert_eq!(status, StatusCode::CREATED);
     let row = block(|| ticket_row(&fx, &ticket_d));
-    assert_eq!(row.quota, 1, "成功创建消费 1 次额度");
-    assert_eq!(row.consumed_at, None, "额度未归零不写 consumed_at");
+    assert_eq!(row.quota, 0, "claim 一次用完票据");
+    assert_eq!(row.consumed_at, Some(BASE_TIME));
 
-    // 同票据重试同一 vault：票据仍有效 → 走创建 → 409 ALREADY_INITIALIZED；
-    // 事务回滚，额度保持 1（失败不消费），不产生第二个 vault。
+    // 同票据重试：票据已消费 → 403（旧库的"额度未用完 → 409"只属于 quota>1 的历史票据，
+    // 新发放不再存在）。
     let (status, body) = call(&app, create_request(&ticket_d, &init_d)).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(error_code(&body), "ALREADY_INITIALIZED");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error_code(&body), "FORBIDDEN");
     let row = block(|| ticket_row(&fx, &ticket_d));
-    assert_eq!(row.quota, 1);
-    assert_eq!(row.consumed_at, None);
+    assert_eq!(row.quota, 0);
     assert_eq!(vault_count(&fx), 2);
 
-    // 同票据换 vault → 403（绑定不符），不消费。
+    // 同票据换 vault → 403（绑定不符），不建库。
     let init_e = init_request(VAULT_E, DEVICE_B, sign_pk, fx.manager_pub);
     let (status, _) = call(&app, create_request(&ticket_d, &init_e)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let row = block(|| ticket_row(&fx, &ticket_d));
-    assert_eq!(row.quota, 1);
+    assert_eq!(row.quota, 0);
 
-    // 一次性票据（quota=1）：成功后额度归零 + consumed_at，再试统一 403。
-    let ticket_e = block(|| ticket_for(&fx, VAULT_E, 900, 1));
+    // 另一张一次性票据：成功后额度归零 + consumed_at，再试统一 403。
+    let ticket_e = block(|| ticket_for(&fx, VAULT_E, 900));
     let (status, _) = call(&app, create_request(&ticket_e, &init_e)).await;
     assert_eq!(status, StatusCode::CREATED);
     let row = block(|| ticket_row(&fx, &ticket_e));
@@ -341,7 +337,7 @@ async fn concurrent_double_consume_only_one_wins() {
     let app = app(&fx);
     let sign_pk = fx.device_signing_key.verifying_key().to_bytes();
     let init = init_request(VAULT_F, DEVICE_B, sign_pk, fx.manager_pub);
-    let ticket = block(|| ticket_for(&fx, VAULT_F, 900, 1));
+    let ticket = block(|| ticket_for(&fx, VAULT_F, 900));
 
     let first = create_request(&ticket, &init);
     let second = create_request(&ticket, &init);
@@ -405,7 +401,7 @@ async fn two_vaults_authenticate_separately_and_v1_stays_on_legacy_default() {
     let sign_pk = fx.device_signing_key.verifying_key().to_bytes();
     // B 用**不同**设备 id，证明 v1 challenge 不会按 subject 猜到 B。
     let init_b = init_request(VAULT_B, DEVICE_B, sign_pk, fx.manager_pub);
-    let ticket = block(|| ticket_for(&fx, VAULT_B, 900, 1));
+    let ticket = block(|| ticket_for(&fx, VAULT_B, 900));
     let (status, _) = call(&app, create_request(&ticket, &init_b)).await;
     assert_eq!(status, StatusCode::CREATED);
 
@@ -554,8 +550,8 @@ async fn v2_rate_limits_return_429_without_touching_v1() {
     let sign_pk = fx.device_signing_key.verifying_key().to_bytes();
     let init_b = init_request(VAULT_B, DEVICE_B, sign_pk, fx.manager_pub);
     let init_c = init_request(VAULT_C, DEVICE_B, sign_pk, fx.manager_pub);
-    let ticket_b = block(|| ticket_for(&fx, VAULT_B, 900, 1));
-    let ticket_c = block(|| ticket_for(&fx, VAULT_C, 900, 1));
+    let ticket_b = block(|| ticket_for(&fx, VAULT_B, 900));
+    let ticket_c = block(|| ticket_for(&fx, VAULT_C, 900));
 
     // 第 1 次 create 放行，第 2 次 429（阈值 = 1/60s）。
     let (status, _) = call(&app, create_request(&ticket_b, &init_b)).await;
@@ -603,7 +599,7 @@ async fn ticket_create_does_not_consume_setup_secret_or_touch_v1_metadata() {
 
     let sign_pk = fx.device_signing_key.verifying_key().to_bytes();
     let init = init_request(VAULT_B, DEVICE_B, sign_pk, fx.manager_pub);
-    let ticket = block(|| ticket_for(&fx, VAULT_B, 900, 1));
+    let ticket = block(|| ticket_for(&fx, VAULT_B, 900));
     let (status, _) = call(&app, create_request(&ticket, &init)).await;
     assert_eq!(status, StatusCode::CREATED);
 

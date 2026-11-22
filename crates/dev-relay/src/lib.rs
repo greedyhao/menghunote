@@ -43,7 +43,7 @@ use relay::config::RelayConfig;
 use relay::db::{Db, DbConfig};
 use relay::gc::GcOutcome;
 use relay::ids::{b64url_encode, random_bytes};
-use relay::ratelimit::RateLimitSpec;
+pub use relay::ratelimit::RateLimitSpec;
 use relay::sig::{SignatureCheck, SignatureHook};
 use relay::time::{Clock, FakeClock};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -188,10 +188,16 @@ impl DevRelay {
                             }
                         }
                         None => {
-                            let served =
-                                axum::serve(listener, app).with_graceful_shutdown(async move {
-                                    let _ = shutdown_rx.await;
-                                });
+                            // ADR 0017 S5a：管理端点按对端地址判定 loopback；明文 harness
+                            // 必须注入 ConnectInfo。TLS 分支的自定义 Listener 暂不注入
+                            // （远程 admin 后置；TLS e2e 不覆盖管理端点）。
+                            let served = axum::serve(
+                                listener,
+                                app.into_make_service_with_connect_info::<SocketAddr>(),
+                            )
+                            .with_graceful_shutdown(async move {
+                                let _ = shutdown_rx.await;
+                            });
                             if let Err(error) = served.await {
                                 eprintln!("[dev-relay] server error: {error}");
                             }
@@ -256,17 +262,45 @@ impl DevRelay {
         &self.setup_secret
     }
 
-    /// 运维发行一张 `/v2/vaults` 创建票据（ADR 0014 S2b 的 `relay::admin` 同一入口）。
+    /// 为**全新** `vault_id` 建预留并发行一张 `/v2/vaults` 创建票据（ADR 0018 §2 唯一入口）。
     ///
     /// DEV ONLY：明文只返回一次，测试用它驱动客户端的票据创建；库/日志都只有哈希。
+    /// 该 ID 已存在（任何 registry 状态）→ `CAS_CONFLICT`（测试必须用新 ID）。
     pub fn issue_create_ticket(
         &self,
         vault_id: [u8; 16],
         ttl: std::time::Duration,
-        quota: u32,
     ) -> AnyResult<[u8; relay::admin::CREATE_TICKET_BYTES]> {
         let db = self.db.as_ref().ok_or("relay 已停止")?;
-        Ok(relay::admin::issue_create_ticket(db, vault_id, ttl, quota)?)
+        Ok(relay::admin::create_reservation_for(db, vault_id, ttl)?.token)
+    }
+
+    /// **DEV ONLY**：给**已存在（ACTIVE）**的 vault 直接种一张新票据（不改变 lifecycle）。
+    ///
+    /// ADR 0018 S4b 起没有"对 ACTIVE vault 只发票据"的 HTTP/CLI/SDK 入口；这里仅供 e2e
+    /// 复现 `/v2/vaults` 的 409 `ALREADY_INITIALIZED`（票据有效、不被消费）。
+    pub fn seed_ticket_for_existing_vault(
+        &self,
+        vault_id: [u8; 16],
+        ttl: std::time::Duration,
+    ) -> AnyResult<[u8; relay::admin::CREATE_TICKET_BYTES]> {
+        let db = self.db.as_ref().ok_or("relay 已停止")?;
+        let token = relay::ids::random_bytes::<{ relay::admin::CREATE_TICKET_BYTES }>()?;
+        let token_hash = relay::ids::sha256(&token);
+        let now = self.clock.now_secs();
+        let expires_at = now
+            .checked_add(i64::try_from(ttl.as_secs())?)
+            .ok_or("ticket ttl overflow")?;
+        db.write_instance_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO create_tickets(token_hash, vault_id, created_at, expires_at, quota,
+                                            consumed_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, NULL)",
+                (token_hash.as_slice(), vault_id.as_slice(), now, expires_at),
+            )?;
+            Ok(())
+        })?;
+        Ok(token)
     }
 
     /// relay 假时钟当前值（Unix 秒）。

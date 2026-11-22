@@ -567,7 +567,7 @@ fn v2_creator(prefix: &str) -> V2Creator {
     let vault_id = [0x9Au8; 16];
     let path = dir.path().join("a").join("vault.sqlite3");
     let raw = relay
-        .issue_create_ticket(vault_id, std::time::Duration::from_secs(900), 1)
+        .issue_create_ticket(vault_id, std::time::Duration::from_secs(900))
         .expect("发行票据");
     let ticket = CreateTicket::from_slice(&raw).expect("32B");
     let created = create_vault_with_ticket(

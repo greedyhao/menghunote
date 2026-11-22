@@ -2,7 +2,9 @@
 //!
 //! 只验三件**布局/挂载**事实（像素/IME/真机观感仍靠 Windows `ui_smoke.ps1`）：
 //!
-//! 1. feature + 运行时启用时，`AppShell` 上真的挂出了面板与 5 个按钮（selector 有非零 bounds）；
+//! 1. feature + 运行时启用时，`AppShell` 上真的挂出了面板与「同步」「停止」按钮
+//!    （selector 有非零 bounds）；顶部**没有**「创建」「加入」（真实入口在 AppRoot），
+//!    也没有发布入口（没有管理身份/基线事实时不应凭空渲染）；
 //! 2. 未启用时（`AppShell::new` 这条默认构造路径）面板 selector **不存在**——即"不渲染、
 //!    不占布局"；
 //! 3. 面板是覆盖层：它出现时右侧编辑器面板仍然存在、根视图仍占满窗口（不挤压布局）。
@@ -97,10 +99,7 @@ async fn dev_sync_panel_and_buttons_are_mounted_when_enabled(cx: &mut TestAppCon
         "dev-sync-relay",
         "dev-sync-error",
         "dev-sync-sync-state",
-        "dev-sync-create",
-        "dev-sync-join",
         "dev-sync-sync",
-        "dev-sync-publish",
         "dev-sync-stop",
         // 切片 6b：轮换入口常显（不可用时置灰 + 原因），必须在真实布局里占位。
         "dev-sync-rotate",
@@ -112,6 +111,14 @@ async fn dev_sync_panel_and_buttons_are_mounted_when_enabled(cx: &mut TestAppCon
         assert!(
             bounds.size.width.as_f32() > 0.0 && bounds.size.height.as_f32() > 0.0,
             "{selector} 必须有非零尺寸：{bounds:?}"
+        );
+    }
+    // 面板不再重复 Create/Join 入口；发布入口只在"有管理钥 + 基线已知缺失"时渲染
+    // （本夹具没有身份/relay，事实未知 → 不渲染）。
+    for selector in ["dev-sync-create", "dev-sync-join", "dev-sync-publish"] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "不得渲染 selector={selector}"
         );
     }
     // 覆盖层不挤压编辑器：两者都必须在。

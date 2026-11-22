@@ -37,6 +37,25 @@ pub const MAX_PASSWORD_BYTES: usize = 1024;
 pub const MAX_LORO_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 pub const MAX_CHECKPOINT_REFS: usize = 1024;
 
+// —— ADR 0015：管理控制链 V2 ——
+
+/// `PolicyV2.max_cap_ttl` 的协议上限（秒，30 天）。
+pub const MAX_CAP_TTL_SECS_V2: u64 = 2_592_000;
+/// `PolicyV2.max_invite_ttl` 的协议上限（秒，1 天）。
+pub const MAX_INVITE_TTL_SECS_V2: u64 = 86_400;
+/// 单条 `OperationV2` 的 signer 上限。ADR 0015 只固定“高危两签”，未给数组上限；
+/// 这里取 16 作为实现边界（升级/PoP/两签叠加仍有充足余量），超出即 `TooLarge`。
+pub const MAX_OPERATION_SIGNERS_V2: usize = 16;
+/// `OperationV2.canonical_path` 的字节上限；实际唯一提交路径固定 58B。
+pub const MAX_CANONICAL_PATH_BYTES_V2: usize = 4096;
+/// `UpgradePolicyPayloadV2.bootstrap_caps[]` 上限（实现边界；ADR 未固定条数）。
+pub const MAX_BOOTSTRAP_CAPS_V2: usize = 64;
+/// `DeviceApprove/DeviceRightsChange` payload 的 `grants[]` 上限（实现边界；ADR 未固定条数）。
+///
+/// 一个 epoch 只需一份 grant（PK `(vault_id, epoch, device_id)`），当前实现进一步要求
+/// 恰好一份当前 epoch 的包；上限只是拒绝超长数组的 wire 边界。
+pub const MAX_GRANT_PACKAGES_V2: usize = 32;
+
 /// 固定切片明文容量。
 pub const fn cap_plain(object_type: crate::records::ObjectType) -> u64 {
     use crate::records::ObjectType;

@@ -87,6 +87,10 @@ pub enum ErrorCode {
     NotImplemented,
     /// 入口限流（ADR 0014 §A：auth/create 入口先限流；只用于 v2，不影响 v1）。
     RateLimited,
+    /// 该 vault 处于在线删除作业状态（`DELETING`/`DELETE_FAILED`/`DELETED`）：
+    /// 数据面入口一律关闭（ADR 0018 §3）。**不可重试**：删除是单向终态，
+    /// 客户端应进入 `NeedsAttention`（不清 pin、不自动重建）。
+    VaultDeleted,
 }
 
 impl ErrorCode {
@@ -129,6 +133,7 @@ impl ErrorCode {
             Self::PayloadTooLarge => "REQUEST_TOO_LARGE",
             Self::NotImplemented => "NOT_IMPLEMENTED",
             Self::RateLimited => "RATE_LIMITED",
+            Self::VaultDeleted => "VAULT_DELETED",
         }
     }
 
@@ -155,7 +160,11 @@ impl ErrorCode {
             | Self::RefConflict
             | Self::Rotating => 409,
             Self::NotFound => 404,
-            Self::CursorExpired | Self::Expired | Self::LeaseExpired | Self::Retired => 410,
+            Self::CursorExpired
+            | Self::Expired
+            | Self::LeaseExpired
+            | Self::Retired
+            | Self::VaultDeleted => 410,
             Self::QuotaExceeded | Self::ReserveExceeded => 507,
             Self::PayloadTooLarge => 413,
             Self::RateLimited => 429,
@@ -294,6 +303,9 @@ mod tests {
         assert_eq!(ErrorCode::Incomplete.status(), 409);
         assert_eq!(ErrorCode::NotFound.status(), 404);
         assert_eq!(ErrorCode::RateLimited.status(), 429);
+        // ADR 0018 §3：删除态数据面关闭 = 410 + 不可重试（客户端 → NeedsAttention）。
+        assert_eq!(ErrorCode::VaultDeleted.status(), 410);
+        assert!(!ErrorCode::VaultDeleted.default_retryable());
         assert!(ErrorCode::RateLimited.default_retryable());
     }
 
@@ -310,6 +322,7 @@ mod tests {
         assert_eq!(ErrorCode::EpochMismatch.as_str(), "EPOCH");
         assert_eq!(ErrorCode::ReserveExceeded.as_str(), "RESERVE");
         assert_eq!(ErrorCode::PayloadTooLarge.as_str(), "REQUEST_TOO_LARGE");
+        assert_eq!(ErrorCode::VaultDeleted.as_str(), "VAULT_DELETED");
     }
 
     #[test]

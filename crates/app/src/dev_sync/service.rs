@@ -654,10 +654,12 @@ impl DevLocalRunner {
         let count = members.len();
         let self_device = identity.device_id;
         let can_manage = identity.manager_seed.is_some();
+        let published_baseline = read_published_baseline(&vault);
         events(Event::DevicesListed {
             members,
             self_device,
             can_manage,
+            published_baseline,
         });
         Ok(OpOutcome::new(format!("设备列表已刷新（{count} 台）")))
     }
@@ -680,6 +682,18 @@ impl DevLocalRunner {
         if identity.manager_seed.is_none() {
             return Err(
                 "生成邀请被拒绝：本机没有管理密钥（Join/邀请加入的设备）；请在有管理钥的设备上生成"
+                    .to_owned(),
+            );
+        }
+        // 本地前置检查（**在联网之前**）：没有 durable 基线事实时生成的链接会让加入端
+        // 在 bootstrap 阶段撞 `NO_VALID_BASELINE`；这里明确挡住并指向发布/重试。
+        if DevLocal::published_baseline(&vault)
+            .map_err(|error| format!("读取本地初始基线事实失败：{error}"))?
+            .is_none()
+        {
+            return Err(
+                "生成邀请被拒绝：创建端尚未发布初始基线；请先在同步面板点「发布基线」/重试\
+                 （Create 会自动发布，失败可重试；成功前邀请链接不会生成）"
                     .to_owned(),
             );
         }
@@ -758,10 +772,12 @@ impl DevLocalRunner {
         // 成功后刷新成员视图（面板直接看到 Pending → Active）。
         let members = DevLocal::members(&context, &vault, identity)
             .map_err(|error| format!("批准成功但刷新设备列表失败：{error}"))?;
+        let published_baseline = read_published_baseline(&vault);
         events(Event::DevicesListed {
             members,
             self_device,
             can_manage,
+            published_baseline,
         });
         Ok(OpOutcome::new(summary))
     }
@@ -821,10 +837,12 @@ impl DevLocalRunner {
                 summary: summary.clone(),
             },
         });
+        let published_baseline = read_published_baseline(&vault);
         events(Event::DevicesListed {
             members: revoked.members,
             self_device,
             can_manage,
+            published_baseline,
         });
         Ok(OpOutcome::new(summary))
     }
@@ -2358,6 +2376,20 @@ fn worker_loop(
             changed_heads,
             result,
         });
+    }
+}
+
+/// 读 durable 初始基线事实（面板据此隐藏/显示「重试发布基线」）。
+///
+/// 读失败按"尚无基线"上报（fail-closed：绝不宣称基线存在）；真正的本地损坏会在用户
+/// 点发布时由库层给出明确错误。这是只读本地 meta，不发网络请求。
+fn read_published_baseline(vault: &Vault) -> Option<menghunote_sync::dev_local::PublishedBaseline> {
+    match DevLocal::published_baseline(vault) {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            eprintln!("[dev-sync] 读取已发布基线事实失败（按未发布上报）：{error}");
+            None
+        }
     }
 }
 

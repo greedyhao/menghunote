@@ -17,19 +17,20 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::Router;
 
-use crate::admin;
 use crate::auth::{self, AuthContext, Realm};
 use crate::checkpoints::{self, CheckpointRole, PublishRequest};
 use crate::config::RelayConfig;
 use crate::control;
 use crate::db::Db;
+use crate::deletion::Deletion;
 use crate::envelope::{ObjectType, MAX_ASSET_ENVELOPE};
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::gc;
@@ -37,8 +38,10 @@ use crate::ids::{b64url_decode, hex_lower, sha256, Hash32, Id16};
 use crate::management::{self, CanonicalBody, ManagedOutcome};
 use crate::objects;
 use crate::pairing;
+use crate::proto;
 use crate::ratelimit::RateLimiter;
 use crate::refs::RefRole;
+use crate::registry;
 use crate::rotations::{self, AbortRequest, ActivateRequest, BeginRequest, GrantInput, NewManager};
 use crate::scope::ScopeConn;
 use crate::scope::VaultScope;
@@ -62,6 +65,11 @@ pub struct AppState {
     v2_auth_limiter: RateLimiter,
     /// v2 **业务**（数据面/控制面）路由入口限流（ADR 0014 §A「入口先限流」的扩展）。
     v2_data_limiter: RateLimiter,
+    /// 在线删除作业运行时（ADR 0018 S3）：admission fence / WS 注册 / purge 作业。
+    ///
+    /// 与 admin listener **共享同一个 Arc**（见 [`AppState::with_deletion`]）：
+    /// 两个 listener 共用一个进程，fence 必须是同一份。
+    deletion: Arc<Deletion>,
 }
 
 /// 唤醒事件（只表示"去看一眼"，不携带业务数据）。
@@ -72,8 +80,22 @@ pub enum WakeEvent {
 }
 
 impl AppState {
-    /// 组装状态。
+    /// 组装状态（自建一个**独立**的删除运行时；测试/单 listener 用）。
+    ///
+    /// `serve` 必须用 [`AppState::with_deletion`] 把同一个 `Deletion` 同时交给 admin listener，
+    /// 否则 admin 触发的删除不会围栏数据面。
     pub fn new(db: Db, config: Arc<RelayConfig>, hook: Arc<dyn SignatureHook>) -> Arc<Self> {
+        let deletion = Arc::new(Deletion::new(db.clone()));
+        Self::with_deletion(db, config, hook, deletion)
+    }
+
+    /// 用共享删除运行时组装状态（生产：数据面 + admin listener 同一份 fence）。
+    pub fn with_deletion(
+        db: Db,
+        config: Arc<RelayConfig>,
+        hook: Arc<dyn SignatureHook>,
+        deletion: Arc<Deletion>,
+    ) -> Arc<Self> {
         let (wake, _) = tokio::sync::broadcast::channel(256);
         let v2_create_limiter = RateLimiter::new(config.v2_create_limit);
         let v2_auth_limiter = RateLimiter::new(config.v2_auth_limit);
@@ -86,7 +108,13 @@ impl AppState {
             v2_create_limiter,
             v2_auth_limiter,
             v2_data_limiter,
+            deletion,
         })
+    }
+
+    /// 删除作业运行时的共享句柄（admin listener / 启动恢复 / 测试用）。
+    pub fn deletion(&self) -> &Arc<Deletion> {
+        &self.deletion
     }
 
     /// v2 创建入口限流（超限 → 429 `RATE_LIMITED`）。
@@ -191,11 +219,60 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(create_challenge_v2),
         )
         .route("/v2/vaults/{vault}/auth/tokens", post(issue_token_v2))
+        // ADR 0015 S4b1：唯一控制提交路径 + V2 鉴权（management cap bearer）。
+        // 这三个端点**只**在 v2 挂载：v1 没有 V2 控制链语义。
+        .route("/v2/vaults/{vault}/control/submit", post(submit_control_v2))
+        .route(
+            "/v2/vaults/{vault}/authz/challenges",
+            post(create_authz_challenge_v2),
+        )
+        .route(
+            "/v2/vaults/{vault}/authz/tokens",
+            post(issue_authz_token_v2),
+        )
+        // ADR 0015 S4c：恢复证据只读（realm 4 bearer；不能代替离线恢复根的签名）。
+        .route(
+            "/v2/vaults/{vault}/recovery/evidence",
+            get(get_recovery_evidence),
+        )
         // 租户业务路由：v1 legacy 与 v2 各注册一份（同一实现，差异见 `ApiFace`）。
         .merge(tenant_routes("/v1/vaults/"))
         .merge(tenant_routes("/v2/vaults/"))
         .layer(DefaultBodyLimit::max(MAX_ASSET_ENVELOPE))
+        // ADR 0018 S3：数据面 admission 门禁（最外层，鉴权/解析之前就拒绝删除态租户）。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admission_guard,
+        ))
         .with_state(state)
+}
+
+/// 数据面 admission 门禁（ADR 0018 S3）：路径里的租户 vault 处于删除态 → `410 VAULT_DELETED`。
+///
+/// 这里只做**快速拒绝**（无 DB 访问）；权威复核在 [`crate::db`] 的 scoped 事务里
+/// （`registry::ensure_not_fenced`），所以不存在"middleware 放行 = 一定能写"的假设。
+async fn admission_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(vault_id) = fenced_vault_from_path(request.uri().path()) {
+        if let Err(err) = state.deletion.admission().check(&vault_id) {
+            return err.into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// 从数据面路径抽出租户 vault 段（`/v1/vaults/{vault}/...` 与 `/v2/vaults/{vault}/...`）。
+///
+/// 只处理**带 vault 段**的路径：`/v1/vaults`、`/v2/vaults`（genesis/claim）没有路径 vault，
+/// 由各自写事务里的 registry 状态机处理。解析失败返回 `None`（让 handler 照常给 400/404）。
+fn fenced_vault_from_path(path: &str) -> Option<Id16> {
+    let rest = path
+        .strip_prefix("/v1/vaults/")
+        .or_else(|| path.strip_prefix("/v2/vaults/"))?;
+    crate::ids::parse_id16_text(rest.split('/').next()?)
 }
 
 /// 一个前缀下的**全部**租户业务路由（v1/v2 共用同一 handler 实现）。
@@ -402,6 +479,21 @@ fn parse_hash32(value: &str) -> Result<Hash32> {
         .map_err(|_| Error::api(ErrorCode::InvalidRequest))
 }
 
+/// ADR 0015：控制提交路径的 vault 段**只接受** 32 位小写 hex（UUID/base64/大写/转义别名
+/// 一律 404，避免同一事实有多种 wire 形式）。
+fn parse_lowerhex16(value: &str) -> Result<Id16> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(Error::api(ErrorCode::NotFound));
+    }
+    hex_decode(value)
+        .and_then(|bytes| bytes.as_slice().try_into().ok())
+        .ok_or_else(|| Error::api(ErrorCode::NotFound))
+}
+
 fn bearer(headers: &HeaderMap) -> Result<String> {
     let value = headers
         .get(header::AUTHORIZATION)
@@ -475,7 +567,34 @@ fn ensure_same_vault(ctx: &AuthContext, scope: VaultScope) -> Result<()> {
 }
 
 /// v2 路由的鉴权入口：在 v1 语义之上**强制** `route.vault == auth.vault`。
+///
+/// 离线恢复 bearer（realm 4）**只**能读恢复证据（[`authenticate_recovery`]）：
+/// 它在这里被显式拒绝，避免"恢复 token 顺手读数据面/管理面"的越权面。
 fn authenticate_v2(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: VaultScope,
+) -> Result<AuthContext> {
+    let ctx = authenticate_v2_any(state, headers, scope)?;
+    if ctx.realm == Realm::Recovery {
+        return Err(Error::api(ErrorCode::Forbidden));
+    }
+    Ok(ctx)
+}
+
+/// v2 恢复证据入口：只接受 realm 4（`subject = SHA256(recovery_pub)[..16]`）。
+fn authenticate_recovery(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: VaultScope,
+) -> Result<AuthContext> {
+    let ctx = authenticate_v2_any(state, headers, scope)?;
+    ctx.require_recovery()?;
+    Ok(ctx)
+}
+
+/// v2 的**任意** realm 鉴权（含 realm 4）；调用方必须自己限定 realm 语义。
+fn authenticate_v2_any(
     state: &AppState,
     headers: &HeaderMap,
     scope: VaultScope,
@@ -613,9 +732,11 @@ async fn create_vault(State(state): State<Arc<AppState>>, body: Bytes) -> Result
 ///
 /// **没有** setup secret：授权来自票据。响应与 v1 create 完全同形。
 ///
-/// 事务：`token_hash` 查票据 → 未过期/未消费/额度/`vault_id` 匹配 → `create_vault_with_ticket`
-/// → 原子扣额度/置 `consumed_at`，四步在**一个** `BEGIN IMMEDIATE` 里：并发双消费只有一个
-/// 成功；创建失败（证书错误/已存在）整体回滚，票据不消费、不留半个 vault。
+/// 事务（ADR 0018 §2 claim）：票据先验（未过期/未消费/额度/`vault_id` 匹配，**不泄露**
+/// vault 存在性）→ registry 必须 `RESERVED`（`ACTIVE` → 409，票据不消费）→ 消费票据
+/// （`quota=0` + `consumed_at`）→ `RESERVED → ACTIVE` CAS → genesis/租户行 → 同 vault
+/// 兄弟票据失效，全部在**一个** `BEGIN IMMEDIATE` 里：并发双 claim 只有一个成功；
+/// 创建失败（证书错误等）整体回滚，票据不消费、不留半个 vault。
 async fn create_vault_v2(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response> {
     // 入口先限流（ADR 0014 §A），再解析 body/查库。
     state.check_v2_create_rate()?;
@@ -637,12 +758,8 @@ async fn create_vault_v2(State(state): State<Arc<AppState>>, body: Bytes) -> Res
     let scope = VaultScope::new(request.vault_id);
     let (outcome, vault) = state
         .write(scope, move |conn, clock| {
-            // 票据消费与 vault genesis 必须同一事务：任何一步失败都整体回滚。
-            admin::consume_create_ticket(conn, clock.now_secs(), &ticket)?;
-            let outcome =
-                vault::create_vault_with_ticket(conn, clock, &config, hook.as_ref(), &request)?;
-            let vault = vault::load(conn)?;
-            Ok((outcome, vault))
+            // 票据消费 + registry CAS + genesis + 兄弟票据失效：同一个写事务（ADR 0018 §2）。
+            registry::claim_reserved(conn, clock, &config, hook.as_ref(), &request, &ticket)
         })
         .await?;
     created_vault_response(&outcome, &vault)
@@ -650,11 +767,9 @@ async fn create_vault_v2(State(state): State<Arc<AppState>>, body: Bytes) -> Res
 
 // ---------------------------------------------------------------- auth
 
+/// wire 上的 realm tag（= `auth::Realm::as_tag()`，schema 12 也用它落库）。
 fn realm_tag(realm: Realm) -> u64 {
-    match realm {
-        Realm::Device => 1,
-        Realm::Management => 2,
-    }
+    u64::try_from(realm.as_tag()).unwrap_or(0)
 }
 
 /// 在**显式 scope** 里创建 challenge（v1/v2 共用）。
@@ -765,6 +880,220 @@ async fn issue_token_v2(
     state.check_v2_auth_rate()?;
     let vault_id = parse_id16(&vault_id)?;
     issue_token_in_scope(state, VaultScope::new(vault_id), body).await
+}
+
+// ---------------------------------------------------------------- V2 控制提交 / authz
+
+/// `POST /v2/vaults/{lowerhex32}/control/submit`：body 固定 `{0: bytes(SignedControlV2)}`。
+///
+/// 只接受唯一 canonical 路径（无 query/转义/别名）；提交本身由控制记录的签名门限自证，
+/// 不需要 bearer token（见 `control_v2` 模块文档）。所有校验与投影写入在同一个
+/// `BEGIN IMMEDIATE` 事务里，成功/重放都返回同一份回执字节。
+async fn submit_control_v2(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_data_rate(ApiFace::V2)?;
+    let vault_id = parse_lowerhex16(&vault_id)?;
+    // 唯一路径逐字节比较（含大小写/转义/query 别名）。
+    if uri.query().is_some() || uri.path() != proto::canonical_submit_path(&vault_id) {
+        return Err(Error::api(ErrorCode::NotFound));
+    }
+    let fields = parse_body(&state, &body)?;
+    // 固定形状：恰好一个键 0（bytes），禁止别名字段/附加字段。
+    if fields.len() != 1 || fields[0].0 != 0 {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let wire::CdeValue::Bytes(signed_bytes) = &fields[0].1 else {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    };
+    let signed_bytes = signed_bytes.clone();
+    let signed = proto::SignedControlV2::decode(&signed_bytes)
+        .map_err(|_| Error::api(ErrorCode::InvalidRequest))?;
+    let scope = VaultScope::new(vault_id);
+    let outcome = state
+        .write(scope, move |conn, clock| {
+            crate::control_v2::submit(conn, clock, &signed, &signed_bytes)
+        })
+        .await?;
+    state.notify();
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, wire::CONTENT_TYPE)],
+        outcome.response,
+    )
+        .into_response())
+}
+
+/// `/authz/challenges` 请求 `{0:realm(1|3),1:subject16,2:cap_id(0/16)}`。
+///
+/// 响应 `{0: bytes(ChallengeV2)}`：客户端对整份字节签 `MN/v2/auth\0||challenge`。
+async fn create_authz_challenge_v2(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_auth_rate()?;
+    let vault_id = parse_id16(&vault_id)?;
+    let fields = parse_body(&state, &body)?;
+    if fields.iter().any(|(key, _)| *key > 2) {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let realm = wire::uint_field(&fields, 0)?;
+    let subject = wire::id16_field(&fields, 1)?;
+    let cap_id = match wire::opt_field(&fields, 2) {
+        None => None,
+        Some(wire::CdeValue::Bytes(bytes)) if bytes.is_empty() => None,
+        Some(wire::CdeValue::Bytes(bytes)) => Some(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::api(ErrorCode::InvalidRequest))?,
+        ),
+        Some(_) => return Err(Error::api(ErrorCode::InvalidRequest)),
+    };
+    let challenge = state
+        .write(VaultScope::new(vault_id), move |conn, clock| {
+            crate::authz::create_challenge(conn, clock, realm, &subject, cap_id)
+        })
+        .await?;
+    let bytes = challenge
+        .encode()
+        .map_err(|_| Error::Invariant("ChallengeV2 encode"))?;
+    Ok(cbor_ok(vec![(0, cbor_bytes(bytes))]))
+}
+
+/// `/authz/tokens` 请求 `{0: challenge bytes, 1: sig64}`。
+///
+/// 响应 `{0: token, 1: expires_at, 2: server_time, 3: realm, 4: auth_rev,
+/// 5: authz_rev, 6: authority_rev, 7?: cap_id}`；明文 token 只出现这一次。
+async fn issue_authz_token_v2(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_auth_rate()?;
+    let vault_id = parse_id16(&vault_id)?;
+    let fields = parse_body(&state, &body)?;
+    // 固定形状：恰好键 0/1。
+    if fields.len() != 2 || fields.iter().any(|(key, _)| *key > 1) {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let challenge_bytes = wire::bytes_field(&fields, 0)?;
+    let signature = wire::bytes_field(&fields, 1)?;
+    let challenge = proto::ChallengeV2::decode(&challenge_bytes)
+        .map_err(|_| Error::api(ErrorCode::InvalidRequest))?;
+    let outcome = state
+        .write(VaultScope::new(vault_id), move |conn, clock| {
+            crate::authz::issue_token(conn, clock, &challenge, &challenge_bytes, &signature)
+        })
+        .await?;
+    let mut response = vec![
+        (0, wire::text(outcome.token)),
+        (1, cbor_uint(u64::try_from(outcome.expires_at).unwrap_or(0))),
+        (
+            2,
+            cbor_uint(u64::try_from(outcome.server_time).unwrap_or(0)),
+        ),
+        (
+            3,
+            cbor_uint(u64::try_from(outcome.realm.as_tag()).unwrap_or(0)),
+        ),
+        (4, cbor_uint(outcome.auth_rev)),
+        (5, cbor_uint(outcome.authz_rev)),
+        (6, cbor_uint(outcome.authority_rev)),
+    ];
+    if let Some(cap_id) = outcome.cap_id {
+        response.push((7, cbor_bytes(cap_id)));
+    }
+    response.sort_by_key(|(key, _)| *key);
+    Ok(cbor_ok(response))
+}
+
+/// `GET /v2/vaults/{lowerhex32}/recovery/evidence`：离线恢复的**只读证据包**。
+///
+/// 鉴权 = realm 4 的恢复 bearer（`subject = SHA256(recovery_pub)[..16]`，TTL 60s，
+/// 每请求重验 authority/authz rev 相等）。恢复 bearer **只能**读这里，不能代替离线
+/// 恢复根对 kind 13/14 的签名（控制记录仍是自证的）。
+///
+/// 响应（CDE map，键升序）：
+/// `{0 authz_state, 1 authority_rev, 2 authz_rev, 3 control_rev, 4 head_hash,
+///   5 recovery_pub, 6 policy_bytes?, 7 active_epoch, 8 vault_state,
+///   9 members[] (0 device_id, 1 certificate), 10 member_cert_hash, 11 grants_hash,
+///   12 pending_rotation? (0 rotation_id,1 from_epoch,2 to_epoch,3 state,4 freeze_seq)}`。
+async fn get_recovery_evidence(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    state.check_v2_data_rate(ApiFace::V2)?;
+    let vault_id = parse_id16(&vault_id)?;
+    let scope = VaultScope::new(vault_id);
+    authenticate_recovery(&state, &headers, scope)?;
+    let fields = state.db.read(scope, move |conn| {
+        let vault = require_vault(conn, &vault_id)?;
+        let (_, head_hash) = crate::vault::control_head(conn)?;
+        let mut fields = vec![
+            (0, wire::text(vault.authz_state.as_str())),
+            (1, cbor_uint(vault.authority_rev)),
+            (2, cbor_uint(vault.authz_rev)),
+            (3, cbor_uint(vault.control_rev)),
+            (4, cbor_bytes(head_hash)),
+        ];
+        if let Some(recovery_pub) = vault.recovery_pub {
+            fields.push((5, cbor_bytes(recovery_pub)));
+        }
+        if let Some(policy) = &vault.policy_bytes {
+            fields.push((6, cbor_bytes(policy.clone())));
+        }
+        fields.push((7, cbor_uint(vault.active_epoch)));
+        fields.push((8, wire::text(vault.state.as_str())));
+        // 成员证书：恢复端需要它们重算 member_cert_hash 并决定新的 caps 绑定。
+        let mut stmt = conn.prepare(
+            "SELECT device_id, certificate FROM devices
+             WHERE vault_id = ?1 AND status = 'active' ORDER BY device_id ASC",
+        )?;
+        let rows = stmt.query_map([conn.scope().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (device_id, certificate) = row?;
+            members.push(wire::map(vec![
+                (0, cbor_bytes(device_id)),
+                (1, cbor_bytes(certificate)),
+            ]));
+        }
+        fields.push((9, wire::array(members)));
+        fields.push((
+            10,
+            cbor_bytes(crate::control_v2::member_cert_set_digest(conn)?),
+        ));
+        let (_, grants_hash) = crate::control_v2::grant_set_digest(conn, vault.active_epoch)?;
+        fields.push((11, cbor_bytes(grants_hash)));
+        if let Some(rotation) = crate::rotations::latest(conn)?.filter(|rotation| {
+            matches!(
+                rotation.state,
+                crate::rotations::RotationState::Frozen | crate::rotations::RotationState::Staging
+            )
+        }) {
+            fields.push((
+                12,
+                wire::map(vec![
+                    (0, cbor_bytes(rotation.rotation_id)),
+                    (1, cbor_uint(rotation.from_epoch)),
+                    (2, cbor_uint(rotation.to_epoch)),
+                    (3, wire::text(rotation.state.as_str())),
+                    (4, cbor_uint(rotation.freeze_seq)),
+                ]),
+            ));
+        }
+        fields.sort_by_key(|(key, _)| *key);
+        Ok(fields)
+    })?;
+    Ok(cbor_ok(fields))
 }
 
 // ---------------------------------------------------------------- state / control / log
@@ -3070,6 +3399,32 @@ async fn latest_grant(
 
 // ---------------------------------------------------------------- WS /wake
 
+/// WS 单帧发送超时（ADR 0018 §3：慢发送限时，避免删除/关闭被一个卡住的客户端拖住）。
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// WS 关闭帧超时（正常 Close/1008；超时就丢 socket，不阻塞删除作业）。
+const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// 删除态/vault 关闭时发给客户端的 WS close code（policy violation，与鉴权失败同码）。
+const WS_CLOSE_CODE: u16 = 1008;
+
+async fn send_ws(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// 发送正常 Close 帧；**限时**，慢客户端不会拖住调用方（不承诺撤回已进入网络的字节）。
+async fn close_ws(socket: &mut WebSocket, reason: &'static str) {
+    let _ = tokio::time::timeout(
+        WS_CLOSE_TIMEOUT,
+        socket.send(Message::Close(Some(CloseFrame {
+            code: WS_CLOSE_CODE,
+            reason: reason.into(),
+        }))),
+    )
+    .await;
+}
+
 async fn wake(
     State(state): State<Arc<AppState>>,
     face: ApiFace,
@@ -3080,6 +3435,9 @@ async fn wake(
     state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let token = bearer(&headers)?;
+    // ADR 0018 S3：删除态 vault 连升级都拒绝（middleware 之外的第二道；`on_upgrade` 之后
+    // 还有注册时复检，覆盖"检查后刚好开始删除"的竞态）。
+    state.deletion.admission().check(&vault_id)?;
     // 升级前先验证一次：无效/已吊销/跨 vault 的 token 直接拒绝，不建立 WS。
     match face {
         // v1 旧行为逐字节保留：这里历史上**不做**跨 vault 复查，跨 vault token → 401。
@@ -3109,6 +3467,12 @@ async fn wake_loop(
     // 先订阅再推首帧：否则"首帧水位的查询"与"订阅"之间的 notify 会丢
     // （测试里也会变成依赖时序的偶发失败）。
     let mut events = state.wake.subscribe();
+    // 删除开始时服务端主动关连接：注册表按 vault 记录连接，关闭信号与 send 竞态在
+    // `push_wake` 的 fence 复检里兜住（不承诺撤回已进入网络的字节）。
+    let Some((_ws_guard, mut deleted_rx)) = state.deletion.register_ws(vault_id) else {
+        close_ws(&mut socket, "vault deleted").await;
+        return;
+    };
     if !push_wake(&state, &vault_id, &token, face, &mut socket).await {
         return;
     }
@@ -3116,6 +3480,10 @@ async fn wake_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = &mut deleted_rx => {
+                close_ws(&mut socket, "vault deleted").await;
+                return;
+            }
             incoming = socket.recv() => {
                 match incoming {
                     None => return,
@@ -3150,6 +3518,11 @@ async fn push_wake(
     socket: &mut WebSocket,
 ) -> bool {
     let vault_id = *vault_id;
+    // 查询前与 send 前各查一次 fence：vault 进入删除态后绝不再推送任何数据面状态。
+    if state.deletion.admission().is_closed(&vault_id) {
+        close_ws(socket, "vault deleted").await;
+        return false;
+    }
     let clock = state.db.clock_handle();
     let token = token.to_string();
     let snapshot = state.db.read(vault_id.into(), move |conn| {
@@ -3159,30 +3532,36 @@ async fn push_wake(
             ensure_same_vault(&ctx, conn.scope())?;
         }
         let vault = require_vault(conn, &vault_id)?;
-        Ok((vault.head_seq, vault.active_epoch, vault.control_rev))
+        Ok((
+            vault.head_seq,
+            vault.active_epoch,
+            vault.control_rev,
+            vault.authz_rev,
+            vault.authority_rev,
+        ))
     });
-    let (head_seq, epoch, control_rev) = match snapshot {
+    let (head_seq, epoch, control_rev, authz_rev, authority_rev) = match snapshot {
         Ok(values) => values,
         Err(_) => {
-            let _ = socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: 1008,
-                    reason: "unauthorized".into(),
-                })))
-                .await;
+            close_ws(socket, "unauthorized").await;
             return false;
         }
     };
+    if state.deletion.admission().is_closed(&vault_id) {
+        close_ws(socket, "vault deleted").await;
+        return false;
+    }
+    // ADR 0015：V2 token 的每帧重验已在 `auth::authenticate` 内完成（cap/双 rev）；
+    // 帧里带上授权 rev，客户端可据此判定自己的 bearer 是否已失效。
     let payload = serde_json::json!({
         "v": 1,
         "head_seq": head_seq,
         "epoch": epoch,
         "control_rev": control_rev,
+        "authz_rev": authz_rev,
+        "authority_rev": authority_rev,
     });
-    socket
-        .send(Message::Text(payload.to_string().into()))
-        .await
-        .is_ok()
+    send_ws(socket, Message::Text(payload.to_string().into())).await
 }
 
 // ---------------------------------------------------------------- 运维入口
@@ -3194,10 +3573,20 @@ pub async fn run_gc(state: Arc<AppState>) -> Result<gc::GcOutcome> {
     let vault_ids = state.db.read_instance(crate::db::schema::list_vault_ids)?;
     let mut total = gc::GcOutcome::default();
     for vault_id in vault_ids {
+        // ADR 0018 §3：GC 跳过被 fence 的 vault（删除作业自己负责清理；GC 不得与 purge 抢行）。
+        if state.deletion.admission().is_closed(&vault_id) {
+            continue;
+        }
         let scope = VaultScope::new(vault_id);
-        let outcome = state
+        let outcome = match state
             .write(scope, move |conn, clock| gc::tick(conn, clock))
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            // fence 与 GC 入队竞态：事务级复核拒绝时按"跳过"处理，不影响其它租户。
+            Err(err) if err.code() == Some(ErrorCode::VaultDeleted) => continue,
+            Err(err) => return Err(err),
+        };
         total.deleted_log_rows += outcome.deleted_log_rows;
         total.retired_update_objects += outcome.retired_update_objects;
         total.deleted_staging_objects += outcome.deleted_staging_objects;

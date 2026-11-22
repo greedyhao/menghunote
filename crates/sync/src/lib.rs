@@ -27,6 +27,7 @@
 #![deny(unsafe_code)]
 
 pub mod api_version;
+pub mod approval_v1;
 pub(crate) mod asset_sync;
 pub mod base64url;
 pub mod bootstrap;
@@ -54,6 +55,7 @@ pub mod init_session;
 pub mod invite_link;
 pub mod kdf;
 pub mod keys;
+pub mod management_v2;
 pub mod random;
 pub mod recovery;
 pub mod recovery_enroll;

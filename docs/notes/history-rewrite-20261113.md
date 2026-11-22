@@ -1,5 +1,8 @@
 # v0.3→v0.4 历史整理记录（2026-11-13）
 
+> 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
+
+
 ## 为什么整理
 
 `v0.3-search..v0.4-sync` 之间积累了 **185 个提交**：58 feat / 59 fix / 40 docs /

@@ -1,5 +1,8 @@
 # 评审 0003 — 同步 v1 最终 BLOCK 与 M0 最小阻断清单（gpt-6.1-sol，2026-11-12）
 
+> 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
+
+
 > **历史留档**：本文写于 2026-11-13 历史整理前；文中哈希只在 `backup/dev-20261113` 可达，
 > 见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
 

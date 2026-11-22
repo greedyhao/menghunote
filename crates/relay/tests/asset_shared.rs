@@ -62,6 +62,9 @@ fn device_ctx(fx: &Fixture, device: Id16) -> AuthContext {
         subject: device,
         device_id: Some(device),
         auth_rev: fx.vault().auth_rev,
+        authz_rev: 0,
+        authority_rev: 0,
+        cap_id: None,
         vault: VaultScope::new(fx.vault_id),
     }
 }

@@ -1,5 +1,8 @@
 # 0007 同步/加密 v1 交接（新窗口开发用）
 
+> 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
+
+
 > 状态：**v0.4-sync 已由 GPT 复审 APPROVE，并打 annotated tag**（非生产，仅 localhost 开发验收）。
 > 复审锚点：整理前 `321f732`（等价新提交 `61d8de4`；APPROVE，无必修项）。
 > **tag 前移（2026-11-13）**：`v0.4-sync` 现指 `d16f6fe`（含 e2e 去脚本化 / 8 条 headless UI 测试 / 文档）；

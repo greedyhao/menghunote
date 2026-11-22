@@ -34,16 +34,16 @@
 //! | `app-root` | 根视图（铺满窗口） |
 //! | `app-root-welcome` / `app-root-create` / `app-root-join` / `app-root-local` | Welcome 页与三个入口 |
 //! | `app-root-instances` / `app-root-instance-<i>` | 已保存实例列表与第 i 行（active 优先） |
-//! | `app-root-create-form` / `app-root-relay-input` / `app-root-secret-input` / `app-root-dir-input` | Create 表单与三个字段 |
-//! | `app-root-create-link` | Welcome 的「粘贴创建链接（v2 票据）」入口 |
+//! | `app-root-create-form` / `app-root-dir-input` | Create 表单（只有创建链接 + 实例目录）与目录字段 |
 //! | `app-root-create-link-input` / `app-root-create-link-apply` / `app-root-create-link-clear` | Create 表单的创建链接字段 /「应用」/「移除链接」 |
-//! | `app-root-create-link-warning` / `app-root-create-link-facts` | 票据模式的一次性警告 / 预填的 relay+vault_id+API 面 |
+//! | `app-root-create-link-warning` / `app-root-create-link-facts` | 一次性票据警告 / 预填的 relay+vault_id+API 面 |
 //! | `app-root-join-form` / `app-root-join-relay-input` / `app-root-vault-id-input` / `app-root-recovery-input` / `app-root-join-dir-input` | Join 表单与四个字段 |
-//! | `app-root-mode-local_dev` / `app-root-mode-remote_tls` / `app-root-remote-consent` | Create 表单的 relay 模式/远程确认 |
+//! | `app-root-remote-consent` / `app-root-remote-dev-notice` | HTTPS 创建链接的远程确认 / DEV 状态标注 |
 //! | `app-root-consent` / `app-root-submit` / `app-root-back` / `app-root-form-error` | Create 表单的同意框/提交/返回/错误行 |
 //! | `app-root-join-submit` / `app-root-join-back` / `app-root-join-error` | Join 表单的提交/返回/错误行 |
 //! | `app-root-working` / `app-root-progress` / `app-root-cancel` | Working 页（Create/Join 共用） |
 //! | `app-root-backup` / `app-root-vault-id` / `app-root-recovery-code` / `app-root-copy-code` / `app-root-backup-confirm` / `app-root-continue` | 备份页 |
+//! | `app-root-copy-invite` / `app-root-invite-ttl` / `app-root-invite-error` | 备份页「复制邀请链接」（v2、15 分钟；token 只在剪贴板）/ 剩余有效期 / 脱敏失败 |
 //! | `app-root-main` | Main（`AppShell` 子视图宿主） |
 //! | `app-root-settings` | 打开设置（Welcome 页与 Main 右下角各一个入口） |
 //! | `dev-sync-settings` | 设置覆盖层根（打开时存在；Main 仍在其下保留） |
@@ -69,7 +69,7 @@ use gpui::{
     div, px, App, ClipboardItem, Context, Entity, IntoElement, MouseButton, Render, SharedString,
     Window,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use menghunote_storage::{SyncContext, Vault};
 use menghunote_sync::create_link::{CreateLink, CreateTicket};
@@ -82,15 +82,14 @@ use crate::dev_vault;
 use crate::editor::theme;
 use crate::shell::AppShell;
 
-use super::create::{
-    CreateCredential, CreateEvent, CreateJob, CreateOutcome, CreateRequest, CREATE_PUMP_INTERVAL,
-};
+use super::create::{CreateEvent, CreateJob, CreateOutcome, CreateRequest, CREATE_PUMP_INTERVAL};
 use super::fingerprint::{FingerprintState, FINGERPRINT_NOTICE};
 use super::input::{FormInput, FormInputEvent};
 use super::invite::{
     InviteCheckRequest, InviteEvent, InviteJob, InviteOutcome, InvitePendingFacts,
     InviteRedeemRequest, INVITE_EMPTY_HINT,
 };
+use super::invite_copy::{CopyInviteEvent, CopyInviteJob, CopyInviteRequest, CopyInviteStage};
 use super::join::{JoinEvent, JoinJob, JoinOutcome, JoinRequest};
 use super::layout::{
     generate_instance_id, DevSyncProfile, InstanceEntry, ProfileError, ProfileLayout, ProfileStore,
@@ -217,15 +216,38 @@ struct ErrorState {
     retry: RetryKind,
 }
 
-/// Create 表单状态（输入框实体 + 模式 + 同意勾选）。
+/// Create 表单的**创建方式**（ADR 0018 S4b：只剩粘贴创建链接）。
+///
+/// 管理员创建与 v1 setup secret 创建入口已移除；枚举保留单一变体，便于测试/诊断
+/// 明确断言"App 不再有其它创建方式"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormCreateMode {
+    /// 粘贴创建链接（`mn-pair://create` + 预发票据）。
+    Link,
+}
+
+impl FormCreateMode {
+    /// 测试/诊断用的稳定字面值（对应 selector 后缀）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+        }
+    }
+}
+
+/// Create 表单状态（创建链接 + 实例目录 + 同意勾选）。
+///
+/// ADR 0018 S4b：表单**只**有创建链接与实例目录；relay 地址/模式都由链接决定，
+/// 不再有管理员凭证或 v1 setup secret 字段。
 struct FormState {
     instance_id: String,
-    /// 本次创建要写的 relay 模式（默认 `local_dev`；票据模式由创建链接决定）。
+    /// 创建方式（只剩 [`FormCreateMode::Link`]）。
+    mode_kind: FormCreateMode,
+    /// 链接 scheme 决定的 relay 模式（应用链接后设置；默认 `local_dev`）。
     mode: RelayMode,
     /// `remote_tls` 的显式确认（"远程服务器/HTTPS"；ADR 0013 §1）。
     remote_consent: bool,
-    relay: Entity<FormInput>,
-    secret: Entity<FormInput>,
     /// 创建链接输入（**秘密**：含一次性票据；遮罩 + 禁复制 + 允许粘贴）。
     link: Entity<FormInput>,
     /// 已应用的创建链接（票据只在内存；提交时移动到 worker，不落盘）。
@@ -331,6 +353,17 @@ struct PendingCreate {
     entry: InstanceEntry,
     confirmed: bool,
     copied: bool,
+    /// 备份页最近一次「复制邀请链接」的**公开**结果（token 只在剪贴板，不在这里）。
+    invite: Option<CopiedInvite>,
+    /// 备份页最近一次生成邀请的脱敏失败文案（成功后清空）。
+    invite_error: Option<String>,
+}
+
+/// 备份页已复制的邀请链接的公开事实（`invite_id` + 过期时刻；**不含 token/URL**）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopiedInvite {
+    invite_id: [u8; 16],
+    expires_at: u64,
 }
 
 /// Join 成功、但公开配置还没写进去的数据（库/身份已落盘）。
@@ -372,6 +405,8 @@ pub struct AppRoot {
     join_job: Option<JoinJob>,
     /// 邀请加入的后台任务（兑换或检查；二者不同时存在）。
     invite_job: Option<InviteJob>,
+    /// 备份页「复制邀请链接」的后台任务（ADR 0017 S5b）。
+    invite_copy_job: Option<CopyInviteJob>,
     /// 邀请 PENDING 等待页状态（`None` = 不在等待页）。
     invite: Option<InvitePendingState>,
     /// bootstrap 已完成、但公开配置写失败：只重试保存（不重新联网/不重新 bootstrap）。
@@ -380,8 +415,6 @@ pub struct AppRoot {
     settings: Option<SettingsState>,
     /// 关闭设置后要把焦点还给 Main 的编辑器（下一帧渲染时消费）。
     pending_focus_restore: bool,
-    /// 进入「粘贴创建链接」表单后，下一帧把焦点给创建链接输入框。
-    focus_create_link: bool,
     main: Option<Entity<AppShell>>,
     lock: Option<InstanceLock>,
     instance: Option<InstanceEntry>,
@@ -394,6 +427,10 @@ pub struct AppRoot {
     ///
     /// 生产恒为空（系统信任根）。只增加显式信任，不关闭证书链/SAN/有效期校验。
     test_relay_roots: Vec<Vec<u8>>,
+    /// **测试专用**：让 Create 的自动发布基线走故意不可达的 relay（模拟发布失败）。
+    ///
+    /// 生产恒为 `false`；只影响发布一步，库/身份/恢复码仍真实创建并保留。
+    test_baseline_unreachable: bool,
 }
 
 impl AppRoot {
@@ -413,11 +450,11 @@ impl AppRoot {
             job: None,
             join_job: None,
             invite_job: None,
+            invite_copy_job: None,
             invite: None,
             pending_invite: None,
             settings: None,
             pending_focus_restore: false,
-            focus_create_link: false,
             main: None,
             lock: None,
             instance: None,
@@ -427,6 +464,7 @@ impl AppRoot {
             pending_focus: false,
             pump_started: false,
             test_relay_roots: Vec::new(),
+            test_baseline_unreachable: false,
         };
         root.boot(cx);
         root
@@ -1221,7 +1259,7 @@ impl AppRoot {
 
     // ---- Welcome / 表单动作 ----
 
-    /// 进入 Create 表单（默认 relay / 自动实例目录 / 秘密字段）。
+    /// 进入 Create 表单（ADR 0018 S4b：只有创建链接 + 实例目录）。
     pub fn enter_create_form(&mut self, cx: &mut Context<Self>) {
         let instance_id = self
             .options
@@ -1234,17 +1272,6 @@ impl AppRoot {
             .instance_dir(&instance_id)
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        let default_relay = self.options.default_relay.clone();
-        let relay = cx.new(|cx| {
-            FormInput::new(default_relay, false, cx)
-                .selector("app-root-relay-input")
-                .click_to_focus()
-        });
-        let secret = cx.new(|cx| {
-            FormInput::new("setup secret", true, cx)
-                .selector("app-root-secret-input")
-                .click_to_focus()
-        });
         // 创建链接含一次性票据：遮罩 + 禁复制 + 允许粘贴（与秘密字段同一控件）。
         let link = cx.new(|cx| {
             FormInput::new("粘贴创建链接 mn-pair://create?...", true, cx)
@@ -1256,7 +1283,7 @@ impl AppRoot {
                 .selector("app-root-dir-input")
                 .click_to_focus()
         });
-        // 在输入链接之后按 Enter = 应用链接；其它字段按 Enter = 提交表单。
+        // 链接输入框按 Enter = 应用链接；其它字段按 Enter = 提交表单。
         let mut subs = Vec::new();
         let link_subscription = cx.subscribe(&link, |root, _input, event: &FormInputEvent, cx| {
             if matches!(event, FormInputEvent::Submit) {
@@ -1264,22 +1291,18 @@ impl AppRoot {
             }
         });
         subs.push(link_subscription);
-        for input in [relay.clone(), secret.clone(), dir.clone()] {
-            let subscription = cx.subscribe(&input, |root, _input, event: &FormInputEvent, cx| {
-                if matches!(event, FormInputEvent::Submit) {
-                    root.submit_create(cx);
-                }
-            });
-            subs.push(subscription);
-        }
+        let dir_subscription = cx.subscribe(&dir, |root, _input, event: &FormInputEvent, cx| {
+            if matches!(event, FormInputEvent::Submit) {
+                root.submit_create(cx);
+            }
+        });
+        subs.push(dir_subscription);
         self.form = Some(FormState {
             instance_id,
-            // ADR 0013 §1：默认 local_dev；remote_tls 需要显式选择 + 确认（本片不发起
-            // 远端 Create 网络，S3b 才接线）。
+            mode_kind: FormCreateMode::Link,
+            // 尚未应用链接：先按 local_dev 展示，应用链接后由 scheme 覆盖。
             mode: RelayMode::LocalDev,
             remote_consent: false,
-            relay,
-            secret,
             link,
             link_state: None,
             dir,
@@ -1289,18 +1312,16 @@ impl AppRoot {
         });
         self.state = State::CreateForm;
         self.error = None;
-        self.focus_create_link = false;
         self.pending_focus = true;
         cx.notify();
     }
 
-    /// 进入 **粘贴创建链接** 的 Create 表单（ADR 0014 S3b：`mn-pair://create` + v2 票据）。
+    /// 进入 **粘贴创建链接** 的 Create 表单（`mn-pair://create` + v2 票据）。
     ///
     /// 与 [`Self::enter_create_form`] 同一个表单/同一条提交路径；差别只是初始焦点在
-    /// 创建链接字段、并给出一次性票据提示。票据模式**不需要** setup secret。
+    /// 创建链接字段、并给出一次性票据提示。
     pub fn enter_create_link_form(&mut self, cx: &mut Context<Self>) {
         self.enter_create_form(cx);
-        self.focus_create_link = true;
         self.notice = Some(
             "粘贴创建链接（mn-pair://create?...&vault=…#ticket=…）：票据一次性、默认 15 分钟内有效，             只从内存提交；不写配置/日志，失败也不会保存票据。"
                 .to_owned(),
@@ -1308,24 +1329,10 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// 测试/预填：设置 relay 输入框文本。
-    pub fn form_set_relay(&mut self, text: &str, cx: &mut Context<Self>) {
-        if let Some(form) = &self.form {
-            form.relay.update(cx, |input, cx| {
-                input.set_text(text);
-                cx.notify();
-            });
-        }
-    }
-
-    /// 测试/预填：设置 setup secret 输入框文本。
-    pub fn form_set_secret(&mut self, text: &str, cx: &mut Context<Self>) {
-        if let Some(form) = &self.form {
-            form.secret.update(cx, |input, cx| {
-                input.set_text(text);
-                cx.notify();
-            });
-        }
+    /// 当前创建方式（测试/诊断；ADR 0018 S4b 只可能是链接）。
+    #[must_use]
+    pub fn form_create_mode(&self) -> Option<FormCreateMode> {
+        self.form.as_ref().map(|form| form.mode_kind)
     }
 
     /// 测试/预填：设置实例目录输入框文本。
@@ -1421,6 +1428,7 @@ impl AppRoot {
         let Some(form) = self.form.as_mut() else {
             return;
         };
+        // 应用链接 = 唯一创建方式；模式由链接 scheme 决定。
         form.mode = mode;
         // 远端必须在票据模式下重新确认（换链接 = 换端点，不能沿用旧确认）。
         form.remote_consent = false;
@@ -1433,16 +1441,8 @@ impl AppRoot {
             pin,
         });
         form.error = None;
-        // 预填 relay（vault id 以只读事实展示）；清空链接与 setup secret 输入框。
-        form.relay.update(cx, |input, cx| {
-            input.set_text(&relay);
-            cx.notify();
-        });
+        // 链接（含票据）只留在内存状态；输入框立刻清空，完整 URL 已丢弃。
         form.link.update(cx, |input, cx| {
-            input.clear();
-            cx.notify();
-        });
-        form.secret.update(cx, |input, cx| {
             input.clear();
             cx.notify();
         });
@@ -1453,9 +1453,8 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// 清掉已应用的创建链接（回到 v1 setup secret 模式；不触发任何网络）。
+    /// 清掉已应用的创建链接（不触发任何网络）。
     pub fn form_clear_create_link(&mut self, cx: &mut Context<Self>) {
-        let default_relay = self.options.default_relay.clone();
         let Some(form) = &mut self.form else {
             return;
         };
@@ -1465,28 +1464,11 @@ impl AppRoot {
         form.mode = RelayMode::LocalDev;
         form.remote_consent = false;
         form.error = None;
-        // relay 回到默认值：链接可能来自别的 origin（或 https），残留在 v1 模式会
-        // 直接触发"模式/地址不匹配"的内联错误。
-        form.relay.update(cx, |input, cx| {
-            input.set_text(&default_relay);
-            cx.notify();
-        });
-        self.notice = Some("已移除创建链接：回到 setup secret（v1）创建模式".to_owned());
+        self.notice = Some(
+            "已移除创建链接：粘贴新的 mn-pair://create 链接后可重新创建（旧票据已从界面丢弃，             未提交时不会被消费）"
+                .to_owned(),
+        );
         cx.notify();
-    }
-
-    /// 测试/断言：Create 表单当前 relay 文本。
-    pub fn form_relay_text(&self, cx: &App) -> Option<String> {
-        self.form
-            .as_ref()
-            .map(|form| form.relay.read(cx).text().to_owned())
-    }
-
-    /// 测试/断言：Create 表单当前 setup secret 文本（只用于测试，不对外展示）。
-    pub fn form_secret_text(&self, cx: &App) -> Option<String> {
-        self.form
-            .as_ref()
-            .map(|form| form.secret.read(cx).text().to_owned())
     }
 
     /// 测试/断言：Create 表单当前实例目录文本。
@@ -1516,15 +1498,6 @@ impl AppRoot {
         self.form.as_ref().map(|form| form.mode)
     }
 
-    /// 设置 Create 表单的 relay 模式（测试/按钮共用；不写配置、不联网）。
-    pub fn form_set_mode(&mut self, mode: RelayMode, cx: &mut Context<Self>) {
-        if let Some(form) = &mut self.form {
-            form.mode = mode;
-            form.error = None;
-        }
-        cx.notify();
-    }
-
     /// Create 表单是否已勾选 remote_tls 的显式确认。
     #[must_use]
     pub fn form_remote_consent(&self) -> Option<bool> {
@@ -1538,6 +1511,14 @@ impl AppRoot {
     #[doc(hidden)]
     pub fn set_test_relay_roots(&mut self, roots: Vec<Vec<u8>>) {
         self.test_relay_roots = roots;
+    }
+
+    /// **测试专用**：让下次 Create 的自动发布基线走故意不可达的 loopback（模拟发布失败）。
+    ///
+    /// 只用于验证"Create 成功但基线未发布"的 UX 与重试路径；生产不调用。
+    #[doc(hidden)]
+    pub fn set_test_baseline_unreachable(&mut self, unreachable: bool) {
+        self.test_baseline_unreachable = unreachable;
     }
 
     /// 设置 Create 表单的 remote_tls 确认勾选。
@@ -1766,141 +1747,28 @@ impl AppRoot {
 
     /// 提交 Create 表单（按钮与 Enter 的同一入口）。
     ///
-    /// 已应用创建链接（ADR 0014 S3b）时走票据模式；否则是既有 v1 setup secret 模式。
-    /// 两条路径互斥（类型上一个请求只带一种 [`CreateCredential`]）。
+    /// ADR 0018 S4b：App 只有「粘贴创建链接」一种创建方式；未应用链接时给出内联错误，
+    /// 不联网、不建文件。真正的校验/提交见 [`Self::submit_ticket_create`]。
     pub fn submit_create(&mut self, cx: &mut Context<Self>) {
         if self.state != State::CreateForm {
             return;
         }
         if self.form_has_create_link() {
             self.submit_ticket_create(cx);
-            return;
-        }
-        let Some(form) = &self.form else {
-            return;
-        };
-        let relay = form.relay.read(cx).text().trim().to_owned();
-        let secret = Zeroizing::new(form.secret.read(cx).text().trim().to_owned());
-        let dir = form.dir.read(cx).text().trim().to_owned();
-        let consent = form.consent;
-        let mode = form.mode;
-        let remote_consent = form.remote_consent;
-        let form_error = |form: &mut FormState, message: String| {
-            form.error = Some(message);
-        };
-        if let Some(form) = &mut self.form {
-            form.error = None;
-        }
-        // 0) remote_tls 必须显式确认"远程服务器/HTTPS"（ADR 0013 §1）。确认端点 ≠ 授权
-        //    接受服务器任意 hash；真正的信任只来自受限初始化的强 pin。
-        if mode == RelayMode::RemoteTls && !remote_consent {
-            if let Some(form) = &mut self.form {
-                form_error(
-                    form,
-                    "请先勾选「我确认要连接远程服务器（HTTPS）」：remote_tls 不是默认模式，确认端点 ≠ 授权接受服务器任意 hash"
-                        .to_owned(),
-                );
-            }
+        } else if let Some(form) = &mut self.form {
+            form.error = Some(
+                "请先粘贴创建链接并点「应用创建链接」：App 不再使用管理凭证或 setup secret，\
+                 创建授权只来自链接 fragment 里的一次性票据"
+                    .to_owned(),
+            );
             cx.notify();
-            return;
         }
-        // 1) relay 必须是本模式允许的 canonical origin（同一套权威 parser）。
-        if let Err(error) = validate_relay_edit(&relay, mode) {
-            if let Some(form) = &mut self.form {
-                form_error(form, error);
-            }
-            cx.notify();
-            return;
-        }
-        // 2) setup secret 必填。
-        if secret.is_empty() {
-            if let Some(form) = &mut self.form {
-                form_error(
-                    form,
-                    "请填写 setup secret（服务器创建凭证；只从本表单进内存，不写配置/日志）"
-                        .to_owned(),
-                );
-            }
-            cx.notify();
-            return;
-        }
-        // 3) 实例目录：绝对路径 + 尚不存在或空目录（Create/Join 共用，见
-        //    `validate_instance_directory`；"已有库/身份/别的文件"一律拒绝，不覆盖）。
-        let dir_path = PathBuf::from(&dir);
-        if let Err(message) = validate_instance_directory(&dir_path) {
-            if let Some(form) = &mut self.form {
-                form_error(form, message);
-            }
-            cx.notify();
-            return;
-        }
-        // 4) 显式同意开发同步。
-        if !consent {
-            if let Some(form) = &mut self.form {
-                form_error(
-                    form,
-                    "请先勾选「同意开发同步」：这是 localhost 开发验证，不是生产跨设备安全同步"
-                        .to_owned(),
-                );
-            }
-            cx.notify();
-            return;
-        }
-        let vault_path = dir_path.join(VAULT_FILE_NAME);
-        // 5) 取实例目录锁 → 启动后台 worker。
-        let lock = match InstanceLock::acquire(&dir_path) {
-            Ok(lock) => lock,
-            Err(error) => {
-                if let Some(form) = &mut self.form {
-                    form_error(form, error.to_string());
-                }
-                cx.notify();
-                return;
-            }
-        };
-        let request = CreateRequest {
-            vault_path,
-            relay_url: relay,
-            relay_mode: mode,
-            credential: CreateCredential::SetupSecret(secret),
-            lock,
-            test_extra_roots: self.test_relay_roots.clone(),
-        };
-        let job = match CreateJob::start(request) {
-            Ok(job) => job,
-            Err(error) => {
-                if let Some(form) = &mut self.form {
-                    form_error(form, format!("无法启动后台创建线程：{error}"));
-                }
-                cx.notify();
-                return;
-            }
-        };
-        // secret 已交给 worker：立刻清空输入框（不在 UI 里继续持有）。
-        if let Some(form) = &mut self.form {
-            form.secret.update(cx, |input, cx| {
-                input.clear();
-                cx.notify();
-            });
-        }
-        self.job = Some(job);
-        self.working = Some(WorkingState {
-            kind: WorkingKind::Create,
-            stage: None,
-            cancel_requested: false,
-            started: Instant::now(),
-            budget_notice_shown: false,
-        });
-        self.state = State::Working;
-        self.notice = None;
-        self.spawn_job_pump(cx);
-        cx.notify();
     }
 
-    /// 票据模式提交（ADR 0014 S3b：`create_vault_with_ticket`，固定 v2 面）。
+    /// 票据模式提交（ADR 0014 S3b / ADR 0018 S4b：App 唯一创建路径）。
     ///
     /// 校验顺序（全部在 UI 线程；任何失败都不联网、不建文件）：链接已应用 →
-    /// `remote_tls` 确认 → 实例目录（与 v1 Create 共用同一套）→ 显式同意 → 目录锁。
+    /// `remote_tls` 确认 → 实例目录 → 显式同意 → 目录锁。
     /// 通过后票据**只**移动到 worker（不写配置/日志）；失败后需重新粘贴同一链接
     /// （票据未被 relay 消费时可重试）。
     fn submit_ticket_create(&mut self, cx: &mut Context<Self>) {
@@ -1938,7 +1806,7 @@ impl AppRoot {
             fail(self, message, cx);
             return;
         }
-        // 2) 显式同意开发同步（与 v1 同一道门禁）。
+        // 2) 显式同意开发同步。
         if !consent {
             fail(
                 self,
@@ -1973,13 +1841,12 @@ impl AppRoot {
             vault_path,
             relay_url: relay,
             relay_mode: mode,
-            credential: CreateCredential::Ticket {
-                vault_id,
-                ticket,
-                expected_instance: pin,
-            },
+            vault_id,
+            ticket,
+            expected_instance: pin,
             lock,
             test_extra_roots: self.test_relay_roots.clone(),
+            test_baseline_unreachable: self.test_baseline_unreachable,
         };
         let job = match CreateJob::start(request) {
             Ok(job) => job,
@@ -2306,7 +2173,10 @@ impl AppRoot {
             timers.timer(CREATE_PUMP_INTERVAL).await;
             let alive = this.update(cx, |root, cx| {
                 root.poll_working(cx);
-                root.job.is_some() || root.join_job.is_some() || root.invite_job.is_some()
+                root.job.is_some()
+                    || root.join_job.is_some()
+                    || root.invite_job.is_some()
+                    || root.invite_copy_job.is_some()
             });
             match alive {
                 Ok(true) => {}
@@ -2340,6 +2210,12 @@ impl AppRoot {
                 invite_events.push(event);
             }
         }
+        let mut copy_invite_events = Vec::new();
+        if let Some(job) = &self.invite_copy_job {
+            while let Some(event) = job.try_next() {
+                copy_invite_events.push(event);
+            }
+        }
         for event in create_events {
             self.apply_create_event(event, cx);
         }
@@ -2348,6 +2224,9 @@ impl AppRoot {
         }
         for event in invite_events {
             self.apply_invite_event(event, cx);
+        }
+        for event in copy_invite_events {
+            self.apply_copy_invite_event(event, cx);
         }
         if self.state == State::Working {
             if let Some(working) = &mut self.working {
@@ -2460,6 +2339,8 @@ impl AppRoot {
                     entry,
                     confirmed: false,
                     copied: false,
+                    invite: None,
+                    invite_error: None,
                 });
                 self.state = State::BackupRequired;
                 self.error = None;
@@ -2924,9 +2805,13 @@ impl AppRoot {
         let mut fields = vec![
             ("实例 id".to_owned(), form.instance_id.clone()),
             (
+                "创建方式".to_owned(),
+                "link（粘贴创建链接；v2 一次性票据）".to_owned(),
+            ),
+            (
                 "relay".to_owned(),
                 form.link_state.as_ref().map_or_else(
-                    || form.relay.read(cx).text().trim().to_owned(),
+                    || "（尚未应用创建链接）".to_owned(),
                     |link| link.relay.clone(),
                 ),
             ),
@@ -2967,6 +2852,178 @@ impl AppRoot {
              恢复码拥有数据/管理恢复能力，只显示这一次。"
                 .to_owned(),
         );
+        cx.notify();
+    }
+
+    /// 备份页「复制邀请链接给其他设备」（ADR 0017 S5b）。
+    ///
+    /// 生成 v2 邀请链接（`api=2`、默认 15 分钟）→ 复制到剪贴板 → 提示风险。
+    /// **不要求活动文档**（邀请是管理操作，只需要 vault + 身份 + 管理私钥）；
+    /// 网络/签名在后台线程，token 不写日志/配置、也不在备份页长期展示。
+    pub fn copy_invite(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::BackupRequired {
+            return;
+        }
+        if self.invite_copy_job.is_some() {
+            self.notice = Some("正在生成邀请链接：请等这次收尾（不并发）。".to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let request = CopyInviteRequest {
+            vault: pending.outcome.vault.clone(),
+            vault_path: pending.outcome.vault_path.clone(),
+            relay_mode: pending.outcome.relay_mode,
+            relay_url: pending.outcome.relay_url.clone(),
+            api_version: pending.outcome.api_version,
+            test_extra_roots: self.test_relay_roots.clone(),
+        };
+        let job = match CopyInviteJob::start(request) {
+            Ok(job) => job,
+            Err(error) => {
+                if let Some(pending) = &mut self.pending {
+                    pending.invite_error = Some(format!("无法启动后台邀请任务：{error}"));
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(pending) = &mut self.pending {
+            pending.invite_error = None;
+        }
+        self.invite_copy_job = Some(job);
+        self.notice = Some(CopyInviteStage::Requesting.label().to_owned());
+        self.spawn_job_pump(cx);
+        cx.notify();
+    }
+
+    /// 备份页是否正在生成邀请链接（按钮禁用/测试用）。
+    #[must_use]
+    pub fn copy_invite_busy(&self) -> bool {
+        self.invite_copy_job.is_some()
+    }
+
+    /// 备份页最近一次成功生成的邀请 id（32 位 hex；**公开**，不含 token）。
+    #[must_use]
+    pub fn backup_invite_id(&self) -> Option<String> {
+        self.pending
+            .as_ref()
+            .and_then(|pending| pending.invite)
+            .map(|invite| menghunote_sync::ids::hex_of(&invite.invite_id))
+    }
+
+    /// 备份页实例的初始基线是否已自动发布（`None` = 不在备份页）。
+    ///
+    /// `false` = Create 的自动发布失败：恢复码/实例仍可用，但邀请会被本地前置检查挡住，
+    /// 需进主界面后显式「重试发布基线」。测试用它断言失败语义没有被吞掉。
+    #[must_use]
+    pub fn backup_baseline_published(&self) -> Option<bool> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.outcome.baseline_published)
+    }
+
+    /// 备份页最近一次生成邀请的脱敏失败文案（成功/未生成时为 `None`）。
+    #[must_use]
+    pub fn backup_invite_error(&self) -> Option<&str> {
+        self.pending
+            .as_ref()
+            .and_then(|pending| pending.invite_error.as_deref())
+    }
+
+    /// 备份页邀请链接的剩余有效期文案（不含 token）。
+    #[must_use]
+    pub fn backup_invite_ttl_text(&self) -> Option<String> {
+        let invite = self.pending.as_ref().and_then(|pending| pending.invite)?;
+        let now = menghunote_sync::http_relay::SystemClock.now_secs();
+        let left = invite.expires_at.saturating_sub(now);
+        Some(if left == 0 {
+            "邀请已过期：请重新点「复制邀请链接」生成新的".to_owned()
+        } else {
+            format!(
+                "邀请 {} 分 {} 秒内有效（一次性；链接含 token，只私发给要加入的设备）",
+                left / 60,
+                left % 60
+            )
+        })
+    }
+
+    /// 测试专用：**阻塞**等待备份页邀请链接的终态（显式收敛点，不是 sleep）。
+    pub fn wait_for_invite_copy_terminal(
+        &mut self,
+        cx: &mut Context<Self>,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut events = Vec::new();
+            if let Some(job) = &self.invite_copy_job {
+                while let Some(event) = job.try_next() {
+                    events.push(event);
+                }
+            }
+            if !events.is_empty() {
+                for event in events {
+                    self.apply_copy_invite_event(event, cx);
+                }
+                if self.invite_copy_job.is_none() {
+                    return true;
+                }
+                continue;
+            }
+            let Some(job) = &self.invite_copy_job else {
+                return true;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match job.recv(remaining) {
+                Some(event) => self.apply_copy_invite_event(event, cx),
+                None => return self.invite_copy_job.is_none(),
+            }
+        }
+    }
+
+    /// 备份页邀请链接事件（成功即复制剪贴板；失败只显示脱敏原因）。
+    fn apply_copy_invite_event(&mut self, event: CopyInviteEvent, cx: &mut Context<Self>) {
+        match event {
+            CopyInviteEvent::Progress(stage) => {
+                self.notice = Some(stage.label().to_owned());
+            }
+            CopyInviteEvent::Finished(link) => {
+                self.invite_copy_job = None;
+                self.pump_started = false;
+                let mut link = *link;
+                // 复制完立刻擦除本地 URL 副本（token 只在剪贴板里留一份）。
+                cx.write_to_clipboard(ClipboardItem::new_string(link.url.clone()));
+                link.url.zeroize();
+                if let Some(pending) = &mut self.pending {
+                    pending.invite = Some(CopiedInvite {
+                        invite_id: link.invite_id,
+                        expires_at: link.expires_at,
+                    });
+                    pending.invite_error = None;
+                }
+                self.notice = Some(
+                    "已复制邀请链接（公开链接含一次性 token，默认 15 分钟内有效）：\
+                     只私发给要加入的那台设备；不要截图/公开发布，剪贴板历史可能保留副本。\
+                     其他设备粘贴链接后是 PENDING，需在本机设备面板批准。"
+                        .to_owned(),
+                );
+            }
+            CopyInviteEvent::Failed { message, kind } => {
+                self.invite_copy_job = None;
+                self.pump_started = false;
+                if let Some(pending) = &mut self.pending {
+                    pending.invite = None;
+                    pending.invite_error = Some(format!("{}：{message}", kind.hint()));
+                }
+                self.notice = None;
+            }
+        }
         cx.notify();
     }
 
@@ -3038,10 +3095,12 @@ impl AppRoot {
         self.error = None;
         self.notice = Some(match warning {
             Some(warning) => format!(
-                "实例已创建。左侧「＋ 笔记」建第一篇，保存后可在右上同步面板点「发布基线」。\
-                 注意：{warning}"
+                "实例已创建（初始基线在 Create 内自动发布；未发布时同步面板会显示\
+                 「重试发布基线」）。其他设备需要加入时，在右上同步面板「邀请设备…」→\
+                 「复制邀请链接」（v2 链接含一次性 token，默认 15 分钟）。注意：{warning}"
             ),
-            None => "实例已创建。左侧「＋ 笔记」建第一篇，保存后可在右上同步面板点「发布基线」。"
+            None => "实例已创建，初始基线已自动发布：其他设备可直接在右上同步面板\
+                 「邀请设备…」→「复制邀请链接」（v2 链接含一次性 token，默认 15 分钟）。"
                 .to_owned(),
         });
     }
@@ -3284,16 +3343,14 @@ impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending_focus {
             self.pending_focus = false;
-            // Join 失败后最该重输的是恢复码；Create/其它情况聚焦第一个字段。
-            let focus_link = std::mem::take(&mut self.focus_create_link);
+            // Join 失败后最该重输的是恢复码；Create 聚焦创建链接（唯一入口）。
             let target = match self.state {
                 State::JoinForm => self
                     .join_form
                     .as_ref()
                     .map(|form| form.recovery_code.clone()),
-                State::CreateForm if focus_link => self.form.as_ref().map(|form| form.link.clone()),
-                State::CreateForm => self.form.as_ref().map(|form| form.relay.clone()),
-                _ => self.form.as_ref().map(|form| form.relay.clone()),
+                State::CreateForm => self.form.as_ref().map(|form| form.link.clone()),
+                _ => None,
             };
             if let Some(target) = target {
                 window.defer(cx, move |window, cx| {
@@ -4235,230 +4292,172 @@ impl AppRoot {
         let consent = form.consent;
         let mode = form.mode;
         let remote_consent = form.remote_consent;
-        let relay = form.relay.clone();
-        let secret = form.secret.clone();
         let link = form.link.clone();
         let dir = form.dir.clone();
         let form_error = form.error.clone();
-        // 票据模式：链接已应用（setup secret 不再需要，隐藏该字段）。
+        // 创建链接已应用：票据在内存，页面只展示公开事实。
         let link_facts = form
             .link_state
             .as_ref()
             .map(|link| (link.relay.clone(), link.vault_id_hex.clone()));
         let ticket_mode = link_facts.is_some();
-        let relay_label = match mode {
-            RelayMode::LocalDev => "relay 地址（local_dev 只允许明文 loopback）",
-            RelayMode::RemoteTls => "relay 地址（remote_tls 只接受 HTTPS canonical origin）",
-        };
-        let mut column = page_column()
-            .debug_selector(|| "app-root-create-form".to_string())
-            .child(title_text(if ticket_mode {
-                "用创建链接创建同步实例（v2 一次性票据）"
-            } else {
-                "创建同步实例（Create）"
-            }))
-            .child(banner_text())
+        let title = "用创建链接创建同步实例（v2 一次性票据）";
+        let mut content = content_column()
+            .child(section_text(
+                "创建链接（粘贴 mn-pair://create?…&vault=…#ticket=… 后点「应用创建链接」）",
+            ))
             .child(
-                content_column()
-                    .child(section_text(
-                        "创建链接（可选；粘贴 mn-pair://create?…&vault=…#ticket=… 后不需要 setup secret）",
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .bg(theme::window_bg())
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .rounded_sm()
+                    .child(link),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(action_button(
+                        "app-root-create-link-apply",
+                        "应用创建链接",
+                        false,
+                        false,
+                        cx,
+                        |root, cx| root.form_apply_create_link(cx),
                     ))
-                    .child(
-                        div()
-                            .w_full()
-                            .px_2()
-                            .py_1()
-                            .bg(theme::window_bg())
-                            .border_1()
-                            .border_color(theme::input_border())
-                            .rounded_sm()
-                            .child(link),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(action_button(
-                                "app-root-create-link-apply",
-                                "应用创建链接",
-                                false,
-                                false,
-                                cx,
-                                |root, cx| root.form_apply_create_link(cx),
-                            ))
-                            .when(ticket_mode, |this| {
-                                this.child(action_button(
-                                    "app-root-create-link-clear",
-                                    "移除链接（回到 setup secret）",
-                                    false,
-                                    false,
-                                    cx,
-                                    |root, cx| root.form_clear_create_link(cx),
-                                ))
-                            }),
-                    )
-                    .when_some(link_facts, |this, (relay, vault_id)| {
-                        this.child(
-                            div()
-                                .debug_selector(|| "app-root-create-link-warning".to_string())
-                                .w_full()
-                                .text_size(px(11.0))
-                                .text_color(theme::caret_color())
-                                .child(SharedString::from(
-                                    "一次性票据（默认 15 分钟内有效）：只在内存里提交一次；不写配置/日志，\
-                                     失败不消费票据，但本次界面里的票据会随提交移除（可重新粘贴同一链接）。\
-                                     创建成功后会先到备份页（恢复码只显示一次），配置写入 api_version=2。",
-                                )),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "app-root-create-link-facts".to_string())
-                                .w_full()
-                                .text_size(px(11.0))
-                                .text_color(theme::text_color())
-                                .child(SharedString::from(format!(
-                                    "relay：{relay}   ·   vault_id：{vault_id}   ·   API 面：v2"
-                                ))),
-                        )
-                        .when(mode == RelayMode::RemoteTls && !remote_consent, |this| {
-                            this.child(checkbox_row(
-                                "app-root-remote-consent",
-                                remote_consent,
-                                "我确认要连接远程服务器（HTTPS）；确认端点 ≠ 授权接受服务器任意 hash",
-                                cx,
-                                |root, cx| {
-                                    let next = root
-                                        .form
-                                        .as_ref()
-                                        .is_some_and(|form| !form.remote_consent);
-                                    root.form_set_remote_consent(next, cx);
-                                },
-                            ))
-                        })
-                    })
-                    .when(!ticket_mode, |this| {
-                        this.child(mode_selector(
-                            "app-root-mode",
-                            mode,
+                    .when(ticket_mode, |this| {
+                        this.child(action_button(
+                            "app-root-create-link-clear",
+                            "移除链接",
+                            false,
+                            false,
                             cx,
-                            |root, mode, cx| root.form_set_mode(mode, cx),
+                            |root, cx| root.form_clear_create_link(cx),
                         ))
-                        .when(mode == RelayMode::RemoteTls, |this| {
-                            this.child(
-                                div()
-                                    .debug_selector(|| "app-root-remote-dev-notice".to_string())
-                                    .w_full()
-                                    .text_size(px(11.0))
-                                    .text_color(theme::caret_color())
-                                    .child(SharedString::from(
-                                        "DEV 状态：remote_tls 初始化已接线（NewGenesis / production TLS + \
-                                         受限初始化，未在真实 relay / Windows 上验证）。不会忽略证书，\
-                                         也不提供私有 CA 导入（请自行安装系统根）。",
-                                    )),
-                            )
-                            .child(checkbox_row(
-                                "app-root-remote-consent",
-                                remote_consent,
-                                "我确认要连接远程服务器（HTTPS）；确认端点 ≠ 授权接受服务器任意 hash",
-                                cx,
-                                |root, cx| {
-                                    let next = root
-                                        .form
-                                        .as_ref()
-                                        .is_some_and(|form| !form.remote_consent);
-                                    root.form_set_remote_consent(next, cx);
-                                },
-                            ))
-                        })
-                        .child(label_text(relay_label))
-                        .child(
-                            div()
-                                .w_full()
-                                .px_2()
-                                .py_1()
-                                .bg(theme::window_bg())
-                                .border_1()
-                                .border_color(theme::input_border())
-                                .rounded_sm()
-                                .child(relay),
-                        )
-                        .child(label_text("setup secret（服务器创建凭证；不会保存）"))
-                        .child(
-                            div()
-                                .w_full()
-                                .px_2()
-                                .py_1()
-                                .bg(theme::window_bg())
-                                .border_1()
-                                .border_color(theme::input_border())
-                                .rounded_sm()
-                                .child(secret),
-                        )
-                        .child(hint_text(
-                            "这不是笔记库密码：dev-local 不接收用户口令，setup secret 只用于本次 genesis。",
-                        ))
-                    })
-                    .child(label_text(
-                        "实例目录（绝对路径；目录内固定 vault.sqlite3 / dev-identity.bin）",
-                    ))
+                    }),
+            );
+        if let Some((relay, vault_id)) = link_facts {
+            content = content
+                .child(
+                    div()
+                        .debug_selector(|| "app-root-create-link-warning".to_string())
+                        .w_full()
+                        .text_size(px(11.0))
+                        .text_color(theme::caret_color())
+                        .child(SharedString::from(
+                            "一次性票据（默认 15 分钟内有效）：只在内存里提交一次；不写配置/日志，\
+                             失败不消费票据，但本次界面里的票据会随提交移除（可重新粘贴同一链接）。\
+                             创建成功后会先到备份页（恢复码只显示一次），配置写入 api_version=2。",
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "app-root-create-link-facts".to_string())
+                        .w_full()
+                        .text_size(px(11.0))
+                        .text_color(theme::text_color())
+                        .child(SharedString::from(format!(
+                            "relay：{relay}   ·   vault_id：{vault_id}   ·   API 面：v2"
+                        ))),
+                );
+            if mode == RelayMode::RemoteTls {
+                content = content
                     .child(
                         div()
+                            .debug_selector(|| "app-root-remote-dev-notice".to_string())
                             .w_full()
-                            .px_2()
-                            .py_1()
-                            .bg(theme::window_bg())
-                            .border_1()
-                            .border_color(theme::input_border())
-                            .rounded_sm()
-                            .child(dir),
+                            .text_size(px(11.0))
+                            .text_color(theme::caret_color())
+                            .child(SharedString::from(
+                                "DEV 状态：remote_tls 初始化已接线（production TLS + 受限初始化，\
+                                 未在真实 relay / Windows 上验证）。不会忽略证书，也不提供私有 \
+                                 CA 导入（请自行安装系统根）。",
+                            )),
                     )
                     .child(checkbox_row(
-                        "app-root-consent",
-                        consent,
-                        "我理解这是开发同步（DEV ONLY / localhost / 非生产），并同意创建",
+                        "app-root-remote-consent",
+                        remote_consent,
+                        "我确认要连接远程服务器（HTTPS）；确认端点 ≠ 授权接受服务器任意 hash",
                         cx,
                         |root, cx| {
-                            let next = root.form.as_ref().is_some_and(|form| !form.consent);
-                            root.form_set_consent(next, cx);
+                            let next = root.form.as_ref().is_some_and(|form| !form.remote_consent);
+                            root.form_set_remote_consent(next, cx);
                         },
+                    ));
+            }
+        } else {
+            content = content.child(hint_text(
+                "尚未应用创建链接：创建授权只来自链接 fragment 里的一次性票据；App 不接收\
+                 管理凭证/setup secret，也不需要填 vault_id/TTL。",
+            ));
+        }
+
+        content = content
+            .child(label_text(
+                "实例目录（绝对路径；目录内固定 vault.sqlite3 / dev-identity.bin）",
+            ))
+            .child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .bg(theme::window_bg())
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .rounded_sm()
+                    .child(dir),
+            )
+            .child(checkbox_row(
+                "app-root-consent",
+                consent,
+                "我理解这是开发同步（DEV ONLY / localhost / 非生产），并同意创建",
+                cx,
+                |root, cx| {
+                    let next = root.form.as_ref().is_some_and(|form| !form.consent);
+                    root.form_set_consent(next, cx);
+                },
+            ))
+            .when_some(form_error, |this, error| {
+                this.child(
+                    div()
+                        .debug_selector(|| "app-root-form-error".to_string())
+                        .text_size(px(11.0))
+                        .text_color(theme::danger_text())
+                        .child(SharedString::from(error)),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(action_button(
+                        "app-root-submit",
+                        "用一次性票据创建",
+                        true,
+                        false,
+                        cx,
+                        |root, cx| root.submit_create(cx),
                     ))
-                    .when_some(form_error, |this, error| {
-                        this.child(
-                            div()
-                                .debug_selector(|| "app-root-form-error".to_string())
-                                .text_size(px(11.0))
-                                .text_color(theme::danger_text())
-                                .child(SharedString::from(error)),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(action_button(
-                                "app-root-submit",
-                                if ticket_mode {
-                                    "用一次性票据创建"
-                                } else {
-                                    "创建"
-                                },
-                                true,
-                                false,
-                                cx,
-                                |root, cx| root.submit_create(cx),
-                            ))
-                            .child(action_button(
-                                "app-root-back",
-                                "返回",
-                                false,
-                                false,
-                                cx,
-                                |root, cx| root.back_to_welcome(cx),
-                            )),
-                    ),
+                    .child(action_button(
+                        "app-root-back",
+                        "返回",
+                        false,
+                        false,
+                        cx,
+                        |root, cx| root.back_to_welcome(cx),
+                    )),
             );
+        let mut column = page_column()
+            .debug_selector(|| "app-root-create-form".to_string())
+            .child(title_text(title))
+            .child(banner_text())
+            .child(content);
         let notice = self.notice.clone();
         column = column.when_some(notice, |this, notice| {
             this.child(
@@ -4536,10 +4535,28 @@ impl AppRoot {
                             .text_size(px(12.0))
                             .text_color(theme::caret_color())
                             .child(SharedString::from(
-                                "本机没有这个设备身份：这是「加入」，不是登录——会用恢复码自批一个\
-                                 新的普通设备身份（没有管理私钥），不会覆盖创建者或其它设备。",
+                                "本机没有这个设备身份：这是「加入」，不是登录——会用恢复码/邀请\
+                                 自批一个新的普通设备身份（没有管理私钥），不会覆盖创建者或其它设备。",
                             )),
                     )
+                    .child(label_text("① 粘贴邀请链接（推荐；创建者「复制邀请链接」得到）"))
+                    .child(
+                        div()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .bg(theme::window_bg())
+                            .border_1()
+                            .border_color(theme::input_border())
+                            .rounded_sm()
+                            .child(invite),
+                    )
+                    .child(hint_text(
+                        "邀请只到「待批准」：创建者必须在设备管理里核对指纹并批准，本机才拿到数据；\
+                         链接含一次性令牌，兑换后输入框立即清空、不落盘、不进日志。\
+                         粘贴邀请后只需要再确认实例目录，relay/vault_id/恢复码可留空。",
+                    ))
+                    .child(hint_text("—— 或者手动输入以下信息（恢复码加入）——"))
                     .child(label_text(relay_label))
                     .child(
                         div()
@@ -4566,22 +4583,6 @@ impl AppRoot {
                     )
                     .child(hint_text(
                         "vault_id 是公开标识，不遮罩；恢复码才是秘密，千万不要贴进这个框。",
-                    ))
-                    .child(label_text("邀请链接（可选；mn-pair://join?...，粘贴后不需要恢复码）"))
-                    .child(
-                        div()
-                            .w_full()
-                            .px_2()
-                            .py_1()
-                            .bg(theme::window_bg())
-                            .border_1()
-                            .border_color(theme::input_border())
-                            .rounded_sm()
-                            .child(invite),
-                    )
-                    .child(hint_text(
-                        "邀请只到「待批准」：创建者必须在设备管理里核对指纹并批准，本机才拿到数据；\
-                         链接含一次性令牌，兑换后输入框立即清空、不落盘、不进日志。",
                     ))
                     .child(label_text("恢复码（走恢复码加入时填写；mnrec1…、遮罩、不落盘）"))
                     .child(
@@ -4821,6 +4822,12 @@ impl AppRoot {
         let copied = pending.copied;
         let vault_id = pending.entry.vault_id.clone();
         let recovery_code = pending.outcome.recovery_code.as_str().to_owned();
+        let baseline_published = pending.outcome.baseline_published;
+        let warning = pending.outcome.warning.clone();
+        let invite_copied = pending.invite.is_some();
+        let invite_busy = self.invite_copy_job.is_some();
+        let invite_ttl = self.backup_invite_ttl_text();
+        let invite_error = self.backup_invite_error().map(str::to_owned);
         let column = page_column()
             .debug_selector(|| "app-root-backup".to_string())
             .child(title_text("备份恢复码（只显示这一次）"))
@@ -4847,6 +4854,32 @@ impl AppRoot {
                     .child(hint_text(
                         "relay 终端里的 relay_instance_id 是服务器实例标识，不是这个 vault_id；                         当前 relay 仍是单 vault。",
                     ))
+                    .child(
+                        div()
+                            .debug_selector(|| "app-root-baseline-status".to_string())
+                            .text_size(px(11.0))
+                            .text_color(if baseline_published {
+                                theme::caret_color()
+                            } else {
+                                theme::danger_text()
+                            })
+                            .child(SharedString::from(if baseline_published {
+                                "初始基线已自动发布：可直接复制邀请链接给其他设备（加入端不再缺基线）。"
+                            } else {
+                                "基线未发布（创建时自动发布失败）：实例/恢复码已保留。请先点\
+                                 「继续进入主界面」，新建或打开一篇笔记后在同步面板点\
+                                 「重试发布基线」；发布成功前邀请链接不会生成（本地前置检查会挡住）。"
+                            })),
+                    )
+                    .when_some(warning, |this, warning| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "app-root-create-warning".to_string())
+                                .text_size(px(11.0))
+                                .text_color(theme::status_bar_text())
+                                .child(SharedString::from(format!("创建告警：{warning}"))),
+                        )
+                    })
                     .child(
                         div()
                             .debug_selector(|| "app-root-recovery-code".to_string())
@@ -4880,6 +4913,58 @@ impl AppRoot {
                                 ))
                             }),
                     )
+                    .child(section_text(
+                        "邀请其他设备（初始基线在 Create 内自动发布；不要求先发布笔记）",
+                    ))
+                    .child(hint_text(
+                        "「复制邀请链接」生成 v2 一次性邀请（默认 15 分钟），其他设备粘贴链接后是 \
+                         PENDING，需在本机设备面板批准。链接含 token：只在剪贴板里，UI 不显示明文；\
+                         只私发，不要截图/公开发布。",
+                    ))
+                    .child(action_button(
+                        "app-root-copy-invite",
+                        if invite_busy {
+                            "正在生成邀请链接…"
+                        } else if invite_copied {
+                            "重新生成并复制邀请链接"
+                        } else {
+                            "复制邀请链接给其他设备"
+                        },
+                        false,
+                        invite_busy,
+                        cx,
+                        |root, cx| root.copy_invite(cx),
+                    ))
+                    .when(invite_copied, |this| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "app-root-invite-copied".to_string())
+                                .text_size(px(11.0))
+                                .text_color(theme::caret_color())
+                                .child(SharedString::from(
+                                    "已复制邀请链接：token 只在剪贴板，本页不显示明文；\
+                                     再次点击会生成并复制一张新链接（旧的作废）。",
+                                )),
+                        )
+                    })
+                    .when_some(invite_ttl, |this, text| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "app-root-invite-ttl".to_string())
+                                .text_size(px(11.0))
+                                .text_color(theme::caret_color())
+                                .child(SharedString::from(text)),
+                        )
+                    })
+                    .when_some(invite_error, |this, text| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "app-root-invite-error".to_string())
+                                .text_size(px(11.0))
+                                .text_color(theme::danger_text())
+                                .child(SharedString::from(text)),
+                        )
+                    })
                     .child(checkbox_row(
                         "app-root-backup-confirm",
                         confirmed,

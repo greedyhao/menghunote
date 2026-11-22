@@ -61,7 +61,8 @@
 //! | `dev-sync-error` | 最近错误行 |
 //! | `dev-sync-notice` | 最近一次按钮操作的结果（排队 / 被拒绝 / 已移除） |
 //! | `dev-sync-sync-state` | 持闸同步行（切片 4c-2：空闲 / 已持闸 / N 条变化） |
-//! | `dev-sync-create` / `join` / `sync` / `publish` / `stop` | 5 个按钮 |
+//! | `dev-sync-sync` / `stop` | 「同步」「停止」按钮（顶部不再有「创建」「加入」：真实入口在 AppRoot Welcome） |
+//! | `dev-sync-publish` | 「重试发布基线」按钮（**只在**本机有管理钥且 durable 基线缺失/未知为缺失时渲染；正常隐藏） |
 //! | `dev-sync-devices` | 设备列表区域（含固定警告文案） |
 //! | `dev-sync-refresh-devices` | 刷新设备列表按钮 |
 //! | `dev-sync-member-<i>` | 第 i 行设备（i 与 `MemberView` 的稳定升序一致） |
@@ -69,10 +70,10 @@
 //! | `dev-sync-member-<i>-status` | 该行的访问状态（含「本机」标记） |
 //! | `dev-sync-remove-<i>` | 该行的移除按钮（仅 Active 且非本机时渲染） |
 //! | `dev-sync-confirm-revoke` / `dev-sync-cancel-revoke` | 二次确认的确认/取消按钮 |
-//! | `dev-sync-invite` | 「邀请设备…」按钮（ADR 0014 S1；无管理钥/无活动文档/忙时置灰并说明） |
-//! | `dev-sync-invite-link` | 生成的邀请链接明文（**含 token**：只在本机内存/面板显示） |
+//! | `dev-sync-invite` | 「邀请设备…」按钮（ADR 0014 S1 / 0017 S5b；无管理钥/无基线/忙时置灰并说明；**不要求活动文档**） |
 //! | `dev-sync-invite-ttl` | 邀请 TTL 文案（公开；不含 token） |
-//! | `dev-sync-copy-invite` | 「复制链接」（显式动作，不自动复制） |
+//! | `dev-sync-copy-invite` | 「复制邀请链接」（显式动作，不自动复制；**链接明文不渲染**） |
+//! | `dev-sync-invite-copied` | 复制后的折叠行（「已复制；关闭面板即失效」；不再展示链接/复制按钮） |
 //! | `dev-sync-approve-<短id>` | pending 行的「批准」按钮（仅管理设备渲染） |
 //! | `dev-sync-approve-confirm` / `dev-sync-approve-cancel` | 批准确认区的确认/取消 |
 //! | `dev-sync-approve-warning` | 批准确认区：目标 device_id + sign/hpke 短 hash（双端比对） |
@@ -84,15 +85,21 @@
 //! | `dev-sync-rotate-warning` | 轮换确认区的固定警告行 |
 //! | `dev-sync-apply-confirm` / `dev-sync-apply-cancel` | 应用新 epoch 确认区的确认/取消 |
 //!
+//! 邀请链接**永不**以明文进入布局：URL/token 只存在 worker 内存、`InviteLinkView`
+//! 与点击复制那一刻的剪贴板；复制成功后邀请块折叠（`dev-sync-invite-copied`）。上一版
+//! 会把 `mn-pair://join?...` 整段画在面板上（截图/录屏就泄露 token），S5b 之后不再这样。
+//!
 //! **`dev-sync-sync` / `dev-sync-publish` 不直接对 service 发命令**（切片 4c-2 / 4c-4）：
 //! 它们只发 [`DevSyncPanelEvent::SyncRequested`] / [`DevSyncPanelEvent::PublishRequested`]，
 //! 由 `AppShell` 走"先持闸、再派发 worker"的状态机（见 `dev_sync::sync_once`）。
 //! 直接 `try_command(SyncOnce)` / `try_command(PublishInitialPair)` 会被生产 runner
 //! 以"缺持闸证明"拒绝——面板不制造那条假路径。
 //!
-//! 发布按钮的前置条件只有一条来自 worker 的公开事实：`can_manage`（本机身份有没有管理
-//! 密钥）。没有管理密钥（Join 设备）时按钮置灰，点击只给明确原因、**不**发请求——真正
-//! 的权威拒绝仍由 worker 重新读身份后给出。
+//! 「重试发布基线」只在两条 worker 公开事实同时成立时**才渲染**：
+//! `can_manage`（本机有管理密钥）与"durable 初始基线**已知缺失**"（`baseline_known &&
+//! published_baseline.is_none()`）。Create 已自动发布基线的正常实例不显示该按钮；Join
+//! 设备也不显示。按钮仍只是请求（[`DevSyncPanelEvent::PublishRequested`]），真正的
+//! 权威拒绝由 AppShell/worker 给出；界面不可用时的原因仍写进 `dev-sync-notice`。
 //!
 //! **轮换/应用新 epoch 也一样不直接发命令**：确认后只登记请求并发
 //! [`DevSyncPanelEvent::RotateRequested`] / [`DevSyncPanelEvent::ApplyEpochRequested`]；
@@ -307,6 +314,9 @@ pub struct DevSyncPanel {
     /// 为什么不在构造/事件回调里**立刻**发命令：那会和用户/宿主的同步命令抢单操作
     /// 串行位（`SyncOnce` 会被 `Busy` 拒绝）。放到泵里、只在空闲时发，顺序可控。
     refresh_pending: bool,
+    /// 当前邀请链接是否已复制过：复制成功后邀请块折叠为「已复制；关闭面板即失效」，
+    /// 不再展示链接/复制按钮（再生成走「邀请设备…」）。
+    invite_copied: bool,
 }
 
 impl DevSyncPanel {
@@ -350,6 +360,7 @@ impl DevSyncPanel {
             pending_rotate_request: None,
             // 面板打开即读一次设备列表（ADR 0010 切片 2a-2）：由 40 ms 泵在空闲时派发。
             refresh_pending: true,
+            invite_copied: false,
         };
         panel.spawn_pump(cx);
         panel
@@ -760,7 +771,9 @@ impl DevSyncPanel {
 
     /// 「邀请设备…」为什么不可用（`None` = 可用）。
     ///
-    /// ADR 0014 S1：无管理钥 / 无活动文档 / 有在途操作 / 宿主持闸忙 都禁用并说明。
+    /// ADR 0014 S1 / ADR 0017 S5b：无管理钥 / 有在途操作 / 宿主持闸忙 都禁用并说明；
+    /// **不要求活动文档**——邀请是管理操作（vault + 身份 + 管理私钥即可），刚创建、
+    /// 还没打开/发布任何笔记的实例也必须能直接复制邀请链接给其他设备。
     #[must_use]
     pub fn invite_block_reason(&self) -> Option<&'static str> {
         if self.snapshot.worker_stopped {
@@ -769,8 +782,12 @@ impl DevSyncPanel {
         if !self.snapshot.can_manage_devices {
             return Some("本机没有管理密钥（Join/邀请加入的设备）：不能生成邀请链接");
         }
-        if !self.has_active_document {
-            return Some("没有活动文档：请先打开一篇笔记再生成邀请（避免在途初始化）");
+        // 本地前置检查（与 worker 同一条 durable 事实）：没有基线时链接会让加入端在
+        // bootstrap 阶段撞 NO_VALID_BASELINE；面板提前给原因，worker 仍会再兜一次。
+        if self.snapshot.baseline_known && self.snapshot.published_baseline.is_none() {
+            return Some(
+                "创建端尚未发布初始基线（Create 会自动发布，失败可重试）：请先在同步面板点「重试发布基线」，成功前邀请链接不会生成",
+            );
         }
         if self.snapshot.in_flight.is_some() || self.host_busy {
             return Some("有操作在途：等收尾后再生成邀请");
@@ -807,7 +824,8 @@ impl DevSyncPanel {
             cx.notify();
             return;
         }
-        // 新链接替换旧链接（旧 token 不再展示，避免复制到已过期的那个）。
+        // 新链接替换旧链接（旧 token 不再展示，避免复制到已过期的那个）；折叠态复位。
+        self.invite_copied = false;
         self.send(Command::CreateInvite, cx);
     }
 
@@ -824,8 +842,11 @@ impl DevSyncPanel {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(url));
+        // 复制成功后折叠邀请块：链接不再留在布局里（截图/录屏也不会泄露 token）。
+        self.invite_copied = true;
         self.notice = Some(
-            "已复制邀请链接（含一次性令牌）：只发给要加入的那台设备；剪贴板历史可能保留副本"
+            "已复制邀请链接（含一次性 token，默认 15 分钟内有效）：只私发给要加入的那台设备；\
+             不要截图/公开发布，剪贴板历史可能保留副本。面板已隐藏链接，关闭面板即失效"
                 .to_owned(),
         );
         cx.notify();
@@ -1070,13 +1091,15 @@ impl DevSyncPanel {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs());
+            // **不渲染** `mn-pair://join?...` 明文（含 token）：链接只进剪贴板。
             invite_area = invite_area
                 .child(
                     div()
-                        .debug_selector(|| "dev-sync-invite-link".to_string())
                         .text_size(px(10.0))
-                        .text_color(theme::text_color())
-                        .child(SharedString::from(link.url.clone())),
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(
+                            "链接明文不会显示在面板上：只通过「复制邀请链接」进剪贴板（一次性 token）",
+                        )),
                 )
                 .child(
                     div()
@@ -1084,15 +1107,28 @@ impl DevSyncPanel {
                         .text_size(px(10.0))
                         .text_color(theme::status_bar_text())
                         .child(SharedString::from(link.ttl_text(now))),
-                )
-                .child(self.action_button(
+                );
+            if self.invite_copied {
+                // 复制成功后折叠：不再展示链接/复制按钮（新链接走「邀请设备…」）。
+                invite_area = invite_area.child(
+                    div()
+                        .debug_selector(|| "dev-sync-invite-copied".to_string())
+                        .text_size(px(10.0))
+                        .text_color(theme::caret_color())
+                        .child(SharedString::from(
+                            "已复制邀请链接；关闭面板即失效（链接不再显示）",
+                        )),
+                );
+            } else {
+                invite_area = invite_area.child(self.action_button(
                     "dev-sync-copy-invite",
-                    "复制链接",
+                    "复制邀请链接",
                     false,
                     false,
                     cx,
                     |panel, cx| panel.copy_invite_link(cx),
                 ));
+            }
         }
 
         div()
@@ -1115,7 +1151,7 @@ impl DevSyncPanel {
                     .text_size(px(10.0))
                     .text_color(theme::status_bar_text())
                     .child(SharedString::from(if can_manage {
-                        "本机有管理密钥：可以移除其它设备、发布初始基线。"
+                        "本机有管理密钥：可以移除其它设备；初始基线在 Create 时自动发布，失败可重试。"
                     } else {
                         "本机没有管理密钥（Join 设备）：移除设备与发布基线都不可用。"
                     })),
@@ -1600,29 +1636,31 @@ impl Render for DevSyncPanel {
             Some(line) => format!("{}：{line}", self.task_label),
             None => "同步：空闲".to_owned(),
         };
-        let buttons = [
-            ("dev-sync-create", "创建", Command::Create, false),
-            ("dev-sync-join", "加入", Command::Join, false),
-            ("dev-sync-sync", "同步", Command::SyncOnce, false),
-        ];
+        // ADR 0017 S5b 收口：顶部**不再**有「创建」「加入」——真实入口在 AppRoot
+        // Welcome/向导里；面板里重复的按钮只会让人以为在面板里创建就能跳过备份页。
+        // 保留「同步」「停止」；「发布基线」只在缺失时出现（见下）。
+        let buttons = [("dev-sync-sync", "同步", Command::SyncOnce, false)];
         let mut row = div().flex().flex_row().flex_wrap().gap_1();
         for (selector, label, command, danger) in buttons {
             row = row.child(self.button(selector, label, command, danger, cx));
         }
-        // 「发布基线」（切片 4c-4）：**不直接发命令**——与「同步」一样先请宿主持闸。
-        // 置灰条件：没有管理密钥（Join 设备）/ 有操作在途 / 宿主正在持闸；
-        // 真正的拒绝仍由 worker 读身份后给（面板不发明规则）。
-        let publish_dimmed = self.snapshot.in_flight.is_some()
-            || self.host_busy
-            || !self.snapshot.can_manage_devices;
-        row = row.child(self.action_button(
-            "dev-sync-publish",
-            "发布基线",
-            false,
-            publish_dimmed,
-            cx,
-            |panel, cx| panel.request_publish(cx),
-        ));
+        // 「重试发布基线」：只在**本机有管理钥**且 durable 基线**已知缺失**时渲染。
+        // 正常实例（Create 已自动发布）不显示；未知（还没读到设备/基线事实）也不显示，
+        // 避免首帧闪一下。仍只是请求：由 AppShell 持闸（现有 `request_publish`）。
+        let publish_missing = self.snapshot.can_manage_devices
+            && self.snapshot.baseline_known
+            && self.snapshot.published_baseline.is_none();
+        if publish_missing {
+            let publish_dimmed = self.snapshot.in_flight.is_some() || self.host_busy;
+            row = row.child(self.action_button(
+                "dev-sync-publish",
+                "重试发布基线",
+                false,
+                publish_dimmed,
+                cx,
+                |panel, cx| panel.request_publish(cx),
+            ));
+        }
         row = row.child(self.button("dev-sync-stop", "停止", Command::Stop, true, cx));
         let devices = self.render_devices(cx);
 
@@ -1685,6 +1723,16 @@ impl Render for DevSyncPanel {
                     .text_color(theme::status_bar_text())
                     .child(SharedString::from(sync_text)),
             )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme::status_bar_text())
+                    .child(SharedString::from(if publish_missing {
+                        "初始基线未发布：创建后会自动发布，失败可重试（重试需要先打开一篇笔记）"
+                    } else {
+                        "初始基线在创建时自动发布；基线已就绪时此面板不显示发布按钮"
+                    })),
+            )
             .child(row)
             .child(devices)
     }
@@ -1718,6 +1766,8 @@ mod tests {
             devices: Vec::new(),
             self_device: None,
             can_manage_devices: false,
+            baseline_known: false,
+            published_baseline: None,
             last_revoked: None,
             invite_link: None,
             last_approved: None,

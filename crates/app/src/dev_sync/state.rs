@@ -35,6 +35,7 @@
 
 use std::fmt;
 
+use menghunote_sync::dev_local::PublishedBaseline;
 use menghunote_sync::http_relay::MemberView;
 use menghunote_sync::DeviceId;
 
@@ -867,6 +868,9 @@ pub enum Event {
         self_device: DeviceId,
         /// 本机身份是否持有管理密钥（Join 设备 = `false`，移除按钮置灰）。
         can_manage: bool,
+        /// 本库 durable 的初始基线事实（`None` = 尚未发布；`None` 时面板才渲染
+        /// 「重试发布基线」，存在时按钮隐藏）。公开事实，不含密钥。
+        published_baseline: Option<PublishedBaseline>,
     },
     /// 邀请链接已生成（ADR 0014 S1；**含 token**，只在面板内存里展示）。
     ///
@@ -1091,6 +1095,11 @@ pub struct StateSnapshot {
     pub self_device: Option<DeviceId>,
     /// 本机身份是否持有管理密钥（`false` = 移除按钮必须置灰）。
     pub can_manage_devices: bool,
+    /// 是否已经从 worker 拿到 durable 基线事实的**确定值**（`false` = 还没读到过；
+    /// 面板在未知时不渲染发布入口，避免首帧闪一下按钮）。
+    pub baseline_known: bool,
+    /// 本库 durable 的初始基线事实（`None` = 尚未发布；见 [`Self::baseline_known`]）。
+    pub published_baseline: Option<PublishedBaseline>,
     /// 最近一次**成功**移除的设备与 relay 事实摘要（面板 notice 的来源）。
     pub last_revoked: Option<(DeviceId, OpResult)>,
     /// 最近一次生成的邀请链接（只存内存；`Debug` 遮 token）。
@@ -1183,6 +1192,10 @@ pub struct SyncState {
     self_device: Option<DeviceId>,
     /// 本机是否有管理密钥（worker 上报的能力位）。
     can_manage_devices: bool,
+    /// 是否已读到 durable 基线事实（`false` = 未知，不渲染发布入口）。
+    baseline_known: bool,
+    /// durable 初始基线事实（`None` = 未发布）。
+    published_baseline: Option<PublishedBaseline>,
     /// 最近一次成功移除（面板 notice 的来源；失败走 `last_error`）。
     last_revoked: Option<(DeviceId, OpResult)>,
     /// 最近一次生成的邀请链接（只存内存；token 不落盘/不进日志）。
@@ -1224,6 +1237,8 @@ impl SyncState {
             devices: Vec::new(),
             self_device: None,
             can_manage_devices: false,
+            baseline_known: false,
+            published_baseline: None,
             last_revoked: None,
             invite_link: None,
             last_approved: None,
@@ -1333,6 +1348,8 @@ impl SyncState {
             devices: self.devices.clone(),
             self_device: self.self_device,
             can_manage_devices: self.can_manage_devices,
+            baseline_known: self.baseline_known,
+            published_baseline: self.published_baseline,
             last_revoked: self.last_revoked.clone(),
             invite_link: self.invite_link.clone(),
             last_approved: self.last_approved.clone(),
@@ -1642,14 +1659,18 @@ impl SyncState {
                 members,
                 self_device,
                 can_manage,
+                published_baseline,
             } => {
                 self.devices = members.clone();
                 self.self_device = Some(self_device);
                 self.can_manage_devices = can_manage;
+                self.baseline_known = true;
+                self.published_baseline = published_baseline;
                 self.mailbox.push(Event::DevicesListed {
                     members,
                     self_device,
                     can_manage,
+                    published_baseline,
                 });
             }
             Event::DeviceRevoked { target, result } => {

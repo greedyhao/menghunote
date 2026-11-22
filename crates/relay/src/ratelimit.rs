@@ -3,8 +3,8 @@
 //! 约束：
 //! - **不引入新依赖**：只用 `std::time::Instant` + `Mutex`，固定窗口（`max_requests` 次 /
 //!   `window_secs` 秒）即可满足"有界速率"的最低要求，不做令牌桶/分布式限流；
-//! - 只挂在 **v2** `/v2/vaults`（创建票据消费）与 `/v2/vaults/{id}/auth/*`（挑战/换 token）上；
-//!   **v1 旧 API 完全不受影响**（ADR 0014 §A：v1 行为保留）；
+//! - 只挂在 **v2** `/v2/vaults`（创建票据消费）、`/v2/vaults/{id}/auth/*`（挑战/换 token）
+//!   与 v2 数据面/控制面上；**v1 旧 API 完全不受影响**（ADR 0014 §A：v1 行为保留）；
 //! - 限流是**实例级**的：relay 是单进程单库，攻击者先耗尽实例预算/写队列比"按租户分摊"
 //!   更值得防；这里不声称提供 per-IP/per-vault 公平性（见 ADR 0014 §A 的限制）；
 //! - 拒绝返回 `429 RATE_LIMITED`（`retryable = true`），错误体与其它协议错误同构，

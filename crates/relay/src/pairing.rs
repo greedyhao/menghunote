@@ -49,13 +49,15 @@ pub struct InviteRow {
     pub expires_at: i64,
     pub pending_device: Option<Id16>,
     pub used_at: Option<i64>,
+    /// ADR 0015：V2 邀请绑定的签发 cap（v1 行为 `None`）。
+    pub issuer_cap_id: Option<Id16>,
 }
 
 /// 读邀请。
 pub fn invite(conn: &ScopeConn, invite_id: &Id16) -> Result<Option<InviteRow>> {
     let mut stmt = conn.prepare(
-        "SELECT invite_id, token_hash, expires_at, pending_device, used_at FROM invites
-         WHERE invite_id = ?1 AND vault_id = ?",
+        "SELECT invite_id, token_hash, expires_at, pending_device, used_at, issuer_cap_id
+         FROM invites WHERE invite_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
         .query_row((invite_id.as_slice(), conn.scope().as_slice()), |row| {
@@ -65,10 +67,11 @@ pub fn invite(conn: &ScopeConn, invite_id: &Id16) -> Result<Option<InviteRow>> {
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<Vec<u8>>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
             ))
         })
         .optional()?;
-    let Some((id, hash, expires_at, pending, used_at)) = row else {
+    let Some((id, hash, expires_at, pending, used_at, issuer_cap_id)) = row else {
         return Ok(None);
     };
     Ok(Some(InviteRow {
@@ -91,6 +94,15 @@ pub fn invite(conn: &ScopeConn, invite_id: &Id16) -> Result<Option<InviteRow>> {
             ),
         },
         used_at,
+        issuer_cap_id: match issuer_cap_id {
+            None => None,
+            Some(bytes) => Some(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Invariant("invites.issuer_cap_id"))?,
+            ),
+        },
     }))
 }
 
@@ -167,6 +179,8 @@ pub fn create_invite(
         expires_at,
         pending_device: None,
         used_at: None,
+        // v1 管理写创建的邀请没有 cap 绑定（V2 走控制记录 kind 11）。
+        issuer_cap_id: None,
     })
 }
 
@@ -209,6 +223,12 @@ pub fn redeem_invite(
     // T 的哈希必须匹配（常数时间比较；错 token 与错 id 都同一错误码，不泄露邀请存在性）。
     if !ct_eq(sha256(token).as_slice(), invite.token_hash.as_slice()) {
         return Err(Error::api(ErrorCode::Forbidden));
+    }
+    // ADR 0015 kind 11：V2 邀请绑定签发 cap；cap 失效（撤销/到期/authority 变更）则
+    // 未兑换邀请一并失效。v1 邀请（issuer_cap_id = NULL）行为不变。
+    if let Some(cap_id) = invite.issuer_cap_id {
+        crate::control_v2::require_effective_cap(conn, clock, &cap_id)
+            .map_err(|_| Error::api(ErrorCode::Forbidden))?;
     }
     // 设备 id 永不复用。
     let exists: i64 = conn.query_row(

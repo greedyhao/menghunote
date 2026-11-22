@@ -67,14 +67,14 @@ fn local_context(relay: &DevRelay) -> RelayContext {
         .with_api_version(RelayApiVersion::V2)
 }
 
-fn raw_ticket(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64, quota: u32) -> [u8; 32] {
+fn raw_ticket(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64) -> [u8; 32] {
     relay
-        .issue_create_ticket(vault_id, Duration::from_secs(ttl_secs), quota)
+        .issue_create_ticket(vault_id, Duration::from_secs(ttl_secs))
         .expect("发行创建票据")
 }
 
-fn ticket(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64, quota: u32) -> CreateTicket {
-    CreateTicket::from_slice(&raw_ticket(relay, vault_id, ttl_secs, quota)).expect("票据长度为 32B")
+fn ticket(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64) -> CreateTicket {
+    CreateTicket::from_slice(&raw_ticket(relay, vault_id, ttl_secs)).expect("票据长度为 32B")
 }
 
 fn no_identity(_identity: &menghunote_sync::identity::LocalIdentityV1) -> Result<(), SyncError> {
@@ -170,8 +170,8 @@ fn two_ticket_vaults_on_the_same_relay_are_isolated() {
     let b_path = dir.path().join("b/vault.sqlite3");
 
     // 两个 vault 都通过 **同一形状** 的创建链接进入（link → parse → context）。
-    let raw_a = raw_ticket(&relay, VAULT_A, 900, 1);
-    let raw_b = raw_ticket(&relay, VAULT_B, 900, 1);
+    let raw_a = raw_ticket(&relay, VAULT_A, 900);
+    let raw_b = raw_ticket(&relay, VAULT_B, 900);
     let link_a = CreateLink::encode(
         RelayMode::LocalDev,
         relay.base_url(),
@@ -356,7 +356,7 @@ fn two_ticket_vaults_on_the_same_relay_are_isolated() {
     assert_ticket_not_persisted(&dir.path().join("b"), &raw_b);
 }
 
-/// 票据错误分类：错 vault/过期/已用 → 403；同 vault 重复（quota>1）→ 409；
+/// 票据错误分类：错 vault/过期/已用 → 403；同 vault 重复（vault 已存在 + 新票据）→ 409；
 /// 限流 → 429。失败不建库、不消费票据（随后同一张票仍能成功）。
 #[test]
 fn ticket_errors_are_classified_and_failures_do_not_consume_the_ticket() {
@@ -365,7 +365,7 @@ fn ticket_errors_are_classified_and_failures_do_not_consume_the_ticket() {
     let context = || local_context(&relay);
 
     // 1) 错 vault：票据绑定 VAULT_A，却用 VAULT_B 创建 → 403（不泄露票据/租户原因）。
-    let wrong_vault_ticket = ticket(&relay, VAULT_A, 900, 1);
+    let wrong_vault_ticket = ticket(&relay, VAULT_A, 900);
     let wrong_path = dir.path().join("wrong/vault.sqlite3");
     let error = expect_create_error(create_vault_with_ticket(
         context(),
@@ -406,7 +406,7 @@ fn ticket_errors_are_classified_and_failures_do_not_consume_the_ticket() {
     assert_no_vault_files(&replay_path);
 
     // 3) 过期：TTL 1s + 推进 relay 假时钟 2s → 403。
-    let expired = ticket(&relay, VAULT_C, 1, 1);
+    let expired = ticket(&relay, VAULT_C, 1);
     relay.advance_secs(2);
     let expired_path = dir.path().join("expired/vault.sqlite3");
     let error = expect_create_error(create_vault_with_ticket(
@@ -421,20 +421,26 @@ fn ticket_errors_are_classified_and_failures_do_not_consume_the_ticket() {
     assert_eq!(relay_code(&error), ("FORBIDDEN", false));
     assert_no_vault_files(&expired_path);
 
-    // 4) 同 vault 重复创建（quota=2）：票据仍有效，但 vault 已存在 → 409 ALREADY_INITIALIZED。
+    // 4) 同 vault 重复创建：测试夹具直接种一张绑定已存在 vault 的新票据（ADR 0018 S4b
+    //    起没有对 ACTIVE vault 的发行入口），该票有效但 registry 已是 ACTIVE →
+    //    409 ALREADY_INITIALIZED，且票据不被消费。
     let duplicate_id = [0xD4; 16];
-    let duplicate_ticket = ticket(&relay, duplicate_id, 900, 2);
+    let first_ticket = ticket(&relay, duplicate_id, 900);
     let first_path = dir.path().join("dup-1/vault.sqlite3");
     create_vault_with_ticket(
         context(),
         duplicate_id,
-        &duplicate_ticket,
+        &first_ticket,
         None,
         &first_path,
         "第一次",
         no_identity,
     )
     .expect("第一次创建成功");
+    let duplicate_raw = relay
+        .seed_ticket_for_existing_vault(duplicate_id, Duration::from_secs(900))
+        .expect("种入已存在 vault 的新票据");
+    let duplicate_ticket = CreateTicket::from_slice(&duplicate_raw).expect("32B");
     let second_path = dir.path().join("dup-2/vault.sqlite3");
     let error = expect_create_error(create_vault_with_ticket(
         context(),
@@ -457,7 +463,7 @@ fn v2_create_rate_limit_is_classified_as_retryable_429() {
     let dir = temp_root("rate");
 
     let first = [0xE1; 16];
-    let first_ticket = ticket(&relay, first, 900, 1);
+    let first_ticket = ticket(&relay, first, 900);
     create_vault_with_ticket(
         local_context(&relay),
         first,
@@ -471,7 +477,7 @@ fn v2_create_rate_limit_is_classified_as_retryable_429() {
 
     // 第二次请求在限流器处被拒（票据本身有效、vault 也还没建）。
     let second = [0xE2; 16];
-    let second_ticket = ticket(&relay, second, 900, 1);
+    let second_ticket = ticket(&relay, second, 900);
     let second_path = dir.path().join("second/vault.sqlite3");
     let error = expect_create_error(create_vault_with_ticket(
         local_context(&relay),
@@ -495,7 +501,7 @@ fn create_link_pin_anchor_is_enforced_without_switching_instances() {
 
     // 先建一个 vault 学习 relay instance（仅测试；生产由创建方/链接携带）。
     let first = [0xF1; 16];
-    let first_ticket = ticket(&relay, first, 900, 1);
+    let first_ticket = ticket(&relay, first, 900);
     let created = create_vault_with_ticket(
         local_context(&relay),
         first,
@@ -514,7 +520,7 @@ fn create_link_pin_anchor_is_enforced_without_switching_instances() {
         RelayMode::LocalDev,
         relay.base_url(),
         good_id,
-        ticket(&relay, good_id, 900, 1),
+        ticket(&relay, good_id, 900),
         Some(instance),
     )
     .expect("good link");
@@ -535,7 +541,7 @@ fn create_link_pin_anchor_is_enforced_without_switching_instances() {
 
     // 错误的 pin：拒绝（不自动换 pin），本地不留库文件。
     let bad_id = [0xF3; 16];
-    let bad_ticket = ticket(&relay, bad_id, 900, 1);
+    let bad_ticket = ticket(&relay, bad_id, 900);
     let bad_path = dir.path().join("bad/vault.sqlite3");
     let error = expect_create_error(create_vault_with_ticket(
         local_context(&relay),
@@ -561,7 +567,7 @@ fn v2_management_record_is_verifiable_from_the_control_chain() {
     let created = create_vault_with_ticket(
         local_context(&relay),
         vault_id,
-        &ticket(&relay, vault_id, 900, 1),
+        &ticket(&relay, vault_id, 900),
         None,
         &vault_path,
         "控制链",

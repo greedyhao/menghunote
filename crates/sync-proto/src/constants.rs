@@ -35,6 +35,21 @@ pub const SIGN_ACTIVATION_T_DOMAIN: &[u8] = b"MN/v1/activation-t\0";
 /// cursor HMAC 域（relay 使用）。
 pub const CURSOR_HMAC_DOMAIN: &[u8] = b"MN/v1/cursor\0";
 
+// —— ADR 0015：管理控制链 V2 的域（与 v1 域互不复用）——
+
+/// V2 设备控制记录签名域。
+pub const SIGN_V2_CONTROL_DOMAIN: &[u8] = b"MN/v2/control\0";
+/// V2 旧 creator 升级签名域。
+pub const SIGN_V2_UPGRADE_DOMAIN: &[u8] = b"MN/v2/upgrade\0";
+/// V2 离线恢复根签名域。
+pub const SIGN_V2_RECOVER_DOMAIN: &[u8] = b"MN/v2/recover\0";
+/// V2 目标设备 PoP 签名域（`MN/v2/pop\0 || h || pk32`）。
+pub const SIGN_V2_POP_DOMAIN: &[u8] = b"MN/v2/pop\0";
+/// V2 鉴权签名域（token 请求签 `MN/v2/auth\0 || challenge`）。
+pub const SIGN_AUTH_V2_DOMAIN: &[u8] = b"MN/v2/auth\0";
+/// V2 epoch grant 的 HPKE info（ADR 0015：明文仅 epoch root）。
+pub const HPKE_INFO_V2: &[u8] = b"MN/v2/epoch-grant\0";
+
 /// `K_object` 的 HKDF info：`MN/v1/data\0 || type_u8 || epoch_BE64 || object_id`。
 pub fn hkdf_data_info(
     object_type: ObjectType,

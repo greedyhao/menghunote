@@ -172,8 +172,9 @@ async fn create_v2_vault_with_device(
     let hpke_pk = [4u8; 32];
     let certificate = certificate_bytes(&vault_id, &device_id, &sign_pk, &hpke_pk, 1);
     let ticket = block(|| {
-        admin::issue_create_ticket(fx.db.inner(), vault_id, Duration::from_secs(900), 1)
-            .expect("issue create ticket")
+        admin::create_reservation_for(fx.db.inner(), vault_id, Duration::from_secs(900))
+            .expect("reserve create ticket")
+            .token
     });
     let fields = vec![
         (0, wire::bytes(ticket.to_vec())),
@@ -205,6 +206,8 @@ async fn auth_token(app: &axum::Router, vault_id: Id16, realm: Realm, subject: &
     let realm_tag = match realm {
         Realm::Device => 1u64,
         Realm::Management => 2u64,
+        Realm::ManagementDevice => 3u64,
+        Realm::Recovery => 4u64,
     };
     let (status, body) = call(
         app,

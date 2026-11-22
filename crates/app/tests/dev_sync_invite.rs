@@ -1,13 +1,16 @@
 //! ADR 0014 **S1**：dev-only 设备面板的「邀请设备…」与「批准 pending 设备」headless 测试。
 //!
 //! 覆盖：
-//! 1. 创建端生成邀请链接：`dev-sync-invite` → 链接出现（`dev-sync-invite-link`/`-ttl`/
-//!    `dev-sync-copy-invite`）→ 链接是 `mn-pair://join?...`、**不含恢复码**、`Debug` 不含 token；
+//! 1. 创建端生成邀请链接：`dev-sync-invite` → 只出现 TTL/风险提示与`dev-sync-copy-invite`
+//!    （**不渲染** `mn-pair://join?...` 明文）→ 点击复制后邀请块折叠
+//!    （`dev-sync-invite-copied`，不再有链接/复制按钮）→ 链接只进剪贴板、**不含恢复码**、
+//!    `Debug` 不含 token；
 //! 2. B 用链接兑换 PENDING（库级入口，真实 relay）→ A 面板出现 pending 行与
 //!    `dev-sync-approve-<短id>` → 点击进入确认区（显示 device_id + sign/hpke 短 hash）→
 //!    确认 → B 变 Active → B 检查/bootstrap 后能同步到 A 的笔记；
 //! 3. 非管理设备（Join）没有批准入口；邀请按钮被明确置灰并给出原因；
-//! 4. 没有活动文档时邀请按钮也置灰（ADR 0014 S1 的前置条件）。
+//! 4. 没有活动文档时邀请按钮**不**置灰（ADR 0017 S5b：邀请是管理操作，不依赖
+//!    活动文档/闸门；刚创建、还没打开笔记的实例也能直接复制邀请链接）。
 //!
 //! ⚠️ **非生产**：`menghunote-dev-relay` 的 hook 对任何签名一律放行；本文件验证面板/worker
 //! 与库级邀请流程的接线，不是 relay 鉴权验收。
@@ -302,12 +305,12 @@ async fn panel_generates_invite_and_approves_pending_device(cx: &mut TestAppCont
     let debug = format!("{link:?}");
     assert!(!debug.contains("mn-pair"), "{debug}");
     assert!(debug.contains("<redacted: contains token>"), "{debug}");
-    // 链接/TTL/复制按钮都参与布局。
-    for selector in [
-        "dev-sync-invite-link",
-        "dev-sync-invite-ttl",
-        "dev-sync-copy-invite",
-    ] {
+    // TTL/复制按钮参与布局；**链接明文不渲染**（token 只进剪贴板）。
+    assert!(
+        cx.debug_bounds("dev-sync-invite-link").is_none(),
+        "面板不得渲染邀请链接明文（含 token）"
+    );
+    for selector in ["dev-sync-invite-ttl", "dev-sync-copy-invite"] {
         let bounds = cx
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("必须画出 selector={selector}"));
@@ -316,6 +319,30 @@ async fn panel_generates_invite_and_approves_pending_device(cx: &mut TestAppCont
             "{selector} 必须有非零尺寸"
         );
     }
+
+    // 点击复制：token 只进剪贴板；成功后面板折叠邀请块（不再展示链接/复制按钮）。
+    click_selector(&mut cx, "dev-sync-copy-invite");
+    let clipboard = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("复制邀请必须写剪贴板");
+    assert_eq!(clipboard, link.url, "剪贴板必须与内存里的链接一致");
+    assert!(
+        cx.debug_bounds("dev-sync-copy-invite").is_none(),
+        "复制成功后必须隐藏复制按钮"
+    );
+    let folded = cx
+        .debug_bounds("dev-sync-invite-copied")
+        .expect("复制成功后必须显示折叠行（关闭面板即失效）");
+    assert!(folded.size.width.as_f32() > 0.0);
+    let copy_notice = read_panel(&mut cx, &host, |panel| {
+        panel.notice_text().map(str::to_owned)
+    })
+    .expect("复制必须有 notice");
+    assert!(
+        !copy_notice.contains("mn-pair://") && !copy_notice.contains("#token="),
+        "notice 不得回显链接/token：{copy_notice}"
+    );
 
     // B：用 A 面板生成的链接兑换（库级入口，真实 relay）→ PENDING。
     let target = InviteLinkTarget::parse(&link.url).expect("解析失败");
@@ -518,7 +545,7 @@ async fn join_device_has_no_invite_or_approve_entry(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
-// 3) 无活动文档：邀请按钮置灰
+// 3) 无活动文档：邀请按钮**不**置灰（ADR 0017 S5b：邀请是管理操作）
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -597,6 +624,14 @@ impl menghunote_app::dev_sync::service::SyncRunner for ListOnlyRunner {
                     members: Vec::new(),
                     self_device: [0x0a; 16],
                     can_manage: true,
+                    // 这个 fake runner 只证明"没有活动文档也能点邀请"；基线事实给 Some，
+                    // 面板的本地前置检查才不会把它误判成"创建端尚未发布基线"。
+                    published_baseline: Some(menghunote_sync::dev_local::PublishedBaseline {
+                        checkpoint_id: [0x11; 16],
+                        epoch: 1,
+                        covered_seq: 0,
+                        published_at: 0,
+                    }),
                 });
                 Ok(menghunote_app::dev_sync::state::OpOutcome::new(
                     "设备列表已刷新（0 台）",
@@ -608,7 +643,7 @@ impl menghunote_app::dev_sync::service::SyncRunner for ListOnlyRunner {
 }
 
 #[gpui::test]
-async fn invite_button_is_blocked_without_active_document(cx: &mut TestAppContext) {
+async fn invite_button_works_without_active_document(cx: &mut TestAppContext) {
     use menghunote_app::dev_sync::service::{ServiceConfig, SyncService};
     use std::sync::Arc;
 
@@ -630,19 +665,55 @@ async fn invite_button_is_blocked_without_active_document(cx: &mut TestAppContex
         cx.executor()
             .advance_clock(menghunote_app::dev_sync::SYNC_PUMP_INTERVAL);
         cx.run_until_parked();
-        let ready = cx.update(|_window, app| panel.read(app).can_manage_devices());
+        // 面板打开会自动刷新设备列表；只等 can_manage 会在 ListDevices 还在途时
+        // 提前断言，撞上合理的"有操作在途"。等到管理能力就绪且邀请无前置阻断。
+        let ready = cx.update(|_window, app| {
+            let panel = panel.read(app);
+            panel.can_manage_devices() && panel.invite_block_reason().is_none()
+        });
         if ready {
             break;
         }
         assert!(Instant::now() < deadline, "面板 30s 内没读到管理能力");
     }
-    let reason = cx.update(|_window, app| panel.read(app).invite_block_reason());
+    // ADR 0017 S5b：邀请是管理操作——**不要求活动文档**（刚创建、还没打开任何笔记的
+    // 实例也必须能直接生成/复制邀请链接）。
     assert!(
-        reason.is_some_and(|reason| reason.contains("活动文档")),
-        "没有活动文档必须说明原因：{reason:?}"
+        !cx.update(|_window, app| panel.read(app).has_active_document()),
+        "本用例的前提是没有活动文档"
+    );
+    let reason = cx.update(|_window, app| panel.read(app).invite_block_reason());
+    assert_eq!(
+        reason, None,
+        "有管理密钥 + 空闲时，没有活动文档也不得阻止邀请：{reason:?}"
     );
     let bounds = cx
         .debug_bounds("dev-sync-invite")
         .expect("邀请按钮必须常显（不可用时置灰）");
     assert!(bounds.size.width.as_f32() > 0.0);
+
+    // 点击确实会派发 `CreateInvite`（这里由 fake runner 明确拒绝，证明没有卡在"活动文档"
+    // 门禁上）。
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        cx.executor()
+            .advance_clock(menghunote_app::dev_sync::SYNC_PUMP_INTERVAL);
+        cx.run_until_parked();
+        let failure = cx.update(|_window, app| {
+            panel
+                .read(app)
+                .service()
+                .snapshot()
+                .last_error
+                .unwrap_or_default()
+        });
+        if failure.contains("不支持") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "30s 内没有派发 CreateInvite（最近错误：{failure}）"
+        );
+    }
 }

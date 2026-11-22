@@ -174,7 +174,7 @@ Phase 1 的面板/同步已能跑，但手工演示缺"操作者能拿到恢复�
 
 ## 实施记录（Phase 2 切片 6a/6b：轮换接入，2026-11-13）
 
-**6a（机制层，`2ff7605`）**：`DevIdentityStore::replace_protected`（只允许同 vault/device 的
+**6a（机制层，`3d7e7d1`）**：`DevIdentityStore::replace_protected`（只允许同 vault/device 的
 身份替换，0600 临时文件 → fsync → rename → 父目录 fsync；失败时旧身份逐字节保留）+
 worker `Command::Rotate { recovery_code, revoke }` / `Command::ApplyEpoch`（**整段持闸**、
 派发前复核库中 head、成功后把新身份写回 `dev-identity.bin` 并重新 load、失败保留 journal

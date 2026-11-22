@@ -4,6 +4,10 @@
 > 关联：[ADR 0006](0006-sync-v1.md)（wire v1/控制链）、[ADR 0010](0010-device-access-revocation.md)（设备吊销）、
 > [ADR 0013](0013-production-relay-pinning.md)（生产 relay/pin）。
 > 本轮只定架构与顺序；真实 relay/Windows 仍后置。
+>
+> **后续变更（ADR 0018 S4b，2026-11-16）**：文中 `dev_server --issue-ticket` 与
+> `POST /v2/admin/create-tickets` 已移除；领取链接由内嵌 Web 管理面发行
+> （App 粘贴创建链接）。下文保留为当时记录。
 
 ## 前提校正
 

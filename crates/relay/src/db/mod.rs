@@ -11,6 +11,10 @@
 //! **多租户（ADR 0014 §A）**：所有租户读写都要带显式 [`VaultScope`]，回调拿到的是
 //! [`ScopeConn`]（连接 + 作用域）；只有实例/运维元数据走 [`Db::read_instance`] /
 //! [`Db::write_instance_blocking`]（或显式 `ScopeConn::raw`）。
+//!
+//! **在线删除 fence（ADR 0018 S3）**：每个 scoped 读/写事务在**执行时**复核
+//! `vault_registry` 状态（[`crate::registry::ensure_not_fenced`]）；删除作业的 purge
+//! 走单独的 [`Db::write_maintenance`]（不做租户 fence，但只能由 deletion 模块使用）。
 
 pub mod schema;
 
@@ -150,7 +154,9 @@ impl Db {
             }
         }
         let mut conn = Connection::open(&cfg.path)?;
-        schema::apply(&mut conn)?;
+        // 迁移时刻用 relay 时钟（生产 SystemClock；测试 FakeClock 可精确断言票据
+        // `created_at` 的迁移口径，且不依赖真实日期）。
+        schema::apply_at(&mut conn, Some(clock.now_secs()))?;
         // 建库后把连接交给 writer 线程独占。
         let (tx, mut rx) = mpsc::channel::<Job>(cfg.writer_queue.max(1));
         let writer = std::thread::Builder::new()
@@ -237,6 +243,95 @@ impl Db {
         reply_rx.blocking_recv().map_err(|_| Error::WriterClosed)?
     }
 
+    /// **实例级**异步写：只允许实例/运维元数据（`relay_meta`、`vault_registry`、`create_tickets`）。
+    ///
+    /// 与 [`Db::write_instance_blocking`] 同一事务语义，供 async 上下文（admin 删除标记）使用；
+    /// 闭包内不允许 `await`（类型上就不允许）。
+    pub async fn write_instance<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let sender = self.sender()?;
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<T>>();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let outcome = run_in_transaction_instance(conn, f);
+            let _ = reply_tx.send(outcome);
+        });
+        sender.send(job).await.map_err(|_| Error::WriterClosed)?;
+        reply_rx.await.map_err(|_| Error::WriterClosed)?
+    }
+
+    /// **维护写**（ADR 0018 §3：在线删除 purge 的**唯一**写入路径）。
+    ///
+    /// 与 scoped [`Db::write`] 的区别只有一个：**不做**租户 fence 复核 —— 删除作业必须在
+    /// `DELETING` 状态下继续清理该 vault 的行。因此调用方必须是 deletion 模块，且 SQL 必须
+    /// 自己带 `vault_id` 条件（本方法不提供 `ScopeConn`，避免被误当成普通租户写入口）。
+    /// 事务边界同 [`Db::write`]：一个短 `BEGIN IMMEDIATE`，不跨 `await`。
+    pub async fn write_maintenance<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let sender = self.sender()?;
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<T>>();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let outcome = run_in_transaction_instance(conn, f);
+            let _ = reply_tx.send(outcome);
+        });
+        sender.send(job).await.map_err(|_| Error::WriterClosed)?;
+        reply_rx.await.map_err(|_| Error::WriterClosed)?
+    }
+
+    /// 维护写的同步版（非 runtime 线程/测试用）。
+    pub fn write_maintenance_blocking<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let sender = self.sender()?;
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<T>>();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let outcome = run_in_transaction_instance(conn, f);
+            let _ = reply_tx.send(outcome);
+        });
+        sender.blocking_send(job).map_err(|_| Error::WriterClosed)?;
+        reply_rx.blocking_recv().map_err(|_| Error::WriterClosed)?
+    }
+
+    /// WAL 文件字节数（诊断/删除作业的 WAL 预算；文件不存在 = 0）。
+    pub fn wal_size_bytes(&self) -> u64 {
+        let mut path = self.inner.path.clone().into_os_string();
+        path.push("-wal");
+        std::fs::metadata(PathBuf::from(path))
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    }
+
+    /// 在 writer 线程上执行一次 `wal_checkpoint`（**不**开写事务：SQLite 不允许在事务内
+    /// checkpoint）。返回 `true` = 完全 checkpoint（`busy = 0`）。
+    ///
+    /// 删除作业在批次之间用它约束 WAL 增长（ADR 0018 §3 的 WAL 预算）；`TRUNCATE` 在仍有
+    /// 读快照时可能 `busy`（返回 `false`），此时不阻塞、错误留给下一批。
+    pub async fn checkpoint_wal(&self, truncate: bool) -> Result<bool> {
+        let sender = self.sender()?;
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<bool>>();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let sql = if truncate {
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            } else {
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            };
+            let outcome = conn
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .map(|busy| busy == 0)
+                .map_err(Error::from);
+            let _ = reply_tx.send(outcome);
+        });
+        sender.send(job).await.map_err(|_| Error::WriterClosed)?;
+        reply_rx.await.map_err(|_| Error::WriterClosed)?
+    }
+
     /// 只读查询（走只读连接池；短查询，可直接在 handler 内同步调用）。
     ///
     /// `scope` 显式传入；闭包拿到 [`ScopeConn`]，无法"忘记"租户过滤。
@@ -244,9 +339,12 @@ impl Db {
     where
         F: FnOnce(&ScopeConn<'_>) -> Result<T>,
     {
-        self.inner
-            .reads
-            .with_conn(|conn| f(&ScopeConn::new(conn, scope)))
+        self.inner.reads.with_conn(|conn| {
+            // ADR 0018 S3：读路径同样按权威 registry 复核（删除作业的 purge 提交后，
+            // 任何 scoped 读都不得再返回该租户数据）。
+            crate::registry::ensure_not_fenced(conn, scope.vault_id())?;
+            f(&ScopeConn::new(conn, scope))
+        })
     }
 
     /// **实例级**只读：只允许 `relay_meta`/`sqlite_master`/`vaults` 等全局元数据
@@ -286,6 +384,9 @@ where
 {
     // IMMEDIATE：写事务一开始就拿写锁，避免 SQLITE_BUSY 在 commit 时才暴露。
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // ADR 0018 S3：拿到写锁后**再查一次**权威 registry（writer 串行 ⇒ 与删除标记 CAS 有全序）。
+    // 已入队/HTTP 已取消的写也逃不过这一步。
+    crate::registry::ensure_not_fenced(&tx, scope.vault_id())?;
     let out = {
         let scoped = ScopeConn::new(&tx, scope);
         f(&scoped)?

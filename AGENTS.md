@@ -357,10 +357,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > Linux 开发适配见 ADR 0008（0600 裸主钥，安全弱于 DPAPI，不宣称等价）。
 > **dev-only 同步 UI（ADR 0009）Phase 1 已完成**：真实 AppShell 内面板 + 持闸 SyncOnce +
 > 活动文档 adopt；面板「发布基线」、设备列表/「移除设备（不轮换）」已接通。
-> **UI 初始化（ADR 0011 S1–S3，2026-11-14，HEAD `b63b541`）**：`AppRoot` 同窗根视图；
+> **UI 初始化（ADR 0011 S1–S3，2026-11-14，当前 `972a083`）**：`AppRoot` 同窗根视图；
 > Create/Join 向导（恢复码一次性展示+备份确认、失败恢复、实例目录锁/公开配置），
 > 真实用户不再需要 CLI/env；命令行仅保留自动化/恢复兼容。
-> **自动同步（ADR 0012 S1–S3，2026-11-13，HEAD `ce31854`）**：两阶段（网络不持闸、
+> **自动同步（ADR 0012 S1–S3，2026-11-13，当前 `184a8dd`）**：两阶段（网络不持闸、
 > integrate/adopt 短持闸）+ 编辑 debounce 2s/周期 45s/退避 + 状态栏 + 重启待应用恢复；
 > 手动同步与发布/设备命令优先。并行测试改为显式事件收敛（连续 10 次全绿）。
 > **轮换 UI（ADR 0009 Phase 2 / 切片 6a–6b）**：设备面板「轮换密钥…」/「应用轮换」、
@@ -376,16 +376,32 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **邀请链接（ADR 0014 S1）**：创建端生成 15min 一次性 `mn-pair://join?...`（token 仅
 > fragment）；加入端 redeem 为 PENDING（durable、可重启，token 不落盘）；创建端批准后
 > 加入端取 self grant/bootstrap 进 Main。
-> **多 vault（ADR 0014 S2–S3b，2026-11-14，HEAD `2e028fb`）**：relay schema 11、
-> 22 张租户表带 `vault_id` + `VaultScope`、v1→v10→v11 迁移；`/v2` 全数据面 +
-> 一次性创建票据 + v2 租户鉴权/限流；客户端 `api_version`（v1 默认，v2 显式）、
-> `mn-pair://create` 票据创建、同 relay 多实例、v2 邀请链接 `api=2`。
-> 手工步骤见 [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md)；
-> app feature 365 / 默认 134 / sync 579+1 / relay 246 / storage 173。
-> **Windows 多 vault/创建链接真机未验；S4 能力授权未做；真实 TLS/鉴权 relay 后置。**
+> **多 vault（ADR 0014 S2–S3b）**：relay schema 11、22 张租户表带 `vault_id` +
+> `VaultScope`、v1→v10→v11 迁移；`/v2` 全数据面 + 一次性创建票据 + v2 租户鉴权/限流；
+> 客户端 `api_version`、`mn-pair://create` 票据创建、同 relay 多实例、v2 邀请链接 `api=2`。
+> **ManagementCapV2（ADR 0015 S4a–S4c + ADR 0016 S4d1a/b，2026-11-14，当前 `b32a5b2`）**：
+> schema 12；relay 控制提交链/CAS/dedup、Upgrade/Cap/Device/Invite/rotation/Recovery 全链路；
+> 客户端库已能回放控制链、选择 cap、realm3 鉴权、ApprovalEnvelope 双签、submit/回执/重放。
+> **客户端管理 UI（S4d1c）与 relay 审批收件箱（S4d2）未做；真实 vault 未启用 V2；
+> TLS/Windows 未验。**
+> **内嵌 Web 管理 + 旧入口移除（ADR 0018 S1–S4b，2026-11-16，当前为 12 组语义提交）**：
+> S1 独立 admin listener/token/session/CSRF/Host 白名单；S2 schema 13 `vault_registry` +
+> 原子 claim/cancel；S3 fenced 在线删除（admission + 事务复核、WS 关闭、分批可恢复 purge）；
+> S4a 最小 Web 管理页面（列表/详情/创建领取链接/取消/删除确认）；S4b 移除旧入口：
+> `POST /v2/admin/create-tickets`、`sync::admin_ticket`、App「管理员创建」/admin secret、
+> 主 CLI `delete-vault`、`dev_server --issue-ticket`。App Create 只保留「粘贴创建链接」；
+> `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
+> 「创建领取链接」→ App 粘贴；手工步骤见
+> [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
+> 测试：relay 356 / sync 605 / app `--features dev-sync` 367 / 默认 134。
+> 历史整理：整理前 97 个提交完整保留在 `backup/dev-before-cleanup-20261116`；
+> `v0.4-sync` tag 未移动。
+> **Windows 真机（Web 管理/claim/App 粘贴）与真实 TLS relay 未验；S4d1c 客户端管理 UI、
+> S4d2 relay 审批收件箱仍未做。**
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
-- **版本管理**：当前开发分支 **`dev`**（2026-11-11 重建：折叠全部 `wip:`，0 wip，36 条提交）；
+- **版本管理**：当前开发分支 **`dev`**（2026-11-16 历史整理：`v0.4-sync` 后 12 个语义提交；
+  整理前 97 个提交保留在 `backup/dev-before-cleanup-20261116`）；
   旧历史保留：**`backup/main-wip-20261110`**（首个基线）、**`backup/dev-wip-20261111`**（重命名/搜索 wip）、
   **`backup/dev-wip-20261111b`**（S5 两次 wip 前）。
   tag：`v0.1-slice6` = 切片 6；**`v0.2-gpui-kit`** = S2 + 引用块 + 导出 + GPUI Kit；

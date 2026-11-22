@@ -25,7 +25,7 @@
 //! ## 非目标（S3a 明确）
 //!
 //! 不做 Windows scheme 注册/QR/剪贴板；不做 App 表单（S3b）；不自动创建票据
-//! （票据由运维 `dev_server --issue-ticket` 发行）。
+//! （票据由 relay Web 管理面「创建领取链接」发行，ADR 0018 S4a/S4b）。
 
 use std::fmt;
 

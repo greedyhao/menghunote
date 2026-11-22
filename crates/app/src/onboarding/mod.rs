@@ -22,7 +22,8 @@
 //! | --- | --- | --- |
 //! | [`layout`] | 公开目录/配置：XDG/LOCALAPPDATA 解析、`dev-sync.json` 原子读写 | `serde`/`serde_json` + std |
 //! | [`lock`] | 每实例目录的进程级独占锁（锁文件 + `create_new`，MVP） | std |
-//! | [`create`] | Create 后台线程：genesis → 身份落盘 → channel 交回（`local_dev` / `remote_tls`） | `menghunote-sync` + `DevIdentityStore` |
+//! | [`create`] | Create 后台线程：一次性创建票据 → v2 创建 → 身份落盘 → channel 交回 | `menghunote-sync` + `DevIdentityStore` |
+//! | [`invite_copy`] | 备份页「复制邀请链接」后台线程：读身份 → 生成 v2 邀请（token 只在内存） | 同上 |
 //! | [`join`] | Join 后台线程：恢复码自批/bootstrap → 身份落盘 → channel 交回（含失败分类） | 同上 |
 //! | [`input`] | 自绘输入控件（`EntityInputHandler`；秘密字段遮罩 + 允许粘贴） | GPUI + `sidebar_rename` |
 //! | [`settings`] | 设置面板状态 + relay 编辑校验（与运行时门禁同一套策略） | `gate`/`service` + `layout` + `input` |
@@ -30,7 +31,8 @@
 //!
 //! ## 安全边界（ADR 0011「表单、恢复码与敏感输入」）
 //!
-//! - setup secret / 恢复码只在内存里：**配置结构体里没有这些字段**（类型上写不进去）；
+//! - 创建票据 / 恢复码只在内存里：**配置结构体里没有这些字段**（类型上写不进去）；
+//!   App 不再收集 setup secret 或 relay 管理凭证（ADR 0018 S4b）；
 //! - Create 成功且身份**受保护落盘**之后，才在备份页展示 `vault_id` + 恢复码；
 //! - 恢复码只在备份页显示一次；离开备份页（进入 Main / 返回）即 drop（`Zeroizing`）；
 //!   Join 的恢复码是用户自己输入的，提交后立刻从输入框清空、只在 worker 内存里存在；
@@ -59,12 +61,15 @@ pub mod create;
 pub mod fingerprint;
 pub mod input;
 pub mod invite;
+pub mod invite_copy;
 pub mod join;
 pub mod layout;
 pub mod lock;
 pub mod settings;
 
-pub use app_root::{AppRoot, AppRootOptions, RootStateLabel, DEFAULT_OPERATION_BUDGET};
+pub use app_root::{
+    AppRoot, AppRootOptions, FormCreateMode, RootStateLabel, DEFAULT_OPERATION_BUDGET,
+};
 pub use create::{
     CreateEvent, CreateJob, CreateOutcome, CreateRequest, CreateStage, CREATE_PUMP_INTERVAL,
 };
@@ -76,6 +81,9 @@ pub use input::{FormInput, FormInputEvent};
 pub use invite::{
     InviteCheckRequest, InviteEvent, InviteFailureKind, InviteJob, InviteOutcome,
     InvitePendingFacts, InviteRedeemRequest, InviteStage, INVITE_EMPTY_HINT,
+};
+pub use invite_copy::{
+    CopyInviteEvent, CopyInviteJob, CopyInviteRequest, CopyInviteStage, InviteCopyFailure,
 };
 pub use join::{JoinEvent, JoinFailureKind, JoinJob, JoinOutcome, JoinRequest, JoinStage};
 pub use layout::{
@@ -92,7 +100,8 @@ pub const MAX_ERROR_CHARS: usize = 800;
 ///
 /// 规则（ADR 0011「错误按类型脱敏，禁止直接显示 `{error:#}`」）：
 ///
-/// 1. `{error:#}` 只作为**输入**：先整段替换本次已知秘密（setup secret）；
+/// 1. `{error:#}` 只作为**输入**：先整段替换调用方给出的秘密（如旧 CLI 的 setup secret；
+///    Create 的链接票据由 `CreateTicket` 自身脱敏、不进入错误文案）；
 /// 2. 恢复码形态的 token（`mnrec1…`）整段替换成 `<恢复码已隐藏>`；
 /// 3. 截断到 [`MAX_ERROR_CHARS`] 个字符（按 char 边界，不切坏 UTF-8）。
 ///

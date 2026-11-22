@@ -117,6 +117,35 @@ pub fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// 十六进制解码：只接受偶数长度的 ASCII hex（大小写都接受）。
+pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty() || !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = (bytes[index] as char).to_digit(16)?;
+        let low = (bytes[index + 1] as char).to_digit(16)?;
+        out.push(((high << 4) | low) as u8);
+        index += 2;
+    }
+    Some(out)
+}
+
+/// 路径/表单里的 16 字节 ID：接受 32 位十六进制（可带 UUID 连字符）或 base64url。
+///
+/// 只接受能**唯一**还原成 16 字节的形式；其他长度/字符集一律 `None`（调用方决定 400/404）。
+pub fn parse_id16_text(value: &str) -> Option<Id16> {
+    let compact: String = value.chars().filter(|c| *c != '-').collect();
+    let bytes = match hex_decode(&compact) {
+        Some(bytes) => bytes,
+        None => b64url_decode(value).ok()?,
+    };
+    bytes.as_slice().try_into().ok()
+}
+
 /// 大端 u32。
 pub fn be32(value: u32) -> [u8; 4] {
     value.to_be_bytes()
@@ -164,6 +193,28 @@ mod tests {
         assert_eq!(b64url_decode(&text).expect("decode"), raw);
         // 带 padding 的非规范编码必须拒绝（否则游标/ token 会出现两种等价形态）。
         assert!(b64url_decode("AAEC-vs").is_ok());
+    }
+
+    #[test]
+    fn hex_and_id_text_parsing_is_strict() {
+        assert_eq!(hex_decode("00ff"), Some(vec![0x00, 0xff]));
+        assert_eq!(hex_decode("00f"), None);
+        assert_eq!(hex_decode("zz"), None);
+        let id = [0xABu8; 16];
+        let hex = hex_lower(&id);
+        assert_eq!(parse_id16_text(&hex), Some(id));
+        assert_eq!(parse_id16_text(&hex.to_ascii_uppercase()), Some(id));
+        let uuid = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        );
+        assert_eq!(parse_id16_text(&uuid), Some(id));
+        assert_eq!(parse_id16_text(&b64url_encode(&id)), Some(id));
+        assert_eq!(parse_id16_text("zz"), None);
     }
 
     #[test]

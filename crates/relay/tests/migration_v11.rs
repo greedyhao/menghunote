@@ -1,11 +1,15 @@
 //! ADR 0014 **S2b**：schema 10 → 11（新增全局 `create_tickets`）。
 //!
 //! 覆盖（任务书 §3 第 5 条）：
-//! 1. 旧 schema 10 数据完整：v9 全量 fixture → 9→10 迁移 → 10→11 后逐表 / 逐字节不变；
+//! 1. 旧 schema 10 数据完整：v9 全量 fixture → 9→10 迁移 → 打开（10→11→12）后
+//!    **按迁移前捕获的列集**逐表 / 逐字节不变（schema 12 只加列，不重写旧行）；
 //! 2. 重复打开/重复 apply 幂等；
-//! 3. 更新版本的库被拒绝（旧 binary 打开 schema 11 同样落到版本门禁，不会自动降 schema）；
-//! 4. 元数据丢失的 v11 形状库能补齐 `create_tickets`（幂等 `IF NOT EXISTS`）；
+//! 3. 更新版本的库被拒绝（旧 binary 打开新 schema 同样落到版本门禁，不会自动降 schema）；
+//! 4. 元数据丢失的 v11/v12 形状库能补齐 `create_tickets`（幂等 `IF NOT EXISTS`）；
 //! 5. 新建库的 `create_tickets` 列形状与 ADR 0014 §A 完全一致。
+//!
+//! 说明：本文件保留 S2b 的断言口径（10→11 不动租户数据）。schema 12 的迁移/约束
+//! 覆盖在 `tests/migration_v12.rs`。
 
 #![allow(clippy::type_complexity)]
 
@@ -105,11 +109,11 @@ fn fk_violations(conn: &Connection) -> i64 {
     count
 }
 
-/// 一张表的**字节级**内容指纹：按列 `quote()`（BLOB → `X'..'`、NULL → `NULL`）拼接并排序。
+/// 一张表的**字节级**内容指纹：按给定列 `quote()`（BLOB → `X'..'`、NULL → `NULL`）拼接并排序。
 ///
-/// 只用于"迁移前后完全一致"的相等断言；不依赖 rowid/物理顺序。
-fn dump_table(conn: &Connection, table: &str) -> Vec<String> {
-    let columns = columns(conn, table);
+/// 只用于"迁移前后完全一致"的相等断言；不依赖 rowid/物理顺序。列集**由调用方捕获**：
+/// schema 12 会给若干表追加列（新列在旧行上取默认值/NULL），所以比较必须在同一列集上做。
+fn dump_rows(conn: &Connection, table: &str, columns: &[String]) -> Vec<String> {
     assert!(!columns.is_empty(), "{table} 不存在");
     let expression = columns
         .iter()
@@ -127,11 +131,25 @@ fn dump_table(conn: &Connection, table: &str) -> Vec<String> {
     rows
 }
 
-/// 全部租户表的内容快照（10→11 不得改动任何一条）。
+/// 全部租户表的内容快照（迁移不得改动任何一条旧列）。
 fn dump_tenants(conn: &Connection) -> Vec<(&'static str, Vec<String>)> {
     TENANT_TABLES
         .iter()
-        .map(|table| (*table, dump_table(conn, table)))
+        .map(|table| {
+            let columns = columns(conn, table);
+            (*table, dump_rows(conn, table, &columns))
+        })
+        .collect()
+}
+
+/// 按**迁移前捕获的列集**重新 dump（用于与 `before` 比较）。
+fn dump_tenants_with_columns(
+    conn: &Connection,
+    captured: &[(&'static str, Vec<String>)],
+) -> Vec<(&'static str, Vec<String>)> {
+    captured
+        .iter()
+        .map(|(table, columns)| (*table, dump_rows(conn, table, columns)))
         .collect()
 }
 
@@ -149,6 +167,11 @@ fn v10_data_survives_migration_to_v11_and_reopen_is_idempotent() {
         !table_exists(&conn, "create_tickets"),
         "schema 10 时尚无 create_tickets（10→11 才新增）"
     );
+    // 捕获 **schema 10 时的列集**与逐行字节：schema 11/12 只会加列，旧列必须逐字节不变。
+    let before_columns: Vec<(&'static str, Vec<String>)> = TENANT_TABLES
+        .iter()
+        .map(|table| (*table, columns(&conn, table)))
+        .collect();
     let before = dump_tenants(&conn);
     let before_counts: Vec<(&'static str, i64)> = TENANT_TABLES
         .iter()
@@ -170,22 +193,25 @@ fn v10_data_survives_migration_to_v11_and_reopen_is_idempotent() {
     )
     .expect("open triggers 10 -> 11");
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("11"));
+        let expected = schema::SCHEMA_VERSION.to_string();
+        assert_eq!(version(conn).as_deref(), Some(expected.as_str()));
         assert!(table_exists(conn, "create_tickets"), "10→11 必须新增票据表");
         assert_eq!(count(conn, "create_tickets"), 0, "迁移不得凭空发票据");
+        // schema 13 起票据表加 `created_at`（迁移时刻）与 registry FK。
         assert_eq!(columns(conn, "create_tickets"), {
             vec![
                 "token_hash".to_string(),
                 "vault_id".to_string(),
+                "created_at".to_string(),
                 "expires_at".to_string(),
                 "quota".to_string(),
                 "consumed_at".to_string(),
             ]
         });
         assert_eq!(
-            dump_tenants(conn),
+            dump_tenants_with_columns(conn, &before_columns),
             before,
-            "10→11 不得改动任何租户表（逐字节）"
+            "10→11→12 不得改动任何旧列（逐字节；新列取默认值）"
         );
         assert_eq!(
             TENANT_TABLES
@@ -220,8 +246,9 @@ fn v10_data_survives_migration_to_v11_and_reopen_is_idempotent() {
     )
     .expect("reopen");
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("11"));
-        assert_eq!(dump_tenants(conn), before);
+        let expected = schema::SCHEMA_VERSION.to_string();
+        assert_eq!(version(conn).as_deref(), Some(expected.as_str()));
+        assert_eq!(dump_tenants_with_columns(conn, &before_columns), before);
         assert_eq!(count(conn, "create_tickets"), 0);
         assert_eq!(fk_violations(conn), 0);
         Ok(())
@@ -240,13 +267,15 @@ fn fresh_schema_11_has_ticket_table_and_admin_can_issue() {
     )
     .expect("fresh open");
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("11"));
+        let expected = schema::SCHEMA_VERSION.to_string();
+        assert_eq!(version(conn).as_deref(), Some(expected.as_str()));
         assert!(table_exists(conn, "create_tickets"));
         assert_eq!(
             columns(conn, "create_tickets"),
             vec![
                 "token_hash".to_string(),
                 "vault_id".to_string(),
+                "created_at".to_string(),
                 "expires_at".to_string(),
                 "quota".to_string(),
                 "consumed_at".to_string(),
@@ -258,8 +287,9 @@ fn fresh_schema_11_has_ticket_table_and_admin_can_issue() {
 
     let vault_id = [0x42u8; 16];
     let ticket =
-        relay::admin::issue_create_ticket(&db, vault_id, std::time::Duration::from_secs(60), 1)
-            .expect("issue");
+        relay::admin::create_reservation_for(&db, vault_id, std::time::Duration::from_secs(60))
+            .expect("reserve")
+            .token;
     let row = relay::admin::load_create_ticket(&db, &ticket)
         .expect("load")
         .expect("row");
@@ -281,9 +311,16 @@ fn missing_metadata_on_v11_shape_repairs_ticket_table_without_touching_data() {
     .expect("open");
     let vault_id = [0x31u8; 16];
     db.write_instance_blocking(move |conn| {
+        // schema 13 起票据 FK 到 registry：先落 RESERVED 生命周期行。
         conn.execute(
-            "INSERT INTO create_tickets(token_hash, vault_id, expires_at, quota, consumed_at)
-             VALUES (?1, ?2, 1000, 1, NULL)",
+            "INSERT INTO vault_registry(vault_id, state, created_at)
+             VALUES (?1, 'RESERVED', 900)",
+            [vault_id.as_slice()],
+        )?;
+        conn.execute(
+            "INSERT INTO create_tickets(token_hash, vault_id, created_at, expires_at, quota,
+                                        consumed_at)
+             VALUES (?1, ?2, 900, 1000, 1, NULL)",
             ([0x77u8; 32].as_slice(), vault_id.as_slice()),
         )?;
         Ok(())
@@ -304,7 +341,8 @@ fn missing_metadata_on_v11_shape_repairs_ticket_table_without_touching_data() {
     )
     .expect("shape-aware repair");
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("11"));
+        let expected = schema::SCHEMA_VERSION.to_string();
+        assert_eq!(version(conn).as_deref(), Some(expected.as_str()));
         assert!(
             table_exists(conn, "create_tickets"),
             "vaults 形状的库必须补齐 10→11 的全局表"

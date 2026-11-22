@@ -10,7 +10,7 @@
 //!    `/v2` 数据面同步（拉取 A 的新笔记）；v1 链接（`api` 缺省）仍由既有
 //!    `onboarding_invite.rs` 覆盖。
 //! 3. 失败矩阵：未知票据 → 403，错 vault → 403（且不消费票据），过期 → 403，
-//!    已用 → 403，同 vault 重复（quota=2）→ 409，超过 v2 创建限流 → 429；
+//!    已用 → 403，同 vault 重复（vault 已存在 + 新票据）→ 409，超过 v2 创建限流 → 429；
 //!    全部明确分类、不建库/身份/配置。
 //! 4. 票据不出现在配置/实例目录/错误文案里；链接输入框在应用后立刻清空。
 //!
@@ -20,7 +20,7 @@
 #![cfg(feature = "dev-sync")]
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use menghunote_app::dev_sync::DevIdentityStore;
@@ -36,7 +36,7 @@ use menghunote_storage::{
 use menghunote_sync::create_link::{CreateLink, CreateTicket};
 use menghunote_sync::dev_local::DevLocal;
 use menghunote_sync::http_transport::DEFAULT_TRANSPORT_TIMEOUTS;
-use menghunote_sync::invite_link::{approve_pending_device, create_invite_link};
+use menghunote_sync::invite_link::{approve_pending_device, create_invite_link, InviteLinkTarget};
 use menghunote_sync::relay_context::RelayContext;
 use menghunote_sync::remote_init::create_vault_with_ticket;
 use tempfile::{Builder as TempDirBuilder, TempDir};
@@ -140,10 +140,10 @@ fn link_from_ticket(relay: &DevRelay, vault_id: [u8; 16], raw: &[u8; 32]) -> Str
     .url
 }
 
-/// 运维发行票据并编码成创建链接（与 `dev_server --issue-ticket` 同一入口）。
-fn issue_link(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64, quota: u32) -> String {
+/// 为全新 vault 预留并发行票据，再编码成创建链接（ADR 0018 S4b：App 只消费链接）。
+fn issue_link(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64) -> String {
     let raw = relay
-        .issue_create_ticket(vault_id, Duration::from_secs(ttl_secs), quota)
+        .issue_create_ticket(vault_id, Duration::from_secs(ttl_secs))
         .expect("发行创建票据失败");
     link_from_ticket(relay, vault_id, &raw)
 }
@@ -157,7 +157,7 @@ fn v2_context(relay: &DevRelay) -> RelayContext {
 /// 库级票据创建（测试夹具：A 的 v2 vault；身份受保护落盘）。
 fn ticket_vault(relay: &DevRelay, path: &Path, vault_id: [u8; 16], label: &str) -> Vault {
     let raw = relay
-        .issue_create_ticket(vault_id, Duration::from_secs(900), 1)
+        .issue_create_ticket(vault_id, Duration::from_secs(900))
         .expect("发行创建票据失败");
     let ticket = CreateTicket::from_slice(&raw).expect("票据必须是 32B");
     let store = DevIdentityStore;
@@ -362,8 +362,8 @@ async fn two_ticket_vaults_on_one_relay_are_isolated_and_restart_into_main(
     let store = layout.store();
     let vault_a = [0xA1u8; 16];
     let vault_b = [0xB2u8; 16];
-    let link_a = issue_link(&relay, vault_a, 900, 1);
-    let link_b = issue_link(&relay, vault_b, 900, 1);
+    let link_a = issue_link(&relay, vault_a, 900);
+    let link_b = issue_link(&relay, vault_b, 900);
     let dir_a = layout.instances_dir.join("inst-a");
     let dir_b = layout.instances_dir.join("inst-b");
 
@@ -386,19 +386,28 @@ async fn two_ticket_vaults_on_one_relay_are_isolated_and_restart_into_main(
     ] {
         expect_bounds(cx, selector);
     }
-    assert!(
-        cx.debug_bounds("app-root-secret-input").is_none(),
-        "票据模式必须隐藏 setup secret 字段"
-    );
+    for selector in [
+        "app-root-secret-input",
+        "app-root-admin-secret",
+        "app-root-admin-notice",
+        "app-root-relay-input",
+        "app-root-create-mode-admin",
+        "app-root-create-mode-legacy",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "ADR 0018 S4b：App 不得再显示 {selector}"
+        );
+    }
     assert_eq!(
         root.update(cx, |root, cx| root.form_create_link_is_empty(cx)),
         Some(true),
         "应用链接后必须立刻清空链接输入框（票据只在内存）"
     );
     assert_eq!(
-        root.update(cx, |root, cx| root.form_relay_text(cx)),
-        Some(relay.base_url().to_owned()),
-        "链接预填 canonical relay"
+        root.update(cx, |root, _| root.form_mode()),
+        Some(RelayMode::LocalDev),
+        "http 创建链接必须固定 local_dev"
     );
     assert_eq!(
         root.update(cx, |root, _| root
@@ -817,7 +826,7 @@ async fn ticket_failures_are_classified_and_persist_nothing(cx: &mut TestAppCont
     let bound_vault = [0x21u8; 16];
     let wrong_vault = [0x22u8; 16];
     let raw_ticket = relay
-        .issue_create_ticket(bound_vault, Duration::from_secs(900), 1)
+        .issue_create_ticket(bound_vault, Duration::from_secs(900))
         .expect("发行票据");
     let wrong_vault_link = link_from_ticket(&relay, wrong_vault, &raw_ticket);
     let dir_wrong = layout.instances_dir.join("dir-wrong-vault");
@@ -839,7 +848,7 @@ async fn ticket_failures_are_classified_and_persist_nothing(cx: &mut TestAppCont
 
     // (c) 过期票据 → 403（relay 假时钟推进）。
     let expired_vault = [0x31u8; 16];
-    let expired_link = issue_link(&relay, expired_vault, 60, 1);
+    let expired_link = issue_link(&relay, expired_vault, 60);
     relay.advance_secs(120);
     let dir_expired = layout.instances_dir.join("dir-expired");
     failed_create_via_link(&root, cx, &expired_link, &dir_expired);
@@ -852,7 +861,7 @@ async fn ticket_failures_are_classified_and_persist_nothing(cx: &mut TestAppCont
 
     // (d) 已用票据（quota=1）→ 403（同票第二次创建）。
     let used_vault = [0x41u8; 16];
-    let used_link = issue_link(&relay_used, used_vault, 900, 1);
+    let used_link = issue_link(&relay_used, used_vault, 900);
     let dir_used_first = layout.instances_dir.join("dir-used-first");
     create_via_link(&root, cx, &used_link, &dir_used_first);
     root.update(cx, |root, cx| {
@@ -868,17 +877,23 @@ async fn ticket_failures_are_classified_and_persist_nothing(cx: &mut TestAppCont
     );
     root.update(cx, |root, cx| root.back_to_welcome(cx));
 
-    // (e) 同 vault 重复创建（quota=2）→ 409 ALREADY_INITIALIZED，事务回滚不扣额度。
+    // (e) 同 vault 重复创建：测试夹具直接种一张绑定已存在 vault 的新票据（ADR 0018 S4b
+    //     起没有对 ACTIVE vault 的发行入口），该票有效但 registry 已是 ACTIVE →
+    //     409 ALREADY_INITIALIZED，且票据不被消费。
     let dup_vault = [0x51u8; 16];
-    let dup_link = issue_link(&relay_used, dup_vault, 900, 2);
+    let dup_link = issue_link(&relay_used, dup_vault, 900);
     let dir_dup_first = layout.instances_dir.join("dir-dup-first");
     create_via_link(&root, cx, &dup_link, &dir_dup_first);
     root.update(cx, |root, cx| {
         root.back_to_welcome(cx);
         assert!(root.should_close(cx));
     });
+    let dup_raw = relay_used
+        .seed_ticket_for_existing_vault(dup_vault, Duration::from_secs(900))
+        .expect("种入已存在 vault 的新票据");
+    let dup_link_again = link_from_ticket(&relay_used, dup_vault, &dup_raw);
     let dir_dup_second = layout.instances_dir.join("dir-dup-second");
-    failed_create_via_link(&root, cx, &dup_link, &dir_dup_second);
+    failed_create_via_link(&root, cx, &dup_link_again, &dir_dup_second);
     let message = error_message(&root, cx);
     assert!(
         message.contains("409") && message.contains("ALREADY_INITIALIZED"),
@@ -925,7 +940,7 @@ async fn ticket_is_never_persisted_or_echoed(cx: &mut TestAppContext) {
     let store = layout.store();
     let vault_id = [0x71u8; 16];
     let raw = relay
-        .issue_create_ticket(vault_id, Duration::from_secs(900), 1)
+        .issue_create_ticket(vault_id, Duration::from_secs(900))
         .expect("发行票据");
     let ticket_b64 = menghunote_sync::base64url::encode(&raw);
     let ticket_hex = menghunote_sync::ids::hex_of(&raw);
@@ -1010,7 +1025,7 @@ async fn ticket_profile_save_failure_retries_without_recreating(cx: &mut TestApp
     let (_dir, layout) = temp_layout("save-fail");
     let store = layout.store();
     let vault_id = [0x81u8; 16];
-    let link = issue_link(&relay, vault_id, 900, 1);
+    let link = issue_link(&relay, vault_id, 900);
     let dir = layout.instances_dir.join("inst-save-fail");
     let (root, cx) = open_root(cx, options_for(&layout, &relay));
     cx.run_until_parked();
@@ -1095,7 +1110,7 @@ async fn settings_show_api_version_and_public_pin(cx: &mut TestAppContext) {
     let relay = DevRelay::start().expect("起进程内 dev relay 失败");
     let (_dir, layout) = temp_layout("settings");
     let vault_id = [0x91u8; 16];
-    let link = issue_link(&relay, vault_id, 900, 1);
+    let link = issue_link(&relay, vault_id, 900);
     let dir = layout.instances_dir.join("inst-settings");
     let (root, cx) = open_root(cx, options_for(&layout, &relay));
     cx.run_until_parked();
@@ -1125,4 +1140,341 @@ async fn settings_show_api_version_and_public_pin(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::Main);
     assert_eq!(profile_entries(&layout.store()).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 7) Create 自动发布初始基线：备份页可直接复制邀请；B 加入不再 NO_VALID_BASELINE
+// ---------------------------------------------------------------------------
+
+/// Create 提交后等到备份页，返回恢复码（**不**确认备份、不进 Main）。
+fn create_to_backup_page(
+    root: &Entity<AppRoot>,
+    cx: &mut VisualTestContext,
+    link: &str,
+    dir: &Path,
+) -> String {
+    apply_create_link(root, cx, link);
+    root.update(cx, |root, cx| {
+        root.form_set_dir(&dir.display().to_string(), cx);
+        root.form_set_consent(true, cx);
+        root.submit_create(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        root.update(cx, |root, cx| root
+            .wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)),
+        "票据 Create 必须在预算内收敛"
+    );
+    cx.run_until_parked();
+    assert_eq!(state_of(root, cx), RootStateLabel::BackupRequired);
+    root.update(cx, |root, _| root.recovery_code().map(str::to_owned))
+        .expect("备份页必须有恢复码")
+}
+
+/// 推进测试时钟 + 宿主泵，直到 `ready(shell)` 成立（显式收敛，不 sleep）。
+fn pump_shell_until(
+    cx: &mut VisualTestContext,
+    root: &Entity<AppRoot>,
+    what: &str,
+    mut ready: impl FnMut(&menghunote_app::shell::AppShell, &gpui::App) -> bool,
+) {
+    let deadline = Instant::now() + DEFAULT_OPERATION_BUDGET;
+    loop {
+        cx.executor()
+            .advance_clock(menghunote_app::dev_sync::SYNC_PUMP_INTERVAL);
+        root.update(cx, |root, cx| {
+            if let Some(shell) = root.main_shell().cloned() {
+                shell.update(cx, |shell, cx| shell.dev_sync_pump(cx));
+            }
+        });
+        cx.run_until_parked();
+        let done = root.update(cx, |root, app| {
+            root.main_shell()
+                .is_some_and(|shell| ready(shell.read(app), app))
+        });
+        if done {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}s 内没有收敛（{what}）",
+            DEFAULT_OPERATION_BUDGET.as_secs()
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[gpui::test]
+async fn create_auto_publishes_baseline_and_backup_invite_joins_immediately(
+    cx: &mut TestAppContext,
+) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("auto-baseline");
+    let vault_id = [0xD1u8; 16];
+    let link = issue_link(&relay, vault_id, 900);
+    let dir = layout.instances_dir.join("inst-auto-a");
+    let vault_path = dir.join("vault.sqlite3");
+    let (root, cx) = open_root(cx, options_for(&layout, &relay));
+    cx.run_until_parked();
+
+    let recovery_code = create_to_backup_page(&root, cx, &link, &dir);
+    assert!(recovery_code.starts_with("mnrec1"), "恢复码仍必须展示");
+    assert_eq!(
+        root.update(cx, |root, _| root.backup_baseline_published()),
+        Some(true),
+        "Create 成功必须已自动发布初始基线"
+    );
+    expect_bounds(cx, "app-root-baseline-status");
+    {
+        let vault = Vault::open(&vault_path).expect("打开 A 库");
+        let baseline = DevLocal::published_baseline(&vault)
+            .expect("读 durable 基线事实")
+            .expect("Create 必须自动发布初始基线（两份 checkpoint）");
+        assert_ne!(baseline.checkpoint_id, [0u8; 16]);
+    }
+
+    // 备份页直接复制邀请：成功、token 只进剪贴板、UI 无明文。
+    root.update(cx, |root, cx| root.copy_invite(cx));
+    assert!(
+        root.update(cx, |root, cx| root
+            .wait_for_invite_copy_terminal(cx, DEFAULT_OPERATION_BUDGET)),
+        "复制邀请必须在预算内收敛"
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        root.update(cx, |root, _| root.backup_invite_error().map(str::to_owned)),
+        None,
+        "基线已发布时复制邀请不得失败"
+    );
+    let invite_id = root
+        .update(cx, |root, _| root.backup_invite_id())
+        .expect("必须生成邀请 id");
+    assert_eq!(invite_id.len(), 32);
+    assert!(
+        cx.debug_bounds("app-root-invite-copied").is_some(),
+        "复制成功必须显示折叠/已复制提示"
+    );
+    let clipboard = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("复制邀请必须写剪贴板");
+    assert!(clipboard.starts_with("mn-pair://join?v=1&relay="));
+    assert!(
+        clipboard.contains("&api=2#token="),
+        "v2 邀请链接必须带 api=2"
+    );
+    let target = InviteLinkTarget::parse(&clipboard).expect("剪贴板链接必须可解析");
+    assert_eq!(target.vault_id(), vault_id);
+    assert_eq!(menghunote_sync::ids::hex_of(&target.invite_id()), invite_id);
+
+    // B：粘贴刚复制的邀请链接 → PENDING（v2 面；不写配置/身份）。
+    let b_dir = layout.instances_dir.join("inst-auto-b");
+    let b_options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-auto-b");
+    drop(recovery_code);
+    let (root_b, cx_b) = open_root(cx, b_options);
+    cx_b.run_until_parked();
+    root_b.update(cx_b, |root, cx| {
+        root.enter_join_form(cx);
+        root.join_form_set_dir(&b_dir.display().to_string(), cx);
+        root.join_form_set_invite(&clipboard, cx);
+        root.submit_join(cx);
+    });
+    assert!(
+        root_b.update(cx_b, |root, cx| root
+            .wait_for_invite_terminal(cx, DEFAULT_OPERATION_BUDGET)),
+        "B 兑换邀请必须在预算内收敛"
+    );
+    cx_b.run_until_parked();
+    assert_eq!(state_of(&root_b, cx_b), RootStateLabel::InvitePending);
+    let facts = root_b
+        .update(cx_b, |root, _| root.invite_pending_facts().cloned())
+        .expect("B 的 PENDING 公开事实");
+    assert_eq!(facts.api_version, RelayApiVersion::V2);
+
+    // A 批准（备份页仍持有库/身份事实；用同一身份从 disk 打开一个只读管理连接）。
+    let a_identity = DevIdentityStore.load(&vault_path).expect("读 A 身份");
+    let a_vault = Vault::open(&vault_path).expect("打开 A 库");
+    let approved = approve_pending_device(
+        &v2_context(&relay),
+        &a_vault,
+        &a_identity,
+        decode_hex16(&facts.device_id),
+        u64::try_from(relay.now()).expect("now"),
+    )
+    .expect("A 批准 B");
+    assert!(approved.changed);
+    drop(a_vault);
+
+    // B「检查状态」→ bootstrap：auto 基线必须让它进 Main（否则就是 NO_VALID_BASELINE）。
+    root_b.update(cx_b, |root, cx| root.check_invite(cx));
+    assert!(
+        root_b.update(cx_b, |root, cx| root
+            .wait_for_invite_terminal(cx, DEFAULT_OPERATION_BUDGET)),
+        "B 检查/ bootstrap 必须在预算内收敛"
+    );
+    cx_b.run_until_parked();
+    assert_eq!(
+        state_of(&root_b, cx_b),
+        RootStateLabel::Main,
+        "B 必须进入 Main（缺基线时会停在等待页并报 NO_VALID_BASELINE）"
+    );
+    let b_vault = Vault::open(b_dir.join("vault.sqlite3")).expect("打开 B 库");
+    assert!(
+        list_tree(&b_vault).expect("读 B 结构树").is_empty(),
+        "空库基线导入后 B 的树应为空"
+    );
+    root_b.update(cx_b, |root, cx| {
+        assert!(root.should_close(cx));
+    });
+}
+
+#[gpui::test]
+async fn failed_auto_publish_keeps_instance_blocks_invite_then_retry_repairs(
+    cx: &mut TestAppContext,
+) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("auto-baseline-fail");
+    let vault_id = [0xE2u8; 16];
+    let link = issue_link(&relay, vault_id, 900);
+    let dir = layout.instances_dir.join("inst-fail-a");
+    let vault_path = dir.join("vault.sqlite3");
+    let (root, cx) = open_root(cx, options_for(&layout, &relay));
+    cx.run_until_parked();
+    // 只让"自动发布基线"这一步走不可达 relay（真实 transport 失败，不改 Create）。
+    root.update(cx, |root, _| root.set_test_baseline_unreachable(true));
+
+    let recovery_code = create_to_backup_page(&root, cx, &link, &dir);
+    // Create 必须成功：库/身份/恢复码全在，只把基线降级为"未发布"。
+    assert_eq!(
+        root.update(cx, |root, _| root.backup_baseline_published()),
+        Some(false),
+        "发布失败不得被吞成成功"
+    );
+    assert!(vault_path.is_file(), "发布失败不得删除本地库");
+    assert!(
+        DevIdentityStore::path_for(&vault_path).exists(),
+        "发布失败不得删除身份"
+    );
+    assert!(recovery_code.starts_with("mnrec1"), "恢复码仍必须展示");
+    expect_bounds(cx, "app-root-create-warning");
+    {
+        let vault = Vault::open(&vault_path).expect("打开库");
+        assert!(
+            DevLocal::published_baseline(&vault)
+                .expect("读 durable 基线事实")
+                .is_none(),
+            "注入失败后不得留下假基线事实"
+        );
+    }
+
+    // 备份页复制邀请：本地前置检查明确挡住（不联网、不生成链接）。
+    root.update(cx, |root, cx| root.copy_invite(cx));
+    assert!(
+        root.update(cx, |root, cx| root
+            .wait_for_invite_copy_terminal(cx, DEFAULT_OPERATION_BUDGET)),
+        "前置检查必须在预算内收敛"
+    );
+    cx.run_until_parked();
+    let error = root
+        .update(cx, |root, _| root.backup_invite_error().map(str::to_owned))
+        .expect("缺基线时复制邀请必须明确失败");
+    assert!(
+        error.contains("尚未发布初始基线") && error.contains("发布"),
+        "失败文案必须指向发布基线：{error}"
+    );
+    assert!(!error.contains("mn-pair://"), "失败文案不得含链接：{error}");
+    assert!(
+        root.update(cx, |root, _| root.backup_invite_id()).is_none(),
+        "前置检查失败不得生成邀请"
+    );
+
+    // 进 Main：面板看到 durable 事实缺失 → 渲染「重试发布基线」。
+    root.update(cx, |root, cx| {
+        root.set_backup_confirmed(true, cx);
+        root.confirm_backup(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+    pump_shell_until(cx, &root, "面板读到基线缺失", |shell, app| {
+        shell.dev_sync_panel().is_some_and(|panel| {
+            let snapshot = panel.read(app).service().snapshot();
+            snapshot.baseline_known && snapshot.published_baseline.is_none()
+        })
+    });
+    expect_bounds(cx, "dev-sync-publish");
+    let invite_reason = root.update(cx, |root, app| {
+        root.main_shell().and_then(|shell| {
+            shell
+                .read(app)
+                .dev_sync_panel()
+                .and_then(|panel| panel.read(app).invite_block_reason())
+        })
+    });
+    assert!(
+        invite_reason.is_some_and(|reason| reason.contains("初始基线")),
+        "缺基线时邀请必须先被挡住：{invite_reason:?}"
+    );
+
+    // 重试发布：先真实建一篇笔记（发布需要活动文档持闸），再点面板按钮。
+    let new_note = expect_bounds(cx, "sidebar-new-note");
+    cx.simulate_click(new_note.center(), Modifiers::default());
+    cx.run_until_parked();
+    let retry = expect_bounds(cx, "dev-sync-publish");
+    cx.simulate_click(retry.center(), Modifiers::default());
+    pump_shell_until(cx, &root, "重试发布基线完成", |shell, _app| {
+        shell
+            .dev_sync_last_publish()
+            .is_some_and(|report| report.is_ok())
+            && !shell.dev_sync_publish_in_progress()
+    });
+    pump_shell_until(cx, &root, "面板读到基线已发布", |shell, app| {
+        shell.dev_sync_panel().is_some_and(|panel| {
+            let snapshot = panel.read(app).service().snapshot();
+            snapshot.baseline_known && snapshot.published_baseline.is_some()
+        })
+    });
+    assert!(
+        cx.debug_bounds("dev-sync-publish").is_none(),
+        "重试成功后必须隐藏发布按钮"
+    );
+    {
+        let vault = Vault::open(&vault_path).expect("打开库");
+        assert!(
+            DevLocal::published_baseline(&vault)
+                .expect("读 durable 基线事实")
+                .is_some(),
+            "重试成功后必须有 durable 基线事实"
+        );
+    }
+
+    // 邀请现在可用（面板生成本地链接；基线下 B 能加入）。
+    // 先等面板真正空闲：自动同步可能占着单操作槽，忙碌时点击只会得到"有操作在途"。
+    pump_shell_until(cx, &root, "面板空闲可生成邀请", |shell, app| {
+        shell
+            .dev_sync_panel()
+            .is_some_and(|panel| panel.read(app).invite_block_reason().is_none())
+    });
+    let invite = expect_bounds(cx, "dev-sync-invite");
+    cx.simulate_click(invite.center(), Modifiers::default());
+    pump_shell_until(cx, &root, "重试后生成邀请", |shell, app| {
+        shell.dev_sync_panel().is_some_and(|panel| {
+            panel.read(app).invite_link().is_some()
+                && panel.read(app).service().snapshot().in_flight.is_none()
+        })
+    });
+    drop(recovery_code);
+    let invite_url = root.update(cx, |root, app| {
+        root.main_shell().and_then(|shell| {
+            shell
+                .read(app)
+                .dev_sync_panel()
+                .and_then(|panel| panel.read(app).invite_link().map(|link| link.url.clone()))
+        })
+    });
+    let invite_url = invite_url.expect("重试发布后必须能生成邀请链接");
+    let target = InviteLinkTarget::parse(&invite_url).expect("重试后生成的链接必须可解析");
+    assert_eq!(target.vault_id(), vault_id);
+    assert_eq!(target.api_version(), RelayApiVersion::V2);
 }

@@ -124,6 +124,13 @@ mod tests {
             normal_limit: 1024,
             maintenance_limit: 2048,
             created_at: 0,
+            authz_version: 1,
+            authz_rev: 0,
+            authority_rev: 0,
+            recovery_pub: None,
+            policy_bytes: None,
+            upgrade_control_rev: None,
+            authz_state: crate::vault::AuthzState::Legacy,
         }
     }
 

@@ -11,6 +11,7 @@ pub mod cursor;
 pub mod envelope;
 pub mod error;
 pub mod limits;
+pub mod management_cap_v2;
 pub mod records;
 mod rotation_records;
 
@@ -27,6 +28,28 @@ pub use envelope::{aad, Envelope, EnvelopeHeader, AAD_DOMAIN};
 pub use envelope::{Envelope as Mne1Envelope, EnvelopeHeader as Mne1Header};
 pub use error::{ErrorBody, ErrorCode, ProtoError};
 pub use limits::*;
+pub use management_cap_v2::{
+    auth_signing_input_v2, canonical_submit_path, control_signing_input, pop_signing_input,
+    recover_signing_input, set_digest_v2, upgrade_signing_input, ActivationV2, CapGrantPayloadV2,
+    CapId, CapRevokePayloadV2, CapScope, ChallengeV2, ControlKindV2, DeviceApprovePayloadV2,
+    DeviceCertV2, DeviceCredentialPayloadV2, DeviceRevokePayloadV2, DeviceRightsChangePayloadV2,
+    EpochActivatePayloadV2, GrantAadV2, GrantIdV2, GrantPackageV2, InviteCancelPayloadV2,
+    InviteCreatePayloadV2, ManagementCapV2, OperationV2, PolicyV2, RecoveryKeyChangePayloadV2,
+    RecoveryResetPayloadV2, RequestIdV2, RotationAbortPayloadV2, RotationAddRevokesPayloadV2,
+    RotationBeginPayloadV2, RotationIdV2, RotationRestartPayloadV2, SetDigestEntryV2, Sha256Fn,
+    SignedControlV2, SignerRole, SignerV2, UpgradePolicyPayloadV2, ACTIVATION_V2_FIELD_COUNT,
+    CAP_GRANT_PAYLOAD_V2_FIELD_COUNT, CAP_REVOKE_PAYLOAD_V2_FIELD_COUNT, CHALLENGE_V2_FIELD_COUNT,
+    CHALLENGE_V2_REALM_DEVICE, CHALLENGE_V2_REALM_MANAGEMENT_DEVICE, CHALLENGE_V2_REALM_RECOVERY,
+    DEVICE_CERT_V2_FIELD_COUNT, DEVICE_CREDENTIAL_PAYLOAD_V2_FIELD_COUNT,
+    DEVICE_REVOKE_PAYLOAD_V2_FIELD_COUNT, EPOCH_ACTIVATE_PAYLOAD_V2_FIELD_COUNT,
+    GRANT_AAD_V2_FIELD_COUNT, GRANT_PACKAGE_V2_FIELD_COUNT, INVITE_CANCEL_PAYLOAD_V2_FIELD_COUNT,
+    INVITE_CREATE_PAYLOAD_V2_FIELD_COUNT, MANAGEMENT_CAP_V2_FIELD_COUNT, OPERATION_V2_FIELD_COUNT,
+    POLICY_V2_FIELD_COUNT, RECOVERY_KEY_CHANGE_PAYLOAD_V2_FIELD_COUNT,
+    RECOVERY_RESET_PAYLOAD_V2_FIELD_COUNT, ROTATION_ABORT_PAYLOAD_V2_FIELD_COUNT,
+    ROTATION_ADD_REVOKES_PAYLOAD_V2_FIELD_COUNT, ROTATION_BEGIN_PAYLOAD_V2_FIELD_COUNT,
+    ROTATION_RESTART_PAYLOAD_V2_FIELD_COUNT, SIGNED_CONTROL_V2_FIELD_COUNT, SIGNER_V2_FIELD_COUNT,
+    UPGRADE_POLICY_PAYLOAD_V2_FIELD_COUNT, V2_WIRE_VERSION,
+};
 pub use records::ObjectType as MessageType;
 pub use records::{
     check_device_count, device_cert_signed_bytes, grant_signed_bytes,

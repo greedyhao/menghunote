@@ -13,29 +13,40 @@
 
 ## GUI 向导（推荐；真实用户不需要命令行）
 
-前提：`cargo run -p menghunote-app --features dev-sync`（不带任何 `--dev-sync*`、不设
-`MENGHUNOTE_DEV_VAULT`），relay 已按 §2.1 起好（`--setup-only`）。
+> **ADR 0018 S4b 起（2026-11-16）**：Create **只支持「粘贴创建链接」**。App 不再有
+> 「管理员创建」/ admin secret / v1 setup secret 创建入口；创建票据由 relay 的 **Web
+> 管理面**「创建领取链接」发行。首次配置的完整顺序见本文末尾
+> 「ADR 0018 S4b：首次配置（Web 管理面创建 claim 链接 → App 粘贴）」。
 
-1. **A 创建实例**：Welcome →「创建新的同步实例」→ 填 relay（默认
-   `http://127.0.0.1:18080`）、setup secret（relay 打印的那串，粘贴即可）、实例目录
+前提：`cargo run -p menghunote-app --features dev-sync`（不带任何 `--dev-sync*`、不设
+`MENGHUNOTE_DEV_VAULT`），relay 已按 S4b 章节起好（`init` + `serve --config`，配置
+`public_url` 与 `admin_listen`），并在浏览器管理面创建了一条 claim 领取链接。
+
+1. **A 创建实例**：Welcome →「创建新的同步实例」（或「粘贴创建链接」）→ 粘贴
+   `mn-pair://create?...` 领取链接 →「应用创建链接」→ 实例目录
    （默认在 `%LOCALAPPDATA%` / `$XDG_DATA_HOME` 的 `menghunote-dev/instances/<id>/`，
-   可改成任意**绝对路径**，且必须不存在或为空目录）→ 勾选「同意开发同步」→「创建」；
+   可改成任意**绝对路径**，且必须不存在或为目录）→ 勾选「同意开发同步」→
+   「用一次性票据创建」；
 2. **A 备份恢复码**：创建成功后停在备份页，**只显示一次** `vault_id` + 恢复码；
    勾选「已在应用之外备份恢复码」→「继续进入主界面」。恢复码拥有数据/管理恢复能力，
    离开本页不再显示（想要自己抄一份，用「复制恢复码（有风险）」并清剪贴板）；
-3. **A 建笔记并发布基线**：侧栏「＋ 笔记」建第一篇、输入正文并等自动保存 → 面板
-   「发布基线」（§2.4）。**B 加入前必须先发布**（需要两份 checkpoint）；
-4. **B 加入**：另开一个进程（同一个二进制，同样不带 env/flag）→ Welcome →「加入已有
-   同步实例」→ 填：
-   - relay：与 A 相同（只允许 loopback 明文）；
-   - `vault_id`：A 备份页上的 32 位十六进制（公开标识，不遮罩）；
-   - 恢复码：A 备份页上的 `mnrec1…`（**遮罩**；可 `Ctrl+V` / `Shift+Insert` 粘贴，
-     `Ctrl+A` 全选，`Tab`/`Shift+Tab` 切字段，**不支持复制**）；
-   - 实例目录：默认自动生成，必须不存在或为空目录（与 Create 共用校验与实例锁）；
-   →「加入」。进度页显示固定阶段文案，UI 不冻结；
-5. **B 进入 Main**：成功即进入真实主界面并**自动打开第一篇**（A 的笔记，正文来自基线），
+3. **A 的初始基线已自动发布**：Create 成功后会自动跑一轮同步并发布两份 checkpoint，
+   备份页显示「初始基线已自动发布」，**不需要**再手动点「发布基线」。若该行显示
+   「基线未发布」（自动发布失败）→ 先继续进 Main，新建/打开一篇笔记后在同步面板点
+   「重试发布基线」；成功前邀请会被本地前置检查挡住；
+4. **A 复制邀请链接**：备份页点「复制邀请链接给其他设备」→ 链接（v2、默认 15 分钟）
+   只进剪贴板，**界面不显示明文**；复制成功后备份页显示「已复制」提示。也可进 Main 后
+   在右上同步面板「邀请设备…」→「复制邀请链接」（面板同样只显示复制按钮/TTL，复制后
+   折叠为「已复制；关闭面板即失效」）；
+5. **B 加入**：另开一个进程（同一个二进制，同样不带 env/flag）→ Welcome →「加入已有
+   同步实例」→ 在「邀请链接」字段粘贴 A 复制的 `mn-pair://join?...`（填实例目录，
+   默认自动生成、必须不存在或为空）→「加入」→ 进入 **PENDING**；
+   A 在同步面板核对指纹后点 pending 行的「批准…」→「确认批准」；B 点「检查状态」→
+   bootstrap 导入基线 → Main。**B 不需要填恢复码**（v2 邀请链接自带一次性 token；
+   恢复码只用于 v1 实例/灾后恢复，token 不落盘、不写配置）；
+6. **B 进入 Main**：成功即进入真实主界面并**自动打开第一篇**（A 的笔记，正文来自基线），
    **不播种 demo**；公开配置 `dev-sync.json` 的 `active_instance` 指向 B；
-6. 之后 B 想再打开：直接启动程序 → 有有效配置 + 身份 → **直接进 Main**（不闪 Welcome）。
+7. 之后 B 想再打开：直接启动程序 → 有有效配置 + 身份 → **直接进 Main**（不闪 Welcome）。
 
 ### GUI 设置（S4：不改配置/命令行）
 
@@ -136,6 +147,11 @@ B 无法 join；**切片 4c-4 之前**发布基线还要关窗口跑 CLI，手�
 
 ### 2.1 起 relay（终端 R，保持前台运行）
 
+> **ADR 0018 S4b**：首次配置推荐用「`init` + `serve --config` + Web 管理面 claim 链接」
+> （见文末 S4b 章节）。下面这条 `dev_server --setup-only` 是**旧 v1 CLI/dev 回归路径**：
+> 它仍可用于旧实例（v1 setup secret genesis），但 App 的 Create 表单已不再提供
+> setup secret 输入入口；不要用它做新的首次配置。
+
 ```bash
 cargo run -p menghunote-relay --example dev_server -- --setup-only --reset
 ```
@@ -181,9 +197,13 @@ cargo run -p menghunote-app --features dev-sync -- --dev-sync-create
 
 > 建完笔记**不要关窗口**，直接进 §2.4 点面板「发布基线」。
 
-### 2.4 A：在窗口里点「发布基线」（推荐）
+### 2.4 A：发布基线（现在由 Create 自动完成）
 
-A 建好笔记后**不用关窗口、不用命令行**：在面板上直接点「发布基线」。
+> **2026-11-16 起**：Create 成功后会自动发布初始基线，备份页显示「初始基线已自动
+> 发布」；正常实例的同步面板**不显示**「发布基线」按钮。本节保留给**旧实例**（Create
+> 时自动发布失败/从未发布）与 CLI 恢复场景——只有基线缺失时面板才显示「重试发布基线」。
+
+A 建好笔记后**不用关窗口、不用命令行**：在面板上直接点「重试发布基线」（仅缺基线时可见）。
 
 1. 面板在右上角（DEV ONLY 浮层）。确认「发布基线」按钮**没有置灰**（置灰 = 本机没有
    管理密钥，即这是 Join 设备）；
@@ -927,18 +947,25 @@ UI：Welcome →「加入已有同步实例」→ 模式 `remote_tls` + 远程�
 > 本片只到**库级**：App UI 表单/多实例面板是 S3b。下面是当前可用的手工验证路径
 > （Linux 本机、in-process/dev relay；真实 TLS relay 与 Windows 仍未验）。
 
-### 1. 发行一次性创建票据（运维侧）
+### 1. 发行一次性创建票据（ADR 0018 S4b 起：只在 Web 管理面）
 
-```bash
-# 只发行票据后退出，不启动服务器；缺省随机 vault_id / 900s / quota=1
-cargo run -p menghunote-relay --example dev_server -- --issue-ticket
-# 指定预留 vault_id、TTL 与额度（同一票据可多次尝试；成功创建才扣 1）
-cargo run -p menghunote-relay --example dev_server -- \
-  --issue-ticket --vault 00112233445566778899aabbccddeeff --ticket-ttl 600 --ticket-quota 2
-```
+`dev_server --issue-ticket` 与 `POST /v2/admin/create-tickets` 已**移除**（S4b）；App 也
+不再有「管理员创建」。创建票据的唯一入口是 relay 的 **Web 管理面**：
 
-输出含 `vault_id`、32B 票据明文（base64url 或 hex）、过期时刻与额度。**明文只打印这一次**；
-relay 库只有 `SHA256(ticket)`。票据绑定 `vault_id`，跨 vault 创建会统一 403 `FORBIDDEN`。
+1. `init` 生成一次性 admin token（只打印一次）；`serve` 起数据面 + `admin_listen`
+   （默认 `127.0.0.1:18081`），配置 `public_url`；
+2. 浏览器登录 `http://127.0.0.1:18081/admin/login` →「创建领取链接」；
+3. 页面**只显示一次** `mn-pair://create?...` 链接（含 ticket 明文）；刷新即失效；
+   丢失就取消预留后重新创建（vault id 不能复用）。
+
+票据语义不变：TTL 900s、quota=1、relay 库只有 `SHA256(ticket)`、绑定 `vault_id`；
+跨 vault 创建统一 403 `FORBIDDEN`，已存在 vault → 409 `ALREADY_INITIALIZED`。
+
+### 1b. 旧管理员 API / CLI（已删除）
+
+`POST /v2/admin/create-tickets`、`dev_server --issue-ticket`、主 CLI `delete-vault` 均在
+ADR 0018 S4b 删除；不要在任何新脚本/文档里引用它们。实例重置只能：停服 + 备份 + 手工
+删库，或在 Web 管理面按 vault 执行 fenced 在线删除。
 
 ### 2. 生成创建链接（创建端/运维）
 
@@ -996,18 +1023,10 @@ let created = create_vault_with_ticket(
 > v2 邀请链接（`api=2`）与设置页的 API 面展示。仍只做 **粘贴**（不做 Windows scheme/QR）；
 > 测试全部是 Linux 本机 + 进程内 dev relay（放行验签），**不是**鉴权/Windows/TLS 验收。
 
-### 1. 发行票据（运维侧，与 S3a 相同）
+### 1. 发行票据（ADR 0018 S4b 起：Web 管理面）
 
-```bash
-# 只发行票据后退出；缺省随机 vault_id / 900s / quota=1
-cargo run -p menghunote-relay --example dev_server -- --issue-ticket
-# 指定预留 vault_id / TTL / 额度（quota>1 = 同一票据允许成功创建 N 次，但同一 vault 只能成功一次）
-cargo run -p menghunote-relay --example dev_server -- \
-  --issue-ticket --vault 00112233445566778899aabbccddeeff --ticket-ttl 600 --ticket-quota 2
-```
-
-输出里的票据明文**只打印这一次**；relay 只存 `SHA256(ticket)`。把明文按 S3a 的格式
-编成创建链接（**不在 App 里发行票据**）：
+旧 `dev_server --issue-ticket` 已移除。用 `init` + `serve --config`（含 `public_url`）后，
+浏览器登录管理面 →「创建领取链接」，复制**只显示一次**的创建链接：
 
 ```text
 mn-pair://create?v=1&relay=http%3A%2F%2F127.0.0.1%3A18080&vault=<hex32>[&pin=<hex32>]#ticket=<base64url>
@@ -1062,7 +1081,7 @@ Error 页；**不建库/身份/配置**，票据不会被保存。配置写失�
 ### 5. 已知限制 / 未做
 
 - 只有「粘贴整段链接」：Windows scheme/深链注册、QR、系统剪贴板监听都未做；
-- 不自动发行票据（必须运维 `--issue-ticket`）；App 不生成 `mn-pair://create` 链接；
+- 不自动发行票据（必须 Web 管理面「创建领取链接」）；App 不生成 `mn-pair://create` 链接；
 - v2 创建入口有实例级限流（默认 6 次/分钟）：批量演练会撞 429，等窗口过去再试；
 - v1→v2 中途切换不支持（面在创建时固定）；多实例共用**同一个**进程内的 relay/身份封装；
 - 真实鉴权 relay / Windows DPAPI / TLS 系统根的真机验收仍未做（S0 后置）。
@@ -1075,3 +1094,209 @@ Error 页；**不建库/身份/配置**，票据不会被保存。配置写失�
 | `crates/sync/tests/invite_links.rs`（+1 = 6） | v2 链接 api=2、pending 持久 api=2、v1 context 拒绝（不降级）、v2 面批准/bootstrap、未知 api 本地拒绝 |
 | `crates/sync/src/invite_link.rs` 单测（+1 = 9） | `api` 编码/解析/缺省 v1/未知拒绝/无 token 回显 |
 | 既有 v1 回归 | `onboarding_ui.rs` / `onboarding_invite.rs` / `dev_sync_*` 全部不改语义 |
+
+## ADR 0017 S5b：App 管理员创建（**ADR 0018 S4b 已移除**）+ 复制邀请链接（2026-11-15）
+
+> **ADR 0018 S4b（2026-11-16）已删除本节的「管理员创建」部分**：App 不再有 admin secret
+> 字段/管理员模式，`sync::admin_ticket` 与 `POST /v2/admin/create-tickets` 也一并移除。
+> Create 现在只有「粘贴创建链接」（票据来自 Web 管理面「创建领取链接」）。
+>
+> 本节保留的 **「复制邀请链接」/加入 PENDING/批准** 流程不变（见 §3/§4）。
+
+### 1. 起 dev relay（旧流程，已不用于 Create）
+
+`dev_server`（可 `--setup-only --reset`）仍可用于旧 v1 实例/联调；新的创建票据必须由
+`init` + `serve --config` 的内嵌 Web 管理面发行。App 不再接收 relay 管理凭证。
+
+### 2. App：管理员创建（已移除）
+
+不要再按旧步骤填「relay 管理凭证」。Create 表单现在只有：创建链接、实例目录、同意框、
+「用一次性票据创建」；链接来自 Web 管理面（见文末 S4b 章节）。
+
+### 3. 复制邀请链接（创建成功后立即可用）
+
+- **备份页**：点「复制邀请链接给其他设备」（`app-root-copy-invite`）→ 生成 v2 邀请链接
+  （`mn-pair://join?...&api=2#token=...`，默认 15 分钟）并复制到剪贴板；页面显示公开的
+  剩余有效期（`app-root-invite-ttl`）与风险提示。
+- **Main 设备面板**：`dev-sync-invite`（生成邀请）→ `dev-sync-copy-invite`（复制链接）。
+  ADR 0017 S5b 起**不再要求有活动文档**：刚创建、尚未打开/发布任何笔记的实例也能直接
+  生成邀请（邀请是管理操作，只需要 vault + 身份 + 管理私钥）。
+- 链接含一次性 token：只私发给要加入的设备；不要截图/公开发布；剪贴板历史可能保留副本。
+
+### 4. 其他设备加入（PENDING → 批准）
+
+1. B 实例「加入已有同步实例」→ 粘贴邀请链接 + 实例目录 → 兑换为 **PENDING**
+   （不写配置/身份，token 不落盘）；
+2. A 在设备面板看到 pending 行 → 批准（`dev-sync-approve-<短id>`）；
+3. B 点「检查状态」→ bootstrap → Main；B 的配置写 `api_version=2`，同步走 `/v2` 数据面。
+
+### 5. 失败矩阵（都对用户明确、零本地残留）
+
+| 情况 | 表现 |
+| --- | --- |
+| 创建链接被拒绝（票据不存在/过期/已用/错 vault） | 403 `FORBIDDEN`；不建库/身份/配置，票据不保存 |
+| 链接已绑定该 vault（已存在） | 409 `ALREADY_INITIALIZED`；不消费票据 |
+| v2 创建入口限流 | 429 `RATE_LIMITED`（默认 6 次/分钟）；同一次也可重试，失败不消费 |
+| relay 未启动 / 地址错 / TLS 不受信 | 可重试分类或安全暂停；不建库/身份/配置 |
+| HTTPS 链接未勾选远程确认 | 表单内联拒绝；不联网、不建目录 |
+| 生成邀请无管理钥/无 pin/relay 断 | 备份页/面板显示脱敏原因；不写 token/配置 |
+
+### 6. 本片未做（明确）
+
+- 真实 TLS relay / Windows 真机验收：仍后置；
+- 邀请的 relay 收件箱/审批 UI（S4d2）仍未做：批准仍在创建端设备面板完成；
+- 票据 TTL/额度自定义、创建链接/邀请链接的 QR/scheme 注册：不做。
+
+### 7. 自动化覆盖（本片）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `crates/app/tests/onboarding_admin_create.rs`（**S4b 已删除**） | 随旧「管理员创建」一并移除 |
+| `crates/sync/tests/admin_ticket.rs` / `sync::admin_ticket`（**S4b 已删除**） | 随旧管理发票端点一并移除 |
+| `crates/app/tests/dev_sync_invite.rs`（改 1） | **无活动文档时邀请按钮不再置灰**，点击确实派发 `CreateInvite`（不再被门禁挡住） |
+| `crates/app/tests/onboarding_ui.rs`（S4b 改） | Create 只剩创建链接 + 实例目录；无 admin/legacy/relay/secret selector；真实链接 → 备份页 → Main |
+| 既有回归 | `onboarding_create_link.rs`（粘贴创建链接/v2 邀请/票据失败矩阵）与全部 `dev_sync_*` 不改语义 |
+
+## ADR 0018 S4a：内嵌 Web 管理页面（列表/创建领取链接/取消/删除）
+
+> 非生产：admin listener 默认 `127.0.0.1:18081`，HTTP 明文；token/会话/领取链接都可能被
+> 同机或同一受信网络上的进程截获。不要映射到公网；跨不可信网络请放在同机 TLS
+> 反向代理之后，并把浏览器使用的 `host:port` 写进 `admin_allowed_hosts`。
+> 旧 `/v2/admin/create-tickets`、App「管理员创建」、CLI `delete-vault` 在 S4a 当时仍保留；
+> **ADR 0018 S4b 已全部移除**（见文末 S4b 章节）。本节其余步骤（Web 登录/创建领取链接/
+> 取消/删除）在 S4b 后仍然有效，且是新首次配置的唯一入口。
+
+### 1. 起 relay（带 `public_url`）
+
+1. `cargo run -p menghunote-relay -- init --db /tmp/mn-relay/relay.sqlite3`
+   → **只显示一次** `admin_token=…`（另有一枚 setup secret）；记下 admin token。
+2. `serve.toml`（示例）：
+
+   ```toml
+   listen = "127.0.0.1:18080"
+   db = "/tmp/mn-relay/relay.sqlite3"
+   admin_listen = "127.0.0.1:18081"
+   public_url = "http://127.0.0.1:18080"   # claim 链接的数据面 origin（只来自配置）
+   ```
+
+   - 本机开发用 `http://127.0.0.1:18080` / `http://localhost:18080` / `http://[::1]:18080`；
+   - 对外/TLS 用 `https://relay.example.com`（建议同机 nginx/Caddy 终止 TLS）；
+   - **不要**写 `http://192.168.x.x:18080`：客户端 `local_dev` 只接受 loopback、
+     `remote_tls` 只接受 https，relay 启动时会拒绝非 loopback 明文 `public_url`。
+3. `cargo run -p menghunote-relay -- serve --config serve.toml`
+   → 日志应有 `[relay] listening on http://127.0.0.1:18080`、
+   `[relay] admin listening on http://127.0.0.1:18081`、
+   `[relay] public_url=http://127.0.0.1:18080`。
+   未配置 `public_url` 时只打印一行警告（创建页会 409）。
+
+### 2. 登录与列表
+
+1. 浏览器打开 `http://127.0.0.1:18081/admin/login`，粘贴第 1 步的 admin token。
+2. `GET /admin`：显示"数据面 URL"（只读）、vault 列表（id/状态/创建时间/数据面 URL/
+   设备数/票据过期/删除进度）；空 relay 显示"空库，尚未创建任何 vault"。
+3. 点 vault id 进详情：生命周期与授权/运行状态分小节；不显示票据 hash/明文。
+
+### 3. 创建领取链接（一次性）
+
+1. 点「创建领取链接」→ 表单只有 CSRF（没有 vault_id/TTL/quota 输入）→「创建领取链接」。
+2. POST 后 303 到 `/admin/vaults/created/<随机 id>`，页面显示**一次**：
+   `vault id`、创建时间、票据过期（+900s）、`mn-pair://create?v=1&relay=…&vault=…#ticket=…`。
+3. **刷新**该页（或后退再进）→ 404「一次性页面已失效」；列表/详情都不会再出现链接/ticket。
+4. 把链接私发给要创建实例的设备（App 粘贴创建链接）；链接含一次性票据明文，不要截图/进工单。
+5. 链接丢失：回列表/详情取消该预留（`RESERVED`），再重新创建（旧 vault id 不能复用）。
+
+### 4. 取消预留
+
+- 详情页 `RESERVED` →「取消预留」→ 303 回列表；状态 `CANCELLED`，票据作废。
+- 重复取消幂等（仍回列表）；已经领取（`ACTIVE`）→ 409（绝不删除已创建 vault）。
+- 票据过期后取消 → 409，registry 落 `EXPIRED`（票据作废，id 不可复用）。
+
+### 5. 不可逆删除（202 / 进度）
+
+1. 详情页 `ACTIVE` →「删除该 vault」→ 确认页逐字输入 `DELETE <32 位小写 hex>`
+   （大小写、单个空格都严格；错/缺 CSRF 分别 400/403，不改变任何状态）。
+2. 提交后返回 **202** 作业页（状态 `DELETING`、job id、进度 `0/26`）：只表示"已持久标记"，
+   **不代表已完成**；数据面入口立即 410 `VAULT_DELETED`。
+3. GET `/admin/vaults/<id>/delete`（或详情页链接）看进度：无 JS，靠
+   `<meta http-equiv="refresh" content="3">` + "刷新本页"链接；`DELETE_FAILED` 可重试同一 job。
+4. 完成前**不要**停 relay；若必须停，重启会自动续跑 `DELETING`（启动先加载 fence 再监听）。
+5. 完成后状态变 `DELETED`（墓碑）：租户表/票据零残留，列表进度 `26/26`；
+   页面没有恢复/回滚按钮，id 永久禁止复用。
+
+### 6. 旧 App/CLI 入口（ADR 0018 S4b 已移除）
+
+- App 的「管理员创建」/ admin secret 字段、`sync::admin_ticket` 与
+  `POST /v2/admin/create-tickets`：**已删除**；
+- 主 CLI `delete-vault` 与示例 `--issue-ticket`：**已删除**；
+- App Create 只保留「粘贴创建链接」；首次配置的唯一入口是本节 Web 管理面。
+
+## ADR 0018 S4b：首次配置（Web 管理面创建 claim 链接 → App 粘贴）
+
+> ADR 0018 S4b（2026-11-16）：移除旧管理入口/App 管理员模式/CLI 发票与删库。保留的入口是
+> **Web 管理面**（列表/创建领取链接/取消/删除）与 App 的**粘贴创建链接**。不涉及 schema/
+> fence/Deletion 语义；claim/cancel/删除与 S2/S3 完全同一套。
+
+### 1. relay 初始化（只一次）
+
+```bash
+cargo run -p menghunote-relay -- init --db /tmp/mn-relay/relay.sqlite3
+# stdout 只显示一次：
+#   setup_secret=…（v1 旧实例/CLI 兼容用；App Create 已不使用）
+#   admin_token=…（Web 管理登录用；只显示一次）
+```
+
+### 2. 起 relay（数据面 + admin listener）
+
+```toml
+# serve.toml
+listen = "127.0.0.1:18080"
+db = "/tmp/mn-relay/relay.sqlite3"
+admin_listen = "127.0.0.1:18081"
+public_url = "http://127.0.0.1:18080"   # claim 链接的 canonical 数据面 origin（只来自配置）
+```
+
+```bash
+cargo run -p menghunote-relay -- serve --config serve.toml
+# 期望：[relay] listening on http://127.0.0.1:18080
+#       [relay] admin listening on http://127.0.0.1:18081
+#       [relay] public_url=http://127.0.0.1:18080
+```
+
+- `status` 是**只读诊断**：`cargo run -p menghunote-relay -- status --db /tmp/mn-relay/relay.sqlite3`；
+  不创建库、不迁移；schema 版本不匹配会明确报错。
+- **没有** `delete-vault` 子命令；实例重置 = 停 relay + 备份库文件 + 手工删除
+  `<db>`（含 `-wal`/`-shm`），或在 Web 管理面按 vault 在线删除（不可逆，其它租户继续服务）。
+
+### 3. Web 管理面创建 claim 领取链接
+
+1. 浏览器打开 `http://127.0.0.1:18081/admin/login`，粘贴 `init` 只显示一次的 `admin_token`；
+2. `GET /admin` 列表 →「创建领取链接」→ 自动生成 vault id（ellipse 900s、quota=1）；
+3. 复制页面**只显示一次**的 `mn-pair://create?v=1&relay=…&vault=…#ticket=…`；
+   刷新/后退即失效；丢失只能取消预留后重建（旧 vault id 不能复用）。
+
+### 4. App 粘贴创建链接
+
+1. `cargo run -p menghunote-app --features dev-sync`（无需 env/flag）；
+2. Welcome →「创建新的同步实例」或「粘贴创建链接」→ 粘贴整段链接 →
+   「应用创建链接」（输入框按 Enter 等价）；
+3. 表单应只剩：创建链接、`app-root-create-link-warning` / `-facts`、实例目录、同意框、
+   「用一次性票据创建」；**没有** admin secret / v1 setup secret / relay 模式选择器；
+4. 勾选同意 →「用一次性票据创建」→ Working → 恢复码备份页（只显示一次）→ 勾选备份 →
+   Main。配置写 `api_version=2`；链接为 `https://` 时还需勾选远程确认。
+
+### 5. 之后
+
+- 其它设备：A 的备份页/设备面板「复制邀请链接」→ B 粘贴 → PENDING → A 批准 → B
+  「检查状态」→ Main（流程不变，见 §4）；
+- 删除：Web 管理面详情 → 逐字输入 `DELETE <32 位 hex>` → 202 作业；数据面立即 410
+  `VAULT_DELETED`；作业独立于浏览器，断连/重启自动续跑；
+- 失败文案：链接过期/已用/错误 vault/无 `public_url` 都由 Web 端或 App 票据错误分类给出；
+  App **不显示**任何 admin 凭证概念。
+
+### 6. 自动化覆盖（S4b）
+
+- relay：`cargo test -p menghunote-relay --all-targets`（旧 `admin_ticket_v2` 用例删除；
+  新增 `status` 只读/不建库/schema 不兼容拒绝的进程级用例；admin web/删除/claim 全绿）；
+- sync：`cargo test -p menghunote-sync --all-targets`（`admin_ticket` 模块/测试删除）；
+- app：`cargo test -p menghunote-app --features dev-sync` / 默认（`onboarding_admin_create`
+  删除；`onboarding_ui` Create 用例改走创建链接；`onboarding_create_link` 断言无 Admin 入口）。

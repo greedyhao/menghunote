@@ -238,6 +238,9 @@ fn crash_replay_after_parts_and_after_complete() {
         subject: [2u8; 16],
         device_id: Some([2u8; 16]),
         auth_rev: vault.auth_rev,
+        authz_rev: 0,
+        authority_rev: 0,
+        cap_id: None,
         vault: relay::VaultScope::new(vault_id),
     };
     let hook = std::sync::Arc::new(TestHook::new());

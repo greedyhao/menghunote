@@ -70,6 +70,9 @@ fn create_second_vault(fx: &Fixture) -> SecondVault {
             subject: SAME_DEVICE,
             device_id: Some(SAME_DEVICE),
             auth_rev: vault.auth_rev,
+            authz_rev: 0,
+            authority_rev: 0,
+            cap_id: None,
             vault: scope,
         },
     }
@@ -611,6 +614,9 @@ fn invites_reservations_leases_and_idempotency_are_isolated() {
             subject: device,
             device_id: Some(device),
             auth_rev: 1,
+            authz_rev: 0,
+            authority_rev: 0,
+            cap_id: None,
             vault: scope,
         };
         fx.db
@@ -803,6 +809,9 @@ fn checkpoint_request_id_is_idempotent_per_vault() {
             subject: device,
             device_id: Some(device),
             auth_rev: 1,
+            authz_rev: 0,
+            authority_rev: 0,
+            cap_id: None,
             vault: scope,
         };
         fx.db

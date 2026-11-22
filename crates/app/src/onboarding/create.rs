@@ -1,39 +1,39 @@
-//! Create 的**后台执行体**（ADR 0011「生命周期与后台」/ S2）。
+//! Create 的**后台执行体**（ADR 0011「生命周期与后台」/ ADR 0018 S4b）。
 //!
-//! ## 顺序（硬约束，不能交换）
+//! ## 唯一入口：创建链接（v2 一次性票据）
+//!
+//! ADR 0018 S4b 起 App **只**支持「粘贴创建链接」（`mn-pair://create`）：
+//! 管理凭证/管理员创建模式已移除，v1 setup secret 创建表单也不再显示。
 //!
 //! ```text
-//! Worker 线程（local_dev）：
-//!   1. DevLocal::create_deferring_identity（真实 genesis；pending 停在 PinCommitted）
-//!   2. DevIdentityStore::persist_protected（受保护身份落盘）
-//!   3. 推进 pending（IdentityWritten → Done）→ 把 Vault + 公开事实 + 恢复码交回 UI
-//!
-//! Worker 线程（remote_tls，ADR 0013 S3b）：
-//!   1. remote_init::create_remote（production TLS：genesis → 身份回调落盘 →
-//!      `IdentityWritten` → /state+/control 全链 + rev1 前缀 → 强 pin → 初始 recovery 槽）
-//!   2. 身份回调就是 DevIdentityStore::persist_protected（原子 rename）
-//!   3. 把 Vault + 公开事实 + 恢复码交回 UI
-//!
-//! Worker 线程（一次性票据，ADR 0014 S3b / S3a 的库级入口）：
+//! Worker 线程（一次性票据）：
 //!   1. remote_init::create_vault_with_ticket（**固定 v2 面**：`POST /v2/vaults`；
-//!      与 v1 Create **完全同一套**主体：本地材料 → 写前 pending → 回执校验/强 pin →
+//!      与既有库级入口同一套主体：本地材料 → 写前 pending → 回执校验/强 pin →
 //!      身份回调落盘 → 初始 recovery 槽 → pending 收尾）
 //!   2. 票据只在内存里用一次：不写 pending/配置/日志；失败不消费票据（relay 事务回滚）
-//!   3. 成功后走**同一张**备份页/配置写入路径，配置 `api_version=2`
+//!   3. **自动发布初始基线**：用同一 `RelayContext`（v2）调
+//!      `DevLocal::publish_initial_pair_with_identity`（一轮 sync + 两份同 epoch
+//!      checkpoint；初始 recovery 槽已在第 1 步上传，不再重复上传）。失败**不是**
+//!      创建失败：库/身份/恢复码全部保留，`baseline_published=false` + 脱敏 warning，
+//!      由备份页说明、面板「重试发布基线」显式重试（不自动重试）
+//!   4. 成功后走备份页/配置写入路径，配置 `api_version=2`
 //! ```
 //!
-//! **v1 setup secret 与 v2 票据互斥**：请求里只有一个 [`CreateCredential`]，类型上
-//! 不能同时带两种授权；workers 的清理/失败语义按各自的编排（票据路径由
-//! `remote_init` 决定，与 v1 remote 相同）。
+//! 链接的 relay 模式（`http`=local_dev / `https`=remote_tls）由链接本身决定，不在表单里
+//! 另设模式选择；`remote_tls` 仍要求在表单显式确认"远程服务器/HTTPS"。
 //!
 //! 两条路径都保证"**身份落盘成功之后**才把 vault_id/恢复码交给 UI"。
 //!
-//! ## 失败清理（两条路径语义不同，见 ADR 0013 §3）
+//! 「刚创建就复制邀请」曾经复现 B 侧 `NO_VALID_BASELINE`：Create 只做 genesis + 初始
+//! 槽，**没有**基线 checkpoint，B 的 bootstrap 找不到两份 published。把发布接进
+//! Create 之后，备份页复制邀请即可用；邀请生成入口另有一道本地 `published_baseline`
+//! 前置检查（失败不发网络请求，避免 B 侧才暴露问题）。
 //!
-//! - `local_dev`：任何失败都清掉本次新建的库/身份文件（既有 ADR 0009 语义）。
-//! - `remote_tls`：拿不到回执之前失败 → 清理本次新建的库文件（远端最多留下不可用
-//!   空 vault）；拿到回执之后失败（含身份落盘失败）→ **保留**库/pending 与已落盘事实
-//!   （不删用户数据），Error 页可重试/等启动对账。app 自己不判断清理，交给 `remote_init`。
+//! ## 失败清理
+//!
+//! 票据路径的失败清理由 `remote_init` 决定（ADR 0013 §3）：拿不到回执之前失败 → 清理
+//! 本次新建的库文件（远端最多留下不可用空 vault）；拿到回执之后失败（含身份落盘失败）
+//! → **保留**库/pending 与已落盘事实（不删用户数据），Error 页可重试/等启动对账。
 //!
 //! **第 2 步成功之前，UI 不得展示 `vault_id` / 恢复码**：没有受保护身份就没有可用的
 //! 实例，"看起来创建成功但身份没落盘"是 ADR 0009 明确禁止的半状态。
@@ -50,12 +50,6 @@
 //! **移交给本 worker**：worker 存活期间独占该目录。成功时锁随
 //! [`CreateOutcome::lock`] 交回 UI（Main 继续持有）；失败时 worker 退出、锁 Drop
 //! （删掉自己的锁文件），不留下"目录被锁死"的状态。
-//!
-//! ## 失败清理
-//!
-//! 只清**本次新建**的库文件（含 WAL/SHM/journal 边车）与身份文件；**实例目录本身
-//! 不删**（可能是用户已有的空目录）。relay 侧可能留下一个没有基线的空 vault，重试会
-//! 建新的——这与 `DevLocal::create` 的既有失败语义一致（ADR 0011「非目标与风险」）。
 
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -72,7 +66,7 @@ use menghunote_sync::http_transport::DEFAULT_TRANSPORT_TIMEOUTS;
 use menghunote_sync::identity::LocalIdentityV1;
 use menghunote_sync::relay_context::RelayContext;
 use menghunote_sync::relay_policy::RelayMode;
-use menghunote_sync::remote_init::{create_remote, create_vault_with_ticket};
+use menghunote_sync::remote_init::create_vault_with_ticket;
 
 use super::lock::InstanceLock;
 use super::sanitize_error;
@@ -91,6 +85,8 @@ pub enum CreateStage {
     Genesis,
     /// 把设备身份受保护落盘。
     PersistingIdentity,
+    /// 自动发布初始基线（一轮 sync + 两份同 epoch checkpoint）。
+    PublishingBaseline,
 }
 
 impl CreateStage {
@@ -98,52 +94,41 @@ impl CreateStage {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Genesis => "正在创建 vault（genesis + 初始恢复槽）…",
+            Self::Genesis => "正在用一次性票据创建 vault（genesis + 初始恢复槽）…",
             Self::PersistingIdentity => "正在持久化设备身份（受保护）…",
+            Self::PublishingBaseline => "正在自动发布初始基线（同步 + 两份 checkpoint）…",
         }
     }
 }
 
-/// Create 的授权方式（**v1 与 v2 互斥**，类型上不能同时给两种）。
+/// Create 请求（含**秘密**：创建链接里的一次性票据）。
 ///
-/// - [`Self::SetupSecret`]：既有 v1 Create（本地 `DevLocal` 或远端 `create_remote`）；
-/// - [`Self::Ticket`]：ADR 0014 S3a 的一次性票据创建（固定 v2 面）。
-///
-/// 两种方式都只在**内存**里携带秘密；不实现 `Debug`/`Clone`。
-pub enum CreateCredential {
-    /// v1：服务器创建凭证（`Zeroizing` 在 drop 时清零）。
-    SetupSecret(Zeroizing<String>),
-    /// v2：一次性票据（`CreateTicket` 在 drop 时零化明文，`Debug` 脱敏）。
-    Ticket {
-        /// 票据绑定的预留 vault id（创建必须使用同一个 id；错 vault 由 relay 统一 403）。
-        vault_id: [u8; 16],
-        /// 32B 票据明文（**只在内存**）。
-        ticket: CreateTicket,
-        /// 可选公开锚：创建链接里的 relay instance；回执不一致即失败（不自动换 pin）。
-        expected_instance: Option<[u8; 16]>,
-    },
-}
-
-/// Create 请求（含**秘密**：setup secret 或创建票据）。
-///
-/// **不实现 `Debug`/`Clone`**：秘密只在这一次创建里用，不复制、不打印。
+/// **不实现 `Debug`/`Clone`**：票据只在这一次创建里用，不复制、不打印。
 pub struct CreateRequest {
     /// 目标库文件路径（实例目录里的 `vault.sqlite3`）。
     pub vault_path: std::path::PathBuf,
     /// relay 基地址（公开；`local_dev` 是 loopback 明文，`remote_tls` 是 HTTPS canonical origin）。
     pub relay_url: String,
-    /// relay 接入模式（ADR 0013 §1：模式是显式配置，不从 URL 猜）。
-    ///
-    /// 票据模式由创建链接决定（链接 scheme 即模式）；v2 面见 [`CreateCredential`]。
+    /// relay 接入模式（由创建链接 scheme 决定：`http`=local_dev，`https`=remote_tls）。
     pub relay_mode: RelayMode,
-    /// 本次创建的授权方式（v1 setup secret / v2 一次性票据，二者互斥）。
-    pub credential: CreateCredential,
+    /// 票据绑定的预留 vault id（创建必须使用同一个 id；错 vault 由 relay 统一 403）。
+    pub vault_id: [u8; 16],
+    /// 32B 票据明文（**只在内存**；由创建链接的 fragment 提供）。
+    pub ticket: CreateTicket,
+    /// 可选公开锚：创建链接里的 relay instance；回执不一致即失败（不自动换 pin）。
+    pub expected_instance: Option<[u8; 16]>,
     /// 实例目录锁（移交给 worker，保证创建期间独占）。
     pub lock: InstanceLock,
     /// **测试专用**：远程初始化追加的显式信任根（DER；本地 TLS harness）。
     ///
     /// 生产恒为空（系统信任根）。只**增加**显式信任，不关闭证书链/SAN/有效期校验。
     pub test_extra_roots: Vec<Vec<u8>>,
+    /// **测试专用**：自动发布初始基线改用故意不可达的 loopback 地址
+    /// （`http://127.0.0.1:1`），模拟"vault 创建成功但基线发布失败"。
+    ///
+    /// 生产恒为 `false`。它只影响**发布**这一步：库/身份/恢复码仍真实创建并保留，
+    /// 行为与真实网络故障完全一致（transport 连接失败）。
+    pub test_baseline_unreachable: bool,
 }
 
 /// Create 成功后的产物。
@@ -159,7 +144,7 @@ pub struct CreateOutcome {
     pub vault_path: std::path::PathBuf,
     /// 本次实例的 relay 模式（写 ProfileV2；remote_tls 不降级 local_dev）。
     pub relay_mode: RelayMode,
-    /// 本次实例的 relay API 面（ADR 0014 S3b：v1 setup secret 创建 = v1；票据 = v2）。
+    /// 本次实例的 relay API 面（创建链接 = v2）。
     pub api_version: RelayApiVersion,
     /// canonical relay origin（公开；写 ProfileV2）。
     pub relay_url: String,
@@ -173,14 +158,21 @@ pub struct CreateOutcome {
     pub key_epoch: u64,
     /// 一次性恢复码（只在备份页展示；不落盘、不进日志/配置）。
     pub recovery_code: Zeroizing<String>,
-    /// 非致命告警（例如身份已落盘但 pending 收尾失败：重启后启动对账会补）。
+    /// 初始基线是否已在 Create 内**自动发布**成功（两份同 epoch checkpoint）。
+    ///
+    /// `false` = 网络/权限/旧实例槽缺失等失败：实例仍可用（库/身份/恢复码都在），
+    /// 但邀请生成会被本地前置检查明确挡住，直到用户显式「重试发布基线」。失败原因
+    /// 在 [`Self::warning`] 里（已脱敏），**不吞**。
+    pub baseline_published: bool,
+    /// 非致命告警（例如身份已落盘但 pending 收尾失败：重启后启动对账会补；或初始基线
+    /// 自动发布失败：可在面板重试）。
     ///
     /// **不影响**成功终态：实例已可用，不能因为一次收尾失败丢掉恢复码/重建实例。
     pub warning: Option<String>,
 }
 
 impl CreateOutcome {
-    /// 公开事实（可写进配置的那部分；**不含**恢复码/setup secret/root）。
+    /// 公开事实（可写进配置的那部分；**不含**恢复码/票据/root）。
     #[must_use]
     pub fn public_facts(&self, instance_id: &str) -> super::layout::InstanceEntry {
         super::layout::InstanceEntry {
@@ -236,9 +228,12 @@ impl CreateJob {
             vault_path,
             relay_url,
             relay_mode,
-            credential,
+            vault_id,
+            ticket,
+            expected_instance,
             lock,
             test_extra_roots,
+            test_baseline_unreachable,
         } = request;
         let thread = thread::Builder::new()
             .name(WORKER_THREAD_NAME.to_owned())
@@ -247,8 +242,11 @@ impl CreateJob {
                 let result = run_create(
                     &relay_url,
                     relay_mode,
-                    credential,
+                    vault_id,
+                    ticket,
+                    expected_instance,
                     &test_extra_roots,
+                    test_baseline_unreachable,
                     &vault_path,
                     lock,
                     &events,
@@ -258,16 +256,12 @@ impl CreateJob {
                     Ok(outcome) => drop(events.send(CreateEvent::Finished(Box::new(outcome)))),
                     Err(Failure {
                         error,
-                        redact,
                         security,
                         lock,
                     }) => {
-                        // 脱敏：setup secret 的任何回显都替换掉，恢复码形态的 token 也遮住。
-                        // 票据路径没有可替文案的秘密（`CreateTicket` 的 `Debug` 本身脱敏）。
-                        let secrets = redact
-                            .as_ref()
-                            .map_or_else(Vec::new, |secret| vec![secret.as_str()]);
-                        let message = sanitize_error(&error, &secrets);
+                        // 票据路径没有可替文案的秘密（`CreateTicket` 的 `Debug` 本身脱敏）；
+                        // 恢复码形态的 token 仍会被 `sanitize_error` 遮住。
+                        let message = sanitize_error(&error, &[]);
                         drop(events.send(CreateEvent::Failed { message, security }));
                         // 失败时锁随局部变量 drop（删掉本次自己创建的锁文件）。
                         drop(lock);
@@ -296,23 +290,15 @@ impl CreateJob {
 /// 失败时把锁**带回来**（供 worker 在发完事件后释放；避免在错误类型里丢所有权）。
 struct Failure {
     error: anyhow::Error,
-    /// 需要从错误文案里抹掉的本次秘密（只有 v1 setup secret；票据路径为 `None`）。
-    redact: Option<Zeroizing<String>>,
     /// 安全类失败（worker 在**包装成 anyhow 之前**按 `SyncError` 分类）。
     security: Option<SecurityCategory>,
     lock: InstanceLock,
 }
 
-/// 组装失败终态（携带可脱敏秘密与锁）。
-fn failed(
-    error: anyhow::Error,
-    security: Option<SecurityCategory>,
-    lock: InstanceLock,
-    redact: Option<Zeroizing<String>>,
-) -> Failure {
+/// 组装失败终态（携带锁）。
+fn failed(error: anyhow::Error, security: Option<SecurityCategory>, lock: InstanceLock) -> Failure {
     Failure {
         error,
-        redact,
         security,
         lock,
     }
@@ -334,7 +320,7 @@ fn ticket_failure_hint(error: &SyncError) -> Option<&'static str> {
     match error {
         SyncError::RelayApi { code, .. } => match code.as_str() {
             "FORBIDDEN" => Some(
-                "票据被拒绝（403 FORBIDDEN）：票据不存在/已过期/已被使用/不属于该 vault\
+                "创建链接被拒绝（403 FORBIDDEN）：票据不存在/已过期/已被使用/不属于该 vault\
                  （relay 统一不区分）；本次没有创建本地库/身份/配置，票据也不会被保存",
             ),
             "ALREADY_INITIALIZED" => Some(
@@ -354,19 +340,16 @@ fn ticket_failure_hint(error: &SyncError) -> Option<&'static str> {
     }
 }
 
-/// 票据创建的内部事实（不实现 `Debug`/`Clone`：`ticket` 是秘密）。
-struct TicketCreate {
-    vault_id: [u8; 16],
-    ticket: CreateTicket,
-    expected_instance: Option<[u8; 16]>,
-}
-
-/// worker 线程主体：v1（local_dev / remote_tls）与 v2 票据两条编排 → 身份落盘 → outcome。
+/// worker 线程主体：创建链接票据 → v2 创建 → 身份落盘 → 自动发布初始基线 → outcome。
+#[allow(clippy::too_many_arguments)]
 fn run_create(
     relay_url: &str,
     relay_mode: RelayMode,
-    credential: CreateCredential,
+    vault_id: [u8; 16],
+    ticket: CreateTicket,
+    expected_instance: Option<[u8; 16]>,
     test_extra_roots: &[Vec<u8>],
+    test_baseline_unreachable: bool,
     vault_path: &std::path::Path,
     lock: InstanceLock,
     events: &mpsc::Sender<CreateEvent>,
@@ -374,25 +357,7 @@ fn run_create(
     let _ = events.send(CreateEvent::Progress(CreateStage::Genesis));
     let label = crate::dev_sync::setup::INSTANCE_LABEL;
     let store = crate::dev_sync::DevIdentityStore;
-    // v1 与 v2 **互斥**：两个分支只会有其中一个存在。
-    let (setup_secret, ticket) = match credential {
-        CreateCredential::SetupSecret(secret) => (Some(secret), None),
-        CreateCredential::Ticket {
-            vault_id,
-            ticket,
-            expected_instance,
-        } => (
-            None,
-            Some(TicketCreate {
-                vault_id,
-                ticket,
-                expected_instance,
-            }),
-        ),
-    };
-
-    // 0) 先按模式构造 context（非法 URL/模式在**建库之前**失败；测试可注入自签根）。
-    //    票据路径在下面显式切到 v2（`create_vault_with_ticket` 只接受 v2）。
+    // 先按链接模式构造 context（非法 URL/模式在**建库之前**失败；测试可注入自签根）。
     let context = match RelayContext::from_mode(relay_mode, relay_url, DEFAULT_TRANSPORT_TIMEOUTS)
         .and_then(|context| {
             if test_extra_roots.is_empty() {
@@ -410,169 +375,102 @@ fn run_create(
                 )),
                 None,
                 lock,
-                setup_secret,
             ));
         }
     };
     let canonical_relay = context.origin_str();
-
-    let created: CreatedData = match ticket {
-        Some(ticket) => {
-            // 票据端点就是 `/v2/vaults`：面由**创建方式**固定（不是 URL 猜的）。
-            let context = context.with_api_version(RelayApiVersion::V2);
-            let progress = events.clone();
-            let created = create_vault_with_ticket(
-                context,
-                ticket.vault_id,
-                &ticket.ticket,
-                ticket.expected_instance,
-                vault_path,
-                label,
-                move |identity: &LocalIdentityV1| {
-                    let _ = progress.send(CreateEvent::Progress(CreateStage::PersistingIdentity));
-                    store
-                        .persist_protected(vault_path, identity)
-                        .map_err(|error| SyncError::Io(format!("dev 身份持久化失败：{error:#}")))
-                },
+    // 票据端点就是 `/v2/vaults`：面由**创建链接**固定（不是 URL 猜的）。
+    let context = context.with_api_version(RelayApiVersion::V2);
+    // 自动发布基线复用**同一个** context（`RelayContext` 只是不可变描述：clone 不会共享
+    // 可变状态；强 pin 已在 genesis 里 durable 提交，`publish_*` 用 vault 里的 pin）。
+    let publish_context = context.clone();
+    let progress = events.clone();
+    let created = create_vault_with_ticket(
+        context,
+        vault_id,
+        &ticket,
+        expected_instance,
+        vault_path,
+        label,
+        move |identity: &LocalIdentityV1| {
+            let _ = progress.send(CreateEvent::Progress(CreateStage::PersistingIdentity));
+            store
+                .persist_protected(vault_path, identity)
+                .map_err(|error| SyncError::Io(format!("dev 身份持久化失败：{error:#}")))
+        },
+    );
+    let created = match created {
+        Ok(created) => created,
+        Err(error) => {
+            let security = security_of(&error);
+            let hint = ticket_failure_hint(&error).unwrap_or(
+                "一次性票据 Create 失败（未建本地库/身份/配置；票据不会被保存；\
+                 失败不消费票据，可用同一链接重试）",
             );
-            match created {
-                Ok(created) => CreatedData {
-                    vault: created.vault,
-                    identity: created.identity,
-                    vault_id: created.vault_id,
-                    recovery_code: created.recovery_code,
-                    warning: created.warning,
-                    api_version: RelayApiVersion::V2,
-                },
-                Err(error) => {
-                    let security = security_of(&error);
-                    let hint = ticket_failure_hint(&error).unwrap_or(
-                        "一次性票据 Create 失败（未建本地库/身份/配置；票据不会被保存；\
-                         失败不消费票据，可用同一链接重试）",
-                    );
-                    return Err(failed(
-                        anyhow::Error::new(error).context(format!(
-                            "票据 Create 失败（模式 {relay_mode:?}，relay = {canonical_relay}，\
-                             路径 = {}）：{hint}",
-                            vault_path.display()
-                        )),
-                        security,
-                        lock,
-                        None,
-                    ));
-                }
-            }
-        }
-        None => {
-            let secret = setup_secret
-                .as_ref()
-                .map(|secret| secret.as_str())
-                .unwrap_or_default();
-            match relay_mode {
-                RelayMode::LocalDev => {
-                    // ADR 0013 S3a：pending 停在 `PinCommitted`；身份 rename 成功后再推进
-                    // `IdentityWritten → Done`（失败留给启动对账，不在这里重建/删库）。
-                    let created = match DevLocal::create_deferring_identity(
-                        relay_url, secret, vault_path, label,
-                    ) {
-                        Ok(created) => created,
-                        Err(error) => {
-                            let security = security_of(&error);
-                            return Err(failed(
-                                anyhow::Error::new(error).context(format!(
-                                    "Create 失败（relay = {relay_url}，路径 = {}）",
-                                    vault_path.display()
-                                )),
-                                security,
-                                lock,
-                                setup_secret,
-                            ));
-                        }
-                    };
-                    // setup secret 只在这一步用；`CreatedVault.setup_secret` 是回显字段，立即丢弃。
-                    drop(created.setup_secret);
-
-                    let _ = events.send(CreateEvent::Progress(CreateStage::PersistingIdentity));
-                    if let Err(error) = store.persist_protected(vault_path, &created.identity) {
-                        // 身份没落盘 = 本次创建无效：关库后清掉本次新建的库/身份文件（目录保留）。
-                        drop(created.vault);
-                        cleanup_created_files(vault_path);
-                        return Err(failed(
-                            error.context(
-                                "设备身份持久化失败（已清理本次新建的库文件/身份文件；实例目录保留）",
-                            ),
-                            None,
-                            lock,
-                            setup_secret,
-                        ));
-                    }
-                    // 身份已原子落盘：推进 pending（IdentityWritten → Done → 清理）。失败**不删数据**。
-                    let warning = match menghunote_sync::init_session::mark_identity_written(
-                        &created.vault,
-                    )
-                    .and_then(|()| {
-                        menghunote_sync::init_session::finish_identity_written(&created.vault)
-                    }) {
-                        Ok(()) => None,
-                        Err(error) => Some(format!(
-                            "身份已落盘，但初始化 pending 收尾失败（{error}）：实例保留可用，重启后会启动对账补齐；本次启动的同步可能被 pending 保护挡住"
-                        )),
-                    };
-                    CreatedData {
-                        vault: created.vault,
-                        identity: created.identity,
-                        vault_id: created.vault_id,
-                        recovery_code: created.recovery_code,
-                        warning,
-                        api_version: RelayApiVersion::V1,
-                    }
-                }
-                RelayMode::RemoteTls => {
-                    // ADR 0013 S3b：受限初始化 + 身份回调（原子 rename 在 sync 的时序里发生）。
-                    // 失败清理语义由 `remote_init` 负责：拿不到回执/身份前清本次新库，之后保留。
-                    let progress = events.clone();
-                    let created = create_remote(
-                        context,
-                        secret,
-                        vault_path,
-                        label,
-                        move |identity: &LocalIdentityV1| {
-                            let _ = progress
-                                .send(CreateEvent::Progress(CreateStage::PersistingIdentity));
-                            store
-                                .persist_protected(vault_path, identity)
-                                .map_err(|error| {
-                                    SyncError::Io(format!("dev 身份持久化失败：{error:#}"))
-                                })
-                        },
-                    );
-                    match created {
-                        Ok(created) => CreatedData {
-                            vault: created.vault,
-                            identity: created.identity,
-                            vault_id: created.vault_id,
-                            recovery_code: created.recovery_code,
-                            warning: created.warning,
-                            api_version: RelayApiVersion::V1,
-                        },
-                        Err(error) => {
-                            let security = security_of(&error);
-                            return Err(failed(
-                                anyhow::Error::new(error).context(format!(
-                                    "远端 Create 失败（模式 remote_tls，relay = {canonical_relay}，路径 = {}）",
-                                    vault_path.display()
-                                )),
-                                security,
-                                lock,
-                                setup_secret,
-                            ));
-                        }
-                    }
-                }
-            }
+            return Err(failed(
+                anyhow::Error::new(error).context(format!(
+                    "票据 Create 失败（模式 {relay_mode:?}，relay = {canonical_relay}，\
+                     路径 = {}）：{hint}",
+                    vault_path.display()
+                )),
+                security,
+                lock,
+            ));
         }
     };
-
+    // 自动发布初始基线（ADR 0017「创建后即可邀请」）：失败**不是**创建失败——库/身份/
+    // 恢复码都必须交回 UI；失败只降级为 `baseline_published=false` + 脱敏 warning。
+    let _ = events.send(CreateEvent::Progress(CreateStage::PublishingBaseline));
+    let publish_target = if test_baseline_unreachable {
+        // 只影响发布这一步的**真实**传输失败（连接拒绝），不改 Create 的任何成功事实。
+        match RelayContext::from_mode(
+            RelayMode::LocalDev,
+            "http://127.0.0.1:1",
+            DEFAULT_TRANSPORT_TIMEOUTS,
+        ) {
+            Ok(context) => context.with_api_version(RelayApiVersion::V2),
+            Err(_) => publish_context,
+        }
+    } else {
+        publish_context
+    };
+    let (baseline_published, baseline_warning) = match DevLocal::publish_initial_pair_with_identity(
+        &publish_target,
+        &created.vault,
+        &created.identity,
+    ) {
+        Ok(report) => {
+            // 发布核心只有真实读回/导入通过才会返回 Ok；失败细节留给 error 分支。
+            debug_assert!(report.validated, "发布基线必须真实校验通过");
+            (true, None)
+        }
+        Err(error) => {
+            // 缺初始 recovery 槽是**不可由面板补救**的例外（K_slot_mne 只能由恢复码派生）：
+            // 文案必须直接指向恢复码 CLI，不能诱导用户去点一个注定失败的重试按钮。
+            let slot_missing = matches!(&error, SyncError::Unsupported(_));
+            // 错误原文先脱敏（网络错误可能带 URL/路径；不含 token），再作为 warning：
+            // 不吞失败——否则用户会在 B 侧才看到 NO_VALID_BASELINE。
+            let error = anyhow::Error::new(error).context("自动发布初始基线失败");
+            (
+                false,
+                Some(format!(
+                    "初始基线未自动发布（{}）；实例已创建、恢复码仍有效：{}",
+                    sanitize_error(&error, &[]),
+                    if slot_missing {
+                        "面板无法补传初始 recovery 槽；请保留恢复码，用 CLI \
+                         `--dev-sync-publish` 补传一次后再邀请其他设备"
+                    } else {
+                        "进入主界面后先打开/新建一篇笔记，在同步面板点「重试发布基线」，\
+                         成功前邀请链接无法生成"
+                    }
+                )),
+            )
+        }
+    };
+    let warning = match (created.warning, baseline_warning) {
+        (Some(existing), Some(baseline)) => Some(format!("{existing}；{baseline}")),
+        (existing, baseline) => existing.or(baseline),
+    };
     let peer_id = created.identity.loro_peer_id();
     let key_epoch = created.identity.current_epoch;
     Ok(CreateOutcome {
@@ -580,34 +478,14 @@ fn run_create(
         lock,
         vault_path: vault_path.to_path_buf(),
         relay_mode,
-        api_version: created.api_version,
+        api_version: RelayApiVersion::V2,
         relay_url: canonical_relay,
         vault_id: menghunote_sync::ids::hex_of(&created.vault_id),
         device_id: menghunote_sync::ids::hex_of(&created.identity.device_id),
         peer_id,
         key_epoch,
         recovery_code: Zeroizing::new(created.recovery_code),
-        warning: created.warning,
+        baseline_published,
+        warning,
     })
-}
-
-/// 两条编排的共同产物（避免在末尾对两套类型重复取值）。
-struct CreatedData {
-    vault: Vault,
-    identity: LocalIdentityV1,
-    vault_id: [u8; 16],
-    recovery_code: String,
-    warning: Option<String>,
-    api_version: RelayApiVersion,
-}
-
-/// 清掉本次 Create 新建的库文件（含边车）与身份文件；**不删实例目录**。
-fn cleanup_created_files(vault_path: &std::path::Path) {
-    let _ = std::fs::remove_file(vault_path);
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = vault_path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
-    }
-    let _ = std::fs::remove_file(crate::dev_sync::DevIdentityStore::path_for(vault_path));
 }

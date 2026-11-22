@@ -158,6 +158,7 @@ impl SyncRunner for FakeDeviceRunner {
                     members: self.members.clone(),
                     self_device: self.self_device,
                     can_manage: self.can_manage,
+                    published_baseline: None,
                 });
                 Ok(OpOutcome::new(format!(
                     "设备列表已刷新（{} 台）",
@@ -182,6 +183,7 @@ impl SyncRunner for FakeDeviceRunner {
                     members: self.after_revoke.clone(),
                     self_device: self.self_device,
                     can_manage: self.can_manage,
+                    published_baseline: None,
                 });
                 Ok(OpOutcome::new(summary))
             }
@@ -278,6 +280,7 @@ fn service_surfaces_devices_listed_and_device_revoked_events() {
             members,
             self_device,
             can_manage,
+            ..
         } => {
             assert_eq!(members, &before, "第一条列表事件必须是移除前的快照");
             assert_eq!(*self_device, a);

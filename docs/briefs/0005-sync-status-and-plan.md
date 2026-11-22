@@ -1,5 +1,8 @@
 # 0005 同步/加密 v1 设计与开发计划（供 GPT 评审）
 
+> 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
+
+
 > **历史留档**：本文写于 2026-11-12 历史整理前；文中哈希（如 `0b30b2e`、`2c93f6e`）只在
 > `backup/dev-20261113` 可达，见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
 

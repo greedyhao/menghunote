@@ -36,15 +36,16 @@ use std::time::Duration;
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use menghunote_app::dev_sync::DevIdentityStore;
 use menghunote_app::onboarding::{
-    AppRoot, AppRootOptions, DevSyncProfile, InstanceEntry, InstanceLock, ProfileLayout,
-    ProfileStore, RelayApiVersion, RelayMode, RootStateLabel, DEFAULT_OPERATION_BUDGET,
-    LOCK_FILE_NAME,
+    AppRoot, AppRootOptions, DevSyncProfile, FormCreateMode, InstanceEntry, InstanceLock,
+    ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, RootStateLabel,
+    DEFAULT_OPERATION_BUDGET, LOCK_FILE_NAME,
 };
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
     append_updates_with_sync_intents, list_tree, load_body_doc, local_sync_intent, StructureWriter,
     SyncContext, UpdateRecord, Vault,
 };
+use menghunote_sync::create_link::{CreateLink, CreateTicket};
 use menghunote_sync::dev_local::DevLocal;
 use menghunote_sync::http_transport::DEFAULT_TRANSPORT_TIMEOUTS;
 use menghunote_sync::identity::LocalIdentityV1;
@@ -66,6 +67,51 @@ fn ensure_test_user_key() {
         menghunote_sync::identity_wrap::initialize_user_key()
             .expect("初始化测试用户主键失败（ADR 0008）");
     });
+}
+
+/// 为全新 vault 预留票据并编码成创建链接（测试只走 App 的链接入口）。
+fn create_link_for(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64) -> String {
+    let raw = relay
+        .issue_create_ticket(vault_id, Duration::from_secs(ttl_secs))
+        .expect("发行创建票据失败");
+    let ticket = CreateTicket::from_slice(&raw).expect("票据必须是 32B");
+    CreateLink::encode(
+        RelayMode::LocalDev,
+        relay.base_url(),
+        vault_id,
+        ticket,
+        None,
+    )
+    .expect("编码创建链接失败")
+    .url
+}
+
+/// 同上，但用 HTTPS（remote_tls）链接。
+fn create_remote_link_for(relay: &DevRelay, vault_id: [u8; 16], ttl_secs: u64) -> String {
+    let raw = relay
+        .issue_create_ticket(vault_id, Duration::from_secs(ttl_secs))
+        .expect("发行创建票据失败");
+    let ticket = CreateTicket::from_slice(&raw).expect("票据必须是 32B");
+    CreateLink::encode(
+        RelayMode::RemoteTls,
+        relay.base_url(),
+        vault_id,
+        ticket,
+        None,
+    )
+    .expect("编码 HTTPS 创建链接失败")
+    .url
+}
+
+/// 真实表单动作：进入 Create、粘贴链接、应用。
+fn apply_create_link(root: &Entity<AppRoot>, cx: &mut VisualTestContext, link: &str) {
+    let link = link.to_owned();
+    root.update(cx, |root, cx| {
+        root.enter_create_link_form(cx);
+        root.form_set_create_link(&link, cx);
+        root.form_apply_create_link(cx);
+    });
+    cx.run_until_parked();
 }
 
 /// 在 `CARGO_TARGET_TMPDIR`（`target/tmp`）下开一个独立临时目录 + 显式公开目录布局。
@@ -145,12 +191,13 @@ async fn onboarding_welcome_is_shown_without_any_config(cx: &mut TestAppContext)
     );
 }
 
-/// 回归：Create 表单可以用 Tab 从 relay 切到 setup secret，也可以鼠标点击聚焦。
+/// 回归：Create 表单可以用 Tab 从创建链接切到实例目录，也可以鼠标点击聚焦。
 ///
 /// 之前 `FormInput` 只有 `track_focus`、没有 `tab_stop(true)`，并且向导字段
-/// `click_to_focus=false`：键盘 Tab 与鼠标点击都进不了 setup secret，用户无法创建。
+/// `click_to_focus=false`：键盘 Tab 与鼠标点击都进不了输入框，用户无法创建。
+/// ADR 0018 S4b 后 Create 只剩创建链接 + 实例目录两个输入框。
 #[gpui::test]
-async fn create_form_tab_and_click_can_focus_setup_secret(cx: &mut TestAppContext) {
+async fn create_form_tab_and_click_can_focus_link_and_dir(cx: &mut TestAppContext) {
     let (_dir, layout) = temp_layout("create-focus");
     let options = AppRootOptions::for_test(
         layout.clone(),
@@ -163,54 +210,72 @@ async fn create_form_tab_and_click_can_focus_setup_secret(cx: &mut TestAppContex
     cx.simulate_click(create.center(), Modifiers::default());
     cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::CreateForm);
-    let initial_relay = root
-        .update(cx, |root, cx| root.form_relay_text(cx))
-        .expect("表单必须有 relay");
+    assert_eq!(
+        root.update(cx, |root, _| root.form_create_mode()),
+        Some(FormCreateMode::Link),
+        "ADR 0018 S4b：Create 只有粘贴创建链接一种方式"
+    );
+    let initial_dir = root
+        .update(cx, |root, cx| root.form_dir_text(cx))
+        .expect("表单必须有实例目录");
 
-    // 进入表单时宿主聚焦 relay；Tab 必须切到 setup secret。
+    // 进入表单时宿主聚焦创建链接；输入进链接（目录不变）。
+    cx.simulate_input("mn-pair://create-draft");
+    cx.run_until_parked();
+    assert_eq!(
+        root.update(cx, |root, cx| root.form_create_link_is_empty(cx)),
+        Some(false),
+        "初始焦点必须在创建链接输入框"
+    );
+    assert_eq!(
+        root.update(cx, |root, cx| root.form_dir_text(cx)),
+        Some(initial_dir.clone()),
+        "输入链接时不得写进实例目录"
+    );
+
+    // Tab 必须切到实例目录；输入进目录。
     cx.simulate_keystrokes("tab");
     cx.run_until_parked();
-    cx.simulate_input("tabbed-secret");
+    cx.simulate_input("-tab");
     cx.run_until_parked();
-    let (relay_after_tab, secret_after_tab) = root.update(cx, |root, cx| {
-        (root.form_relay_text(cx), root.form_secret_text(cx))
-    });
-    assert_eq!(
-        secret_after_tab.as_deref(),
-        Some("tabbed-secret"),
-        "Tab 后输入必须进入 setup secret"
-    );
-    assert_eq!(
-        relay_after_tab.as_deref(),
-        Some(initial_relay.as_str()),
-        "Tab 后 relay 不能被继续输入"
+    let dir_after_tab = root
+        .update(cx, |root, cx| root.form_dir_text(cx))
+        .expect("表单必须有实例目录");
+    assert!(
+        dir_after_tab.ends_with("-tab"),
+        "Tab 后输入必须进入实例目录：{dir_after_tab}"
     );
 
-    // 鼠标点击 relay → 输入进 relay；再点 setup secret → 输入进 secret。
-    let relay_bounds = expect_bounds(cx, "app-root-relay-input");
-    cx.simulate_click(relay_bounds.center(), Modifiers::default());
+    // 鼠标点击链接 → 输入进链接；再点实例目录 → 输入进目录。
+    let link_bounds = expect_bounds(cx, "app-root-create-link-input");
+    cx.simulate_click(link_bounds.center(), Modifiers::default());
     cx.run_until_parked();
-    cx.simulate_input("-relay-click");
+    cx.simulate_input("-link-click");
     cx.run_until_parked();
-    let relay_after_click = root
-        .update(cx, |root, cx| root.form_relay_text(cx))
-        .expect("表单必须有 relay");
-    assert!(
-        relay_after_click.contains("-relay-click"),
-        "点击 relay 后输入必须进入 relay：{relay_after_click}"
+    assert_eq!(
+        root.update(cx, |root, cx| root.form_create_link_is_empty(cx)),
+        Some(false),
+        "点击链接后输入必须进入链接（且仍有内容）"
+    );
+    let dir_after_click_link = root
+        .update(cx, |root, cx| root.form_dir_text(cx))
+        .expect("表单必须有实例目录");
+    assert_eq!(
+        dir_after_click_link, dir_after_tab,
+        "点击链接后输入不得写进实例目录"
     );
 
-    let secret_bounds = expect_bounds(cx, "app-root-secret-input");
-    cx.simulate_click(secret_bounds.center(), Modifiers::default());
+    let dir_bounds = expect_bounds(cx, "app-root-dir-input");
+    cx.simulate_click(dir_bounds.center(), Modifiers::default());
     cx.run_until_parked();
-    cx.simulate_input("-secret-click");
+    cx.simulate_input("-dir-click");
     cx.run_until_parked();
-    let secret_after_click = root
-        .update(cx, |root, cx| root.form_secret_text(cx))
-        .expect("表单必须有 secret");
+    let dir_after_click_dir = root
+        .update(cx, |root, cx| root.form_dir_text(cx))
+        .expect("表单必须有实例目录");
     assert!(
-        secret_after_click.contains("-secret-click"),
-        "点击 setup secret 后输入必须进入 secret：{secret_after_click}"
+        dir_after_click_dir.ends_with("-dir-click"),
+        "点击实例目录后输入必须进入目录：{dir_after_click_dir}"
     );
 }
 
@@ -246,9 +311,15 @@ async fn create_flow_backs_up_code_then_opens_empty_main_and_restarts(cx: &mut T
         create_form.size.height.as_f32() > 0.0,
         "表单必须有实际布局：{create_form:?}"
     );
+    // ADR 0018 S4b：Create 只有创建链接 + 实例目录。
+    assert_eq!(
+        root.update(cx, |root, _| root.form_create_mode()),
+        Some(FormCreateMode::Link),
+        "默认（也是唯一）创建方式必须是粘贴创建链接"
+    );
     for selector in [
-        "app-root-relay-input",
-        "app-root-secret-input",
+        "app-root-create-link-input",
+        "app-root-create-link-apply",
         "app-root-dir-input",
         "app-root-consent",
         "app-root-submit",
@@ -256,6 +327,33 @@ async fn create_flow_backs_up_code_then_opens_empty_main_and_restarts(cx: &mut T
     ] {
         expect_bounds(cx, selector);
     }
+    for selector in [
+        "app-root-relay-input",
+        "app-root-secret-input",
+        "app-root-admin-secret",
+        "app-root-admin-notice",
+        "app-root-create-mode-admin",
+        "app-root-create-mode-legacy",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "ADR 0018 S4b：Create 不得再显示 {selector}"
+        );
+    }
+
+    // ---- 应用一张真实创建链接（v2 一次性票据）；公开事实必须展示 ----
+    let vault_id = [0x5Bu8; 16];
+    let link = create_link_for(&relay, vault_id, 900);
+    apply_create_link(&root, cx, &link);
+    expect_bounds(cx, "app-root-create-link-warning");
+    expect_bounds(cx, "app-root-create-link-facts");
+    assert_eq!(
+        root.update(cx, |root, _| root
+            .form_create_link_vault_id()
+            .map(str::to_owned)),
+        Some(menghunote_sync::ids::hex_of(&vault_id)),
+        "应用链接后必须记录绑定的 vault id"
+    );
 
     // ---- 未勾选同意：提交被拒（留在表单 + 明确原因），不触发任何网络 ----
     let instance_dir = layout
@@ -264,8 +362,6 @@ async fn create_flow_backs_up_code_then_opens_empty_main_and_restarts(cx: &mut T
         .display()
         .to_string();
     root.update(cx, |root, cx| {
-        root.form_set_relay(relay.base_url(), cx);
-        root.form_set_secret(relay.setup_secret(), cx);
         root.form_set_dir(&instance_dir, cx);
         root.submit_create(cx);
     });
@@ -283,6 +379,7 @@ async fn create_flow_backs_up_code_then_opens_empty_main_and_restarts(cx: &mut T
     });
     cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::Working);
+
     expect_bounds(cx, "app-root-working");
     expect_bounds(cx, "app-root-progress");
     expect_bounds(cx, "app-root-cancel");
@@ -576,10 +673,9 @@ async fn profile_save_failure_is_retried_without_recreating(cx: &mut TestAppCont
         .expect("合法实例 id")
         .display()
         .to_string();
+    let link = create_link_for(&relay, [0x5Cu8; 16], 900);
+    apply_create_link(&root, cx, &link);
     root.update(cx, |root, cx| {
-        root.enter_create_form(cx);
-        root.form_set_relay(relay.base_url(), cx);
-        root.form_set_secret(relay.setup_secret(), cx);
         root.form_set_dir(&instance_dir, cx);
         root.form_set_consent(true, cx);
         root.submit_create(cx);
@@ -2589,23 +2685,15 @@ fn open_remote_root<'a>(
     (root, cx)
 }
 
-/// 填好 remote Create 表单并提交（调用方负责等待终态）。
-fn submit_remote_create(
-    root: &Entity<AppRoot>,
-    cx: &mut VisualTestContext,
-    relay_url: &str,
-    secret: &str,
-    dir: &str,
-) {
-    let relay_url = relay_url.to_owned();
-    let secret = secret.to_owned();
+/// 用 HTTPS 创建链接填好 remote Create 表单并提交（调用方负责等待终态）。
+fn submit_remote_create(root: &Entity<AppRoot>, cx: &mut VisualTestContext, link: &str, dir: &str) {
+    let link = link.to_owned();
     let dir = dir.to_owned();
     root.update(cx, |root, cx| {
-        root.enter_create_form(cx);
-        root.form_set_mode(RelayMode::RemoteTls, cx);
+        root.enter_create_link_form(cx);
+        root.form_set_create_link(&link, cx);
+        root.form_apply_create_link(cx);
         root.form_set_remote_consent(true, cx);
-        root.form_set_relay(&relay_url, cx);
-        root.form_set_secret(&secret, cx);
         root.form_set_dir(&dir, cx);
         root.form_set_consent(true, cx);
         root.submit_create(cx);
@@ -2690,11 +2778,11 @@ async fn remote_mode_requires_consent_and_shows_dev_status_notice(cx: &mut TestA
         .expect("合法实例 id")
         .display()
         .to_string();
+    let link = create_remote_link_for(&relay, [0x71u8; 16], 900);
     root.update(cx, |root, cx| {
-        root.enter_create_form(cx);
-        root.form_set_mode(RelayMode::RemoteTls, cx);
-        root.form_set_relay(relay.base_url(), cx);
-        root.form_set_secret(relay.setup_secret(), cx);
+        root.enter_create_link_form(cx);
+        root.form_set_create_link(&link, cx);
+        root.form_apply_create_link(cx);
         root.form_set_dir(&dir, cx);
         root.form_set_consent(true, cx);
         root.submit_create(cx);
@@ -2738,7 +2826,8 @@ async fn remote_create_over_tls_writes_remote_profile_pin_and_restarts(cx: &mut 
         .expect("合法实例 id")
         .display()
         .to_string();
-    submit_remote_create(&root, cx, relay.base_url(), relay.setup_secret(), &dir);
+    let link = create_remote_link_for(&relay, [0x72u8; 16], 900);
+    submit_remote_create(&root, cx, &link, &dir);
     assert_eq!(
         state_of(&root, cx),
         RootStateLabel::Working,
@@ -2914,7 +3003,7 @@ async fn remote_join_over_tls_opens_creator_note_and_writes_remote_profile(
     assert_eq!(state_of(&restarted, cx), RootStateLabel::Main);
 }
 
-/// remote 失败路径：未信任 TLS / 错 setup secret → 不建库/不写配置；错误提示安全暂停。
+/// remote 失败路径：未信任 TLS / 无效票据 → 不建库/不写配置；错误提示安全暂停。
 #[gpui::test]
 async fn remote_create_failures_leave_no_vault_or_profile(cx: &mut TestAppContext) {
     ensure_test_user_key();
@@ -2931,7 +3020,8 @@ async fn remote_create_failures_leave_no_vault_or_profile(cx: &mut TestAppContex
         .expect("合法实例 id")
         .display()
         .to_string();
-    submit_remote_create(&root, cx, relay.base_url(), relay.setup_secret(), &dir);
+    let link = create_remote_link_for(&relay, [0x73u8; 16], 900);
+    submit_remote_create(&root, cx, &link, &dir);
     let finished = root.update(cx, |root, cx| {
         root.wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)
     });
@@ -2955,15 +3045,25 @@ async fn remote_create_failures_leave_no_vault_or_profile(cx: &mut TestAppContex
     );
     assert!(!layout.config_path.exists(), "失败不得写配置");
 
-    // (b) 注入自签根但 setup secret 错 → relay 明确拒绝；同样不建库/不写配置。
-    let instance_id = "inst-remote-bad-secret";
+    // (b) 注入自签根但票据无效 → relay 明确 403；同样不建库/不写配置。
+    let instance_id = "inst-remote-bad-ticket";
     let (root, cx) = open_remote_root(cx, &relay, &layout, instance_id);
     let dir = layout
         .instance_dir(instance_id)
         .expect("合法实例 id")
         .display()
         .to_string();
-    submit_remote_create(&root, cx, relay.base_url(), "wrong-setup-secret", &dir);
+    let bogus_ticket = CreateTicket::from_bytes([0x66u8; 32]);
+    let link = CreateLink::encode(
+        RelayMode::RemoteTls,
+        relay.base_url(),
+        [0x74u8; 16],
+        bogus_ticket,
+        None,
+    )
+    .expect("编码无效票据链接失败")
+    .url;
+    submit_remote_create(&root, cx, &link, &dir);
     let finished = root.update(cx, |root, cx| {
         root.wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)
     });
@@ -2972,7 +3072,7 @@ async fn remote_create_failures_leave_no_vault_or_profile(cx: &mut TestAppContex
     assert_eq!(state_of(&root, cx), RootStateLabel::Error);
     assert!(
         !layout.vault_path(instance_id).expect("库路径").exists(),
-        "错 setup secret 不得留下库文件"
+        "无效票据不得留下库文件"
     );
     assert!(!layout.config_path.exists(), "失败不得写配置");
 }
