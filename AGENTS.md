@@ -854,7 +854,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   - Main 左下角改为**一行**动作（`app-root-bottom-actions`）：vault 切换器占剩余宽度 +
     紧凑「设置」按钮，两按钮同一底边/行高；`app-root-settings` / `app-root-vault-switcher`
     selector 不变，窄窗口宽度夹紧。
-  测试：app 默认 **734** / `--features dev-sync` **885** / no-default **569**；fmt/clippy 干净。
+  测试：app 默认 **740** / `--features dev-sync` **891** / no-default **575**；storage **239** / sync **631**；fmt/clippy 干净。
   后续同批追加：
   - Welcome 重做 Obsidian 式仓库选择页：`welcome-vault-list` 左栏列同步实例+本地库并直接打开；
     右栏 `welcome-new-local` / `welcome-open-local` / `welcome-sync-remote`；同步远程只用一条
@@ -874,17 +874,27 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   - **回收站**：ribbon `ribbon-trash` + `trash-panel` 列表/恢复；复用
     `StructureWriter::restore_note`，回原父级、不自动打开；彻底删除因多设备语义未定**未做**。
     详见 [`docs/notes/trash.md`](docs/notes/trash.md)。
-  - **代码块语法高亮**：`pulldown-cmark` 暴露 `CodeBlockSpan`，`syntect`（纯 Rust）
+  - **代码块语法高亮/灰底/复制**：`pulldown-cmark` 暴露 `CodeBlockSpan`，`syntect`（纯 Rust）
     输出 token 颜色；只经 `glyph::shape_row_code` 改颜色，不改布局/编辑/选区；
-    10 个主题 token、块级 + display 两级缓存、超 256 KiB 降级无色。不引入 TextView/
-    tree-sitter/C 依赖；详见 [`docs/notes/code-highlight.md`](docs/notes/code-highlight.md)。
-  - **IME 组合串擦底纸**：绘制 preedit 前按实际 shaping 宽度用正文底色擦掉下方文字，
-    修复“光标后还有文字时组合串重叠”；headless 断言 `preedit_mask_width_last_frame`。
+    10 个主题 token、块级 + display 两级缓存、超 256 KiB 降级无色。代码块整块铺
+    `code_bg` 灰色圆角底；光标/选区不在块内时右上角浮出 `code-copy-<i>` 复制按钮
+    （只复制围栏内源码、不动 caret；组合/对象块不显示）。不引入 TextView/tree-sitter/C；
+    详见 [`docs/notes/code-highlight.md`](docs/notes/code-highlight.md)。
+  - **IME 组合串推移**：preedit 先插入 `composition_display()` 的临时布局文本再折行，
+    后续文字被真实推移/折行（不再叠字）；`Controller` source/选区不变，跨行替换也进入临时布局；行度量沿用原 display 行，提交后修正。
+    headless 断言布局文本、串尾 caret 与取消无残留。
   - **标题/单元格复制**：`Ctrl+C`/`Cmd+C` 复制选区、`Ctrl+X`/`Cmd+X` 剪切并删除选区
     （`text_shortcuts::copy_shortcut/cut_shortcut`）；搜索框/向导仍保持不支持剪贴板。
-  - **同步快速追赶计划**：先做 checkpoint 快速追赶（复用已有 `/bootstrap` + `baseline_apply`），
-    不按“r1…r7 只留 id”改 relay；完整方案/决策点见
-    [`docs/notes/sync-fast-catchup-plan.md`](docs/notes/sync-fast-catchup-plan.md)。
+  - **同步 Phase 1A（已落地）**：批量 inbox 单事务 + `BEGIN IMMEDIATE` + skipped 窗口
+    有界扫描；按文档聚合正文 integrate（`load_head` 预检、同 doc 多轮合并自愈物理乱序、
+    选批防饥饿、整批一次 integrated 前缀）；`baseline_apply` 单次 snapshot 解码 +
+    detached oplog 合并，5/20 MiB gate 从秒级降到 35/110 ms；remote-known VV 同事务
+    落 meta 修复已有库 tombstone。Release 实测 5000 单文档 integrate 147s→275ms、
+    20 篇 14.9s→0.76s。Phase 1B（checkpoint 快速追赶）**未实现**，N_min=25k /
+    16 MiB 机会性上限 / 3 s 持闸见
+    [`docs/notes/sync-fast-catchup-plan.md`](docs/notes/sync-fast-catchup-plan.md) §9；
+    评审材料见 [`docs/notes/sync-review-packet-20261121.md`](docs/notes/sync-review-packet-20261121.md)；
+单文件评审版见 [`docs/notes/sync-critical-modules-review.md`](docs/notes/sync-critical-modules-review.md)。
   已知限制：UI/拖拽/IME/标题/快捷键录制尚未 Windows 真机验收；TLS 已由用户验证但未做安全审计。
 
 - **UI 重构：设置分类导航 / 最左侧图标栏 / 侧栏排序（2026-11-18，Obsidian 风格）**：

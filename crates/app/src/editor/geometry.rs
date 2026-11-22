@@ -602,6 +602,37 @@ impl EditorGeometry {
         first..last.max(first + 1).min(self.frame.row_count())
     }
 
+    /// display 字节所在视觉行，**仅当该行真的在视口内**（prepaint 多取的一行 overscan
+    /// 不算）时返回。
+    ///
+    /// 代码块浮层（复制按钮）用它判断"首行是否可见"：屏外行既没有绘制也没有点击意义。
+    #[must_use]
+    pub fn visible_row_of_byte(&self, byte: usize) -> Option<usize> {
+        let row = self.frame.row_of_byte(byte);
+        self.rows_in_view(self.scroll_y, self.viewport_height)
+            .contains(&row)
+            .then_some(row)
+    }
+
+    /// display 区间 `range` 覆盖的视觉行区间（半开），**裁到真正可见的行**。
+    ///
+    /// 首行按 `range.start`、末行按 `range.end - 1`（不含右端点）定位：跨软折行的
+    /// 代码块因此拿到首/末可见行；整块滚出视口时返回 `None`（不画、不命中）。
+    #[must_use]
+    pub fn visible_rows_for_display_range(&self, range: &Range<usize>) -> Option<Range<usize>> {
+        if range.is_empty() {
+            return None;
+        }
+        let first = self.frame.row_of_byte(range.start);
+        let last = self
+            .frame
+            .row_of_byte(range.end.saturating_sub(1).max(range.start));
+        let visible = self.rows_in_view(self.scroll_y, self.viewport_height);
+        let start = first.max(visible.start);
+        let end = (last + 1).min(visible.end);
+        (start < end).then_some(start..end)
+    }
+
     /// 窗口坐标 `y` 落在哪一视觉行，夹到可见范围内。
     #[must_use]
     pub fn row_at_y(&self, y: Pixels) -> usize {

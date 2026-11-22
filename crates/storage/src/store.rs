@@ -9,7 +9,7 @@
 //! CAS 用「该语句必须影响 1 行」的事务守卫实现：一旦 head 已被别人推进，
 //! 整笔事务回滚，**不会出现「update 落库了但 head 没动」的半截状态**。
 
-use loro::Frontiers;
+use loro::{Frontiers, VersionVector};
 use rusqlite::types::Value;
 
 use crate::actor::{AffectedGuard, Statement};
@@ -113,6 +113,36 @@ pub fn load_head(vault: &Vault, doc_id: &str) -> Result<HeadState, StorageError>
         head_frontier: blob_of(&row, 1, "loro_docs.head_frontier")?,
         head_vv: blob_of(&row, 2, "loro_docs.head_vv")?,
     })
+}
+
+/// 读 `loro_docs.head_seq` 仍等于 `expected_head_seq` 时的 `head_vv`（远端已知 VV 的起点）。
+///
+/// 若 head 已被并发推进（CAS 必然失败、整笔事务回滚），返回空 VV 即可：它不会落库。
+fn load_head_vv_at(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+) -> Result<VersionVector, StorageError> {
+    let rows = vault.query(
+        "SELECT head_seq, head_vv FROM loro_docs WHERE doc_id = ?1",
+        &[Value::Text(doc_id.to_owned())],
+    )?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("loro_docs 缺少文档 {doc_id}"),
+        })?;
+    if u64_of(&row, 0, "loro_docs.head_seq")? != expected_head_seq {
+        return Ok(VersionVector::default());
+    }
+    match row.get(1) {
+        Some(Value::Null) | None => Ok(VersionVector::default()),
+        Some(Value::Blob(bytes)) => VersionVector::decode(bytes).map_err(StorageError::from),
+        Some(other) => Err(StorageError::Corrupt {
+            context: format!("loro_docs.head_vv 读回异常：{other:?}"),
+        }),
+    }
 }
 
 /// 读文档行 + 快照元信息。
@@ -362,7 +392,50 @@ pub fn append_updates(
     expected_head_seq: u64,
     records: &[UpdateRecord],
 ) -> Result<HeadState, StorageError> {
-    append_updates_inner(vault, doc_id, expected_head_seq, records, &[])
+    append_updates_inner(vault, doc_id, expected_head_seq, records, &[], &[], &[])
+}
+
+/// A 事务：追加**一条**组合 update，并把同一批 remote inbox 行标为 `integrated`。
+///
+/// Phase 1A-2 的聚合 integrate 入口：同一文档的多条 inbox 行先在内存里逐条
+/// `BodyDoc::import`，再把 `before..end` 的增量合成**一条** `UpdateRecord` 落盘；
+/// 「追加 update + 推进 head + projection_outbox + 标记 inbox 行」全部在**同一个**
+/// A 事务里（守卫要求每条 `UPDATE sync_inbox` 恰好影响 1 行，任何一行不存在/已不是
+/// `verified` 都会整笔回滚，不会出现「update 写了但 inbox 没标」的半份状态）。
+///
+/// 与 [`append_updates`] 的差别只有同事务的批量标记：
+/// - `relay_seqs` 为空时行为与 [`append_updates`] 逐字节一致（仍然只有一条记录）；
+/// - 本函数**不推进** `sync.integrated_seq`；调用方在整批正文都完成后统一调用
+///   [`crate::advance_integrated_prefix`]，避免每个 doc 组各写一次前缀；
+/// - 校验失败映射：head CAS 失败仍是 [`StorageError::HeadConflict`]；inbox 标记失败
+///   （行不存在 / 已 integrated / 已 quarantine）映射为 [`StorageError::SyncConflict`]，
+///   两种情况下 update 都没有落库；
+/// - 同事务把 `end_vv - 旧 head_vv`（= 这条远端消息实际带来的 ops）并入本机的
+///   「远端已知 VV」（`sync.remote_known_vv.<doc_id>`，non-destructive meta），
+///   供 `baseline_apply` 的 tombstone 判定区分已同步文档与 local-only 文档。
+pub fn append_updates_with_integrated_marks(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    record: &UpdateRecord,
+    log_id: &[u8; 16],
+    relay_seqs: &[u64],
+) -> Result<HeadState, StorageError> {
+    let marks: Vec<(&[u8; 16], u64)> = relay_seqs
+        .iter()
+        .map(|relay_seq| (log_id, *relay_seq))
+        .collect();
+    append_updates_inner(
+        vault,
+        doc_id,
+        expected_head_seq,
+        std::slice::from_ref(record),
+        &[],
+        &marks,
+        // engine integrate 的这条组合 update 全部来自远端消息：其 `end_vv - 旧 head_vv`
+        // 就是远端实际带来的 ops，记入「远端已知 VV」（tombstone 判定用）。
+        &[true],
+    )
 }
 
 /// A 事务内同时写出站同步意图（按位置一一对应；`None` = 该条不产生意图）。
@@ -370,15 +443,30 @@ pub fn append_updates(
 /// 与 [`append_updates_with_sync_intents`] 相比，这里允许"某些 update 没有意图"：
 /// 一次 flush 的前缀可能混本地编辑与 remote 导入，而 remote 导入**绝不能**产生
 /// 出站意图（ADR 0009）。仍然只有**一条** A 事务，失败即整笔回滚。
+///
+/// `remote_marks` 与 records 一一对应（空切片 = 全部本地）：标为 remote 的记录会在
+/// 同一事务里把 `end_vv - 上一条 end_vv` 并入「远端已知 VV」，供 tombstone 判定。
 pub(crate) fn append_updates_with_intent_slots(
     vault: &Vault,
     doc_id: &str,
     expected_head_seq: u64,
     records: &[UpdateRecord],
     slots: &[Option<crate::sync_bridge::SyncIntent>],
+    remote_marks: &[bool],
 ) -> Result<HeadState, StorageError> {
-    append_updates_inner(vault, doc_id, expected_head_seq, records, slots)
+    append_updates_inner(
+        vault,
+        doc_id,
+        expected_head_seq,
+        records,
+        slots,
+        &[],
+        remote_marks,
+    )
 }
+
+/// 同事务附加的 inbox 标记：`(log_id, relay_seq)`，每个都要求恰好命中一行 `verified`。
+type IntegratedMarks<'a> = &'a [(&'a [u8; 16], u64)];
 
 fn append_updates_inner(
     vault: &Vault,
@@ -386,11 +474,18 @@ fn append_updates_inner(
     expected_head_seq: u64,
     records: &[UpdateRecord],
     slots: &[Option<crate::sync_bridge::SyncIntent>],
+    integrated_marks: IntegratedMarks<'_>,
+    remote_marks: &[bool],
 ) -> Result<HeadState, StorageError> {
     if records.is_empty() {
         if !slots.is_empty() {
             return Err(StorageError::Corrupt {
                 context: "空 update 批次不能带 sync intent".to_owned(),
+            });
+        }
+        if !integrated_marks.is_empty() {
+            return Err(StorageError::Corrupt {
+                context: "空 update 批次不能带 inbox 标记".to_owned(),
             });
         }
         return load_head(vault, doc_id);
@@ -404,6 +499,32 @@ fn append_updates_inner(
             ),
         });
     }
+    if !remote_marks.is_empty() && remote_marks.len() != records.len() {
+        return Err(StorageError::Corrupt {
+            context: format!(
+                "append_updates: records={} remote_marks={} 必须一对一",
+                records.len(),
+                remote_marks.len()
+            ),
+        });
+    }
+
+    // 远端已知 VV 的增量：只有 remote 条目会扩大它（`after_vv - running_vv`）。
+    let remote_meta = if remote_marks.iter().any(|flag| *flag) {
+        let mut running = load_head_vv_at(vault, doc_id, expected_head_seq)?;
+        let mut known = VersionVector::new();
+        for (index, record) in records.iter().enumerate() {
+            let after = VersionVector::decode(&record.update.end_vv).map_err(StorageError::from)?;
+            if remote_marks.get(index).copied().unwrap_or(false) {
+                let added = crate::remote_known::added_since(&after, &running);
+                known = crate::remote_known::union(&known, &added);
+            }
+            running = after;
+        }
+        crate::remote_known::merge_statement(vault, doc_id, &known)?
+    } else {
+        None
+    };
 
     let last = &records
         .last()
@@ -481,14 +602,46 @@ fn append_updates_inner(
         ));
     }
 
-    match vault.exec_transaction(&statements, &[AffectedGuard::exactly(0, 1)]) {
+    // 远端已知 VV 的 meta 写入（与 update/head 同一 A 事务；失败一起回滚）。
+    let remote_guard = remote_meta.as_ref().map(|statement| {
+        let index = statements.len();
+        statements.push(statement.clone());
+        AffectedGuard::exactly(index, 1)
+    });
+
+    // 同事务标记 inbox 行：每条都要求恰好影响 1 行（不存在 / 已 integrated /
+    // 已 quarantine 都会让整笔 A 事务回滚）。标记语句放在最后，避免它们的守卫先于
+    // head CAS 暴露，保证并发冲突仍然报 HeadConflict。
+    let marks_start = statements.len();
+    for (mark_log_id, relay_seq) in integrated_marks {
+        statements.push(Statement::new(
+            "UPDATE sync_inbox SET state='integrated' \
+             WHERE log_id=?1 AND relay_seq=?2 AND state='verified'",
+            vec![
+                Value::Blob(mark_log_id.to_vec()),
+                Value::Integer(i64_of(*relay_seq)?),
+            ],
+        ));
+    }
+    let mut guards = Vec::with_capacity(2 + integrated_marks.len());
+    guards.push(AffectedGuard::exactly(0, 1));
+    guards.extend(remote_guard);
+    guards.extend(
+        integrated_marks
+            .iter()
+            .enumerate()
+            .map(|(index, _)| AffectedGuard::exactly(marks_start + index, 1)),
+    );
+
+    match vault.exec_transaction(&statements, &guards) {
         Ok(_) => Ok(HeadState {
             doc_id: doc_id.to_owned(),
             head_seq,
             head_frontier: last.end_frontier.clone(),
             head_vv: last.end_vv.clone(),
         }),
-        Err(StorageError::GuardFailed { .. }) => {
+        // 第 0 条守卫 = head CAS。
+        Err(StorageError::GuardFailed { statement: 0, .. }) => {
             let actual = load_head(vault, doc_id)
                 .map(|head| head.head_seq)
                 .unwrap_or(0);
@@ -496,6 +649,16 @@ fn append_updates_inner(
                 doc_id: doc_id.to_owned(),
                 expected: expected_head_seq,
                 actual,
+            })
+        }
+        // 标记失败：update 与所有标记一起回滚；调用方必须保持 inbox verified 原样。
+        Err(StorageError::GuardFailed { statement, .. }) if statement >= marks_start => {
+            Err(StorageError::SyncConflict {
+                context: format!(
+                    "inbox 标记 integrated 失败（第 {} 个标记行不存在或当前不是 verified）；\
+                     整笔 A 事务（update+标记）已回滚",
+                    statement - marks_start
+                ),
             })
         }
         Err(error) => Err(error),

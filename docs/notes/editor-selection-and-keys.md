@@ -31,9 +31,10 @@
 
 - 标题输入框获得焦点时，正文 **不画 caret**（修复“标题一个光标、正文又一个光标”）；提交/取消标题后焦点还给正文。
 - 正文 caret 约 **530 ms** 闪烁：复用 50 ms `pump` 推进相位（不为光标单独起 timer）；按键/点击/移动/聚焦失焦都立刻回到可见并重新计时，IME 组合期间常亮。
-- IME preedit 存在时，本帧**唯一** caret 画在**组合串末尾**（`x + shaped.width()`），起点不再重复画；preedit 文本与下划线与 caret 闪烁相互独立。
+- IME preedit 会先插入临时 **display 文本**再折行：组合串占据真实宽度，后续文字被推移/折行（Obsidian 式），不再盖在已有文字上。本帧**唯一** caret 画在组合串末尾，起点不重复画；preedit 下划线与 caret 闪烁相互独立。
+- 组合期间 `EditorElement` 用 `EditorView::composition_display()` 的临时文本布局，`Controller` 的 source/投影/选区坐标不变；空选区替换可视化删除选区文本，提交/取消后下一帧回到正常布局。跨换行替换也进入临时布局，行度量沿用原 display 行，提交后修正。
 - 标题/重命名输入框 caret 同样约 **530 ms** 闪烁（独立 timer，输入/点击/移动重置；`caret_blink_visible` 供 headless 断言）。
-- IME preedit 用空 spans shaping 时必须生成覆盖全文的 Plain run；否则 GPUI 0.10 的 `shape_line` 零字形，只剩候选窗（`headless_ime_preedit` 回归）。
+- 组合串进入临时布局后，`compose_style_runs` 会删除选区样式、插入 Plain preedit、平移后缀样式；空 spans 仍要有覆盖全文的 Plain run（GPUI 0.10 `shape_line` 零字形回归）。
 
 ## 标题编辑样式与 About
 
@@ -49,4 +50,4 @@
 - `headless_editor_shortcuts`：按词移动/选择、Ctrl+L、Ctrl+Home/End、Esc 折叠。
 - `headless_note_title`：点击定位、拖选（正/反向/越界）、粘贴。
 - `sidebar_rename::tests::double_click_word_range_handles_cjk_ascii_and_punctuation`：CJK+ASCII 同词、空白只选自身、emoji 不并词。
-- `headless_ime_preedit`：F8 preedit 必须进入绘制路径。
+- `headless_ime_preedit`：F8 preedit 进入绘制路径、插入布局文本推移后续文字、串尾 caret 位置、取消无残留。

@@ -162,36 +162,43 @@ async fn ime_preedit_enters_paint_path_after_click(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn ime_preedit_erases_text_underneath_when_caret_is_in_the_middle(cx: &mut TestAppContext) {
+async fn ime_preedit_pushes_following_text_in_layout(cx: &mut TestAppContext) {
     let dir = temp_vault_dir();
     let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
-    seed_note(&vault, "IME 重叠回归", "甲乙丙丁\n");
+    seed_note(&vault, "IME 推移回归", "甲乙丙丁\n");
     let (host, cx) = open_shell(cx, vault);
     let view = active_view(&host, cx);
 
     click_editor(cx);
-    // caret 移到“乙/丙”之间：后面还有“丙丁”，组合串如果不擦底纸就会压住它们。
+    // caret 移到“乙/丙”之间：后面还有“丙丁”，组合串必须把它们向右推移/折行，
+    // 而不是像旧 overlay 那样盖在原字上。
     cx.simulate_keystrokes("right right");
     cx.simulate_keystrokes("f8");
     cx.run_until_parked();
 
-    let (preedit, mask) = cx.update(|_window, app| {
+    let (preedit, layout) = cx.update(|_window, app| {
         let view = view.read(app);
         (
             view.preedit_text().map(str::to_owned),
-            view.preedit_mask_width_last_frame(),
+            view.composition_layout_text(),
         )
     });
     assert_eq!(preedit.as_deref(), Some("zhongwen"));
-    let expected = shaped_width("zhongwen", cx);
-    assert!(expected > px(0.0), "组合串宽度必须为正，否则 mask 断言空转");
     assert_eq!(
-        mask,
-        Some(expected),
-        "组合串必须在自身宽度上先擦掉底下的正文，否则会与后续文字重叠"
+        layout.as_deref(),
+        Some("甲乙zhongwen丙丁\n"),
+        "组合串必须插入布局文本，后续文字才会被推移（而不是叠字）"
+    );
+    let caret_x = cx.update(|_window, app| view.read(app).preedit_caret_x_last_frame());
+    let start_x = caret_start_x(&view, cx);
+    let width = shaped_width("zhongwen", cx);
+    assert!(width > px(0.0), "组合串宽度必须为正，否则 caret 断言空转");
+    let caret_x = caret_x.expect("组合串末尾必须画 caret");
+    assert!(
+        caret_x > start_x + width / 2.0,
+        "组合串末尾 caret 必须落在插入文本之后（start={start_x:?}, width={width:?}, caret={caret_x:?}）"
     );
 }
-
 #[gpui::test]
 async fn ime_preedit_survives_click_transition(cx: &mut TestAppContext) {
     let dir = temp_vault_dir();

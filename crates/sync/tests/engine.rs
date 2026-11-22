@@ -11,8 +11,10 @@ mod support;
 use support::*;
 
 use menghunote_storage::{
-    load_body_doc, load_head, outbox_parts, outbox_row, sync_cursor_state, take_inbox_ready,
-    StorageError, SyncOutboxState, Vault, META_SYNC_LOG_ID,
+    append_updates, count_inbox_ready, load_body_doc, load_head, outbox_parts, outbox_row,
+    store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, BodyDoc, StorageError,
+    SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow, APP_DOC_SCHEMA, CODEC_VERSION,
+    META_SYNC_LOG_ID, MIN_READER,
 };
 use menghunote_sync::engine::{
     EngineConfig, EngineIdentity, IntegrateConfig, SyncEngine, RELAY_CURSOR_META,
@@ -21,7 +23,7 @@ use menghunote_sync::relay::{PauseReason, RelayLogKind};
 use menghunote_sync::SyncError;
 use menghunote_sync_proto::{
     cap_plain, encode_cde, part_count_for, CdeValue, Envelope, ObjectCommit, ObjectType,
-    ProtoError, MAX_ASSET_RAW_BYTES,
+    ProtoError, UpdateV1, MAX_ASSET_RAW_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -73,6 +75,743 @@ fn publish_from(relay: &mut FakeRelay, vault: &Vault, device: &Device) -> usize 
     };
     assert_eq!(acked, encrypted);
     encrypted
+}
+
+// ============================================================ Phase 1A-2：正文聚合
+//
+// 这些用例直接在 inbox 里构造真实 `UpdateV1`（不走 relay 加密/拉取），这样能精确控制
+// 依赖关系（缺哪一段 base_vv）与 relay_seq 顺序，且无需 sleep/网络。
+
+/// Phase 1A-2 测试专用 log_id（与 FakeRelay 的默认 log_id 相同语义，独立命名便于断言）。
+const INBOX_LOG_ID: [u8; 16] = [0x3b; 16];
+
+/// 把源文档的一段真实增量包成 `UpdateV1`（inbox 明文）。
+fn inbox_update(
+    doc_id: &str,
+    index: u64,
+    base_vv: Vec<u8>,
+    end_vv: Vec<u8>,
+    end_frontier: Vec<u8>,
+    loro_update_bytes: Vec<u8>,
+) -> UpdateV1 {
+    UpdateV1 {
+        doc_id: doc_id.to_owned(),
+        generation: 1,
+        codec_version: CODEC_VERSION.to_owned(),
+        app_doc_schema: u32::try_from(APP_DOC_SCHEMA).expect("app_doc_schema 在 u32 内"),
+        min_reader: u32::try_from(MIN_READER).expect("min_reader 在 u32 内"),
+        update_id: format!("{doc_id}#inbox-{index}"),
+        batch_id: format!("inbox-batch-{index}"),
+        origin_device_id: [0x91; 16],
+        origin_seq: index,
+        base_vv,
+        end_vv,
+        end_frontier,
+        loro_update_bytes,
+    }
+}
+
+/// 从空文档开始逐条插入文本，返回 `(每条更新的 inbox 明文, 最终正文)`。
+///
+/// 第 i 条的 `base_vv` 是插入前的 VV、`end_vv` 是插入后的 VV，因此这组 update 是严格
+/// 因果连续的；调用方可以故意从 inbox 里抽掉中间某条来构造 deferred。
+fn chained_updates(doc_id: &str, edits: &[String]) -> (Vec<UpdateV1>, String) {
+    // 只构造 Loro 文档导出增量，不需要落库（BodyDoc::create 不碰 SQLite）。
+    let source = BodyDoc::create(doc_id, 0x9001).expect("创建源文档");
+    let mut base = loro::VersionVector::new();
+    let mut updates = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let position = source.scalar_len();
+        source.insert_scalars(position, edit).expect("源正文写入");
+        let pending = source.pending_update(&base).expect("源增量");
+        let end = source.vv();
+        updates.push(inbox_update(
+            doc_id,
+            index as u64 + 1,
+            base.encode(),
+            end.encode(),
+            source.frontiers().encode(),
+            pending.payload,
+        ));
+        base = end;
+    }
+    (updates, source.text())
+}
+
+/// 把 `updates` 按给定顺序写入目标 vault 的 inbox（relay_seq = 下标 + 1）。
+fn seed_inbox(vault: &Vault, updates: &[UpdateV1]) {
+    let rows: Vec<VerifiedInboxRow> = updates
+        .iter()
+        .enumerate()
+        .map(|(index, update)| VerifiedInboxRow {
+            log_id: INBOX_LOG_ID,
+            relay_seq: index as u64 + 1,
+            object_id: [u8::try_from(index % 251).expect("index 在 u8 内"); 32],
+            epoch: EPOCH,
+            verified_payload: update.encode().expect("UpdateV1 编码"),
+        })
+        .collect();
+    store_inbox_verified_batch(vault, &rows).expect("写 inbox");
+}
+
+/// inbox 里仍 verified 的 relay_seq（升序）。
+fn verified_seqs(vault: &Vault) -> Vec<u64> {
+    take_inbox_ready(vault, 4096)
+        .expect("读 inbox ready")
+        .into_iter()
+        .map(|row| row.relay_seq)
+        .collect()
+}
+
+#[test]
+fn aggregate_body_loads_one_document_once_for_a_full_page() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x7b);
+    let edits: Vec<String> = (0..256).map(|index| format!("-{index:03}-")).collect();
+    let (updates, expected_text) = chained_updates("doc-1", &edits);
+
+    seed_doc(&vault_dst, "doc-1", device.identity.peer_id);
+    seed_inbox(&vault_dst, &updates);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let config = IntegrateConfig::default();
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(config).expect("聚合集成")
+    };
+    let report = outcome.report;
+    assert_eq!(
+        report.doc_loads, 1,
+        "同一文档 256 行（一页）必须只 load_body_doc 一次（旧路径是 256 次）"
+    );
+    assert_eq!(report.integrated, 256);
+    assert_eq!(report.body_integrated, 256);
+    assert_eq!(report.structure_integrated, 0);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(report.batches, 1, "256 行同一文档一批完成");
+    assert_eq!(outcome.changed_heads, vec!["doc-1".to_owned()]);
+
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放目标正文");
+    assert_eq!(body.text(), expected_text, "聚合后的正文必须与源一致");
+    assert_eq!(head.head_seq, 1, "256 条 remote 组合成一个本地 update");
+    let cursor = sync_cursor_state(&vault_dst).expect("游标");
+    assert_eq!(cursor.received_seq, 256);
+    assert_eq!(cursor.integrated_seq, 256, "整批结束后统一推进一次前缀");
+    assert_eq!(count_inbox_ready(&vault_dst).expect("剩余"), 0);
+    assert!(verified_seqs(&vault_dst).is_empty());
+
+    // 幂等重跑：没有新 import、head 不动、正文不变、doc_loads 不再增长。
+    let again = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(config)
+            .expect("第二次集成")
+    };
+    assert_eq!(again.report.integrated, 0);
+    assert_eq!(again.report.deferred, 0);
+    assert_eq!(again.report.batches, 0);
+    assert_eq!(again.report.doc_loads, 0);
+    let (body_again, head_again) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(head_again.head_seq, 1, "重跑不得新增本地 seq");
+    assert_eq!(body_again.text(), expected_text);
+}
+
+#[test]
+fn aggregate_body_stops_at_missing_base_and_resumes_after_dependency_arrives() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x7c);
+    let edits: Vec<String> = (0..4).map(|index| format!("-{index}-")).collect();
+    let (updates, expected_text) = chained_updates("doc-1", &edits);
+    // inbox：u1、u3、u4（故意缺 u2）。u3 的 base 需要 u2，故只能先集成 u1。
+    let inbox = vec![updates[0].clone(), updates[2].clone(), updates[3].clone()];
+
+    seed_doc(&vault_dst, "doc-1", device.identity.peer_id);
+    seed_inbox(&vault_dst, &inbox);
+    let mut relay = FakeRelay::new(&[&device]);
+    let config = IntegrateConfig::default();
+    let first = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(config)
+            .expect("第一次集成")
+    };
+    assert_eq!(first.report.integrated, 1, "只集成因果前缀 u1");
+    assert_eq!(first.report.body_integrated, 1);
+    assert_eq!(first.report.deferred, 2);
+    assert_eq!(
+        verified_seqs(&vault_dst),
+        vec![2, 3],
+        "u3/u4 必须保持 durable verified（deferred 截断该 doc）"
+    );
+    assert_eq!(
+        sync_cursor_state(&vault_dst).expect("游标").integrated_seq,
+        1,
+        "integrated 前缀不得跳过 deferred"
+    );
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(head.head_seq, 1);
+    assert_eq!(body.text(), edits[0], "第一轮只应应用 u1");
+
+    // "补齐依赖"：把缺失的 u2 直接 import 到本地文档（模拟 checkpoint/其它路径先补齐了
+    // 这段历史），下一个 integrate 轮次必须从 deferred 处继续，不跳因果、不重复。
+    {
+        let (doc, head) =
+            load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+        let before = doc.vv();
+        doc.import(&updates[1].loro_update_bytes).expect("补齐 u2");
+        let combined = doc.pending_update(&before).expect("u2 增量");
+        append_updates(
+            &vault_dst,
+            "doc-1",
+            head.head_seq,
+            &[UpdateRecord::new("manual-missing-base", combined)],
+        )
+        .expect("落盘补齐的 u2");
+    }
+    let second = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(config)
+            .expect("第二次集成")
+    };
+    assert_eq!(second.report.integrated, 2, "依赖补齐后继续集成 u3/u4");
+    assert_eq!(second.report.deferred, 0);
+    assert_eq!(second.report.doc_loads, 1, "同一文档仍只全量重放一次");
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(body.text(), expected_text, "无跳因果、无重复");
+    assert_eq!(
+        head.head_seq, 3,
+        "u1 / 补齐的 u2 / 组合 u3+u4 各一个本地 seq"
+    );
+    assert_eq!(
+        sync_cursor_state(&vault_dst).expect("游标").integrated_seq,
+        3
+    );
+    assert_eq!(count_inbox_ready(&vault_dst).expect("剩余"), 0);
+}
+
+#[test]
+fn aggregate_body_marks_covered_rows_and_imports_new_ones_in_one_transaction() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x7d);
+    let edits: Vec<String> = (0..2).map(|index| format!("-{index}-")).collect();
+    let (updates, expected_text) = chained_updates("doc-1", &edits);
+
+    // 目标库先应用 u1（模拟"自己产生的 update 从 relay 回环"或本地已有同 ops）。
+    let target = seed_doc(&vault_dst, "doc-1", device.identity.peer_id);
+    {
+        let before = target.vv();
+        target
+            .import(&updates[0].loro_update_bytes)
+            .expect("本地应用 u1");
+        let combined = target.pending_update(&before).expect("u1 增量");
+        append_updates(
+            &vault_dst,
+            "doc-1",
+            0,
+            &[UpdateRecord::new("local-u1", combined)],
+        )
+        .expect("本地落盘 u1");
+    }
+    let head_before = load_head(&vault_dst, "doc-1").expect("head").head_seq;
+    assert_eq!(head_before, 1);
+    // inbox：seq1 = u1（end_vv 已覆盖，只标记）、seq2 = u2（需要 import）。
+    seed_inbox(&vault_dst, &updates);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(IntegrateConfig::default())
+            .expect("混合集成")
+    };
+    assert_eq!(outcome.report.doc_loads, 1);
+    assert_eq!(outcome.report.integrated, 2, "已覆盖行也要标记");
+    assert_eq!(outcome.report.body_integrated, 2);
+    assert_eq!(outcome.report.deferred, 0);
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(body.text(), expected_text, "不得重复应用 u1");
+    assert_eq!(
+        head.head_seq, 2,
+        "已覆盖行只标记、新行 import：本地 seq 只前进一次"
+    );
+    assert_eq!(
+        sync_cursor_state(&vault_dst).expect("游标").integrated_seq,
+        2
+    );
+    assert_eq!(count_inbox_ready(&vault_dst).expect("剩余"), 0);
+}
+
+#[test]
+fn aggregate_body_disabled_keeps_per_row_doc_loads() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x7e);
+    let edits: Vec<String> = (0..30).map(|index| format!("-{index}-")).collect();
+    let (updates, expected_text) = chained_updates("doc-1", &edits);
+    seed_doc(&vault_dst, "doc-1", device.identity.peer_id);
+    seed_inbox(&vault_dst, &updates);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let legacy = IntegrateConfig {
+        aggregate_body: false,
+        ..IntegrateConfig::default()
+    };
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(legacy).expect("逐行集成")
+    };
+    assert_eq!(outcome.report.integrated, 30);
+    assert_eq!(
+        outcome.report.doc_loads, 30,
+        "旧路径每条 update 都全量重放一次（基准对照）"
+    );
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(body.text(), expected_text);
+    assert_eq!(head.head_seq, 30, "旧路径一条 update 一个本地 seq");
+}
+
+/// 多文档公平轮转：每批只放 5 篇文档（`batch_objects` 的聚合语义），4 批覆盖 20 篇；
+/// 每篇文档仍然只全量重放一次，且没有文档被饿死。
+#[test]
+fn aggregate_body_rotates_across_documents_without_starving() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x81);
+    let docs: Vec<(String, Vec<UpdateV1>, String)> = (0..20)
+        .map(|index| {
+            let doc_id = format!("doc-{index:02}");
+            let edits = vec![format!("-{index}-a"), format!("-{index}-b")];
+            let (updates, text) = chained_updates(&doc_id, &edits);
+            (doc_id, updates, text)
+        })
+        .collect();
+    for (doc_id, _, _) in &docs {
+        seed_doc(&vault_dst, doc_id, device.identity.peer_id);
+    }
+    // relay 日志按"轮次 × 文档"交错（不是按文档连续），确保聚合必须自己按 doc 分组。
+    let mut inbox = Vec::new();
+    for round in 0..2 {
+        for (_, updates, _) in &docs {
+            inbox.push(updates[round].clone());
+        }
+    }
+    seed_inbox(&vault_dst, &inbox);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let config = IntegrateConfig {
+        batch_objects: 5,
+        max_batches: 8,
+        ..IntegrateConfig::default()
+    };
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(config)
+            .expect("多文档聚合集成")
+    };
+    assert_eq!(outcome.report.integrated, 40);
+    assert_eq!(outcome.report.body_integrated, 40);
+    assert_eq!(outcome.report.deferred, 0);
+    assert_eq!(outcome.report.doc_loads, 20, "20 篇文档各自只全量重放一次");
+    assert_eq!(outcome.report.batches, 4, "5 篇文档/批 × 4 批");
+    assert_eq!(outcome.changed_heads.len(), 20, "每篇 head 只记一次");
+    for (doc_id, _, expected_text) in &docs {
+        let (body, head) =
+            load_body_doc(&vault_dst, doc_id, device.identity.peer_id, None).expect("重放");
+        assert_eq!(&body.text(), expected_text, "{doc_id} 正文必须一致");
+        assert_eq!(head.head_seq, 1, "{doc_id} 两个 update 合成一个本地 seq");
+    }
+}
+
+/// 把一组源 update 先在本地文档上应用，再合成**一条**本地 update 落盘。
+///
+/// 模拟"这些 ops 本地已经有了"（自己产生的 update 从 relay 回环 / checkpoint / 其它
+/// 路径先导入）：目标库的 `head_vv` 会覆盖这些 update 的 `end_vv`。
+fn apply_updates_locally(vault: &Vault, doc: &BodyDoc, updates: &[UpdateV1]) {
+    let before = doc.vv();
+    for update in updates {
+        doc.import(&update.loro_update_bytes)
+            .expect("本地应用 update");
+    }
+    let combined = doc.pending_update(&before).expect("组合增量");
+    append_updates(
+        vault,
+        doc.doc_id(),
+        0,
+        &[UpdateRecord::new("local-precovered", combined)],
+    )
+    .expect("本地落盘");
+}
+
+/// Phase 1A 预检：本地 `head_vv` 已覆盖整组 `end_vv` 时只标记，不 `load_body_doc`、
+/// 不 import、head 不前进。
+#[test]
+fn aggregate_body_precheck_marks_fully_covered_group_without_doc_load() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x82);
+    let edits: Vec<String> = (0..2).map(|index| format!("-covered-{index}-")).collect();
+    let (updates, expected_text) = chained_updates("doc-1", &edits);
+
+    // 目标库先应用这两条 update（模拟回环 / 其它路径已导入）。
+    let target = seed_doc(&vault_dst, "doc-1", device.identity.peer_id);
+    apply_updates_locally(&vault_dst, &target, &updates);
+    assert_eq!(load_head(&vault_dst, "doc-1").expect("head").head_seq, 1);
+    seed_inbox(&vault_dst, &updates);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(IntegrateConfig::default())
+            .expect("预检集成")
+    };
+    let report = outcome.report;
+    assert_eq!(report.doc_loads, 0, "全部已覆盖不得 load_body_doc");
+    assert_eq!(report.integrated, 2, "已覆盖行也必须标记 integrated");
+    assert_eq!(report.body_integrated, 2);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(report.batches, 1, "已覆盖组仍作为一个待处理批次交付");
+    assert!(
+        outcome.changed_heads.is_empty(),
+        "没有 import，head 不得前进"
+    );
+    assert_eq!(
+        load_head(&vault_dst, "doc-1").expect("head").head_seq,
+        1,
+        "只标记不写 update"
+    );
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(body.text(), expected_text, "不得重复应用已覆盖 update");
+    assert_eq!(head.head_seq, 1);
+    assert!(verified_seqs(&vault_dst).is_empty());
+    assert_eq!(
+        sync_cursor_state(&vault_dst).expect("游标").integrated_seq,
+        2
+    );
+}
+
+/// Phase 1A 预检：全部已覆盖组按 0 字节计，不占正文预算，不会把后面的就绪文档挤出
+/// 本批（旧实现会先按 covered 行的 payload 字节占满 `batch_bytes`）。
+#[test]
+fn aggregate_body_precheck_covered_group_does_not_consume_batch_bytes() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x83);
+    // covered 文档：每条 24 KiB 文本，两行合计明显超过 32 KiB 预算。
+    let covered_edits = vec!["C".repeat(24 * 1024), "D".repeat(24 * 1024)];
+    let (covered_updates, covered_text) = chained_updates("doc-covered", &covered_edits);
+    let ready_edits = vec!["-ready-a-".to_owned(), "-ready-b-".to_owned()];
+    let (ready_updates, ready_text) = chained_updates("doc-ready", &ready_edits);
+
+    let covered_doc = seed_doc(&vault_dst, "doc-covered", device.identity.peer_id);
+    apply_updates_locally(&vault_dst, &covered_doc, &covered_updates);
+    seed_doc(&vault_dst, "doc-ready", device.identity.peer_id);
+    // relay 顺序：covered 文档在前（旧实现会先吃掉全部预算），就绪文档在后。
+    let mut inbox = covered_updates.clone();
+    inbox.extend(ready_updates);
+    seed_inbox(&vault_dst, &inbox);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let config = IntegrateConfig {
+        batch_bytes: 32 * 1024,
+        ..IntegrateConfig::default()
+    };
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(config).expect("预检集成")
+    };
+    let report = outcome.report;
+    assert_eq!(report.integrated, 4, "covered + ready 两篇都必须处理");
+    assert_eq!(report.deferred, 0);
+    assert_eq!(
+        report.doc_loads, 1,
+        "covered 文档不重放；就绪文档只重放一次"
+    );
+    assert_eq!(report.batches, 1, "covered 组 0 字节，就绪文档同一批完成");
+    assert_eq!(outcome.changed_heads, vec!["doc-ready".to_owned()]);
+    let (covered_body, covered_head) =
+        load_body_doc(&vault_dst, "doc-covered", device.identity.peer_id, None)
+            .expect("重放 covered");
+    assert_eq!(covered_body.text(), covered_text);
+    assert_eq!(covered_head.head_seq, 1, "covered 文档 head 不得前进");
+    let (ready_body, ready_head) =
+        load_body_doc(&vault_dst, "doc-ready", device.identity.peer_id, None).expect("重放 ready");
+    assert_eq!(ready_body.text(), ready_text);
+    assert_eq!(ready_head.head_seq, 1, "两条 ready update 合成一个本地 seq");
+    assert!(verified_seqs(&vault_dst).is_empty());
+}
+
+/// Phase 1A 预检：纯 deferred 组不进入 selected、不消耗 `batch_bytes`；两个大 deferred
+/// 文档不得饿死排在后面的就绪文档。
+///
+/// `max_batches = 2` 是故意卡紧的：旧实现前两批会被两个大 deferred 文档按字节占满
+/// （每批都是 0 进展），排在最后的就绪文档整轮都选不到 → 饿死。
+#[test]
+fn aggregate_body_precheck_skips_large_deferred_docs_without_starving_ready_doc() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x84);
+    // 两篇 deferred：每篇 inbox 里放两条 update（都依赖永远缺失的第一条）→ base_vv 不满足。
+    // 每行约 24 KiB，单篇两行就超过 32 KiB 预算：旧实现每批只装得下「一篇的第一行」。
+    let (deferred_a, _) = chained_updates(
+        "doc-deferred-a",
+        &[
+            "A".repeat(24 * 1024),
+            "B".repeat(24 * 1024),
+            "C".repeat(24 * 1024),
+        ],
+    );
+    let (deferred_b, _) = chained_updates(
+        "doc-deferred-b",
+        &[
+            "D".repeat(24 * 1024),
+            "E".repeat(24 * 1024),
+            "F".repeat(24 * 1024),
+        ],
+    );
+    let ready_edits = vec!["-ready-0-".to_owned(), "-ready-1-".to_owned()];
+    let (ready_updates, ready_text) = chained_updates("doc-ready", &ready_edits);
+
+    for doc_id in ["doc-deferred-a", "doc-deferred-b", "doc-ready"] {
+        seed_doc(&vault_dst, doc_id, device.identity.peer_id);
+    }
+    // relay 顺序：两个大 deferred 文档各占两行排在前，就绪文档在最后。
+    seed_inbox(
+        &vault_dst,
+        &[
+            deferred_a[1].clone(),
+            deferred_a[2].clone(),
+            deferred_b[1].clone(),
+            deferred_b[2].clone(),
+            ready_updates[0].clone(),
+            ready_updates[1].clone(),
+        ],
+    );
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let config = IntegrateConfig {
+        batch_bytes: 32 * 1024,
+        max_batches: 2,
+        ..IntegrateConfig::default()
+    };
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(config).expect("预检集成")
+    };
+    let report = outcome.report;
+    assert_eq!(report.integrated, 2, "只有就绪文档被集成");
+    assert_eq!(report.body_integrated, 2);
+    assert_eq!(report.deferred, 4, "两个大 deferred 文档的 4 行如实上报");
+    assert_eq!(
+        report.doc_loads, 1,
+        "两篇纯 deferred 文档都不 load_body_doc"
+    );
+    assert_eq!(report.batches, 1, "大 deferred 不占预算，就绪文档同批完成");
+    assert_eq!(outcome.changed_heads, vec!["doc-ready".to_owned()]);
+    assert_eq!(
+        verified_seqs(&vault_dst),
+        vec![1, 2, 3, 4],
+        "deferred 行保持 durable verified"
+    );
+    let (ready_body, ready_head) =
+        load_body_doc(&vault_dst, "doc-ready", device.identity.peer_id, None).expect("重放 ready");
+    assert_eq!(ready_body.text(), ready_text);
+    assert_eq!(ready_head.head_seq, 1);
+    for doc_id in ["doc-deferred-a", "doc-deferred-b"] {
+        let (body, head) = load_body_doc(&vault_dst, doc_id, device.identity.peer_id, None)
+            .expect("重放 deferred");
+        assert_eq!(head.head_seq, 0, "{doc_id} 不得落盘");
+        assert!(body.text().is_empty(), "{doc_id} 正文不得变化");
+    }
+    assert_eq!(count_inbox_ready(&vault_dst).expect("剩余"), 4);
+}
+
+/// Phase 1A 多轮合并：物理乱序（relay 先到的行 base 依赖后到的行）自愈；整组仍只
+/// `load_body_doc` 一次、head 只前进一次。
+#[test]
+fn aggregate_body_multi_round_heals_physical_out_of_order() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x85);
+    let edits = vec!["-first-".to_owned(), "-second-".to_owned()];
+    let (updates, expected_text) = chained_updates("doc-1", &edits);
+    seed_doc(&vault_dst, "doc-1", device.identity.peer_id);
+    // relay 顺序与因果顺序相反：seq=1 是后一步（base = u1），seq=2 才是它依赖的 u1。
+    seed_inbox(&vault_dst, &[updates[1].clone(), updates[0].clone()]);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let outcome = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(IntegrateConfig::default())
+            .expect("多轮集成")
+    };
+    let report = outcome.report;
+    assert_eq!(report.integrated, 2, "乱序两行都必须集成");
+    assert_eq!(report.body_integrated, 2);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(report.doc_loads, 1, "整组只全量重放一次");
+    assert_eq!(report.batches, 1);
+    assert_eq!(
+        outcome.changed_heads,
+        vec!["doc-1".to_owned()],
+        "head 只前进一次（一条组合 update）"
+    );
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(body.text(), expected_text, "物理乱序不得丢正文");
+    assert_eq!(head.head_seq, 1, "两条 update 合成一个本地 seq");
+    assert!(
+        verified_seqs(&vault_dst).is_empty(),
+        "两行都必须标记 integrated"
+    );
+    assert_eq!(
+        sync_cursor_state(&vault_dst).expect("游标").integrated_seq,
+        2
+    );
+}
+
+/// Phase 1A 多轮合并：同组里一行真缺外部依赖、另一行可满足；可满足的集成、缺依赖的
+/// 留 deferred；补齐依赖后下一轮完成（不跳因果、不丢已成功行）。
+#[test]
+fn aggregate_body_multi_round_keeps_importable_rows_and_defers_missing_dependency() {
+    ensure_test_identity_wrap();
+    let (_dst_dir, vault_dst) = fresh_vault();
+    let device = Device::new(0x86);
+    let edits = vec!["-a-".to_owned(), "-b-".to_owned(), "-c-".to_owned()];
+    let (updates, expected_text) = chained_updates("doc-1", &edits);
+    seed_doc(&vault_dst, "doc-1", device.identity.peer_id);
+    // relay 顺序：u3（需要 u2）在前，u1（无依赖）在后；u2 暂时缺失。
+    seed_inbox(&vault_dst, &[updates[2].clone(), updates[0].clone()]);
+
+    let mut relay = FakeRelay::new(&[&device]);
+    let first = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(IntegrateConfig::default())
+            .expect("第一轮")
+    };
+    assert_eq!(first.report.integrated, 1, "只有 u1 可集成");
+    assert_eq!(first.report.body_integrated, 1);
+    assert_eq!(first.report.deferred, 1, "u3 真缺 u2");
+    assert_eq!(first.report.doc_loads, 1, "整组只重放一次");
+    assert_eq!(first.report.batches, 1);
+    assert_eq!(first.changed_heads, vec!["doc-1".to_owned()]);
+    assert_eq!(verified_seqs(&vault_dst), vec![1], "u3 那一行保持 verified");
+    assert_eq!(
+        sync_cursor_state(&vault_dst).expect("游标").integrated_seq,
+        0,
+        "deferred 的 seq=1 挡住前缀：不跳因果"
+    );
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(body.text(), edits[0], "第一轮只应用 u1");
+    assert_eq!(head.head_seq, 1);
+
+    // 补齐缺失的 u2（模拟 checkpoint / 其它路径先补到这段历史）。
+    {
+        let (doc, head) =
+            load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+        let before = doc.vv();
+        doc.import(&updates[1].loro_update_bytes).expect("补齐 u2");
+        let combined = doc.pending_update(&before).expect("u2 增量");
+        append_updates(
+            &vault_dst,
+            "doc-1",
+            head.head_seq,
+            &[UpdateRecord::new("manual-missing-dependency", combined)],
+        )
+        .expect("落盘补齐的 u2");
+    }
+    let second = {
+        let mut sync = engine(&vault_dst, &mut relay, &device);
+        sync.integrate_dependency_ordered(IntegrateConfig::default())
+            .expect("第二轮")
+    };
+    assert_eq!(second.report.integrated, 1, "依赖补齐后 u3 集成");
+    assert_eq!(second.report.deferred, 0);
+    assert_eq!(second.report.doc_loads, 1, "仍只重放一次");
+    assert_eq!(second.report.batches, 1);
+    let (body, head) =
+        load_body_doc(&vault_dst, "doc-1", device.identity.peer_id, None).expect("重放");
+    assert_eq!(body.text(), expected_text, "无跳因果、无重复");
+    assert_eq!(
+        head.head_seq, 3,
+        "第一轮的 u1 / 补齐的 u2 / 第二轮组合的 u3 各一个本地 seq"
+    );
+    assert!(verified_seqs(&vault_dst).is_empty());
+    assert_eq!(
+        sync_cursor_state(&vault_dst).expect("游标").integrated_seq,
+        2
+    );
+}
+
+#[test]
+fn pull_flushes_verified_updates_before_pausing_on_checkpoint() {
+    ensure_test_identity_wrap();
+    let (_a_dir, vault_a) = fresh_vault();
+    let (_b_dir, vault_b) = fresh_vault();
+    let device_a = Device::new(0x7f);
+    let device_b = Device::new(0x80);
+    let mut relay = FakeRelay::new(&[&device_a, &device_b]);
+
+    let doc_b = seed_doc(&vault_b, "doc-1", device_b.identity.peer_id);
+    doc_b
+        .insert_scalars(0, "flush-before-pause")
+        .expect("B 正文");
+    commit_with_intent(&vault_b, &doc_b, &uuid_like(0x7f01), [0x7f; 32], EPOCH);
+    assert_eq!(publish_from(&mut relay, &vault_b, &device_b), 1);
+    // update 之后跟一条 checkpoint：pull 必须先 flush update 再 Paused。
+    relay.publish_event(RelayLogKind::Checkpoint, [0xaa; 32]);
+
+    seed_doc(&vault_a, "doc-1", device_a.identity.peer_id);
+    seed_cursor(&vault_a);
+
+    let mut sync = engine(&vault_a, &mut relay, &device_a);
+    for attempt in 0..2 {
+        let error = sync.pull().expect_err("checkpoint 必须暂停");
+        assert!(
+            matches!(error, SyncError::Paused(PauseReason::UnsupportedEvent)),
+            "第 {attempt} 次：实际 {error:?}"
+        );
+        assert_eq!(cursor(&vault_a).as_deref(), Some("c0"), "游标不得推进");
+        assert_eq!(
+            received(&vault_a),
+            1,
+            "第 {attempt} 次：update 已验证行必须 durable 且推进 received 前缀"
+        );
+        assert_eq!(
+            verified_seqs(&vault_a),
+            vec![1],
+            "第 {attempt} 次：flush 后 inbox 行仍 verified，重试幂等"
+        );
+    }
+    drop(sync);
+
+    // 移走 checkpoint（模拟控制帧由 bootstrap 任务处理掉）后同一页可正常完成。
+    relay.log.pop();
+    relay.head_seq -= 1;
+    {
+        let mut sync = engine(&vault_a, &mut relay, &device_a);
+        let pull = sync.pull().expect("checkpoint 移除后拉取");
+        assert_eq!(pull.events, 1);
+        assert_eq!(pull.skipped, 1, "已 durable 的 update 在重试页里跳过");
+        assert_eq!(pull.stored, 0);
+        assert_eq!(cursor(&vault_a).as_deref(), Some("c1"));
+        let integrate = sync.integrate(16).expect("集成");
+        assert_eq!(integrate.integrated, 1);
+    }
+    let (body, _) =
+        load_body_doc(&vault_a, "doc-1", device_a.identity.peer_id, None).expect("重放");
+    assert!(
+        body.text().contains("flush-before-pause"),
+        "{}",
+        body.text()
+    );
 }
 
 #[test]
@@ -265,13 +1004,27 @@ fn out_of_order_dependency_is_durable_then_integrated() {
     seed_doc(&vault_a, "doc-1", device_a.identity.peer_id);
     seed_cursor(&vault_a);
     {
+        // 该用例模拟 relay 把同一文档的 update 乱序送达（依赖在更高 relay_seq）。
+        // 聚合路径按 relay_seq 升序**截断**该文档（Phase 1A-2 的因果前缀语义），
+        // 不会跳过 deferred 去集成后面的行；旧逐行路径保留给这种乱序历史兼容。
+        // `with_object_budget(16)` 保持旧 `integrate(16)` 的"本次最多 1 批"语义。
+        let legacy = IntegrateConfig {
+            aggregate_body: false,
+            ..IntegrateConfig::with_object_budget(16)
+        };
         let mut sync = engine(&vault_a, &mut relay, &device_a);
         assert_eq!(sync.pull().expect("拉取").stored, 2);
-        let first = sync.integrate(16).expect("第一次集成");
+        let first = sync
+            .integrate_dependency_ordered(legacy)
+            .expect("第一次集成")
+            .report;
         assert_eq!(first.integrated, 1, "update2 依赖未齐只能先集成 update1");
         assert_eq!(first.deferred, 1);
         assert_eq!(received(&vault_a), 2, "verified 行已 durable");
-        let second = sync.integrate(16).expect("第二次集成");
+        let second = sync
+            .integrate_dependency_ordered(legacy)
+            .expect("第二次集成")
+            .report;
         assert_eq!(second.integrated, 1);
         assert_eq!(second.deferred, 0);
     }
@@ -544,7 +1297,11 @@ fn integrate_defers_unknown_document() {
         let report = outcome.report;
         assert_eq!(report.integrated, 0);
         assert_eq!(report.deferred, 1);
-        assert_eq!(report.batches, 2, "无进展：重试一批后必须停止");
+        // Phase 1A 预检收口后，未知文档在选批阶段就被认定为 deferred（没有 head_vv 可
+        // 预检），不会再进 selected 触发"零进展重试一批"，所以 batches 从 2 变成 0。
+        // 语义未变：行仍是 durable verified（deferred=1），只是少了一次必然零进展的批。
+        assert_eq!(report.batches, 0, "纯 deferred 不再进入批次");
+        assert_eq!(report.doc_loads, 0, "预检不 load_body_doc");
         assert!(!report.projected, "没有结构更新就不投影");
         assert_eq!(received(&vault_a), 1, "durable 保存但仍 verified");
     }
@@ -1516,7 +2273,7 @@ fn pull_and_integrate_reports_phase0_metrics() {
     assert_eq!(pull.stored, 2);
     assert_eq!(pull.skipped, 1, "ASSET 走 skipped 计数不进 inbox");
     assert_eq!(pull.pages, 1);
-    assert!(!pull.inbox_batch, "默认配置必须逐条写 inbox");
+    assert!(pull.inbox_batch, "Phase 1A-2 起默认批量写 inbox");
     assert_eq!(pull.next_cursor, "c3");
     assert!(pull.update_bytes > 0, "成功验收的 update 明文负载必须 > 0");
     assert_eq!(pull.asset_bytes, ASSET_DATA.len() as u64);

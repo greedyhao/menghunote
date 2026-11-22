@@ -223,6 +223,47 @@ impl BodyDoc {
         Ok(())
     }
 
+    /// 基线 merge 专用：把增量只合进 **oplog**（detached），不触发 DocState 的
+    /// diff 计算与状态应用。
+    ///
+    /// 语义等价性：CRDT 的 oplog 合并与 state 应用是同一组 op；detached 只跳过
+    /// 「把新 op 应用到容器状态」这一步，oplog 的 VV/frontier 与 attached 完全一致。
+    /// 调用方只能使用 [`Self::pending_update_from_oplog`] / [`Self::oplog_frontiers_encoded`]
+    /// 这类纯 oplog 接口，**不得**在 detached 之后读正文。
+    ///
+    /// 为什么需要它：对「已有本地内容」的文档，Loro 的 attached import 会重算
+    /// diff 并把大文本重新应用到 state，成本随总文本长度超线性增长
+    /// （5→20 MiB 实测 ≈15–17×，见 `phase1a_release` 探针）；baseline merge 只需要
+    /// 「oplog 并集 + 导出差集」，detached 路径把这部分成本降到 O(增量)。
+    pub(crate) fn import_oplog_only(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        if !self.doc.is_detached() {
+            self.doc.detach();
+        }
+        self.doc.import(bytes)?;
+        Ok(())
+    }
+
+    /// detached 模式下合并后的 oplog frontier（attached 等价物 = [`Self::frontiers`]）。
+    pub(crate) fn oplog_frontiers_encoded(&self) -> Vec<u8> {
+        self.doc.oplog_frontiers().encode()
+    }
+
+    /// 从 oplog 导出 `from` 之后的增量；`end_frontier`/`end_vv` 取 **oplog** 版本。
+    ///
+    /// 仅用于已 [`Self::import_oplog_only`] 的文档；对 attached 文档它与
+    /// [`Self::pending_update`] 结果一致（state 在 latest 时两者相同）。
+    pub(crate) fn pending_update_from_oplog(
+        &self,
+        from: &VersionVector,
+    ) -> Result<PendingUpdate, StorageError> {
+        let payload = self.doc.export(ExportMode::updates(from))?;
+        Ok(PendingUpdate {
+            payload,
+            end_frontier: self.oplog_frontiers_encoded(),
+            end_vv: self.doc.oplog_vv().encode(),
+        })
+    }
+
     /// 校验 `[pos, pos + len)` 在当前文本内（scalar 口径），避免 Loro 抛出的越界信息丢上下文。
     ///
     /// 坐标错误直接复用 `menghunote_text::CoordError`（ADR 0003：全仓只有一份）。

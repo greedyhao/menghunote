@@ -1095,10 +1095,22 @@ mod tests {
 
     #[test]
     fn retry_discards_the_terminal_state_and_renders_again() {
+        use std::sync::mpsc;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_worker = Arc::clone(&calls);
+        // 第二次渲染卡住，保证测试观察到的“在途”是确定的；不靠 sleep / 调度运气。
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let render: Arc<RenderFn> = Arc::new(move |_source: &str, _theme: ThemeId| {
-            calls_worker.fetch_add(1, Ordering::SeqCst);
+            let call = calls_worker.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 2 {
+                let _ = second_started_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv_timeout(Duration::from_secs(10));
+            }
             Ok(TINY_SVG.to_owned())
         });
         let service = MermaidService::build(Arc::new(()), render, MERMAID_CACHE_BUDGET_BYTES);
@@ -1110,10 +1122,14 @@ mod tests {
             service.retry(key, "flowchart TD\nA-->B\n"),
             "终态必须可重渲染"
         );
+        second_started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("第二次渲染必须真的开始");
         assert!(
             !service.retry(key, "flowchart TD\nA-->B\n"),
             "在途不重复排队"
         );
+        release_tx.send(()).expect("放行第二次渲染");
         assert!(service.wait_idle(Duration::from_secs(10)));
         assert_eq!(service.request_count(), 2, "重新渲染必须再请求一次");
         assert_eq!(service.render_count(), 2, "重新渲染必须再执行一次");

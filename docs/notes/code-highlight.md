@@ -18,6 +18,13 @@
   shaping 相同，行宽、caret、命中几何不变。未命中 token 的文本用正文色。
 - 主题新增 10 个 token（关键字/字符串/注释/数字/类型/函数/变量/运算符/标点/属性），
   浅色/深色各一套；切主题自动失效重绘。
+- **整块灰底**：`EditorElement::paint_code_block_backgrounds` 在正文/选区之前，按
+  `code_block_display_ranges()` 画 `code_bg` 圆角矩形（只给 fenced/indented，行内代码
+  仍走 `TextRun.background_color`）；组合帧/对象块不画。
+- **复制按钮**：`EditorView::render_code_copy_buttons` 在光标/选区不在块内且非组合时，
+  于块首行右上角渲染 `code-copy-<i>`（26×22，copy SVG）；`code_copy_rects` 让元素层
+  把点击当浮层放行，`swallow_mouse_up` 吞掉抬起，所以不移动 caret。复制
+  `controller.code_blocks()[i].content`（围栏之间源码，不含 info/围栏；indented 整块）。
 
 ## 依赖
 

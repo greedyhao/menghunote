@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    div, img, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle,
+    div, img, point, px, size, svg, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle,
     Entity, ExternalPaths, FocusHandle, Focusable, ImageSource, KeyDownEvent, MouseButton,
     MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Window,
 };
@@ -91,6 +91,15 @@ use super::mermaid_preview::{MermaidCacheKey, MermaidPreviewState, MermaidServic
 use super::object_image::{parse_asset_hash, ImageService, ImageState, SharedAssetProvider};
 use super::shared::EditorShared;
 use super::theme;
+
+/// 代码块「复制」按钮的内嵌图标（lucide `copy`：两个叠加的圆角矩形，`currentColor`）。
+///
+/// 与 `shell::icons` 同一做法：`gpui::svg().data(include_bytes!(...))`，颜色走
+/// `text_color`（主题 token），**不**新增依赖、不需要注册资产源。
+mod icons {
+    /// lucide `copy`（24×24 viewBox）。
+    pub const COPY: &[u8] = include_bytes!("../../assets/icons/copy.svg");
+}
 
 /// 会话驱动 pump 间隔：只做内存操作，50 ms 足够跟上 250 ms 的 flush 窗口。
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
@@ -597,8 +606,23 @@ struct ImageZoom {
 pub struct CodeHighlightDisplay {
     /// 代码块的 display 整块区间（有序；围栏隐藏时就是内容区间）。
     blocks: Vec<Range<usize>>,
+    /// 与 [`Self::blocks`] **同序**的源码内容区间（围栏之间的代码；indented 为整块）。
+    ///
+    /// 只给「复制」按钮取原文用：**不含**围栏行与 info string。放在同一份快照里是
+    /// 为了不依赖 `code_block_display_ranges()` 与 `controller.code_blocks()` 的下标
+    /// 一定对齐（映射失败/空区间时 display 侧会跳过块，下标就会错位）。
+    contents: Vec<Range<usize>>,
     /// 语法 span（display 坐标，有序、不重叠；未命中的文本不在里面）。
     spans: Vec<(Range<usize>, CodeHighlightClass)>,
+}
+
+/// 一个代码块的 display 区间 + 源码内容区间（一一对应；代码块浮层用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBlockDisplaySlice {
+    /// display 整块区间（围栏隐藏时就是内容区间）。
+    pub display: Range<usize>,
+    /// 源码内容区间（*不含*围栏/info；indented 为整块）。
+    pub content: Range<usize>,
 }
 
 impl CodeHighlightDisplay {
@@ -618,6 +642,17 @@ impl CodeHighlightDisplay {
     #[must_use]
     pub fn code_block_ranges(&self) -> &[Range<usize>] {
         &self.blocks
+    }
+
+    /// 代码块的 display 区间 + 源码内容区间（同序、一一对应）。
+    #[must_use]
+    pub fn code_block_slices(&self) -> Vec<CodeBlockDisplaySlice> {
+        self.blocks
+            .iter()
+            .cloned()
+            .zip(self.contents.iter().cloned())
+            .map(|(display, content)| CodeBlockDisplaySlice { display, content })
+            .collect()
     }
 
     /// 这段 display 区间是否落在某个代码块内（空区间按起点判定）。
@@ -693,8 +728,23 @@ struct CodeBlockHighlight {
     content_hash: u64,
     /// 整块 source 区间（display 行判定用）。
     block: Range<usize>,
+    /// 源码内容区间（围栏之间；复制按钮取原文用）。
+    content: Range<usize>,
     /// source 坐标语法 span（绝对偏移，有序）。
     spans: Vec<(Range<usize>, CodeHighlightClass)>,
+}
+
+/// 组合期间的临时 display 文本：`text = display[..start] + preedit + display[start+removed..]`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositionDisplay {
+    /// preedit 插入点（**原 display** 字节）。
+    pub(crate) start: usize,
+    /// 被替换的原 display 字节数（折叠选区为 0）。
+    pub(crate) removed: usize,
+    /// preedit 的 UTF-8 字节数。
+    pub(crate) len: usize,
+    /// 交给 `LayoutFrame` 的完整文本。
+    pub(crate) text: String,
 }
 
 pub struct EditorView {
@@ -723,11 +773,6 @@ pub struct EditorView {
     pub(crate) preedit_caret_painted_last_frame: bool,
     /// 上一帧组合串末尾 caret 的窗口 x 坐标；没画（无 preedit/未聚焦/定位失败）时为 `None`。
     pub(crate) preedit_caret_x_last_frame: Option<Pixels>,
-    /// 上一帧为组合串擦除底纸的宽度；`None` = 本帧没有绘制 preedit。
-    ///
-    /// 组合串不进布局，只画在 caret 处；不擦掉下面的正文就会与后续文字重叠
-    /// （真机反馈“输入时后面还有文字会重叠”）。该字段只供 headless 回归。
-    pub(crate) preedit_mask_width_last_frame: Option<Pixels>,
     /// 正文 caret 当前是否可见（~530 ms 交替；未聚焦 / IME 组合中保持常亮）。
     ///
     /// 绘制只读它；相位由 `pump` 推进，任何输入/移动/点击/聚焦重置为 `true`。
@@ -809,6 +854,10 @@ pub struct EditorView {
     zoomed_image: Option<ImageZoom>,
     /// 代码块只读语法高亮的缓存（source/theme 变化才重跑 syntect）。
     code_highlight: CodeHighlightCache,
+    /// 本帧代码块「复制」按钮的**窗口坐标**矩形（元素层据此放行点击，不挪 caret）。
+    code_copy_rects: Vec<Bounds<Pixels>>,
+    /// 本帧画出的代码块灰底数量（元素层绘制时记录；headless 断言用，行内代码不计）。
+    pub(crate) code_block_backgrounds: usize,
     /// 已被驱动受理的**本地**编辑代数（ADR 0012 S3 自动同步的触发源）。
     ///
     /// 只在 `EditOutcome::Applied` 上自增：远端 adopt 不经过 `submit_request`，
@@ -841,7 +890,6 @@ impl EditorView {
             caret_painted_last_frame: false,
             preedit_caret_painted_last_frame: false,
             preedit_caret_x_last_frame: None,
-            preedit_mask_width_last_frame: None,
             caret_blink_visible: true,
             caret_blink_ticks: 0,
             caret_blink_focused_last_frame: false,
@@ -876,6 +924,8 @@ impl EditorView {
             swallow_mouse_up: false,
             zoomed_image: None,
             code_highlight: CodeHighlightCache::default(),
+            code_copy_rects: Vec::new(),
+            code_block_backgrounds: 0,
             #[cfg(feature = "sync-ui")]
             local_edit_seq: 0,
         };
@@ -2170,8 +2220,9 @@ impl EditorView {
             .map(|prefix| prefix.iter().filter(|byte| **byte == b'\n').count())
     }
 
-    /// 是否点在**浮层控件**上（悬浮工具条 / 表格边缘浮层 / 正文右键菜单）：
-    /// 元素层的鼠标事件在这些控件上不应改 caret，也不应挪 hover 目标。
+    /// 是否点在**浮层控件**上（悬浮工具条 / 表格边缘浮层 / 正文右键菜单 /
+    /// 代码块复制按钮）：元素层的鼠标事件在这些控件上不应改 caret，也不应挪 hover
+    /// 目标。
     pub(crate) fn point_in_toolbar(&self, position: Point<Pixels>) -> bool {
         self.toolbar_rect
             .is_some_and(|rect| rect.contains(&position))
@@ -2184,6 +2235,11 @@ impl EditorView {
             // 表格行列拖拽把手（ADR 0019 S3b5）：按下把手不得被当成正文命中。
             || self
                 .table_handle_rects
+                .iter()
+                .any(|rect| rect.contains(&position))
+            // 代码块「复制」按钮：点它只复制，不能把 caret 挪进代码块。
+            || self
+                .code_copy_rects
                 .iter()
                 .any(|rect| rect.contains(&position))
     }
@@ -4662,6 +4718,32 @@ impl EditorView {
         self.code_highlight_display().code_block_ranges().to_vec()
     }
 
+    /// 当前 display 坐标的代码块（display 区间 + 源码内容区间，同序；复制按钮用）。
+    pub fn code_block_display_slices(&mut self) -> Vec<CodeBlockDisplaySlice> {
+        self.code_highlight_display().code_block_slices()
+    }
+
+    /// 本帧画出的代码块灰底数量（headless 断言用；行内代码不计入）。
+    ///
+    /// 由 [`EditorElement::paint_code_block_backgrounds`] 在真实绘制时写入：
+    /// 组合帧 / 没有可见代码块都是 0。
+    #[must_use]
+    pub fn code_block_background_count(&self) -> usize {
+        self.code_block_backgrounds
+    }
+
+    /// 复制一个代码块（围栏之间的源码原文）到系统剪贴板。
+    ///
+    /// **不**提交编辑、**不**移动 caret/选区：按钮的按下由元素层用
+    /// `code_copy_rects` 放行、抬起由 `swallow_mouse_up` 吞掉。提示复用
+    /// `link_notice`（非阻塞、下一次点击/按键清掉）。
+    pub(crate) fn copy_code_block(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.link_notice = Some("已复制代码".to_owned());
+        self.swallow_mouse_up = true;
+        cx.notify();
+    }
+
     /// 已识别（有语法定义）的块语言列表（诊断/headless 用；与块顺序一致）。
     pub fn code_highlight_languages(&mut self) -> Vec<String> {
         self.refresh_code_highlight();
@@ -4750,6 +4832,7 @@ impl EditorView {
                 language,
                 content_hash,
                 block,
+                content: content_range,
                 spans,
             });
         }
@@ -4772,6 +4855,7 @@ impl EditorView {
             let (start, end) = (start.get(), end.get());
             if start < end {
                 display.blocks.push(start..end);
+                display.contents.push(block.content.clone());
             }
             for (range, class) in &block.spans {
                 let (Some(span_start), Some(span_end)) = (
@@ -5044,12 +5128,6 @@ impl EditorView {
         self.preedit_caret_x_last_frame
     }
 
-    /// headless 回归：上一帧 preedit 擦除底纸的宽度；没有 preedit 时为 None。
-    #[must_use]
-    pub fn preedit_mask_width_last_frame(&self) -> Option<Pixels> {
-        self.preedit_mask_width_last_frame
-    }
-
     /// headless 回归：正文 caret 当前是否处于闪烁的"可见"相位。
     ///
     /// 只在绘制中生效（隐藏时 `paint_caret` 整条不画）；未聚焦 / IME 组合中恒为 `true`。
@@ -5060,10 +5138,54 @@ impl EditorView {
 
     /// 当前 preedit（组合文本）；没有组合返回 `None`。
     ///
-    /// 它**只**用于绘制 overlay 与状态栏文案，永远不会被写进 source。
+    /// 它**只**用于绘制/布局与状态栏文案，永远不会被写进 source。
     #[must_use]
     pub fn preedit_text(&self) -> Option<&str> {
         self.controller.preedit_text()
+    }
+
+    /// 组合期间给布局/绘制的**临时 display 文本**（preedit 已插入 caret 处）。
+    ///
+    /// 这不是 `Controller` 的 display：source/投影/`Controller` 坐标完全不变，
+    /// 只是 `EditorElement` 的 `LayoutFrame` 用这份文本，后续文字才会像 Obsidian
+    /// 一样被推移/折行。preedit 提交后 source 变化，下一帧自然回到正常文本。
+    ///
+    /// 多行选区替换时 display 行数会变，行度量仍按原 display 行给；组合期间只影响
+    /// 字号/行高，提交后下一次解析修正。普通 IME 组合是折叠选区，没有这个偏差。
+    pub(crate) fn composition_display(&self) -> Option<CompositionDisplay> {
+        let preedit = self.preedit_text()?;
+        let preedit = sanitize_single_line(preedit);
+        if preedit.is_empty() {
+            return None;
+        }
+        let range = self.selection_in_display_range()?;
+        if range.start > range.end {
+            return None;
+        }
+        let display = self.controller.display_text();
+        if range.end > display.len()
+            || !display.is_char_boundary(range.start)
+            || !display.is_char_boundary(range.end)
+        {
+            return None;
+        }
+        let mut text = String::with_capacity(display.len() + preedit.len());
+        text.push_str(&display[..range.start]);
+        text.push_str(&preedit);
+        text.push_str(&display[range.end..]);
+        Some(CompositionDisplay {
+            start: range.start,
+            removed: range.end - range.start,
+            len: preedit.len(),
+            text,
+        })
+    }
+
+    /// 组合期间实际交给布局的文本（headless 回归用；没有组合为 `None`）。
+    #[must_use]
+    pub fn composition_layout_text(&self) -> Option<String> {
+        self.composition_display()
+            .map(|composition| composition.text)
     }
 
     /// 组合是否进行中（控制器有 preedit 或存储侧闸门开着）。
@@ -7761,6 +7883,123 @@ impl EditorView {
         )
     }
 
+    /// 代码块右上角的「复制」按钮浮层（`code-copy-<i>`）。
+    ///
+    /// 可见性与位置（和 `EditorElement` 的灰底共用同一套几何）：
+    ///
+    /// - 对每个**可见**代码块（[`Self::code_block_display_slices`]，display 区间与
+    ///   源码 `content` 一一对应）逐块判：首行滚出视口就不显示；
+    /// - 光标/选区落在该块 display 区间内（或 IME 组合中）→ **隐藏**：此时用户正在
+    ///   编辑源码，浮层会挡住第一行；
+    /// - 投影成 Object 的块（mermaid 预览）不显示：图形不是源码，且会与对象工具条
+    ///   抢同一个右上角；
+    /// - 位置贴块右上角：距右 `PAD_X`、`top = 行顶 + 4px`；按钮序号 `i` 是**本帧实际
+    ///   画出的按钮**顺序（0 起，被 caret 占据/滚出视口的块不占号）；
+    /// - 点击只复制（源码原文，不含围栏/info）→ 非阻塞提示 `已复制代码`，**不移动
+    ///   caret/选区**：本帧矩形记进 `code_copy_rects`，元素层据此把这次按下当浮层
+    ///   点击放行，抬起由 `swallow_mouse_up` 吞掉。
+    ///
+    /// 返回空 vec 表示没有可显示按钮的代码块。
+    fn render_code_copy_buttons(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.code_copy_rects.clear();
+        // 组合期间原 display 区间与临时布局错位：按钮一律不画（提交后恢复）。
+        if self.is_composing() {
+            return Vec::new();
+        }
+        let Some(geometry) = self.shared.geometry() else {
+            return Vec::new();
+        };
+        let slices = self.code_block_display_slices();
+        if slices.is_empty() {
+            return Vec::new();
+        }
+        let (viewport_width, _) = self.shared.viewport();
+        let left = viewport_width - theme::PAD_X - theme::CODE_COPY_BUTTON_WIDTH;
+        if viewport_width <= 0.0 || left <= 0.0 {
+            return Vec::new();
+        }
+        let caret = self.display_caret();
+        let selection = self.selection_in_display_range();
+        // 只借 `controller` 这一个字段（不克隆整篇 source）：`code_copy_rects` 是可
+        // 变借用的另一个字段，两不相干。
+        let source = self.controller.source_text();
+        let mut buttons = Vec::new();
+        for slice in slices {
+            // 块首行必须**真的**可见（只有 prepaint overscan 行不算）：滚出视口不显示。
+            let Some(row) = geometry.visible_row_of_byte(slice.display.start) else {
+                continue;
+            };
+            // 投影成 Object 的块（mermaid 预览）没有可复制的源码视图。
+            if geometry.object_row(row).is_some() {
+                continue;
+            }
+            // 光标/选区在块内：正在编辑源码，按钮让位（不改变选区/文本）。
+            if caret.is_some_and(|byte| slice.display.contains(&byte)) {
+                continue;
+            }
+            if selection.as_ref().is_some_and(|selected| {
+                selected.start < slice.display.end && selected.end > slice.display.start
+            }) {
+                continue;
+            }
+            let Some(text) = source.get(slice.content.clone()) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let text = text.to_owned();
+            let index = buttons.len();
+            // 行顶 + 4px；块首行被视口上沿裁掉时贴住上沿，不让按钮沉到别的行上。
+            let top = ((geometry.row_top(row) - geometry.origin.y).as_f32()
+                + theme::CODE_COPY_BUTTON_TOP_GAP)
+                .max(0.0);
+            self.code_copy_rects.push(Bounds::new(
+                point(geometry.origin.x + px(left), geometry.origin.y + px(top)),
+                size(
+                    px(theme::CODE_COPY_BUTTON_WIDTH),
+                    px(theme::CODE_COPY_BUTTON_HEIGHT),
+                ),
+            ));
+            let selector = format!("code-copy-{index}");
+            buttons.push(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector)
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(theme::CODE_COPY_BUTTON_WIDTH))
+                    .h(px(theme::CODE_COPY_BUTTON_HEIGHT))
+                    .rounded(px(theme::CODE_BLOCK_CORNER_RADIUS))
+                    .bg(theme::input_bg())
+                    .border(px(1.0))
+                    .border_color(theme::sidebar_border())
+                    .text_color(theme::status_bar_text())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(
+                        svg()
+                            .data(icons::COPY)
+                            .size(px(theme::CODE_COPY_ICON_SIZE))
+                            .flex_shrink_0()
+                            .text_color(theme::status_bar_text()),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _event: &MouseDownEvent, _window, cx| {
+                            view.copy_code_block(text.clone(), cx);
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        buttons
+    }
+
     fn render_object_toolbar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let line = self.toolbar_target_line()?;
         let geometry = self.shared.geometry()?;
@@ -8574,14 +8813,17 @@ impl Render for EditorView {
 
         // 每帧请求加载当前文档的图片（幂等；解码完成由 pump 触发重绘）。
         self.request_object_images();
-        // 工具条/表格边缘浮层/右键菜单每帧重建：目标对象/几何变化时自动跟随，
-        // None 时清空命中矩形。
+        // 工具条/表格边缘浮层/右键菜单/代码块复制按钮每帧重建：目标对象/几何变化时
+        // 自动跟随，None 时清空命中矩形。
         self.toolbar_rect = None;
         self.table_actions_rect = None;
         self.context_menu_rect = None;
         self.table_handle_rects.clear();
+        self.code_copy_rects.clear();
         // 单元格原地编辑输入框：浮在 cell 矩形上，绘制在正文之上、其它浮层之下。
         let cell_editor = self.render_table_cell_editor(cx);
+        // 代码块右上角「复制」按钮：压住正文，但在单元格输入框/工具条/菜单之下。
+        let code_copy_buttons = self.render_code_copy_buttons(cx);
         let toolbar = self.render_object_toolbar(cx);
         let table_actions = self.render_table_actions(cx);
         let context_menu = self.render_context_menu(cx);
@@ -8645,6 +8887,7 @@ impl Render for EditorView {
                     )
                     .child(element)
                     .when_some(properties, |this, panel| this.child(panel))
+                    .children(code_copy_buttons)
                     .when_some(axis_selection, |this, selection| this.child(selection))
                     .when_some(cell_editor, |this, editor| this.child(editor))
                     .children(drag_handles)

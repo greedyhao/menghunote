@@ -3,13 +3,22 @@
 //! 语义：
 //! - 下载/解密/摘要验证在 sync 层完成；本模块只接收已验证的 Loro snapshot 字节。
 //! - 每批 docs/tombstones 在**一个 SQLite 事务**里落库；任何失败整批回滚。
-//! - 对已有 doc 先 `import` 再以旧 head VV 导出增量，所以本地离线 ops 不会被覆盖；
-//!   update 的 `batch_id` 固定为 [`BASELINE_MERGE_BATCH`]（origin 标记）。
+//! - snapshot 每篇只解码/导入**一次**（`BodyDoc::restore`），之后的派生全部基于这个副本：
+//!   - 新文档：直接 `pending_update(&VersionVector::default())`；
+//!   - 已有且无本地额外 op：只读 `load_head` 的 VV，等价（VV 相同）则不写 update；
+//!   - 已有且有本地额外 op：只重放一次本地副本，导出**极小**的本地差集并反向合进
+//!     基线副本的 **oplog**（detached，不重算 state/diff），再导出差集。
+//!     绝不二次 `import(snapshot)`、也不用 `load_body_doc` 只为取 VV。
+//! - update 的 `batch_id` 固定为 [`BASELINE_MERGE_BATCH`]（origin 标记）。
+//! - 每篇应用的快照 VV（远端已知 ops）写入非破坏性本地 meta
+//!   `sync.remote_known_vv.<doc_id>`（见 [`crate::remote_known`]），跨 journal 保留，
+//!   供后续 tombstone 判定区分「远端已删的已同步文档」与「local-only 文档」。
 //! - `finish` 只做**单调**水位/cursor CAS 与 journal 状态迁移；失败不推进任何 cursor。
-//! - `abort` 只清 staging，不删已导入的 Loro/asset 数据。
+//! - `abort` 只清 staging，不删已导入的 Loro/asset 数据，也不回滚远端已知 VV。
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use loro::VersionVector;
 use rusqlite::types::Value;
@@ -18,6 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::actor::{AffectedGuard, Statement};
 use crate::body_doc::{BodyDoc, PendingUpdate, APP_DOC_SCHEMA, CODEC_VERSION, MIN_READER};
 use crate::error::StorageError;
+use crate::remote_known;
 use crate::store::{load_body_doc, load_head, HeadState};
 use crate::sync_bridge::{
     sync_cursor_state, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
@@ -31,6 +41,93 @@ pub const BASELINE_MERGE_BATCH: &str = "baseline_merge";
 pub const META_SYNC_RELAY_CURSOR: &str = "sync.relay_cursor";
 /// storage 内部构造 BodyDoc 时使用的 peer id（只影响新文档的本地 op id，不影响 import）。
 const BASELINE_PEER_ID: u64 = 1;
+
+/// 基线 apply 的分段计时（**仅用于基准/诊断**；按线程累计，不持久化、不参与语义）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BaselineApplyDebugTimings {
+    /// `BodyDoc::restore`（含 snapshot 解码/导入）。
+    pub restore_ns: u64,
+    /// `doc_exists` / `load_head` / 本地 VV 比较。
+    pub head_lookup_ns: u64,
+    /// `load_body_doc`（本地重放）。
+    pub load_body_doc_ns: u64,
+    /// 本地极小增量导出（`local_delta = doc.pending_update(&baseline_vv)`）。
+    pub local_delta_export_ns: u64,
+    /// 本地极小增量反向导入 `baseline_doc`。
+    pub local_delta_import_ns: u64,
+    /// 旧实现：对本地 doc 二次 `import(snapshot)` 的耗时（优化后应恒为 0）。
+    pub snapshot_reimport_ns: u64,
+    /// 新文档：`BodyDoc::create` + `import(snapshot)` 的耗时（优化后应恒为 0）。
+    pub new_doc_import_ns: u64,
+    /// 落盘用的 `pending_update` 导出。
+    pub pending_update_ns: u64,
+    /// `exec_transaction`。
+    pub transaction_ns: u64,
+    /// 整个 `apply_baseline_batch`。
+    pub batch_total_ns: u64,
+}
+
+/// 基线 apply 的计数（**仅用于基准/诊断**；按线程累计，不持久化）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BaselineApplyDebugCounters {
+    pub batches: u64,
+    pub docs: u64,
+    pub new_docs: u64,
+    pub existing_no_extra: u64,
+    pub existing_local_extra: u64,
+    pub replayed_same_digest: u64,
+    pub snapshot_imports: u64,
+    pub snapshot_bytes: u64,
+    pub load_body_doc_calls: u64,
+    pub snapshot_reimport_bytes: u64,
+    pub new_doc_import_bytes: u64,
+    pub pending_update_calls: u64,
+    pub pending_update_bytes: u64,
+    pub local_delta_bytes: u64,
+}
+
+#[derive(Default)]
+struct BaselineDebugAcc {
+    timings: BaselineApplyDebugTimings,
+    counters: BaselineApplyDebugCounters,
+}
+
+thread_local! {
+    static BASELINE_DEBUG: RefCell<BaselineDebugAcc> = RefCell::new(BaselineDebugAcc::default());
+}
+
+/// 清零当前线程的基线 apply 诊断计数（基准/测试用）。
+#[doc(hidden)]
+pub fn reset_baseline_apply_debug() {
+    BASELINE_DEBUG.with(|acc| *acc.borrow_mut() = BaselineDebugAcc::default());
+}
+
+/// 读当前线程的分段计时（基准/测试用）。
+#[doc(hidden)]
+pub fn baseline_apply_debug_timings() -> BaselineApplyDebugTimings {
+    BASELINE_DEBUG.with(|acc| acc.borrow().timings)
+}
+
+/// 读当前线程的计数（基准/测试用）。
+#[doc(hidden)]
+pub fn baseline_apply_debug_counters() -> BaselineApplyDebugCounters {
+    BASELINE_DEBUG.with(|acc| acc.borrow().counters)
+}
+
+fn debug_add_time<F>(field: F, started: Instant)
+where
+    F: FnOnce(&mut BaselineApplyDebugTimings) -> &mut u64,
+{
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    BASELINE_DEBUG.with(|acc| *field(&mut acc.borrow_mut().timings) += elapsed);
+}
+
+fn debug_add_count<F>(field: F, delta: u64)
+where
+    F: FnOnce(&mut BaselineApplyDebugCounters) -> &mut u64,
+{
+    BASELINE_DEBUG.with(|acc| *field(&mut acc.borrow_mut().counters) += delta);
+}
 
 /// staging journal 状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +212,8 @@ struct PreparedDoc {
     baseline_vv: Vec<u8>,
     expected_head: Option<HeadState>,
     update: Option<PendingUpdate>,
+    /// 合并后的远端已知 VV（写入 `sync.remote_known_vv.<doc_id>`）。
+    remote_known: Vec<u8>,
 }
 struct PreparedTombstone {
     doc_id: String,
@@ -159,6 +258,22 @@ pub fn begin_baseline_apply(
     let mut guards = Vec::new();
     if existing.is_some() {
         // completed 的 journal 可以安全替换；旧 journal 子表只属于它。
+        //
+        // 但 `baseline_apply_docs.baseline_vv` 是**跨 journal 仍然有效**的
+        // 「远端已知 VV」证据：必须在删除前落到非破坏性本地 meta 里，
+        // 否则已有设备下一次快照追赶时会把远端已删文档误判成 local-only。
+        //
+        // `DO NOTHING`：已有 meta（普通 pull/integrate 记录的更新的远端已知 VV）
+        // 永远不降级；缺失时才由旧 baseline_vv 补上。
+        statements.push(Statement::new(
+            format!(
+                "INSERT INTO meta(key,value) \
+                 SELECT '{}' || doc_id, baseline_vv FROM baseline_apply_docs WHERE applied=1 \
+                 ON CONFLICT(key) DO NOTHING",
+                remote_known::META_REMOTE_KNOWN_VV_PREFIX
+            ),
+            Vec::new(),
+        ));
         statements.push(Statement::new(
             "DELETE FROM baseline_apply_docs",
             Vec::new(),
@@ -246,64 +361,142 @@ pub fn apply_baseline_batch(
     let applied_docs = load_applied_doc_digests(vault)?;
     let mut prepared_docs = Vec::new();
     let mut baseline_by_doc: BTreeMap<String, bool> = BTreeMap::new();
+    let batch_started = Instant::now();
+    debug_add_count(|c| &mut c.batches, 1);
     for (doc_id, snapshot) in docs {
+        debug_add_count(|c| &mut c.docs, 1);
         if snapshot.is_empty() {
             return Err(StorageError::Corrupt {
                 context: format!("baseline 文档 {doc_id} 快照为空"),
             });
         }
         let digest: [u8; 32] = Sha256::digest(snapshot).into();
-        let baseline_doc = BodyDoc::restore(doc_id.clone(), BASELINE_PEER_ID, Some(snapshot), &[])?;
-        let baseline_vv = baseline_doc.vv();
-        let exists = crate::read_api::doc_exists(vault, doc_id)?;
-        let local_extra = if exists {
-            let (_, head) = load_body_doc(vault, doc_id, BASELINE_PEER_ID, None)?;
-            let local_vv = head.version_vector()?;
-            let local_extra = local_vv.sub_iter(&baseline_vv).next().is_some();
-            local_extra
-        } else {
-            false
-        };
 
+        // 幂等重放：同一快照已应用过。**不再解码/导入 snapshot**，直接用本批已记录的
+        // baseline VV 判断 tombstone 需要的 local_extra。
         if let Some(old_digest) = applied_docs.get(doc_id) {
             if old_digest != &digest {
                 return Err(StorageError::SyncConflict {
                     context: format!("baseline 文档 {doc_id} 已用另一份快照应用"),
                 });
             }
-            // 同一快照重放：幂等跳过，但仍参与 tombstone 的本地内容判断。
+            let baseline_vv = load_applied_baseline_vv(vault, doc_id)?;
+            let lookup_started = Instant::now();
+            let local_extra = local_has_extra(vault, doc_id, &baseline_vv)?;
+            debug_add_time(|t| &mut t.head_lookup_ns, lookup_started);
+            debug_add_count(|c| &mut c.replayed_same_digest, 1);
             baseline_by_doc.insert(doc_id.clone(), local_extra);
             continue;
         }
 
-        if exists {
-            let (doc, head) = load_body_doc(vault, doc_id, BASELINE_PEER_ID, None)?;
+        // snapshot 只解码/导入这一遍：后续所有派生都基于这个 `baseline_doc`。
+        let restore_started = Instant::now();
+        let baseline_doc = BodyDoc::restore(doc_id.clone(), BASELINE_PEER_ID, Some(snapshot), &[])?;
+        debug_add_time(|t| &mut t.restore_ns, restore_started);
+        debug_add_count(|c| &mut c.snapshot_imports, 1);
+        debug_add_count(|c| &mut c.snapshot_bytes, snapshot.len() as u64);
+        let baseline_vv = baseline_doc.vv();
+
+        // 仅取 VV 的地方一律用 O(1) 的 load_head，不重放整篇文档。
+        let lookup_started = Instant::now();
+        let exists = crate::read_api::doc_exists(vault, doc_id)?;
+        let (local_extra, head, local_vv) = if exists {
+            let head = load_head(vault, doc_id)?;
             let local_vv = head.version_vector()?;
-            doc.import(snapshot)?;
-            let update = doc.pending_update(&local_vv)?;
-            let update = (!update.payload.is_empty()).then_some(update);
-            prepared_docs.push(PreparedDoc {
-                doc_id: doc_id.clone(),
-                snapshot_digest: digest,
-                baseline_vv: baseline_vv.encode(),
-                expected_head: Some(head),
-                update,
-            });
-            baseline_by_doc.insert(doc_id.clone(), local_extra);
+            let local_extra = local_vv.sub_iter(&baseline_vv).next().is_some();
+            (local_extra, Some(head), Some(local_vv))
         } else {
-            let doc = BodyDoc::create(doc_id.clone(), BASELINE_PEER_ID)?;
-            doc.import(snapshot)?;
-            let update = doc.pending_update(&VersionVector::default())?;
-            let update = (!update.payload.is_empty()).then_some(update);
-            prepared_docs.push(PreparedDoc {
-                doc_id: doc_id.clone(),
-                snapshot_digest: digest,
-                baseline_vv: baseline_vv.encode(),
-                expected_head: None,
-                update,
-            });
-            baseline_by_doc.insert(doc_id.clone(), false);
+            (false, None, None)
+        };
+        debug_add_time(|t| &mut t.head_lookup_ns, lookup_started);
+
+        let mut update = None;
+        let mut expected_head = None;
+        if let (Some(head), Some(local_vv)) = (head, local_vv) {
+            if !local_extra {
+                debug_add_count(|c| &mut c.existing_no_extra, 1);
+                if baseline_vv != local_vv {
+                    let export_started = Instant::now();
+                    let pending = baseline_doc.pending_update(&local_vv)?;
+                    debug_add_time(|t| &mut t.pending_update_ns, export_started);
+                    debug_add_count(|c| &mut c.pending_update_calls, 1);
+                    debug_add_count(
+                        |c| &mut c.pending_update_bytes,
+                        pending.payload.len() as u64,
+                    );
+                    if !pending.payload.is_empty() {
+                        update = Some(pending);
+                    }
+                }
+                expected_head = Some(head);
+            } else {
+                debug_add_count(|c| &mut c.existing_local_extra, 1);
+                // 只重放一次本地副本，导出**极小**的本地增量；绝不把大 snapshot 再导入一遍。
+                let load_started = Instant::now();
+                let (local_doc, loaded_head) =
+                    load_body_doc(vault, doc_id, BASELINE_PEER_ID, None)?;
+                debug_add_time(|t| &mut t.load_body_doc_ns, load_started);
+                debug_add_count(|c| &mut c.load_body_doc_calls, 1);
+                // 以本次重放读到的 head/VV 为准：若 load_head 之后有并发写，CAS 与导出基准
+                // 都跟着最新值走，不 panic、也不写错 head。
+                let local_vv = loaded_head.version_vector()?;
+                let local_delta_started = Instant::now();
+                let local_delta = local_doc.pending_update(&baseline_vv)?;
+                debug_add_time(|t| &mut t.local_delta_export_ns, local_delta_started);
+                debug_add_count(
+                    |c| &mut c.local_delta_bytes,
+                    local_delta.payload.len() as u64,
+                );
+                let import_started = Instant::now();
+                if !local_delta.payload.is_empty() {
+                    // 把本地极小增量反向合进基线副本，得到 merged 状态。
+                    // 只合 oplog（detached）：attached import 会把大文本重新应用到 state，
+                    // 成本随总文本长度超线性增长；这里只需要 oplog 并集。
+                    baseline_doc.import_oplog_only(&local_delta.payload)?;
+                }
+                debug_add_time(|t| &mut t.local_delta_import_ns, import_started);
+                let export_started = Instant::now();
+                let pending = baseline_doc.pending_update_from_oplog(&local_vv)?;
+                debug_add_time(|t| &mut t.pending_update_ns, export_started);
+                debug_add_count(|c| &mut c.pending_update_calls, 1);
+                debug_add_count(
+                    |c| &mut c.pending_update_bytes,
+                    pending.payload.len() as u64,
+                );
+                if !pending.payload.is_empty() {
+                    update = Some(pending);
+                }
+                expected_head = Some(loaded_head);
+            }
+        } else {
+            // 新文档：直接用已 restore 的 baseline_doc 导出相对空 VV 的全量历史。
+            debug_add_count(|c| &mut c.new_docs, 1);
+            let export_started = Instant::now();
+            let pending = baseline_doc.pending_update(&VersionVector::default())?;
+            debug_add_time(|t| &mut t.pending_update_ns, export_started);
+            debug_add_count(|c| &mut c.pending_update_calls, 1);
+            debug_add_count(
+                |c| &mut c.pending_update_bytes,
+                pending.payload.len() as u64,
+            );
+            if !pending.payload.is_empty() {
+                update = Some(pending);
+            }
         }
+
+        let remote_known = match remote_known::load(vault, doc_id)? {
+            Some(existing) => remote_known::union(&existing, &baseline_vv).encode(),
+            None => baseline_vv.encode(),
+        };
+        prepared_docs.push(PreparedDoc {
+            doc_id: doc_id.clone(),
+            snapshot_digest: digest,
+            baseline_vv: baseline_vv.encode(),
+            expected_head,
+            update,
+            remote_known,
+        });
+        baseline_by_doc.insert(doc_id.clone(), local_extra);
     }
 
     let mut prepared_tombstones = Vec::new();
@@ -337,6 +530,19 @@ pub fn apply_baseline_batch(
             ],
         ));
         guards.push(AffectedGuard::exactly(journal_index, 1));
+
+        // 跨 journal 保留的「远端已知 VV」：本批快照的 VV 就是远端已见过的 ops。
+        // 与旧值取单调并集（旧值可能来自普通 pull/integrate 的更新远端已知集）。
+        let remote_index = statements.len();
+        statements.push(Statement::new(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            vec![
+                Value::Text(remote_known::meta_key(&prepared.doc_id)),
+                Value::Blob(prepared.remote_known.clone()),
+            ],
+        ));
+        guards.push(AffectedGuard::exactly(remote_index, 1));
 
         let Some(update) = &prepared.update else {
             if prepared.expected_head.is_none() {
@@ -475,6 +681,7 @@ pub fn apply_baseline_batch(
     ));
     guards.push(AffectedGuard::exactly(journal_index, 1));
 
+    let transaction_started = Instant::now();
     match vault.exec_transaction(&statements, &guards) {
         Ok(_) => {}
         Err(StorageError::GuardFailed { .. }) => {
@@ -484,6 +691,8 @@ pub fn apply_baseline_batch(
         }
         Err(error) => return Err(error),
     }
+    debug_add_time(|t| &mut t.transaction_ns, transaction_started);
+    debug_add_time(|t| &mut t.batch_total_ns, batch_started);
     baseline_apply_state(vault)?.ok_or_else(|| StorageError::Corrupt {
         context: "apply_baseline_batch 后 journal 不存在".to_owned(),
     })
@@ -757,7 +966,7 @@ fn tombstone_can_delete(
     doc_id: &str,
     baseline_in_batch: Option<bool>,
 ) -> Result<bool, StorageError> {
-    // 本地仍待同步的 outbox 行：无条件保留。
+    // 本地仍待同步的 outbox 行：无条件保留（可能是用户尚未上传的编辑）。
     let outbox_rows = vault.query(
         "SELECT count(*) FROM sync_outbox WHERE doc_id=?1",
         &[Value::Text(doc_id.to_owned())],
@@ -784,38 +993,70 @@ fn tombstone_can_delete(
         Some(true) => return Ok(false),
         None => {}
     }
-    // 没有本批快照时，用该 doc 上次基线应用的 VV 判断 local-only ops。
+
+    // 没有本批快照：用**跨 journal 保留**的「远端已知 VV」判断本地有没有远端未知的 op。
+    //
+    // - 普通 pull/integrate 集成过、`head_seq>0`、`sync_outbox` 为空 → 本地 ops 全被
+    //   远端已知 VV 覆盖 → `deleted`；
+    // - local-only 文档（从未远程同步、无任何证据）→ 没有记录 → 保守保留；
+    // - 有本地未上传/未被远端确认的 op → `local_vv` 超出已知集 → 保留。
+    let head = load_head(vault, doc_id)?;
+    let local_vv = head.version_vector()?;
+    if let Some(known) = remote_known::load(vault, doc_id)? {
+        let known_all = local_vv.sub_iter(&known).next().is_none();
+        return Ok(known_all);
+    }
+
+    // 兜底：当前 journal 里已经应用过该 doc（例如 meta 写入之前的历史数据）。
+    // 只读取 VV，不再重放整篇文档。
+    if let Some(baseline) = load_applied_baseline_vv_opt(vault, doc_id)? {
+        let known = local_vv.sub_iter(&baseline).next().is_none();
+        return Ok(known);
+    }
+
+    // 完全没有证据：local-only 内容必须保留；只有从未有过 op 的空文档才可删除。
+    Ok(head.head_seq == 0)
+}
+
+/// 读当前 journal 中某篇已应用文档的 baseline VV（幂等重放分支用；缺失视为损坏）。
+fn load_applied_baseline_vv(vault: &Vault, doc_id: &str) -> Result<VersionVector, StorageError> {
+    load_applied_baseline_vv_opt(vault, doc_id)?.ok_or_else(|| StorageError::Corrupt {
+        context: format!("baseline_apply_docs 缺少已应用文档 {doc_id} 的 baseline_vv"),
+    })
+}
+
+/// 读当前 journal 中某篇已应用文档的 baseline VV；没有该行返回 `None`。
+fn load_applied_baseline_vv_opt(
+    vault: &Vault,
+    doc_id: &str,
+) -> Result<Option<VersionVector>, StorageError> {
     let rows = vault.query(
         "SELECT baseline_vv FROM baseline_apply_docs WHERE doc_id=?1 AND applied=1",
         &[Value::Text(doc_id.to_owned())],
     )?;
-    if let Some(Value::Blob(baseline_vv)) = rows.first().and_then(|row| row.first()) {
-        let baseline = VersionVector::decode(baseline_vv).map_err(StorageError::from)?;
-        let (_, head) = load_body_doc(vault, doc_id, BASELINE_PEER_ID, None)?;
-        let local = head.version_vector()?;
-        return Ok(local.sub_iter(&baseline).next().is_none());
+    match rows.first().and_then(|row| row.first()) {
+        Some(Value::Blob(baseline_vv)) => VersionVector::decode(baseline_vv)
+            .map(Some)
+            .map_err(StorageError::from),
+        Some(other) => Err(StorageError::Corrupt {
+            context: format!("baseline_apply_docs.baseline_vv 读回异常：{other:?}"),
+        }),
+        None => Ok(None),
     }
+}
 
-    // 没有快照可比较：已应用过该 doc 的基线 journal 说明它来自基线；
-    // 否则可能是 local-only/离线内容，保守保留。
-    let applied = vault.query(
-        "SELECT count(*) FROM baseline_apply_docs WHERE doc_id=?1",
-        &[Value::Text(doc_id.to_owned())],
-    )?;
-    let applied = applied
-        .first()
-        .and_then(|row| row.first())
-        .and_then(|value| match value {
-            Value::Integer(value) => Some(*value > 0),
-            _ => None,
-        })
-        .unwrap_or(false);
-    if applied {
-        return Ok(true);
+/// 本地文档是否有 baseline 之外的 op（只看 head VV，O(1)，不重放正文）。
+fn local_has_extra(
+    vault: &Vault,
+    doc_id: &str,
+    baseline_vv: &VersionVector,
+) -> Result<bool, StorageError> {
+    if !crate::read_api::doc_exists(vault, doc_id)? {
+        return Ok(false);
     }
-    // 空文档没有 local-only 内容，可直接删除。
-    let head = load_head(vault, doc_id)?;
-    Ok(head.head_seq == 0)
+    let local_vv = load_head(vault, doc_id)?.version_vector()?;
+    let extra = local_vv.sub_iter(baseline_vv).next().is_some();
+    Ok(extra)
 }
 
 fn prepare_asset_statement(

@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 
 use crate::body_doc::PendingUpdate;
 use crate::error::StorageError;
-use crate::store::{self, UpdateRecord};
+use crate::store::UpdateRecord;
 use crate::sync_bridge::{self, SyncContext, SyncIntent};
 use crate::Vault;
 
@@ -329,9 +329,22 @@ impl DurableSink for VaultJournalSink {
             .iter()
             .map(|entry| UpdateRecord::new(entry.batch_id.clone(), entry.update.clone()))
             .collect();
+        // 远端导入条目：其 `end_vv - 上一条 end_vv` 是远端真正带来的 ops，
+        // 同事务记入「远端已知 VV」（baseline tombstone 判定用）。
+        let remote_marks: Vec<bool> = entries
+            .iter()
+            .map(|entry| entry.origin == JournalOrigin::Remote)
+            .collect();
         let head = match self.sync {
-            // 默认路径（未启用同步）：与切片 2a 之前逐字节一致。
-            None => store::append_updates(&self.vault, &self.doc_id, self.head_seq, &records)?,
+            // 默认路径（未启用同步）：行为与切片 2a 之前一致（只是多记远端已知 VV）。
+            None => sync_bridge::append_updates_with_intent_slots(
+                &self.vault,
+                &self.doc_id,
+                self.head_seq,
+                &records,
+                &[],
+                &remote_marks,
+            )?,
             Some(ctx) => {
                 // 一 update 一意图（remote 条目为空位）；seq 必须与 A 事务写进
                 // `loro_updates.seq` 的值完全一致，否则意图会指向别人的 update。
@@ -361,6 +374,7 @@ impl DurableSink for VaultJournalSink {
                     self.head_seq,
                     &records,
                     &slots,
+                    &remote_marks,
                 )?
             }
         };

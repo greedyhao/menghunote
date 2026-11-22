@@ -11,17 +11,19 @@
 //! 创建、也在工作线程内析构，**绝不跨线程移动**，因此关闭连接时的 WAL checkpoint
 //! 也发生在它自己的线程上。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
 use rusqlite::types::Value;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::connection;
 use crate::error::StorageError;
 use crate::migrate;
+use crate::sync_meta::{self, ConsumedPrefix};
 
 /// 查询结果中的一行：按 SQL 的列顺序排列的值。
 pub type Row = Vec<Value>;
@@ -68,6 +70,25 @@ impl AffectedGuard {
             expected,
         }
     }
+}
+
+/// 批量 inbox 原子写入的一行。
+///
+/// 由 `sync_bridge::store_inbox_verified_batch` 构造，送到 worker 线程后在同一事务里
+/// 完成「既有行比对 + 新行插入 + `received` 连续前缀推进」；字段含义与
+/// [`crate::VerifiedInboxRow`] 一一对应，只是在 actor 层不依赖 sync 语义。
+#[derive(Debug, Clone)]
+pub(crate) struct InboxBatchRow {
+    /// relay 日志 incarnation（同一批必须一致）。
+    pub(crate) log_id: [u8; 16],
+    /// relay 日志序号（必须 > 0；同一批内不得重复）。
+    pub(crate) relay_seq: u64,
+    /// 密文对象名（32B）。
+    pub(crate) object_id: [u8; 32],
+    /// 加密 epoch（必须 > 0）。
+    pub(crate) epoch: u64,
+    /// 已解密并完成载荷校验的 `UpdateV1` 明文。
+    pub(crate) verified_payload: Vec<u8>,
 }
 
 /// 工作线程命令。
@@ -117,6 +138,21 @@ enum Command {
     UserVersion {
         /// 结果回传通道。
         reply: Reply<i64>,
+    },
+    /// 原子批量写 inbox：校验、既有行冲突检测、新行插入、`received` 连续前缀推进
+    /// 全部在**同一个事务**里完成。
+    ExecInboxBatch {
+        /// 待写入行（worker 内重新校验/排序）。
+        rows: Vec<InboxBatchRow>,
+        /// 结果回传通道：本次真正新插入的行数（幂等命中不计）。
+        reply: Reply<usize>,
+    },
+    /// 在同一条命令里推进连续前缀（读窗口 + 一次写最终值都在 worker 连接上完成）。
+    AdvanceConsumedPrefix {
+        /// 要推进的前缀（received / integrated）。
+        prefix: ConsumedPrefix,
+        /// 结果回传通道。
+        reply: Reply<()>,
     },
 }
 
@@ -304,6 +340,25 @@ impl Vault {
         })
     }
 
+    /// 原子批量写 inbox（storage 内部入口；外部请走
+    /// [`crate::sync_bridge::store_inbox_verified_batch`]）。
+    ///
+    /// 空批次是合法 no-op（与逐条入口一致），不会打开事务。
+    pub(crate) fn exec_inbox_batch(&self, rows: Vec<InboxBatchRow>) -> Result<usize, StorageError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.call(|reply| Command::ExecInboxBatch { rows, reply })
+    }
+
+    /// 推进连续前缀（`received` / `integrated`），同一条命令内完成读窗口与写最终值。
+    pub(crate) fn advance_consumed_prefix(
+        &self,
+        prefix: ConsumedPrefix,
+    ) -> Result<(), StorageError> {
+        self.call(|reply| Command::AdvanceConsumedPrefix { prefix, reply })
+    }
+
     /// 把一条命令发给工作线程并等待回复。
     fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Command) -> Result<T, StorageError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<T, StorageError>>(1);
@@ -383,7 +438,179 @@ fn handle_command(conn: &Connection, command: Command) {
         Command::UserVersion { reply } => {
             let _ = reply.send(migrate::user_version(conn));
         }
+        Command::ExecInboxBatch { rows, reply } => {
+            let _ = reply.send(exec_inbox_batch(conn, rows));
+        }
+        Command::AdvanceConsumedPrefix { prefix, reply } => {
+            let _ = reply.send(sync_meta::advance_consumed_prefix_on(conn, prefix));
+        }
     }
+}
+
+/// 批量 inbox 的原子执行。
+///
+/// 全部动作在 worker 持有独占连接上的**同一个事务**里：
+///
+/// 1. 校验批内行：同 `log_id`、`relay_seq/epoch > 0`、`relay_seq` 不重复；按序号排序；
+/// 2. 校验 `sync.log_id`（不存在则写，存在不同则 [`StorageError::SyncLogMismatch`]）；
+/// 3. 读该序号范围既有行，逐行比较 `object_id/epoch/verified_payload`：
+///    - 完全相同 → 幂等跳过（不插入、不触发任何守卫）；
+///    - 任意不同 → [`StorageError::SyncConflict`]，`tx` 在此 drop，整笔回滚（一行不写）；
+/// 4. 新行在同一事务插入（每行要求恰好影响 1 行）；
+/// 5. **同一事务内**推进 `received` 连续前缀（与普通路径同一套扫描语义）；
+/// 6. 提交后返回新插入行数（幂等行不计）。
+///
+/// 先读后写的竞态因此被消除：快照与插入属于同一个写事务（SQLite 的单写者锁），
+/// 且一次提交只产生一次 fsync；崩溃/冲突只会留下「什么都没发生」或「行+前缀一起提交」。
+///
+/// 事务用 **Immediate** 显式开启（而不是 deferred）：本事务先读后写，deferred 的锁升级
+/// 详见下方注释。
+fn exec_inbox_batch(
+    conn: &Connection,
+    mut rows: Vec<InboxBatchRow>,
+) -> Result<usize, StorageError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let log_id = rows[0].log_id;
+    for row in &rows {
+        if row.log_id != log_id {
+            return Err(StorageError::Corrupt {
+                context: "批量 inbox 行必须属于同一 log_id".to_owned(),
+            });
+        }
+        if row.relay_seq == 0 || row.epoch == 0 {
+            return Err(StorageError::Corrupt {
+                context: "inbox relay_seq/epoch 必须 >0".to_owned(),
+            });
+        }
+    }
+    rows.sort_by_key(|row| row.relay_seq);
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].relay_seq == pair[1].relay_seq)
+    {
+        return Err(StorageError::Corrupt {
+            context: "批量 inbox 出现重复 relay_seq".to_owned(),
+        });
+    }
+
+    // 显式 **Immediate** 事务（不是 deferred）：
+    //
+    // 本事务里先读（校验 `sync.log_id`、比对 `[first_seq,last_seq]` 既有行）再写
+    // （插新行、推进 received 前缀）。Deferred 事务的 `BEGIN` 只是登记，第一条 SELECT
+    // 拿共享锁，等到第一条写语句才尝试把共享锁升级成写锁；而 SQLite 的锁升级**不走
+    // busy handler**——此刻若已有别的写事务在途，不会用 `busy_timeout` 等待，而是直接
+    // 返回 `SQLITE_BUSY`，让调用方在"最多等 5s"的预期之外立刻失败。`BEGIN IMMEDIATE`
+    // 在事务开始就取写锁（这一步照常受 `busy_timeout` 约束），与 ADR 0001 §3.9
+    // 「每 vault 单 writer actor」的模型一致：写事务不该和别的写事务撞在升级点上。
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    sync_meta::ensure_log_id_on(&tx, &log_id)?;
+
+    let first_seq = rows.first().map_or(0, |row| row.relay_seq);
+    let last_seq = rows.last().map_or(0, |row| row.relay_seq);
+    let existing = read_existing_inbox(&tx, &log_id, first_seq, last_seq)?;
+    let mut fresh: Vec<&InboxBatchRow> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match existing.get(&row.relay_seq) {
+            Some((object_id, epoch, payload)) => {
+                if *object_id != row.object_id
+                    || *epoch != row.epoch
+                    || *payload != row.verified_payload
+                {
+                    // 不 commit：tx 在此 drop，SQLite 自动回滚整笔事务（包括已插入的新行）。
+                    return Err(StorageError::SyncConflict {
+                        context: format!("inbox {log_id:?}/{} 字节不一致", row.relay_seq),
+                    });
+                }
+            }
+            None => fresh.push(row),
+        }
+    }
+
+    if !fresh.is_empty() {
+        insert_inbox_rows(&tx, &log_id, &fresh)?;
+    }
+
+    // 与插入处于同一事务：提交后 received 一定覆盖本批新行；崩溃/冲突则一起回滚。
+    sync_meta::advance_consumed_prefix_on(&tx, ConsumedPrefix::Received)?;
+    tx.commit()?;
+    Ok(fresh.len())
+}
+
+/// 既有 inbox 行的比较字段：`(object_id, epoch, verified_payload)`。
+type ExistingInboxFacts = ([u8; 32], u64, Vec<u8>);
+
+/// 读 `[first_seq, last_seq]` 范围内的既有 inbox 行，按序号建索引。
+fn read_existing_inbox(
+    conn: &Connection,
+    log_id: &[u8; 16],
+    first_seq: u64,
+    last_seq: u64,
+) -> Result<BTreeMap<u64, ExistingInboxFacts>, StorageError> {
+    let mut statement = conn.prepare(
+        "SELECT relay_seq,object_id,epoch,verified_payload FROM sync_inbox \
+         WHERE log_id=?1 AND relay_seq>=?2 AND relay_seq<=?3",
+    )?;
+    let mut rows = statement.query(rusqlite::params_from_iter([
+        Value::Blob(log_id.to_vec()),
+        Value::Integer(i64_of(first_seq)?),
+        Value::Integer(i64_of(last_seq)?),
+    ]))?;
+    let mut existing = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let seq: i64 = row.get(0)?;
+        let seq = u64::try_from(seq).map_err(|_| StorageError::Corrupt {
+            context: "sync_inbox.relay_seq 为负数".to_owned(),
+        })?;
+        let object_id: Vec<u8> = row.get(1)?;
+        let object_id = object_id
+            .try_into()
+            .map_err(|bytes: Vec<u8>| StorageError::Corrupt {
+                context: format!("sync_inbox.object_id 应为 32B，实际 {}B", bytes.len()),
+            })?;
+        let epoch: i64 = row.get(2)?;
+        let epoch = u64::try_from(epoch).map_err(|_| StorageError::Corrupt {
+            context: "sync_inbox.epoch 为负数".to_owned(),
+        })?;
+        let payload: Option<Vec<u8>> = row.get(3)?;
+        existing.insert(seq, (object_id, epoch, payload.unwrap_or_default()));
+    }
+    Ok(existing)
+}
+
+/// 在同一事务里插入新行；每行都要求恰好影响 1 行，否则整笔回滚。
+fn insert_inbox_rows(
+    conn: &Connection,
+    log_id: &[u8; 16],
+    rows: &[&InboxBatchRow],
+) -> Result<(), StorageError> {
+    let mut statement = conn.prepare(
+        "INSERT INTO sync_inbox(log_id,relay_seq,object_id,epoch,state,verified_payload) \
+         VALUES(?1,?2,?3,?4,'verified',?5)",
+    )?;
+    for row in rows {
+        let affected = statement.execute(rusqlite::params_from_iter([
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(row.relay_seq)?),
+            Value::Blob(row.object_id.to_vec()),
+            Value::Integer(i64_of(row.epoch)?),
+            Value::Blob(row.verified_payload.clone()),
+        ]))?;
+        if affected != 1 {
+            return Err(StorageError::SyncConflict {
+                context: format!("inbox {log_id:?}/{} 写入冲突", row.relay_seq),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// SQLite INTEGER（有符号 64 位）到 u64 的转换；负数说明库/入参不自洽。
+fn i64_of(value: u64) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|_| StorageError::Corrupt {
+        context: format!("数值 {value} 超出 SQLite INTEGER"),
+    })
 }
 
 /// 读一条 meta。

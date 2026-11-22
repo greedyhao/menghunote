@@ -34,13 +34,13 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use loro::VersionVector;
 use menghunote_storage::{
-    append_updates, asset_bytes, count_inbox_ready, count_unreferenced_assets,
-    list_referenced_assets, load_body_doc, load_head, mark_acked, mark_integrated, mark_sent,
-    mark_skipped_event_received, outbox_parts, outbox_rows, pending_encryption, repack_required,
-    set_confirmed_highwater, set_sync_log_id, store_encrypted_parts, store_inbox_verified,
-    store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, SyncContext,
-    SyncEncryptedPart, SyncInboxRow, SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow,
-    STRUCTURE_DOC_ID,
+    advance_integrated_prefix, append_updates, append_updates_with_integrated_marks, asset_bytes,
+    count_inbox_ready, count_unreferenced_assets, list_referenced_assets, load_body_doc, load_head,
+    mark_acked, mark_integrated, mark_integrated_batch, mark_sent, mark_skipped_event_received,
+    outbox_parts, outbox_rows, pending_encryption, repack_required, set_confirmed_highwater,
+    set_sync_log_id, store_encrypted_parts, store_inbox_verified, store_inbox_verified_batch,
+    sync_cursor_state, take_inbox_ready, SyncContext, SyncEncryptedPart, SyncInboxRow,
+    SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow, STRUCTURE_DOC_ID,
 };
 use menghunote_sync_proto::{
     cap_plain, expected_part_plain_len, object_commit_signing_input, object_digest_input,
@@ -105,14 +105,16 @@ pub struct EngineConfig {
     pub page_limit: u32,
     /// 每次 integrate 最多处理的行数。
     pub integrate_limit: usize,
-    /// Phase 0 实验开关：`pull` 是否把一页的 verified 行用**一个事务**批量写入 inbox。
+    /// `pull` 是否把一页的 verified 行用**一个事务**批量写入 inbox（默认真）。
     ///
-    /// 默认 `false` = 生产语义（每条事件一个事务；页内前面的行在后续事件失败时已经
-    /// durable）。打开后**结果等价**（重复字节幂等、冲突 fail-closed、游标只在整页
-    /// 验收成功后推进），只是 durability 粒度从"条"变成"页"：后续事件失败时本页已
-    /// 验签的行还没有落库，重试会重新下载/验签（幂等，不丢数据）。
+    /// Phase 0 的实测开关，Phase 1A-2 起默认开启：整页 256 条 UPDATE 只产生一次
+    /// `sync_inbox` 提交（`received` 前缀与行同一事务推进，见
+    /// [`menghunote_storage::store_inbox_verified_batch`]）。结果与逐条路径等价
+    /// （重复字节幂等、冲突 fail-closed、游标只在整页验收成功后推进）；差别只是
+    /// durability 粒度从"条"变成"页内 flush"，以及页内提前返回（例如遇到
+    /// checkpoint/control 的 `Paused(UnsupportedEvent)`）时会先 flush 已验收行再返回。
     ///
-    /// 本字段只用于 Phase 0 实测"批量事务能否低成本提速"，Phase 1 才决定是否默认开启。
+    /// 保留 `false` 分支给基准对照（Phase 0 的逐条事务路径）。
     pub inbox_batch: bool,
 }
 
@@ -122,7 +124,7 @@ impl Default for EngineConfig {
             send_batch: 256,
             page_limit: 256,
             integrate_limit: 256,
-            inbox_batch: false,
+            inbox_batch: true,
         }
     }
 }
@@ -245,7 +247,7 @@ pub struct PullReport {
     /// Phase 1 的多页/快照路径复用。
     pub pages: usize,
     /// 本页 verified 行是否用**一个事务**批量写入 inbox
-    /// （[`EngineConfig::inbox_batch`]；默认逐条写 = `false`）。
+    /// （[`EngineConfig::inbox_batch`]；默认真，`false` = 基准对照的逐条路径）。
     pub inbox_batch: bool,
 }
 
@@ -255,11 +257,20 @@ pub struct PullReport {
 /// - 结构文档优先，正文按 **doc 轮转** 公平取批（不循环刷最早一批）；
 /// - 每批最多 [`IntegrateConfig::batch_objects`] 个对象 / 约
 ///   [`IntegrateConfig::batch_bytes`] 字节 / [`IntegrateConfig::batch_time`] 的**软**预算；
-/// - 到事务边界（每个对象自己的 A 事务 + `mark_integrated`）交付，**不跨批提前 ACK**；
+/// - 到事务边界交付，**不跨批提前 ACK**：逐行路径是每个对象自己的 A 事务 +
+///   `mark_integrated`；正文聚合路径是每篇文档一个 A 事务（组合 update + 批量标记），
+///   整批正文结束后统一推进一次 integrated 前缀；
 /// - 有进展才继续下一批；连续无进展就停，并把剩余 deferred 如实上报。
+///
+/// [`IntegrateConfig::aggregate_body`] 打开时正文的 `batch_objects` 语义不同：它限制
+/// 的是**每批参与的文档数**（而不是行数），同一文档的所有待处理行尽量进同一批，
+/// 只受 `batch_bytes` / `batch_time` 与扫描窗口约束。这样一页 256 条同一文档的 update
+/// 只需一次 `load_body_doc`（旧路径是 32 行一批 = 8 次全量重放）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntegrateConfig {
     /// 单批对象上限（1 个超大对象仍允许单独成批）。
+    ///
+    /// `aggregate_body = true` 时正文阶段把它解释成"单批最多多少篇文档"（结构阶段不变）。
     pub batch_objects: usize,
     /// 单批明文负载软上限（字节）。
     pub batch_bytes: usize,
@@ -267,6 +278,14 @@ pub struct IntegrateConfig {
     pub batch_time: std::time::Duration,
     /// 一次 integrate 的批数上限（结构批 + 正文批）。
     pub max_batches: usize,
+    /// 正文阶段是否按文档聚合（默认真）。
+    ///
+    /// - `true`：同一文档的待处理行按 `relay_seq` 升序在一批内处理；一次
+    ///   `load_body_doc` + 内存逐条 import + **一条**组合 update 落盘，inbox 标记与
+    ///   update 在同一 A 事务里（见 [`Self::batch_objects`] 的语义差异）；
+    /// - `false`：Phase 0 的逐行路径（每条 update 一次全量重放 + 一次 A 事务），
+    ///   保留给基准对照；聚合路径的多轮合并已能自愈同文档物理乱序。
+    pub aggregate_body: bool,
 }
 
 impl Default for IntegrateConfig {
@@ -276,6 +295,7 @@ impl Default for IntegrateConfig {
             batch_bytes: INTEGRATE_BATCH_BYTES,
             batch_time: INTEGRATE_BATCH_TIME,
             max_batches: INTEGRATE_MAX_BATCHES,
+            aggregate_body: true,
         }
     }
 }
@@ -285,6 +305,11 @@ impl IntegrateConfig {
     ///
     /// `limit` 是**本次调用的对象预算**，不是单批上限：批次大小仍受 32 对象/1MiB/50ms
     /// 约束，批数按需折算（至少一批）。
+    ///
+    /// 注意：`aggregate_body = true`（默认）时正文按文档聚合，`batch_objects` 被解释成
+    /// "每批参与的文档数"，因此一次调用可能处理**超过 `limit` 个正文对象**（同一文档
+    /// 一页 256 行会一次集成完）。结构阶段仍严格按对象预算；需要严格逐对象预算的基准
+    /// 对照请设 `aggregate_body = false`。
     #[must_use]
     pub fn with_object_budget(limit: usize) -> Self {
         let batch_objects = INTEGRATE_BATCH_OBJECTS.min(limit.max(1));
@@ -323,6 +348,13 @@ pub struct IntegrateReport {
     ///
     /// 包含结构阶段、只投影、正文轮转与 `deferred` 计数；不含网络（pull 已单独计时）。
     pub elapsed_ms: u64,
+    /// 本阶段调用 `load_body_doc`（全量重放历史）的次数。
+    ///
+    /// 聚合正文（[`IntegrateConfig::aggregate_body`]）下同一文档一批只算一次，且选批
+    /// 预检判定"全部已覆盖/纯 deferred"的组为 0 次（只读 O(1) 的 head_vv）；结构阶段
+    /// 仍是逐行路径（每行一次全量重放），因此本字段是"整个 integrate 的全量重放次数"，
+    /// 供 Phase 1A 的 release 基准对比旧逐行路径（256 行 = 256 次）。
+    pub doc_loads: usize,
 }
 
 /// 依赖有序集成的完整结果（`changed_heads` 供 UI 判断要不要交付/刷新）。
@@ -1307,84 +1339,107 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
             pages: 1,
             ..PullReport::default()
         };
-        // Phase 0 实验：`inbox_batch` 打开时把整页 verified 行攒起来，用一个事务写入
-        // （见 `EngineConfig::inbox_batch`）。默认关，仍然逐条 `store_inbox_verified`。
+        // Phase 1A-2：`inbox_batch`（默认真）把一页的 verified 行攒起来，用一个事务写入。
+        // 关键纪律：**任何提前返回都必须先 flush 已验收的行**——逐条路径在每条事件后
+        // 就 durable，批量路径不能在 `Paused(UnsupportedEvent)` 之类的早退时把已验证行
+        // 留在内存里丢掉。用立即执行的闭包承载事件循环，所有 `?` 早退都会落到闭包外的
+        // 统一 flush（flush 也失败时保留原错误优先，只记录）。
         let mut buffered: Vec<VerifiedInboxRow> = Vec::new();
         let mut buffered_bytes = 0usize;
-        for event in &page.events {
-            if event.relay_seq <= local.received_seq {
-                // ASSET 已推进 received 前缀后仍要核对 durable skipped 记录：relay 把
-                // 同一 seq 重写成另一条资产时必须 Paused(RelayHistoryRewritten)，不能
-                // 因为"水位已覆盖"就静默跳过（记录本身还绑定完整 commit 字节）。
-                if event.kind == RelayLogKind::Asset {
-                    let bytes =
-                        self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
-                    report.asset_bytes = report.asset_bytes.saturating_add(bytes);
+        let consume_result: Result<(), SyncError> = (|| {
+            for event in &page.events {
+                if event.relay_seq <= local.received_seq {
+                    // ASSET 已推进 received 前缀后仍要核对 durable skipped 记录：relay 把
+                    // 同一 seq 重写成另一条资产时必须 Paused(RelayHistoryRewritten)，不能
+                    // 因为"水位已覆盖"就静默跳过（记录本身还绑定完整 commit 字节）。
+                    if event.kind == RelayLogKind::Asset {
+                        let bytes =
+                            self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                        report.asset_bytes = report.asset_bytes.saturating_add(bytes);
+                    }
+                    report.skipped += 1;
+                    continue;
                 }
-                report.skipped += 1;
-                continue;
-            }
-            match event.kind {
-                RelayLogKind::Update => {
-                    let row = self.verify_update_event(&state.log_id, event)?;
-                    // 指标口径：成功验收的 Update **明文负载**字节（见 PullReport 注释）。
-                    report.update_bytes = report.update_bytes.saturating_add(
-                        u64::try_from(row.verified_payload.len()).unwrap_or(u64::MAX),
-                    );
-                    if self.config.inbox_batch {
-                        buffered_bytes = buffered_bytes.saturating_add(row.verified_payload.len());
-                        buffered.push(row);
-                        if buffered_bytes >= PULL_INBOX_BATCH_BYTES {
-                            // 返回的"新插入行数"只用于区分幂等命中；`stored` 口径是
-                            // "成功验收并 durable"，与逐条路径一致（重放行也算已 durable）。
-                            store_inbox_verified_batch(self.vault, &buffered)?;
-                            report.stored += buffered.len();
-                            report.inbox_batch = true;
-                            buffered.clear();
-                            buffered_bytes = 0;
+                match event.kind {
+                    RelayLogKind::Update => {
+                        let row = self.verify_update_event(&state.log_id, event)?;
+                        // 指标口径：成功验收的 Update **明文负载**字节（见 PullReport 注释）。
+                        report.update_bytes = report.update_bytes.saturating_add(
+                            u64::try_from(row.verified_payload.len()).unwrap_or(u64::MAX),
+                        );
+                        if self.config.inbox_batch {
+                            buffered_bytes =
+                                buffered_bytes.saturating_add(row.verified_payload.len());
+                            buffered.push(row);
+                            if buffered_bytes >= PULL_INBOX_BATCH_BYTES {
+                                // 返回的"新插入行数"只用于区分幂等命中；`stored` 口径是
+                                // "成功验收并 durable"，与逐条路径一致（重放行也算已 durable）。
+                                store_inbox_verified_batch(self.vault, &buffered)?;
+                                report.stored += buffered.len();
+                                report.inbox_batch = true;
+                                buffered.clear();
+                                buffered_bytes = 0;
+                            }
+                        } else {
+                            store_inbox_verified(
+                                self.vault,
+                                &row.log_id,
+                                row.relay_seq,
+                                &row.object_id,
+                                row.epoch,
+                                &row.verified_payload,
+                            )?;
+                            report.stored += 1;
                         }
+                    }
+                    // 资产事件不是文档水位事件：其密文本体已由 checkpoint refs 恢复，
+                    // 新设备从 S 补齐日志时直接跳过，不阻塞后续 update。
+                    //
+                    // 评审 0003 P0-B 残余：**推进游标之前**先把"本机消费了这条 ASSET"
+                    // 落成 durable 事实。否则 checkpoint 只能把"游标之前、无 inbox 行"
+                    // 的缺口推断成 ASSET——恶意 relay 只要漏发一条 UPDATE 并推进 cursor
+                    // 就能伪造覆盖。写记录前必须真正下载全部分片并完成密码学验证
+                    // （见 `persist_skipped_asset`）；记录写入失败时整个 pull 返回错误，
+                    // 游标不前进。
+                    RelayLogKind::Asset => {
+                        let bytes =
+                            self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                        report.asset_bytes = report.asset_bytes.saturating_add(bytes);
+                        // ASSET 不写 inbox，但必须在 durable 消费后推进 received 连续前缀，
+                        // 否则同一页里"ASSET 在前、UPDATE 在后"会让后续 UPDATE 永远不 ready。
+                        mark_skipped_event_received(self.vault, &state.log_id, event.relay_seq)?;
+                        report.skipped += 1;
+                    }
+                    // checkpoint/control 由 bootstrap/checkpoint 任务处理；静默跳过会
+                    // 让 received 前缀出现洞，所以这里明确暂停。
+                    _ => return Err(SyncError::Paused(PauseReason::UnsupportedEvent)),
+                }
+            }
+            Ok(())
+        })();
+        // 先 flush 已验收行（`stored` 口径仍是"成功验收并 durable"；重放行幂等）。
+        if !buffered.is_empty() {
+            match store_inbox_verified_batch(self.vault, &buffered) {
+                Ok(_) => {
+                    report.stored += buffered.len();
+                    report.inbox_batch = true;
+                    buffered.clear();
+                }
+                Err(flush_error) => {
+                    if let Err(original) = &consume_result {
+                        // 原错误优先：flush 失败只记录，不掩盖触发早退的真实原因。
+                        eprintln!(
+                            "[sync] pull: 早退前 flush {} 条已验证 inbox 行失败（保留原错误）：\
+                             {flush_error}; original={original}",
+                            buffered.len()
+                        );
                     } else {
-                        store_inbox_verified(
-                            self.vault,
-                            &row.log_id,
-                            row.relay_seq,
-                            &row.object_id,
-                            row.epoch,
-                            &row.verified_payload,
-                        )?;
-                        report.stored += 1;
+                        return Err(SyncError::from(flush_error));
                     }
                 }
-                // 资产事件不是文档水位事件：其密文本体已由 checkpoint refs 恢复，
-                // 新设备从 S 补齐日志时直接跳过，不阻塞后续 update。
-                //
-                // 评审 0003 P0-B 残余：**推进游标之前**先把"本机消费了这条 ASSET"
-                // 落成 durable 事实。否则 checkpoint 只能把"游标之前、无 inbox 行"
-                // 的缺口推断成 ASSET——恶意 relay 只要漏发一条 UPDATE 并推进 cursor
-                // 就能伪造覆盖。写记录前必须真正下载全部分片并完成密码学验证
-                // （见 `persist_skipped_asset`）；记录写入失败时整个 pull 返回错误，
-                // 游标不前进。
-                RelayLogKind::Asset => {
-                    let bytes =
-                        self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
-                    report.asset_bytes = report.asset_bytes.saturating_add(bytes);
-                    // ASSET 不写 inbox，但必须在 durable 消费后推进 received 连续前缀，
-                    // 否则同一页里"ASSET 在前、UPDATE 在后"会让后续 UPDATE 永远不 ready。
-                    mark_skipped_event_received(self.vault, &state.log_id, event.relay_seq)?;
-                    report.skipped += 1;
-                }
-                // checkpoint/control 由 bootstrap/checkpoint 任务处理；静默跳过会
-                // 让 received 前缀出现洞，所以这里明确暂停。
-                _ => return Err(SyncError::Paused(PauseReason::UnsupportedEvent)),
             }
         }
-        // 整页验收成功后才把批量行落库（默认逐条路径这里无事可做）。
-        if !buffered.is_empty() {
-            store_inbox_verified_batch(self.vault, &buffered)?;
-            report.stored += buffered.len();
-            report.inbox_batch = true;
-            buffered.clear();
-        }
+        consume_result?;
         // 只有全部事件验收成功才推进游标（失败已在上面返回）。
         self.write_cursor(&page.next_cursor)?;
         report.next_cursor = page.next_cursor.clone();
@@ -1413,6 +1468,10 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
     /// 等价于 [`Self::integrate_dependency_ordered`] + [`IntegrateConfig::with_object_budget`]：
     /// 保留"一次调用最多处理 `limit` 个对象"的兼容语义，但内部已按 ADR 0012 S2b 的
     /// 结构→投影→正文顺序收敛（不再需要调用方再发一轮网络）。
+    ///
+    /// Phase 1A-2 起正文默认按文档聚合：`limit` 仍决定批数与结构对象预算，但同一文档
+    /// 的待处理行会在一批内一起集成（可能超过 `limit` 行）；需要严格逐对象预算时用
+    /// [`IntegrateConfig::aggregate_body`] 显式关闭聚合。
     pub fn integrate(&mut self, limit: usize) -> Result<IntegrateReport, SyncError> {
         let config = IntegrateConfig::with_object_budget(limit);
         self.integrate_dependency_ordered(config)
@@ -1474,25 +1533,49 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
             }
         }
 
-        // 3) 正文阶段：按 doc 轮转公平取批；有进展才继续；无进展先重试一批再停。
-        let mut retried_without_progress = false;
-        while batches < config.max_batches {
-            let pending = self.scan_ready_rows(scan_limit)?;
-            let selected = select_body_batch(&pending, &config, batches);
-            if selected.is_empty() {
-                break;
+        // 3) 正文阶段。
+        if config.aggregate_body {
+            // Phase 1A-2：按文档聚合。每篇文档一批只做一次 `load_body_doc`，行内按
+            // relay_seq 升序 import，最后把增量合成**一条** update 落盘、同事务标记
+            // inbox；整轮正文结束后统一推进一次 integrated 前缀。
+            let body_result =
+                self.integrate_body_aggregated(&config, scan_limit, &mut outcome, &mut batches);
+            // 即使正文中途报错，也要推进已经提交的 integrated 行前缀（deferred/错误不是
+            // 丢数据）；前缀推进失败不得掩盖正文的原错误。
+            let prefix_result = advance_integrated_prefix(self.vault).map_err(SyncError::from);
+            match (body_result, prefix_result) {
+                (Ok(()), Ok(())) => {}
+                (Ok(()), Err(error)) => return Err(error),
+                (Err(error), Ok(())) => return Err(error),
+                (Err(error), Err(prefix_error)) => {
+                    eprintln!(
+                        "[sync] integrate: 正文报错后推进 integrated 前缀失败（保留原错误）：\
+                         {prefix_error}; original={error}"
+                    );
+                    return Err(error);
+                }
             }
-            batches += 1;
-            let progressed = self.integrate_selected(&pending, &selected, &mut outcome)?;
-            if progressed == 0 {
-                if retried_without_progress {
-                    // 连续两批零进展：依赖确实没就绪，停止并上报剩余 deferred。
+        } else {
+            // 旧逐行路径（基准对照）：每条 update 一次全量重放 + 一次 A 事务 + 一次标记。
+            let mut retried_without_progress = false;
+            while batches < config.max_batches {
+                let pending = self.scan_ready_rows(scan_limit)?;
+                let selected = select_body_batch(&pending, &config, batches);
+                if selected.is_empty() {
                     break;
                 }
-                // 同一次 integrate 内对剩余 deferred 重试一次（结构投影可能刚建立 body 行）。
-                retried_without_progress = true;
-            } else {
-                retried_without_progress = false;
+                batches += 1;
+                let progressed = self.integrate_selected(&pending, &selected, &mut outcome)?;
+                if progressed == 0 {
+                    if retried_without_progress {
+                        // 连续两批零进展：依赖确实没就绪，停止并上报剩余 deferred。
+                        break;
+                    }
+                    // 同一次 integrate 内对剩余 deferred 重试一次（结构投影可能刚建立 body 行）。
+                    retried_without_progress = true;
+                } else {
+                    retried_without_progress = false;
+                }
             }
         }
 
@@ -1504,13 +1587,14 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         // 脱敏日志：只有计数/耗时（Phase 0 观测用）。
         eprintln!(
             "[sync] integrate integrated={} structure={} body={} deferred={} batches={} \
-             projected={} elapsed_ms={}",
+             projected={} doc_loads={} elapsed_ms={}",
             outcome.report.integrated,
             outcome.report.structure_integrated,
             outcome.report.body_integrated,
             outcome.report.deferred,
             outcome.report.batches,
             outcome.report.projected,
+            outcome.report.doc_loads,
             outcome.report.elapsed_ms
         );
         Ok(outcome)
@@ -1543,7 +1627,8 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         Ok(pending)
     }
 
-    /// 集成选中的行；返回**真的有进展**（integrated）的对象数。
+    /// 集成选中的行（逐行路径：结构阶段与 `aggregate_body = false` 的正文阶段）；
+    /// 返回**真的有进展**（integrated）的对象数。
     fn integrate_selected(
         &self,
         pending: &[PendingInboxRow],
@@ -1553,7 +1638,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         let mut progressed = 0usize;
         for &index in selected {
             let item = &pending[index];
-            match self.integrate_inbox_row(&item.row)? {
+            match self.integrate_inbox_row(&item.row, &mut outcome.report.doc_loads)? {
                 InboxRowOutcome::Integrated { changed } => {
                     outcome.report.integrated += 1;
                     if item.doc_id == STRUCTURE_DOC_ID {
@@ -1582,7 +1667,14 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
     ///
     /// `HeadConflict` 是可重放的并发冲突（别的 writer 把 head 推进了）：不覆盖 head、
     /// 不丢 inbox/outbox，重读 head 后按新基准**有界重放一次**；再冲突就如实报错。
-    fn integrate_inbox_row(&self, row: &SyncInboxRow) -> Result<InboxRowOutcome, SyncError> {
+    ///
+    /// `doc_loads` 累计本阶段 `load_body_doc`（全量重放）次数：逐行路径每 import 一行
+    /// 就 +1（Phase 0 证明的 O(历史 × 事件) 就在这里）；聚合路径按文档 +1。
+    fn integrate_inbox_row(
+        &self,
+        row: &SyncInboxRow,
+        doc_loads: &mut usize,
+    ) -> Result<InboxRowOutcome, SyncError> {
         let payload = row
             .verified_payload
             .as_deref()
@@ -1619,6 +1711,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         loop {
             let (doc, current) =
                 load_body_doc(self.vault, &update.doc_id, self.identity.peer_id, None)?;
+            *doc_loads = doc_loads.saturating_add(1);
             let before = doc.vv();
             doc.import(&update.loro_update_bytes)?;
             let pending = doc.pending_update(&before)?;
@@ -1651,6 +1744,217 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         }
         mark_integrated(self.vault, &row.log_id, row.relay_seq)?;
         Ok(InboxRowOutcome::Integrated { changed: false })
+    }
+
+    // ---------------------------------------------------------------- 正文聚合（Phase 1A-2）
+
+    /// 正文聚合路径的批循环。
+    ///
+    /// 与逐行路径的区别只在选择与交付粒度：每批最多 `batch_objects` **篇文档**
+    /// （而不是 32 行），同一文档的候选行一次处理；批之间仍按 `batches` 轮转起点，
+    /// 多文档时不会总从第一篇开始。选批前先用 `head_vv` 做轻量预检：纯 deferred 组
+    /// 直接跳过、不占正文预算（避免大 deferred 文档饿死后面的就绪文档）。
+    /// 有进展才继续，连续两批零进展就停。
+    fn integrate_body_aggregated(
+        &self,
+        config: &IntegrateConfig,
+        scan_limit: usize,
+        outcome: &mut IntegrateOutcome,
+        batches: &mut usize,
+    ) -> Result<(), SyncError> {
+        let mut retried_without_progress = false;
+        while *batches < config.max_batches {
+            let pending = self.scan_ready_rows(scan_limit)?;
+            let selected = select_body_batch_aggregated(self.vault, &pending, config, *batches)?;
+            if selected.is_empty() {
+                break;
+            }
+            *batches += 1;
+            let progressed = self.integrate_body_selected(&pending, &selected, outcome)?;
+            if progressed == 0 {
+                if retried_without_progress {
+                    // 连续两批零进展：依赖确实没就绪，停止并上报剩余 deferred。
+                    break;
+                }
+                // 同一次 integrate 内对剩余 deferred 重试一次（结构投影可能刚建立 body 行）。
+                retried_without_progress = true;
+            } else {
+                retried_without_progress = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// 处理一批正文行：按 `(doc_id, log_id)` 分组；同一文档的候选行在 `pending` 里
+    /// 已按 relay_seq 升序，因此每个 doc 组内部天然有序。
+    fn integrate_body_selected(
+        &self,
+        pending: &[PendingInboxRow],
+        selected: &[usize],
+        outcome: &mut IntegrateOutcome,
+    ) -> Result<usize, SyncError> {
+        let mut groups: Vec<(&str, [u8; 16], Vec<usize>)> = Vec::new();
+        for &index in selected {
+            let item = &pending[index];
+            match groups
+                .iter_mut()
+                .find(|group| group.0 == item.doc_id.as_str() && group.1 == item.row.log_id)
+            {
+                Some((_, _, rows)) => rows.push(index),
+                None => groups.push((item.doc_id.as_str(), item.row.log_id, vec![index])),
+            }
+        }
+        let mut progressed = 0usize;
+        for (doc_id, log_id, indices) in groups {
+            progressed = progressed.saturating_add(
+                self.integrate_body_doc_group(pending, doc_id, &log_id, &indices, outcome)?,
+            );
+        }
+        Ok(progressed)
+    }
+
+    /// 聚合处理**一篇文档**的候选行；返回真正标记为 integrated 的行数。
+    ///
+    /// 顺序与失败语义（Phase 1A-2 的硬约束 + Phase 1A engine 聚合缺陷收口）：
+    ///
+    /// 1. **轻量预检**（不 `load_body_doc`）：只 [`load_head`] 取 O(1) 的 `head_vv`；
+    ///    - 全部行的 `end_vv` 都已被覆盖 → [`mark_integrated_batch`] 一次标记后返回，
+    ///      零重放；
+    ///    - 未覆盖行里没有任何一行的 `base_vv` 满足 → 纯 deferred，直接返回、不重放；
+    ///    - 只有至少一行需要 import 时才 `load_body_doc`（`HeadConflict` 重试才再读）；
+    /// 2. 进入内存后对组内行做**多轮合并**：每轮把已覆盖的行标记、把 `base_vv` 已满足
+    ///    的行 import，剩下的留到下一轮；只要本轮有新的 import 就继续（后 import 的 op
+    ///    可能刚好满足前面行的依赖 → 物理乱序自愈），没有新 import 就停。真正缺外部
+    ///    依赖的行保持 verified，**不会因为中间某行 deferred 而丢弃已成功的前缀**；
+    /// 3. 所有成功 import 的 ops 用**一次** `pending_update(&before)` 合成一条
+    ///    `UpdateRecord`，与所有可标记行的 `state='integrated'` 标记进同一个 A 事务
+    ///    （inbox 行不满足 `verified` 则整笔回滚，组内不落盘）；
+    /// 4. 只有已覆盖行时用 [`mark_integrated_batch`] 一次标记；
+    /// 5. 任何 import 错误都原样返回：整组不落盘、不标记，inbox 保持 verified；
+    /// 6. `HeadConflict` 重读 head 后**有界重试一次**，再冲突就报错。
+    ///
+    /// 本函数**不推进** integrated 前缀；调用方在整批正文结束后统一推进一次。
+    fn integrate_body_doc_group(
+        &self,
+        pending: &[PendingInboxRow],
+        doc_id: &str,
+        log_id: &[u8; 16],
+        indices: &[usize],
+        outcome: &mut IntegrateOutcome,
+    ) -> Result<usize, SyncError> {
+        if indices.is_empty() || !storage_view::doc_exists(self.vault, doc_id)? {
+            return Ok(0);
+        }
+        // 1) 轻量预检：只读 O(1) 的 head_vv，不重放历史。
+        let head_vv = load_head(self.vault, doc_id)?.version_vector()?;
+        match body_group_readiness(pending, indices, &head_vv) {
+            // 纯 deferred：整组保持 durable verified，不 load_body_doc。
+            BodyGroupReadiness::Deferred => return Ok(0),
+            BodyGroupReadiness::Covered => {
+                let seqs = relay_seqs_of(pending, indices);
+                mark_integrated_batch(self.vault, log_id, &seqs)?;
+                let count = seqs.len();
+                outcome.report.integrated += count;
+                outcome.report.body_integrated += count;
+                return Ok(count);
+            }
+            BodyGroupReadiness::Ready => {}
+        }
+        let mut conflict_retries = 0usize;
+        loop {
+            let (doc, current) = load_body_doc(self.vault, doc_id, self.identity.peer_id, None)?;
+            outcome.report.doc_loads = outcome.report.doc_loads.saturating_add(1);
+            let before = doc.vv();
+            let mut integrated_seqs = Vec::with_capacity(indices.len());
+            let mut imported = 0usize;
+            let mut last_batch_id: Option<String> = None;
+            // 2) 同文档内存多轮合并：只有本轮真的 import 了新 op 才再扫一轮。
+            let mut remaining: Vec<usize> = indices.to_vec();
+            while !remaining.is_empty() {
+                let mut deferred: Vec<usize> = Vec::new();
+                let mut round_imported = 0usize;
+                for &index in &remaining {
+                    let item = &pending[index];
+                    let payload = item
+                        .row
+                        .verified_payload
+                        .as_deref()
+                        .ok_or(SyncError::LocalCorrupt("verified inbox 缺 payload"))?;
+                    let update = UpdateV1::decode(payload)?;
+                    // 先看 end_vv：本地已覆盖 = 这个 update 应用过（自己产生的回环/重复
+                    // 投递，或本轮前面的 import 已把它包含的 ops 带进来），只标记。
+                    let end_vv = decode_vv(&update.end_vv, "end_vv 解码失败")?;
+                    if vv_includes(&doc.vv(), &end_vv) {
+                        integrated_seqs.push(item.row.relay_seq);
+                        continue;
+                    }
+                    // 依赖未齐：留到下一轮（本轮后面的 import 可能刚好满足它）。
+                    let base_vv = decode_vv(&update.base_vv, "base_vv 解码失败")?;
+                    if !vv_includes(&doc.vv(), &base_vv) {
+                        deferred.push(index);
+                        continue;
+                    }
+                    doc.import(&update.loro_update_bytes)?;
+                    imported += 1;
+                    round_imported += 1;
+                    last_batch_id = Some(update.batch_id);
+                    integrated_seqs.push(item.row.relay_seq);
+                }
+                remaining = deferred;
+                // 本轮没有任何新 import：剩下的行缺的是组外依赖，多扫也扫不出来。
+                if round_imported == 0 {
+                    break;
+                }
+            }
+            if integrated_seqs.is_empty() {
+                // 预检说 Ready、重放后却一行都动不了（并发/损坏）：整组保持 verified。
+                return Ok(0);
+            }
+            let changed = imported > 0;
+            if imported == 0 {
+                // 只有已覆盖行：一次事务标记，不写 update。
+                mark_integrated_batch(self.vault, log_id, &integrated_seqs)?;
+            } else {
+                let combined = doc.pending_update(&before)?;
+                if combined.payload.is_empty() {
+                    // 防御性分支：没有新 ops 时不能追加空 update，只标记。
+                    mark_integrated_batch(self.vault, log_id, &integrated_seqs)?;
+                } else {
+                    let batch_id = last_batch_id.unwrap_or_else(|| "aggregate".to_owned());
+                    let record = UpdateRecord::new(batch_id, combined);
+                    match append_updates_with_integrated_marks(
+                        self.vault,
+                        doc_id,
+                        current.head_seq,
+                        &record,
+                        log_id,
+                        &integrated_seqs,
+                    ) {
+                        Ok(head_after) => {
+                            // 本地 seq 只能由 head+1 分配（一次组合落盘 = 一个 seq）。
+                            if head_after.head_seq != current.head_seq.saturating_add(1) {
+                                return Err(SyncError::LocalCorrupt("本地 seq 未按 head+1 分配"));
+                            }
+                        }
+                        // 并发 writer 推进了 head：整组没有落盘/标记，重读后重放一次。
+                        Err(menghunote_storage::StorageError::HeadConflict { .. })
+                            if conflict_retries == 0 =>
+                        {
+                            conflict_retries += 1;
+                            continue;
+                        }
+                        Err(error) => return Err(storage_view::map_storage_error(error)),
+                    }
+                }
+            }
+            let count = integrated_seqs.len();
+            outcome.report.integrated += count;
+            outcome.report.body_integrated += count;
+            if changed && !outcome.changed_heads.iter().any(|head| head == doc_id) {
+                outcome.changed_heads.push(doc_id.to_owned());
+            }
+            return Ok(count);
+        }
     }
 
     /// 只做投影：没有新结构 op 时 `commit` 仅重建 `tree/notes` 与 body 行（幂等）。
@@ -2234,6 +2538,182 @@ fn select_body_batch(
         }
     }
     selected
+}
+
+/// 正文聚合批选取（[`IntegrateConfig::aggregate_body`]）：按 doc 轮转，**每篇文档**的
+/// 候选行尽量全部进同一批。
+///
+/// 与 [`select_body_batch`] 的语义差异（Phase 1A-2 有意为之）：
+/// - 旧路径把 `batch_objects` 解释为**行数**（32 行一批），一页 256 行同一文档会被切成
+///   8 批 = 8 次 `load_body_doc` 全量重放；
+/// - 聚合路径把 `batch_objects` 解释为**每批参与的文档数**（默认 32 篇），单篇文档的
+///   行数只受 `batch_bytes` / `batch_time` 与扫描窗口约束。目标：单文档一页 256 行
+///   一次 load；多文档仍按 `rotation` 轮转起点，避免饿死靠后的文档。
+/// - 预算仍是**软**的：单行超大时允许它单独成批；遇到字节/时间上限就停这一批，
+///   已选中的行全部交付，剩余行留在 durable verified 等下一批。
+///
+/// Phase 1A 缺陷收口起，选批前先按 doc 读一次 O(1) 的 `head_vv` 做与组处理**同一套**
+/// 预检（[`body_group_readiness`]，不 `load_body_doc`）：
+/// - 纯 deferred 组不进 selected，也不消耗 `batch_bytes` —— 否则两个大 deferred 文档
+///   会把后面的就绪文档挤出本批，连续零进展后整轮提前停止（饿死）；
+/// - 全部已覆盖组进 selected 以便标记，但按 0 字节计，不占就绪正文预算；
+/// - 未知文档（没有 `loro_docs` 行）无法预检，按 deferred 处理（保持 durable verified，
+///   等结构投影/依赖到达）。
+fn select_body_batch_aggregated(
+    vault: &Vault,
+    pending: &[PendingInboxRow],
+    config: &IntegrateConfig,
+    rotation: usize,
+) -> Result<Vec<usize>, SyncError> {
+    let started = std::time::Instant::now();
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    // 需要 import 的行数（软预算只看这些行，已覆盖的标记行是 0 字节）。
+    let mut ready_rows = 0usize;
+    // (doc_id, 该 doc 的候选下标)。doc 数量很少（参与方按笔记数），线性查找足够。
+    let mut docs: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (index, item) in pending.iter().enumerate() {
+        if item.doc_id == STRUCTURE_DOC_ID {
+            continue;
+        }
+        match docs
+            .iter_mut()
+            .find(|(doc_id, _)| *doc_id == item.doc_id.as_str())
+        {
+            Some((_, indices)) => indices.push(index),
+            None => docs.push((item.doc_id.as_str(), vec![index])),
+        }
+    }
+    if docs.is_empty() {
+        return Ok(selected);
+    }
+    let offset = rotation % docs.len();
+    let max_docs = config.batch_objects.max(1);
+    let mut groups = 0usize;
+    'outer: for step in 0..docs.len() {
+        if groups >= max_docs {
+            break;
+        }
+        let doc = (offset + step) % docs.len();
+        let doc_id = docs[doc].0;
+        // 未知文档无法预检：按 deferred 跳过（组处理也不会 load；等结构投影建立文档行）。
+        if !storage_view::doc_exists(vault, doc_id)? {
+            continue;
+        }
+        let head_vv = load_head(vault, doc_id)?.version_vector()?;
+        // 同一文档可能跨 log（日志轮换）：标记必须在同 log 内一次事务完成，因此按 log
+        // 拆子组分别预检；文档级轮转与预算口径不变。
+        let mut subgroups: Vec<([u8; 16], Vec<usize>)> = Vec::new();
+        for &index in &docs[doc].1 {
+            let log_id = pending[index].row.log_id;
+            match subgroups.iter_mut().find(|(id, _)| *id == log_id) {
+                Some((_, rows)) => rows.push(index),
+                None => subgroups.push((log_id, vec![index])),
+            }
+        }
+        let mut took_any = false;
+        for (_, indices) in &subgroups {
+            match body_group_readiness(pending, indices, &head_vv) {
+                // 纯 deferred：不进入 selected、不消耗批次预算。
+                BodyGroupReadiness::Deferred => continue,
+                // 全部已覆盖：需要标记但不 load，按 0 字节计。
+                BodyGroupReadiness::Covered => {
+                    selected.extend(indices.iter().copied());
+                    took_any = true;
+                }
+                BodyGroupReadiness::Ready => {
+                    for &index in indices {
+                        // 软预算：第一条 ready 行永远放行（单行超大时单独成批）。
+                        if ready_rows > 0 {
+                            if bytes.saturating_add(pending[index].size) > config.batch_bytes {
+                                break 'outer;
+                            }
+                            if started.elapsed() >= config.batch_time {
+                                break 'outer;
+                            }
+                        }
+                        bytes = bytes.saturating_add(pending[index].size);
+                        ready_rows += 1;
+                        selected.push(index);
+                        took_any = true;
+                    }
+                }
+            }
+        }
+        if took_any {
+            groups += 1;
+        }
+    }
+    Ok(selected)
+}
+
+/// 一组（同一 `doc_id` + `log_id`，按 relay_seq 升序）inbox 行的预检结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyGroupReadiness {
+    /// 所有行的 `end_vv` 都已被 `head_vv` 覆盖：只需标记，不需要 import。
+    Covered,
+    /// 至少一行未被覆盖且 `base_vv` 已被 `head_vv` 覆盖：至少有一行要 import。
+    Ready,
+    /// 未覆盖行的 `base_vv` 全都不满足：纯 deferred，本轮跳过（不重放、不占预算）。
+    Deferred,
+}
+
+/// 用 `head_vv`（O(1)）对一组行做轻量预检，**不** `load_body_doc`。
+///
+/// 语义与组内逐行重放后的检查一致：`end_vv` 已被覆盖 = 该 update 应用过；未覆盖行的
+/// `base_vv` 全不满足 = 真正缺外部依赖。空 `base_vv/end_vv` 由 [`decode_vv`] 归一化成
+/// 空版本向量（与逐行路径一致），空 `head_vv` 由 `HeadState::version_vector` 归一化。
+///
+/// 解码失败时返回 [`BodyGroupReadiness::Ready`]：把错误留给真正的组处理路径原样报出，
+/// 预检不能把损坏数据误判成 deferred 而让它永远滞留。
+fn body_group_readiness(
+    pending: &[PendingInboxRow],
+    indices: &[usize],
+    head_vv: &VersionVector,
+) -> BodyGroupReadiness {
+    let mut uncovered = false;
+    for &index in indices {
+        let Some(payload) = pending[index].row.verified_payload.as_deref() else {
+            return BodyGroupReadiness::Ready;
+        };
+        let Ok(update) = UpdateV1::decode(payload) else {
+            return BodyGroupReadiness::Ready;
+        };
+        let Ok(end_vv) = decode_vv(&update.end_vv, "end_vv 解码失败") else {
+            return BodyGroupReadiness::Ready;
+        };
+        if vv_includes(head_vv, &end_vv) {
+            continue;
+        }
+        uncovered = true;
+        let Ok(base_vv) = decode_vv(&update.base_vv, "base_vv 解码失败") else {
+            return BodyGroupReadiness::Ready;
+        };
+        if vv_includes(head_vv, &base_vv) {
+            return BodyGroupReadiness::Ready;
+        }
+    }
+    if uncovered {
+        BodyGroupReadiness::Deferred
+    } else {
+        BodyGroupReadiness::Covered
+    }
+}
+
+/// 组内各行的 relay_seq（批量标记用；顺序不影响标记语义）。
+fn relay_seqs_of(pending: &[PendingInboxRow], indices: &[usize]) -> Vec<u64> {
+    indices
+        .iter()
+        .map(|&index| pending[index].row.relay_seq)
+        .collect()
+}
+
+/// 解码 `UpdateV1.base_vv/end_vv`；空字节等价于空版本向量（seq=1 的规范形式）。
+fn decode_vv(bytes: &[u8], error: &'static str) -> Result<VersionVector, SyncError> {
+    if bytes.is_empty() {
+        return Ok(VersionVector::new());
+    }
+    VersionVector::decode(bytes).map_err(|_| SyncError::Object(error))
 }
 
 /// 空的 `end_vv`（seq=1 时）规范化为空版本向量的编码，避免接收端解码失败。

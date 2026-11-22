@@ -50,12 +50,14 @@ mod migrate;
 mod projector;
 mod read_api;
 mod read_snapshot;
+mod remote_known;
 pub mod rename_links;
 pub mod session;
 mod store;
 mod structure;
 mod structure_store;
 mod sync_bridge;
+mod sync_meta;
 mod tree_view;
 
 pub use actor::{AffectedGuard, Row, Statement, Vault};
@@ -66,8 +68,10 @@ pub use asset_store::{
     set_asset_orphan_since, unlink_asset_ref, AssetRef, AssetRefReconcile,
 };
 pub use baseline_apply::{
-    abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, baseline_apply_state,
-    begin_baseline_apply, finish_baseline_apply, BaselineApplyFinish, BaselineApplyState,
+    abort_baseline_apply, apply_baseline_assets, apply_baseline_batch,
+    baseline_apply_debug_counters, baseline_apply_debug_timings, baseline_apply_state,
+    begin_baseline_apply, finish_baseline_apply, reset_baseline_apply_debug,
+    BaselineApplyDebugCounters, BaselineApplyDebugTimings, BaselineApplyFinish, BaselineApplyState,
     BaselineApplyStatus, BaselineAsset, BASELINE_MERGE_BATCH, META_SYNC_RELAY_CURSOR,
 };
 pub use body_doc::{
@@ -102,8 +106,9 @@ pub use read_api::{
 pub use read_snapshot::{existing_vault_has_content, ReadSnapshot};
 pub use rusqlite::types::Value;
 pub use store::{
-    append_updates, create_body_doc, create_note_slot, end_frontier_at, end_vv_at, load_body_doc,
-    load_body_state, load_head, store_snapshot, BodyState, HeadState, UpdateRecord,
+    append_updates, append_updates_with_integrated_marks, create_body_doc, create_note_slot,
+    end_frontier_at, end_vv_at, load_body_doc, load_body_state, load_head, store_snapshot,
+    BodyState, HeadState, UpdateRecord,
 };
 pub use structure::{
     normalize_tag, NodeSnapshot, NoteSeed, StructureDoc, StructureSnapshot, TagSnapshot,
@@ -111,18 +116,18 @@ pub use structure::{
 };
 pub use structure_store::{ensure_structure_row, load_structure, StructureWriter};
 pub use sync_bridge::{
-    allocate_local_seq_for_import, append_updates_with_sync_intents, can_recycle_update,
-    count_inbox_ready, enqueue_sync_intent, intent_message_id, intent_object_id, local_sync_intent,
-    mark_acked, mark_inbox_quarantine, mark_integrated, mark_sent, mark_skipped_event_received,
-    outbox_parts, outbox_repack_candidates, outbox_row, outbox_rows, pending_encryption,
-    pending_send, repack_outbox, repack_required, set_confirmed_highwater, set_repack_required,
-    set_sync_log_id, store_encrypted_parts, store_inbox_verified, store_inbox_verified_batch,
-    sync_cursor_state, take_inbox_ready, take_inbox_ready_where, update_referenced_by_outbox,
-    OutboxKey, OutboxRepackCandidate, RepackOutcome, RepackPart, RepackPartSummary, RepackSpec,
-    SyncContext, SyncCursorState, SyncEncryptedPart, SyncInboxRow, SyncInboxState, SyncIntent,
-    SyncOutboxPart, SyncOutboxRow, SyncOutboxState, VerifiedInboxRow,
-    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
-    META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED, META_SYNC_SKIPPED_RECEIVED_PREFIX,
-    SYNC_INTENT_ID_DOMAIN,
+    advance_integrated_prefix, allocate_local_seq_for_import, append_updates_with_sync_intents,
+    can_recycle_update, count_inbox_ready, enqueue_sync_intent, intent_message_id,
+    intent_object_id, local_sync_intent, mark_acked, mark_inbox_quarantine, mark_integrated,
+    mark_integrated_batch, mark_sent, mark_skipped_event_received, outbox_parts,
+    outbox_repack_candidates, outbox_row, outbox_rows, pending_encryption, pending_send,
+    repack_outbox, repack_required, set_confirmed_highwater, set_repack_required, set_sync_log_id,
+    store_encrypted_parts, store_inbox_verified, store_inbox_verified_batch, sync_cursor_state,
+    take_inbox_ready, take_inbox_ready_where, update_referenced_by_outbox, OutboxKey,
+    OutboxRepackCandidate, RepackOutcome, RepackPart, RepackPartSummary, RepackSpec, SyncContext,
+    SyncCursorState, SyncEncryptedPart, SyncInboxRow, SyncInboxState, SyncIntent, SyncOutboxPart,
+    SyncOutboxRow, SyncOutboxState, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER,
+    META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED,
+    META_SYNC_SKIPPED_RECEIVED_PREFIX, SYNC_INTENT_ID_DOMAIN,
 };
 pub use tree_view::{list_notes, list_tree, list_tree_sorted, NodeKind, TreeEntry, TreeSort};

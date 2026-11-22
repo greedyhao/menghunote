@@ -2,15 +2,88 @@
 
 mod support;
 
+use std::time::Duration;
+
 use support::*;
 
-use menghunote_storage::{
-    abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, baseline_apply_state,
-    begin_baseline_apply, finish_baseline_apply, load_body_doc, sync_cursor_state,
-    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BodyDoc, Value, Vault,
-    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
-    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
+use menghunote_storage::session::{
+    ChangeSource, DocumentSession, EditOutcome, EditRequest, FlushReason, LiveRev, ScalarEdit,
+    SessionEpoch, SessionOptions,
 };
+use menghunote_storage::{
+    abort_baseline_apply, append_updates_with_integrated_marks, apply_baseline_assets,
+    apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_state,
+    begin_baseline_apply, create_note_slot, finish_baseline_apply, load_body_doc, load_head,
+    reset_baseline_apply_debug, set_sync_log_id, store_inbox_verified_batch, sync_cursor_state,
+    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BodyDoc, SyncContext, UpdateRecord,
+    Value, Vault, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
+    META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
+};
+use menghunote_text::UnicodeScalar;
+
+/// 测试用同步上下文：peer 故意不用常量 1（既有默认值），epoch = 1。
+const SYNC_CTX: SyncContext = SyncContext {
+    peer_id: 0xA1CE_0001,
+    key_epoch: 1,
+};
+
+fn session_options(sync: Option<SyncContext>) -> SessionOptions {
+    SessionOptions {
+        peer_id: SYNC_CTX.peer_id,
+        session_epoch: SessionEpoch(9),
+        sync,
+        ..SessionOptions::default()
+    }
+}
+
+fn scalar_edit(start: usize, end: usize, replacement: &str) -> ScalarEdit {
+    ScalarEdit {
+        start: UnicodeScalar::new(start),
+        end: UnicodeScalar::new(end),
+        replacement: replacement.to_owned(),
+    }
+}
+
+fn edit_request(
+    session: &DocumentSession,
+    command: &str,
+    base: u64,
+    edits: Vec<ScalarEdit>,
+) -> EditRequest {
+    EditRequest {
+        doc_id: session.doc_id().to_owned(),
+        generation: session.generation(),
+        session_epoch: session.session_epoch(),
+        command_id: command.to_owned(),
+        base_live_rev: LiveRev(base),
+        edits,
+        origin: "local".to_owned(),
+        undo_group: None,
+    }
+}
+
+/// 生成一条远端 update（模拟普通 pull/integrate 收到的数据）。
+fn remote_update(doc_id: &str, peer: u64, text: &str) -> Vec<u8> {
+    let doc = BodyDoc::create(doc_id, peer).expect("远端副本");
+    doc.insert_scalars(0, text).expect("远端编辑");
+    doc.export_all_updates().expect("导出 update")
+}
+
+/// 把一个已有快照装进本地文档并提交，使本地 VV == 快照 VV。
+fn seed_doc_from_snapshot(vault: &Vault, note_id: &str, doc_id: &str, snapshot: &[u8]) -> BodyDoc {
+    let _ = seed_note(vault, note_id, doc_id);
+    let doc = BodyDoc::restore(doc_id, PEER_A, Some(snapshot), &[]).expect("本地副本");
+    commit_now(vault, &doc, "local-copy");
+    doc
+}
+
+fn meta_remote_known_count(vault: &Vault, doc_id: &str) -> i64 {
+    count(
+        vault,
+        "SELECT count(*) FROM meta WHERE key=?1",
+        &[Value::Text(format!("sync.remote_known_vv.{doc_id}"))],
+    )
+}
 
 fn snapshot(doc_id: &str, peer: u64, text: &str) -> Vec<u8> {
     let doc = BodyDoc::create(doc_id, peer).expect("创建基线 LoroDoc");
@@ -577,4 +650,433 @@ fn schema_v3_has_baseline_journal_tables() {
             .expect("table query");
         assert_eq!(rows[0][0], Value::Integer(1), "缺少表 {table}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 解码/重放去重：snapshot 只解码一次，不再二次 import 大 snapshot
+// ---------------------------------------------------------------------------
+
+#[test]
+fn new_doc_decodes_snapshot_once_without_legacy_create_import() {
+    let (_dir, vault) = fresh_vault();
+    begin(&vault, 1, "src");
+    reset_baseline_apply_debug();
+    apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-new".to_owned(),
+            snapshot("doc-new", PEER_B, "from-baseline"),
+        )],
+        &[],
+    )
+    .expect("new doc");
+
+    let counters = baseline_apply_debug_counters();
+    assert_eq!(counters.snapshot_imports, 1, "snapshot 只允许解码/导入一次");
+    assert_eq!(counters.new_docs, 1);
+    assert_eq!(counters.load_body_doc_calls, 0, "新文档不需要重放本地副本");
+    assert_eq!(
+        counters.snapshot_reimport_bytes, 0,
+        "不得二次 import 大 snapshot"
+    );
+    assert_eq!(
+        counters.new_doc_import_bytes, 0,
+        "新文档不得走 create+import 旧路径"
+    );
+    assert_eq!(counters.pending_update_calls, 1);
+    assert!(counters.pending_update_bytes > 0);
+
+    let (doc, head) = load_body_doc(&vault, "doc-new", PEER_A, None).expect("load new");
+    assert_eq!(doc.text(), "from-baseline");
+    assert_eq!(head.head_seq, 1, "新文档仍只落一条 baseline_merge update");
+}
+
+#[test]
+fn existing_doc_fully_covered_by_baseline_writes_no_update() {
+    let (_dir, vault) = fresh_vault();
+    let snap = snapshot("doc-1", PEER_B, "shared content");
+    seed_doc_from_snapshot(&vault, "note-1", "doc-1", &snap);
+    let before_head = load_head(&vault, "doc-1").expect("head before");
+    let before_updates = count(
+        &vault,
+        "SELECT count(*) FROM loro_updates WHERE doc_id='doc-1'",
+        &[],
+    );
+
+    begin(&vault, 2, "src");
+    reset_baseline_apply_debug();
+    apply_baseline_batch(&vault, &[("doc-1".to_owned(), snap)], &[]).expect("apply");
+
+    let counters = baseline_apply_debug_counters();
+    assert_eq!(counters.existing_no_extra, 1);
+    assert_eq!(
+        counters.pending_update_calls, 0,
+        "VV 完全相同时不应导出/落盘任何 update"
+    );
+    assert_eq!(
+        counters.load_body_doc_calls, 0,
+        "只判 local_extra 时不得重放正文"
+    );
+    assert_eq!(counters.snapshot_reimport_bytes, 0);
+
+    let after_head = load_head(&vault, "doc-1").expect("head after");
+    assert_eq!(after_head.head_seq, before_head.head_seq, "head 不得被推进");
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-1'",
+            &[]
+        ),
+        before_updates,
+        "不得追加空 update"
+    );
+    assert_eq!(
+        meta_remote_known_count(&vault, "doc-1"),
+        1,
+        "即使无新 op，也要记录远端已知 VV"
+    );
+}
+
+#[test]
+fn existing_doc_with_baseline_superset_exports_only_missing_ops() {
+    let (_dir, vault) = fresh_vault();
+    // 远端两段提交：本地只有第一段，baseline 是完整两段。
+    let remote = BodyDoc::create("doc-1", PEER_B).expect("remote");
+    remote.insert_scalars(0, "first").expect("first");
+    let first_snapshot = remote.export_snapshot().expect("first snapshot");
+    remote.insert_scalars(5, "-second").expect("second");
+    let full_snapshot = remote.export_snapshot().expect("full snapshot");
+    seed_doc_from_snapshot(&vault, "note-1", "doc-1", &first_snapshot);
+
+    begin(&vault, 3, "src");
+    reset_baseline_apply_debug();
+    let full_len = full_snapshot.len() as u64;
+    apply_baseline_batch(&vault, &[("doc-1".to_owned(), full_snapshot)], &[]).expect("apply");
+
+    let counters = baseline_apply_debug_counters();
+    assert_eq!(counters.existing_no_extra, 1, "本地没有 baseline 之外的 op");
+    assert_eq!(counters.snapshot_imports, 1);
+    assert_eq!(counters.load_body_doc_calls, 0);
+    assert_eq!(counters.snapshot_reimport_bytes, 0);
+    assert_eq!(counters.pending_update_calls, 1);
+    assert!(
+        counters.pending_update_bytes > 0 && counters.pending_update_bytes < full_len,
+        "只应导出缺失的那一段（{} >= {}）",
+        counters.pending_update_bytes,
+        full_len
+    );
+
+    let (doc, head) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("merged");
+    assert_eq!(doc.text(), "first-second");
+    assert_eq!(head.head_seq, 2, "本地一条 + baseline 增量一条");
+}
+
+#[test]
+fn existing_doc_with_local_extra_imports_only_local_delta() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-1", "local");
+    let snap = snapshot(
+        "doc-1",
+        PEER_B,
+        "remote baseline text that is much larger than the local delta",
+    );
+    let snapshot_len = snap.len() as u64;
+
+    begin(&vault, 4, "src");
+    reset_baseline_apply_debug();
+    apply_baseline_batch(&vault, &[("doc-1".to_owned(), snap)], &[]).expect("apply");
+
+    let counters = baseline_apply_debug_counters();
+    assert_eq!(counters.existing_local_extra, 1);
+    assert_eq!(counters.snapshot_imports, 1);
+    assert_eq!(
+        counters.snapshot_reimport_bytes, 0,
+        "不得二次 import 大 snapshot"
+    );
+    assert_eq!(counters.new_doc_import_bytes, 0);
+    assert_eq!(counters.load_body_doc_calls, 1, "只允许一次本地重放");
+    assert!(counters.local_delta_bytes > 0, "本地增量不能为空");
+    assert!(
+        counters.local_delta_bytes < snapshot_len / 4,
+        "反向导入的必须只是本地小增量（{} vs snapshot {}）",
+        counters.local_delta_bytes,
+        snapshot_len
+    );
+    assert_eq!(counters.pending_update_calls, 1);
+    assert!(counters.pending_update_bytes > 0);
+
+    let (doc, _head) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("merged");
+    assert!(doc.text().contains("local"));
+    assert!(doc.text().contains("remote baseline text"));
+}
+
+#[test]
+fn existing_doc_with_local_op_depending_on_baseline_keeps_merged_frontier() {
+    let (_dir, vault) = fresh_vault();
+    // 远端：base 之后又追加了 -r2（本地还没收到）。
+    let remote = BodyDoc::create("doc-1", PEER_B).expect("remote");
+    remote.insert_scalars(0, "base").expect("baseline edit");
+    let first_snapshot = remote.export_snapshot().expect("first snapshot");
+    remote.insert_scalars(4, "-r2").expect("remote second edit");
+    let full_snapshot = remote.export_snapshot().expect("full snapshot");
+    // 本地：先收到 base，再在 base 之上编辑（本地 op 因果依赖基线 op）。
+    seed_doc_from_snapshot(&vault, "note-1", "doc-1", &first_snapshot);
+    let (local, _) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("local");
+    local
+        .insert_scalars(4, "-local")
+        .expect("local edit on baseline");
+    commit_now(&vault, &local, "local-on-baseline");
+
+    begin(&vault, 5, "src");
+    reset_baseline_apply_debug();
+    apply_baseline_batch(&vault, &[("doc-1".to_owned(), full_snapshot)], &[]).expect("apply");
+
+    let counters = baseline_apply_debug_counters();
+    assert_eq!(counters.existing_local_extra, 1);
+    assert_eq!(counters.load_body_doc_calls, 1);
+    assert!(
+        counters.local_delta_bytes > 0,
+        "本地依赖基线的新 op 必须作为差集导出"
+    );
+    assert_eq!(counters.snapshot_reimport_bytes, 0);
+
+    // 关键：本地 op 与远端 -r2 并发；head_frontier 必须等于重放后的 state frontiers，
+    // 否则 load_body_doc 直接报 Corrupt（detached 合并的 oplog frontier 必须正确）。
+    let (merged, head) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("merged replay");
+    assert!(merged.text().contains("base"));
+    assert!(merged.text().contains("-local"));
+    assert!(merged.text().contains("-r2"));
+    assert_eq!(head.head_seq, 3, "base + local + baseline 差集");
+}
+
+#[test]
+fn replay_same_digest_skips_snapshot_decode() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-1", "local");
+    let snap = snapshot("doc-1", PEER_B, "remote");
+    begin(&vault, 6, "src");
+    apply_baseline_batch(&vault, &[("doc-1".to_owned(), snap.clone())], &[]).expect("first apply");
+
+    reset_baseline_apply_debug();
+    apply_baseline_batch(&vault, &[("doc-1".to_owned(), snap)], &[]).expect("replay");
+    let counters = baseline_apply_debug_counters();
+    assert_eq!(counters.replayed_same_digest, 1);
+    assert_eq!(counters.snapshot_imports, 0, "重放不得再解码 snapshot");
+    assert_eq!(counters.snapshot_bytes, 0);
+    assert_eq!(counters.load_body_doc_calls, 0, "重放只允许 load_head");
+    assert_eq!(counters.pending_update_calls, 0);
+    assert_eq!(
+        baseline_apply_state(&vault)
+            .expect("state")
+            .expect("staging")
+            .applied_docs,
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 已有库 tombstone 判定：cross-journal 远端已知 VV
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tombstone_deletes_previous_baseline_doc_after_begin_clears_staging_tables() {
+    let (_dir, vault) = fresh_vault();
+    begin(&vault, 10, "src1");
+    apply_baseline_batch(
+        &vault,
+        &[("doc-x".to_owned(), snapshot("doc-x", PEER_B, "remote body"))],
+        &[],
+    )
+    .expect("first baseline");
+    assert!(matches!(
+        finish_baseline_apply(&vault, 10, "c10").expect("finish"),
+        BaselineApplyFinish::Applied(_)
+    ));
+    create_note_slot(&vault, "note-x", "doc-x", "远端笔记", 1).expect("note row");
+
+    // 模拟旧版本数据：只有 journal 行、没有跨 journal 的 meta。
+    vault
+        .exec(
+            "DELETE FROM meta WHERE key=?1",
+            &[Value::Text("sync.remote_known_vv.doc-x".to_owned())],
+        )
+        .expect("删 meta");
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM baseline_apply_docs WHERE doc_id='doc-x'",
+            &[]
+        ),
+        1
+    );
+
+    // 下一次快照追赶：begin 会清空 staging 子表，但必须先非破坏性地回填远端已知 VV。
+    begin(&vault, 20, "src2");
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
+        0,
+        "begin 仍清空本轮的 staging 子表"
+    );
+    assert_eq!(
+        meta_remote_known_count(&vault, "doc-x"),
+        1,
+        "旧 baseline VV 必须回填到 meta（非破坏性）"
+    );
+
+    let state = apply_baseline_batch(&vault, &[], &["doc-x".to_owned()]).expect("tombstone");
+    assert_eq!(meta_remote_known_count(&vault, "doc-x"), 1);
+    assert_eq!(
+        notes_deleted(&vault, "doc-x"),
+        1,
+        "远端已删 + 本地无额外 op 必须 deleted"
+    );
+    assert_eq!(state.kept_local_edit, 0);
+}
+
+#[test]
+fn tombstone_deletes_doc_pulled_through_normal_sync() {
+    let (_dir, vault) = fresh_vault();
+    seed_note(&vault, "note-pull", "doc-pull");
+    let mut session =
+        DocumentSession::open(&vault, "doc-pull", session_options(Some(SYNC_CTX))).expect("会话");
+    let delta = session
+        .apply_remote(&remote_update("doc-pull", PEER_B, "pulled body"))
+        .expect("导入远端")
+        .expect("应当产生 LiveDelta");
+    assert_eq!(delta.source, ChangeSource::Remote);
+    session.flush(FlushReason::Manual);
+    session
+        .wait_for_durable(LiveRev(1), Duration::from_secs(5))
+        .expect("远端导入必须 durable");
+    drop(session);
+
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM sync_outbox", &[]),
+        0,
+        "普通 pull 不得留下 outbox"
+    );
+    assert_eq!(
+        meta_remote_known_count(&vault, "doc-pull"),
+        1,
+        "normal pull/integrate 必须记录远端已知 VV"
+    );
+
+    begin(&vault, 7, "src");
+    let state = apply_baseline_batch(&vault, &[], &["doc-pull".to_owned()]).expect("tombstone");
+    assert_eq!(
+        notes_deleted(&vault, "doc-pull"),
+        1,
+        "head_seq>0、outbox 为空、内容全来自远端的文档必须 deleted"
+    );
+    assert_eq!(state.kept_local_edit, 0);
+}
+
+#[test]
+fn tombstone_keeps_local_only_doc() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-local", "local only");
+    assert_eq!(
+        meta_remote_known_count(&vault, "doc-local"),
+        0,
+        "local-only 文档不应有远端已知 VV"
+    );
+
+    begin(&vault, 8, "src");
+    let state = apply_baseline_batch(&vault, &[], &["doc-local".to_owned()]).expect("tombstone");
+    assert_eq!(
+        notes_deleted(&vault, "doc-local"),
+        0,
+        "local-only 文档绝不能被 tombstone 误删"
+    );
+    assert_eq!(state.kept_local_edit, 1);
+}
+
+#[test]
+fn tombstone_keeps_doc_with_unsynced_outbox() {
+    let (_dir, vault) = fresh_vault();
+    seed_note(&vault, "note-sync", "doc-sync");
+    let mut session =
+        DocumentSession::open(&vault, "doc-sync", session_options(Some(SYNC_CTX))).expect("会话");
+    let outcome = session.apply(edit_request(
+        &session,
+        "c1",
+        0,
+        vec![scalar_edit(0, 0, "unsynced local")],
+    ));
+    assert!(
+        matches!(outcome, EditOutcome::Applied(_)),
+        "本地编辑必须被受理：{outcome:?}"
+    );
+    session.flush(FlushReason::Manual);
+    session
+        .wait_for_durable(LiveRev(1), Duration::from_secs(5))
+        .expect("本地编辑 durable");
+    drop(session);
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM sync_outbox", &[]),
+        1,
+        "未上传的本地编辑必须留下 outbox"
+    );
+
+    begin(&vault, 9, "src");
+    let state = apply_baseline_batch(&vault, &[], &["doc-sync".to_owned()]).expect("tombstone");
+    assert_eq!(
+        notes_deleted(&vault, "doc-sync"),
+        0,
+        "有未同步 outbox 必须保留"
+    );
+    assert_eq!(state.kept_local_edit, 1);
+}
+
+#[test]
+fn tombstone_deletes_doc_integrated_through_engine_path() {
+    // 模拟后台 engine integrate：远端 update 先合进内存副本，再走
+    // `append_updates_with_integrated_marks` 组合落盘（普通 pull 的主路径）。
+    let (_dir, vault) = fresh_vault();
+    let log_id = [0x3a; 16];
+    set_sync_log_id(&vault, &log_id).expect("写入 sync.log_id");
+    let inbox = VerifiedInboxRow {
+        log_id,
+        relay_seq: 1,
+        object_id: [0x11; 32],
+        epoch: 1,
+        verified_payload: b"remote-update".to_vec(),
+    };
+    assert_eq!(
+        store_inbox_verified_batch(&vault, std::slice::from_ref(&inbox)).expect("inbox"),
+        1
+    );
+
+    let doc = seed_note(&vault, "note-pull2", "doc-pull2");
+    let current = load_head(&vault, "doc-pull2").expect("head");
+    doc.import(&remote_update("doc-pull2", PEER_B, "engine pulled"))
+        .expect("import remote");
+    let combined = doc
+        .pending_update(&current.version_vector().expect("vv"))
+        .expect("delta");
+    append_updates_with_integrated_marks(
+        &vault,
+        "doc-pull2",
+        current.head_seq,
+        &UpdateRecord::new("remote-batch", combined),
+        &log_id,
+        &[1],
+    )
+    .expect("engine integrate");
+
+    assert_eq!(
+        meta_remote_known_count(&vault, "doc-pull2"),
+        1,
+        "engine integrate 必须记录远端已知 VV"
+    );
+    assert_eq!(count(&vault, "SELECT count(*) FROM sync_outbox", &[]), 0);
+
+    begin(&vault, 11, "src");
+    let state = apply_baseline_batch(&vault, &[], &["doc-pull2".to_owned()]).expect("tombstone");
+    assert_eq!(
+        notes_deleted(&vault, "doc-pull2"),
+        1,
+        "后台 pull 集成来的文档在远端删除后必须 deleted"
+    );
+    assert_eq!(state.kept_local_edit, 0);
 }

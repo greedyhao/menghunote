@@ -159,7 +159,7 @@
 1. **触发公式**：必须用 `S - received_seq`（能被 checkpoint 真正抵消的窗口），不能只看
    `head - received`。`/bootstrap` 响应没有快照字节数，决策前要额外取一次 manifest
    （体积小、已签名）读 `docs.total_plain_len`；估算 replay 字节不足时用事件数 × 平均
-   update 大小，另加单次快照硬上限（建议 128 MiB）。
+   update 大小，另加单次快照硬上限（§9 已收紧为机会性 16 MiB；强制追赶只受本地磁盘预算）。
 2. **Asset 不能“全部跳过”**：当前 `pull` 对 ASSET 并不是只留 skipped 记录，而是
    `persist_skipped_asset` **真实下载、验签、解密并落库**（否则同步后图片取不到）。
    `bootstrap::load_baseline` 也是无条件 `download_assets`，`verify_imported` 还要求
@@ -187,3 +187,97 @@
 
 另外两个评审点确认成立：fallback 必须用**实际选中的** checkpoint S 推进游标；
 epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当损坏回退。
+
+---
+
+## 9. Phase 1A/1B 架构评审修订（2026-11-21）
+
+> 本节是**权威约束**；§6 的“500 条”初值已被本节取代。Phase 1B 代码尚未开始，
+> 需先完成 Stage 1（Phase 1A）的 release 标定并确认后再实现。
+
+### 9.1 双模式触发与双向成本模型
+
+**强制追赶（Mandatory）**
+- 条件：`state.gc_floor > local.received_seq`（普通 `pull` 会 `CursorExpired`）。
+- **不受任何机会性快照体积上限拦截**；只受本地磁盘安全预算保护（基线快照 + 临时
+  staging + 资产解压的峰值需预留）。
+- 失败必须进入明确的 `Paused` + 指数退避，**严禁回退普通 `pull`**（会立即再次过期，
+  形成死循环）。成功后才允许恢复普通 pull。
+- 强制追赶也不使用 `N_min`/成本交叉：只要能拿到合法 checkpoint，就必须尽快离开
+  过期游标。
+
+**机会性追赶（Opportunistic）**
+- 先取已签名的小体积 `manifest`，读**实际选定** checkpoint 的 `S` 与
+  `docs.total_plain_len`；fallback 时使用 fallback 的 `S`，不能拿 `head` 或 primary
+  的 `S` 代替。
+- 仅当同时满足才启动：
+  1. `S.saturating_sub(local.received_seq) >= N_min`，默认 **`N_min = 25_000`**
+     （可配置）。不得用 `head - received_seq`；
+  2. **快照密文字节硬上限默认 `16 MiB`**（可配置范围 8–16 MiB）。这是机会性上限，
+     不是 128 MiB 那种无分批保护的上限；超过即不启动机会性追赶，走普通聚合 pull。
+     下限 8 MiB 用于更保守的 rollout；
+  3. **双向成本交叉**：`estimated_replay_bytes >= max(8 MiB, 2.0 *
+     manifest.docs.total_plain_len)`，**且**预估增量集成时间 >
+     `1.5 *` 预估快照总耗时（下载 + 解密/验签 + merge + verify，按实测常数估）。
+     防止为几百 KB 增量去拉十几 MB 全库快照。
+- **单次持闸预算 3 000 ms**：`gate_hold_ms` 必须 < 3 s。选点时按当前 release 实测
+  （16 MiB 优化后 storage merge ≈0.1 s，见 §9.4）估算；估算超预算就不进机会性追赶。
+  实际持闸若超预算，`catchup_integrate` 必须中止并走无损回退，不能继续持闸。
+- 任一环节失败：清理临时 staging、记录冷却窗口（指数退避）、**无损回退普通聚合
+  pull**；不能卡死同步，也不能把失败当作 checkpoint 损坏而降级。
+
+### 9.2 写闸拆分与 gate_hold_ms
+
+- `catchup_prepare`（**不持写闸**）：`/bootstrap` 选 primary/fallback；fallback 必须
+  把**实际选中的** `S` 与 `checkpoint_cursor` 一起绑定到后续 integrate，不能沿用
+  primary 的值。验签 manifest 与 snapshot；用 `asset_bytes(vault, hash)` 预检
+  （长度 + SHA256），**只下载本地缺失的资产**；全部校验（含 epoch/轮换）通过后
+  暂存到有容量上限的 staging。
+- epoch/rotation 跨越未处理控制边界时：安全暂停等待控制帧，**不得当作快照损坏降级**。
+- `catchup_integrate`（**持写闸**）：先 flush 本地未落盘改动 → 分批/紧凑执行优化后的
+  `baseline_apply`（每批 5 篇；复用 detached oplog 合并，避免 attached 大文本重放）→
+  `finish_baseline_apply` 单调 CAS 推进水位与 cursor 到**实际选定且成功导入的**
+  checkpoint 的 `S`/cursor（fallback 时误用 primary S 是硬错误）→ 记录 `gate_hold_ms`。
+  `verify_imported` 放在闸外或单独预算内，不计入 3 s 持闸；若必须放入持闸，16 MiB
+  上限需按 §9.4 的 verify 实测重新收紧。
+- 复用 ADR 0012 现有 `sync_prepare`/`sync_integrate` 骨架，但 `bootstrap::run` 单体
+  不能直接塞进 `sync_once` 的持闸段。
+
+### 9.3 Inbox 清理与 Coverage 证明边界
+
+- 新增 `prune_covered_inbox(vault, up_to_seq)`：**仅在 `finalize` 事务成功且持久化
+  `integrated_seq >= S` 之后**清理（或标记覆盖）`relay_seq <= S` 的 inbox 记录。
+- 清理前必须让 coverage 证明可由 `integrated` 前缀（及 durable skipped-asset/
+  pending receipt 证据）覆盖；任何时刻崩溃都不能破坏 ADR 0006 的本地 checkpoint
+  coverage 证明。
+- 禁止在 finalize 之前按游标直接删除 inbox 行。
+
+### 9.4 Stage 1A Release 标定结论与缺陷收口（2026-11-21）
+
+`--release` 重跑后（详见 `sync-phase0-metrics.md` §8）：
+
+- 聚合正文把 `doc_loads` 从“每条一次”降到“每文档每页一次”：单文档 2000 条
+  `2000 → 8`、5000 条 `5000 → 20`；5000 条/20 篇 `5000 → 400`。
+  integrate 墙钟：2000 单文档 `28.9 s → 86 ms`，5000 单文档 `147.0 s → 275 ms`，
+  5000/20 篇 `14.9 s → 0.76 s`；**O(历史 × 事件) 已消除**。
+- Phase 1A 缺陷收口：聚合路径先用 `load_head` 预检，纯已覆盖组不再重放（`doc_loads=0`）、
+  纯 deferred 组不占预算（防跨文档饥饿）；同文档内存多轮 import 自愈物理乱序；
+  `baseline_apply` 去掉二次 snapshot import，detached oplog 合并把 5/20 MiB
+  storage merge 从 `2.7–4.1 s / 44.6–61.3 s` 降到 **35 ms / 110 ms**；
+  `actor` 批量写锁改 `BEGIN IMMEDIATE`，`skipped_received` 扫描加
+  `ORDER BY key LIMIT 4096` 并支持跨窗口推进。
+- `baseline_apply` 5→20 MiB 旧实现的 **14.8–16.9×** 超线性根因：**Loro attached
+  import 对“大文本 op + 非空本地文档”的 diff/state 应用**，占 gate 97.9–99.8%；
+  snapshot decode 3.4×、pending_update 3.35×，都接近线性。detached oplog 合并绕开
+  state/diff 后 gate 5→20 为 3.1–3.7×（4× 数据，亚线性）。
+- **但闸外 `verify_imported` 仍 2.7 s / 45.1 s（16.7×）**：它仍走 attached
+  `load_body_doc` 重放大 update。这是 Phase 1B 前的残余风险：`gate_hold` 小不代表
+  首次打开/B 物化小；后续应把合并结果落 `loro_docs.snapshot`（`store_snapshot`
+  已有）或等 Loro 侧优化，不能把 16 MiB 机会性上限当成“全链路 <3 s”。
+- **`N_min=25 000`、`16 MiB` 机会性硬上限** 是本次 release 数据 + 3 s 持闸预算的
+  默认值；最终值仍需用户确认。强制追赶不使用这两个阈值。
+- Phase 1B **尚未实现**；上述阈值确认后再编码。
+- Phase 1A 代码已落地：批量 inbox 原子化、按文档聚合 integrate、release 标定、
+  precheck/乱序/防饥饿、baseline detached merge；完整评审入口见
+  [`sync-review-packet-20261121.md`](sync-review-packet-20261121.md)，
+  文件清单见 [`sync-phase1a-review-index.md`](sync-phase1a-review-index.md)。

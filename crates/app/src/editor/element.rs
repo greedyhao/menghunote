@@ -144,122 +144,69 @@ impl EditorElement {
         }
     }
 
-    /// 画 IME 组合文本（overlay），返回本帧是否真的画了 preedit。
+    /// 组合串的“本帧 caret / 下划线”绘制入口。
     ///
-    /// preedit **不在布局里**（`LayoutFrame` 只描述 source），所以这里按光标位置临时
-    /// shaping 一次并画在光标右侧；组合串通常很短，超出行宽时由 content mask 裁掉。
+    /// preedit 已经通过 [`EditorView::composition_display`] 进入 `LayoutFrame`，正文
+    /// 绘制时就会推移后续文字/折行；这里**不再重复画字形**，只补 preedit 下划线与
+    /// 串尾唯一 caret，避免双份字形。
     ///
-    /// **caret 归属**：preedit 非空时，这一帧**唯一**的 caret 画在组合串末尾
-    /// （`x + shaped.width()`），调用方必须据此跳过 [`Self::paint_caret`]；否则组合串
-    /// 起点还会再画一条竖线（真机反馈：caret 停在 `biao'p` 开头）。
-    ///
-    /// `caret_visible` 是闪烁相位：隐藏时不画串尾 caret（preedit 文本与下划线保留）。
-    /// 组合期间 `pump` 会强制常亮，所以实际使用中组合时不会闪。
+    /// 返回本帧是否画了组合串（调用方据此跳过 `paint_caret`）。没有组合或临时布局
+    /// 不可用（跨行替换的兜底路径）返回 `false`，走普通 caret。
     fn paint_preedit(
         &self,
         geometry: &EditorGeometry,
-        display_caret: Option<usize>,
+        _display_caret: Option<usize>,
         focused: bool,
         caret_visible: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> bool {
-        let preedit = self.view.read(cx).preedit_text().map(str::to_owned);
-        let Some(preedit) = preedit else {
-            // 没有 preedit：清掉上一帧组合串 caret/底纸的痕迹，走原来的 caret 路径。
-            self.record_preedit_caret(cx, None, None);
+        let Some(composition) = self.view.read(cx).composition_display() else {
+            self.record_preedit_caret(cx, None);
             return false;
         };
-        // preedit 不进 display_text，但**位置**按 display 坐标算（标记可能被隐藏）。
-        // 兜底：极少数帧里 source→display 的 head 映射会拿不到（例如选区正跨过
-        // 刚被投影隐藏的标记）；此时仍应把组合串画在选区起点，不能静默消失。
-        let caret = display_caret.or_else(|| {
-            self.view
-                .read(cx)
-                .selection_in_display_range()
-                .map(|range| range.start)
-        });
-        let Some(caret) = caret else {
-            self.record_preedit_caret(cx, None, None);
+        let start = composition.start;
+        let end = composition.start + composition.len;
+        let Some((start_row, start_x)) = geometry.caret_row_x(start) else {
+            self.record_preedit_caret(cx, None);
             return false;
         };
-        let Some((row, x)) = geometry.caret_row_x(caret) else {
-            self.record_preedit_caret(cx, None, None);
+        let Some((end_row, end_x)) = geometry.caret_row_x(end) else {
+            self.record_preedit_caret(cx, None);
             return false;
         };
-        let sanitized = super::view::sanitize_single_line(&preedit);
-        if sanitized.is_empty() {
-            self.record_preedit_caret(cx, None, None);
-            return false;
-        }
         self.view.update(cx, |view, _| {
             view.preedit_paint_count += 1;
         });
-        // 宽度按**实际绘制用的 sanitized 文本** shaping（反引号/制表符/换行都已处理），
-        // 不能拿原始 preedit 的长度或估算宽度来定 caret 位置。
-        let shaped = super::glyph::shape_row_styled_at(
-            window,
-            &sanitized,
-            &[],
-            geometry.frame.row_font_size(row),
-            geometry.frame.lines[row].mono,
-        );
-        let top = geometry.row_top(row);
-        let width = shaped.width();
-        // **先擦底纸**：组合串不在布局里，只画在 caret 处；如果不清掉它下面的正文，
-        // 光标后面的已有文字会和组合串叠在一起（真机反馈的“输入时重叠”）。
-        // 只覆盖组合串实际宽度，后续文字虽然不会右移（布局没变），但不会被压字。
-        if width > px(0.0) {
+        // 下划线只画同一视觉行内；跨行组合串由折行后的每段字形自然显示。
+        if start_row == end_row && end_x > start_x {
+            let top = geometry.row_top(start_row) + geometry.row_height(start_row) - px(1.0);
             window.paint_quad(fill(
-                Bounds::new(point(x, top), size(width, geometry.row_height(row))),
-                theme::window_bg(),
-            ));
-        }
-        // 组合串用主色 + 下划线，和已提交文本区分开。
-        if let Err(error) = shaped.paint(
-            point(x, top),
-            geometry.row_height(row),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        ) {
-            eprintln!("[menghunote] 绘制 preedit 失败：{error}");
-        }
-        if width > px(0.0) {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(x, top + geometry.line_height - px(1.0)),
-                    size(width, px(1.0)),
-                ),
+                Bounds::new(point(start_x, top), size(end_x - start_x, px(1.0))),
                 theme::caret_color(),
             ));
         }
-        // 组合串末尾画这一帧唯一的 caret：同一视觉行、同一行高、同一颜色。
-        // 正文未聚焦或闪烁相位隐藏时不画（与 `paint_caret` 的口径一致）。
         let preedit_caret_x = if focused && caret_visible {
-            let caret_x = x + width;
             window.paint_quad(fill(
                 Bounds::new(
-                    point(caret_x, top),
-                    size(px(CARET_WIDTH), geometry.row_height(row)),
+                    point(end_x, geometry.row_top(end_row)),
+                    size(px(CARET_WIDTH), geometry.row_height(end_row)),
                 ),
                 theme::caret_color(),
             ));
-            Some(caret_x)
+            Some(end_x)
         } else {
             None
         };
-        self.record_preedit_caret(cx, preedit_caret_x, (width > px(0.0)).then_some(width));
+        self.record_preedit_caret(cx, preedit_caret_x);
         true
     }
 
     /// 记录本帧组合串末尾 caret 的绘制结果（headless 回归用；不参与业务判断）。
-    fn record_preedit_caret(&self, cx: &mut App, x: Option<Pixels>, mask_width: Option<Pixels>) {
+    fn record_preedit_caret(&self, cx: &mut App, x: Option<Pixels>) {
         self.view.update(cx, |view, _| {
             view.preedit_caret_painted_last_frame = x.is_some();
             view.preedit_caret_x_last_frame = x;
-            view.preedit_mask_width_last_frame = mask_width;
         });
     }
 
@@ -288,6 +235,69 @@ impl EditorElement {
                 theme::caret_color(),
             ));
         }
+    }
+
+    /// 画代码块的灰色圆角底（fenced / indented **整块**）。
+    ///
+    /// 只给整块代码块铺底：行内代码的底色仍由 `TextRun::background_color` 在
+    /// [`Self::paint_text`] 里刷，这里不重复画，避免"行内代码多出一条整行底"。
+    ///
+    /// - 区间来自 [`EditorView::code_block_display_ranges`]（**display** 坐标）；
+    /// - 纵向取该块首/末**可见**行的 `row_top`/`row_height`，并裁到 `bounds`：
+    ///   长块跨出视口时不会被画到正文外（圆角只在真正可见的边出现）；
+    /// - 横向固定 `PAD_X` 到 `width - PAD_X`（块级缩进不改变底色宽度）；
+    /// - 投影成 Object 的块（mermaid 预览）不铺源码底色：对象自己画背景/占位框。
+    ///
+    /// 本帧实际画出的块数记录到 `EditorView::code_block_backgrounds`（headless 断言用，
+    /// 行内代码不计入）。
+    fn paint_code_block_backgrounds(
+        &self,
+        bounds: Bounds<Pixels>,
+        geometry: &EditorGeometry,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let blocks = self
+            .view
+            .update(cx, |view, _| view.code_block_display_ranges());
+        let mut painted = 0usize;
+        let left = bounds.origin.x + px(theme::PAD_X);
+        let right = bounds.origin.x + bounds.size.width - px(theme::PAD_X);
+        let top_limit = bounds.origin.y;
+        let bottom_limit = bounds.origin.y + bounds.size.height;
+        if right > left && !blocks.is_empty() {
+            for range in &blocks {
+                let Some(rows) = geometry.visible_rows_for_display_range(range) else {
+                    continue;
+                };
+                // 单行投影的块（mermaid）整块落在对象行上：底色交给对象自己。
+                // 代码块不会被对象从中间截断，因此只看首/末可见行即可。
+                if geometry.object_row(rows.start).is_some()
+                    || geometry.object_row(rows.end - 1).is_some()
+                {
+                    continue;
+                }
+                let last_row = rows.end - 1;
+                let top = geometry.row_top(rows.start).max(top_limit);
+                let bottom =
+                    (geometry.row_top(last_row) + geometry.row_height(last_row)).min(bottom_limit);
+                if bottom <= top {
+                    continue;
+                }
+                window.paint_quad(quad(
+                    Bounds::new(point(left, top), size(right - left, bottom - top)),
+                    Corners::all(px(theme::CODE_BLOCK_CORNER_RADIUS)),
+                    theme::code_bg(),
+                    Edges::all(px(0.0)),
+                    transparent_black(),
+                    BorderStyle::default(),
+                ));
+                painted += 1;
+            }
+        }
+        // 记录本帧画出的块数：组合帧与"没有可见代码块"都是 0。
+        self.view
+            .update(cx, |view, _| view.code_block_backgrounds = painted);
     }
 
     /// 画正文（逐可见视觉行，跳过屏外行）。
@@ -629,14 +639,18 @@ impl EditorElement {
                 {
                     return;
                 }
-                // 非阻塞链接提示：任何正文点击都清掉（它只用于一次性反馈）。
-                down_view
-                    .update(cx, |view, _| view.clear_link_notice())
-                    .ok();
-                // 悬浮工具条上的点击由工具条自己的按钮处理：这里必须放行，否则会同时挪光标。
+                // 悬浮工具条/代码块复制按钮上的点击由浮层自己的按钮处理：这里必须
+                // 放行，否则会同时挪光标。**先判浮层再清提示**：浮层动作（复制代码/
+                // 复制链接）刚设上的 `link_notice` 不能被同一次手势清掉。
                 let toolbar_hit = down_view
                     .update(cx, |view, _| view.point_in_toolbar(event.position))
                     .unwrap_or(false);
+                if !toolbar_hit {
+                    // 非阻塞链接提示：任何正文点击都清掉（它只用于一次性反馈）。
+                    down_view
+                        .update(cx, |view, _| view.clear_link_notice())
+                        .ok();
+                }
                 // 正文右键菜单（ADR 0019 S3b4）：点菜单外 → 先关菜单，再照常处理这次
                 // 左键（落 caret / 选区）。菜单内的点击由菜单自己的按钮处理（上面已放行）。
                 let menu_hit = down_view
@@ -985,6 +999,90 @@ impl IntoElement for EditorElement {
     }
 }
 
+/// 把原 display 的语义样式段映射到 `composition_display()` 的临时文本。
+///
+/// 删除 `[start, start+removed)`，在 `start` 插入 `len` 字节的 Plain 样式；后续段整体
+/// 平移 `len - removed`。原样式应完整覆盖 display；这里仍防御性补 Plain 空洞。
+fn compose_style_runs(
+    styles: &[(std::ops::Range<usize>, menghunote_editor::StyleKind)],
+    composition: &super::view::CompositionDisplay,
+) -> Vec<(std::ops::Range<usize>, menghunote_editor::StyleKind)> {
+    use menghunote_editor::StyleKind;
+    let start = composition.start;
+    let end = start + composition.removed;
+    let inserted = composition.len;
+    let shift_after = |value: usize| -> usize {
+        value
+            .saturating_sub(composition.removed)
+            .saturating_add(inserted)
+    };
+    let mut out: Vec<(std::ops::Range<usize>, StyleKind)> = Vec::new();
+    let mut push = |range: std::ops::Range<usize>, kind: StyleKind| {
+        if range.start >= range.end {
+            return;
+        }
+        match out.last_mut() {
+            Some((last, last_kind)) if *last_kind == kind && last.end == range.start => {
+                last.end = range.end;
+            }
+            _ => out.push((range, kind)),
+        }
+    };
+    for (range, kind) in styles {
+        let (a, b) = (range.start, range.end);
+        if b <= start {
+            push(a..b, *kind);
+            continue;
+        }
+        if a >= end {
+            let a = if composition.removed == 0 {
+                a + inserted
+            } else {
+                shift_after(a)
+            };
+            let b = if composition.removed == 0 {
+                b + inserted
+            } else {
+                shift_after(b)
+            };
+            push(a..b, *kind);
+            continue;
+        }
+        // 与删除区间相交：保留左侧、右侧；被删部分不保留。
+        if a < start {
+            push(a..start, *kind);
+        }
+        if b > end {
+            let a = start + inserted;
+            let b = if composition.removed == 0 {
+                b + inserted
+            } else {
+                shift_after(b)
+            };
+            push(a..b, *kind);
+        }
+    }
+    // preedit 自身用 Plain；与相邻同 kind 合并由 push 负责。
+    push(start..start + inserted, StyleKind::Plain);
+    out.sort_by_key(|(range, _)| range.start);
+    // 防御：样式若有空洞，补 Plain，保证 runs 长度覆盖整篇。
+    let mut filled = Vec::with_capacity(out.len());
+    let mut cursor = 0usize;
+    for (range, kind) in out {
+        if range.start > cursor {
+            filled.push((cursor..range.start, StyleKind::Plain));
+        }
+        if range.start >= cursor {
+            filled.push((range.clone(), kind));
+            cursor = range.end;
+        }
+    }
+    if cursor < composition.text.len() {
+        filled.push((cursor..composition.text.len(), StyleKind::Plain));
+    }
+    filled
+}
+
 impl Element for EditorElement {
     type RequestLayoutState = ();
     type PrepaintState = Option<Rc<EditorGeometry>>;
@@ -1022,9 +1120,14 @@ impl Element for EditorElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         // 布局用 **display 文本**（Markdown 标记按当前 selection 隐藏/显现）。
-        // `WrapCache` 按文本比对，因此"caret 进入/离开构造导致 display 变长变短"
-        // 会自动让缓存失效并重排——不需要再单独记 `display_len`。
-        let text = self.view.read(cx).display_text();
+        // 组合期间改用 `composition_display()`：preedit 已插入 caret 处，后续文字
+        // 会随折行一起推移（Obsidian 式），而不是盖在已有文字上。
+        // `WrapCache` 按文本比对，因此组合/提交/取消都会自动让缓存失效并重排。
+        let composition = self.view.read(cx).composition_display();
+        let text = match &composition {
+            Some(composition) => composition.text.clone(),
+            None => self.view.read(cx).display_text(),
+        };
         let scroll_y = self.view.read(cx).scroll_y();
         let font = theme::font();
         let font_size = px(theme::FONT_SIZE);
@@ -1078,12 +1181,20 @@ impl Element for EditorElement {
         // 语义样式（display 坐标，完整覆盖）：绘制与命中都用它分段 shaping。
         // 注意：样式随 caret 变化（进入/离开构造），所以**每帧**都要按当前 runs 重新
         // shaping；`WrapCache` 只缓存折行（纯文本函数），不会把样式缓存住。
-        let styles = Rc::new(self.view.read(cx).style_runs_display());
+        let styles = Rc::new(match &composition {
+            Some(composition) => {
+                compose_style_runs(&self.view.read(cx).style_runs_display(), composition)
+            }
+            None => self.view.read(cx).style_runs_display(),
+        });
         // 代码块只读语法高亮：display 坐标快照（syntect 只在 source 变化时重跑；
         // 这里每帧只克隆一个 `Rc`）。颜色只在 shaping 时生效，不影响折行/行高/命中。
+        // 组合期间临时 display 坐标带插入偏移，语法 span 不再对得上；先不着色，
+        // 提交后下一帧恢复（比错位着色安全）。
         let code_highlight = self
             .view
             .update(cx, |view, _| view.code_highlight_display());
+        let code_highlight_active = composition.is_none();
         // 图片对象：几何矩形按 LayoutFrame 的行顶/行高算（元素局部坐标，下面再加 origin）。
         let objects_local = self.view.read(cx).object_paints(
             window,
@@ -1113,7 +1224,7 @@ impl Element for EditorElement {
                 // 代码行（等宽且落在代码块内）：用语法 spans 着色。字体/字号与普通
                 // shaping 完全一致（只是 TextRun 颜色不同），行宽与命中几何不变；
                 // 未命中 token 的文本仍是正文色。代码块里没有语义样式（粗体/斜体）。
-                if line.mono && code_highlight.is_code_range(&line.bytes) {
+                if code_highlight_active && line.mono && code_highlight.is_code_range(&line.bytes) {
                     let syntax = code_highlight.spans_for_line(&line.bytes);
                     return super::glyph::shape_row_code(
                         window,
@@ -1255,12 +1366,28 @@ impl Element for EditorElement {
 
         // 文字不能画到画布外面（最后一个视觉行可能只有半行高）。
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            // 顺序：选区底色 → 正文 → IME 组合串（含组合串末尾的 caret）→ 光标。
+            // 顺序：代码块灰底 → 选区底色 → 正文 → IME 组合串（含组合串末尾的
+            // caret）→ 光标。
             // 有 preedit 时组合串末尾那条竖线就是本帧唯一 caret，不能再从起点画。
-            self.paint_selection(&geometry, selection, display_selection, window, cx);
+            // 组合期间 frame 用的是临时 display 文本，`display_selection` / 分隔线 /
+            // 任务框 / 链接 / 代码块区间仍是原 display 坐标；这些按字节映射会错位，
+            // 先跳过（正文与 preedit 本身照常绘制，提交后下一帧恢复）。
+            let composing = self.view.read(cx).composition_display().is_some();
+            if !composing {
+                // 代码块灰底要在正文/选区**之前**：它是"这一块是一个代码块"的底层，
+                // 不能被文字或选区盖成别的颜色。
+                self.paint_code_block_backgrounds(bounds, &geometry, window, cx);
+                self.paint_selection(&geometry, selection, display_selection, window, cx);
+            } else {
+                // 组合帧没有画底色，计数归零（提交后恢复）。
+                self.view
+                    .update(cx, |view, _| view.code_block_backgrounds = 0);
+            }
             self.paint_text(&geometry, window, cx);
-            self.paint_thematic_breaks(bounds, &geometry, window, cx);
-            self.paint_task_boxes(&geometry, window);
+            if !composing {
+                self.paint_thematic_breaks(bounds, &geometry, window, cx);
+                self.paint_task_boxes(&geometry, window);
+            }
             self.paint_objects(bounds, &geometry, window, cx);
             let body_focused = self.view.read(cx).focus_handle(cx).is_focused(window);
             // 聚焦/失焦：闪烁立刻回到可见并重新计时（只在绘制帧观察，不额外注册监听）。
