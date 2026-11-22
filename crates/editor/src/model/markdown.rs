@@ -79,6 +79,19 @@ use crate::model::projection::{ProjectionMap, ProjectionPiece};
 use crate::model::selection::Selection;
 use crate::model::style::StyleRun;
 
+/// 任务框（`[ ]` / `[x]`）在**隐藏态**下的 display 占位文本（ADR 0019 S3）。
+///
+/// 2 个不换行空格（U+00A0）而不是可见的 `☐`：
+///
+/// - 绘制层会在该 display 区间上**自绘**复选框（主题色描边/勾），占位必须是不可见的；
+///   用可见字符会在字体缺字时露出豆腐块，也会与自绘方框重影；
+/// - NBSP 不参与断行，复选框不会在折行处被拆成两半；
+/// - 宽度约等于一个方框（正文 15px 等宽字体下约 16px），内容列/续行 hanging indent
+///   仍按**真实 shaping** 测量（app `block_metrics` 用同一段文本量宽度），不做字符数估算。
+///
+/// 它只出现在 display 串里；source 仍是 3 个字节的 `[ ]`/`[x]`，编辑永远写 source。
+pub const TASK_BOX_DISPLAY: &str = "\u{00A0}\u{00A0}";
+
 /// Markdown 构造类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ConstructKind {
@@ -100,6 +113,8 @@ pub enum ConstructKind {
     Strike,
     /// `[text](url)`。
     Link,
+    /// `[[Note]]` / `[[Note|alias]]`（wiki 链接；L1 只投影/点击）。
+    WikiLink,
 }
 
 impl ConstructKind {
@@ -108,7 +123,12 @@ impl ConstructKind {
     pub const fn is_inline(self) -> bool {
         matches!(
             self,
-            Self::Bold | Self::Emphasis | Self::InlineCode | Self::Strike | Self::Link
+            Self::Bold
+                | Self::Emphasis
+                | Self::InlineCode
+                | Self::Strike
+                | Self::Link
+                | Self::WikiLink
         )
     }
 
@@ -186,6 +206,88 @@ impl MarkdownConstruct {
     #[must_use]
     pub const fn content(&self) -> SourceRange {
         self.content
+    }
+}
+
+/// 一个普通 Markdown 链接（`[text](url)`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownLink {
+    span: SourceRange,
+    content: SourceRange,
+    dest: String,
+}
+
+impl MarkdownLink {
+    /// 完整链接区间。
+    #[must_use]
+    pub const fn span(&self) -> SourceRange {
+        self.span
+    }
+
+    /// 方括号内文本区间。
+    #[must_use]
+    pub const fn content(&self) -> SourceRange {
+        self.content
+    }
+
+    /// 解析后的目标 URL。
+    #[must_use]
+    pub fn dest(&self) -> &str {
+        &self.dest
+    }
+}
+
+/// 一条 wiki 链接（L1）。
+///
+/// 与 [`MarkdownImage`] 一样，它是构造之外的**附加元数据**：投影仍通过
+/// `ConstructKind::WikiLink` 隐藏括号；这里保留 target/heading/alias 的 source
+/// 区间，供 app 做“点击打开/未解析样式/重命名改写”。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownWikiLink {
+    span: SourceRange,
+    target: SourceRange,
+    heading: Option<SourceRange>,
+    alias: Option<SourceRange>,
+    display: SourceRange,
+}
+
+impl MarkdownWikiLink {
+    /// 整条链接（含 `[[`/`]]`）。
+    #[must_use]
+    pub const fn span(&self) -> SourceRange {
+        self.span
+    }
+
+    /// 目标笔记区间（`[[#H]]` 时为空区间）。
+    #[must_use]
+    pub const fn target(&self) -> SourceRange {
+        self.target
+    }
+
+    /// 目标笔记原文（从 source 切片；`[[#H]]` 为空）。
+    #[must_use]
+    pub fn target_text<'a>(&self, source: &'a str) -> &'a str {
+        source
+            .get(self.target.start().get()..self.target.end().get())
+            .unwrap_or("")
+    }
+
+    /// `#` 后的 heading 区间。
+    #[must_use]
+    pub const fn heading(&self) -> Option<SourceRange> {
+        self.heading
+    }
+
+    /// 别名的 source 区间。
+    #[must_use]
+    pub const fn alias(&self) -> Option<SourceRange> {
+        self.alias
+    }
+
+    /// 投影后可见内容区间。
+    #[must_use]
+    pub const fn display(&self) -> SourceRange {
+        self.display
     }
 }
 
@@ -305,6 +407,10 @@ pub struct MarkdownDocument {
     constructs: Vec<MarkdownConstruct>,
     /// 图片构造（S2a）：object 投影与 app 的图片加载都从这里取。
     images: Vec<MarkdownImage>,
+    /// wiki 链接（L1）：点击/未解析样式/重命名改写用。
+    wiki_links: Vec<MarkdownWikiLink>,
+    /// 普通链接（点击打开外链用）。
+    links: Vec<MarkdownLink>,
     /// 新解析器的完整语义（列表/行信息），即使行内投影回退到旧 scanner 也保留。
     semantic: ParsedMarkdown,
     /// 行内投影是否退回旧 scanner（只影响 inline 构造，不影响列表/块级）。
@@ -316,12 +422,32 @@ impl MarkdownDocument {
     pub fn parse(source: &str) -> Result<Self, MarkdownError> {
         let semantic = semantic::parse(source);
         let images = collect_images(source, &semantic);
+        let wiki_links = collect_wiki_links(source, &semantic);
+        let links = collect_links(source, &semantic);
         let legacy = legacy_constructs(source)?;
-        let (constructs, inline_fallback) = merge_constructs(source, &semantic, legacy);
+        let (mut constructs, inline_fallback) = merge_constructs(source, &semantic, legacy);
+        // wiki 构造不依赖旧 scanner 的 inline fallback：即使整篇退回旧 scanner，
+        // `[[...]]` 仍要投影，否则 fallback 文档里会突然显示双括号。
+        constructs.extend(wiki_constructs(source, &semantic));
+        constructs.sort_by_key(|construct| {
+            (
+                construct.span().start().get(),
+                construct.span().end().get(),
+                construct.kind(),
+            )
+        });
+        constructs.dedup_by(|a, b| {
+            a.kind() == b.kind()
+                && a.span() == b.span()
+                && a.markers() == b.markers()
+                && a.content() == b.content()
+        });
         Ok(Self {
             source: source.to_owned(),
             constructs,
             images,
+            wiki_links,
+            links,
             semantic,
             inline_fallback,
         })
@@ -331,6 +457,18 @@ impl MarkdownDocument {
     #[must_use]
     pub fn images(&self) -> &[MarkdownImage] {
         &self.images
+    }
+
+    /// 全部 wiki 链接（按文档顺序）。
+    #[must_use]
+    pub fn wiki_links(&self) -> &[MarkdownWikiLink] {
+        &self.wiki_links
+    }
+
+    /// 全部普通链接（按文档顺序；`dest` 已解析）。
+    #[must_use]
+    pub fn links(&self) -> &[MarkdownLink] {
+        &self.links
     }
 
     /// 只返回整行独占的图片（可投影成 Object Block）。
@@ -409,6 +547,9 @@ impl MarkdownDocument {
     ///
     /// 与构造显现规则不同：caret 恰好在 `marker.end`（内容起点）时**不**显现，
     /// 这样按 `End`/点内容时仍显示 bullet。
+    ///
+    /// ADR 0019 S3 起，任务项的 `[ ]`/`[x]` 也算 marker：caret 进入任务框同样整段
+    /// 显现源码（`- [ ] …`），于是点击/键盘进框时看到的是真实字符而不是自绘复选框。
     pub fn list_marker_revealed(
         &self,
         index: usize,
@@ -423,17 +564,8 @@ impl MarkdownDocument {
                 end: index,
                 len: self.semantic.items.len(),
             })?;
-        if item.marker.is_empty() {
-            return Ok(false);
-        }
-        let marker = self.range(item.marker.start, item.marker.end)?;
-        let start = selection.start().to_source_byte(&self.source)?.get();
-        let end = selection.end().to_source_byte(&self.source)?.get();
-        if start == end {
-            Ok(marker.start().get() <= start && start < marker.end().get())
-        } else {
-            Ok(marker.start().get() < end && marker.end().get() > start)
-        }
+        let (start, end) = self.selection_bytes(selection)?;
+        Ok(item_span_revealed(item, start, end))
     }
 
     /// 一次性算出所有列表 marker 的显现状态（`true` = 显示源码 marker）。
@@ -446,16 +578,7 @@ impl MarkdownDocument {
             .semantic
             .items
             .iter()
-            .map(|item| {
-                if item.marker.is_empty() {
-                    return false;
-                }
-                if start == end {
-                    item.marker.start <= start && start < item.marker.end
-                } else {
-                    item.marker.start < end && item.marker.end > start
-                }
-            })
+            .map(|item| item_span_revealed(item, start, end))
             .collect())
     }
 
@@ -513,6 +636,22 @@ impl MarkdownDocument {
             };
             let marker = self.range(item.marker.start, item.marker.end)?;
             replacements.push(ProjectionPiece::Replace(marker, text));
+        }
+        // ADR 0019 S3：任务框 `[ ]`/`[x]` → 不可见占位（绘制层在这个 display 区间
+        // 上自绘复选框）。marker 与任务框是两段相邻的 Replace，source 仍是逐字真源；
+        // caret/选区落在任务框上时（`revealed`）不产生 Replace，显示真实 `[ ]` 供编辑。
+        for (index, item) in self.semantic.items.iter().enumerate() {
+            if revealed.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(box_span) = item.task_marker else {
+                continue;
+            };
+            let box_range = self.range(box_span.start, box_span.end)?;
+            replacements.push(ProjectionPiece::Replace(
+                box_range,
+                TASK_BOX_DISPLAY.to_owned(),
+            ));
         }
         for line in &self.semantic.lines {
             let Some(list) = &line.list else {
@@ -713,6 +852,24 @@ impl MarkdownDocument {
     }
 }
 
+/// 一个列表 item 的 marker（含任务框）是否被 caret/选区显现。
+///
+/// 规则与旧实现一致：折叠 caret 严格落在 `[start, end)` 内；非空选区取相交。
+/// 任务框与列表 marker 是**同一条**“进入即显现”规则（ADR 0019 S3）：
+/// 二者任一命中就整段显示源码。
+fn item_span_revealed(item: &semantic::ListItem, start: usize, end: usize) -> bool {
+    let hits = |span: &semantic::Span| {
+        if start == end {
+            span.start <= start && start < span.end
+        } else {
+            span.start < end && span.end > start
+        }
+    };
+    let marker_hit = !item.marker.is_empty() && hits(&item.marker);
+    let box_hit = item.task_marker.is_some_and(|span| hits(&span));
+    marker_hit || box_hit
+}
+
 /// 合并有序/无序、可能重叠的 source 区间（保证升序、不重叠）。
 fn merge_ranges(
     source: &str,
@@ -765,6 +922,61 @@ fn legacy_constructs(source: &str) -> Result<Vec<MarkdownConstruct>, MarkdownErr
         )
     });
     Ok(constructs)
+}
+
+/// 新解析器的普通链接元数据 → editor 的 [`MarkdownLink`]。
+fn collect_links(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownLink> {
+    let mut links = Vec::new();
+    for link in &semantic.links {
+        let (Some(span), Some(content)) = (
+            convert_span(source, link.span),
+            convert_span(source, link.content),
+        ) else {
+            continue;
+        };
+        links.push(MarkdownLink {
+            span,
+            content,
+            dest: link.dest.clone(),
+        });
+    }
+    links
+}
+
+/// 新解析器的 wiki 元数据 → editor 的 [`MarkdownWikiLink`]。
+fn collect_wiki_links(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownWikiLink> {
+    let mut links = Vec::new();
+    for wiki in &semantic.wiki_links {
+        let (Some(span), Some(target), Some(display)) = (
+            convert_span(source, wiki.span),
+            convert_span(source, wiki.target),
+            convert_span(source, wiki.display),
+        ) else {
+            continue;
+        };
+        let heading = wiki
+            .heading
+            .and_then(|heading| convert_span(source, heading));
+        let alias = wiki.alias.and_then(|alias| convert_span(source, alias));
+        links.push(MarkdownWikiLink {
+            span,
+            target,
+            heading,
+            alias,
+            display,
+        });
+    }
+    links
+}
+
+/// 从解析器的 wiki 构造生成投影构造（含 alias 时的 target/`|` 隐藏）。
+fn wiki_constructs(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownConstruct> {
+    semantic
+        .constructs
+        .iter()
+        .filter(|construct| construct.kind == semantic::ConstructKind::WikiLink)
+        .filter_map(|construct| convert_construct(source, construct))
+        .collect()
 }
 
 /// 新解析器的图片构造 → editor 的 [`MarkdownImage`]（ADR 0019 S2a）。
@@ -950,6 +1162,7 @@ fn convert_construct(source: &str, construct: &semantic::Construct) -> Option<Ma
         semantic::ConstructKind::InlineCode => ConstructKind::InlineCode,
         semantic::ConstructKind::Strike => ConstructKind::Strike,
         semantic::ConstructKind::Link => ConstructKind::Link,
+        semantic::ConstructKind::WikiLink => ConstructKind::WikiLink,
         semantic::ConstructKind::Image => return None,
     };
     let span = convert_span(source, construct.span)?;

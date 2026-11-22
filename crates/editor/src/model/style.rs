@@ -67,6 +67,10 @@ pub enum StyleKind {
     Strike,
     /// `[text](url)` 的文本部分。
     Link,
+    /// `[[Note]]` / `[[Note|alias]]` 的可见部分。
+    WikiLink,
+    /// 解析不到目标的 wiki 链接（app 覆盖样式用；模型本身不判定）。
+    WikiLinkUnresolved,
 }
 
 impl StyleKind {
@@ -83,7 +87,8 @@ impl StyleKind {
             Self::Bold => 1,
             Self::Emphasis => 2,
             Self::Strike => 3,
-            Self::Link => 4,
+            Self::Link | Self::WikiLink => 4,
+            Self::WikiLinkUnresolved => 3,
             Self::Plain => 5,
         }
     }
@@ -215,6 +220,7 @@ fn semantic_kind(kind: ConstructKind) -> Option<StyleKind> {
         ConstructKind::InlineCode => Some(StyleKind::InlineCode),
         ConstructKind::Strike => Some(StyleKind::Strike),
         ConstructKind::Link => Some(StyleKind::Link),
+        ConstructKind::WikiLink => Some(StyleKind::WikiLink),
         ConstructKind::Heading
         | ConstructKind::BlockQuote
         | ConstructKind::ListItem

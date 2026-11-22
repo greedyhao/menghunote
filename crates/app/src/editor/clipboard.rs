@@ -47,11 +47,13 @@ pub enum ImportImageFormat {
     WebP,
     /// GIF（动画只取首帧，字节原样保留）
     Gif,
+    /// Windows CF_DIB：GPUI 已转成 BMP 文件字节；落库前转 PNG。
+    Bmp,
 }
 
 impl ImportImageFormat {
-    /// GPUI 剪贴板格式 → 首版支持的位图格式；SVG/BMP/TIFF/ICO 返回 `None`
-    /// （它们按普通附件处理）。
+    /// GPUI 剪贴板格式 → 位图格式；SVG/TIFF/ICO 返回 `None`（按普通附件处理）。
+    /// BMP 来自 Windows CF_DIB，落库前转 PNG。
     #[must_use]
     pub fn from_clipboard(format: ImageFormat) -> Option<Self> {
         match format {
@@ -59,7 +61,8 @@ impl ImportImageFormat {
             ImageFormat::Jpeg => Some(Self::Jpeg),
             ImageFormat::Webp => Some(Self::WebP),
             ImageFormat::Gif => Some(Self::Gif),
-            ImageFormat::Svg | ImageFormat::Bmp | ImageFormat::Tiff | ImageFormat::Ico => None,
+            ImageFormat::Bmp => Some(Self::Bmp),
+            ImageFormat::Svg | ImageFormat::Tiff | ImageFormat::Ico => None,
             // `ImageFormat` 是外部枚举（非本仓），新增变体时按"不支持"处理而不是 panic。
             _ => None,
         }
@@ -76,6 +79,8 @@ impl ImportImageFormat {
             Some(Self::Gif)
         } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
             Some(Self::WebP)
+        } else if bytes.starts_with(b"BM") {
+            Some(Self::Bmp)
         } else {
             None
         }
@@ -89,6 +94,7 @@ impl ImportImageFormat {
             Self::Jpeg => "jpg",
             Self::WebP => "webp",
             Self::Gif => "gif",
+            Self::Bmp => "bmp",
         }
     }
 
@@ -100,6 +106,7 @@ impl ImportImageFormat {
             Self::Jpeg => "image/jpeg",
             Self::WebP => "image/webp",
             Self::Gif => "image/gif",
+            Self::Bmp => "image/bmp",
         }
     }
 }
@@ -110,14 +117,15 @@ pub enum ImportPayload {
     /// 文件/目录路径（剪贴板 CF_HDROP 或拖放）。宿主只读**普通文件**、不递归目录、
     /// 不接受相对路径；每批 ≤ 10 项 / 总输入 ≤ 100 MiB / 单文件 ≤ 20 MiB。
     Files(Vec<PathBuf>),
-    /// 剪贴板位图（PNG/JPEG/WebP/GIF）：插入 `![名字](asset://hash)`，可进图片对象预览。
+    /// 剪贴板位图（PNG/JPEG/WebP/GIF/BMP）：插入 `![名字](asset://hash)`，可进图片对象预览。
+    /// BMP（Windows CF_DIB）在落库前转 PNG。
     Image {
         /// 剪贴板声明的格式（落库前以字节嗅探为准）。
         format: ImportImageFormat,
-        /// 原始编码字节（PNG/JPEG/WebP/GIF 容器，**不转码**）。
+        /// 原始编码字节（BMP 由 `stage_image` 转 PNG；其它格式不转码）。
         bytes: Vec<u8>,
     },
-    /// 其它剪贴板字节（SVG / BMP / TIFF / ICO）：按**普通附件**存，不执行、不预览。
+    /// 其它剪贴板字节（SVG / TIFF / ICO）：按**普通附件**存，不执行、不预览。
     Binary {
         /// 文件扩展名（不带点；落库前会清洗）。
         extension: String,
@@ -554,8 +562,17 @@ mod tests {
                 bytes: b"<svg/>".to_vec(),
             })
         );
-        // BMP/TIFF/ICO 同样按附件（保住字节，不做不支持的预览）。
+        // Windows CF_DIB 由 GPUI 转成 BMP：先进入图片负载，stage_image 会转 PNG。
         let entries = vec![ClipboardEntry::Image(image(ImageFormat::Bmp, b"BM"))];
+        assert!(matches!(
+            choose_paste(&entries, false),
+            PasteAction::Import(ImportPayload::Image {
+                format: ImportImageFormat::Bmp,
+                ..
+            })
+        ));
+        // TIFF/ICO 仍按附件。
+        let entries = vec![ClipboardEntry::Image(image(ImageFormat::Tiff, b"II*"))];
         assert!(matches!(
             choose_paste(&entries, false),
             PasteAction::Import(ImportPayload::Binary { .. })
@@ -612,6 +629,7 @@ mod tests {
             ImportImageFormat::Jpeg,
             ImportImageFormat::WebP,
             ImportImageFormat::Gif,
+            ImportImageFormat::Bmp,
         ] {
             assert!(!format.extension().is_empty());
             assert!(format.media_type().starts_with("image/"));
@@ -621,6 +639,7 @@ mod tests {
                     ImportImageFormat::Jpeg => ImageFormat::Jpeg,
                     ImportImageFormat::WebP => ImageFormat::Webp,
                     ImportImageFormat::Gif => ImageFormat::Gif,
+                    ImportImageFormat::Bmp => ImageFormat::Bmp,
                 }),
                 Some(format)
             );

@@ -215,6 +215,88 @@ fn task_list_markers_attach_to_their_own_item() {
 }
 
 #[test]
+fn task_list_marker_range_covers_brackets_only() {
+    // ADR 0019 S3：任务框的源码区间必须正好是 `[ ]` / `[x]` / `[X]` 两个方括号及
+    // 其内部字符（3 字节），**不含** `]` 之后的空白，也不含内容。
+    let source = "- [ ] todo\n- [x] done\n- [X] upper\n";
+    let doc = parse(source);
+    assert_eq!(doc.items.len(), 3);
+    assert!(
+        doc.items.iter().all(|item| item.task_marker.is_some()),
+        "三个任务项都必须有任务框区间"
+    );
+    let texts: Vec<&str> = doc
+        .items
+        .iter()
+        .map(|item| {
+            let span = item.task_marker.expect("任务项必须有 task_marker");
+            &source[span.start..span.end]
+        })
+        .collect();
+    assert_eq!(texts, vec!["[ ]", "[x]", "[X]"]);
+    // 区间终点正好在 `]` 之后：后续空格/正文不在区间内。
+    let first = doc.items[0].task_marker.expect("box");
+    assert_eq!(first.end, 5);
+    assert_eq!(&source[first.end..first.end + 1], " ", "任务框不含后续空格");
+    assert_eq!(doc.items[0].task, Some(false));
+    assert_eq!(doc.items[1].task, Some(true));
+    assert_eq!(doc.items[2].task, Some(true), "大写 X 也解析为勾选");
+}
+
+#[test]
+fn task_list_marker_spans_work_in_nested_ordered_and_quoted_items() {
+    let source = "- [ ] parent\n  - [x] child\n\n1. [X] ordered\n\n> - [ ] quoted\n";
+    let doc = parse(source);
+    let boxes: Vec<(String, bool)> = doc
+        .items
+        .iter()
+        .filter_map(|item| {
+            let span = item.task_marker?;
+            Some((source[span.start..span.end].to_owned(), item.task?))
+        })
+        .collect();
+    assert_eq!(
+        boxes,
+        vec![
+            ("[ ]".to_owned(), false),
+            ("[x]".to_owned(), true),
+            ("[X]".to_owned(), true),
+            ("[ ]".to_owned(), false),
+        ]
+    );
+    // 每个 span 都必须是 3 字节且以方括号包住一个 GFM 允许的字符。
+    for item in doc.items.iter().filter(|item| item.task_marker.is_some()) {
+        let span = item.task_marker.expect("box");
+        let slice = &source[span.start..span.end];
+        assert_eq!(slice.len(), 3, "{slice:?}");
+        assert!(slice.starts_with('[') && slice.ends_with(']'), "{slice:?}");
+    }
+}
+
+#[test]
+fn non_task_and_malformed_task_items_expose_no_box() {
+    for source in [
+        "- plain item\n",
+        // `]` 后没有空白：GFM 不把它当任务项。
+        "- [ ]no-space\n",
+        // marker 后 5 个空格：pulldown 的任务框扫描只看 ≤3 个前导空格。
+        "-     [ ] five-spaces\n",
+        // 不是 GFM 允许的框字符。
+        "- [ab] nope\n",
+    ] {
+        let doc = parse(source);
+        assert!(
+            doc.items.iter().all(|item| item.task.is_none()),
+            "{source:?} 不应被解析成任务项"
+        );
+        assert!(
+            doc.items.iter().all(|item| item.task_marker.is_none()),
+            "{source:?} 不应暴露任务框区间"
+        );
+    }
+}
+
+#[test]
 fn tables_and_setext_are_unsupported_spans_not_constructs() {
     let table = parse("| a | b |\n|---|---|\n| 1 | 2 |\n");
     assert!(!table.unsupported_spans.is_empty());
@@ -345,4 +427,82 @@ fn image_inside_link_only_reports_the_image_span() {
     assert_eq!(doc.images.len(), 1);
     assert_eq!(slice(source, doc.images[0].span), "![a](asset://aa)");
     assert_eq!(doc.images[0].dest, "asset://aa");
+}
+
+#[test]
+fn wiki_links_parse_alias_heading_and_paths() {
+    let source = "[[Note]] [[Note|别名]] [[Folder/Note#标题]] [[#当前标题]]\n";
+    let doc = parse(source);
+    assert_eq!(doc.wiki_links.len(), 4);
+    let first = &doc.wiki_links[0];
+    assert_eq!(slice(source, first.span), "[[Note]]");
+    assert_eq!(slice(source, first.target), "Note");
+    assert_eq!(slice(source, first.display), "Note");
+    assert!(first.heading.is_none() && first.alias.is_none());
+
+    let alias = &doc.wiki_links[1];
+    assert_eq!(slice(source, alias.span), "[[Note|别名]]");
+    assert_eq!(slice(source, alias.target), "Note");
+    assert_eq!(slice(source, alias.alias.expect("alias")), "别名");
+    assert_eq!(slice(source, alias.display), "别名");
+
+    let heading = &doc.wiki_links[2];
+    assert_eq!(slice(source, heading.target), "Folder/Note");
+    assert_eq!(slice(source, heading.heading.expect("heading")), "标题");
+    assert_eq!(slice(source, heading.display), "Folder/Note#标题");
+
+    let current = &doc.wiki_links[3];
+    assert!(current.target.is_empty());
+    assert_eq!(slice(source, current.heading.expect("heading")), "当前标题");
+    assert_eq!(slice(source, current.display), "#当前标题");
+
+    // 投影构造：alias 时隐藏 target/`|`，其它只隐藏括号。
+    let construct = doc
+        .constructs
+        .iter()
+        .find(|construct| {
+            construct.kind == ConstructKind::WikiLink && construct.content == alias.display
+        })
+        .expect("alias 构造");
+    assert_eq!(construct.markers.len(), 3);
+    assert_eq!(slice(source, construct.content), "别名");
+}
+
+#[test]
+fn wiki_links_skip_code_escapes_and_embedded_images() {
+    let source = "`[[code]]`\n\n```\n[[fence]]\n```\n\n\\[[escaped]] ![[embed]] [[ok]]\n";
+    let doc = parse(source);
+    assert_eq!(doc.wiki_links.len(), 1, "只应解析最后一个普通链接");
+    assert_eq!(slice(source, doc.wiki_links[0].target), "ok");
+    assert_eq!(
+        doc.wiki_links[0].span.start,
+        source.find("[[ok]]").expect("ok")
+    );
+}
+
+#[test]
+fn wiki_links_reject_empty_alias_and_cross_newline() {
+    let doc = parse("[[a|]] [[a\nb]] [[unclosed\n");
+    assert!(doc.wiki_links.is_empty(), "空别名/跨行/未闭合都不解析");
+}
+
+#[test]
+fn ordinary_links_keep_resolved_destinations() {
+    let source = "[示例](https://example.com/a?b=1) [邮箱](mailto:a@b.c) <https://auto.example>\n";
+    let doc = parse(source);
+    assert_eq!(doc.links.len(), 3);
+    let destinations: Vec<&str> = doc.links.iter().map(|link| link.dest.as_str()).collect();
+    assert_eq!(
+        destinations,
+        [
+            "https://example.com/a?b=1",
+            "mailto:a@b.c",
+            "https://auto.example"
+        ]
+    );
+    assert_eq!(slice(source, doc.links[0].content), "示例");
+    assert_eq!(
+        slice(source, doc.links[0].span),
+        "[示例](https://example.com/a?b=1)"
+    );
 }

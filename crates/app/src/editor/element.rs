@@ -20,16 +20,16 @@ use gpui::{
     fill, point, px, quad, relative, size, transparent_black, App, BorderStyle, Bounds,
     ContentMask, Corners, CursorStyle, DispatchPhase, Edges, Element, ElementId,
     ElementInputHandler, Entity, Focusable as _, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent,
-    ShapedLine, Style, TextAlign, Window,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    ScrollEvent, ShapedLine, Style, TextAlign, Window,
 };
 use menghunote_editor::{units, Bias, Selection};
 
-use super::geometry::EditorGeometry;
+use super::geometry::{EditorGeometry, TaskBoxPaint};
 use super::layout::VisualLine;
 use super::shared::EditorShared;
 use super::theme;
-use super::view::EditorView;
+use super::view::{EditorView, TaskCheckbox};
 
 /// 光标竖线宽度（像素）。
 const CARET_WIDTH: f32 = 2.0;
@@ -47,6 +47,12 @@ pub struct EditorElement {
     /// `dispatch_mouse_event` → `reset_cursor_style` 会自动在 IBeam / Arrow 之间切换，
     /// 不需要我们自己判进出、也不依赖"有没有重绘"。
     hitbox: Option<gpui::Hitbox>,
+    /// wiki/普通链接的独立 hitbox（悬停时切手形；只覆盖可见 display 内容）。
+    link_hitboxes: Vec<gpui::Hitbox>,
+    /// 图片对象 hitbox（悬停显示手形/可放大）。
+    object_hitboxes: Vec<gpui::Hitbox>,
+    /// 任务复选框 hitbox（ADR 0019 S3：悬停手形；点击只切换 source，不落 caret）。
+    task_hitboxes: Vec<gpui::Hitbox>,
 }
 
 impl EditorElement {
@@ -57,6 +63,9 @@ impl EditorElement {
             view,
             shared,
             hitbox: None,
+            link_hitboxes: Vec::new(),
+            object_hitboxes: Vec::new(),
+            task_hitboxes: Vec::new(),
         }
     }
 
@@ -316,6 +325,60 @@ impl EditorElement {
         }
     }
 
+    /// 画任务复选框（ADR 0019 S3）。
+    ///
+    /// 矩形来自本帧 shaping 的占位区间（两连 NBSP），方框在矩形内**居中**绘制：
+    /// 勾选态是主题强调色底 + 白色勾形，未勾选是白底灰描边。绘制在正文之后、
+    /// caret 之前，压在占位空白上；点击命中与指针样式由同一矩形驱动。
+    fn paint_task_boxes(&self, geometry: &EditorGeometry, window: &mut Window) {
+        for task in geometry.task_boxes() {
+            let rect = task.rect;
+            let side = (rect.size.height.as_f32() - 8.0)
+                .min(rect.size.width.as_f32() - 2.0)
+                .clamp(theme::TASK_BOX_MIN_SIZE, theme::TASK_BOX_MAX_SIZE);
+            let side = px(side);
+            let bounds = Bounds::new(
+                point(
+                    rect.origin.x + (rect.size.width - side) / 2.0,
+                    rect.origin.y + (rect.size.height - side) / 2.0,
+                ),
+                size(side, side),
+            );
+            if task.checked {
+                window.paint_quad(quad(
+                    bounds,
+                    Corners::all(px(theme::TASK_BOX_RADIUS)),
+                    theme::task_box_checked_bg(),
+                    Edges::all(px(1.0)),
+                    theme::task_box_checked_border(),
+                    BorderStyle::default(),
+                ));
+                let (x, y, edge) = (
+                    bounds.origin.x.as_f32(),
+                    bounds.origin.y.as_f32(),
+                    bounds.size.width.as_f32(),
+                );
+                let mut path = PathBuilder::stroke(px(1.5));
+                path.move_to(point(px(x + edge * 0.24), px(y + edge * 0.52)));
+                path.line_to(point(px(x + edge * 0.42), px(y + edge * 0.72)));
+                path.line_to(point(px(x + edge * 0.78), px(y + edge * 0.30)));
+                match path.build() {
+                    Ok(path) => window.paint_path(path, theme::task_box_check()),
+                    Err(error) => eprintln!("[menghunote] 绘制任务勾形失败：{error}"),
+                }
+            } else {
+                window.paint_quad(quad(
+                    bounds,
+                    Corners::all(px(theme::TASK_BOX_RADIUS)),
+                    theme::task_box_bg(),
+                    Edges::all(px(1.0)),
+                    theme::task_box_border(),
+                    BorderStyle::default(),
+                ));
+            }
+        }
+    }
+
     /// 注册本帧的鼠标监听（每帧重建，跟随最新 `bounds` 与几何）。
     fn register_handlers(
         &self,
@@ -343,6 +406,18 @@ impl EditorElement {
                 if toolbar_hit {
                     return;
                 }
+                // 任务复选框（ADR 0019 S3）：只切换 source，不落正文 caret、不开始拖选。
+                if let Some((item, source)) = down_geometry
+                    .task_box_at(event.position)
+                    .map(|task| (task.item, task.source))
+                {
+                    down_view
+                        .update(cx, |view, cx| {
+                            view.toggle_task_checkbox(item, source, Some(window), cx)
+                        })
+                        .ok();
+                    return;
+                }
                 // 图片对象：单击只选中块（描边），不展开源码、不产生对象内部 caret。
                 if let Some(object) = down_geometry.object_at(event.position) {
                     let line = object.line;
@@ -355,6 +430,27 @@ impl EditorElement {
                 let (byte, bias) = down_geometry
                     .byte_at_with_bias(event.position)
                     .unwrap_or((down_geometry.byte_at(event.position), Bias::Right));
+                // wiki 链接：单击打开（不先移动 caret；未解析由宿主提示）。
+                let wiki = down_view
+                    .update(cx, |view, _| view.wiki_link_at_display(byte))
+                    .ok()
+                    .flatten();
+                if let Some((target, heading)) = wiki {
+                    down_view
+                        .update(cx, |view, cx| view.request_wiki_link(target, heading, cx))
+                        .ok();
+                    return;
+                }
+                let external = down_view
+                    .update(cx, |view, _| view.external_link_at_display(byte))
+                    .ok()
+                    .flatten();
+                if let Some(url) = external {
+                    down_view
+                        .update(cx, |view, cx| view.request_external_link(url, cx))
+                        .ok();
+                    return;
+                }
                 down_view
                     .update(cx, |view, cx| {
                         view.begin_pointer_selection(byte, bias, window, cx)
@@ -416,6 +512,36 @@ impl EditorElement {
             },
         );
     }
+}
+
+/// 把任务框的 display 占位区间换算成本帧窗口矩形。
+///
+/// 与链接 hitbox 共用 `EditorGeometry::caret_row_x`（同一份 shaping），
+/// 因此绘制、命中、headless 断言看到的矩形完全一致；占位被折行拆开（跨视觉行）时
+/// 返回 `None`（不画半个复选框，也不产生半行点击区）。
+fn task_box_paint(
+    geometry: &EditorGeometry,
+    checkbox: &TaskCheckbox,
+    bounds: Bounds<Pixels>,
+) -> Option<TaskBoxPaint> {
+    let (row, start_x) = geometry.caret_row_x(checkbox.display.0)?;
+    let (end_row, end_x) = geometry.caret_row_x(checkbox.display.1)?;
+    if row != end_row || end_x <= start_x {
+        return None;
+    }
+    let rect = Bounds::new(
+        point(start_x, geometry.row_top(row)),
+        size(end_x - start_x, geometry.row_height(row)),
+    );
+    if !bounds.intersects(&rect) {
+        return None;
+    }
+    Some(TaskBoxPaint {
+        item: checkbox.item,
+        source: checkbox.source,
+        checked: checkbox.checked,
+        rect,
+    })
 }
 
 impl IntoElement for EditorElement {
@@ -552,7 +678,7 @@ impl Element for EditorElement {
             })
             .collect();
 
-        let geometry = Rc::new(EditorGeometry {
+        let mut geometry = EditorGeometry {
             frame,
             shaped,
             visible_start: first,
@@ -562,10 +688,60 @@ impl Element for EditorElement {
             viewport_height: bounds.size.height.as_f32(),
             styles,
             objects,
-        });
+            task_boxes: Vec::new(),
+        };
+        // 任务复选框（ADR 0019 S3）：display 上的占位区间 → 本帧窗口矩形。
+        // 与链接 hitbox 一样用 `caret_row_x`（同一份 shaping 几何），不按字符宽度估算。
+        geometry.task_boxes = self
+            .view
+            .read(cx)
+            .task_checkboxes()
+            .into_iter()
+            .filter_map(|checkbox| task_box_paint(&geometry, &checkbox, bounds))
+            .collect();
+        let geometry = Rc::new(geometry);
         self.shared.set_geometry(Rc::clone(&geometry));
         // 正文 hitbox：prepaint 阶段插入（与绘制矩形一致），paint 阶段绑定光标样式。
         self.hitbox = Some(window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal));
+        // wiki/普通链接：可见 display 区间各插一个 hitbox；悬停时由 gpui 切 PointingHand。
+        self.link_hitboxes.clear();
+        let mut link_ranges = self.view.read(cx).wiki_display_ranges();
+        for (start, end, target) in self.view.read(cx).external_link_display_ranges() {
+            // 只复用 start/end；target/heading 在这里不用。
+            link_ranges.push((start, end, target, None));
+        }
+        for (start, end, _, _) in link_ranges {
+            let Some((row, start_x)) = geometry.caret_row_x(start) else {
+                continue;
+            };
+            let Some((end_row, end_x)) = geometry.caret_row_x(end) else {
+                continue;
+            };
+            if row != end_row || end_x <= start_x {
+                continue;
+            }
+            let rect = Bounds::new(
+                point(start_x, geometry.row_top(row)),
+                size(end_x - start_x, geometry.row_height(row)),
+            );
+            if !bounds.intersects(&rect) {
+                continue;
+            }
+            self.link_hitboxes
+                .push(window.insert_hitbox(rect, gpui::HitboxBehavior::Normal));
+        }
+        self.object_hitboxes.clear();
+        for object in geometry.objects() {
+            if bounds.intersects(&object.rect) {
+                self.object_hitboxes
+                    .push(window.insert_hitbox(object.rect, gpui::HitboxBehavior::Normal));
+            }
+        }
+        self.task_hitboxes.clear();
+        for task in geometry.task_boxes() {
+            self.task_hitboxes
+                .push(window.insert_hitbox(task.rect, gpui::HitboxBehavior::Normal));
+        }
         Some(geometry)
     }
 
@@ -602,6 +778,7 @@ impl Element for EditorElement {
             // 顺序：选区底色 → 正文 → IME 组合串 → 光标（光标永远压在最上面）。
             self.paint_selection(&geometry, selection, display_selection, window, cx);
             self.paint_text(&geometry, window, cx);
+            self.paint_task_boxes(&geometry, window);
             self.paint_objects(bounds, &geometry, window, cx);
             self.paint_preedit(&geometry, display_caret, window, cx);
             self.paint_caret(&geometry, display_caret, window);
@@ -614,9 +791,23 @@ impl Element for EditorElement {
         // `set_cursor_style` 要求 paint 阶段；之后 gpui 在鼠标命中链变化时自己
         // 调 `reset_cursor_style`（进入本 hitbox → IBeam，离开 → Arrow），
         // 因此不存在"没重绘就漏判"，也不需要我们自己记状态。
+        // gpui 的 `cursor_style` 从后往前取第一个 hover 的 hitbox；主 hitbox 覆盖
+        // 正文，必须在**前**注册，链接的 PointingHand 后注册才能压过 IBeam。
         if let Some(hitbox) = &self.hitbox {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
-
+        }
+        for hitbox in &self.link_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        for hitbox in &self.object_hitboxes {
+            // 图片默认就是可放大/可点选的；选中后同样保持可点击的指针（平台无 zoom-in 枚举）。
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        for hitbox in &self.task_hitboxes {
+            // 任务复选框悬停手形；命中矩形的注册顺序在正文 IBeam 之后 → 手形压过 IBeam。
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        if let Some(hitbox) = &self.hitbox {
             // 证据（截图抓不到系统光标）：用 gpui 自己的 `is_hovered` 打一行变化日志。
             // 它读的就是 `mouse_hit_test`，与 `reset_cursor_style` 同源。
             #[cfg(debug_assertions)]

@@ -172,7 +172,8 @@ pub fn runs(doc: &MarkdownDocument) -> Result<Vec<BlockRun>, MarkdownError> {
             | ConstructKind::Emphasis
             | ConstructKind::InlineCode
             | ConstructKind::Strike
-            | ConstructKind::Link => {}
+            | ConstructKind::Link
+            | ConstructKind::WikiLink => {}
         }
     }
 

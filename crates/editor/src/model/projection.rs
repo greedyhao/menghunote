@@ -568,6 +568,21 @@ impl ProjectionMap {
             .map(|segment| segment.display_start.get()..segment.display_end.get())
     }
 
+    /// 给定被 `Replace` 的 source 区间，返回它在 display 上的字节区间。
+    ///
+    /// 只匹配 `source` **完全相同**的 Replace 段；当前投影里该区间是普通 Copy
+    /// （caret 进入、标记显现源码）或不存在时返回 `None`。
+    ///
+    /// 任务框（`[ ]`/`[x]` → [`crate::model::markdown::TASK_BOX_DISPLAY`]）用：
+    /// app 用它在占位文本上自绘复选框并建立点击命中区，返回 `None` 就不画、不命中。
+    #[must_use]
+    pub fn replace_display_range(&self, source: SourceRange) -> Option<Range<usize>> {
+        self.segments
+            .iter()
+            .find(|segment| segment.kind == SegmentKind::Replace && segment.source == source)
+            .map(|segment| segment.display_start.get()..segment.display_end.get())
+    }
+
     /// 由 source + 隐藏区间构造段表；隐藏区间必须有序、非空、在 source 内。
     fn project(source: &str, hidden: &[SourceRange]) -> Result<Self, ProjectionError> {
         let source_len = units::byte_len(source);

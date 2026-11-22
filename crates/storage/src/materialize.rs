@@ -16,6 +16,7 @@ use rusqlite::types::Value;
 
 use crate::actor::Statement;
 use crate::error::StorageError;
+use crate::links::{resolve_wiki_links, ResolvedWikiLink};
 use crate::store;
 use crate::Vault;
 
@@ -102,6 +103,7 @@ struct PreparedMaterialize {
     frontier: Vec<u8>,
     body_text: String,
     body_scalars: u64,
+    links: Vec<ResolvedWikiLink>,
 }
 
 /// 一条待物化的 outbox 记录。
@@ -182,6 +184,7 @@ fn prepare_materialize(
     let started = Instant::now();
     let body_text = doc.text();
     let body_scalars = doc.scalar_len() as u64;
+    let links = resolve_wiki_links(vault, note_id, &body_text)?;
     add_stage(timings, |timings| timings.text += started.elapsed());
 
     Ok(PreparedMaterialize {
@@ -191,11 +194,12 @@ fn prepare_materialize(
         frontier,
         body_text,
         body_scalars,
+        links,
     })
 }
 
-fn materialize_statements(prepared: &PreparedMaterialize) -> Result<[Statement; 2], StorageError> {
-    Ok([
+fn materialize_statements(prepared: &PreparedMaterialize) -> Result<Vec<Statement>, StorageError> {
+    let mut statements = vec![
         Statement::new(
             // CAS 规则：
             //  - body_seq 落后 → 正常推进；
@@ -220,7 +224,29 @@ fn materialize_statements(prepared: &PreparedMaterialize) -> Result<[Statement; 
                 Value::Integer(i64_of(prepared.target_seq)?),
             ],
         ),
-    ])
+        // links 是本地派生表：先清后插，和 body_md 同一个 B 事务提交。
+        Statement::new(
+            "DELETE FROM links WHERE from_note_id = ?1",
+            vec![Value::Text(prepared.note_id.clone())],
+        ),
+    ];
+    for link in &prepared.links {
+        statements.push(Statement::new(
+            "INSERT INTO links(from_note_id, start_byte, end_byte, to_note_id, target, kind, body_seq) \
+             VALUES(?1, ?2, ?3, ?4, ?5, 'wiki', ?6)",
+            vec![
+                Value::Text(prepared.note_id.clone()),
+                Value::Integer(i64_of(link.span_start)?),
+                Value::Integer(i64_of(link.span_end)?),
+                link.to_note_id
+                    .clone()
+                    .map_or(Value::Null, Value::Text),
+                Value::Text(link.target.clone()),
+                Value::Integer(i64_of(prepared.target_seq)?),
+            ],
+        ));
+    }
+    Ok(statements)
 }
 
 fn write_prepared(
@@ -349,14 +375,13 @@ pub fn reconcile_batched(
         }
 
         if !prepared.is_empty() {
-            let mut statements = Vec::with_capacity(prepared.len() * 2);
+            let mut statements = Vec::with_capacity(prepared.len() * 3);
+            let mut offsets = Vec::with_capacity(prepared.len());
             let mut statement_error = false;
             for item in &prepared {
+                offsets.push(statements.len());
                 match materialize_statements(item) {
-                    Ok([update, delete_outbox]) => {
-                        statements.push(update);
-                        statements.push(delete_outbox);
-                    }
+                    Ok(mut item_statements) => statements.append(&mut item_statements),
                     Err(_) => {
                         statement_error = true;
                         break;
@@ -370,7 +395,7 @@ pub fn reconcile_batched(
                 match vault.exec_transaction(&statements, &[]) {
                     Ok(affected) => {
                         for (index, item) in prepared.iter().enumerate() {
-                            if affected.get(index * 2).copied().unwrap_or(0) == 1 {
+                            if affected.get(offsets[index]).copied().unwrap_or(0) == 1 {
                                 summary.materialized += 1;
                                 vault.publish_event(crate::StorageEvent::BodyMaterialized {
                                     note_id: item.note_id.clone(),

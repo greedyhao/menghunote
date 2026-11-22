@@ -386,25 +386,43 @@ pub fn stage_image(
         });
     }
     // 声明格式与实际字节不一致时以字节为准（剪贴板可能挂错格式名）。
-    let format = ImportImageFormat::sniff(bytes).ok_or_else(|| {
-        AttachmentError::CorruptImage("不是 PNG/JPEG/WebP/GIF 的字节头".to_owned())
+    let detected = ImportImageFormat::sniff(bytes).ok_or_else(|| {
+        AttachmentError::CorruptImage("不是 PNG/JPEG/WebP/GIF/BMP 的字节头".to_owned())
     })?;
     let _ = declared;
+    // Windows 剪贴板 CF_DIB 经 GPUI 转成 BMP；资产管线只预览 PNG/JPEG/WebP/GIF，
+    // 所以**入库前**统一转 PNG（保留像素，不把 BMP 变成普通附件）。
+    let (format, data) = if detected == ImportImageFormat::Bmp {
+        (ImportImageFormat::Png, bmp_to_png(bytes)?)
+    } else {
+        (detected, bytes.to_vec())
+    };
     // 只校验预算（尺寸本身不写进正文/资产列：沿用现有 schema，不加列）。
-    image_dimensions(bytes, format)?;
+    image_dimensions(&data, format)?;
     let file_name = format!("{CLIPBOARD_IMAGE_STEM}.{}", format.extension());
-    let asset_hash = asset_content_hash(bytes);
+    let asset_hash = asset_content_hash(&data);
     Ok(PendingAttachment {
         path: None,
         media_type: format.media_type(),
         markdown: image_markdown(&file_name, &asset_hash),
         file_name,
-        data: bytes.to_vec(),
+        data,
         asset_hash,
     })
 }
 
-/// 剪贴板里的非位图字节（SVG / BMP / TIFF / ICO）→ 普通附件（不执行、不预览）。
+/// 剪贴板 BMP → PNG（Windows CF_DIB 的落库前转换）。
+fn bmp_to_png(bytes: &[u8]) -> Result<Vec<u8>, AttachmentError> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Bmp)
+        .map_err(|error| AttachmentError::CorruptImage(format!("BMP 解码失败：{error}")))?;
+    let mut output = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(|error| AttachmentError::CorruptImage(format!("BMP 转 PNG 失败：{error}")))?;
+    Ok(output.into_inner())
+}
+
+/// 剪贴板里的非可预览字节（SVG / TIFF / ICO；BMP 已在上游转 PNG）→ 普通附件。
 pub fn stage_binary(extension: &str, bytes: &[u8]) -> Result<PendingAttachment, AttachmentError> {
     if bytes.is_empty() {
         return Err(AttachmentError::EmptyFile);
@@ -812,6 +830,7 @@ fn image_dimensions(
         ImportImageFormat::Jpeg => image::ImageFormat::Jpeg,
         ImportImageFormat::Gif => image::ImageFormat::Gif,
         ImportImageFormat::WebP => image::ImageFormat::WebP,
+        ImportImageFormat::Bmp => image::ImageFormat::Bmp,
     };
     let (width, height) = image::ImageReader::with_format(Cursor::new(bytes), image_format)
         .into_dimensions()
@@ -1083,5 +1102,28 @@ mod tests {
         assert_eq!(staged.file_name, "粘贴图片.x");
         let staged = stage_binary("", b"x").unwrap();
         assert_eq!(staged.file_name, "粘贴图片.bin");
+    }
+
+    #[test]
+    fn windows_clipboard_bmp_is_converted_to_png_image_asset() {
+        let image = image::RgbaImage::from_pixel(3, 2, image::Rgba([10, 20, 30, 255]));
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bmp, image::ImageFormat::Bmp)
+            .expect("生成 BMP 失败");
+        let staged = stage_image(ImportImageFormat::Bmp, &bmp.into_inner())
+            .expect("BMP 剪贴板必须转成图片资产");
+        assert_eq!(staged.file_name, "粘贴图片.png");
+        assert_eq!(staged.media_type, "image/png");
+        assert!(
+            staged.markdown.starts_with("![粘贴图片.png](asset://"),
+            "必须写成图片语法：{}",
+            staged.markdown
+        );
+        assert_eq!(
+            ImportImageFormat::sniff(&staged.data),
+            Some(ImportImageFormat::Png),
+            "落库字节必须是 PNG（否则预览仍不认）"
+        );
     }
 }

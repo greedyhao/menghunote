@@ -132,6 +132,22 @@ pub fn text_runs(spans: &[(usize, StyleKind)]) -> Vec<TextRun> {
                         wavy: false,
                     });
                 }
+                StyleKind::WikiLink => {
+                    run.color = theme::link_color().into();
+                    run.underline = Some(gpui::UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(theme::link_color().into()),
+                        wavy: false,
+                    });
+                }
+                StyleKind::WikiLinkUnresolved => {
+                    run.color = theme::status_bar_text().into();
+                    run.underline = Some(gpui::UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(theme::status_bar_text().into()),
+                        wavy: true,
+                    });
+                }
             }
             run
         })

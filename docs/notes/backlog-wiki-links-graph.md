@@ -1,7 +1,37 @@
-# 待办：Wiki 双链与关系图谱（记录，未排期）
+# Wiki 双链与关系图谱
 
-> 2026-11-16 记录。两项都**未实现**；先做双链 L1/L2，再做图谱。
+> 2026-11-16 记录。**L1 已实现**（2026-11-17）：`[[...]]` 解析/投影/点击/
+> 未解析灰色样式；**L2a 已实现**（2026-11-17）：links 物化 + 反向链接面板；
+> **L2b 已实现**（2026-11-17）：笔记重命名联动改写解析到该笔记的 wiki 链接；
+> 图谱仍未做。
 > 图谱是 `links` 表的派生视图，不改同步协议、不改 schema。
+
+## L1 已实现（2026-11-17）
+
+- `crates/markdown` 自定义 inline pass：单行 `[[target#heading|alias]]`，排除代码块/
+  行内代码/转义/`![[...]]`；产出 `WikiLink` 元数据 + 投影构造；
+- editor 把 `WikiLink` 当行内构造（alias 时隐藏 target/`|`），app 单击打开；
+- 目标解析：路径精确 > 标题（大小写不敏感）> 最短路径；歧义/无匹配只提示，不自动建；
+- unresolved 链接渲染为灰色波浪下划线（`StyleKind::WikiLinkUnresolved`）；
+- 回归：`crates/markdown/tests/golden.rs` 3 个、`crates/editor/tests/wiki_links.rs` 2 个、
+  `crates/app/tests/headless_wiki.rs` 2 个。
+
+## L2b 已实现（2026-11-17）
+
+- `crates/storage/src/rename_links.rs`：
+  - `plan_wiki_link_renames` 纯函数：按解析结果只规划 target 子区间，四种写法 +
+    alias/heading/路径前缀/`.md`/末尾 `/` 逐字保留；代码/行内代码/转义/`![[...]]`
+    天然不在解析结果里；`linked_targets` 逐字比对 `links.target`，未解析/同名歧义不误改；
+  - `link_sources_for_note`：从 `links`（`kind='wiki'` 且 `to_note_id` 非空）取来源与
+    target 集合，不扫正文；
+  - `rewrite_link_sources`：逐篇 `SessionDriver::open → EditRequest → apply → close`
+    （有界等 durable + B 物化）；一篇一次正文提交，跨篇不原子；失败只计数不回滚。
+- App `commit_rename`：结构重命名**成功后**才联动（仅笔记，目录不改）；非活动来源走
+  storage 逐篇会话；**活动笔记自身是来源时走活动 `EditorView` 的同一个 driver**
+  （`rewrite_wiki_link_targets`），另开会话会用旧快照覆盖在途编辑；改写后 flush(Manual)
+  并等该 note 的 B 物化，`links` 自然刷新；notice 显示「更新 X 篇 / Y 条链接，失败 Z 篇」。
+- 回归：`crates/storage/tests/rename_links.rs` 8 个（纯函数 6 + 执行 2，含故障注入）；
+  `crates/app/tests/headless_wiki_rename.rs` 2 个（活动来源不 stale 覆盖 / 活动目标后切换）。
 
 ## 前置：Wiki 双链
 
@@ -11,7 +41,7 @@
 - 投影隐藏 `[[`/`]]`，alias 时隐藏 target/`|`，caret 进入 marker 显现源码；
 - 点击打开目标；unresolved 灰色虚线，不自动建笔记；
 - 解析规则：路径精确 > 标题（大小写不敏感）> 最短路径；仍冲突则 unresolved；
-- **重命名必须联动改写正文里的旧链接**（已决，2026-11-16）；详见下节；
+- **重命名必须联动改写正文里的旧链接**（已实现 L2b，2026-11-17）；详见下节；
 - 现有 SQLite `links(from_note_id,start_byte,end_byte,to_note_id,target,kind,body_seq)` 已就绪：
   - 正文物化 B 事务里写入，`kind='wiki'`；
   - `to_note_id` 按当前结构树解析，解析不到为 `NULL`；
@@ -61,6 +91,11 @@
 ### 已知限制
 
 - 跨多篇改写不进入单一撤销项；各篇仍按普通正文 undo 管理；
+- 活动笔记里**尚未物化到 `links`** 的新键入链接（同一会话内刚写、还没 flush）不会被
+  自动改写——L2b 以 `links` 行为“确实解析到该笔记”的判据，避免误改同名/歧义链接；
+- 失败目前只报告篇数（notice + stderr），没有持久化重试任务/「重试更新链接」按钮；
+  重命名本身已提交，后续可再做显式重试入口；
+- 改写同步发生在重命名提交之后，来源篇数很多时会阻塞 UI 若干毫秒/篇；
 - 远端并发编辑由 CRDT 合并；同一篇的改写若与远端冲突，以正常合并结果为准；
 - 拖拽移动/改文件夹（非标题重命名）暂不自动改路径链接，后续单独定；
 - 若 `links` 表尚未物化（L1 阶段），先扫描全库正文用解析器找链接，成本较高；

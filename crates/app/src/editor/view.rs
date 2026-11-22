@@ -36,29 +36,33 @@
 //! 所以放实体字段 + `notify()`；而折行结果与上一帧几何只影响绘制，放在
 //! [`EditorShared`] 里（见 `shared` 模块的说明）。
 
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    div, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
-    Render, SharedString, Window,
+    div, img, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, ImageSource, KeyDownEvent, MouseButton, MouseDownEvent,
+    ObjectFit, Pixels, Point, Render, SharedString, Window,
 };
 use menghunote_editor::{
     Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, MarkdownImage,
-    Selection, SourceByte, SourceRange, StyleKind, UnicodeScalar,
+    Selection, SourceByte, SourceRange, StyleKind, UnicodeScalar, TASK_BOX_DISPLAY,
 };
+use menghunote_storage::rename_links::{plan_wiki_link_renames, scalar_edits_for_renames};
 #[cfg(feature = "dev-sync")]
 use menghunote_storage::session::{
     AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease, ExternalCommitTicket, GateError,
     GateState, PreparedCommittedDelta,
 };
 use menghunote_storage::session::{
-    CloseReport, DriverEvent, EditOutcome, EditRequest, LiveDelta, RejectReason, SessionDriver,
+    CloseReport, DriverEvent, EditOutcome, EditRequest, FlushReason, LiveDelta, LiveRev,
+    RejectReason, ScalarEdit, SessionDriver,
 };
+use menghunote_storage::MaterializeOutcome;
 
 use super::clipboard::{
     choose_paste, AssetRefSummary, ImportPayload, ImportReport, ImportSource, ImportedSummary,
@@ -110,6 +114,15 @@ pub enum EditorEvent {
     SearchRequested,
     /// 一次粘贴/拖放的资产导入结果（宿主据此写提示行；失败时正文与引用都未改变）。
     ImportReported(Box<ImportReport>),
+    /// 点击 wiki 链接：目标与可选的 `#heading`（解析/打开由宿主负责）。
+    WikiLinkRequested {
+        /// 目标笔记文本（`[[#H]]` 时为空）。
+        target: String,
+        /// `#` 后的标题（不含 `#`）。
+        heading: Option<String>,
+    },
+    /// 点击普通 Markdown 链接：宿主负责校验 scheme 并打开外链。
+    ExternalLinkRequested(String),
 }
 
 /// 图片对象的状态（只读快照，测试/诊断用；不参与绘制决策）。
@@ -144,6 +157,22 @@ pub struct ObjectSnapshot {
     pub editing_source: bool,
     /// 源码是否直接可见（源码模式 / 未投影）。
     pub source_visible: bool,
+}
+
+/// 一个可点击任务复选框的**视图层**描述（ADR 0019 S3）。
+///
+/// 只含 source / display 字节与勾选态；窗口坐标矩形由 [`super::geometry::TaskBoxPaint`]
+/// 根据本帧 shaping 给出（绘制、命中、headless 断言同源）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskCheckbox {
+    /// 列表项下标（按 `ParsedMarkdown::items` 顺序）。
+    pub item: usize,
+    /// 是否已勾选（解析器状态）。
+    pub checked: bool,
+    /// 任务框源码区间 `(start, end)`（3 字节，含方括号）。
+    pub source: (usize, usize),
+    /// 占位文本的 display 区间（两连 NBSP；绘制/命中都在这个区间上）。
+    pub display: (usize, usize),
 }
 
 /// 这个按键是不是"打开搜索"的快捷键（**纯函数**，便于单测）。
@@ -202,12 +231,16 @@ pub struct EditorView {
     /// 用来在**没有资产链接的普通笔记**上跳过对账（否则每次按键都要跑一次引用查询）；
     /// 删掉最后一条链接的那次编辑必须仍然对账，所以这里保留"上一次有过"的痕迹。
     had_asset_links: bool,
+    /// 当前视图里解析不到的 wiki 目标（normalized；app 覆盖灰色虚线下划线）。
+    unresolved_wiki_targets: HashSet<String>,
     /// 当前悬停的图片对象源码行（悬浮工具条的触发源）。
     hovered_object_line: Option<usize>,
     /// 单击选中的图片对象源码行（描边/工具条/F2 的目标；选区变化会清空）。
     selected_object_line: Option<usize>,
     /// 本帧悬浮工具条的**窗口坐标**矩形（元素层用它避免把点击误当成正文命中）。
     toolbar_rect: Option<Bounds<Pixels>>,
+    /// 放大预览的图片（点击图片/放大按钮后显示；`None` = 关闭）。
+    zoomed_image: Option<Arc<gpui::RenderImage>>,
     /// 已被驱动受理的**本地**编辑代数（ADR 0012 S3 自动同步的触发源）。
     ///
     /// 只在 `EditOutcome::Applied` 上自增：远端 adopt 不经过 `submit_request`，
@@ -245,9 +278,11 @@ impl EditorView {
             images: ImageService::new(asset_provider),
             import_writer,
             had_asset_links: false,
+            unresolved_wiki_targets: HashSet::new(),
             hovered_object_line: None,
             selected_object_line: None,
             toolbar_rect: None,
+            zoomed_image: None,
             #[cfg(feature = "dev-sync")]
             local_edit_seq: 0,
         };
@@ -590,6 +625,136 @@ impl EditorView {
         })
     }
 
+    /// 当前**隐藏态**任务框的视图层描述（ADR 0019 S3；绘制/命中都从这里取）。
+    ///
+    /// 只返回“投影里确实是 Replace 占位”的项：
+    ///
+    /// - caret/选区进入 marker 或任务框 → `list_marker_revealed` 为真，源码显现，
+    ///   此时返回空（不画复选框，交给文本编辑）；
+    /// - 解析器没有给出精确 `task_marker` 区间 → 跳过（宁可不画，也不会点错字节）。
+    #[must_use]
+    pub fn task_checkboxes(&self) -> Vec<TaskCheckbox> {
+        let projection = self.controller.projection();
+        let source_len = projection.source_len();
+        let mut boxes = Vec::new();
+        for (index, item) in self.controller.list_items().iter().enumerate() {
+            let Some(span) = item.task_marker else {
+                continue;
+            };
+            if self.controller.list_marker_revealed(index) {
+                continue;
+            }
+            let Ok(source) = SourceRange::new(
+                SourceByte::new(span.start),
+                SourceByte::new(span.end),
+                source_len,
+            ) else {
+                continue;
+            };
+            let Some(display) = projection.replace_display_range(source) else {
+                continue;
+            };
+            boxes.push(TaskCheckbox {
+                item: index,
+                checked: item.task.unwrap_or(false),
+                source: (span.start, span.end),
+                display: (display.start, display.end),
+            });
+        }
+        boxes
+    }
+
+    /// 当前可见任务复选框的**窗口坐标**矩形 `(item, checked, rect)`。
+    ///
+    /// 几何与绘制/命中同源（上一帧 `EditorGeometry`）；滚出可见范围时不在列表里。
+    /// headless 测试用它定位点击，不按字符宽度估算坐标。
+    #[must_use]
+    pub fn task_checkbox_rects(&self) -> Vec<(usize, bool, Bounds<Pixels>)> {
+        self.shared.geometry().map_or_else(Vec::new, |geometry| {
+            geometry
+                .task_boxes()
+                .iter()
+                .map(|task| (task.item, task.checked, task.rect))
+                .collect()
+        })
+    }
+
+    /// 点击任务复选框：**只切换源码** `[ ] ↔ [x]`，不移动 caret、不改选区。
+    ///
+    /// - 一次点击一个 `EditRequest`（控制器 [`EditorController::toggle_task_marker`]），
+    ///   进会话撤销组；
+    /// - `source` 是命中帧记录的源码区间：与当前解析结果不一致（陈旧帧）就忽略，
+    ///   绝不拿旧偏移去改新文本；
+    /// - 持闸 / IME 组合中直接忽略（不产生请求）；
+    /// - 返回 `true` 表示请求已交给驱动（调用方据此重绘）。
+    pub fn toggle_task_checkbox(
+        &mut self,
+        item: usize,
+        source: (usize, usize),
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.pending_enter_text_input = false;
+        if self.frozen_by_external_commit() {
+            eprintln!("[menghunote] 同步持闸中：忽略任务框点击 item={item}");
+            return false;
+        }
+        if self.is_composing() {
+            eprintln!("[menghunote] IME 组合中：忽略任务框点击 item={item}");
+            return false;
+        }
+        // 防陈旧帧：命中用的矩形来自上一帧，远端变更可能已经改过 item/区间。
+        // 只认“当前解析结果里这个 item 的任务框仍是点击时那个 span”，不猜新的偏移。
+        let Some(current) = self
+            .controller
+            .list_items()
+            .get(item)
+            .and_then(|it| it.task_marker)
+        else {
+            return false;
+        };
+        if (current.start, current.end) != source {
+            eprintln!(
+                "[menghunote] 任务框点击已过期（item={item} span={source:?}，当前=({}, {})），忽略",
+                current.start, current.end
+            );
+            return false;
+        }
+        let before = self
+            .controller
+            .list_items()
+            .get(item)
+            .and_then(|it| it.task);
+        match self.controller.toggle_task_marker(item) {
+            Ok(Some(request)) => {
+                let command_id = request.command_id.clone();
+                if let Some(window) = window {
+                    window.focus(&self.focus_handle, cx);
+                }
+                let accepted = self.submit_request(Some(request)).is_some();
+                if accepted {
+                    // 点任务框与点正文一样结束图片对象的“点选态”，但不改文本 caret。
+                    self.selected_object_line = None;
+                    let after = self
+                        .controller
+                        .list_items()
+                        .get(item)
+                        .and_then(|it| it.task);
+                    eprintln!(
+                        "[menghunote] 任务框点击 item={item} {before:?} → {after:?} command_id={command_id}（只改 [ ]/[x]，caret 不变）"
+                    );
+                    cx.notify();
+                }
+                accepted
+            }
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("[menghunote] 任务框切换被拒：{error:?}");
+                false
+            }
+        }
+    }
+
     /// 图片对象的只读快照（headless 测试断言几何/状态用）。
     #[must_use]
     pub fn object_snapshots(&self) -> Vec<ObjectSnapshot> {
@@ -654,6 +819,7 @@ impl EditorView {
         let Some(image) = self.controller.block_image_at_line(line).cloned() else {
             return;
         };
+        let already_selected = self.selected_object_line == Some(line);
         let text = self.controller.source_text();
         let Ok(caret) = SourceByte::new(image.span().end().get()).to_scalar(&text) else {
             return;
@@ -665,7 +831,33 @@ impl EditorView {
         self.commit_selection(Selection::caret(caret), cx);
         self.selected_object_line = Some(line);
         self.preferred_x = None;
+        if already_selected {
+            self.open_object_zoom(line, cx);
+        }
         cx.notify();
+    }
+
+    /// 打开图片放大预览（图片已解码时）。
+    pub fn open_object_zoom(&mut self, line: usize, cx: &mut Context<Self>) {
+        let Some(image) = self.controller.block_image_at_line(line) else {
+            return;
+        };
+        let Some(hash) = parse_asset_hash(image.dest()) else {
+            return;
+        };
+        let ImageState::Ready(decoded) = self.images.state(hash) else {
+            return;
+        };
+        self.zoomed_image = Some(Arc::clone(&decoded.image));
+        self.selected_object_line = Some(line);
+        cx.notify();
+    }
+
+    /// 关闭图片放大预览。
+    pub fn close_object_zoom(&mut self, cx: &mut Context<Self>) {
+        if self.zoomed_image.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// 工具条「编辑源码」：把目标对象切换到源码模式（ADR 0019 §1）。
@@ -841,16 +1033,31 @@ impl EditorView {
                     let level_indent = quote + list.depth as f32 * theme::LIST_INDENT_PER_LEVEL;
                     let marker = items
                         .get(list.item)
-                        .map(|_| {
+                        .map(|item| {
                             if self.controller.list_marker_revealed(list.item) {
                                 self.controller
                                     .list_marker_source(list.item)
                                     .unwrap_or_default()
                                     .to_owned()
                             } else {
-                                self.controller
+                                let mut text = self
+                                    .controller
                                     .list_marker_text(list.item)
-                                    .unwrap_or_default()
+                                    .unwrap_or_default();
+                                // ADR 0019 S3：任务项的内容列还要跨过 `[ ]` 占位
+                                // （自绘复选框）与 `]` 之后的那段源空白；否则续行
+                                // hanging indent 会停在复选框下面，与正文错位。
+                                if let Some(span) = item.task_marker {
+                                    text.push_str(TASK_BOX_DISPLAY);
+                                    if let Some(rest) = source.get(span.end..) {
+                                        let ws = rest
+                                            .bytes()
+                                            .take_while(|byte| *byte == b' ' || *byte == b'\t')
+                                            .count();
+                                        text.push_str(&rest[..ws]);
+                                    }
+                                }
+                                text
                             }
                         })
                         .unwrap_or_default();
@@ -920,13 +1127,218 @@ impl EditorView {
             .collect()
     }
 
+    /// wiki 链接的目标（已归一化；供宿主解析）。
+    pub fn wiki_targets(&self) -> Vec<String> {
+        let source = self.controller.source_text();
+        self.controller
+            .wiki_links()
+            .iter()
+            .map(|link| normalize_wiki_target(link.target_text(&source)))
+            .collect()
+    }
+
+    /// 所有 wiki 链接的 **display** 字节区间（用于精确点击/手形光标）。
+    pub fn wiki_display_ranges(&self) -> Vec<(usize, usize, String, Option<String>)> {
+        let source = self.controller.source_text();
+        let mut ranges = Vec::new();
+        for link in self.controller.wiki_links() {
+            let Some(start) = self.controller.source_to_display(link.display().start()) else {
+                continue;
+            };
+            let Some(end) = self.controller.source_to_display(link.display().end()) else {
+                continue;
+            };
+            if start >= end {
+                continue;
+            }
+            let target = link.target_text(&source).to_owned();
+            let heading = link.heading().and_then(|span| {
+                source
+                    .get(span.start().get()..span.end().get())
+                    .map(str::to_owned)
+            });
+            ranges.push((start.get(), end.get(), target, heading));
+        }
+        ranges
+    }
+
+    /// 命中 wiki 链接：`display` 必须严格落在可见内容区间内。
+    ///
+    /// 末尾边界（`byte == end`）不算命中，这样点链接末尾会正常进入/显示源码，
+    /// 而不是直接跳转；上一行/邻近行的 display 字节也不会误命中。
+    pub fn wiki_link_at_display(&self, display: usize) -> Option<(String, Option<String>)> {
+        self.wiki_display_ranges()
+            .into_iter()
+            .find(|(start, end, _, _)| *start <= display && display < *end)
+            .map(|(_, _, target, heading)| (target, heading))
+    }
+
+    /// 所有普通链接的 **display** 可见内容区间（点击/手形用）。
+    pub fn external_link_display_ranges(&self) -> Vec<(usize, usize, String)> {
+        let mut ranges = Vec::new();
+        for link in self.controller.links() {
+            let Some(start) = self.controller.source_to_display(link.content().start()) else {
+                continue;
+            };
+            let Some(end) = self.controller.source_to_display(link.content().end()) else {
+                continue;
+            };
+            if start >= end {
+                continue;
+            }
+            ranges.push((start.get(), end.get(), link.dest().to_owned()));
+        }
+        ranges
+    }
+
+    /// 命中普通链接；只接受可见文本区间（末尾边界不跳转）。
+    pub fn external_link_at_display(&self, display: usize) -> Option<String> {
+        self.external_link_display_ranges()
+            .into_iter()
+            .find(|(start, end, _)| *start <= display && display < *end)
+            .map(|(_, _, dest)| dest)
+    }
+
+    /// 宿主更新“解析不到的目标集合”；变化时触发重绘/重排样式。
+    pub fn set_unresolved_wiki_targets(
+        &mut self,
+        targets: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.unresolved_wiki_targets != targets {
+            self.unresolved_wiki_targets = targets;
+            cx.notify();
+        }
+    }
+
     /// 本帧的语义样式段（display 字节区间，完整覆盖全文）。
     pub(crate) fn style_runs_display(&self) -> Vec<(std::ops::Range<usize>, StyleKind)> {
-        self.controller
+        let mut runs: Vec<(std::ops::Range<usize>, StyleKind)> = self
+            .controller
             .style_runs()
             .iter()
             .map(|run| (run.start().get()..run.end().get(), run.kind()))
-            .collect()
+            .collect();
+        if self.unresolved_wiki_targets.is_empty() {
+            return runs;
+        }
+        let source = self.controller.source_text();
+        let mut overrides = Vec::new();
+        for link in self.controller.wiki_links() {
+            let target = normalize_wiki_target(link.target_text(&source));
+            if !self.unresolved_wiki_targets.contains(&target) {
+                continue;
+            }
+            let Some(start) = self.controller.source_to_display(link.display().start()) else {
+                continue;
+            };
+            let Some(end) = self.controller.source_to_display(link.display().end()) else {
+                continue;
+            };
+            if start < end {
+                overrides.push((start.get()..end.get(), StyleKind::WikiLinkUnresolved));
+            }
+        }
+        for (range, kind) in overrides {
+            runs = replace_style_range(runs, range, kind);
+        }
+        runs
+    }
+
+    /// 命中一条 wiki 链接：返回 `(target, heading)`（源码切片，不含括号/alias）。
+    ///
+    /// `byte` 是源码字节；点击落在 display 文本上时由几何映射回来，因此 alias
+    /// 可见时命中的是显示区间，但这里仍用整条链接的 source span 判定。
+    pub fn wiki_link_at_source(&self, byte: SourceByte) -> Option<(String, Option<String>)> {
+        let source = self.controller.source_text();
+        let link = self.controller.wiki_links().iter().find(|link| {
+            let span = link.span();
+            span.start() <= byte && byte < span.end()
+        })?;
+        let target = link.target_text(&source).to_owned();
+        let heading = link.heading().and_then(|span| {
+            source
+                .get(span.start().get()..span.end().get())
+                .map(str::to_owned)
+        });
+        Some((target, heading))
+    }
+
+    /// 发出 wiki 链接请求（宿主负责解析目标并打开）。
+    pub fn request_wiki_link(
+        &mut self,
+        target: String,
+        heading: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(EditorEvent::WikiLinkRequested { target, heading });
+    }
+
+    /// 发出普通外链请求（宿主负责 scheme 校验并打开系统浏览器）。
+    pub fn request_external_link(&mut self, url: String, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::ExternalLinkRequested(url));
+    }
+
+    /// 重命名联动：通过**当前活动 driver** 改写正文里的 wiki 链接 target。
+    ///
+    /// 为什么必须走这里而不是 storage 的“另开一个会话”：活动笔记的 live 状态只在
+    /// 本视图的 driver 里；另开会话会拿旧快照写正文，把在途编辑覆盖掉（stale 覆盖）。
+    /// 本方法复用同一个 `EditRequest` 通道，再 `flush(Manual)` 等 durable + B 物化，
+    /// 因此 `links` 会在返回前刷新（不直接写 `body_md` / `links`）。
+    ///
+    /// `linked_targets` 是 `links` 里解析到被重命名笔记的 target 原文（见
+    /// [`menghunote_storage::rename_links::link_sources_for_note`]）。返回改写的链接数。
+    pub fn rewrite_wiki_link_targets(
+        &mut self,
+        old_title: &str,
+        new_title: &str,
+        linked_targets: &BTreeSet<String>,
+        timeout: Duration,
+    ) -> Result<usize, String> {
+        if self.frozen_by_external_commit() {
+            return Err("同步持闸中，未改写当前笔记".to_owned());
+        }
+        if self.is_composing() {
+            return Err("输入法组合中，未改写当前笔记".to_owned());
+        }
+        let source = self.controller.source_text();
+        let renames = plan_wiki_link_renames(&source, old_title, new_title, linked_targets);
+        if renames.is_empty() {
+            return Ok(0);
+        }
+        let edits = scalar_edits_for_renames(&source, &renames)?;
+        let selection = self.controller.selection();
+        let request = self
+            .controller
+            .compose_edits(edits.clone())
+            .map_err(|error| format!("构造链接改写请求失败：{error}"))?;
+        let Some(outcome) = self.submit_request(Some(request)) else {
+            return Err("链接改写请求未被受理".to_owned());
+        };
+        let target_live_rev = match outcome {
+            EditOutcome::Applied(applied) => applied.live_rev,
+            EditOutcome::Rejected(rejected) => {
+                return Err(format!("链接改写被拒：{:?}", rejected.reason));
+            }
+            EditOutcome::Stale(stale) => {
+                return Err(format!(
+                    "链接改写基准过期（current_live_rev={}）",
+                    stale.current_live_rev.0
+                ));
+            }
+        };
+        // `compose_edits` 会把 caret 移到最后一处替换之后；这里按同一组编辑把
+        // 用户原来的选区映射回来，避免自动改写把正在编辑的光标甩走。
+        let mapped = Selection::new(
+            UnicodeScalar::new(transform_scalar(selection.anchor().get(), &edits)),
+            UnicodeScalar::new(transform_scalar(selection.head().get(), &edits)),
+        );
+        if let Err(error) = self.controller.set_selection(mapped) {
+            eprintln!("[menghunote] 链接改写后恢复选区失败：{error}");
+        }
+        self.driver.flush(FlushReason::Manual);
+        self.await_link_materialize(target_live_rev, timeout)?;
+        Ok(renames.len())
     }
 
     /// 当前选区在 **display** 坐标下的字节区间（`None` = 换算失败，不画）。
@@ -1060,6 +1472,63 @@ impl EditorView {
     /// 图片解码线程随视图 Drop 关闭（worker 收到 `Shutdown` 后退出，不等待未完成的解码）。
     pub fn close_session(&mut self) {
         self.drain_and_close(CLOSE_TIMEOUT);
+    }
+
+    /// 手动 flush 后等待 durable + B 物化（重命名联动改写用）。
+    ///
+    /// 不走 `close`：活动文档的会话必须继续可用。等待条件与 `close` 同一口径：
+    /// ACK 覆盖本次 target，且该 ACK 对应的物化结果已经返回（`body_seq >= head_seq`）。
+    /// 与 `close` 一样是**有界**的，超时返回错误而不是挂死 UI。
+    fn await_link_materialize(&mut self, target: LiveRev, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut durable_head: Option<u64> = None;
+        let mut materialized_seq: Option<u64> = None;
+        let mut materialize_error: Option<String> = None;
+        loop {
+            for event in self.driver.pump() {
+                match event {
+                    DriverEvent::Durable(ack) => {
+                        self.controller.apply_durable_ack(&ack);
+                        if ack.through_live_rev >= target {
+                            durable_head = Some(
+                                durable_head.map_or(ack.head_seq, |head| head.max(ack.head_seq)),
+                            );
+                        }
+                    }
+                    DriverEvent::Materialized(outcome) => {
+                        let body_seq = match outcome {
+                            MaterializeOutcome::Applied { body_seq, .. }
+                            | MaterializeOutcome::Stale { body_seq, .. } => body_seq,
+                        };
+                        materialized_seq =
+                            Some(materialized_seq.map_or(body_seq, |seq| seq.max(body_seq)));
+                    }
+                    DriverEvent::MaterializeFailed { note_id, message } => {
+                        // 事件可能先于 Durable 到达；先记下，等 ACK 后统一报错。
+                        materialize_error =
+                            Some(format!("links 物化失败（note={note_id}）：{message}"));
+                    }
+                    DriverEvent::Remote(delta) => {
+                        if let Err(error) = self.controller.apply_live_delta(delta) {
+                            eprintln!("[menghunote] 链接改写期间远端变更未能应用：{error}");
+                        }
+                    }
+                    DriverEvent::FlushScheduled { .. } => {}
+                }
+            }
+            if let Some(head) = durable_head {
+                if let Some(message) = materialize_error {
+                    return Err(message);
+                }
+                if materialized_seq.is_some_and(|seq| seq >= head) {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("等待正文落库/物化超时".to_owned());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     // ---- 鼠标 ----
@@ -2740,7 +3209,51 @@ impl Focusable for EditorView {
 }
 
 impl EditorView {
-    /// 悬浮工具条（ADR 0019 §1）：至少「编辑源码」「复制 Markdown」。
+    /// 图片放大预览遮罩（点击图片/工具条放大按钮打开；点击任意处关闭）。
+    fn render_image_zoom(
+        &self,
+        image: Arc<gpui::RenderImage>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("image-zoom-overlay")
+            .debug_selector(|| "image-zoom-overlay".to_string())
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x000000cc))
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "escape" {
+                    view.close_object_zoom(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    view.close_object_zoom(cx);
+                }),
+            )
+            .child(
+                div()
+                    .id("image-zoom-image")
+                    .debug_selector(|| "image-zoom-image".to_string())
+                    .max_w(gpui::relative(0.9))
+                    .max_h(gpui::relative(0.9))
+                    .child(
+                        img(ImageSource::Render(image))
+                            .object_fit(ObjectFit::Contain)
+                            .max_w(gpui::relative(0.9))
+                            .max_h(gpui::relative(0.9)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 悬浮工具条（ADR 0019 §1）：放大 + 编辑源码（Obsidian 式）。
     ///
     /// 位置来自**上一帧几何**里该对象的矩形（窗口坐标减去元素原点 = 元素局部坐标），
     /// 因此滚动/重排后一帧内自动跟随；图片滚出可见范围时不渲染。
@@ -2752,8 +3265,10 @@ impl EditorView {
             .iter()
             .find(|object| object.line == line)?;
         let (viewport_width, _) = self.shared.viewport();
-        let toolbar_width = theme::OBJECT_TOOLBAR_BUTTON_WIDTH * 2.0 + 8.0;
+        // 两枚 28px 按钮 + 中间 4px gap + 左右各 4px padding。
+        let toolbar_width = theme::OBJECT_TOOLBAR_BUTTON_WIDTH * 2.0 + 4.0 + 8.0;
         let toolbar_height = theme::OBJECT_TOOLBAR_HEIGHT;
+        let target_line = line;
         let local_left = (object.rect.origin.x - geometry.origin.x).as_f32()
             + object.rect.size.width.as_f32()
             - toolbar_width;
@@ -2782,21 +3297,23 @@ impl EditorView {
                 .justify_center()
                 .w(px(theme::OBJECT_TOOLBAR_BUTTON_WIDTH))
                 .h_full()
-                .text_size(px(12.0))
+                .rounded(px(6.0))
+                .text_size(px(15.0))
                 .text_color(theme::object_toolbar_text())
+                .hover(|style| style.bg(theme::sidebar_selected_bg()))
                 .child(SharedString::from(label))
         };
 
-        let edit = button("object-toolbar-edit", "编辑源码").on_mouse_down(
+        let zoom = button("object-toolbar-zoom", "⊕").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, _event: &MouseDownEvent, _window, cx| {
+                view.open_object_zoom(target_line, cx);
+            }),
+        );
+        let edit = button("object-toolbar-edit", "</>").on_mouse_down(
             MouseButton::Left,
             cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
                 view.enter_selected_object_source_edit(cx);
-            }),
-        );
-        let copy = button("object-toolbar-copy", "复制 Markdown").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
-                view.copy_selected_object_markdown(cx);
             }),
         );
 
@@ -2809,14 +3326,17 @@ impl EditorView {
                 .top(px(local_top))
                 .flex()
                 .flex_row()
+                .items_center()
                 .h(px(toolbar_height))
+                .p(px(4.0))
+                .gap(px(4.0))
                 .bg(theme::object_toolbar_bg())
                 .border(px(1.0))
                 .border_color(theme::object_toolbar_border())
-                .rounded(px(theme::OBJECT_CORNER_RADIUS))
+                .rounded(px(8.0))
                 .overflow_hidden()
+                .child(zoom)
                 .child(edit)
-                .child(copy)
                 .into_any_element(),
         )
     }
@@ -2841,6 +3361,7 @@ impl Render for EditorView {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             // 测试元数据（只读断言用）：当前打开的文档视图（`AppShell` 里只有一个）。
@@ -2896,6 +3417,9 @@ impl Render for EditorView {
                     .child(status)
                     .child(SharedString::from(HINT)),
             )
+            .when_some(self.zoomed_image.clone(), |this, image| {
+                this.child(self.render_image_zoom(image, cx))
+            })
     }
 }
 
@@ -2971,4 +3495,64 @@ mod list_indent_tests {
         assert!(!list_indent_applies(false, true, true));
         assert!(!list_indent_applies(false, false, true));
     }
+}
+
+/// wiki target 归一化：去掉首尾空白/`.md`/路径首尾 `/`，统一小写。
+fn normalize_wiki_target(target: &str) -> String {
+    target
+        .trim()
+        .trim_end_matches(".md")
+        .trim_matches('/')
+        .to_lowercase()
+}
+
+/// 把 source scalar 坐标按一组编辑映射到编辑后的坐标（恢复活动笔记选区用）。
+///
+/// 编辑按起点升序、互不重叠；落在被替换区间内的位置夹到替换文本内部，
+/// 其余位置按前面编辑的净位移平移。
+fn transform_scalar(position: usize, edits: &[ScalarEdit]) -> usize {
+    let mut delta: i64 = 0;
+    for edit in edits {
+        let start = edit.start.get();
+        let end = edit.end.get();
+        if position <= start {
+            break;
+        }
+        let inserted = edit.replacement.chars().count();
+        if position <= end {
+            let inside = position.saturating_sub(start);
+            let mapped = start as i64 + delta + inside.min(inserted) as i64;
+            return usize::try_from(mapped).unwrap_or(position);
+        }
+        delta += inserted as i64 - (end - start) as i64;
+    }
+    usize::try_from(position as i64 + delta).unwrap_or(position)
+}
+
+/// 把 runs 中与 `range` 相交的部分换成 `kind`（保留区间外原样式）。
+fn replace_style_range(
+    mut runs: Vec<(std::ops::Range<usize>, StyleKind)>,
+    range: std::ops::Range<usize>,
+    kind: StyleKind,
+) -> Vec<(std::ops::Range<usize>, StyleKind)> {
+    let mut result = Vec::with_capacity(runs.len() + 2);
+    for (run_range, run_kind) in runs.drain(..) {
+        if run_range.end <= range.start || range.end <= run_range.start {
+            result.push((run_range, run_kind));
+            continue;
+        }
+        let start = run_range.start.max(range.start);
+        let end = run_range.end.min(range.end);
+        if run_range.start < start {
+            result.push((run_range.start..start, run_kind));
+        }
+        if start < end {
+            result.push((start..end, kind));
+        }
+        if end < run_range.end {
+            result.push((end..run_range.end, run_kind));
+        }
+    }
+    result.sort_by_key(|(range, _)| range.start);
+    result
 }

@@ -254,6 +254,16 @@ impl EditorController {
         &self.style_runs
     }
 
+    /// 全部 wiki 链接（L1：点击/未解析样式/后续重命名改写）。
+    pub fn wiki_links(&self) -> &[crate::model::markdown::MarkdownWikiLink] {
+        self.markdown.wiki_links()
+    }
+
+    /// 全部普通链接（外链点击用）。
+    pub fn links(&self) -> &[crate::model::markdown::MarkdownLink] {
+        self.markdown.links()
+    }
+
     /// 块级语义区间（source 坐标，每行一个 run，完整覆盖 `[0, source_len)`）。
     ///
     /// **只在 source 变化时重建**：移动 caret / 改 selection 不会改变块级结构，
@@ -477,6 +487,45 @@ impl EditorController {
             replacement,
         };
         self.compose_edits(vec![edit]).map(Some)
+    }
+
+    /// 切换第 `index` 个列表项的任务框（`[ ] ↔ [x]`，ADR 0019 S3）。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - 只改任务框那 3 个 source 字节（`[ ]` / `[x]` / `[X]`），**不**动缩进、列表
+    ///   marker、任务框后的空白、其它正文与换行（逐字不变）；
+    /// - 勾选统一写**小写** `x`（`[X]` 视为已勾选；点击后写 `[ ]`，再点写 `[x]`）；
+    /// - 一次点击产生**一个** `EditRequest`（单 `ScalarEdit`），由会话默认撤销组进
+    ///   undo；不批量改其它 item；
+    /// - caret/选区**保持不变**：`compose_edits` 会把 caret 挪到替换文本之后，这里
+    ///   在返回请求前恢复原选区（点击复选框不能落正文 caret）；替换等长（3 scalar），
+    ///   所以恢复的坐标必然仍然合法；
+    /// - IME 组合中由 [`Self::ensure_editable`] 拒绝（调用方应先取消组合）；
+    /// - 不是任务项 / 下标越界 → `Ok(None)`（不产生请求，不改文本）。
+    pub fn toggle_task_marker(&mut self, index: usize) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        let Some(item) = self.markdown.list_items().get(index) else {
+            return Ok(None);
+        };
+        let Some(box_span) = item.task_marker else {
+            return Ok(None);
+        };
+        let checked = item.task.unwrap_or(false);
+        let replacement = if checked { "[ ]" } else { "[x]" };
+        let text = self.mirror.to_string();
+        let start = SourceByte::new(box_span.start).to_scalar(&text)?;
+        let end = SourceByte::new(box_span.end).to_scalar(&text)?;
+        let selection = self.selection;
+        let edit = ScalarEdit {
+            start,
+            end,
+            replacement: replacement.to_owned(),
+        };
+        let request = self.compose_edits(vec![edit])?;
+        // 等长替换：原选区坐标不变；恢复后投影会按新 source 重建（显示新勾选态）。
+        self.set_selection(selection)?;
+        Ok(Some(request))
     }
 
     /// 当前逻辑显示文本（Markdown 标记按当前 selection 隐藏/显现）。

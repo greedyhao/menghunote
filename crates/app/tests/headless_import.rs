@@ -11,9 +11,10 @@
 //! 5. 普通文本 Ctrl+V 仍按文本插入；`Ctrl+Shift+V` 强制文本（不把文件路径写进正文）；
 //! 6. IME 组合中不插入；
 //! 7. 引用对账：移动/删除链接后 `start_byte` 正确、重复对账幂等、落库后可复算；
-//! 8. SVG 按普通附件（不执行、不当图片对象）。
+//! 8. SVG 按普通附件（不执行、不当图片对象）；
+//! 9. Windows CF_DIB 的 BMP 字节 → PNG 资产 → 图片对象。
 //!
-//! 未覆盖（真机项，见 ADR 0019 §8）：Windows CF_DIB/CF_DIBV5 剪贴板位图、真实
+//! 未覆盖（真机项，见 ADR 0019 §8）：CF_DIBV5、真实
 //! `IDropTarget` 文件拖放像素/交互、DPI 与真实窗口焦点。
 
 use std::path::{Path, PathBuf};
@@ -47,6 +48,15 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     image::DynamicImage::ImageRgba8(buffer)
         .write_to(&mut out, image::ImageFormat::Png)
         .expect("测试 PNG 编码失败");
+    out.into_inner()
+}
+
+fn bmp_bytes(width: u32, height: u32) -> Vec<u8> {
+    let buffer = image::RgbaImage::from_pixel(width, height, image::Rgba([20, 120, 220, 255]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(buffer)
+        .write_to(&mut out, image::ImageFormat::Bmp)
+        .expect("测试 BMP 编码失败");
     out.into_inner()
 }
 
@@ -891,4 +901,51 @@ async fn paste_is_ignored_while_sync_gate_is_held(cx: &mut TestAppContext) {
     })
     .expect("释放闸门失败");
     close_shell(&host, cx);
+}
+
+#[gpui::test]
+async fn paste_windows_dib_bmp_is_converted_to_png_image_object(cx: &mut TestAppContext) {
+    let dir = temp_vault_dir("bmp");
+    let vault_path = dir.path().join("vault.sqlite3");
+    let vault = Vault::open(&vault_path).expect("打开临时 vault");
+    let probe = vault.clone();
+    let doc_id = seed_note(&vault, "粘贴图片", "");
+    let note_id = note_id_of_doc(&vault, &doc_id);
+    let (host, cx) = open_shell(cx, vault, "headless-import-bmp");
+    let view = active_view(&host, cx);
+
+    let bmp = bmp_bytes(6, 3);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_image(&Image {
+        format: ImageFormat::Bmp,
+        bytes: bmp,
+        id: 1,
+    }));
+    cx.simulate_keystrokes("ctrl-v");
+    cx.run_until_parked();
+
+    let source = source_of(&view, cx);
+    assert!(
+        source.starts_with("![粘贴图片.png](asset://"),
+        "Windows CF_DIB 必须转成 PNG 图片 Markdown：{source}"
+    );
+    let refs = list_asset_refs(&probe, &note_id).expect("列引用失败");
+    assert_eq!(refs.len(), 1);
+    let data = asset_bytes(&probe, refs[0].asset_hash)
+        .expect("读资产")
+        .expect("资产必须存在");
+    assert!(
+        data.starts_with(&[0x89, b'P', b'N', b'G']),
+        "资产必须是 PNG 字节"
+    );
+    let meta = asset_meta(&probe, refs[0].asset_hash)
+        .expect("读元数据")
+        .expect("资产存在");
+    assert_eq!(meta.media_type.as_deref(), Some("image/png"));
+
+    settle_images(&view, cx);
+    let display = cx.update(|_window, app| view.read(app).display_text());
+    assert!(
+        display.contains(PLACEHOLDER),
+        "BMP 粘贴也必须投影成图片对象"
+    );
 }

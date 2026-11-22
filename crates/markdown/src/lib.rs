@@ -138,6 +138,8 @@ pub enum ConstructKind {
     Strike,
     /// `[text](url)` / `[text][label]` / `<autolink>`。
     Link,
+    /// `[[Note]]` / `[[Note|alias]]` / `[[Note#Heading]]`（L1 只投影/点击）。
+    WikiLink,
     /// `![alt](url)`（S1 只解析，不投影；图片 Object 在 S2）。
     Image,
 }
@@ -163,6 +165,7 @@ impl ConstructKind {
                 | Self::Strike
                 | Self::Link
                 | Self::Image
+                | Self::WikiLink
         )
     }
 }
@@ -178,6 +181,38 @@ pub struct Construct {
     pub markers: Vec<Span>,
     /// 内容区间（不含本层标记；可能为空）。
     pub content: Span,
+}
+
+/// 一个普通 Markdown 链接（`[text](url)`）的 source 元数据。
+///
+/// `span` 是完整链接；`content` 是方括号内文本；`dest` 是 pulldown-cmark 解析后的
+/// 目标（引用式链接也已解析）。正文逐字节保留，不重新序列化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSpan {
+    /// 完整链接区间。
+    pub span: Span,
+    /// 方括号内文本区间。
+    pub content: Span,
+    /// 解析后的目标 URL。
+    pub dest: String,
+}
+
+/// 一条 wiki 链接（`[[target#heading|alias]]`）的 source 元数据。
+///
+/// `display` 是投影后可见的内容：有 alias 时是 alias；否则是 target/heading 原文。
+/// `target` 为空表示 `[[#Heading]]`（指向当前笔记）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiLink {
+    /// 整条链接（含 `[[`/`]]`）。
+    pub span: Span,
+    /// 目标笔记（不含 `#heading`；可为空）。
+    pub target: Span,
+    /// `#` 后的标题（不含 `#`）。
+    pub heading: Option<Span>,
+    /// `|` 后的别名。
+    pub alias: Option<Span>,
+    /// 投影可见内容。
+    pub display: Span,
 }
 
 /// 列表块（同一层级的连续列表项）。
@@ -235,8 +270,16 @@ pub struct ListItem {
     pub content_indent: usize,
     /// 编号显示宽度（右对齐用）。
     pub number_width: usize,
-    /// 任务框状态（S1 只记录，不交互）。
+    /// 任务框状态（S1 只记录；S3 起由 app 点击切换，见 [`Self::task_marker`]）。
     pub task: Option<bool>,
+    /// 任务框**源码**区间（`[ ]` / `[x]` / `[X]`）。
+    ///
+    /// 覆盖两个方括号与其内部字符（GFM 允许单个空格/Tab/`x`/`X`），
+    /// **不含** `]` 之后的空白或正文内容。`None` 表示该 item 不是任务项。
+    ///
+    /// 与 `pulldown-cmark` 的 `Event::TaskListMarker` 一一对应：状态看 [`Self::task`]，
+    /// 写回时只替换这 3 个字节，缩进/marker/其它正文逐字不变（ADR 0019 S3）。
+    pub task_marker: Option<Span>,
 }
 
 impl ListItem {
@@ -330,6 +373,10 @@ pub struct ParsedMarkdown {
     pub lists: Vec<ListBlock>,
     /// 列表项（按出现顺序）。
     pub items: Vec<ListItem>,
+    /// wiki 链接（按 `span` 起点排序；不含代码块/行内代码/转义）。
+    pub wiki_links: Vec<WikiLink>,
+    /// 普通链接（含 inline/reference/autolink；`dest` 已解析）。
+    pub links: Vec<LinkSpan>,
     /// 图片构造（含 inline / 引用式；按 `span` 起点排序）。
     ///
     /// 每个图片同时也出现在 [`Self::constructs`] 里（`ConstructKind::Image`）；
@@ -441,6 +488,10 @@ struct Builder<'a> {
     image_stack: Vec<(usize, String)>,
     /// 解析出的图片元数据（按 `span` 起点排序后写进 [`ParsedMarkdown::images`]）。
     images: Vec<ImageSpan>,
+    /// 普通链接的 `(start, dest)` 栈，`TagEnd::Link` 时配对。
+    link_stack: Vec<(usize, String)>,
+    /// 解析出的普通链接元数据。
+    links: Vec<LinkSpan>,
     quote_stack: Vec<Span>,
     table_stack: Vec<Span>,
     html_stack: Vec<Span>,
@@ -468,7 +519,9 @@ impl<'a> Builder<'a> {
             code_stack: Vec::new(),
             inline_stack: Vec::new(),
             image_stack: Vec::new(),
+            link_stack: Vec::new(),
             images: Vec::new(),
+            links: Vec::new(),
             quote_stack: Vec::new(),
             table_stack: Vec::new(),
             html_stack: Vec::new(),
@@ -493,9 +546,15 @@ impl<'a> Builder<'a> {
             Event::TaskListMarker(checked) => {
                 // 事件顺序是 Start(Item) → TaskListMarker → Text；必须挂到当前打开的 item，
                 // 不能留到下一个 Start(Item)（否则会整体错位一个 item）。
+                //
+                // 区间先按当前 item 算好再拿可变借用：事件 range 就是源码里 `[ ]`/`[x]`
+                // 的 3 个字节（已用 golden 测试钉住），这里再做一次形状校验，形状不符时
+                // 宁可只记录状态、不暴露可点区间（不猜 offset）。
+                let marker = Self::task_marker_span(self.source, range);
                 if let Some(frame) = self.items_stack.last() {
                     if let Some(item) = frame.item.and_then(|index| self.items.get_mut(index)) {
                         item.task = Some(checked);
+                        item.task_marker = marker;
                     }
                 }
             }
@@ -548,7 +607,10 @@ impl<'a> Builder<'a> {
             Tag::Strong => self.push_inline(InlineKind::Bold, range.start),
             Tag::Emphasis => self.push_inline(InlineKind::Emphasis, range.start),
             Tag::Strikethrough => self.push_inline(InlineKind::Strike, range.start),
-            Tag::Link { .. } => self.push_inline(InlineKind::Link, range.start),
+            Tag::Link { dest_url, .. } => {
+                self.link_stack.push((range.start, dest_url.to_string()));
+                self.push_inline(InlineKind::Link, range.start);
+            }
             Tag::Image { dest_url, .. } => {
                 // `dest_url` 是 pulldown-cmark 解析后的语义目标（引用式图片也在这里
                 // 变成真实 URL）。**只读取、不重写正文**：源码逐字节保留。
@@ -640,6 +702,14 @@ impl<'a> Builder<'a> {
         } else {
             None
         };
+        let link_dest = if matches!(kind, InlineKind::Link) {
+            self.link_stack
+                .pop()
+                .filter(|(start, _)| *start == frame.start)
+                .map(|(_, dest)| dest)
+        } else {
+            None
+        };
         let construct = match kind {
             InlineKind::Bold => self
                 .analyze_delimited(span, b'*', 2, ConstructKind::Bold)
@@ -655,6 +725,13 @@ impl<'a> Builder<'a> {
             Some(construct) => {
                 if let Some(dest) = image_dest {
                     self.images.push(ImageSpan {
+                        span: construct.span,
+                        content: construct.content,
+                        dest,
+                    });
+                }
+                if let Some(dest) = link_dest {
+                    self.links.push(LinkSpan {
                         span: construct.span,
                         content: construct.content,
                         dest,
@@ -917,12 +994,33 @@ impl<'a> Builder<'a> {
             content_indent,
             number_width: 1,
             task: None,
+            task_marker: None,
         });
         self.items_stack.push(ItemFrame {
             item: Some(index),
             span_start: range.start,
             marker_end: marker.content_start,
         });
+    }
+
+    /// 把 `TaskListMarker` 事件的区间校验成任务框源码区间。
+    ///
+    /// `pulldown-cmark` 给出的 range 已经是源码里 `[`…`]` 的精确区间（golden 测试
+    /// `task_list_marker_range_covers_brackets_only` 钉住）；这里只接受
+    /// “`[` + 单个空格/Tab/x/X + `]`” 的形状，任何意外都返回 `None`，不把不确定的
+    /// offset 暴露给投影/点击（宁可少一个复选框，也不点错字节）。
+    fn task_marker_span(source: &str, range: Span) -> Option<Span> {
+        if range.end <= range.start || range.end > source.len() {
+            return None;
+        }
+        let bytes = source.as_bytes().get(range.start..range.end)?;
+        if bytes.len() != 3 || bytes[0] != b'[' || bytes[2] != b']' {
+            return None;
+        }
+        if !matches!(bytes[1], b' ' | b'\t' | b'x' | b'X') {
+            return None;
+        }
+        Some(Span::new(range.start, range.end))
     }
 
     fn finish_item(&mut self, end: usize) {
@@ -1062,6 +1160,7 @@ impl<'a> Builder<'a> {
             mut list_blocks,
             mut items,
             mut images,
+            mut links,
             constructs,
             headings,
             mut code_spans,
@@ -1166,6 +1265,12 @@ impl<'a> Builder<'a> {
         unsupported_spans.dedup();
         images.sort_by_key(|image| (image.span.start, image.span.end));
         images.dedup();
+        links.sort_by_key(|link| (link.span.start, link.span.end));
+        links.dedup();
+        // wiki 链接：自定义 inline pass；排除代码块/行内代码/转义（L1）。
+        let (wiki_links, wiki_constructs) = scan_wiki_links(source, &code_spans, &all);
+        all.extend(wiki_constructs);
+        all.sort_by_key(|construct| (construct.span.start, construct.span.end, construct.kind));
 
         // list block 按文档顺序（嵌套 list 的 End 是内层先到），排序后要重映射 list_index。
         let mut order: Vec<usize> = (0..list_blocks.len()).collect();
@@ -1196,6 +1301,8 @@ impl<'a> Builder<'a> {
             lists: list_blocks,
             items,
             images,
+            links,
+            wiki_links,
             constructs: all,
             code_spans,
             unsupported_spans,
@@ -1576,4 +1683,159 @@ fn skip_escape(source: &str, at: usize, end: usize) -> usize {
 fn next_char_boundary(source: &str, at: usize, end: usize) -> usize {
     let size = source[at..].chars().next().map_or(1, char::len_utf8);
     (at + size).min(end)
+}
+
+/// 扫描 `[[...]]` wiki 链接（L1）。
+///
+/// 只接受单行、非代码、非转义的写法；`![[...]]` 暂不支持（当普通文本）。
+fn scan_wiki_links(
+    source: &str,
+    code_spans: &[Span],
+    constructs: &[Construct],
+) -> (Vec<WikiLink>, Vec<Construct>) {
+    let bytes = source.as_bytes();
+    let mut excluded = code_spans.to_vec();
+    excluded.extend(
+        constructs
+            .iter()
+            .filter(|construct| matches!(construct.kind, ConstructKind::InlineCode))
+            .map(|construct| construct.span),
+    );
+    let mut links = Vec::new();
+    let mut wiki_constructs = Vec::new();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'[' || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        if is_escaped(bytes, index) || (index > 0 && bytes[index - 1] == b'!') {
+            index += 2;
+            continue;
+        }
+        if excluded
+            .iter()
+            .any(|span| span.start <= index && index < span.end)
+        {
+            index += 2;
+            continue;
+        }
+        let Some(close) = find_wiki_close(bytes, index + 2) else {
+            index += 1;
+            continue;
+        };
+        let inner_start = index + 2;
+        let inner_end = close;
+        if inner_start >= inner_end {
+            index = close + 2;
+            continue;
+        }
+        // 内层不允许再出现 `[[`（避免嵌套误判）。
+        if bytes[inner_start..inner_end]
+            .windows(2)
+            .any(|window| window == b"[[")
+        {
+            index = close + 2;
+            continue;
+        }
+        let Some((target, heading, alias)) = split_wiki_inner(inner_start, inner_end, bytes) else {
+            index = close + 2;
+            continue;
+        };
+        let display = alias.unwrap_or(Span::new(inner_start, inner_end));
+        let mut markers = vec![Span::new(index, inner_start)];
+        if let Some(alias_span) = alias {
+            markers.push(Span::new(inner_start, alias_span.start));
+        }
+        markers.push(Span::new(close, close + 2));
+        let span = Span::new(index, close + 2);
+        wiki_constructs.push(Construct {
+            kind: ConstructKind::WikiLink,
+            span,
+            markers,
+            content: display,
+        });
+        links.push(WikiLink {
+            span,
+            target,
+            heading,
+            alias,
+            display,
+        });
+        index = close + 2;
+    }
+    links.sort_by_key(|link| (link.span.start, link.span.end));
+    links.dedup();
+    (links, wiki_constructs)
+}
+
+fn find_wiki_close(bytes: &[u8], mut index: usize) -> Option<usize> {
+    while index + 1 < bytes.len() {
+        match bytes[index] {
+            b'\n' | b'\r' => return None,
+            b']' if bytes[index + 1] == b']' => return Some(index),
+            b'[' if bytes.get(index + 1) == Some(&b'[') => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn split_wiki_inner(
+    start: usize,
+    end: usize,
+    bytes: &[u8],
+) -> Option<(Span, Option<Span>, Option<Span>)> {
+    // 第一个未转义的 `|` 分别名；之前的部分再按第一个 `#` 分 heading。
+    let mut pipe = None;
+    let mut index = start;
+    while index < end {
+        if bytes[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'|' {
+            pipe = Some(index);
+            break;
+        }
+        index += 1;
+    }
+    let target_end = pipe.unwrap_or(end);
+    let alias = pipe.map(|at| {
+        let alias_start = at + 1;
+        Span::new(alias_start, end)
+    });
+    if alias.is_some_and(|span| span.is_empty()) {
+        return None;
+    }
+    let mut hash = None;
+    let mut index = start;
+    while index < target_end {
+        if bytes[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'#' {
+            hash = Some(index);
+            break;
+        }
+        index += 1;
+    }
+    let target = Span::new(start, hash.unwrap_or(target_end));
+    let heading = hash.map(|at| Span::new(at + 1, target_end));
+    if target.is_empty() && heading.as_ref().is_none_or(|span| span.is_empty()) {
+        return None;
+    }
+    Some((target, heading, alias))
+}
+
+fn is_escaped(bytes: &[u8], at: usize) -> bool {
+    let mut count = 0usize;
+    let mut index = at;
+    while index > 0 && bytes[index - 1] == b'\\' {
+        count += 1;
+        index -= 1;
+    }
+    count % 2 == 1
 }

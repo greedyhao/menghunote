@@ -42,11 +42,13 @@ mod error;
 mod events;
 mod index_manifest;
 mod journal;
+pub mod links;
 mod materialize;
 mod migrate;
 mod projector;
 mod read_api;
 mod read_snapshot;
+pub mod rename_links;
 pub mod session;
 mod store;
 mod structure;
@@ -75,6 +77,7 @@ pub use journal::{
     DurableSink, FlushReport, JournalEntry, JournalOrigin, JournalWriter, PendingJournal,
     VaultJournalSink,
 };
+pub use links::{list_backlinks, Backlink};
 pub use materialize::{
     materialize_body, materialize_body_profiled, pending_outbox, project_pending, reconcile,
     reconcile_batched, scan_stale_bodies, MaterializeOutcome, MaterializeProgress,

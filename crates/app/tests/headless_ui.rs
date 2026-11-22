@@ -655,3 +655,58 @@ async fn editor_keystroke_inserts_character_and_persists(cx: &mut TestAppContext
         insertion_point
     );
 }
+
+#[gpui::test]
+async fn right_click_root_note_can_rename_after_folder_creation(cx: &mut TestAppContext) {
+    let (_dir, dev) = open_temp_dev_vault();
+    let vault = dev.vault.clone();
+    let (_host, cx) = cx.add_window_view(move |_, cx| {
+        let shell = cx.new(|cx| AppShell::new(vault, "headless-ui-rename-root".to_owned(), cx));
+        ShellHost { shell }
+    });
+    cx.run_until_parked();
+
+    // 先创建一个根目录文件夹（用户报告就是在这之后右键失效）。
+    let folder_button = cx
+        .debug_bounds("sidebar-new-folder")
+        .expect("侧栏必须画出新建文件夹按钮");
+    cx.simulate_click(folder_button.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        list_tree(&dev.vault).expect("读树失败").len(),
+        4,
+        "新建文件夹后树应有 4 项"
+    );
+
+    let note = cx.debug_bounds("tree-row-0").expect("根笔记行");
+    cx.simulate_mouse_down(note.center(), MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("context-menu").is_some(),
+        "右键根笔记必须弹菜单"
+    );
+    let rename = cx
+        .debug_bounds("menu-item-0")
+        .expect("笔记菜单第一项是重命名");
+    cx.simulate_click(rename.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("context-menu").is_none(),
+        "点重命名后菜单必须关闭"
+    );
+    let renaming = cx.update(|_window, app| _host.read(app).shell.read(app).is_renaming());
+    assert!(renaming, "点「重命名」必须进入行内重命名");
+
+    cx.simulate_input("根笔记新名");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let tree = list_tree(&dev.vault).expect("读树失败");
+    assert!(
+        tree.iter().any(|entry| entry.title == "根笔记新名"),
+        "右键重命名必须真的写入结构树：{:?}",
+        tree.iter()
+            .map(|entry| entry.title.clone())
+            .collect::<Vec<_>>()
+    );
+}

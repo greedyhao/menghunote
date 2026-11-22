@@ -265,7 +265,7 @@ menghunote/
 **依赖方向（ADR 0003 + ADR 0006，禁止成环，含 dev-dependency）**：
 `app → editor/storage/text/gpui/sync`；`editor → storage/text`；`storage → text/loro/rusqlite`；
 `sync → storage + sync-proto`；`relay → sync-proto`；`sync-proto` 纯类型（serde，无 IO/crypto/Loro/SQLite）；
-`text → unicode-segmentation`。`storage` **不依赖** `editor`/`sync`；`editor`/`storage`/`text` **不依赖** GPUI；
+`text → unicode-segmentation`；`storage → markdown`（仅 L2 正文链接物化/重写，markdown 不反向依赖 storage）。`storage` **不依赖** `editor`/`sync`；`editor`/`storage`/`text` **不依赖** GPUI；
 `relay` **不依赖** storage/Loro/Tantivy。
 
 **决策落地规则**：GPT 给出的每个架构级结论，都要在 `docs/adr/NNNN-*.md` 留一页
@@ -395,7 +395,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 356 / sync 605 / app `--features dev-sync` 414 / 默认 183 / editor 148 / markdown 15。
+> 测试：relay 356 / sync 605 / app `--features dev-sync` 427 / 默认 196 / storage 187 / editor 157 / markdown 22。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
@@ -423,6 +423,28 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > 手动同步永远 `单操作在途`，重启后激活再次触发。现改为退回 pending（清
 > `last_auto_start`），下一拍 tick 正常派发；另保留“无真实 op 时清理陈旧轮次”保险。
 > 回归：`window_activation_never_leaves_scheduler_running_without_dispatch`。
+> **图片对象交互（2026-11-17）**：悬浮/选中显示 Obsidian 式两按钮「放大」「编辑源码」；
+> 放大按钮或已选中图片再次单击打开遮罩（点击/Esc 关闭）；图片 hitbox 悬停手形；
+> 原「复制 Markdown」按钮移除以保持两按钮。
+> **Windows 剪贴板 BMP（2026-11-17）**：CF_DIB 经 GPUI 转 BMP，`stage_image` 落库前
+> 统一转 PNG（`image` 增加 `bmp` feature），粘贴写出 `![粘贴图片.png](asset://…)`
+> 并投影成图片对象；CF_DIBV5 仍是缺口。
+> **普通链接打开（2026-11-17）**：`[text](url)` 解析 destination，按可见文本区间命中，
+> 单击交给系统打开 `http`/`https`/`mailto`，悬停手形；末尾边界不误触；其它 scheme 明确拒绝。
+> **交互修复（2026-11-17）**：设置页按窗口高度限高并可滚动；wiki 链接悬停手形、
+> 末尾边界不跳转、点击仅命中 display 可见区间（修复上一行误跳）；右键菜单动作后
+> 吞掉同一次手势的 mouse-up，修复根目录笔记/文件夹右键重命名被立刻提交。
+> **S3 任务列表（2026-11-17）**：任务框 `[ ]`/`[x]` 解析出精确源码区间，
+> 隐藏态自绘复选框；点击只发一个 `EditRequest` 切换 3 字节（不动 caret/其它字节），
+> 进 undo；嵌套/有序/`[X]` 独立切换。表格 Object、物理资产 GC 仍未做。
+> **Wiki L2（2026-11-17）**：L2a 正文 B 事务按解析结果重建 `links`（`kind='wiki'`，
+> 当前结构树解析 `to_note_id`，未解析写 NULL）+ 状态栏「反向链接 N」右侧面板；
+> L2b 重命名联动改写（仅解析到该笔记的 target；alias/heading/路径保留；活动来源走
+> 活动 driver 防 stale 覆盖；失败只报告不回滚）。未做持久化重试入口。
+> **Wiki 双链 L1（2026-11-17）**：`[[Note]]` / `[[Note|alias]]` / `[[Folder/Note]]` /
+> `[[Note#Heading]]` / `[[#Heading]]` 解析、投影隐藏括号、单击打开、unresolved 灰色波浪线；
+> 目标解析按路径精确 > 标题（大小写不敏感）> 最短路径，歧义/无匹配只提示不自动建。
+> 代码/围栏/转义/`![[...]]` 不解析；links 物化/反向链接/重命名联动（L2）仍后置。
 > **Windows 真机（Web 管理/claim/App 粘贴）与真实 TLS relay 未验；S4d1c 客户端管理 UI、
 > S4d2 relay 审批收件箱仍未做。**
 

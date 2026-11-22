@@ -45,6 +45,8 @@ pub struct EditorGeometry {
     pub styles: Rc<Vec<(Range<usize>, StyleKind)>>,
     /// 本帧可见的图片对象（按视觉行顺序；只覆盖可见范围）。
     pub objects: Vec<ObjectPaint>,
+    /// 本帧可见的任务复选框（ADR 0019 S3；按视觉行顺序）。
+    pub task_boxes: Vec<TaskBoxPaint>,
 }
 
 /// 图片对象的绘制状态（占位与图片共用同一块矩形，几何完全一致）。
@@ -90,6 +92,22 @@ impl ObjectPaint {
     pub const fn is_ready(&self) -> bool {
         matches!(self.state, ObjectPaintState::Ready) && self.image.is_some()
     }
+}
+
+/// 一个**可见**的任务复选框（ADR 0019 S3）：绘制、命中、headless 断言共用。
+///
+/// `rect` 是窗口坐标的**占位矩形**（display 上两连 NBSP 的真实 shaping 区间 ×
+/// 该视觉行行高）：点击命中用整个矩形（比 13px 方框更好点），绘制在矩形内居中画方框。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TaskBoxPaint {
+    /// 列表项下标（`ParsedMarkdown::items`；点击后按它切换源码）。
+    pub item: usize,
+    /// 任务框源码区间（点击时与当前解析结果比对，防止陈旧帧点到别的 item）。
+    pub source: (usize, usize),
+    /// 是否已勾选（来自解析器状态；source 是唯一真源）。
+    pub checked: bool,
+    /// 占位矩形（窗口坐标）。
+    pub rect: Bounds<Pixels>,
 }
 
 impl EditorGeometry {
@@ -255,6 +273,20 @@ impl EditorGeometry {
         self.object_at(position).map(|object| object.line)
     }
 
+    /// 本帧可见的任务复选框（按视觉行顺序）。
+    #[must_use]
+    pub fn task_boxes(&self) -> &[TaskBoxPaint] {
+        &self.task_boxes
+    }
+
+    /// 窗口坐标命中的任务复选框（矩形是占位区，不是方框本身）。
+    #[must_use]
+    pub fn task_box_at(&self, position: Point<Pixels>) -> Option<&TaskBoxPaint> {
+        self.task_boxes
+            .iter()
+            .find(|task| task.rect.contains(&position))
+    }
+
     /// 第 `row` 行的样式分段 `(字节数, 种类)`（总长等于该行字节数）。
     #[must_use]
     pub fn spans_for_row(&self, row: usize) -> Vec<(usize, StyleKind)> {
@@ -319,6 +351,7 @@ mod tests {
             viewport_height: 220.0,
             styles: Rc::new(Vec::new()),
             objects: Vec::new(),
+            task_boxes: Vec::new(),
         };
         assert!(geometry.visible_rows().is_empty());
         assert_eq!(geometry.row_at_y(px(0.0)), 10);

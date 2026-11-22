@@ -242,8 +242,8 @@ async fn image_object_renders_selects_edits_and_deletes_whole_block(cx: &mut Tes
         "工具条必须有「编辑源码」按钮"
     );
     assert!(
-        cx.debug_bounds("object-toolbar-copy").is_some(),
-        "工具条必须有「复制 Markdown」按钮"
+        cx.debug_bounds("object-toolbar-zoom").is_some(),
+        "工具条必须有「放大」按钮"
     );
 
     // 5) 工具条「编辑源码」→ 显示完整源码；Esc 退出恢复图片。
@@ -570,7 +570,7 @@ async fn corrupt_asset_degrades_to_placeholder_without_panicking(cx: &mut TestAp
 }
 
 #[gpui::test]
-async fn image_object_copy_button_writes_complete_markdown(cx: &mut TestAppContext) {
+async fn image_object_zoom_button_and_second_click_open_overlay(cx: &mut TestAppContext) {
     let dir = temp_vault_dir();
     let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
     let png = png_bytes();
@@ -578,39 +578,50 @@ async fn image_object_copy_button_writes_complete_markdown(cx: &mut TestAppConte
     insert_asset(&vault, &hash, png.len() as u64, Some("image/png"), &png).expect("写入资产失败");
     let hash = hash_hex(&hash);
     let text = format!("![示意](asset://{hash})\n");
-    seed_note(&vault, "复制图片", &text);
+    seed_note(&vault, "放大图片", &text);
 
     let (host, cx) = open_shell(cx, vault);
     let view = active_view(&host, cx);
     settle_images(&view, cx);
 
-    // 点图片 → 工具条出现 → 点「复制 Markdown」。
     let rects = cx.update(|_window, app| view.read(app).object_rects());
     let (_, rect) = rects.first().expect("图片对象必须可见");
+    let center = gpui::point(
+        rect.origin.x + rect.size.width / 2.0,
+        rect.origin.y + rect.size.height / 2.0,
+    );
+    cx.simulate_click(center, Modifiers::default());
+    cx.run_until_parked();
+    let zoom = cx
+        .debug_bounds("object-toolbar-zoom")
+        .expect("「放大」按钮必须可见");
     cx.simulate_click(
         gpui::point(
-            rect.origin.x + rect.size.width / 2.0,
-            rect.origin.y + rect.size.height / 2.0,
+            zoom.origin.x + zoom.size.width / 2.0,
+            zoom.origin.y + zoom.size.height / 2.0,
         ),
         Modifiers::default(),
     );
     cx.run_until_parked();
-    let copy_button = cx
-        .debug_bounds("object-toolbar-copy")
-        .expect("「复制 Markdown」按钮必须可见");
-    cx.simulate_click(
-        gpui::point(
-            copy_button.origin.x + copy_button.size.width / 2.0,
-            copy_button.origin.y + copy_button.size.height / 2.0,
-        ),
-        Modifiers::default(),
+    assert!(
+        cx.debug_bounds("image-zoom-overlay").is_some(),
+        "点放大按钮必须打开遮罩"
     );
+    assert!(cx.debug_bounds("image-zoom-image").is_some());
+
+    // 点遮罩关闭；图片仍处于选中态，再单击图片应直接打开放大。
+    let overlay = cx.debug_bounds("image-zoom-overlay").unwrap();
+    cx.simulate_click(overlay.center(), Modifiers::default());
     cx.run_until_parked();
-    let copied = cx.update(|_window, app| app.read_from_clipboard().and_then(|item| item.text()));
-    assert_eq!(
-        copied.as_deref(),
-        Some(format!("![示意](asset://{hash})").as_str()),
-        "复制必须得到完整 Markdown"
+    assert!(cx.debug_bounds("image-zoom-overlay").is_none());
+    // 遮罩点击会经过编辑器并清掉块选中；重新选中后再点一次才是“第二次单击”。
+    cx.simulate_click(center, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_click(center, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("image-zoom-overlay").is_some(),
+        "已选中的图片再次单击必须放大"
     );
     close_shell(&host, cx);
 }

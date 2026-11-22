@@ -167,6 +167,47 @@ pub const QUOTE_INDENT_PER_LEVEL: f32 = 16.0;
 /// 列表每层缩进（像素）。bullet/number 的 gutter 由该层级缩进 + marker 显示宽度组成，
 /// 续行 hanging indent 与 marker 宽度**同一来源**（ADR 0019 S1：度量/绘制/命中共用几何）。
 pub const LIST_INDENT_PER_LEVEL: f32 = 24.0;
+
+/// 任务复选框在 22px 行高内的最大边长（像素；ADR 0019 S3）。
+///
+/// 实际绘制边长 = `min(占位宽度, 行高 - 8, 本值)`，最小 [`TASK_BOX_MIN_SIZE`]：
+/// 宽度来自真实 shaping 的两连 NBSP，字号/主题变了也不会画到行外。
+pub const TASK_BOX_MAX_SIZE: f32 = 15.0;
+/// 任务复选框最小边长（像素）：再小就没有可读的勾形，且点击命中由整个占位矩形决定。
+pub const TASK_BOX_MIN_SIZE: f32 = 9.0;
+/// 任务复选框圆角（像素）。
+pub const TASK_BOX_RADIUS: f32 = 3.0;
+
+/// 任务复选框（未勾选）底色。
+#[must_use]
+pub fn task_box_bg() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// 任务复选框（未勾选）描边色。
+#[must_use]
+pub fn task_box_border() -> Rgba {
+    rgb(0x8c959f)
+}
+
+/// 任务复选框（已勾选）底色 / 描边色（主题强调色）。
+#[must_use]
+pub fn task_box_checked_bg() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 任务复选框（已勾选）描边色。
+#[must_use]
+pub fn task_box_checked_border() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 已勾选时的勾形颜色（压在强调色上）。
+#[must_use]
+pub fn task_box_check() -> Rgba {
+    rgb(0xffffff)
+}
+
 /// 引用块左侧竖条宽度（像素）。
 pub const QUOTE_BAR_WIDTH: f32 = 3.0;
 /// 竖条与文字之间的距离（像素）。
@@ -275,10 +316,10 @@ pub fn object_selected_border() -> Rgba {
     rgb(0x0969da)
 }
 
-/// 悬浮工具条高度（像素）。
-pub const OBJECT_TOOLBAR_HEIGHT: f32 = 24.0;
+/// 悬浮工具条高度（像素，Obsidian 式圆形/胶囊按钮）。
+pub const OBJECT_TOOLBAR_HEIGHT: f32 = 28.0;
 /// 悬浮工具条按钮（单个）宽度（像素）。
-pub const OBJECT_TOOLBAR_BUTTON_WIDTH: f32 = 92.0;
+pub const OBJECT_TOOLBAR_BUTTON_WIDTH: f32 = 28.0;
 /// 悬浮工具条与图片顶部的间距（像素）。
 pub const OBJECT_TOOLBAR_GAP: f32 = 4.0;
 

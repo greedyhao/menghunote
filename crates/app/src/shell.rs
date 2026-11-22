@@ -22,17 +22,22 @@ use std::collections::HashSet;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, AnyElement, App, Context, Entity, FocusHandle, MouseButton, Pixels, Point, Render,
-    SharedString, Size, Window,
+    div, px, AnyElement, App, Context, Entity, FocusHandle, FontWeight, MouseButton, Pixels, Point,
+    Render, SharedString, Size, Window,
 };
 use menghunote_editor::EditorController;
+use menghunote_storage::rename_links::{
+    link_sources_for_note, rewrite_link_sources, RenameLinkOptions, DEFAULT_REWRITE_TIMEOUT,
+};
 #[cfg(feature = "dev-sync")]
 use menghunote_storage::session::{
     prepare_committed_delta, AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease,
     ExternalCommitTicket, GateError, GateState, PreparedCommittedDelta,
 };
 use menghunote_storage::session::{DriverOptions, SessionDriver};
-use menghunote_storage::{list_tree, StructureWriter, SyncContext, TreeEntry, Vault};
+use menghunote_storage::{
+    list_backlinks, list_tree, Backlink, StructureWriter, SyncContext, TreeEntry, Vault,
+};
 #[cfg(feature = "dev-sync")]
 use menghunote_storage::{load_head, STRUCTURE_DOC_ID};
 
@@ -118,11 +123,24 @@ struct Editing {
 struct OpenNote {
     /// 结构节点 ID（侧栏高亮用）。
     node_id: String,
+    /// 笔记 ID（反向链接查询、链接改写用）。
+    note_id: String,
     /// 真正渲染的编辑器视图。
     view: Entity<EditorView>,
     /// 编辑器事件的订阅（切换文档时 drop = 取消订阅）。
     /// 字段本身不读，靠 **Drop** 生效。
     _events: gpui::Subscription,
+}
+
+/// 重命名联动改写后的汇总（UI 提示用）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LinkRenameTotals {
+    /// 成功改写的来源篇数。
+    notes_updated: usize,
+    /// 改写的链接条数。
+    links_rewritten: usize,
+    /// 失败/未完成的篇数。
+    notes_failed: usize,
 }
 
 /// 窗口根视图。
@@ -141,6 +159,10 @@ pub struct AppShell {
     tree: Vec<TreeEntry>,
     /// 当前打开的笔记；`None` 表示库里还没有可打开的笔记。
     active: Option<OpenNote>,
+    /// 当前笔记的反向链接（L2；打开/切换/点开面板时刷新）。
+    backlinks: Vec<Backlink>,
+    /// 反向链接面板是否展开。
+    backlinks_open: bool,
     /// 侧栏底部的临时提示（切换被拒、读树失败等）。
     notice: Option<String>,
     /// 已折叠的目录 `node_id`（默认全部展开；**不持久化**，v1 只存内存）。
@@ -166,6 +188,8 @@ pub struct AppShell {
     pending_focus_rename: bool,
     /// 菜单打开的时刻（写日志、以及"同一次手势不关菜单"的守卫用）。
     menu_opened_at: Option<std::time::Instant>,
+    /// 最近一次点中菜单动作的时刻（吞掉紧跟着的 mouse-up 落到下层行）。
+    menu_action_at: Option<std::time::Instant>,
     /// 本次打开是否已经画过一帧（诊断"状态已设置但没画出来"）。
     menu_painted: std::cell::Cell<bool>,
     /// 视图创建时刻：日志里的相对时间戳。
@@ -186,6 +210,7 @@ pub struct AppShell {
     #[cfg(feature = "dev-sync")]
     settings_open: bool,
     /// 设置页焦点（Esc 关闭用）。
+    #[cfg(feature = "dev-sync")]
     settings_focus: FocusHandle,
     /// 面板事件订阅（切片 4c-2）：「同步」按钮只发出 `SyncRequested`，由本视图持闸后派发。
     #[cfg(feature = "dev-sync")]
@@ -360,6 +385,8 @@ impl AppShell {
             vault_label,
             tree: Vec::new(),
             active: None,
+            backlinks: Vec::new(),
+            backlinks_open: false,
             notice: None,
             collapsed: HashSet::new(),
             selected_node_id: None,
@@ -372,6 +399,7 @@ impl AppShell {
             search: None,
             pending_focus_rename: false,
             menu_opened_at: None,
+            menu_action_at: None,
             menu_painted: std::cell::Cell::new(false),
             epoch: std::time::Instant::now(),
             menu_focus: cx.focus_handle(),
@@ -381,6 +409,7 @@ impl AppShell {
             dev_sync: None,
             #[cfg(feature = "dev-sync")]
             settings_open: false,
+            #[cfg(feature = "dev-sync")]
             settings_focus: cx.focus_handle(),
             #[cfg(feature = "dev-sync")]
             dev_sync_subscription: None,
@@ -677,7 +706,7 @@ impl AppShell {
         cx.notify();
     }
 
-    /// 右键点击侧栏某一行：**只对目录**弹菜单（右键笔记不弹，也不打开）。
+    /// 右键点击侧栏某一行（目录/笔记都弹菜单；菜单动作不触发左键打开）。
     /// 侧栏某一行的"打开菜单"入口（目前只有右键；曾另有「⋯」左键入口，已移除）。
     ///
     /// **入口先无条件打一行日志**（在任何 is_folder 判断之前）：这样"点到了笔记行"
@@ -772,6 +801,9 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 菜单是在 mouse-down 上执行的；菜单随即消失，同一次手势的 mouse-up 会落到
+        // 下面的树行（右键重命名因此被"点外部提交"立刻结束）。记下时刻，让行点击忽略它。
+        self.menu_action_at = Some(std::time::Instant::now());
         match action {
             MenuAction::Rename => {
                 let title = self
@@ -935,23 +967,35 @@ impl AppShell {
         )
         .detach();
         trace_menu!("[menghunote] 开始重命名 node={node_id} 原标题={title:?}");
+        // 已决定的交互：重命名默认联动改写，不提供“是否更新”选择；提前把数量告诉用户。
+        let link_count = self
+            .tree
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .and_then(|entry| entry.note_id.as_deref())
+            .and_then(|note_id| list_backlinks(&self.vault, note_id).ok())
+            .map_or(0, |links| links.len());
+        self.notice = (link_count > 0).then(|| format!("将同时更新 {link_count} 条链接"));
         self.editing = Some(Editing { node_id, input });
-        self.notice = None;
         cx.notify();
     }
 
     /// 提交重命名：标题没变就直接退出；否则 `rename` + commit + 刷新。
+    ///
+    /// **笔记**重命名成功后才联动改写正文里的 wiki 链接（目录改名不做路径改写）。
+    /// 结构已提交、正文改写失败时**不回滚**结构：失败篇数写进提示，其余篇不受影响。
     fn commit_rename(&mut self, title: String, cx: &mut Context<Self>) {
         let Some(editing) = self.editing.take() else {
             return;
         };
         let node_id = editing.node_id;
-        let current = self
+        let entry = self
             .tree
             .iter()
             .find(|entry| entry.node_id == node_id)
-            .map(|entry| entry.title.clone());
-        if current.as_deref() == Some(title.as_str()) {
+            .cloned();
+        let old_title = entry.as_ref().map(|entry| entry.title.clone());
+        if old_title.as_deref() == Some(title.as_str()) {
             trace_menu!("[menghunote] 重命名未变化，直接退出 node={node_id}");
             self.notice = None;
             cx.notify();
@@ -967,9 +1011,113 @@ impl AppShell {
             eprintln!("[menghunote] 已重命名 node={node_id} → {title:?}");
             self.refresh_tree();
             self.selected_node_id = Some(node_id);
-            self.notice = None;
+            let note = entry.as_ref().filter(|entry| entry.is_note());
+            if let Some(note) = note {
+                if let Some(note_id) = note.note_id.as_deref() {
+                    self.rewrite_links_after_rename(note_id, &note.title, &title, cx);
+                    self.refresh_backlinks();
+                    self.refresh_wiki_resolution(cx);
+                }
+            } else {
+                self.notice = None;
+            }
         }
         cx.notify();
+    }
+
+    /// 结构重命名成功后的 wiki 链接联动改写。
+    ///
+    /// - 非活动来源：交给 storage 逐篇 `SessionDriver`（每篇一次正文提交，互不原子）；
+    /// - 当前打开的笔记：**必须**走活动 `EditorView` 的同一个 driver，另开会话会用
+    ///   旧快照覆盖在途编辑；
+    /// - 失败只计入 `notes_failed`，不回滚结构重命名，也不影响其它篇。
+    fn rewrite_links_after_rename(
+        &mut self,
+        note_id: &str,
+        old_title: &str,
+        new_title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let sources = match link_sources_for_note(&self.vault, note_id) {
+            Ok(sources) => sources,
+            Err(error) => {
+                eprintln!("[menghunote] 重命名联动：读取待更新链接失败 note={note_id}：{error}");
+                self.notice = Some(format!(
+                    "已重命名为「{new_title}」；读取待更新链接失败（详见 stderr）"
+                ));
+                return;
+            }
+        };
+        let active_note_id = self.active.as_ref().map(|active| active.note_id.clone());
+        let mut totals = LinkRenameTotals::default();
+        let mut deferred = Vec::new();
+        for source in sources {
+            if active_note_id.as_deref() == Some(source.note_id.as_str()) {
+                let Some(active) = self.active.as_ref() else {
+                    deferred.push(source);
+                    continue;
+                };
+                let view = active.view.clone();
+                let targets = source.targets.clone();
+                let result = view.update(cx, |view, cx| {
+                    let result = view.rewrite_wiki_link_targets(
+                        old_title,
+                        new_title,
+                        &targets,
+                        DEFAULT_REWRITE_TIMEOUT,
+                    );
+                    cx.notify();
+                    result
+                });
+                match result {
+                    Ok(0) => {}
+                    Ok(links) => {
+                        totals.notes_updated += 1;
+                        totals.links_rewritten += links;
+                    }
+                    Err(message) => {
+                        eprintln!(
+                            "[menghunote] 重命名联动：活动笔记改写失败 note={}：{message}",
+                            source.note_id
+                        );
+                        totals.notes_failed += 1;
+                    }
+                }
+            } else {
+                deferred.push(source);
+            }
+        }
+        if !deferred.is_empty() {
+            let options = RenameLinkOptions {
+                peer_id: self.peer_id,
+                sync: self.sync,
+                timeout: DEFAULT_REWRITE_TIMEOUT,
+            };
+            let report =
+                rewrite_link_sources(&self.vault, &deferred, old_title, new_title, options);
+            totals.notes_updated += report.notes_updated;
+            totals.links_rewritten += report.links_rewritten;
+            totals.notes_failed += report.notes_failed;
+            for failure in &report.failures {
+                eprintln!(
+                    "[menghunote] 重命名联动：来源「{}」未更新：{}",
+                    failure.title, failure.message
+                );
+            }
+        }
+        eprintln!(
+            "[menghunote] 重命名联动：更新 {} 篇 / {} 条链接，失败 {} 篇（note={note_id}）",
+            totals.notes_updated, totals.links_rewritten, totals.notes_failed
+        );
+        let retry = if totals.notes_failed == 0 {
+            String::new()
+        } else {
+            "（可重试）".to_owned()
+        };
+        self.notice = Some(format!(
+            "已重命名为「{new_title}」；更新 {} 篇 / {} 条链接，失败 {} 篇{retry}",
+            totals.notes_updated, totals.links_rewritten, totals.notes_failed
+        ));
     }
 
     /// **点外部**（别的行 / 正文 / 右键）：按"确认提交"处理，与 `Enter` 走同一条路径。
@@ -1140,10 +1288,136 @@ impl AppShell {
         }
     }
 
+    /// wiki 链接点击：按“路径精确 > 标题（大小写不敏感）> 最短路径”解析并打开。
+    ///
+    /// 解析不到/歧义时只写提示，不自动创建笔记（L1 的明确约束）。`heading` 目前
+    /// 只参与语法识别，L1 打开笔记即可；滚动到标题留给后续切片。
+    fn open_wiki_link(&mut self, target: String, _heading: Option<String>, cx: &mut Context<Self>) {
+        let raw = target.trim();
+        let normalized = raw
+            .trim_end_matches(".md")
+            .trim_matches('/')
+            .replace('\\', "/")
+            .to_lowercase();
+        if normalized.is_empty() {
+            if self.active.is_none() {
+                self.notice = Some("wiki 链接指向当前笔记，但当前没有打开的笔记".to_owned());
+                cx.notify();
+            }
+            return;
+        }
+        let Some(index) = self.resolve_wiki_target(&normalized) else {
+            self.notice = Some(format!("未找到 wiki 链接目标「{}」（不会自动创建）", raw));
+            cx.notify();
+            return;
+        };
+        self.selected_node_id = self.tree.get(index).map(|entry| entry.node_id.clone());
+        self.notice = None;
+        self.open_entry(index, cx);
+        cx.notify();
+    }
+
+    /// 普通外链点击：只放行 http/https/mailto，其余 scheme 明确拒绝。
+    fn open_external_link(&mut self, url: String, cx: &mut Context<Self>) {
+        let lower = url.trim().to_ascii_lowercase();
+        if !(lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("mailto:"))
+        {
+            self.notice = Some("只允许打开 http/https/mailto 链接".to_owned());
+            cx.notify();
+            return;
+        }
+        cx.open_url(url.trim());
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 结构树里某节点的完整路径（目录标题 + 笔记标题，`/` 分隔）。
+    fn tree_path_for(&self, index: usize) -> String {
+        let mut titles = Vec::new();
+        let mut current = index;
+        for _ in 0..64 {
+            let Some(entry) = self.tree.get(current) else {
+                break;
+            };
+            titles.push(entry.title.clone());
+            let Some(parent) = entry.parent_id.as_deref() else {
+                break;
+            };
+            let Some(parent_index) = self.tree.iter().position(|entry| entry.node_id == parent)
+            else {
+                break;
+            };
+            current = parent_index;
+        }
+        titles.reverse();
+        titles.join("/")
+    }
+
+    /// 把归一化后的 target 解析成树里的笔记下标；歧义/无匹配返回 `None`。
+    fn resolve_wiki_target(&self, normalized: &str) -> Option<usize> {
+        let mut candidates: Vec<(u8, usize, usize)> = Vec::new();
+        for (index, entry) in self.tree.iter().enumerate() {
+            if !entry.is_note() {
+                continue;
+            }
+            let path = self.tree_path_for(index);
+            let path_lower = path.to_lowercase();
+            let title_lower = entry.title.to_lowercase();
+            let score = if path_lower == normalized {
+                0
+            } else if !normalized.contains('/') && title_lower == normalized {
+                1
+            } else if path_lower.ends_with(&format!("/{normalized}")) {
+                2
+            } else {
+                continue;
+            };
+            candidates.push((score, path.chars().count(), index));
+        }
+        candidates.sort_unstable();
+        match candidates.as_slice() {
+            [] => None,
+            [only] => Some(only.2),
+            [best, next, ..] if best.0 == next.0 && best.1 == next.1 => None,
+            [best, ..] => Some(best.2),
+        }
+    }
+
+    /// 重新计算活动文档里的未解析 wiki 目标（用于灰色虚线样式）。
+    fn refresh_wiki_resolution(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let view = active.view.clone();
+        let targets = view.read(cx).wiki_targets();
+        let unresolved: HashSet<String> = targets
+            .into_iter()
+            .filter(|target| {
+                if target.is_empty() {
+                    self.active.is_none()
+                } else {
+                    self.resolve_wiki_target(target).is_none()
+                }
+            })
+            .collect();
+        view.update(cx, |view, cx| {
+            view.set_unresolved_wiki_targets(unresolved, cx);
+        });
+    }
+
     /// 点击侧栏第 `index` 行。
     ///
     /// 目录不打开文档；当前笔记重复点击直接忽略。
     fn on_row_click(&mut self, index: usize, cx: &mut Context<Self>) {
+        // 菜单项的 mouse-up 余波：不要让下层行把刚进入的重命名立刻提交掉。
+        if self
+            .menu_action_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(150))
+        {
+            return;
+        }
         let Some(entry) = self.tree.get(index).cloned() else {
             return;
         };
@@ -1266,6 +1540,10 @@ impl AppShell {
                     shell.commit_editing_from_outside(cx);
                 }
             }
+            EditorEvent::WikiLinkRequested { target, heading } => {
+                shell.open_wiki_link(target.clone(), heading.clone(), cx);
+            }
+            EditorEvent::ExternalLinkRequested(url) => shell.open_external_link(url.clone(), cx),
             EditorEvent::SearchRequested => {
                 // 编辑器只发事件；窗口在宿主手里（事件回调拿不到 `&mut Window`），
                 // 因此置一个待打开标记，下一帧 render 里真正创建浮层。
@@ -1313,9 +1591,12 @@ impl AppShell {
         );
         self.active = Some(OpenNote {
             node_id: entry.node_id,
+            note_id: entry.note_id.clone().expect("已打开笔记必须有 note_id"),
             view,
             _events: events,
         });
+        self.refresh_backlinks();
+        self.backlinks_open = false;
         // ADR 0012 S3：编辑代数按视图计（新视图从 0 开始），观测基准一起复位。
         #[cfg(feature = "dev-sync")]
         {
@@ -1324,6 +1605,7 @@ impl AppShell {
         self.notice = None;
         // 3) 切换完成后刷新侧栏（投影表在 commit 之后才是准的）。
         self.refresh_tree();
+        self.refresh_wiki_resolution(cx);
         // 切片 6b：活动文档变了（轮换/apply 的前置条件）。
         #[cfg(feature = "dev-sync")]
         self.dev_sync_push_active_document(cx);
@@ -1379,7 +1661,18 @@ impl AppShell {
         }
     }
 
-    /// 关窗前排空当前文档（`on_window_should_close` 里调用）。
+    /// 是否正在行内重命名（测试/诊断用）。
+    #[must_use]
+    pub fn is_renaming(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// 侧栏提示文本（测试/诊断用；`None` = 没有提示）。
+    #[must_use]
+    pub fn notice_text(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
     /// 当前活动文档的编辑器视图（`None` = 没有打开的笔记）。
     ///
     /// 与 `dev_sync_active_view` 同一个实体，但**不依赖 dev-sync feature**：
@@ -1449,6 +1742,7 @@ impl AppShell {
 
     /// 只做投屏：状态由 [`crate::dev_sync::AutoSync`] 决定（`sync-status` / `sync-status-error`
     /// 两个固定 selector）。每轮成功不弹 toast、不抢焦点；"需要处理"才多一行。
+    #[cfg(feature = "dev-sync")]
     fn dev_sync_status_projection(&self) -> Option<(String, Option<String>)> {
         #[cfg(feature = "dev-sync")]
         let projection: Option<(String, Option<String>)> = self
@@ -1457,6 +1751,140 @@ impl AppShell {
         #[cfg(not(feature = "dev-sync"))]
         let projection: Option<(String, Option<String>)> = None;
         projection
+    }
+
+    /// 刷新当前笔记的反向链接（派生表；失败只记日志，不影响编辑）。
+    fn refresh_backlinks(&mut self) {
+        self.backlinks.clear();
+        let Some(active) = &self.active else {
+            return;
+        };
+        match list_backlinks(&self.vault, &active.note_id) {
+            Ok(links) => self.backlinks = links,
+            Err(error) => eprintln!("[menghunote] 反向链接查询失败：{error}"),
+        }
+    }
+
+    /// 反向链接面板（右侧；L2 最小版：来源标题 + 点击打开）。
+    fn render_backlinks_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.backlinks.iter().enumerate().map(|(index, link)| {
+            div()
+                .id(SharedString::from(format!("backlink-{index}")))
+                .debug_selector(move || format!("backlink-{index}"))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .px_2()
+                .py_1()
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme::text_color())
+                        .truncate()
+                        .child(SharedString::from(link.from_title.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme::status_bar_text())
+                        .truncate()
+                        .child(SharedString::from(format!("[[{}]]", link.target))),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                        shell.open_backlink_note(index, cx);
+                    }),
+                )
+        });
+        div()
+            .id("backlinks-panel")
+            .debug_selector(|| "backlinks-panel".to_string())
+            .w(px(240.0))
+            .flex_shrink_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_l(px(1.0))
+            .border_color(theme::sidebar_border())
+            .bg(theme::sidebar_bg())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .border_b(px(1.0))
+                    .border_color(theme::sidebar_border())
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(SharedString::from(format!(
+                                "反向链接 {}",
+                                self.backlinks.len()
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id("backlinks-close")
+                            .debug_selector(|| "backlinks-close".to_string())
+                            .cursor_pointer()
+                            .px_1()
+                            .text_size(px(12.0))
+                            .text_color(theme::status_bar_text())
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    shell.backlinks_open = false;
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("backlinks-list")
+                    .debug_selector(|| "backlinks-list".to_string())
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .py_1()
+                    .when(self.backlinks.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .px_2()
+                                .py_2()
+                                .text_size(px(11.0))
+                                .text_color(theme::status_bar_text())
+                                .child(SharedString::from("没有反向链接")),
+                        )
+                    })
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// 反向链接点击：按 `note_id` 找到树行并打开（不按标题匹配）。
+    fn open_backlink_note(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(link) = self.backlinks.get(index).cloned() else {
+            return;
+        };
+        let Some((tree_index, _)) = self
+            .tree
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.note_id.as_deref() == Some(link.from_note_id.as_str()))
+        else {
+            self.notice = Some("来源笔记已不存在".to_owned());
+            cx.notify();
+            return;
+        };
+        self.open_entry(tree_index, cx);
     }
 
     /// 侧栏面板。
@@ -1890,9 +2318,39 @@ impl AppShell {
             .text_color(theme::status_bar_text())
             .child(SharedString::from(self.vault_label.clone()));
         let mut right = div().flex().flex_row().items_center().gap_2();
-        // dev-sync 未启用时整块不存在。
+        if self.active.is_some() {
+            right = right.child(
+                div()
+                    .id("backlinks-toggle")
+                    .debug_selector(|| "backlinks-toggle".to_string())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h_full()
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(if self.backlinks_open {
+                        theme::text_color()
+                    } else {
+                        theme::status_bar_text()
+                    })
+                    .child(SharedString::from(format!(
+                        "反向链接 {}",
+                        self.backlinks.len()
+                    )))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                            shell.refresh_backlinks();
+                            shell.backlinks_open = !shell.backlinks_open;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
         #[cfg(feature = "dev-sync")]
         {
+            // dev-sync 未启用时整块不存在。
             right = right.when_some(self.dev_sync_status_projection(), |this, (line, error)| {
                 this.child(
                     div()
@@ -2035,9 +2493,9 @@ impl AppShell {
         )
     }
 
-    fn render_main(&self) -> impl IntoElement {
+    fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self.active.as_ref().map(|active| active.view.clone());
-        div()
+        let editor = div()
             .flex()
             .flex_col()
             .flex_1()
@@ -2057,6 +2515,16 @@ impl AppShell {
                         .text_color(theme::status_bar_text())
                         .child(SharedString::from("没有打开的笔记（从左侧选一篇）")),
                 )
+            });
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .h_full()
+            .min_w(px(0.0))
+            .child(editor)
+            .when(self.backlinks_open && self.active.is_some(), |this| {
+                this.child(self.render_backlinks_panel(cx))
             })
     }
 }
@@ -5291,7 +5759,11 @@ impl Render for AppShell {
             if let Some(editing) = &self.editing {
                 let input = editing.input.clone();
                 window.defer(cx, move |window, cx| {
-                    input.update(cx, |input, cx| input.focus(window, cx));
+                    // 右键菜单的 mouse-up 可能在本帧之后把焦点抢回编辑器；再延一帧聚焦，
+                    // 保证输入框最终拿到焦点（F2 无 mouse-up，所以一直正常）。
+                    window.defer(cx, move |window, cx| {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    });
                 });
             }
         }
@@ -5341,7 +5813,7 @@ impl Render for AppShell {
         }
 
         let sidebar = self.render_sidebar(cx);
-        let main = self.render_main();
+        let main = self.render_main(cx);
         let content = div()
             .flex()
             .flex_row()

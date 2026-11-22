@@ -3433,7 +3433,7 @@ impl Render for AppRoot {
             }
             State::Error => self.render_error(cx).into_any_element(),
         };
-        let settings = self.render_settings(cx);
+        let settings = self.render_settings(window, cx);
         div()
             .relative()
             .size_full()
@@ -3676,7 +3676,7 @@ impl AppRoot {
     ///
     /// 只投影公开配置；不持有 setup secret/恢复码/root/manager seed（类型上也没有）。
     /// 关闭/取消不写配置；保存只写公开配置，运行中的 `AppShell`/Vault/worker 不动。
-    fn render_settings(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (
             active_entry,
             mode,
@@ -3966,7 +3966,9 @@ impl AppRoot {
                         .id("dev-sync-settings")
                         .debug_selector(|| "dev-sync-settings".to_string())
                         .w(px(680.0))
-                        .max_h(px(900.0))
+                        .h(px(
+                            (window.bounds().size.height.as_f32() - 112.0).clamp(240.0, 900.0)
+                        ))
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()

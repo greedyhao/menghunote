@@ -96,6 +96,7 @@ pub use model::error::EditorError;
 pub use model::input::InputDocument;
 pub use model::markdown::{
     ConstructKind, MarkdownConstruct, MarkdownDocument, MarkdownError, MarkdownImage,
+    TASK_BOX_DISPLAY,
 };
 pub use model::projection::{
     Bias, BoundaryBias, ProjectionError, ProjectionMap, ProjectionPiece, Segment, SegmentKind,

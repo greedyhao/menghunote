@@ -5387,6 +5387,7 @@ name = "menghunote-storage"
 version = "0.1.0"
 dependencies = [
  "loro",
+ "menghunote-markdown",
  "menghunote-text",
  "rusqlite",
  "sha2 0.10.9",

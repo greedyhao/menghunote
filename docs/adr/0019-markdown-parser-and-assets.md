@@ -25,7 +25,7 @@
 - 图片/Mermaid 渲染块用 **Object Block**：独占段落按内容宽度等比显示，混排用原子缩略图；
   不擅自补换行/写尺寸 HTML。加载失败显示 alt/名称占位。
 - **点击/选中对象块不直接展开源码**（Obsidian 式）：单击只选中块（描边/高亮）；
-  悬浮显示块工具条（编辑、放大/预览、复制 Markdown；Mermaid 另有重新渲染）。
+  悬浮显示块工具条（放大、编辑源码；Mermaid 后续同款但只保留编辑）。
   只有点工具条「编辑」/`F2` 才进入源码模式，显示完整 `![alt](asset://hash)` 或
   fenced mermaid；`Esc`、点击块外或 `Ctrl+Enter` 退出并提交。
 - 对象块内部不产生文本 caret/部分选区；Delete/Backspace 先选块、再删整个源跨度；
@@ -52,6 +52,7 @@
 - 保持 `gpui-kit =0.9.1` 与现有 lockfile 组合；复用 GPUI `RenderImage/ImageSource::Render`。
 - 直接复用已锁定的 `image 0.25.10`：后台受控解码、EXIF、RGBA→BGRA；不走隐式 HTTP/file 加载器。
 - 首版 PNG/JPEG/WebP/GIF，动画只取首帧、原字节保留；SVG 作普通附件，不执行/不栅格化。
+  Windows 剪贴板 CF_DIB 由 GPUI 转成 BMP，落库前统一转 PNG（2026-11-17）。
 - 预算：边长≤8192、总像素≤16MP、`max_alloc=128MiB`、缓存 LRU 128MiB、并发 1；
   超限/损坏只降级预览，不删正文/远端资产。
 - GPUI 已支持 `ClipboardEntry::{String,Image,ExternalPaths}`、Windows CF_DIB/CF_HDROP、
@@ -259,7 +260,8 @@
 - 绘制：对象行不画字形；已解码用 `Window::paint_image`（BGRA `RenderImage`，首帧），
   未就绪画占位框 + alt/状态文案（`图片加载中…` / `图片缺失或待同步` / `图片无法预览`）；
   选中态画 2px 描边。`paint_selection` 跳过对象行（不画占位符的文本选区）。
-- 悬浮工具条：对象被悬停/选中/文本选区相交时出现，「编辑源码」「复制 Markdown」；
+- 悬浮工具条：对象被悬停/选中/文本选区相交时出现，「放大」「编辑源码」；
+  放大按钮或已选中图片再次单击打开遮罩；按钮/遮罩样式参考 Obsidian；
   位置来自上一帧对象矩形，点击由工具条按钮处理，元素层的鼠标监听用
   `toolbar_rect` 放行（不会同时挪光标）。
 - 键盘：`F2` 有对象目标时进入源码模式（否则仍是侧栏重命名）；`Esc` / `Ctrl+Enter` /
@@ -338,8 +340,9 @@
   元数据）；`Ctrl+C` 复制对象 Markdown/选区源码时写入该标记，所以复制粘贴回本应用时
   走文本路径（与 S1 行为一致）。
 - 图片：`ClipboardEntry::Image` 的**原始编码字节**（PNG/JPEG/WebP/GIF）直接入库，不转码；
+  Windows CF_DIB 经 GPUI 转成 BMP，落库前统一转 PNG（2026-11-17 修复）；
   声明的格式与字节魔数不一致时以**字节**为准。
-- SVG / BMP / TIFF / ICO：按**普通附件**（`[附件：粘贴图片.svg](asset://…)`）存，
+- SVG / TIFF / ICO（以及 BMP **文件**，不是 CF_DIB）：按**普通附件**存，
   不执行、不栅格化、不进图片对象预览。
 - 入口：`on_key_down` 的 `Ctrl+V`/`Ctrl+Shift+V` + `InputHandler::paste`（平台直接派发
   paste 的后端，例如 web）+ 编辑区 `on_drop::<ExternalPaths>`。三条路都走同一套
@@ -442,12 +445,79 @@
 
 1. 资源管理器复制文件 → `Ctrl+V`：CF_HDROP → `ExternalPaths` 分流（本机已有代码路径，
    需真机确认不落成文本/路径）；
-2. 截图工具/浏览器复制图片 → `Ctrl+V`：Windows 后端读 `PNG`/`JFIF`/`GIF` 自定义格式，
-   **CF_DIB/CF_DIBV5 缺口**由后续适配层补（本切片不做，也不写 Windows API）；
+2. 截图工具/浏览器复制图片 → `Ctrl+V`：Windows 后端读 `PNG`/`JFIF`/`GIF` 自定义格式；
+   **CF_DIB 已支持**（GPUI 转 BMP → 落库前转 PNG，2026-11-17），CF_DIBV5 仍是缺口；
 3. 从资源管理器拖文件到编辑区：`IDropTarget` → `FileDropEvent` → `on_drop`（含落点
    hover 命中、DPI 缩放下的坐标）；
 4. 中文/空格路径、多文件（≤10）、超大文件（>20 MiB 拒绝）与目录拖入的提示行；
 5. 粘贴图片后立刻按 `Ctrl+Z`：一次撤销整批；重开后引用 `start_byte` 与正文一致。
+
+## 9. S3 实施记录（2026-11-17，任务列表复选框交互）
+
+> 范围：**任务列表复选框的解析/投影/绘制/命中/切换**。
+> 明确**未做**：表格对象与交互（S3 另一半）、资产物理 GC、列表折叠/拖拽；
+> 不改 schema / 同步 wire / tag。
+
+### 9.1 解析层：`ListItem.task_marker`
+
+- `menghunote-markdown` 的 `ListItem` 新增 `task_marker: Option<Span>`：
+  **源码**里 `[ ]` / `[x]` / `[X]` 的 3 字节区间（两个方括号 + 内部字符），
+  **不含** `]` 之后的空白或正文。区间来自 `pulldown-cmark` 的
+  `Event::TaskListMarker` range，再做形状校验（`[` + 空格/Tab/`x`/`X` + `]`），
+  形状不符只保留 `task` 状态、不暴露可点区间；已有 `task: Option<bool>` 语义不变。
+- golden 测试钉住：普通/嵌套/有序/引用任务项各自的 span、`[X]` 仍为已勾选、
+  区间终点正好在 `]` 后；`- [ ]no-space` 与 marker 后 5 空格（pulldown 只看 ≤3）
+  不产生任务项，也就不暴露 span。
+
+### 9.2 editor：占位投影与切换 API
+
+- `TASK_BOX_DISPLAY = "\u{00A0}\u{00A0}"`（两个不换行空格）：隐藏态下把任务框
+  `Replace` 成不可见占位。不用可见 `☐` 的原因：绘制层自绘复选框，可见字符会在
+  缺字时露豆腐块/与自绘方框重影；NBSP 还避免复选框在折行处被拆开。
+- 显现规则与列表 marker 一致：caret 落在 marker **或任务框**内、或非空选区与之
+  相交时，marker + 任务框都显示源码（`- [ ] …`），此时不画复选框。
+- `ProjectionMap::replace_display_range(source)`：只有 source 完全等于某个
+  `Replace` 段时返回 display 区间；app 据此自绘/命中，显现源码时返回 `None`。
+- `EditorController::toggle_task_marker(index)`：
+  - 只替换任务框 3 个字节（`[ ]` → `[x]`，`[x]`/`[X]` → `[ ]`，**勾选统一写小写
+    `x`**；`[X]` 视为已勾选）；缩进、marker、`]` 后空白、其它正文/换行逐字不变；
+  - 一次调用 = 一个 `EditRequest`（单 `ScalarEdit`），进会话默认撤销组；
+  - `compose_edits` 的“caret 落到替换之后”在这里被纠正：替换等长（3 scalar），
+    返回请求前恢复原 selection，点击复选框不落正文 caret；
+  - 非任务项/越界 → `Ok(None)`；IME 组合由 `ensure_editable` 拒绝。
+- 测试（`crates/editor/tests/task_box.rs`，6 个）：占位/映射/复制反查、caret 与
+  选区显现、父/子/有序/大写独立切换、caret 不变、非任务 no-op。
+
+### 9.3 app：绘制 / 命中 / 编辑接线
+
+- 复用现有列表几何：`block_metrics` 对任务项把 **marker 显示文本 + 任务框占位 +
+  `]` 后源空白**一起按真实 shaping 测宽，内容列/续行 hanging indent 与复选框位置
+  同一来源；非任务列表宽度不变。
+- `EditorView::task_checkboxes()` 给出 `(item, checked, source span, display range)`；
+  `EditorElement::prepaint` 用与链接 hitbox 相同的 `caret_row_x` 把 display 区间换算成
+  窗口矩形，写入 `EditorGeometry.task_boxes`（绘制/命中/headless 断言同源）。
+- 绘制：行内矩形内居中画圆角方框；未勾选白底灰描边，已勾选主题蓝底 + 白色勾形
+  （颜色只在 `theme` 里）。矩形是整个占位区（约一个字符格），比 13px 方框好点。
+- 命中：每帧为可见任务框 `insert_hitbox` + `set_cursor_style(PointingHand)`（沿用
+  AGENTS §6 的 gpui 原生 cursor 机制，不自建 hover 状态机）；mouse-down 在处理正文
+  caret/选区**之前**命中任务框，只调 `toggle_task_checkbox` 并 `return` —— 不落
+  caret、不开始拖选、不触发对象选中/列表折叠。命中矩形带 `source span`，点击时与
+  当前解析结果比对；陈旧帧（远端已改文本）直接忽略，不拿旧偏移改新内容。
+- headless（`crates/app/tests/headless_tasks.rs`，4 个，真实 `AppShell` + 临时 vault）：
+  点击 `[ ]`→`[x]` 再点回 `[ ]` 且 caret 不变；嵌套/有序/`[X]` 各自独立；`Ctrl+Z` /
+  `Ctrl+Shift+Z` 一次撤销/重做；durable 后重开 vault 与重新打开 shell 仍是新勾选态。
+
+### 9.4 验证与已知限制
+
+- `cargo fmt --all -- --check`、`cargo clippy -p menghunote-markdown -p menghunote-editor
+  -p menghunote-app --all-targets --features dev-sync -- -D warnings` 通过；
+  `cargo test -p menghunote-markdown` **22**、`-p menghunote-editor` **157**、
+  `-p menghunote-app --features dev-sync` **427**，0 failed（本机 Linux）。
+- 未做像素/真机验收：复选框外观、手形光标、DPI 下命中仍需 Windows `ui_smoke.ps1`；
+  本环境只证明了“几何 → hitbox → EditRequest → undo/持久化”链路。
+- 任务框显现源码时（caret 进入）不画复选框是**写死行为**：与列表 marker 的 Typora
+  规则一致；如果后续要 Obsidian 式“光标在框里仍显示复选框”，需要另立决策。
+- 表格对象与交互、资产物理 GC 仍按 §5 S3 后半段后置。
 
 ## 非目标
 
