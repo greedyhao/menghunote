@@ -1,0 +1,22 @@
+[package]
+name = "menghunote-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 应用层错误汇总（库层用 thiserror，见 AGENTS.md §4）
+anyhow = "1"
+# 依赖基线见 AGENTS.md §1，勿随意升级
+# lib name 为 `gpui`，故代码里 `use gpui::*`
+gpui-unofficial = "1.27"
+# 包名与 lib name 不同，必须用 package 别名
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "1.27.0" }
+# ADR 0003 §3：app 可以依赖 editor / storage / text，反向不允许
+menghunote-editor = { path = "../editor" }
+menghunote-storage = { path = "../storage" }
+
+[target.'cfg(windows)'.dependencies]
+# 启动时读回进程 DPI 感知级别（GetThreadDpiAwarenessContext / GetDpiForSystem）。
+# 0.61 已在依赖图里（gpui 的 Windows 后端在用），特性只要 HiDpi。
+windows-sys = { version = "0.61", features = ["Win32_UI_HiDpi"] }

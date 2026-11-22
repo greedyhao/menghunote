@@ -1,0 +1,1163 @@
+//! 编辑器视图：`EditorController` + `SessionDriver` 的接线、键盘导航、状态栏。
+//!
+//! ## 线程模型
+//!
+//! `SessionDriver::pump()` 只做内存操作（读 ticker、检查 250ms 固定窗口、
+//! 收会话 / B 物化事件），不碰 SQLite。它仍然放在**主线程**上跑，但由
+//! `cx.spawn` + `background_executor().timer(..)` 驱动：
+//!
+//! ```text
+//! 主线程: spawn(future) → timer(50ms).await（后台线程计时）→ 回到主线程 pump()
+//! ```
+//!
+//! 因此 UI 线程不会被 IO 阻塞；`flush` 的计时也**不在这里**——那是
+//! `SessionDriver` 既有的 250ms / 64 KiB 调度（ADR 0002 §9），app 不另写一套。
+//! `driver.close(timeout)` 只在窗口关闭时调用，且有界（见 [`CLOSE_TIMEOUT`]）。
+//!
+//! ## 切片 6b：IME 输入闭环
+//!
+//! 平台文本输入（含 IME 组合）由 `impl EntityInputHandler for EditorView`（`input` 模块）
+//! 接入；本模块负责它背后那些**必须串行、必须可观测**的动作：
+//!
+//! 1. **组合闸门**：第一次 preedit 到达时 `driver.begin_composition()`，commit/cancel 时
+//!    `end_composition()` 并按序把返回的 `LiveDelta` 应用镜像（**只**从返回值取，
+//!    不再走 `DriverEvent::Remote`，避免同一条 delta 应用两次）；
+//! 2. **一次 commit 只有一个 `EditRequest`**：所有编辑都过 [`EditorView::submit_request`]，
+//!    那里打日志（`请求#N … edits=M`）——日志就是"只发一次"的证据；
+//! 3. **组合期主动不发**：组合中若还有用户命令（快捷键 / 别的路径），先挂起，
+//!    `end_composition()` 之后用**同一 `command_id`** 重试（会话侧幂等）；
+//!    万一仍收到 `Rejected{CompositionActive}`，不把它交给控制器（否则会进 `needs_resync`）；
+//! 4. **Undo/Redo**：`Ctrl+Z` / `Ctrl+Shift+Z` 走会话唯一的 `UndoManager`，
+//!    组合态下先取消组合（丢弃 overlay，不提交）再撤销。
+//!
+//! ## 为什么 `scroll_y` 放在实体里
+//!
+//! 滚动位置是**用户可观察状态**（键盘翻页要基于它，render 也要读它），
+//! 所以放实体字段 + `notify()`；而折行结果与上一帧几何只影响绘制，放在
+//! [`EditorShared`] 里（见 `shared` 模块的说明）。
+
+use std::ops::Range;
+use std::rc::Rc;
+use std::time::Duration;
+
+use gpui::prelude::*;
+use gpui::{
+    div, px, App, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton,
+    MouseDownEvent, Pixels, Render, SharedString, Window,
+};
+use menghunote_editor::{
+    EditorController, EditorError, GraphemeStep, InputDocument, Selection, SourceByte,
+    UnicodeScalar,
+};
+use menghunote_storage::session::{
+    CloseReport, DriverEvent, EditOutcome, EditRequest, LiveDelta, RejectReason, SessionDriver,
+};
+
+use super::element::EditorElement;
+use super::layout::LayoutFrame;
+use super::shared::EditorShared;
+use super::theme;
+
+/// 会话驱动 pump 间隔：只做内存操作，50 ms 足够跟上 250 ms 的 flush 窗口。
+const PUMP_INTERVAL: Duration = Duration::from_millis(50);
+/// 关闭窗口时的有界排空上限（ADR 0002 §9：`close` 必须有界）。
+const CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// 状态栏右侧的固定提示。
+const HINT: &str =
+    "切片 6b：可输入 · Ctrl+Z 撤销 / Ctrl+Shift+Z 重做 · 中文走 IME（组合文本上屏前不落库）";
+
+/// IME 组合状态。
+///
+/// preedit 本身在 `EditorController` 的 overlay 里（[`EditorController::set_preedit`]），
+/// 这里只记"平台这一次组合"在 app 侧需要的东西：闸门是否已开、IME 内部选区、
+/// 以及组合期被挂起的待重试请求。
+#[derive(Default)]
+struct Composition {
+    /// 是否已经调过 `driver.begin_composition()`（避免把深度叠加两次）。
+    active: bool,
+    /// preedit 内的 UTF-16 选区（IME 自己的光标位置，目前只用于日志）。
+    selected: Option<Range<usize>>,
+    /// 因 `CompositionActive` 未被受理、等组合结束后用**同一 `command_id`** 重试的请求。
+    pending_retry: Option<EditRequest>,
+}
+
+/// 编辑器窗口的主视图。
+/// 编辑器对宿主（`AppShell`）的少量事件。
+///
+/// 用事件而不是回调：侧栏要知道"按了 F2 / 点进了正文"，但不该把 shell 的引用塞进
+/// 编辑器（依赖方向反了）。宿主 `cx.subscribe` 即可。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorEvent {
+    /// 按了 `F2`：请宿主重命名侧栏当前选中的节点。
+    RenameRequested,
+    /// 正文被按下鼠标：宿主可用它取消行内编辑。
+    PointerDown,
+}
+
+impl gpui::EventEmitter<EditorEvent> for EditorView {}
+
+pub struct EditorView {
+    controller: EditorController,
+    driver: SessionDriver,
+    focus_handle: FocusHandle,
+    shared: Rc<EditorShared>,
+    /// 已向下滚过的像素数（非负，0 = 文档顶部）。
+    scroll_y: f32,
+    /// 上下移动时保持的视觉列（相对行首的像素）；水平定位会清空。
+    preferred_x: Option<Pixels>,
+    /// 拖拽锚点（按下时的 scalar）；`None` = 当前没有拖拽。
+    drag_anchor: Option<UnicodeScalar>,
+    /// 是否已经做过首帧聚焦（避免每帧重复 `window.focus`）。
+    focused_once: bool,
+    /// 关闭排空结果（留痕用，只在 stderr 打一行）。
+    close_report: Option<CloseReport>,
+    /// 状态栏展示的 vault 路径。
+    vault_label: String,
+    /// IME 组合状态（preedit 只活在控制器 overlay 里，绝不进 CRDT）。
+    composition: Composition,
+    /// 已发出的 `EditRequest` 计数：日志里用来证明"一次 commit 只有一个请求"。
+    request_seq: u64,
+    /// 下一次绘制选区时是否把几何明细打到 stderr（拖拽/点击时置位，task-19 诊断用）。
+    dump_selection: bool,
+}
+
+impl EditorView {
+    /// 组装视图并启动后台 pump 循环。
+    pub fn new(
+        controller: EditorController,
+        driver: SessionDriver,
+        vault_label: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let view = Self {
+            controller,
+            driver,
+            focus_handle: cx.focus_handle(),
+            shared: EditorShared::new(),
+            scroll_y: 0.0,
+            preferred_x: None,
+            drag_anchor: None,
+            focused_once: false,
+            close_report: None,
+            vault_label,
+            composition: Composition::default(),
+            request_seq: 0,
+            dump_selection: false,
+        };
+        view.spawn_pump(cx);
+        view
+    }
+
+    /// 启动 `pump` 循环：后台计时、主线程收事件。
+    fn spawn_pump(&self, cx: &mut Context<Self>) {
+        let timers = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                timers.timer(PUMP_INTERVAL).await;
+                let updated = this.update(cx, |view, cx| {
+                    if view.pump() {
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    // 实体已被释放（窗口关闭）：结束循环，不要继续 await。
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 收一次驱动事件；返回是否影响了可视状态（只有影响时才 `notify`）。
+    fn pump(&mut self) -> bool {
+        let mut changed = false;
+        for event in self.driver.pump() {
+            match event {
+                DriverEvent::Durable(ack) => {
+                    self.controller.apply_durable_ack(&ack);
+                    eprintln!(
+                        "[menghunote] durable 水位 → live_rev={}（is_saved={}）",
+                        ack.through_live_rev.0,
+                        self.controller.is_saved()
+                    );
+                    changed = true;
+                }
+                DriverEvent::Remote(delta) => match self.controller.apply_live_delta(delta) {
+                    Ok(_) => changed = true,
+                    Err(error) => {
+                        eprintln!("[menghunote] 远端变更未能应用（等待重建）：{error}");
+                    }
+                },
+                // flush 已提交但后台还没写完：状态栏由 `is_saved()` 表达，无需额外处理。
+                DriverEvent::FlushScheduled { .. } => {}
+                // B 物化只写 `notes.body_md`，本切片视图不读它。
+                DriverEvent::Materialized(_) => {}
+                DriverEvent::MaterializeFailed { note_id, message } => {
+                    eprintln!("[menghunote] B 物化失败 note={note_id}：{message}");
+                }
+            }
+        }
+        // 组合期间延后的远端可能因背压没排空：非组合态下每次 pump 都补一次。
+        if !self.is_composing() && self.driver.deferred_remote_len() > 0 {
+            self.drain_deferred_remote();
+            changed = true;
+        }
+        if changed {
+            // 远端变更可能让内容变短，滚动量必须重新夹取，否则会滚到空白区。
+            self.clamp_scroll();
+        }
+        changed
+    }
+
+    /// 本帧源码快照（绘制入口）。
+    #[must_use]
+    pub fn source_text(&self) -> String {
+        self.controller.source_text()
+    }
+
+    /// 当前 source selection。
+    #[must_use]
+    pub fn selection(&self) -> Selection {
+        self.controller.selection()
+    }
+
+    /// 当前滚动偏移（像素，正 = 已向下滚）。
+    #[must_use]
+    pub fn scroll_y(&self) -> f32 {
+        self.scroll_y
+    }
+
+    /// 是否全部已 durable（状态栏 `已保存 / 保存中` 的来源）。
+    #[must_use]
+    pub fn is_saved(&self) -> bool {
+        self.controller.is_saved()
+    }
+
+    /// 请求在下一次绘制选区时输出几何明细（task-19 诊断：软折行选区的首末行范围）。
+    pub(crate) fn request_selection_dump(&mut self) {
+        self.dump_selection = true;
+    }
+
+    /// 取走"是否要 dump"的一次性标记。
+    pub(crate) fn take_selection_dump(&mut self) -> bool {
+        core::mem::take(&mut self.dump_selection)
+    }
+
+    /// 当前 preedit（组合文本）；没有组合返回 `None`。
+    ///
+    /// 它**只**用于绘制 overlay 与状态栏文案，永远不会被写进 source。
+    #[must_use]
+    pub fn preedit_text(&self) -> Option<&str> {
+        self.controller.preedit_text()
+    }
+
+    /// 组合是否进行中（控制器有 preedit 或存储侧闸门开着）。
+    #[must_use]
+    pub fn is_composing(&self) -> bool {
+        self.controller.preedit_text().is_some() || self.driver.is_composing()
+    }
+
+    /// 当前虚拟输入文档（source 在选区处替换成 preedit）。
+    pub(crate) fn input_document(&self) -> Result<InputDocument, EditorError> {
+        self.controller.input_document()
+    }
+
+    /// **有界排空**：`end_composition()` → flush(Close) → 等 durable → 等 B 物化。
+    ///
+    /// 窗口关闭与**切换文档**共用这一条路径；`timed_out == true` 表示没排空，
+    /// 调用方（切换文档）必须据此**中止切换**并保留现场 —— 不许静默丢编辑。
+    pub fn drain_and_close(&mut self, timeout: Duration) -> CloseReport {
+        if let Some(report) = &self.close_report {
+            return report.clone();
+        }
+        // 关闭前先结束组合闸门（丢弃 overlay，不产生请求），否则延后的远端导入
+        // 会随会话一起丢掉，且 `close` 期间不会自动合并。
+        self.controller.clear_preedit();
+        if self.composition.active || self.driver.is_composing() {
+            self.composition.active = false;
+            self.composition.selected = None;
+            let deltas = self.driver.end_composition();
+            eprintln!(
+                "[menghunote] 关闭前结束组合：合并延后远端 {} 条",
+                deltas.len()
+            );
+            self.apply_live_deltas(deltas);
+        }
+        let report = self.driver.close(timeout);
+        eprintln!(
+            "[menghunote] 关闭排空：durable={} materialized={} pending_edits={} pending_materialize={} timed_out={}",
+            report.durable.is_some(),
+            report.materialized,
+            report.pending_edits,
+            report.pending_materialize,
+            report.timed_out
+        );
+        self.close_report = Some(report.clone());
+        report
+    }
+
+    /// 关闭窗口时**有界**排空（沿用 5a 的固定上限）。
+    pub fn close_session(&mut self) {
+        self.drain_and_close(CLOSE_TIMEOUT);
+    }
+
+    // ---- 鼠标 ----
+
+    /// 左键按下：命中 → 落光标，并开始一次可能的拖拽。
+    pub fn begin_pointer_selection(
+        &mut self,
+        byte: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.controller.source_text();
+        let byte = self.snap_byte(byte, &text);
+        let Some(scalar) = scalar_of_byte(&text, byte) else {
+            return;
+        };
+        self.drag_anchor = Some(scalar);
+        self.preferred_x = None;
+        window.focus(&self.focus_handle, cx);
+        self.request_selection_dump();
+        self.commit_selection(Selection::caret(scalar), cx);
+    }
+
+    /// 拖拽移动：anchor 保持，head 跟着鼠标。
+    pub fn extend_selection_to(&mut self, byte: usize, cx: &mut Context<Self>) {
+        let Some(anchor) = self.drag_anchor else {
+            return;
+        };
+        let text = self.controller.source_text();
+        let byte = self.snap_byte(byte, &text);
+        let Some(head) = scalar_of_byte(&text, byte) else {
+            return;
+        };
+        self.preferred_x = None;
+        self.request_selection_dump();
+        self.commit_selection(Selection::new(anchor, head), cx);
+    }
+
+    /// 左键抬起：结束拖拽。
+    pub fn end_drag(&mut self) {
+        self.drag_anchor = None;
+    }
+
+    /// 滚动（像素，正 = 向下滚）：滚轮与后续自动滚动都走这里。
+    pub fn scroll_by(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if !delta.is_finite() || delta == 0.0 {
+            return;
+        }
+        self.scroll_y = (self.scroll_y + delta).max(0.0);
+        self.clamp_scroll();
+        cx.notify();
+    }
+
+    // ---- 键盘 ----
+
+    /// 方向键 / 翻页 / 行首行尾。
+    ///
+    /// 只处理**无修饰键**与 `Shift`（扩选）；带 Ctrl / Alt 的组合留给后续切片
+    /// （按词移动、命令面板等）。
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = event.keystroke.modifiers;
+
+        // F2：请宿主重命名侧栏选中项（编辑器自己不管侧栏，只发事件）。
+        if !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && event.keystroke.key.as_str() == "f2"
+        {
+            cx.emit(EditorEvent::RenameRequested);
+            window.prevent_default();
+            return;
+        }
+
+        // 调试入口（仅 debug 构建）：模拟一次中文 IME 组合。
+        //
+        // 真实 IME 事件（微软拼音的候选窗 / Esc / 空格上屏）只能人工验；这里用**同一条**
+        // app 侧入口（`update_preedit` → `commit_composition` / `cancel_composition`），
+        // 让"一次 commit 只有一个 EditRequest""cancel 不产生请求"这两条约束可以被机器验证。
+        #[cfg(debug_assertions)]
+        if !modifiers.control && !modifiers.alt && !modifiers.platform {
+            match event.keystroke.key.as_str() {
+                "f8" => {
+                    // 只开始组合、不提交：用来肉眼/截图确认 preedit overlay 与状态栏文案。
+                    eprintln!("[menghunote][debug] 模拟 IME 组合（仅 overlay，F8）");
+                    self.update_preedit("zhongwen", None, cx);
+                    return;
+                }
+                "f9" => {
+                    self.debug_ime_compose("zhongwen", "中文", cx);
+                    return;
+                }
+                "f10" => {
+                    self.debug_ime_cancel("nihao", cx);
+                    return;
+                }
+                "f11" => {
+                    eprintln!("[menghunote][debug] 模拟 Ctrl+Z（F11）");
+                    self.undo(cx);
+                    return;
+                }
+                "f12" => {
+                    eprintln!("[menghunote][debug] 模拟 Ctrl+Shift+Z（F12）");
+                    self.redo(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // 撤销 / 重做：走会话唯一的 UndoManager（组合态下先取消组合）。
+        if modifiers.control && !modifiers.alt && !modifiers.platform {
+            match (event.keystroke.key.as_str(), modifiers.shift) {
+                ("z", false) => self.undo(cx),
+                ("z", true) => self.redo(cx),
+                _ => {}
+            }
+            return;
+        }
+
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return;
+        }
+        let extend = modifiers.shift;
+        match event.keystroke.key.as_str() {
+            // 换行：走和 IME 上屏同一条路径（一次 EditRequest）。
+            "enter" => self.insert_text("\n", cx),
+            // 退格 / Delete：删什么由编辑器按 grapheme 决定（app 不自己拼 ScalarEdit）。
+            "backspace" => self.delete_grapheme(GraphemeStep::Backward, cx),
+            "delete" => self.delete_grapheme(GraphemeStep::Forward, cx),
+            "left" => self.move_grapheme(GraphemeStep::Backward, extend, cx),
+            "right" => self.move_grapheme(GraphemeStep::Forward, extend, cx),
+            "up" => self.move_rows(-1, extend, window, cx),
+            "down" => self.move_rows(1, extend, window, cx),
+            "pageup" => self.move_page(false, extend, window, cx),
+            "pagedown" => self.move_page(true, extend, window, cx),
+            "home" => self.move_to_row_edge(false, extend, window, cx),
+            "end" => self.move_to_row_edge(true, extend, window, cx),
+            _ => {}
+        }
+    }
+
+    /// 左右：按 **grapheme** 移动（由控制器实现，app 不重算 grapheme）。
+    fn move_grapheme(&mut self, step: GraphemeStep, extend: bool, cx: &mut Context<Self>) {
+        match self.controller.move_grapheme(step, extend) {
+            Ok(()) => {
+                self.preferred_x = None;
+                let selection = self.controller.selection();
+                self.ensure_caret_visible(selection.head());
+                self.log_caret(selection);
+                cx.notify();
+            }
+            Err(error) => eprintln!("[menghunote] 光标移动失败：{error}"),
+        }
+    }
+
+    /// 上下：按**视觉行**移动，并尽量保持视觉列（`preferred_x`）。
+    fn move_rows(&mut self, delta: i64, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(geometry) = self.shared.geometry() else {
+            return;
+        };
+        let text = self.controller.source_text();
+        let selection = self.controller.selection();
+        let Some(head_byte) = source_byte_of(&text, selection.head()) else {
+            return;
+        };
+        let frame = &geometry.frame;
+        let row = frame.row_of_byte(head_byte);
+        let x = self
+            .preferred_x
+            .unwrap_or_else(|| self.caret_x_in_row(frame, row, head_byte, window));
+        let last_row = frame.row_count().saturating_sub(1);
+        let target_row = super::layout::vertical_target(row, delta, last_row);
+        let target_byte = self.byte_at_row_x(frame, target_row, x, window);
+        let Some(target) = scalar_of_byte(&text, frame.snap_byte_to_grapheme(target_byte)) else {
+            return;
+        };
+        self.preferred_x = Some(x);
+        let next = if extend {
+            Selection::new(selection.anchor(), target)
+        } else {
+            Selection::caret(target)
+        };
+        self.commit_selection(next, cx);
+    }
+
+    /// PageUp / PageDown：按可见行数翻页（光标跟着走，视口由
+    /// `ensure_caret_visible` 拉到位，因此翻页与滚动是同一套几何）。
+    fn move_page(
+        &mut self,
+        forward: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.shared.geometry().map_or(1, |geometry| {
+            super::layout::rows_per_page(geometry.viewport_height, theme::LINE_HEIGHT)
+        });
+        self.move_rows(if forward { rows } else { -rows }, extend, window, cx);
+    }
+
+    /// Home / End：当前**视觉行**的行首 / 行尾（不是源码行，符合软折行后的直觉）。
+    fn move_to_row_edge(
+        &mut self,
+        to_end: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = window;
+        let Some(geometry) = self.shared.geometry() else {
+            return;
+        };
+        let text = self.controller.source_text();
+        let selection = self.controller.selection();
+        let Some(head_byte) = source_byte_of(&text, selection.head()) else {
+            return;
+        };
+        let row = geometry.frame.row_of_byte(head_byte);
+        let bytes = geometry.frame.row_bytes(row);
+        let target_byte = if to_end { bytes.end } else { bytes.start };
+        let Some(target) = scalar_of_byte(&text, geometry.frame.snap_byte_to_grapheme(target_byte))
+        else {
+            return;
+        };
+        self.preferred_x = None;
+        let next = if extend {
+            Selection::new(selection.anchor(), target)
+        } else {
+            Selection::caret(target)
+        };
+        self.commit_selection(next, cx);
+    }
+
+    // ---- 文本输入 / IME 组合（切片 6b）----
+
+    /// 组合更新：**只改 overlay**（preedit 不进 source、不产生 `EditRequest`）。
+    pub(crate) fn update_preedit(
+        &mut self,
+        text: &str,
+        selected: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.composition.active {
+            let depth = self.driver.begin_composition();
+            self.composition.active = true;
+            eprintln!("[menghunote] IME 组合开始（storage 闸门 depth={depth}）");
+        }
+        self.composition.selected = selected;
+        match self.controller.set_preedit(text) {
+            Ok(()) => eprintln!(
+                "[menghunote] preedit ← {:?}（只更新 overlay，不产生 EditRequest）",
+                text
+            ),
+            Err(error) => eprintln!("[menghunote] 设置 preedit 失败：{error}"),
+        }
+        cx.notify();
+    }
+
+    /// 取消组合：丢弃 overlay，**不发请求**；返回的延后远端仍然要合并。
+    pub(crate) fn cancel_composition(&mut self, cx: &mut Context<Self>) {
+        let dropped = self.controller.preedit_text().map(str::to_owned);
+        self.controller.clear_preedit();
+        if let Some(preedit) = dropped.as_deref() {
+            eprintln!("[menghunote] IME 取消：丢弃 preedit {preedit:?}（不发 EditRequest）");
+        }
+        self.finish_composition_bridge();
+        cx.notify();
+    }
+
+    /// 组合提交：`text` 是平台给的最终文本，**只产生一个 `EditRequest`**。
+    pub(crate) fn commit_composition(&mut self, text: &str, cx: &mut Context<Self>) {
+        let preedit = self.controller.preedit_text().map(str::to_owned);
+        // 1) 先结束存储侧闸门：延后的远端在这里合并（合并可能让 preedit 失效）
+        self.finish_composition_bridge();
+        // 2) 一次替换：组合文本 → 一个 EditRequest
+        let request = if preedit.is_some() && self.controller.preedit_text().is_some() {
+            self.controller.commit_preedit(text)
+        } else {
+            // preedit 已被并发远端取消：退回"在光标处插入"，绝不丢用户的字
+            self.controller.compose_replace_selection(text)
+        };
+        match request {
+            Ok(request) => {
+                eprintln!(
+                    "[menghunote] IME 上屏：preedit={:?} → committed={:?}",
+                    preedit, text
+                );
+                self.submit_request(request);
+            }
+            Err(error) => eprintln!("[menghunote] 提交组合失败：{error}"),
+        }
+        cx.notify();
+    }
+
+    /// 普通文本输入（无组合：打字 / 粘贴）。
+    pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        match self.controller.compose_replace_selection(text) {
+            Ok(request) => self.submit_request(request),
+            Err(error) => eprintln!("[menghunote] 插入文本失败：{error}"),
+        }
+        cx.notify();
+    }
+
+    /// 退格 / Delete：走与普通输入**完全相同**的一条路径。
+    ///
+    /// 删哪一段由 [`EditorController::delete_backward`] / [`EditorController::delete_forward`]
+    /// 按 grapheme 决定（有选区删选区），app 只负责把返回的 `EditRequest` 交给
+    /// [`Self::submit_request`] —— 不在这里拼 `ScalarEdit`，也不二次改文本。
+    ///
+    /// 组合态按删除键：先取消组合（丢弃 overlay，不发请求），不要让编辑请求去撞闸门。
+    fn delete_grapheme(&mut self, step: GraphemeStep, cx: &mut Context<Self>) {
+        if self.is_composing() {
+            self.cancel_composition(cx);
+        }
+        let outcome = match step {
+            GraphemeStep::Backward => self.controller.delete_backward(),
+            GraphemeStep::Forward => self.controller.delete_forward(),
+        };
+        match outcome {
+            Ok(Some(request)) => {
+                // 日志里带上 EditRequest 的形状：一次删除永远只有 1 个 ScalarEdit
+                let edit = request.edits.first();
+                match edit {
+                    Some(edit) => eprintln!(
+                        "[menghunote] 删除（{step:?}）：edits={} {:#?}..{:#?} → {:?}",
+                        request.edits.len(),
+                        edit.start.get(),
+                        edit.end.get(),
+                        edit.replacement
+                    ),
+                    None => eprintln!("[menghunote] 删除（{step:?}）：请求里没有 ScalarEdit（异常）"),
+                }
+                self.submit_request(Some(request));
+            }
+            Ok(None) => eprintln!(
+                "[menghunote] 删除（{step:?}）：无可删单元（空文档 / 已在边界 / 选区为空），不产生请求"
+            ),
+            Err(EditorError::PreeditActive) => {
+                // 理论上上面已经 cancel 过；走到这里说明组合又被平台打开，再取消一次即可
+                eprintln!("[menghunote] 删除被拒（组合中）：先取消组合，本次按键丢弃");
+                self.cancel_composition(cx);
+            }
+            Err(EditorError::Backpressured(command_id)) => eprintln!(
+                "[menghunote] 删除被拒（背压）：command_id={command_id}，等 DurableAck 后再按一次"
+            ),
+            Err(EditorError::ResyncRequired) => {
+                eprintln!("[menghunote] 删除被拒：控制器已失效，需要按新 OpenSnapshot 重建（切片 7）")
+            }
+            Err(error) => eprintln!("[menghunote] 删除失败：{error}"),
+        }
+        cx.notify();
+    }
+
+    /// 结束存储侧组合闸门：合并延后远端、重试被挂起的请求。
+    fn finish_composition_bridge(&mut self) {
+        if !self.composition.active && !self.driver.is_composing() {
+            self.composition.selected = None;
+            return;
+        }
+        self.composition.active = false;
+        self.composition.selected = None;
+        let deltas = self.driver.end_composition();
+        if !deltas.is_empty() {
+            eprintln!(
+                "[menghunote] 组合结束：按序应用延后的远端变更 {} 条",
+                deltas.len()
+            );
+        }
+        self.apply_live_deltas(deltas);
+        self.drain_deferred_remote();
+        if let Some(request) = self.composition.pending_retry.take() {
+            eprintln!(
+                "[menghunote] 组合结束，重试挂起请求 command_id={}",
+                request.command_id
+            );
+            self.submit_request(Some(request));
+        }
+    }
+
+    /// 把延后的远端变更按到达顺序应用镜像（**唯一**投递口是 `end_composition` /
+    /// `merge_deferred_remote` 的返回值）。
+    fn apply_live_deltas(&mut self, deltas: Vec<LiveDelta>) {
+        for delta in deltas {
+            if let Err(error) = self.controller.apply_live_delta(delta) {
+                eprintln!("[menghunote] 延后的远端变更未能应用：{error}");
+            }
+        }
+    }
+
+    /// 背压恢复：非组合态下再排空一次延后队列。
+    fn drain_deferred_remote(&mut self) {
+        if self.driver.is_composing() || self.driver.deferred_remote_len() == 0 {
+            return;
+        }
+        let deltas = self.driver.merge_deferred_remote();
+        if !deltas.is_empty() {
+            eprintln!("[menghunote] 补排空延后远端 {} 条", deltas.len());
+        }
+        self.apply_live_deltas(deltas);
+    }
+
+    /// **所有** `EditRequest` 的唯一出口：组合期挂起、`CompositionActive` 不污染控制器、
+    /// 每次请求打一行日志（`请求#N … edits=M` 就是"一次 commit 只有一个请求"的证据）。
+    fn submit_request(&mut self, request: Option<EditRequest>) {
+        let Some(request) = request else {
+            // 空选区 + 空替换是 no-op：不产生请求，但要留痕，避免被误读成"丢请求"。
+            eprintln!("[menghunote] 本次输入是 no-op（空选区 + 空文本），不产生 EditRequest");
+            return;
+        };
+        self.request_seq = self.request_seq.saturating_add(1);
+        let seq = self.request_seq;
+
+        if self.driver.is_composing() {
+            eprintln!(
+                "[menghunote] 请求#{seq} 挂起：组合进行中 command_id={}",
+                request.command_id
+            );
+            self.composition.pending_retry = Some(request);
+            return;
+        }
+
+        let command_id = request.command_id.clone();
+        let edits = request.edits.len();
+        let outcome = self.driver.apply(request.clone());
+        let composition_rejected = matches!(
+            &outcome,
+            EditOutcome::Rejected(rejected) if rejected.reason == RejectReason::CompositionActive
+        );
+        if composition_rejected {
+            eprintln!(
+                "[menghunote] 请求#{seq} 未受理（CompositionActive）：挂起 command_id={command_id}，组合结束后用同一 id 重试"
+            );
+            self.composition.pending_retry = Some(request);
+            return;
+        }
+        match &outcome {
+            EditOutcome::Applied(applied) => eprintln!(
+                "[menghunote] 请求#{seq} 受理 command_id={command_id} edits={edits} local_echo={} live_rev={}",
+                applied.local_echo, applied.live_rev.0
+            ),
+            EditOutcome::Rejected(rejected) => eprintln!(
+                "[menghunote] 请求#{seq} 被拒 command_id={command_id} reason={:?}",
+                rejected.reason
+            ),
+            EditOutcome::Stale(stale) => eprintln!(
+                "[menghunote] 请求#{seq} 基准过期 command_id={command_id} current_live_rev={}",
+                stale.current_live_rev.0
+            ),
+        }
+        self.apply_outcome_guarded(outcome);
+    }
+
+    /// 调试：模拟"输入法组合 → 上屏"（F9，仅 debug 构建）。
+    ///
+    /// 走的是与真实 IME 完全相同的 app 侧路径，因此日志能证明"一次 commit 只有一个请求"。
+    #[cfg(debug_assertions)]
+    fn debug_ime_compose(&mut self, preedit: &str, committed: &str, cx: &mut Context<Self>) {
+        eprintln!("[menghunote][debug] 模拟 IME 组合：preedit ← {preedit:?}（F9）");
+        self.update_preedit(preedit, None, cx);
+        eprintln!("[menghunote][debug] 模拟 IME 上屏：committed ← {committed:?}");
+        self.commit_composition(committed, cx);
+    }
+
+    /// 调试：模拟"输入法组合 → 取消"（F10，仅 debug 构建）。取消**不产生** `EditRequest`。
+    #[cfg(debug_assertions)]
+    fn debug_ime_cancel(&mut self, preedit: &str, cx: &mut Context<Self>) {
+        eprintln!("[menghunote][debug] 模拟 IME 组合：preedit ← {preedit:?}（F10）");
+        self.update_preedit(preedit, None, cx);
+        eprintln!("[menghunote][debug] 模拟 IME 取消（等价 Esc）");
+        self.cancel_composition(cx);
+    }
+
+    /// `Ctrl+Z`：会话唯一 UndoManager 的撤销；组合态下先取消组合。
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        if self.is_composing() {
+            self.cancel_composition(cx);
+        }
+        match self.driver.undo() {
+            Ok(Some(outcome)) => {
+                self.log_history("undo", &outcome);
+                self.apply_outcome_guarded(outcome);
+            }
+            Ok(None) => eprintln!("[menghunote] undo：没有可撤销项（不改变文本）"),
+            Err(error) => eprintln!("[menghunote] undo 失败：{error:?}"),
+        }
+        cx.notify();
+    }
+
+    /// `Ctrl+Shift+Z`：重做。
+    fn redo(&mut self, cx: &mut Context<Self>) {
+        if self.is_composing() {
+            self.cancel_composition(cx);
+        }
+        match self.driver.redo() {
+            Ok(Some(outcome)) => {
+                self.log_history("redo", &outcome);
+                self.apply_outcome_guarded(outcome);
+            }
+            Ok(None) => eprintln!("[menghunote] redo：没有可重做项（不改变文本）"),
+            Err(error) => eprintln!("[menghunote] redo 失败：{error:?}"),
+        }
+        cx.notify();
+    }
+
+    fn log_history(&self, what: &str, outcome: &EditOutcome) {
+        match outcome {
+            EditOutcome::Applied(applied) => eprintln!(
+                "[menghunote] {what} 生效：live_rev={}（镜像按 splice 更新）",
+                applied.live_rev.0
+            ),
+            EditOutcome::Rejected(rejected) => {
+                eprintln!("[menghunote] {what} 未受理：reason={:?}", rejected.reason);
+            }
+            EditOutcome::Stale(stale) => eprintln!(
+                "[menghunote] {what} 基准过期：current_live_rev={}",
+                stale.current_live_rev.0
+            ),
+        }
+    }
+
+    /// 把结局交给控制器，但**先**滤掉会让控制器 `needs_resync` 的瞬态拒绝。
+    ///
+    /// `Rejected{CompositionActive}` 表示"请求未被受理、Loro 未修改"，
+    /// 交给控制器只会把它标记成必须重建 —— 这不是我们想要的语义。
+    fn apply_outcome_guarded(&mut self, outcome: EditOutcome) {
+        if matches!(
+            &outcome,
+            EditOutcome::Rejected(rejected) if rejected.reason == RejectReason::CompositionActive
+        ) {
+            eprintln!(
+                "[menghunote] 瞬态拒绝（CompositionActive）：不交给控制器，避免 needs_resync"
+            );
+            return;
+        }
+        match self.controller.apply_outcome(outcome) {
+            Ok(_) => {}
+            Err(error) => eprintln!("[menghunote] 编辑结局未能应用：{error}"),
+        }
+    }
+
+    /// 光标选区在**虚拟输入文档**里的 UTF-16 区间（平台查询用）。
+    pub(crate) fn selection_utf16_in_input_document(&self) -> Option<Range<usize>> {
+        let source = self.controller.source_text();
+        let preedit = self.controller.preedit_text().unwrap_or("").to_owned();
+        super::ime_map::InputMapping::new(&source, self.controller.selection(), &preedit)
+            .selection_utf16()
+    }
+
+    /// 虚拟输入文档的 UTF-16 位置 → 窗口坐标（候选窗用）。
+    pub(crate) fn point_for_input_utf16(
+        &self,
+        utf16: usize,
+        window: &Window,
+    ) -> Option<gpui::Point<Pixels>> {
+        let source = self.controller.source_text();
+        let preedit = self.controller.preedit_text().unwrap_or("").to_owned();
+        let mapping =
+            super::ime_map::InputMapping::new(&source, self.controller.selection(), &preedit);
+        let source_byte = mapping.utf16_to_source_byte(utf16)?;
+        let position = self.point_for_source_byte(source_byte, window)?;
+        if preedit.is_empty() {
+            return Some(position);
+        }
+        // 组合串没有进布局：先定位到组合起点，再按 preedit 的 UTF-16 前缀宽度右移。
+        let prefix_bytes = mapping.preedit_prefix_bytes(utf16);
+        if prefix_bytes == 0 {
+            return Some(position);
+        }
+        let shaped = super::glyph::shape_row(window, &sanitize_single_line(&preedit));
+        let advance = shaped.x_for_index(prefix_bytes.min(preedit.len()));
+        Some(gpui::point(position.x + advance, position.y))
+    }
+
+    /// 源码字节 → 窗口坐标（行内 x + 行顶 y）；屏外行按需 shaping。
+    pub(crate) fn point_for_source_byte(
+        &self,
+        byte: usize,
+        window: &Window,
+    ) -> Option<gpui::Point<Pixels>> {
+        let geometry = self.shared.geometry()?;
+        let frame = &geometry.frame;
+        let row = frame.row_of_byte(byte.min(frame.text.len()));
+        let bytes = frame.row_bytes(row);
+        let offset = byte.saturating_sub(bytes.start).min(bytes.len());
+        let slice = &frame.text[bytes];
+        let local_x = if slice.is_empty() {
+            px(0.0)
+        } else {
+            super::glyph::shape_row(window, slice).x_for_index(offset)
+        };
+        Some(gpui::point(
+            geometry.text_left() + local_x,
+            geometry.row_top(row),
+        ))
+    }
+
+    /// 窗口坐标 → 源码字节（几何命中，与本切片点击一致）。
+    pub(crate) fn source_byte_at_point(&self, position: gpui::Point<Pixels>) -> Option<usize> {
+        Some(self.shared.geometry()?.byte_at(position))
+    }
+
+    /// 源码字节 → 虚拟输入文档的 UTF-16 序号。
+    pub(crate) fn source_byte_to_input_utf16(&self, byte: usize) -> Option<usize> {
+        let source = self.controller.source_text();
+        let preedit = self.controller.preedit_text().unwrap_or("").to_owned();
+        super::ime_map::InputMapping::new(&source, self.controller.selection(), &preedit)
+            .source_byte_to_utf16(byte)
+    }
+
+    /// 虚拟输入文档的 UTF-16 序号 → 源码字节。
+    pub(crate) fn virtual_utf16_to_source_byte(&self, utf16: usize) -> Option<usize> {
+        let source = self.controller.source_text();
+        let preedit = self.controller.preedit_text().unwrap_or("").to_owned();
+        super::ime_map::InputMapping::new(&source, self.controller.selection(), &preedit)
+            .utf16_to_source_byte(utf16)
+    }
+
+    /// 把字节吸附到前一个 grapheme 边界（点击 / 平台选区共用）。
+    pub(crate) fn snap_source_byte_to_grapheme(&self, byte: usize) -> usize {
+        let text = self.controller.source_text();
+        self.snap_byte(byte, &text)
+    }
+
+    /// 把光标放到源码字节处（平台设置选区时用）。
+    pub(crate) fn place_caret_at_byte(&mut self, byte: usize, cx: &mut Context<Self>) {
+        let text = self.controller.source_text();
+        let Some(scalar) = scalar_of_byte(&text, byte.min(text.len())) else {
+            return;
+        };
+        self.preferred_x = None;
+        self.commit_selection(Selection::caret(scalar), cx);
+    }
+
+    // ---- 内部辅助 ----
+
+    /// 提交选区：控制器校验通过后滚动到光标可见并重绘。
+    fn commit_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        match self.controller.set_selection(selection) {
+            Ok(()) => {
+                self.ensure_caret_visible(selection.head());
+                self.log_caret(selection);
+                cx.notify();
+            }
+            Err(error) => eprintln!("[menghunote] 设置选区失败：{error}"),
+        }
+    }
+
+    /// 开发期留痕：把"点击 / 键盘 → scalar → 视觉行"打到 stderr。
+    ///
+    /// 这是 S1 的临时调试手段：切片 5a 没有可交互的 DevTools，而 150% 缩放的小屏上
+    /// 状态栏可能被裁掉，日志是第二条证据源。等切片 6 有了 preedit 调试面板再删。
+    fn log_caret(&self, selection: Selection) {
+        let Some(geometry) = self.shared.geometry() else {
+            return;
+        };
+        let text = self.controller.source_text();
+        let Ok(byte) = selection.head().to_source_byte(&text) else {
+            return;
+        };
+        eprintln!(
+            "[menghunote] 光标 scalar #{} → 视觉行 {}（选区 {}..{}）",
+            selection.head().get(),
+            geometry.frame.row_of_byte(byte.get()),
+            selection.start().get(),
+            selection.end().get()
+        );
+    }
+
+    /// 让光标所在视觉行保持在视口内（只做最小滚动）。
+    fn ensure_caret_visible(&mut self, head: UnicodeScalar) {
+        let Some(geometry) = self.shared.geometry() else {
+            return;
+        };
+        let text = self.controller.source_text();
+        let Some(byte) = source_byte_of(&text, head) else {
+            return;
+        };
+        let row = geometry.frame.row_of_byte(byte);
+        self.scroll_y = super::layout::scroll_to_reveal(
+            self.scroll_y,
+            row,
+            theme::LINE_HEIGHT,
+            geometry.viewport_height,
+        );
+        self.clamp_scroll();
+    }
+
+    /// 把滚动量夹到 `[0, 内容高度 - 视口高度]`。
+    fn clamp_scroll(&mut self) {
+        let viewport = self.shared.viewport().1;
+        let content = self
+            .shared
+            .geometry()
+            .map_or(0.0, |geometry| geometry.frame.content_height());
+        self.scroll_y = super::layout::clamp_scroll(self.scroll_y, content, viewport);
+    }
+
+    /// 字节 → 前一个 grapheme 边界（优先用折行表里已算好的边界）。
+    fn snap_byte(&self, byte: usize, text: &str) -> usize {
+        match self.shared.geometry() {
+            Some(geometry) if geometry.frame.text == text => {
+                geometry.frame.snap_byte_to_grapheme(byte)
+            }
+            _ => floor_char_boundary(text, byte.min(text.len())),
+        }
+    }
+
+    /// 在任意视觉行上把像素 x（相对行首）换成源码字节。
+    ///
+    /// 目标行可能不在当前绘制范围内（翻页时必然如此），因此这里**按需 shaping**，
+    /// 而不是退回"字符数 × 平均宽度"。
+    fn byte_at_row_x(&self, frame: &LayoutFrame, row: usize, x: Pixels, window: &Window) -> usize {
+        let bytes = frame.row_bytes(row);
+        let slice = &frame.text[bytes.clone()];
+        if slice.is_empty() {
+            return bytes.start;
+        }
+        let shaped = super::glyph::shape_row(window, slice);
+        let index = shaped.closest_index_for_x(x.max(px(0.0)));
+        bytes.start + index.min(slice.len())
+    }
+
+    /// 光标在视觉行内的像素 x（相对行首）。
+    fn caret_x_in_row(
+        &self,
+        frame: &LayoutFrame,
+        row: usize,
+        byte: usize,
+        window: &Window,
+    ) -> Pixels {
+        let bytes = frame.row_bytes(row);
+        let offset = byte.saturating_sub(bytes.start).min(bytes.len());
+        let slice = &frame.text[bytes];
+        if slice.is_empty() {
+            return px(0.0);
+        }
+        super::glyph::shape_row(window, slice).x_for_index(offset)
+    }
+
+    /// 状态栏左侧文案：保存状态 / 光标 / 显示行数。
+    fn status_text(&self) -> String {
+        let saved = if let Some(preedit) = self.controller.preedit_text() {
+            // 组合期间 preedit 不进 CRDT：明确告诉用户"还没提交"
+            format!("输入中，尚未提交（preedit {} 字）", preedit.chars().count())
+        } else if self.controller.is_saved() {
+            "已保存".to_owned()
+        } else {
+            "保存中".to_owned()
+        };
+        let selection = self.controller.selection();
+        let position = if selection.is_empty() {
+            format!("光标 scalar #{}", selection.head().get())
+        } else {
+            format!(
+                "选区 scalar #{}..#{}（{} 个）",
+                selection.start().get(),
+                selection.end().get(),
+                selection.len()
+            )
+        };
+        let rows = self
+            .shared
+            .geometry()
+            .map_or(0, |geometry| geometry.frame.row_count());
+        format!(
+            "{} · {saved} · {position} · {rows} 显示行 · {}",
+            self.controller.doc_id(),
+            self.vault_label
+        )
+    }
+}
+
+impl Focusable for EditorView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for EditorView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focused_once {
+            self.focused_once = true;
+            // `focus_self` 走 `window.defer`：等本帧元素树建好再设焦点，
+            // 比在 render 里直接 `window.focus` 更稳（首帧就能收到方向键）。
+            cx.focus_self(window);
+        }
+
+        let status = SharedString::from(self.status_text());
+        let element = EditorElement::new(cx.entity(), Rc::clone(&self.shared));
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::window_bg())
+            .font_family(theme::FONT_FAMILY)
+            .text_size(px(theme::FONT_SIZE))
+            .line_height(px(theme::LINE_HEIGHT))
+            .text_color(theme::text_color())
+            .child(
+                div()
+                    .id("menghunote-editor-surface")
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.0))
+                    .track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(Self::on_key_down))
+                    // 正文被按下：通知宿主（它用这个取消侧栏的行内编辑）。
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_view, _event: &MouseDownEvent, _window, cx| {
+                            cx.emit(EditorEvent::PointerDown);
+                        }),
+                    )
+                    .child(element),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .bg(theme::status_bar_bg())
+                    .text_size(px(12.0))
+                    .text_color(theme::status_bar_text())
+                    .font_weight(FontWeight::NORMAL)
+                    .child(status)
+                    .child(SharedString::from(HINT)),
+            )
+    }
+}
+
+/// scalar → 源码字节；失败返回 `None`（调用方只是跳过这次操作）。
+fn source_byte_of(text: &str, scalar: UnicodeScalar) -> Option<usize> {
+    scalar.to_source_byte(text).ok().map(|byte| byte.get())
+}
+
+/// 源码字节 → scalar；非 scalar 边界返回 `None`。
+fn scalar_of_byte(text: &str, byte: usize) -> Option<UnicodeScalar> {
+    SourceByte::new(byte).to_scalar(text).ok()
+}
+
+/// 组合串不可能含换行，但 `shape_line` 对 `\n` 会断言；这里统一换成空格，
+/// 保证绘制路径永远安全（不 panic）。
+pub(crate) fn sanitize_single_line(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .collect()
+}
+
+/// 把字节位置退到最近的 `char` 边界（兜底路径，避免落在多字节字符中间）。
+fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}

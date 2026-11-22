@@ -1,0 +1,15 @@
+# 统一换行：本仓源码与 Markdown 一律 LF（ADR 0002 要求源码 LF 归一）。
+# checkout 与 commit 两个方向都按 LF 处理，避免 Windows 上出现 CRLF 混入。
+* text=auto eol=lf
+
+# 二进制：不参与换行转换、不做文本 diff。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.pdb binary
+*.sqlite3 binary

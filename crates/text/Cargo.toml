@@ -1,0 +1,11 @@
+[package]
+name = "menghunote-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# ADR 0003 §3：text 只依赖 unicode-segmentation（grapheme 交互边界）。
+# 错误类型只有 CoordError 一份，手写 Display + std::error::Error，
+# 刻意不引 thiserror（少一个依赖；本 crate 的错误枚举不需要 source 链）。
+unicode-segmentation = "1"

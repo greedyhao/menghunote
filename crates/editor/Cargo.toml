@@ -1,0 +1,17 @@
+[package]
+name = "menghunote-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# ADR 0003 §4：坐标/单位原语的唯一实现在 menghunote-text，本 crate 只 re-export。
+# grapheme 原语随实现一起在 text 内部，editor 不再直接依赖 unicode-segmentation。
+menghunote-text = { path = "../text" }
+# ADR 0003 §3/§4：会话协议类型唯一归属 storage::session，editor 只读协议类型；
+# 依赖方向是 editor → storage，不成环，也仍然不碰 GPUI。
+menghunote-storage = { path = "../storage" }
+# UTF-8 Rope 文本缓冲（ADR 0002 §4：Rope 的具体版本属于"可后补"项）。
+# 1.6.1 是 crates.io 上的当前稳定版；ropey 另有 2.0.0-beta.1，本切片不采用
+# 未冻结 API 的 beta，等它稳定后再评估。
+ropey = "1.6"

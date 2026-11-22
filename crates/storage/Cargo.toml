@@ -1,0 +1,16 @@
+[package]
+name = "menghunote-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+loro = "1.17.1"
+# 单位/坐标换算的唯一实现在 menghunote-text（ADR 0003 §4/§6），storage 只调用不实现
+menghunote-text = { path = "../text" }
+# `bundled` 特性会静态编译一份 SQLite，不依赖系统 sqlite3.dll / 用户机器上的版本
+rusqlite = { version = "0.41", features = ["bundled"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

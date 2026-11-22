@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/storage", "crates/editor", "crates/text"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.dev]
+# GPUI 依赖树很深，开发构建保持默认优化级别会明显偏慢
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# libsqlite3-sys 用 `bundled` 特性把整份 sqlite3.c 交给 cc/cl 编译。
+# 本机（受限进程上下文里由 cargo 启动 cl.exe）生成 C 调试记录会失败：
+#   cl : Command line error D8050 : cannot execute 'c1.dll': failed to get command line into debug records
+# 只在没有调试信息（-Z7/-Zi）时正常。因此仅对这个包关掉调试信息；
+# Rust 侧（含本仓库自己的 crate）调试信息不受影响，SQLite 以 -O2 编译。
+#
+# 复现方式（已实测）：删掉本节 → `cargo clean -p libsqlite3-sys && cargo build -p menghunote-storage`
+# 必定在 sqlite3.c 处报 D8050。若将来换到 cargo 子进程可写 %TEMP% 的环境，本节可以删除。
+[profile.dev.package.libsqlite3-sys]
+debug = false
+
+# 同一环境问题的第二个受害者：loro → loro-internal → pest → pest_stack_guard → stacker，
+# stacker 带 C 源 `src/arch/windows.c`，cc 同样带 `-Z7` 时必报 D8050。
+# 只关该包的调试信息；Rust 侧调试信息与优化级别不受影响。
+# 复现方式：删掉本节 → `cargo clean -p stacker && cargo build -p menghunote-storage`。
+[profile.dev.package.stacker]
+debug = false

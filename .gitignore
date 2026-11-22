@@ -1,0 +1,17 @@
+# 构建产物
+/target
+**/*.rs.bk
+*.pdb
+
+# 本仓工具产物（bench 控制台日志等）
+/.bench/
+
+# 本地数据库 / WAL / SHM（用户数据不入库）
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 系统杂项
+Thumbs.db
+desktop.ini
+.DS_Store
