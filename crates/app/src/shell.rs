@@ -221,7 +221,7 @@ impl AppShell {
             });
         let vault = self.vault.clone();
         let overlay = cx.new(|cx| {
-            crate::search_overlay::SearchOverlay::new(vault, window, cx, on_open, on_close)
+            crate::search_overlay::SearchOverlay::new(vault, PEER_ID, window, cx, on_open, on_close)
         });
         overlay.update(cx, |overlay, cx| overlay.focus_input(window, cx));
         trace_menu!("[menghunote] 打开搜索浮层");

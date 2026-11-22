@@ -673,7 +673,24 @@ impl Element for RenameElement {
             eprintln!("[menghunote] 重命名文本绘制失败：{error}");
         }
 
-        // 光标（组合中画在 preedit 末尾）
+        // 光标（组合中画在 preedit 末尾）。与搜索框共用 `caret_visible` 判定：
+        // 空文本聚焦也要画（此前搜索框因为多了一个"非空"守卫而漏掉，这里保持一致）。
+        let focus = self.input.read(cx).focus_handle.clone();
+        let focused = focus.is_focused(window);
+        if !crate::search_input::caret_visible(
+            focused,
+            state.marked_utf16().is_some(),
+            display.len(),
+        ) {
+            // 失焦不画 caret（但仍要把输入处理器注册上，见函数末尾）。
+            let focus = self.input.read(cx).focus_handle.clone();
+            window.handle_input(
+                &focus,
+                ElementInputHandler::new(bounds, self.input.clone()),
+                cx,
+            );
+            return;
+        }
         let caret_byte = match state.marked_utf16() {
             Some(_) => display.len(),
             None => state.caret(),

@@ -6,8 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use menghunote_search::{
-    markdown_to_plain, DocVersion, Fingerprint, SearchDoc, SearchError, SearchIndex,
-    FINGERPRINT_FILE,
+    markdown_to_plain, DocVersion, Fingerprint, QueryOptions, QueryResult, SearchDoc, SearchError,
+    SearchIndex, FINGERPRINT_FILE,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -88,21 +88,22 @@ fn index_query_delete() {
         .into_iter()
         .find(|hit| hit.note_id == "n1")
         .expect("缺 n1");
-    assert!(!hit.snippet_text.is_empty());
+    assert!(!hit.snippets[0].text.is_empty());
     assert!(
-        !hit.snippet_ranges.is_empty(),
+        !hit.snippets[0].ranges.is_empty(),
         "snippet 应有高亮区间: {hit:?}"
     );
-    for range in &hit.snippet_ranges {
+    for range in &hit.snippets[0].ranges {
         assert!(range.start < range.end);
-        assert!(range.end <= hit.snippet_text.len());
-        assert!(hit.snippet_text.is_char_boundary(range.start));
-        assert!(hit.snippet_text.is_char_boundary(range.end));
+        assert!(range.end <= hit.snippets[0].text.len());
+        assert!(hit.snippets[0].text.is_char_boundary(range.start));
+        assert!(hit.snippets[0].text.is_char_boundary(range.end));
     }
     assert!(
-        hit.snippet_ranges
+        hit.snippets[0]
+            .ranges
             .iter()
-            .any(|range| &hit.snippet_text[range.clone()] == "笔记"),
+            .any(|range| &hit.snippets[0].text[range.clone()] == "笔记"),
         "高亮区间应对应「笔记」: {hit:?}"
     );
 
@@ -218,11 +219,11 @@ fn snippet_ranges_are_utf8_boundaries_with_emoji() {
         .into_iter()
         .next()
         .expect("应有命中");
-    assert!(!hit.snippet_text.is_empty());
-    for range in &hit.snippet_ranges {
-        assert!(hit.snippet_text.is_char_boundary(range.start));
-        assert!(hit.snippet_text.is_char_boundary(range.end));
-        assert!(range.end <= hit.snippet_text.len());
+    assert!(!hit.snippets[0].text.is_empty());
+    for range in &hit.snippets[0].ranges {
+        assert!(hit.snippets[0].text.is_char_boundary(range.start));
+        assert!(hit.snippets[0].text.is_char_boundary(range.end));
+        assert!(range.end <= hit.snippets[0].text.len());
     }
 }
 
@@ -243,4 +244,365 @@ fn markdown_to_plain_is_used_before_indexing() {
     assert_eq!(index.query("链接", 10).expect("query").len(), 1);
     // 标记本身不应成为检索词。
     assert!(index.query("**", 10).expect("query markers").is_empty());
+}
+
+#[test]
+fn all_hits_get_snippets() {
+    let dir = temp_dir("snippet-all");
+    let mut index = open(&dir);
+    for i in 0..7 {
+        index
+            .upsert(search_doc(
+                &format!("n{i}"),
+                &format!("文档 {i}"),
+                "共同词 用于验证所有结果都有摘要",
+                i as u64 + 1,
+            ))
+            .expect("upsert");
+    }
+    index.commit().expect("commit");
+
+    let hits = index.query("共同词", 10).expect("query");
+    assert_eq!(hits.len(), 7);
+    for (position, hit) in hits.iter().enumerate() {
+        assert!(
+            !hit.snippets[0].text.is_empty(),
+            "第 {position} 条也必须有摘要: {hit:?}"
+        );
+        assert!(!hit.snippets[0].ranges.is_empty());
+        for range in &hit.snippets[0].ranges {
+            assert!(hit.snippets[0].text.is_char_boundary(range.start));
+            assert!(hit.snippets[0].text.is_char_boundary(range.end));
+        }
+    }
+}
+
+#[test]
+fn tail_match_in_one_megabyte_body_is_snippeted() {
+    let dir = temp_dir("snippet-tail");
+    let mut index = open(&dir);
+    let mut body = "a".repeat(1_000_000);
+    body.push_str("末尾笔记");
+    index
+        .upsert(search_doc("long", "长文", &body, 1))
+        .expect("upsert");
+    index.commit().expect("commit");
+
+    let hits = index.query("笔记", 10).expect("query");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].snippets[0].text.contains("笔记"),
+        "1MB 末尾命中必须有摘要: {hits:?}"
+    );
+    assert!(!hits[0].snippets[0].ranges.is_empty());
+    for range in &hits[0].snippets[0].ranges {
+        assert!(hits[0].snippets[0].text.is_char_boundary(range.start));
+        assert!(hits[0].snippets[0].text.is_char_boundary(range.end));
+        assert!(range.end <= hits[0].snippets[0].text.len());
+    }
+}
+
+#[test]
+fn empty_body_and_title_only_match_do_not_panic() {
+    let dir = temp_dir("snippet-empty");
+    let mut index = open(&dir);
+    index
+        .upsert(search_doc("empty", "空正文标题", "", 1))
+        .expect("upsert");
+    index.commit().expect("commit");
+
+    assert!(index.query("不存在", 10).expect("query").is_empty());
+    let hits = index.query("空正文标题", 10).expect("query title");
+    assert_eq!(hits.len(), 1);
+    assert!(!hits[0].snippets[0].text.is_empty(), "标题命中应有标题摘要");
+}
+
+#[test]
+fn total_is_reported_before_limit() {
+    let dir = temp_dir("total");
+    let mut index = open(&dir);
+    for i in 0..3 {
+        index
+            .upsert(search_doc(
+                &format!("n{i}"),
+                &format!("总数 {i}"),
+                "共同词 三篇都命中",
+                i + 1,
+            ))
+            .expect("upsert");
+    }
+    index.commit().expect("commit");
+
+    let result: QueryResult = index
+        .query_with_options("共同词", 2, QueryOptions::default())
+        .expect("query");
+    assert_eq!(result.total, 3);
+    assert_eq!(result.hits.len(), 2);
+}
+
+#[test]
+fn case_sensitive_toggle_uses_cs_fields() {
+    let dir = temp_dir("case");
+    let mut index = open(&dir);
+    index
+        .upsert(search_doc("upper", "大写", "GPUI", 1))
+        .expect("upsert upper");
+    index
+        .upsert(search_doc("lower", "小写", "gpui", 2))
+        .expect("upsert lower");
+    index.commit().expect("commit");
+
+    let cs = QueryOptions {
+        case_sensitive: true,
+        whole_word: true,
+    };
+    let hits = index
+        .query_with_options("GPUI", 10, cs)
+        .expect("query cs")
+        .hits;
+    assert_eq!(hits.len(), 1, "cs=true 只应命中原样 GPUI: {hits:?}");
+    assert_eq!(hits[0].note_id, "upper");
+
+    let insensitive = QueryOptions::default();
+    let hits = index
+        .query_with_options("gpui", 10, insensitive)
+        .expect("query ci")
+        .hits;
+    assert_eq!(hits.len(), 2, "cs=false 应命中两篇: {hits:?}");
+}
+
+#[test]
+fn whole_word_false_matches_substrings() {
+    let dir = temp_dir("substring");
+    let mut index = open(&dir);
+    for (id, body) in [
+        ("exact", "独立 addr 词"),
+        ("address", "address book"),
+        ("thaddr", "prefix thaddr suffix"),
+    ] {
+        index
+            .upsert(search_doc(id, "标题", body, 1))
+            .expect("upsert");
+    }
+    index.commit().expect("commit");
+
+    let substring = QueryOptions {
+        case_sensitive: false,
+        whole_word: false,
+    };
+    let hits = index
+        .query_with_options("addr", 10, substring)
+        .expect("substring")
+        .hits;
+    assert_eq!(hits.len(), 3, "子串应命中 address/thaddr: {hits:?}");
+
+    let whole = QueryOptions {
+        case_sensitive: false,
+        whole_word: true,
+    };
+    let hits = index
+        .query_with_options("addr", 10, whole)
+        .expect("whole word")
+        .hits;
+    assert_eq!(hits.len(), 1, "整词只应命中独立 addr: {hits:?}");
+    assert_eq!(hits[0].note_id, "exact");
+}
+
+#[test]
+fn chinese_substring_matches_without_analyzer_token() {
+    let dir = temp_dir("chinese-substring");
+    let mut index = open(&dir);
+    index
+        .upsert(search_doc("n", "标题", "笔记流程", 1))
+        .expect("upsert");
+    index.commit().expect("commit");
+
+    let substring = QueryOptions {
+        case_sensitive: false,
+        whole_word: false,
+    };
+    let hits = index
+        .query_with_options("记流", 10, substring)
+        .expect("substring")
+        .hits;
+    assert_eq!(hits.len(), 1, "中文子串应命中: {hits:?}");
+
+    let whole = QueryOptions {
+        case_sensitive: false,
+        whole_word: true,
+    };
+    assert!(
+        index
+            .query_with_options("记流", 10, whole)
+            .expect("whole")
+            .hits
+            .is_empty(),
+        "非 analyzer token 的串在整词模式下不应命中"
+    );
+}
+
+#[test]
+fn case_sensitive_substring_is_supported() {
+    let dir = temp_dir("case-substring");
+    let mut index = open(&dir);
+    index
+        .upsert(search_doc("upper", "标题", "GPUI address", 1))
+        .expect("upsert upper");
+    index
+        .upsert(search_doc("lower", "标题", "gpui address", 2))
+        .expect("upsert lower");
+    index.commit().expect("commit");
+
+    let options = QueryOptions {
+        case_sensitive: true,
+        whole_word: false,
+    };
+    let hits = index
+        .query_with_options("GPUI", 10, options)
+        .expect("query")
+        .hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].note_id, "upper");
+}
+
+#[test]
+fn snippet_is_single_line_and_long_line_is_trimmed() {
+    let dir = temp_dir("line-snippet");
+    let mut index = open(&dir);
+    index
+        .upsert(search_doc("multi", "标题", "第一行\n唯一命中\n第三行", 1))
+        .expect("upsert multi");
+    index.commit().expect("commit");
+
+    let hit = index
+        .query("唯一", 10)
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("hit");
+    assert_eq!(hit.snippets[0].text, "唯一命中");
+    assert!(!hit.snippets[0].text.contains('\n'));
+    assert!(!hit.snippets[0].ranges.is_empty());
+
+    let dir = temp_dir("line-snippet-long");
+    let mut index = open(&dir);
+    let long = format!("{}命中{}", "a".repeat(300), "b".repeat(300));
+    index
+        .upsert(search_doc("long", "标题", &long, 1))
+        .expect("upsert long");
+    index.commit().expect("commit");
+    let hit = index
+        .query("命中", 10)
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("hit");
+    assert!(hit.snippets[0].text.contains('…'));
+    assert!(!hit.snippets[0].text.contains('\n'));
+    for range in &hit.snippets[0].ranges {
+        assert!(hit.snippets[0].text.is_char_boundary(range.start));
+        assert!(hit.snippets[0].text.is_char_boundary(range.end));
+    }
+}
+
+#[test]
+fn hit_groups_all_lines_and_reports_matched_lines() {
+    let dir = temp_dir("multi-line");
+    let mut index = open(&dir);
+    let body = (0..5)
+        .map(|index| format!("第 {index} 行命中"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    index
+        .upsert(search_doc("multi", "标题", &body, 1))
+        .expect("upsert");
+    index.commit().expect("commit");
+
+    let hit = index
+        .query("命中", 10)
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("hit");
+    assert_eq!(hit.matched_lines, 5);
+    assert_eq!(hit.snippets.len(), 5);
+    assert_eq!(
+        hit.snippets
+            .iter()
+            .map(|snippet| snippet.line_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    for snippet in &hit.snippets {
+        assert!(!snippet.text.contains('\n'));
+        assert!(!snippet.ranges.is_empty());
+    }
+}
+
+#[test]
+fn one_hundred_hit_lines_are_all_returned() {
+    let dir = temp_dir("hundred-lines");
+    let mut index = open(&dir);
+    let body = (0..100)
+        .map(|index| format!("第 {index} 行命中"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    index
+        .upsert(search_doc("hundred", "标题", &body, 1))
+        .expect("upsert");
+    index.commit().expect("commit");
+
+    let hit = index
+        .query("命中", 10)
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("hit");
+    assert_eq!(hit.matched_lines, 100);
+    assert_eq!(hit.snippets.len(), 100);
+    assert_eq!(hit.snippets[0].line_index, 0);
+    assert_eq!(hit.snippets[99].line_index, 99);
+}
+
+#[test]
+fn multiple_hits_on_one_long_line_are_one_snippet_with_all_ranges() {
+    let dir = temp_dir("multi-hit-line");
+    let mut index = open(&dir);
+    let mut body = "a".repeat(200);
+    body.push_str("命中-命中-命中");
+    body.push_str(&"b".repeat(200));
+    index
+        .upsert(search_doc("long", "标题", &body, 1))
+        .expect("upsert");
+    index.commit().expect("commit");
+
+    let hit = index
+        .query("命中", 10)
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("hit");
+    assert_eq!(hit.matched_lines, 1);
+    assert_eq!(hit.snippets.len(), 1);
+    assert_eq!(hit.snippets[0].ranges.len(), 3);
+}
+
+#[test]
+fn empty_body_and_title_only_hit_has_title_snippet() {
+    let dir = temp_dir("empty-body-group");
+    let mut index = open(&dir);
+    index
+        .upsert(search_doc("empty", "标题命中", "", 1))
+        .expect("upsert");
+    index.commit().expect("commit");
+
+    let hit = index
+        .query("标题命中", 10)
+        .expect("query")
+        .into_iter()
+        .next()
+        .expect("hit");
+    assert_eq!(hit.matched_lines, 1);
+    assert_eq!(hit.snippets.len(), 1);
+    assert!(!hit.snippets[0].text.is_empty());
 }

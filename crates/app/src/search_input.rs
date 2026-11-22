@@ -46,6 +46,24 @@ pub enum SearchInputEvent {
     Escape,
 }
 
+/// 是否该画光标（**纯函数**，搜索框与行内重命名共用同一套判定）。
+///
+/// 规则：
+/// - **失焦 → 不画**（两个输入框同时闪 caret 会让人分不清焦点在哪）；
+/// - **组合态 → 只在 preedit 非空时画**（caret 贴在 preedit 末尾，还在拼写的空壳没地方放）；
+/// - **聚焦 + 非组合 → 一律画**，**包括空文本**：空输入框没有 caret 时用户看不出
+///   "这里可以打字"（真机反馈的正是这个）。
+#[must_use]
+pub fn caret_visible(focused: bool, composing: bool, text_len: usize) -> bool {
+    if !focused {
+        return false;
+    }
+    if composing {
+        return text_len > 0;
+    }
+    true
+}
+
 /// 组合态下的 `Esc` 语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscapeAction {
@@ -105,6 +123,11 @@ impl SearchInput {
             focus_handle: cx.focus_handle(),
             placeholder: "搜索笔记…",
         }
+    }
+
+    /// 直接设置文本（开发开关/测试用；会清空组合并全选）。
+    pub fn set_text(&mut self, text: &str) {
+        self.state = RenameState::selecting_all(text);
     }
 
     /// 当前文本（不含组合串）。
@@ -407,10 +430,18 @@ impl Element for SearchElement {
             window
                 .text_system()
                 .shape_line(SharedString::from(text), font_size, &runs, None);
-        let origin = point(
-            bounds.origin.x + px(super::editor::theme::PAD_X),
-            bounds.origin.y,
-        );
+        let focus = self.input.read(cx).focus_handle.clone();
+        let focused = focus.is_focused(window);
+        let composing = state.marked_utf16().is_some();
+        // 空文本 + 聚焦时也要能看到光标；placeholder 往右让开 4px，两者不重叠。
+        let show_caret = caret_visible(focused, composing, display.len());
+        let placeholder_shift = if empty && show_caret {
+            px(4.0)
+        } else {
+            px(0.0)
+        };
+        let caret_origin_x = bounds.origin.x + px(super::editor::theme::PAD_X);
+        let origin = point(caret_origin_x + placeholder_shift, bounds.origin.y);
         let baseline = (bounds.size.height - line_height) / 2.0;
 
         // 选区底色先画、文字后画（顺序反了会把字盖住，rename 踩过）。
@@ -431,16 +462,17 @@ impl Element for SearchElement {
             eprintln!("[menghunote] 搜索框文本绘制失败：{error}");
         }
 
-        // 光标（组合中画在 preedit 末尾）。
-        if !empty {
+        // 光标：**聚焦就画**（空文本也画，否则用户看不出这里能打字）；组合中贴在 preedit 末尾。
+        if show_caret {
+            // 组合中贴在 preedit 末尾；否则用真实 caret（空文本时是 0，正好在起点）。
             let caret_byte = match state.marked_utf16() {
                 Some(_) => display.len(),
-                None => state.caret(),
+                None => state.caret().min(display.len()),
             };
-            let caret_x = shaped.x_for_index(caret_byte.min(display.len()));
+            let caret_local_x = shaped.x_for_index(caret_byte);
             window.paint_quad(gpui::fill(
                 Bounds::new(
-                    point(origin.x + caret_x, origin.y + baseline),
+                    point(caret_origin_x + caret_local_x, origin.y + baseline),
                     size(px(2.0), line_height),
                 ),
                 theme::input_caret(),
@@ -488,6 +520,25 @@ mod tests {
         assert!(input_state.marked_utf16().is_some());
         input_state.clear_marked();
         assert!(input_state.marked_utf16().is_none());
+    }
+
+    #[test]
+    fn caret_shows_when_focused_even_if_empty() {
+        // 真机 bug：空文本 + 聚焦时看不到 caret。
+        assert!(caret_visible(true, false, 0), "空文本聚焦也要画 caret");
+        assert!(caret_visible(true, false, 5), "有文本聚焦当然画");
+    }
+
+    #[test]
+    fn caret_hides_when_not_focused() {
+        assert!(!caret_visible(false, false, 0));
+        assert!(!caret_visible(false, false, 5));
+    }
+
+    #[test]
+    fn caret_follows_preedit_while_composing() {
+        assert!(caret_visible(true, true, 3), "组合中贴在 preedit 末尾");
+        assert!(!caret_visible(true, true, 0), "空 preedit 没有落点");
     }
 
     #[test]

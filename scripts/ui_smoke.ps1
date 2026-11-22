@@ -9,7 +9,7 @@
 #     不再固定 sleep。
 param(
     [string]$Exe = "target\debug\menghunote-app.exe",
-    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside", "projection", "displayedit", "cursorkeys", "blockcaret", "export", "shot", "exportstress", "quotehit", "search", "searchreal")]
+    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside", "projection", "displayedit", "cursorkeys", "blockcaret", "export", "shot", "exportstress", "quotehit", "search", "searchreal", "searchempty", "biashit", "biasweep", "groupenter", "groupfold", "searchcount", "searchprogress", "searchautorequery")]
     [string]$Scenario = "menu",
     [string]$Screenshot = "",
     [string]$Vault = "",
@@ -89,7 +89,7 @@ Remove-Item $outPath -ErrorAction SilentlyContinue
 if ($Vault) { $env:MENGHUNOTE_DEV_VAULT = $Vault }
 $env:MENGHUNOTE_TRACE_MENU = "1"
 $env:MENGHUNOTE_TRACE_MOUSE = "1"
-if ($Scenario -in @('search', 'searchreal')) { $env:MENGHUNOTE_SEARCH_ON_START = "1" }
+if ($Scenario -in @('search', 'searchreal', 'searchempty', 'searchcount', 'searchprogress', 'searchautorequery', 'groupenter', 'groupfold')) { $env:MENGHUNOTE_SEARCH_ON_START = "1" }
 
 $exePath = Join-Path $repo $Exe
 $launchWatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -481,6 +481,83 @@ switch ($Scenario) {
         Start-Sleep -Milliseconds 500
         Save-Shot ($Screenshot -replace '\.png$', '-after.png')
         Write-Output "search ok"
+    }
+    "biasweep" {
+        # 在 `source_text()` 那一行横向扫一遍，记录每个落点的 bias（取证用）。
+        $xs = @(560, 600, 640, 680, 720, 760, 800, 840, 880, 920, 960, 1000, 1040, 1080)
+        foreach ($x in $xs) {
+            LeftClick $x 785
+            Start-Sleep -Milliseconds 120
+        }
+        Save-Shot ($Screenshot -replace '\.png$', '-sweep.png')
+        Write-Output "biasweep ok"
+    }
+    "biashit" {
+        # 命中偏置取证：点 `source_text()` 行内构造的末尾 `)` 右半，日志应 bias=Left、落在构造内。
+        # 演示文档里 `source_text()` 那行大约在 y=785（物理），先点它的右半。
+        LeftClick 900 785
+        Start-Sleep -Milliseconds 400
+        Save-Shot ($Screenshot -replace '\.png$', '-right.png')
+        # 再点同一行走开一点（左半）
+        LeftClick 700 785
+        Start-Sleep -Milliseconds 400
+        Save-Shot ($Screenshot -replace '\.png$', '-left.png')
+        Write-Output "biashit ok"
+    }
+    "searchautorequery" {
+        # 构建中先输入查询，构建完成后应**自动重查**并显示结果数（不需要再敲键）。
+        if ((Wait-ForLog "打开搜索浮层" 15000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 400
+        TypeText "000"
+        Start-Sleep -Milliseconds 15000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchautorequery ok"
+    }
+    "groupfold" {
+        # 折叠态截图 → 点分组**标题行**（y≈345 物理 = 230 逻辑）展开 → 展开态截图。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        Save-Shot ($Screenshot -replace '\.png$', '-collapsed.png')
+        LeftClick 700 345
+        Start-Sleep -Milliseconds 600
+        Save-Shot ($Screenshot -replace '\.png$', '-expanded.png')
+        Write-Output "groupfold ok"
+    }
+    "groupenter" {
+        # 预填查询（MENGHUNOTE_SEARCH_QUERY）→ Enter 应打开当前（第一）个分组。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        PressKey 0x0D
+        if ((Wait-ForLog "打开搜索结果" 5000) -lt 0) { Fail "Enter 没有打开分组结果" }
+        if ((Wait-ForLog "关闭搜索浮层" 5000) -lt 0) { Fail "打开后浮层没有关闭" }
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-opened.png')
+        Write-Output "groupenter ok"
+    }
+    "searchcount" {
+        # 总数 + 单行摘要 + 两个开关的截图（不点开关，点击不稳）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 900
+        TypeText "menghunote"
+        Start-Sleep -Milliseconds 1200
+        Save-Shot ($Screenshot -replace '\.png$', '-count.png')
+        Write-Output "searchcount ok"
+    }
+    "searchprogress" {
+        # 首次建索引进度：开浮层后立刻截一张（构建中），再过几秒截一张（就绪）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 350
+        Save-Shot ($Screenshot -replace '\.png$', '-building.png')
+        Start-Sleep -Milliseconds 6000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchprogress ok"
+    }
+    "searchempty" {
+        # 打开浮层后**不输入**：验证空输入框也有 caret（user 真机报的 bug）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 900
+        Save-Shot ($Screenshot -replace '\.png$', '-empty.png')
+        Write-Output "searchempty ok"
     }
     "searchreal" {
         # 真实索引：后台线程先对账，再查（打字用 ASCII，CJK 查询由集成测试覆盖）。

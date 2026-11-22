@@ -11,7 +11,7 @@ use crate::error::SearchError;
 use crate::markdown::MARKDOWN_TO_PLAIN_VERSION;
 
 /// 索引 schema 结构版本。字段集合/存储选项变化时 +1。
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 /// analyzer 管线版本。分词器或过滤器顺序变化时 +1。
 pub const ANALYZER_VERSION: u32 = 1;
 /// Markdown 转换算法版本；与 [`crate::markdown::MARKDOWN_TO_PLAIN_VERSION`] 保持一致。

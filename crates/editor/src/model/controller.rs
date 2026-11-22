@@ -277,6 +277,16 @@ impl EditorController {
         self.projection.source_byte_at_display(display)
     }
 
+    /// 带左右偏置的 display → source（命中用；语义见 [`crate::Bias`]）。
+    #[must_use]
+    pub fn display_to_source_biased(
+        &self,
+        display: DisplayByte,
+        bias: crate::Bias,
+    ) -> Option<SourceByte> {
+        self.projection.source_byte_at_display_biased(display, bias)
+    }
+
     /// 把当前 source 选区映射到 display 坐标，返回**有序**的 `(start, end)`。
     ///
     /// 两端按 [`ProjectionMap`] 的 source→display 偏置收敛；折叠选区返回空区间。

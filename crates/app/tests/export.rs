@@ -10,7 +10,8 @@ use menghunote_app::dev_vault::{demo_markdown, open_vault_at, second_note_markdo
 use menghunote_app::export::{export_vault, sanitize_name};
 
 fn tmp_root(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let dir =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("建临时目录失败");
     dir

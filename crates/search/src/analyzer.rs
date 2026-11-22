@@ -17,6 +17,8 @@ use tantivy::tokenizer::{LowerCaser, TextAnalyzer, Token, TokenFilter, TokenStre
 /// 注册进 tantivy `TokenizerManager` 的名字。
 /// 改名/改管线时必须同时升级 [`crate::fingerprint::ANALYZER_VERSION`]。
 pub const TOKENIZER_NAME: &str = "cangjie_for_search";
+/// 大小写敏感版 analyzer 的注册名（同一 cang-jie 分词，不挂 `LowerCaser`）。
+pub const CS_TOKENIZER_NAME: &str = "cangjie_for_search_cs";
 
 /// 丢弃纯空白 token 的过滤器。
 #[derive(Debug, Clone, Copy, Default)]
@@ -81,6 +83,16 @@ pub fn build(worker: Arc<Jieba>) -> TextAnalyzer {
     })
     .filter(DropWhitespaceFilter)
     .filter(LowerCaser)
+    .build()
+}
+
+/// 大小写敏感版：同一 cang-jie 分词与空白过滤，但**不挂** `LowerCaser`。
+pub fn build_case_sensitive(worker: Arc<Jieba>) -> TextAnalyzer {
+    TextAnalyzer::builder(CangJieTokenizer {
+        worker,
+        option: TokenizerOption::ForSearch { hmm: true },
+    })
+    .filter(DropWhitespaceFilter)
     .build()
 }
 

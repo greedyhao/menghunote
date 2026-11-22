@@ -46,8 +46,8 @@ use gpui::{
     MouseDownEvent, Pixels, Render, SharedString, Window,
 };
 use menghunote_editor::{
-    DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, Selection, SourceByte,
-    StyleKind, UnicodeScalar,
+    Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, Selection,
+    SourceByte, StyleKind, UnicodeScalar,
 };
 use menghunote_storage::session::{
     CloseReport, DriverEvent, EditOutcome, EditRequest, LiveDelta, RejectReason, SessionDriver,
@@ -324,9 +324,14 @@ impl EditorView {
 
     /// display 字节（布局坐标系）→ source scalar。
     fn scalar_at_display_byte(&self, display: usize) -> Option<UnicodeScalar> {
+        self.scalar_at_display_byte_biased(display, Bias::Right)
+    }
+
+    /// 带偏置的 display 字节 → scalar（命中时用：右半 `Left`、左半 `Right`）。
+    fn scalar_at_display_byte_biased(&self, display: usize, bias: Bias) -> Option<UnicodeScalar> {
         let source = self
             .controller
-            .display_to_source(DisplayByte::new(display))?
+            .display_to_source_biased(DisplayByte::new(display), bias)?
             .get();
         let text = self.controller.source_text();
         scalar_of_byte(&text, source)
@@ -424,13 +429,14 @@ impl EditorView {
     pub fn begin_pointer_selection(
         &mut self,
         display_byte: usize,
+        bias: Bias,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // 入参是**布局（display）字节**：先在 display 空间吸附 grapheme，
         // 再经投影回到 source scalar（隐藏标记后 display 比 source 短）。
         let display_byte = self.snap_display_byte(display_byte);
-        let Some(scalar) = self.scalar_at_display_byte(display_byte) else {
+        let Some(scalar) = self.scalar_at_display_byte_biased(display_byte, bias) else {
             return;
         };
         let text = self.controller.source_text();
@@ -440,7 +446,7 @@ impl EditorView {
         };
         if crate::shell::trace_mouse_enabled() {
             eprintln!(
-                "[menghunote] 命中 display_byte={display_byte} → source_byte={byte} → scalar #{}",
+                "[menghunote] 命中 display_byte={display_byte} → bias={bias:?} → source_byte={byte} → scalar #{}",
                 scalar.get()
             );
         }
@@ -453,11 +459,21 @@ impl EditorView {
 
     /// 拖拽移动：anchor 保持，head 跟着鼠标。
     pub fn extend_selection_to(&mut self, display_byte: usize, cx: &mut Context<Self>) {
+        self.extend_selection_to_biased(display_byte, Bias::Right, cx);
+    }
+
+    /// 拖选（带偏置）：与点击命中共用同一套"半格 → 偏置"规则。
+    pub fn extend_selection_to_biased(
+        &mut self,
+        display_byte: usize,
+        bias: Bias,
+        cx: &mut Context<Self>,
+    ) {
         let Some(anchor) = self.drag_anchor else {
             return;
         };
         let display_byte = self.snap_display_byte(display_byte);
-        let Some(head) = self.scalar_at_display_byte(display_byte) else {
+        let Some(head) = self.scalar_at_display_byte_biased(display_byte, bias) else {
             return;
         };
         self.preferred_x = None;

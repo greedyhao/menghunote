@@ -52,6 +52,23 @@ use menghunote_text::{units, DisplayByte, SourceByte, SourceRange};
 use crate::model::markdown::MarkdownDocument;
 use crate::model::selection::Selection;
 
+/// 命中时的**左右偏置**（点击落点在字形哪一半）。
+///
+/// 隐藏标记宽度为 0，同一个 display 位置可能对应两个 source 位置：
+/// - [`Bias::Right`] = 该位置**之后**（右侧，原行为：`source_byte_at_display`）；
+/// - [`Bias::Left`] = 该位置**之前**（左侧，跨过零宽隐藏标记取前一个 source 位置）。
+///
+/// 命中时由"点在字形左半/右半"决定：右半取 `Left`、左半取 `Right`，
+/// 这样点 `` `abc` `` 末尾字母的右半，光标落在**构造内**（闭合反引号之前），
+/// 点左半则落在字母之间——与用户在行首/行尾的直觉一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bias {
+    /// 取靠前（左）一侧：跳过零宽隐藏标记，落在标记**之前**。
+    Left,
+    /// 取靠后（右）一侧：原 `source_byte_at_display` 的行为。
+    Right,
+}
+
 /// 段类型（ADR 0002 §4 的最小集合）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SegmentKind {
@@ -402,6 +419,51 @@ impl ProjectionMap {
         }
     }
 
+    /// 逻辑显示 byte → source byte，带**左右偏置**（命中用）。
+    ///
+    /// - [`Bias::Right`]：原行为（等价于 [`Self::source_byte_at_display`]）：
+    ///   接缝取右侧、`display_len` 取 `source_len`；
+    /// - [`Bias::Left`]：跳过该位置上的零宽隐藏标记，取标记**之前**的 source 位置：
+    ///   - `display_len` 且有尾部隐藏标记（如 `` `abc` `` 的闭合反引号）→ 取标记起点；
+    ///   - 中间接缝（如 `**粗**文字` 中 "粗" 之后）→ 取隐藏标记起点；
+    ///   - 普通可见字符内部 → 与 `Right` 相同（无歧义）。
+    ///
+    /// 越界返回 `None`。
+    #[must_use]
+    pub fn source_byte_at_display_biased(
+        &self,
+        display: DisplayByte,
+        bias: Bias,
+    ) -> Option<SourceByte> {
+        match bias {
+            Bias::Right => self.source_byte_at_display(display),
+            Bias::Left => self.source_byte_at_display_left(display),
+        }
+    }
+
+    /// `Left` 偏置的实现：该 display 位置上若有零宽隐藏段，取段起点。
+    fn source_byte_at_display_left(&self, display: DisplayByte) -> Option<SourceByte> {
+        let at = display.get();
+        if at > self.display_byte_len {
+            return None;
+        }
+        // 该 display 位置上的（可能连续多段）零宽隐藏段。
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        for segment in &self.segments {
+            if segment.kind == SegmentKind::Elide && segment.display_start().get() == at {
+                start.get_or_insert(segment.source.start().get());
+                end = Some(segment.source.end().get());
+            }
+        }
+        if let (Some(start), Some(end)) = (start, end) {
+            debug_assert!(start <= end, "隐藏段起点不应晚于终点");
+            return Some(SourceByte::new(start));
+        }
+        // 没有隐藏段：与 Right 等价（可见字符内部无歧义）。
+        self.source_byte_at_display(display)
+    }
+
     /// 逻辑显示 byte → source byte（Option 版）。
     ///
     /// 接缝处取右侧（After）；`display_len` 端点定义为 `source_len`；越界 `None`。
@@ -541,3 +603,117 @@ impl fmt::Display for ProjectionError {
 }
 
 impl Error for ProjectionError {}
+
+#[cfg(test)]
+mod bias_tests {
+    use super::*;
+
+    /// 造一个 `` `abc` `` 的投影：开头/结尾各一段 Elide，中间 Copy。
+    fn inline_code() -> ProjectionMap {
+        let source = "`abc`";
+        let segments = vec![
+            Segment::elide(
+                SourceRange::new(SourceByte::new(0), SourceByte::new(1), 5).expect("起点"),
+                DisplayByte::new(0),
+            )
+            .expect("elide"),
+            Segment::copy(
+                SourceRange::new(SourceByte::new(1), SourceByte::new(4), 5).expect("copy"),
+                DisplayByte::new(0),
+            )
+            .expect("copy"),
+            Segment::elide(
+                SourceRange::new(SourceByte::new(4), SourceByte::new(5), 5).expect("终点"),
+                DisplayByte::new(3),
+            )
+            .expect("elide"),
+        ];
+        ProjectionMap::from_segments(source, segments).expect("构造投影失败")
+    }
+
+    #[test]
+    fn left_bias_stays_inside_the_construct_at_display_end() {
+        let map = inline_code();
+        // display 末尾 = "abc" 之后；Right 落在闭合反引号之后（构造外），Left 落在之前（构造内）。
+        let right = map
+            .source_byte_at_display_biased(DisplayByte::new(3), Bias::Right)
+            .expect("Right 应有值");
+        let left = map
+            .source_byte_at_display_biased(DisplayByte::new(3), Bias::Left)
+            .expect("Left 应有值");
+        assert_eq!(right.get(), 5, "Right = 文档尾（闭合反引号之后）");
+        assert_eq!(left.get(), 4, "Left = 闭合反引号之前（构造内）");
+    }
+
+    #[test]
+    fn left_bias_is_symmetric_at_the_display_start() {
+        let map = inline_code();
+        let left = map
+            .source_byte_at_display_biased(DisplayByte::new(0), Bias::Left)
+            .expect("Left 应有值");
+        assert_eq!(left.get(), 0, "起点 Left = 0（开头反引号之前）");
+        // 起点 Right 仍是原行为（本实现保留 legacy），不强制改。
+        let right = map
+            .source_byte_at_display_biased(DisplayByte::new(0), Bias::Right)
+            .expect("Right 应有值");
+        assert!(right.get() <= 1, "起点 Right 不应越界到构造外");
+    }
+
+    #[test]
+    fn biases_agree_inside_visible_text() {
+        let map = inline_code();
+        // 只比较可见字符**内部**的边界（1..3）；0 与 3 是隐藏标记所在接缝，
+        // 两种偏置本来就应当不同（0：开头反引号前 vs 后；3：闭合反引号前 vs 后）。
+        for display in 1..3usize {
+            let left = map
+                .source_byte_at_display_biased(DisplayByte::new(display), Bias::Left)
+                .expect("Left");
+            let right = map
+                .source_byte_at_display_biased(DisplayByte::new(display), Bias::Right)
+                .expect("Right");
+            if display < 3 {
+                assert_eq!(
+                    left, right,
+                    "可见字符内部两种偏置必须一致（display={display}）"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn biases_agree_without_hidden_markers() {
+        let source = "plain text";
+        let map = ProjectionMap::from_segments(
+            source,
+            vec![Segment::copy(
+                SourceRange::new(
+                    SourceByte::new(0),
+                    SourceByte::new(source.len()),
+                    source.len(),
+                )
+                .expect("copy"),
+                DisplayByte::new(0),
+            )
+            .expect("copy")],
+        )
+        .expect("构造投影失败");
+        for display in 0..=source.len() {
+            assert_eq!(
+                map.source_byte_at_display_biased(DisplayByte::new(display), Bias::Left),
+                map.source_byte_at_display_biased(DisplayByte::new(display), Bias::Right),
+                "无隐藏标记时两种偏置必须等价（display={display}）"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_bounds_returns_none() {
+        let map = inline_code();
+        assert!(map
+            .source_byte_at_display_biased(DisplayByte::new(4), Bias::Left)
+            .is_none());
+        assert!(map
+            .source_byte_at_display_biased(DisplayByte::new(99), Bias::Right)
+            .is_none());
+    }
+}

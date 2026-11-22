@@ -22,9 +22,12 @@ pub use fingerprint::{
     Fingerprint, ANALYZER_VERSION, DICTIONARY_HASH_PLACEHOLDER, FINGERPRINT_FILE, MARKDOWN_VERSION,
     SCHEMA_VERSION,
 };
-pub use index::{DocVersion, Hit, IndexedDocVersion, SearchDoc, SearchIndex};
+pub use index::{
+    fast_snippet, DocVersion, Hit, IndexedDocVersion, QueryOptions, QueryResult, SearchDoc,
+    SearchIndex, SnippetLine, GRAM_TOKENIZER_NAME, SNIPPET_WINDOW_BYTES,
+};
 pub use manager::{
-    FlushOutcome, GenerationPointer, IndexManager, ReconcileReport, ACTIVE_GENERATION_META_KEY,
-    DEBOUNCE, VAULT_UUID_META_KEY,
+    BuildProgress, FlushOutcome, GenerationPointer, IndexManager, ProgressPhase, ReconcileReport,
+    ACTIVE_GENERATION_META_KEY, DEBOUNCE, VAULT_UUID_META_KEY,
 };
 pub use markdown::{markdown_to_plain, MARKDOWN_TO_PLAIN_VERSION};

@@ -22,7 +22,7 @@ use gpui::{
     IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     ScrollEvent, ShapedLine, Style, TextAlign, Window,
 };
-use menghunote_editor::{units, Selection};
+use menghunote_editor::{units, Bias, Selection};
 
 use super::geometry::EditorGeometry;
 use super::layout::VisualLine;
@@ -261,10 +261,13 @@ impl EditorElement {
                 {
                     return;
                 }
-                let byte = down_geometry.byte_at(event.position);
+                // 命中带偏置：点字形右半 → 停在隐藏标记之前（构造内），左半 → 之后。
+                let (byte, bias) = down_geometry
+                    .byte_at_with_bias(event.position)
+                    .unwrap_or((down_geometry.byte_at(event.position), Bias::Right));
                 down_view
                     .update(cx, |view, cx| {
-                        view.begin_pointer_selection(byte, window, cx)
+                        view.begin_pointer_selection(byte, bias, window, cx)
                     })
                     .ok();
             },
@@ -277,9 +280,14 @@ impl EditorElement {
                 if !event.dragging() {
                     return;
                 }
-                let byte = move_geometry.byte_at(event.position);
+                // 拖选与点击用同一套偏置，否则跨构造拖动会跳。
+                let (byte, bias) = move_geometry
+                    .byte_at_with_bias(event.position)
+                    .unwrap_or((move_geometry.byte_at(event.position), Bias::Right));
                 move_view
-                    .update(cx, |view, cx| view.extend_selection_to(byte, cx))
+                    .update(cx, |view, cx| {
+                        view.extend_selection_to_biased(byte, bias, cx)
+                    })
                     .ok();
             },
         );

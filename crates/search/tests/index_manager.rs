@@ -5,14 +5,16 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use menghunote_search::{
-    Fingerprint, FlushOutcome, IndexManager, SearchError, SearchIndex, ACTIVE_GENERATION_META_KEY,
-    DEBOUNCE, FINGERPRINT_FILE,
+    BuildProgress, Fingerprint, FlushOutcome, IndexManager, ProgressPhase, SearchError,
+    SearchIndex, ACTIVE_GENERATION_META_KEY, DEBOUNCE, FINGERPRINT_FILE,
 };
 use menghunote_storage::{
-    append_updates, load_body_doc, materialize_body, StructureWriter, UpdateRecord, Vault,
+    append_updates, load_body_doc, materialize_body, Statement, StructureWriter, UpdateRecord,
+    Value, Vault, APP_DOC_SCHEMA, CODEC_VERSION, MIN_READER,
 };
 
 const PEER: u64 = 9_100_001;
@@ -55,6 +57,40 @@ fn delete_note(vault: &Vault, node_id: &str, now: i64) {
     let mut writer = StructureWriter::open(vault, PEER).expect("打开结构写入口失败");
     writer.doc().delete_note(node_id, now).expect("删除失败");
     writer.commit("delete").expect("提交结构失败");
+}
+
+fn seed_many_notes(vault: &Vault, count: usize) {
+    let mut statements = Vec::with_capacity(count * 2);
+    let now = 1_700_000_000_000i64;
+    for index in 0..count {
+        let body_doc_id = format!("progress-body-{index}");
+        let note_id = format!("progress-note-{index}");
+        statements.push(Statement::new(
+            "INSERT INTO loro_docs(doc_id, kind, generation, app_doc_schema, codec_version, min_reader) \
+             VALUES(?1, 'body', 1, ?2, ?3, ?4)",
+            vec![
+                Value::Text(body_doc_id.clone()),
+                Value::Integer(APP_DOC_SCHEMA),
+                Value::Text(CODEC_VERSION.to_owned()),
+                Value::Integer(MIN_READER),
+            ],
+        ));
+        statements.push(Statement::new(
+            "INSERT INTO notes(note_id, body_doc_id, title, body_md, body_seq, body_frontier, \
+             meta_seq, created_at, updated_at, deleted, is_favorite, is_pinned) \
+             VALUES(?1, ?2, ?3, ?4, 1, NULL, 1, ?5, ?5, 0, 0, 0)",
+            vec![
+                Value::Text(note_id),
+                Value::Text(body_doc_id),
+                Value::Text(format!("进度笔记 {index}")),
+                Value::Text(format!("第 {index} 篇进度测试正文")),
+                Value::Integer(now + index as i64),
+            ],
+        ));
+    }
+    vault
+        .exec_transaction(&statements, &[])
+        .expect("批量播种失败");
 }
 
 #[test]
@@ -310,4 +346,36 @@ fn open_missing_fingerprint_directory_is_recovered() {
         manager.query("可恢复", 10).expect("重建后查询失败").len(),
         1
     );
+}
+
+#[test]
+fn open_with_progress_reports_batches_for_200_docs() {
+    let (_dir, vault) = tmp_vault("progress");
+    seed_many_notes(&vault, 200);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let manager = IndexManager::open_with_progress(&vault, move |progress| {
+        sink.lock().expect("进度锁").push(progress);
+    })
+    .expect("带进度打开失败");
+    drop(manager);
+
+    let events: Vec<BuildProgress> = events.lock().expect("进度锁").clone();
+    assert!(events.len() >= 2, "200 篇应至少回调 2 次: {events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|progress| progress.phase == ProgressPhase::BuildIndex),
+        "search 只报 BuildIndex: {events:?}"
+    );
+    assert!(
+        events
+            .windows(2)
+            .all(|window| window[0].done <= window[1].done),
+        "done 必须单调不减: {events:?}"
+    );
+    let last = events.last().expect("至少一次回调");
+    assert_eq!(last.done, 200);
+    assert_eq!(last.done, last.total);
 }

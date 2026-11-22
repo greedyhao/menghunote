@@ -15,7 +15,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{px, Pixels, Point, ShapedLine};
-use menghunote_editor::StyleKind;
+use menghunote_editor::{Bias, StyleKind};
 
 use super::glyph;
 use super::layout::LayoutFrame;
@@ -131,6 +131,39 @@ impl EditorGeometry {
 
     /// 在**可见**的行内把像素 x（相对行首）换成源码字节；屏外行返回 `None`。
     #[must_use]
+    /// 「点击在字形左半/右半」→ 投影偏置（**纯函数**，与 UI 解耦，便于单测）。
+    ///
+    /// **右半 → Left、左半 → Right**：隐藏标记宽度为 0，同一个 display 位置对应两个
+    /// source 位置。点字符右半时人期望"跨过这个字符"，于是取左侧偏置（停在隐藏标记
+    /// 之前，即构造内）；点左半时停在字符之前，取右侧偏置。
+    pub fn bias_for_half(right_half: bool) -> Bias {
+        if right_half {
+            Bias::Left
+        } else {
+            Bias::Right
+        }
+    }
+
+    /// 命中：返回 `(display 字节, 偏置)`。
+    ///
+    /// 偏置由"点是否落在该边界的右侧字形内"决定：`closest_index_for_x` 取最近边界，
+    /// 若点在该边界**左侧**（即它落在前一个字符的右半），说明点在字形右半 → `Left`。
+    pub fn byte_at_with_bias(&self, position: Point<Pixels>) -> Option<(usize, Bias)> {
+        let row = self.row_at_y(position.y);
+        let bytes = self.frame.row_bytes(row);
+        let shaped = self.shaped.get(row.checked_sub(self.visible_start)?)?;
+        if bytes.is_empty() {
+            return Some((bytes.start, Bias::Right));
+        }
+        let local_x = (position.x - self.text_left_for_row(row)).max(px(0.0));
+        let index = shaped.closest_index_for_x(local_x);
+        let index = index.min(bytes.len());
+        let boundary_x = shaped.x_for_index(index);
+        // 点在该边界左侧 → 处在前面字符的右半。
+        let right_half = local_x < boundary_x;
+        Some((bytes.start + index, Self::bias_for_half(right_half)))
+    }
+
     pub fn byte_at_row_x(&self, row: usize, x: Pixels) -> Option<usize> {
         let bytes = self.frame.row_bytes(row);
         let shaped = self.shaped.get(row.checked_sub(self.visible_start)?)?;
@@ -206,6 +239,19 @@ mod tests {
         assert_eq!(
             geometry.row_top(11),
             px(0.0) + px(theme::PAD_Y) - px(200.0) + px(geometry.frame.row_top_offset(11))
+        );
+    }
+    #[test]
+    fn right_half_maps_to_left_bias() {
+        use super::EditorGeometry;
+        // 右半 → Left（跨过字形，停在隐藏标记之前）；左半 → Right。
+        assert_eq!(
+            EditorGeometry::bias_for_half(true),
+            menghunote_editor::Bias::Left
+        );
+        assert_eq!(
+            EditorGeometry::bias_for_half(false),
+            menghunote_editor::Bias::Right
         );
     }
 }

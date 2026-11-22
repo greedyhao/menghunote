@@ -62,6 +62,30 @@ fn main() -> anyhow::Result<()> {
         .context("写 A 事务失败")?;
     }
 
-    println!("已播种 {count} 篇笔记到 {}", path.display());
+    // 额外一篇：6 行都含 `needle`，用来验收"按笔记分组 + 多行摘要 + 共 N 处命中"。
+    let mut writer = StructureWriter::open(&vault, PEER_ID).context("重开结构写入口失败")?;
+    let multi = writer
+        .doc()
+        .create_note("多行命中示例", 9_000_000)
+        .context("创建多行命中笔记失败")?;
+    writer.commit("seed-multiline").context("提交结构失败")?;
+    let body = "# 多行命中示例\n\nneedle 第 1 行\nneedle 第 2 行\nneedle 第 3 行\nneedle 第 4 行\nneedle 第 5 行\nneedle 第 6 行\n";
+    let (doc, head) =
+        load_body_doc(&vault, &multi.body_doc_id, PEER_ID, None).context("加载正文失败")?;
+    doc.insert_scalars(0, body).context("写正文失败")?;
+    let base = head.version_vector().context("解码 head_vv 失败")?;
+    let update = doc.pending_update(&base).context("导出增量失败")?;
+    menghunote_storage::append_updates(
+        &vault,
+        &multi.body_doc_id,
+        head.head_seq,
+        &[UpdateRecord::new("seed-multiline", update)],
+    )
+    .context("写 A 事务失败")?;
+
+    println!(
+        "已播种 {count} 篇笔记到 {}（另加 1 篇多行命中示例）",
+        path.display()
+    );
     Ok(())
 }

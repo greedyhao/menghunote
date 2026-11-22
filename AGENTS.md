@@ -339,8 +339,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
 - **版本管理**：当前开发分支 **`dev`**（2026-11-11 重建：折叠全部 `wip:`，0 wip，36 条提交）；
-  旧历史保留两份备份：**`backup/main-wip-20261110`**（首个基线）与 **`backup/dev-wip-20261111`**（含重命名/搜索的 wip 段）。
-  tag：`v0.1-slice6` = 切片 6 真机验收点；**`v0.2-gpui-kit`** = S2 投影编辑器 + 引用块 + 导出 + 切换 GPUI Kit（真机验收）。
+  旧历史保留：**`backup/main-wip-20261110`**（首个基线）、**`backup/dev-wip-20261111`**（重命名/搜索 wip）、
+  **`backup/dev-wip-20261111b`**（S5 两次 wip 前）。
+  tag：`v0.1-slice6` = 切片 6；**`v0.2-gpui-kit`** = S2 + 引用块 + 导出 + GPUI Kit；
+  **`v0.3-search`** = S4/S5 检索（P0 物化修复、单行多行摘要、大小写/整词开关、进度条、分组折叠；真机验收）。
   `target/`（20G）与本地 vault 不入库；**Lead review 一律看 `git diff`**，提交前必须三绿。
 - 已落盘：[`AGENTS.md`](AGENTS.md)、[`docs/briefs/0000-kickoff.md`](docs/briefs/0000-kickoff.md)、
   [`0001-storage-format.md`](docs/briefs/0001-storage-format.md)（**已作废**）、
@@ -383,6 +385,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   （`search_input.rs`；`gpui-component` 的 Input 无 `EntityInputHandler`，文本输入必须自绘）、
   snippet 高亮、↑/↓/Enter/点击跳转、点空白关闭、Ctrl+A 全选（Ctrl+C/X/V 明确 v1 不做）。
   **教训**：`WM_CHAR` 注入绕过 IME，自动化能打字 ≠ 输入法可用；文本输入控件必须真机验。
+- **S5 检索体验（2026-11-11，真机验收）**：总计/单行→多行摘要（命中行全量、单行 160B 截断 + 省略号）、
+  `Aa` 大小写敏感与 `整词`（关=子串，trigram 召回 + 原文校验）开关、两阶段重建进度条、按笔记分组折叠（默认 3 行）。
+  索引 schema v2：**索引体积约 2.5×**、2000 篇首建「补齐正文」约 **40–50s**（逐篇物化，待批量优化）、
+  查询 p95 全量多行摘要后 **27.8–39.9ms**（仍 <50ms 门槛）。
 - **UI 框架已切 GPUI Kit（2026-11-10，ADR 0004，真机验收）**：`gpui = { package = "gpui-kit", version = "=0.9.1" }`（精确 pin），
   平台入口 `gpui::platform::application()`；`text`/`editor`/`storage` **零改动**。
   探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口；迁移后三绿 329 用例 + UI smoke 10/10 + 用户真机 IME/DPI 通过。

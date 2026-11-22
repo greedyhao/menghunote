@@ -197,3 +197,33 @@ pub fn search_highlight_text() -> Rgba {
 pub fn search_warn_text() -> Rgba {
     rgb(0xb35900)
 }
+
+/// 进度条底槽色（浅灰，和面板背景区分）。
+#[must_use]
+pub fn search_progress_track() -> Rgba {
+    rgb(0xe6e9ed)
+}
+
+/// 进度条填充色（低饱和蓝，与选区色同族）。
+#[must_use]
+pub fn search_progress_fill() -> Rgba {
+    rgb(0x7aa7e8)
+}
+
+/// 开关「打开」态底色。
+#[must_use]
+pub fn search_toggle_active() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 开关「打开」态文字色。
+#[must_use]
+pub fn search_toggle_active_text() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// 搜索结果里"当前选中分组"的底色（浅蓝，保证正文与统计行都可读）。
+#[must_use]
+pub fn search_group_selected() -> Rgba {
+    rgb(0xe8f0fb)
+}

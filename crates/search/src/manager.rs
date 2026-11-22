@@ -28,7 +28,7 @@ use menghunote_storage::{
 
 use crate::error::SearchError;
 use crate::fingerprint::Fingerprint;
-use crate::index::{DocVersion, Hit, SearchDoc, SearchIndex};
+use crate::index::{DocVersion, Hit, QueryOptions, QueryResult, SearchDoc, SearchIndex};
 use crate::markdown_to_plain;
 
 /// 发布指针的 meta key。
@@ -37,6 +37,29 @@ pub const ACTIVE_GENERATION_META_KEY: &str = "search.active_generation";
 pub const VAULT_UUID_META_KEY: &str = "search.vault_uuid";
 /// 事件增量的 debounce 窗口。
 pub const DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// 重建进度阶段。
+///
+/// search crate 自行只报 [`ProgressPhase::BuildIndex`]；物化正文阶段由 app /
+/// storage 的 reconcile 流程负责，search 侧不碰 Loro 物化，避免跨 crate 抢占。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressPhase {
+    /// 正文物化（search 不报；预留给 app 的 reconcile 进度）。
+    MaterializeBodies,
+    /// 全量构建 tantivy 索引。
+    BuildIndex,
+}
+
+/// 一次重建进度回调。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildProgress {
+    /// 当前阶段。
+    pub phase: ProgressPhase,
+    /// 当前阶段已完成数量。
+    pub done: usize,
+    /// 当前阶段总数。
+    pub total: usize,
+}
 
 /// 发布指针内容：三代信息缺一不可。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,11 +166,30 @@ pub struct IndexManager {
 }
 
 impl IndexManager {
-    /// 打开（必要时创建）当前 vault 的检索索引。
+    /// 打开（必要时创建）当前 vault 的检索索引；默认不报进度。
     ///
     /// 启动流程：校验/新建代 → 全量对账 → 清理非活动代。任何一步失败都不会
     /// 覆盖旧指针；旧代只有在指针切换成功后才删除。
     pub fn open(vault: &Vault) -> Result<Self, SearchError> {
+        let mut ignore = |_progress: BuildProgress| {};
+        Self::open_inner(vault, &mut ignore)
+    }
+
+    /// 带重建进度的打开方式。
+    ///
+    /// 只有**新建代/全量构建索引**时才回调；复用已有代时不会回调。search 只报
+    /// [`ProgressPhase::BuildIndex`]（按每 50 篇 + 首尾），物化正文由 app 自己报。
+    pub fn open_with_progress(
+        vault: &Vault,
+        mut sink: impl FnMut(BuildProgress) + Send,
+    ) -> Result<Self, SearchError> {
+        Self::open_inner(vault, &mut sink)
+    }
+
+    fn open_inner(
+        vault: &Vault,
+        progress: &mut dyn FnMut(BuildProgress),
+    ) -> Result<Self, SearchError> {
         let vault = vault.clone();
         let vault_uuid = load_or_create_vault_uuid(&vault)?;
         let generations = generations_root(&vault);
@@ -160,7 +202,7 @@ impl IndexManager {
                 let dir = generations.join(&pointer.id);
                 (index, pointer, dir)
             }
-            None => build_generation(&vault, &vault_uuid, &generations)?,
+            None => build_generation(&vault, &vault_uuid, &generations, progress)?,
         };
 
         let mut manager = Self {
@@ -209,42 +251,63 @@ impl IndexManager {
         self.degraded.as_deref()
     }
 
-    /// 查询：索引候选再经**新开的 ReadSnapshot**确认仍存在且未删除。
-    ///
-    /// 只有快照打开时**已经提交**的删除一定不会返回；快照打开之后才提交的删除
-    /// 可能仍被本次查询看到（与 SQLite 快照语义一致，下一次查询会消失）。
-    ///
-    /// 候选不足时按 2 倍扩大候选数，直到够 `limit` 或索引穷尽；不会因为
-    /// top-K 里有墓碑就少返回。
+    /// 查询；默认 [`QueryOptions`]（大小写不敏感、整词）。
     pub fn query(&self, q: &str, limit: usize) -> Result<Vec<Hit>, SearchError> {
-        if limit == 0 || q.trim().is_empty() {
-            return Ok(Vec::new());
+        Ok(self
+            .query_with_options(q, limit, QueryOptions::default())?
+            .hits)
+    }
+
+    /// 带开关查询；`total` 是索引侧命中数（墓碑终检前），`hits` 已终检。
+    pub fn query_with_options(
+        &self,
+        q: &str,
+        limit: usize,
+        options: QueryOptions,
+    ) -> Result<QueryResult, SearchError> {
+        if q.trim().is_empty() {
+            return Ok(QueryResult {
+                total: 0,
+                hits: Vec::new(),
+            });
         }
         let snapshot = self.vault.open_read_snapshot()?;
-        let total = self.index.num_docs();
-        if total == 0 {
-            return Ok(Vec::new());
+        let docs = self.index.num_docs();
+        if docs == 0 {
+            return Ok(QueryResult {
+                total: 0,
+                hits: Vec::new(),
+            });
         }
-        let total = usize::try_from(total).unwrap_or(usize::MAX);
-        let mut fetch = limit.clamp(1, total);
+        let docs = usize::try_from(docs).unwrap_or(usize::MAX);
+        let mut fetch = limit.max(1).clamp(1, docs);
 
         loop {
-            let candidates = self.index.query(q, fetch)?;
-            let ids: Vec<String> = candidates.iter().map(|hit| hit.note_id.clone()).collect();
+            // 候选先不做 snippet：墓碑终检会剔除一部分，不能为被剔除的候选白算。
+            let candidates = self.index.query_candidates(q, fetch, options)?;
+            let total = candidates.total;
+            let ids: Vec<String> = candidates
+                .hits
+                .iter()
+                .map(|hit| hit.note_id.clone())
+                .collect();
             let live = live_ids(&snapshot, &ids)?;
             let mut valid = Vec::new();
-            for hit in candidates {
+            for hit in candidates.hits {
                 if live.contains(&hit.note_id) {
                     valid.push(hit);
                     if valid.len() >= limit {
-                        return Ok(valid);
+                        valid.truncate(limit);
+                        self.index.attach_snippets(q, options, &mut valid)?;
+                        return Ok(QueryResult { total, hits: valid });
                     }
                 }
             }
-            if ids.len() < fetch || fetch >= total {
-                return Ok(valid);
+            if ids.len() < fetch || fetch >= docs {
+                self.index.attach_snippets(q, options, &mut valid)?;
+                return Ok(QueryResult { total, hits: valid });
             }
-            fetch = fetch.saturating_mul(2).min(total);
+            fetch = fetch.saturating_mul(2).min(docs);
         }
     }
 
@@ -602,10 +665,11 @@ fn build_generation(
     vault: &Vault,
     vault_uuid: &str,
     generations: &Path,
+    progress: &mut dyn FnMut(BuildProgress),
 ) -> Result<(SearchIndex, GenerationPointer, PathBuf), SearchError> {
     let id = unique_id("gen");
     let dir = generations.join(&id);
-    let result = build_generation_in_dir(vault, vault_uuid, &dir, &id);
+    let result = build_generation_in_dir(vault, vault_uuid, &dir, &id, progress);
     if result.is_err() {
         // 指针还没写：失败的新代是孤儿，清掉；旧代保持原样。
         let _ = fs::remove_dir_all(&dir);
@@ -618,13 +682,30 @@ fn build_generation_in_dir(
     vault_uuid: &str,
     dir: &Path,
     id: &str,
+    progress: &mut dyn FnMut(BuildProgress),
 ) -> Result<(SearchIndex, GenerationPointer, PathBuf), SearchError> {
     fs::create_dir_all(dir)?;
     let mut index = SearchIndex::create(dir, &Fingerprint::current())?;
     let manifest = read_manifest(vault)?;
+    let total = manifest.iter().filter(|row| !row.deleted).count();
+    progress(BuildProgress {
+        phase: ProgressPhase::BuildIndex,
+        done: 0,
+        total,
+    });
+    let mut done = 0usize;
     for row in &manifest {
-        if !row.deleted {
-            index.upsert(search_doc(row))?;
+        if row.deleted {
+            continue;
+        }
+        index.upsert(search_doc(row))?;
+        done += 1;
+        if done.is_multiple_of(50) || done == total {
+            progress(BuildProgress {
+                phase: ProgressPhase::BuildIndex,
+                done,
+                total,
+            });
         }
     }
     index.commit()?;

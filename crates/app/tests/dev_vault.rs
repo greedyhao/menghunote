@@ -14,7 +14,8 @@ use menghunote_storage::list_tree;
 use menghunote_storage::session::{DriverOptions, SessionDriver};
 
 fn temp_vault(name: &str) -> std::path::PathBuf {
-    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("menghunote-app");
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("menghunote-app-{}", std::process::id()));
     std::fs::create_dir_all(&base).expect("创建 target/tmp 下的测试目录");
     base.join(name)
 }
