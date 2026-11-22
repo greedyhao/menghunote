@@ -319,6 +319,135 @@
 - `asset://` 解析是**严格** `asset://<64 小写 hex>`；S2b 若要支持带 title 的
   `![alt](asset://hash "title")`，应在 markdown crate 的 `ImageSpan::dest` 已解析的前提
   下扩展（当前 `dest_url` 已去掉 title，无需改 editor）。
+- **S2b 已补齐上述"未做"项**（粘贴/拖放/引用对账/旧路径输入条移除），见 §8；S2a 的
+  投影/绘制/解码语义未改动。
+
+## 8. S2b 实施记录（2026-11-16）
+
+> 范围：**粘贴/拖放 → 资产入库 → 正文插入 → 引用对账**。
+> 明确**未做**：Windows CF_DIB/CF_DIBV5 剪贴板位图与真实 `IDropTarget` 真机验收、
+> Mermaid/表格 Object、物理资产 GC；旧侧栏「插入附件…」路径输入条**已移除**。
+
+### 8.1 剪贴板分流（每次只选一种）
+
+- 唯一决策点 `editor::clipboard::choose_paste`（纯函数，可单测）：
+  **本应用 Markdown/文本元数据 → 文件路径 → 图片 → 普通文本**；
+  `Ctrl+Shift+V`（`force_text`）只看字符串条目，**绝不**把 `CF_HDROP` 变成绝对路径文字
+  （`ClipboardItem::text()` 的路径回落被显式绕开）。
+- "本应用元数据"用纯文本前缀 `menghunote/1 markdown`（不引 JSON 依赖，也不信任任意
+  元数据）；`Ctrl+C` 复制对象 Markdown/选区源码时写入该标记，所以复制粘贴回本应用时
+  走文本路径（与 S1 行为一致）。
+- 图片：`ClipboardEntry::Image` 的**原始编码字节**（PNG/JPEG/WebP/GIF）直接入库，不转码；
+  声明的格式与字节魔数不一致时以**字节**为准。
+- SVG / BMP / TIFF / ICO：按**普通附件**（`[附件：粘贴图片.svg](asset://…)`）存，
+  不执行、不栅格化、不进图片对象预览。
+- 入口：`on_key_down` 的 `Ctrl+V`/`Ctrl+Shift+V` + `InputHandler::paste`（平台直接派发
+  paste 的后端，例如 web）+ 编辑区 `on_drop::<ExternalPaths>`。三条路都走同一套
+  分流/事务/回滚/对账。
+
+### 8.2 导入能力面与写入顺序
+
+`EditorView` 只认一个 trait `editor::clipboard::AssetImportWriter`（与 S2a 的
+`AssetBytesProvider` 同一模式，编辑器不依赖 storage/文件系统）；`AppShell` 注入
+`attachment::VaultAssetWriter`：
+
+1. `stage_and_store`：按 `body_doc_id` 从**当前结构投影**反查 `note_id`（切笔记/删笔记
+   后这里就失败）→ 全量校验/读取 → 写 `assets`（内容寻址，重复导入 = 单资产）→ 按
+   `基址 + 相对偏移` 写 `asset_refs`；**任何失败都发生在正文写入之前**，中途失败回滚
+   本批已写引用；
+2. 编辑器把整批 Markdown 作为**一个** `compose_replace_selection` 提交（一个撤销组）；
+3. 插入前重验：`doc_id` / `body_seq` / 插入锚点（光标 source 偏移）/ 持闸 / IME 组合，
+   任一变化 → 回滚引用并放弃（"切笔记/IME 不偷插"）；
+4. 正文成功 → `commit`：按**当前正文**整篇重建引用；失败只记日志（下次对账修好）。
+
+上限（ADR §2）：每批 ≤ 10 个文件、总输入 ≤ 100 MiB、单资产 ≤ 20 MiB；只接受**普通
+文件**（目录/相对路径/设备文件整批失败）。多项之间用 `\n` 分隔；单项不补换行。
+
+### 8.3 图片字节校验（先校验，再入库）
+
+`stage_image`：非空 → ≤ 20 MiB → 魔数必须是 PNG/JPEG/WebP/GIF → `ImageReader` 只读头部
+拿尺寸 → 复用 S2a 预算（边长 ≤ 8192、总像素 ≤ 16MP）。任一失败 → 明确错误、
+**不写资产、不写正文**（损坏图片不会留半条正文）。文件名 `粘贴图片.<ext>`（alt 转义
+`\ [ ] ( )`，换行压空格）。
+
+### 8.4 引用对账与坐标约定
+
+- 新增 storage 事务 API `menghunote_storage::replace_asset_refs(vault, note_id, body_seq,
+  refs)`：一个事务里 `DELETE` 该笔记全部引用 → 为缺元数据的 hash 建占位
+  （`byte_len/media_type/data` 全 `NULL`，否则外键不成立）→ 逐条 `INSERT`；任一步失败
+  整笔回滚。**不删资产**（v1 不做孤儿删除），`data IS NULL` 的合法引用照写。
+- **定位点约定**：`asset_refs.start_byte` 是对账路径写下的 **`asset://` 前缀在正文中的
+  字节偏移**（内联/引用式链接/`[label]: asset://…` 定义行都能扫到）。它不是长期身份，
+  任何时候都按正文整篇重建；旧路径插入写的是链接起点，两种都只是"位置标签"。
+- 扫描 `attachment::asset_refs_in_source`：严格 `asset://` + 正好 64 个小写 hex，且后一个
+  字节不是小写 hex；不解析 Markdown 结构（URI 扫描对引用式链接天然成立）。代码块里的
+  出现**也计入**（fail-open：宁可多留一条账本，也不误删真实引用）。
+- 触发点：
+  - 导入成功（`commit` 精确重建）；
+  - **每次本地编辑被受理**（`EditOutcome::Applied`，含撤销/重做）——没有资产链接的笔记
+    在这里按"上一次/这一次是否出现过 `asset://`"短路，不查库；
+  - `DriverEvent::Durable`（正文真落库后）；
+  - 打开笔记（构造时）、切换/关闭笔记（`drain_and_close` 之后）。
+  - **剩余触发点（明确未接）**：远端 adopt 若没有产生 `DriverEvent::Durable`，引用要等到
+    下一次本地编辑/切换/关闭才对账。没有把对账放进 storage 的 A 事务（那需要改
+    `storage::session` 的 flush 路径，超出本切片写作用域）：因此"最坏情况"是引用账本
+    短暂落后于正文，下一次提交/关闭即收敛。
+- 幂等：对账前先比较"当前引用集合 vs 扫描结果"，相同则**不写库**（重复对账零事务）。
+
+### 8.5 移除旧路径输入条
+
+侧栏「插入附件…」按钮 + 路径输入框（`render_attachment_block` / `AttachmentUi` /
+`attachment_toggle/submit_path/disabled_reason` 等）**整体删除**；粘贴/拖放成为唯一导入
+入口。`crates/app/src/attachment.rs` 保留可复用的读取/校验/去重/`assets` 写入核心，
+并去掉 `dev-sync` feature 门禁（默认构建立即具备粘贴/拖放导入能力，不引入新依赖）。
+
+### 8.6 测试
+
+- `cargo test -p menghunote-app --test headless_import`：**10**（默认 9 + dev-sync 1）：
+  PNG 粘贴 → 资产字节 + 引用 + S2a 对象 Ready；同图两次 = 单资产两引用；多文件单事务
+  （一次 Ctrl+Z 全撤、Ctrl+Shift+Z 整批恢复）+ 落库后引用复算；目录/11 个文件/损坏图片
+  整批失败零写入；纯文本粘贴与 `Ctrl+Shift+V` 强制文本（含"只有文件时不写路径"）；
+  IME 组合中不插；拖放用**真实 `FileDropEvent`**（caret 在第二行、落点在第一行 → 插在
+  caret）；SVG 按普通附件；持闸期间不插（dev-sync）。
+- `attachment` 单测 **6**：链接/alt 转义、扩展名/MIME/SVG 判定、`asset_refs_in_source`
+  （内联/引用式定义/多字节前缀/大小写/63/65 位）、`batch_markdown` 偏移、图片魔数与
+  尺寸校验、SVG 附件与扩展名清洗；`editor::clipboard` 单测 **6**：优先级、元数据、
+  强制文本、位图/非位图分流、`ClipboardItem` 真实条目。
+- `menghunote-storage` 单测 **4**（`replace_asset_refs`）：整篇替换、幂等/去重、缺字节
+  引用保留 + 占位、失败不改已有引用。
+- 回归：app 默认 / `--features dev-sync`、storage/editor/markdown/text 全绿；
+  `dev_sync_sync_once` 的"附件经 relay 到另一台"改走**粘贴链路**后仍通过。
+- headless 拖放的一个框架细节：GPUI 的 drop 派发用 `hitbox.is_hovered(window)`，键盘
+  模态下恒为 `false`（按键后不显示 hover 高亮）。真实拖拽本身是鼠标手势（先有
+  mouse move），测试里显式补一次 `simulate_mouse_move` 才能命中 `on_drop`。
+
+### 8.7 已知限制（明确记录，不假装全量）
+
+- **导入在宿主帧内同步完成**（读文件 → SHA-256 → 写 assets/refs → 编辑器事务），没有
+  后台线程；上限 100 MiB/批就是给这条同步路径设的护栏。往后台搬需要"资产已落库但正文
+  还没插"的中间态，属于后续切片。
+- **远端 adopt 的对账依赖 `DriverEvent::Durable`**：若某次远端变更没有产生 durable 事件，
+  引用要等到下一次本地编辑/切换/关闭才对账（见 §8.4 的触发点）。没有把对账放进 storage
+  的 A 事务（需要改 `storage::session` 的 flush 路径，超出本切片写作用域）。
+- **编辑时引用账本可能短暂领先/落后正文**：对账在"编辑被受理（乐观镜像）"时就做，正文
+  durable 之后再做一次；引用只是账本（同步用它挑要上传的资产），不参与裁决。
+- 移到最后一条 `asset://` 之后的对账靠"上一次有过链接"的痕迹触发；没有资产链接的笔记
+  完全不查引用表。
+- **S2a 的 `Missing` 缓存不失效**（继承限制，未在本次改）：资产字节稍后由同步到达时，
+  已缓存 `Missing` 的图片要重开文档才刷新；粘贴路径的字节在插正文前就已落库，不受影响。
+- 混排/行内图片仍按 S2a 决定原样显示源码；粘贴在行中产生的 `![](...)` 不会自动补换行，
+  因此不会变成 Object Block（ADR §1：不擅自补换行）。
+
+### 8.8 Windows 真机清单（未做，后续）
+
+1. 资源管理器复制文件 → `Ctrl+V`：CF_HDROP → `ExternalPaths` 分流（本机已有代码路径，
+   需真机确认不落成文本/路径）；
+2. 截图工具/浏览器复制图片 → `Ctrl+V`：Windows 后端读 `PNG`/`JFIF`/`GIF` 自定义格式，
+   **CF_DIB/CF_DIBV5 缺口**由后续适配层补（本切片不做，也不写 Windows API）；
+3. 从资源管理器拖文件到编辑区：`IDropTarget` → `FileDropEvent` → `on_drop`（含落点
+   hover 命中、DPI 缩放下的坐标）；
+4. 中文/空格路径、多文件（≤10）、超大文件（>20 MiB 拒绝）与目录拖入的提示行；
+5. 粘贴图片后立刻按 `Ctrl+Z`：一次撤销整批；重开后引用 `start_byte` 与正文一致。
 
 ## 非目标
 

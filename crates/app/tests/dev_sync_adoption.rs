@@ -210,6 +210,8 @@ async fn editor_view_applies_adopted_delta_and_freezes_typing_while_held(cx: &mu
     let vault = Vault::open(&vault_path).expect("打开临时 vault");
     seed_body_doc(&vault, "doc-1", EDITOR_SEED);
     let writer = vault.clone();
+    // ADR 0019 S2b：粘贴/拖放导入的落库能力面（本用例不导入，注入真实 vault 即可）。
+    let import_writer = menghunote_app::attachment::VaultAssetWriter::shared(&vault);
 
     let mut options = DriverOptions::default();
     options.session.peer_id = LOCAL_PEER;
@@ -221,6 +223,7 @@ async fn editor_view_applies_adopted_delta_and_freezes_typing_while_held(cx: &mu
             driver,
             "dev-sync-adoption".to_owned(),
             menghunote_app::editor::object_image::empty_asset_provider(),
+            import_writer,
             cx,
         )
     });
@@ -353,6 +356,7 @@ async fn app_shell_adopts_external_commit_without_reopening(cx: &mut TestAppCont
         let shell = cx.new(|cx| {
             AppShell::new_with_dev_sync(vault, "dev-sync-adoption".to_owned(), config, sync, cx)
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     cx.run_until_parked();
@@ -486,6 +490,7 @@ async fn adopt_failures_keep_text_and_held_then_cancel_releases(cx: &mut TestApp
         let shell = cx.new(|cx| {
             AppShell::new_with_dev_sync(vault, "dev-sync-adoption".to_owned(), config, sync, cx)
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     cx.run_until_parked();

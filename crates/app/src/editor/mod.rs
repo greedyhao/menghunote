@@ -7,6 +7,7 @@
 //! | [`glyph`] | 行 shaping 的唯一入口（绘制与键盘导航共用） |
 //! | [`shared`] | 视图 ↔ 元素共享的非观察状态（折行缓存 / 上一帧几何） |
 //! | [`input`] | `EntityInputHandler`：IME / 文本输入（虚拟输入文档 + 一次提交） |
+//! | [`clipboard`] | 粘贴/拖放的剪贴板分流（纯逻辑）+ 资产导入能力面（S2b） |
 //! | [`ime_map`] | 虚拟输入文档 ↔ source 的 UTF-16 换算（纯函数，重点单测） |
 //! | [`element`] | 单 `Element`：绘制 + 鼠标命中 / 拖拽 / 滚轮 |
 //! | [`view`] | `EditorView`：控制器 + 会话驱动接线、键盘、状态栏 |
@@ -15,6 +16,7 @@
 //! 本切片只做 **S1 identity 投影**：`source_text()` 原样显示（`#` / `**` 不隐藏），
 //! 不隐藏标记、不做 IME、不改写文本。
 
+pub mod clipboard;
 pub mod display_edit;
 pub mod element;
 pub mod geometry;

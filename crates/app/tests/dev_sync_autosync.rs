@@ -195,6 +195,7 @@ fn add_shell_window_auto(
                 cx,
             )
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     let handle = slot

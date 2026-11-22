@@ -26,7 +26,7 @@
 
 use std::ops::Range;
 
-use gpui::{px, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window};
+use gpui::{px, ClipboardItem, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window};
 use menghunote_editor::InputUtf16;
 
 use super::view::EditorView;
@@ -197,5 +197,15 @@ impl EntityInputHandler for EditorView {
     /// 编辑器接受文本输入（`gpui-windows` 用它决定是否关联 IME 上下文）。
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
+    }
+
+    /// 平台**直接派发**的 paste（web 的 DOM paste；Windows 后端把 `Ctrl+V` 当普通按键
+    /// 送进 `on_key_down`）：两条路走同一套剪贴板分流（ADR 0019 §2 / S2b）。
+    ///
+    /// 绝不能在这里退化成"只取 `item.text()`"：`ClipboardItem::text()` 会把 CF_HDROP
+    /// 变成一串绝对路径，粘贴成文本就是把本机路径写进正文。
+    fn paste(&mut self, item: ClipboardItem, _window: &mut Window, cx: &mut Context<Self>) {
+        self.paste_item(item, cx);
+        cx.notify();
     }
 }

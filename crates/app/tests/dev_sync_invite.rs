@@ -159,6 +159,7 @@ fn add_shell_window(
         captured.set(Some(window.window_handle()));
         let shell =
             cx.new(|cx| AppShell::new_with_dev_sync(vault, label.to_owned(), dev_sync, sync, cx));
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     let handle = slot

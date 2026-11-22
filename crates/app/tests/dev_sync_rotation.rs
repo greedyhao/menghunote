@@ -221,6 +221,7 @@ fn add_shell_window(
         captured.set(Some(window.window_handle()));
         let shell =
             cx.new(|cx| AppShell::new_with_dev_sync(vault, label.to_owned(), dev_sync, sync, cx));
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     let handle = slot
@@ -1010,7 +1011,19 @@ fn probe(selector: &str) -> &'static str {
     Box::leak(selector.to_owned().into_boxed_str())
 }
 
+fn reopen_settings_if_closed(cx: &mut VisualTestContext) {
+    if cx.debug_bounds("settings-panel").is_none() {
+        if let Some(gear) = cx.debug_bounds("sync-status") {
+            cx.simulate_click(gear.center(), Modifiers::default());
+            cx.run_until_parked();
+        }
+    }
+}
+
 fn expect_selector(cx: &mut VisualTestContext, selector: &'static str) {
+    if cx.debug_bounds(selector).is_none() {
+        reopen_settings_if_closed(cx);
+    }
     assert!(
         cx.debug_bounds(selector).is_some(),
         "必须画出 selector={selector}"
@@ -1026,6 +1039,9 @@ fn expect_missing(cx: &mut VisualTestContext, selector: &'static str, why: &str)
 
 /// 点一个固定 selector（必须存在且非零尺寸）。
 fn ui_click(cx: &mut VisualTestContext, selector: &'static str) {
+    if cx.debug_bounds(selector).is_none() {
+        reopen_settings_if_closed(cx);
+    }
     let bounds = cx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("必须画出 selector={selector}"));

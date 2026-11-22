@@ -266,6 +266,7 @@ async fn app_shell_uses_identity_peer_for_structure_and_session(cx: &mut TestApp
         let shell = cx.new(|cx| {
             AppShell::new_with_dev_sync(vault, "dev-identity-peer".to_owned(), config, sync, cx)
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     cx.run_until_parked();

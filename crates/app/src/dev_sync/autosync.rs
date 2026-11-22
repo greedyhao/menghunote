@@ -742,7 +742,17 @@ impl AutoSync {
             && self.origin.is_none()
             && !matches!(self.status.state, StatusState::SecurityPaused { .. })
         {
-            let _ = self.scheduler.on_network_recovered(now);
+            // 激活回调里**不能**只把 Decision 丢掉：`on_network_recovered` 命中 pending
+            // 时会返回 Start 并把 scheduler 置为 Running，但这里没有派发上下文。
+            // 结果就是“scheduler 假 Running、origin 仍为空”，手动同步永远 Wait(Running)，
+            // 重启后窗口激活再次触发、再次卡住（2026-11-16 A 实例的实测根因）。
+            // 这里把启动退回 pending，由下一拍 tick 统一派发。
+            let decision = self.scheduler.on_network_recovered(now);
+            if decision.is_start() {
+                // 没人派发这次 Start：退回 pending，并清掉“已启动”的时间戳，
+                // 让下一拍 tick 立刻真正启动（不受 5s 最小间隔误伤）。
+                self.scheduler.cancel_start_without_dispatch(now);
+            }
         }
     }
 
@@ -834,6 +844,27 @@ impl AutoSync {
             self.status.state = StatusState::Syncing { auto: false };
         }
         decision
+    }
+
+    /// 清理"没有真实操作、但记账里还有一轮"的陈旧状态。
+    ///
+    /// 只在宿主已确认 **没有 ActiveSyncOnce / 没有 worker in_flight** 时调用：
+    /// - `origin` 残留：按 abort 撤销，不计失败/不退避；
+    /// - 只有 scheduler `running` 残留：成功收尾把 running 清掉，最多留下一条 pending。
+    ///
+    /// 有真实 op（`dev_sync_sync` / service `in_flight`）时宿主不会调用本方法，
+    /// 因此不会误杀正常同步。
+    pub fn recover_stale_round(&mut self, now: Instant) -> bool {
+        if self.origin.is_some() {
+            self.abort_round(now);
+            return true;
+        }
+        if self.scheduler.is_running() {
+            self.status.state = StatusState::Idle;
+            let _ = self.scheduler.on_finished_idle(Finished::Success, now);
+            return true;
+        }
+        false
     }
 
     /// 派发被拒/没有真的跑起来：撤回本轮登记（不计失败、不退避）。
@@ -1637,5 +1668,45 @@ mod tests {
         };
         assert_eq!(status.line(now), "已接收·待应用 7（续批暂停：无进展）");
         assert_eq!(status.error_line(), None);
+    }
+
+    #[test]
+    fn stale_round_bookkeeping_can_be_recovered_without_a_real_op() {
+        let clock = TestClock::new();
+        let mut auto = auto_with(&clock, AutoSyncConfig::new().no_ticker());
+        let backlog = Backlog {
+            outbox: 301,
+            inbox: 15,
+        };
+        auto.begin_auto_round(Trigger::Startup, backlog);
+        assert!(auto.origin().is_some());
+        assert!(auto.recover_stale_round(clock.now()));
+        assert_eq!(auto.origin(), None);
+        assert!(!auto.scheduler().is_running());
+        assert!(matches!(auto.status().state, StatusState::Idle));
+    }
+
+    #[test]
+    fn window_activation_never_leaves_scheduler_running_without_dispatch() {
+        let clock = TestClock::new();
+        let mut auto = auto_with(&clock, AutoSyncConfig::new().no_ticker());
+        auto.observe_backlog(
+            Backlog {
+                outbox: 0,
+                inbox: 15,
+            },
+            clock.now(),
+        );
+        // 窗口激活先于第一拍 tick：必须只排队，不能把 scheduler 留在 Running。
+        auto.on_activation(true, clock.now());
+        assert!(
+            !auto.scheduler().is_running(),
+            "激活回调不能留下没有宿主派发的 Running"
+        );
+        // 下一拍才真正 Start，由宿主派发。
+        assert!(matches!(
+            auto.tick(clock.now()),
+            Decision::Start(Trigger::NetworkRecovered)
+        ));
     }
 }

@@ -45,7 +45,7 @@
 //! | `app-root-backup` / `app-root-vault-id` / `app-root-recovery-code` / `app-root-copy-code` / `app-root-backup-confirm` / `app-root-continue` | 备份页 |
 //! | `app-root-copy-invite` / `app-root-invite-ttl` / `app-root-invite-error` | 备份页「复制邀请链接」（v2、15 分钟；token 只在剪贴板）/ 剩余有效期 / 脱敏失败 |
 //! | `app-root-main` | Main（`AppShell` 子视图宿主） |
-//! | `app-root-settings` | 打开设置（Welcome 页与 Main 右下角各一个入口） |
+//! | `app-root-settings` | 打开设置（Welcome 页与 Main 左侧栏底部入口） |
 //! | `dev-sync-settings` | 设置覆盖层根（打开时存在；Main 仍在其下保留） |
 //! | `settings-instance-<i>` / `settings-instance-<i>-active` | 公开实例行 /「设为默认」控件（active 优先） |
 //! | `settings-relay` / `settings-save` / `settings-cancel` | relay 输入框 / 保存 / 关闭（不保存） |
@@ -413,6 +413,8 @@ pub struct AppRoot {
     pending_invite: Option<(Box<InviteOutcome>, String)>,
     /// 设置面板（overlay；Main/Welcome 都可用，关闭后回到原状态）。
     settings: Option<SettingsState>,
+    /// 设置页里的同步面板是否展开（默认收起，避免设置页无限长）。
+    settings_sync_open: bool,
     /// 关闭设置后要把焦点还给 Main 的编辑器（下一帧渲染时消费）。
     pending_focus_restore: bool,
     main: Option<Entity<AppShell>>,
@@ -454,6 +456,7 @@ impl AppRoot {
             invite: None,
             pending_invite: None,
             settings: None,
+            settings_sync_open: false,
             pending_focus_restore: false,
             main: None,
             lock: None,
@@ -902,6 +905,7 @@ impl AppRoot {
                 root.settings_save(cx);
             }
         });
+        self.settings_sync_open = false;
         self.settings = Some(SettingsState {
             active,
             mode,
@@ -922,6 +926,7 @@ impl AppRoot {
         if self.settings.take().is_none() {
             return;
         }
+        self.settings_sync_open = false;
         if self.state == State::Main {
             // 下一帧把焦点还给编辑器（设置打开时焦点在 relay 输入框）。
             self.pending_focus_restore = true;
@@ -933,6 +938,15 @@ impl AppRoot {
     #[must_use]
     pub fn settings_is_open(&self) -> bool {
         self.settings.is_some()
+    }
+
+    /// 展开/收起设置页里的同步面板（默认收起；不改变任何同步状态）。
+    pub fn settings_toggle_sync(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            return;
+        }
+        self.settings_sync_open = !self.settings_sync_open;
+        cx.notify();
     }
 
     /// 设置面板 relay 输入框的当前文本（公开字段；`None` = 面板未打开）。
@@ -3392,22 +3406,21 @@ impl Render for AppRoot {
                 .into_any_element(),
             State::Main => {
                 let shell = self.main.clone();
-                // 固定的「设置」入口：右下角、编辑器状态栏上方的小按钮。
-                // 只用鼠标事件，不注册焦点/快捷键，因此不会干扰编辑器的键盘输入；
-                // 点开后是覆盖层，`AppShell`（文档/滚动/撤销栈）原地保留。
-                let settings_entry =
-                    div()
-                        .absolute()
-                        .right(px(12.0))
-                        .bottom(px(40.0))
-                        .child(action_button(
-                            "app-root-settings",
-                            "设置",
-                            false,
-                            false,
-                            cx,
-                            |root, cx| root.open_settings(cx),
-                        ));
+                // 唯一的「设置」入口：左侧栏底部（与笔记动作行分开，避免右下角两个设置）。
+                // 覆盖在 `AppShell` 侧栏底部；点在按钮上不会漏给编辑器。
+                let settings_entry = div()
+                    .absolute()
+                    .left(px(8.0))
+                    .bottom(px(30.0))
+                    .w(px(204.0))
+                    .child(action_button(
+                        "app-root-settings",
+                        "⚙ 设置",
+                        false,
+                        false,
+                        cx,
+                        |root, cx| root.open_settings(cx),
+                    ));
                 div()
                     .relative()
                     .size_full()
@@ -3923,6 +3936,14 @@ impl AppRoot {
             "修改保存后需重启应用才生效；公开 id 可复制，秘密不要分享。".to_owned()
         });
 
+        // 同步面板作为设置页的一部分渲染（唯一设置入口里同时有连接配置与同步操作）；
+        // 默认构建/未启用时 `None`，整块不存在。
+        #[cfg(feature = "dev-sync")]
+        let sync_panel = self
+            .main
+            .as_ref()
+            .and_then(|shell| shell.read(cx).dev_sync_panel());
+
         Some(
             div()
                 .id("dev-sync-settings-backdrop")
@@ -3944,7 +3965,9 @@ impl AppRoot {
                     div()
                         .id("dev-sync-settings")
                         .debug_selector(|| "dev-sync-settings".to_string())
-                        .w(px(640.0))
+                        .w(px(680.0))
+                        .max_h(px(900.0))
+                        .overflow_y_scroll()
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -3970,6 +3993,40 @@ impl AppRoot {
                         ))
                         .child(title_text("同步设置（DEV ONLY）"))
                         .child(banner_text())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .w_full()
+                                .child(section_text(if self.settings_sync_open {
+                                    "同步面板（已展开）"
+                                } else {
+                                    "同步面板（默认收起，展开后查看设备/邀请/轮换）"
+                                }))
+                                .child(action_button(
+                                    "settings-toggle-sync",
+                                    if self.settings_sync_open {
+                                        "收起"
+                                    } else {
+                                        "展开"
+                                    },
+                                    false,
+                                    false,
+                                    cx,
+                                    |root, cx| root.settings_toggle_sync(cx),
+                                )),
+                        )
+                        .when(self.settings_sync_open, |this| {
+                            #[cfg(feature = "dev-sync")]
+                            {
+                                if let Some(panel) = sync_panel {
+                                    return this.child(div().w_full().child(panel));
+                                }
+                            }
+                            this
+                        })
                         .child(section_text(
                             "实例（active 优先；点「设为默认」只写配置，重启后生效）",
                         ))

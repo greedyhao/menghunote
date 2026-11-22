@@ -563,6 +563,20 @@ impl Scheduler {
         self.decide(now)
     }
 
+    /// 一次 `Start` 决策被调用方丢弃（没有 Host 派发）：撤销 Running 与启动时间戳，
+    /// 并把它退回 pending；下一拍 tick 再启动。
+    ///
+    /// 不能复用 `on_finished_idle`：它会把 `last_auto_start` 恢复成"刚才启动"的值，
+    /// 导致下一拍被 5s 最小间隔挡住。
+    pub fn cancel_start_without_dispatch(&mut self, now: Instant) {
+        self.running = false;
+        self.last_auto_start = None;
+        self.merge_request(Pending {
+            due: now,
+            trigger: Trigger::NetworkRecovered,
+        });
+    }
+
     /// 自动请求遇到 Held/单操作在途：稍后重试（不抢占已开始的事务）。
     pub fn on_busy_retry(&mut self, now: Instant, delay: Duration) -> Decision {
         self.merge_request(Pending {

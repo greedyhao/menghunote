@@ -906,7 +906,7 @@ impl DevLocalRunner {
             phase: Phase::Transport,
             detail: format!("连接 relay 并完整同步一轮（{relay}）"),
         });
-        println!(
+        eprintln!(
             "[dev-sync] sync_once 开始：relay={relay} doc={} base_head={} \
              transport={:?}/{:?}/{:?}",
             gate.doc_id,
@@ -936,7 +936,7 @@ impl DevLocalRunner {
                 eprintln!("[dev-sync] sync_once 失败：{error}");
                 format!("同步失败：{error}")
             })?;
-        println!(
+        eprintln!(
             "[dev-sync] sync_once 完成：encrypted={} pushed={} pulled={} integrated={} deferred={}",
             report.encrypted,
             report.push.acked,
@@ -1006,7 +1006,7 @@ impl DevLocalRunner {
             phase: Phase::Transport,
             detail: format!("连接 relay 并完整同步一轮（无会话，{relay}）"),
         });
-        println!("[dev-sync] 无会话 sync_once 开始：relay={relay}");
+        eprintln!("[dev-sync] 无会话 sync_once 开始：relay={relay}");
         // 没有闸门就没有 head 复核；但**取消**同样必须在首次外部集成前生效。
         let mut before_integrate = || {
             if control.is_cancelled() {
@@ -1024,7 +1024,7 @@ impl DevLocalRunner {
                 eprintln!("[dev-sync] 无会话 sync_once 失败：{error}");
                 format!("同步失败：{error}")
             })?;
-        println!(
+        eprintln!(
             "[dev-sync] 无会话 sync_once 完成：encrypted={} pushed={} pulled={} integrated={} deferred={}",
             report.encrypted,
             report.push.acked,
@@ -1504,6 +1504,7 @@ impl DevLocalRunner {
     ) -> Result<OpOutcome, String> {
         // 三阶段共用同一个 local_dev context（预算/pin 策略只有一处来源）。
         let context = self.relay_context()?;
+        eprintln!("[dev-sync] 两阶段同步开始 op={op_id} relay={}", self.relay);
 
         // ---------- 1) Prepare：网络阶段，不持闸 ----------
         events(Event::Progress {
@@ -1519,6 +1520,10 @@ impl DevLocalRunner {
             // "已接收·待应用"：verified 且落在 durable 连续前缀内、尚未集成的行
             // （ADR 0012：收到 ≠ 已应用，面板必须能显示这个数）。
             let ready = menghunote_storage::count_inbox_ready(&vault).unwrap_or(0);
+            eprintln!(
+                "[dev-sync] Prepare 完成 op={op_id} push={} pull={} ready={ready}",
+                prepare.push.acked, prepare.pull.stored
+            );
             (prepare, usize::try_from(ready).unwrap_or(usize::MAX))
         };
         let authorization_epoch = u64::from_be_bytes(
@@ -1543,7 +1548,9 @@ impl DevLocalRunner {
         });
 
         // 等授权：取消/停止由独立控制通道穿透（job 队列在这里读不到，也不该读）。
+        eprintln!("[dev-sync] 等待持闸授权 op={op_id}");
         let message = self.wait_for_grant(op_id, control)?;
+        eprintln!("[dev-sync] 收到授权/取消 op={op_id}");
         let gate = match message {
             SyncControl::GrantGate {
                 authorization_epoch: granted_epoch,
@@ -1643,8 +1650,13 @@ impl DevLocalRunner {
         let finish = {
             let vault = self.open_vault()?;
             let identity = self.load_identity()?;
-            DevLocal::sync_finish(&context, &vault, identity, None)
-                .map_err(|error| format!("同步失败（Finish）：{error}"))?
+            let finish = DevLocal::sync_finish(&context, &vault, identity, None)
+                .map_err(|error| format!("同步失败（Finish）：{error}"))?;
+            eprintln!(
+                "[dev-sync] Finish 完成 op={op_id} tail={} ack={}/{}",
+                finish.push.acked, finish.ack.received_seq, finish.ack.integrated_seq
+            );
+            finish
         };
         let summary = format!(
             "推送 {} / 拉取 {} / 整合 {} / 延后 {} / tail {} / ACK received={} integrated={}{projection_note}",

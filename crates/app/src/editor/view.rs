@@ -43,9 +43,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString,
-    Window,
+    div, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
+    Render, SharedString, Window,
 };
 use menghunote_editor::{
     Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, MarkdownImage,
@@ -60,6 +60,10 @@ use menghunote_storage::session::{
     CloseReport, DriverEvent, EditOutcome, EditRequest, LiveDelta, RejectReason, SessionDriver,
 };
 
+use super::clipboard::{
+    choose_paste, AssetRefSummary, ImportPayload, ImportReport, ImportSource, ImportedSummary,
+    PasteAction, SharedImportWriter, MARKDOWN_METADATA_PREFIX,
+};
 use super::element::EditorElement;
 use super::geometry::{ObjectPaint, ObjectPaintState};
 use super::layout::LayoutFrame;
@@ -96,7 +100,7 @@ struct Composition {
 ///
 /// 用事件而不是回调：侧栏要知道"按了 F2 / 点进了正文"，但不该把 shell 的引用塞进
 /// 编辑器（依赖方向反了）。宿主 `cx.subscribe` 即可。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
     /// 按了 `F2`：请宿主重命名侧栏当前选中的节点。
     RenameRequested,
@@ -104,6 +108,8 @@ pub enum EditorEvent {
     PointerDown,
     /// 按了 `Ctrl+K` / `Ctrl+F`：请宿主打开搜索浮层。
     SearchRequested,
+    /// 一次粘贴/拖放的资产导入结果（宿主据此写提示行；失败时正文与引用都未改变）。
+    ImportReported(Box<ImportReport>),
 }
 
 /// 图片对象的状态（只读快照，测试/诊断用；不参与绘制决策）。
@@ -189,6 +195,13 @@ pub struct EditorView {
     held: bool,
     /// 图片资产加载 / 解码 / LRU 缓存（ADR 0019 S2a；后台单线程解码）。
     images: ImageService,
+    /// 粘贴/拖放的资产导入实现（ADR 0019 S2b）：编辑器只认能力面，不依赖 storage。
+    import_writer: SharedImportWriter,
+    /// 上一次对账时正文里有没有 `asset://` 链接。
+    ///
+    /// 用来在**没有资产链接的普通笔记**上跳过对账（否则每次按键都要跑一次引用查询）；
+    /// 删掉最后一条链接的那次编辑必须仍然对账，所以这里保留"上一次有过"的痕迹。
+    had_asset_links: bool,
     /// 当前悬停的图片对象源码行（悬浮工具条的触发源）。
     hovered_object_line: Option<usize>,
     /// 单击选中的图片对象源码行（描边/工具条/F2 的目标；选区变化会清空）。
@@ -210,9 +223,10 @@ impl EditorView {
         driver: SessionDriver,
         vault_label: String,
         asset_provider: SharedAssetProvider,
+        import_writer: SharedImportWriter,
         cx: &mut Context<Self>,
     ) -> Self {
-        let view = Self {
+        let mut view = Self {
             controller,
             driver,
             focus_handle: cx.focus_handle(),
@@ -229,6 +243,8 @@ impl EditorView {
             dump_selection: false,
             held: false,
             images: ImageService::new(asset_provider),
+            import_writer,
+            had_asset_links: false,
             hovered_object_line: None,
             selected_object_line: None,
             toolbar_rect: None,
@@ -236,6 +252,9 @@ impl EditorView {
             local_edit_seq: 0,
         };
         view.spawn_pump(cx);
+        // 打开笔记即做一次引用对账（ADR 0019 §3）：断线/崩溃/远端改动之后，
+        // 引用账本按当前正文重建一次；集合没变时不会写库。
+        view.reconcile_asset_refs_now();
         view
     }
 
@@ -262,6 +281,7 @@ impl EditorView {
     /// 收一次驱动事件；返回是否影响了可视状态（只有影响时才 `notify`）。
     fn pump(&mut self) -> bool {
         let mut changed = false;
+        let mut pending_reconcile = false;
         for event in self.driver.pump() {
             match event {
                 DriverEvent::Durable(ack) => {
@@ -271,6 +291,9 @@ impl EditorView {
                         ack.through_live_rev.0,
                         self.controller.is_saved()
                     );
+                    // 正文已经落库：按当前正文整篇重建资产引用（ADR 0019 §3）。
+                    // 集合没变时实现方短路，因此这里可以每次都调。
+                    pending_reconcile = true;
                     changed = true;
                 }
                 DriverEvent::Remote(delta) => match self.controller.apply_live_delta(delta) {
@@ -305,6 +328,10 @@ impl EditorView {
         // 图片后台解码完成：重绘一次，图片/占位与行高在下一次 prepaint 生效。
         if self.images.take_completed() > 0 {
             changed = true;
+        }
+        // 引用对账（正文 durable 之后）：只写"引用账本"，不改正文，因此不需要重绘。
+        if pending_reconcile {
+            self.reconcile_asset_refs_now();
         }
         changed
     }
@@ -693,7 +720,11 @@ impl EditorView {
         else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+        // 元数据标记：粘贴时"本应用 Markdown 文本"优先级最高（ADR 0019 §2）。
+        cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
+            markdown,
+            MARKDOWN_METADATA_PREFIX.to_owned(),
+        ));
         eprintln!(
             "[menghunote] 复制图片 Markdown（{} 字节，hash 前缀 {}）",
             image.dest().chars().count(),
@@ -1018,6 +1049,8 @@ impl EditorView {
             report.pending_materialize,
             report.timed_out
         );
+        // 关闭/切换前最后对一次账：正文已 flush，引用按最终正文重建（ADR 0019 §3）。
+        self.reconcile_asset_refs_now();
         self.close_report = Some(report.clone());
         report
     }
@@ -1247,9 +1280,24 @@ impl EditorView {
                     if let Some(text) = self.selected_source_text() {
                         if !text.is_empty() {
                             eprintln!("[menghunote] 复制选区源码（{} 字节）", text.len());
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
+                                text,
+                                MARKDOWN_METADATA_PREFIX.to_owned(),
+                            ));
                         }
                     }
+                }
+                // Ctrl+V / Ctrl+Shift+V：剪贴板分流（ADR 0019 §2 / S2b）。
+                //
+                // `prevent_default`：不让平台把这次按键再当文本输入走一遍
+                // （Windows 后端不处理 Ctrl+V，但 web 等后端会派发 paste 事件）。
+                ("v", false) => {
+                    window.prevent_default();
+                    self.paste_from_clipboard(false, cx);
+                }
+                ("v", true) => {
+                    window.prevent_default();
+                    self.paste_from_clipboard(true, cx);
                 }
                 // Ctrl+Enter：退出图片源码模式（与 Esc 等价）。
                 ("enter", _) if self.controller.is_editing_object_source() => {
@@ -1545,19 +1593,13 @@ impl EditorView {
         cx.notify();
     }
 
-    /// 附件插入的目标偏移（**不产生编辑**）。
+    // ---- 粘贴 / 拖放导入（ADR 0019 §2/§3，S2b）----
+
+    /// 光标（选区起点）在 **source 字节**坐标下的位置。
     ///
-    /// 先做与 [`Self::insert_attachment_markdown`] 完全相同的闸门检查（持闸 / 组合中），
-    /// 再返回选区起点在 **source 字节**坐标下的值——宿主用它算 `asset_refs.start_byte`，
-    /// 因此"读文件/换算失败"必须发生在任何落库之前。
-    #[cfg(feature = "dev-sync")]
-    pub(crate) fn attachment_insert_offset(&mut self) -> Result<usize, String> {
-        if self.frozen_by_external_commit() {
-            return Err("同步持闸中，暂不能插入附件".to_owned());
-        }
-        if self.is_composing() {
-            return Err("输入法组合中：请先上屏或按 Esc".to_owned());
-        }
+    /// 导入前拿它当 `asset_refs.start_byte` 的基址；插入前会**重算并比对**，
+    /// 因此"从读剪贴板到真正插入之间光标被挪走/切了笔记"不会写出错位引用。
+    fn current_source_offset(&self) -> Result<usize, String> {
         let source = self.controller.source_text();
         self.controller
             .selection()
@@ -1567,51 +1609,198 @@ impl EditorView {
             .map_err(|error| format!("光标位置换算失败：{error}"))
     }
 
-    /// 附件插入：在光标/选区处插入一段 Markdown（**一个编辑事务**）。
-    ///
-    /// 与普通输入走**同一条** [`Self::submit_request`] 路径（Held/组合/闸门语义一致），
-    /// 因此"插入成功"在这里就能判定，而"一次插入 = 一个撤销单元"由驱动保证。
-    ///
-    /// 返回这段 Markdown 在 **source 字节**里的起点（`asset_refs.start_byte` 要用它）。
-    /// 失败（持闸 / 组合中 / 编辑被拒）返回人类可读原因，**不产生半链接**：调用方在
-    /// 收到错误时会回滚刚写下的 `asset_refs` 行。
-    #[cfg(feature = "dev-sync")]
-    pub(crate) fn insert_attachment_markdown(
-        &mut self,
-        markdown: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<usize, String> {
+    /// 导入前的闸门：同步持闸 / IME 组合中一律**不插**（ADR 0019 §2：切笔记/IME 不偷插）。
+    fn import_blocked_reason(&mut self) -> Option<String> {
         if self.frozen_by_external_commit() {
-            return Err("同步持闸中，暂不能插入附件".to_owned());
+            return Some("同步持闸中，暂不能粘贴/拖放导入".to_owned());
         }
         if self.is_composing() {
-            return Err("输入法组合中：请先上屏或按 Esc".to_owned());
+            return Some("输入法组合中：请先上屏或按 Esc".to_owned());
         }
-        let source = self.controller.source_text();
-        let start_byte = self
-            .controller
-            .selection()
-            .start()
-            .to_source_byte(&source)
-            .map_err(|error| format!("光标位置换算失败：{error}"))?
-            .get();
-        let request = self
-            .controller
-            .compose_replace_selection(markdown)
-            .map_err(|error| format!("插入附件失败：{error}"))?;
+        None
+    }
+
+    /// `Ctrl+V` / `Ctrl+Shift+V` / 平台 paste 的**唯一入口**。
+    ///
+    /// 分流规则见 [`super::clipboard::choose_paste`]：本应用 Markdown 元数据 → 文件 →
+    /// 图片 → 普通文本，每次只选一种；`force_text` 强制纯文本。纯文本仍走
+    /// [`Self::insert_text`]（与打字完全同一条路径），需要落库的负载交给注入的
+    /// [`super::clipboard::AssetImportWriter`]。
+    pub(crate) fn paste_from_clipboard(&mut self, force_text: bool, cx: &mut Context<Self>) {
+        if let Some(reason) = self.import_blocked_reason() {
+            // 连剪贴板都不读：持闸/组合期间不产生任何写入或日志噪音。
+            eprintln!("[menghunote] 粘贴被忽略：{reason}");
+            return;
+        }
+        let Some(item) = cx.read_from_clipboard() else {
+            eprintln!("[menghunote] 粘贴：剪贴板为空或不可读");
+            return;
+        };
+        let action = choose_paste(item.entries(), force_text);
+        self.apply_paste(action, ImportSource::Clipboard, cx);
+    }
+
+    /// 平台直接送达的 paste（例如 web 的 DOM paste 事件）：与 `Ctrl+V` 完全同路。
+    ///
+    /// Windows 后端把 `Ctrl+V` 当普通按键送进来（`on_key_down` 处理），这里主要覆盖
+    /// "平台把 paste 当输入事件"的后端；两条路都走同一套分流/事务/回滚。
+    pub(crate) fn paste_item(&mut self, item: ClipboardItem, cx: &mut Context<Self>) {
+        if let Some(reason) = self.import_blocked_reason() {
+            eprintln!("[menghunote] 平台粘贴被忽略：{reason}");
+            return;
+        }
+        let action = choose_paste(item.entries(), false);
+        self.apply_paste(action, ImportSource::Clipboard, cx);
+    }
+
+    /// 拖放：只接受 `ExternalPaths`（GPUI 已把平台文件拖放转成这个载荷）。
+    ///
+    /// **用当前 caret 作为插入点**（不看落点）：不弹文件对话框、不读相对路径、
+    /// 不递归目录；目录/超限会让整批失败（正文与引用都不动）。
+    pub(crate) fn import_dropped_paths(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        let payload = ImportPayload::Files(paths.paths().to_vec());
+        self.apply_paste(PasteAction::Import(payload), ImportSource::Drop, cx);
+    }
+
+    /// 分流结果落地：纯文本自己插，资产导入走宿主能力面。
+    fn apply_paste(&mut self, action: PasteAction, source: ImportSource, cx: &mut Context<Self>) {
+        match action {
+            PasteAction::None => {
+                eprintln!("[menghunote] {}：剪贴板里没有可导入的内容", source.label());
+                let report = ImportReport {
+                    source,
+                    result: Err("剪贴板里没有可插入的内容".to_owned()),
+                };
+                cx.emit(EditorEvent::ImportReported(Box::new(report)));
+                cx.notify();
+            }
+            // 纯文本：行为与打字一致（插入光标处/替换选区，一个撤销单元）。
+            PasteAction::Text(text) => self.insert_text(&text, cx),
+            PasteAction::Import(payload) => self.import_assets(payload, source, cx),
+        }
+    }
+
+    /// 资产导入：读+校验 → 落资产/引用 → **一个**编辑事务 → 对账或回滚。
+    fn import_assets(
+        &mut self,
+        payload: ImportPayload,
+        source: ImportSource,
+        cx: &mut Context<Self>,
+    ) {
+        let report = match self.try_import(&payload, source) {
+            Ok(summary) => {
+                eprintln!(
+                    "[menghunote] {}导入完成：{} 项 / {} 字节 / 引用 {} 条",
+                    source.label(),
+                    summary.items,
+                    summary.byte_len,
+                    summary.refs
+                );
+                Ok(summary)
+            }
+            Err(reason) => {
+                eprintln!(
+                    "[menghunote] {}导入失败（{}）：{reason}",
+                    source.label(),
+                    payload.category()
+                );
+                Err(reason)
+            }
+        };
+        cx.emit(EditorEvent::ImportReported(Box::new(ImportReport {
+            source,
+            result: report,
+        })));
+        cx.notify();
+    }
+
+    /// 导入的核心路径（同步、可单测）：任何失败都发生在正文写入之前，或已回滚。
+    fn try_import(
+        &mut self,
+        payload: &ImportPayload,
+        _source: ImportSource,
+    ) -> Result<ImportedSummary, String> {
+        if let Some(reason) = self.import_blocked_reason() {
+            return Err(reason);
+        }
+        let doc_id = self.controller.doc_id().to_owned();
+        let body_seq = self.driver.durable_head_seq();
+        let anchor = self.current_source_offset()?;
+        // 1) 读 + 校验 + 资产 + 引用（重验 note 归属在任何写入之前）。
+        let stored =
+            self.import_writer
+                .stage_and_store(&doc_id, body_seq, anchor as u64, payload)?;
+        // 2) 重验锚点与文档：从读剪贴板到真正插入之间不能"偷插"到别处。
+        if self.import_blocked_reason().is_some()
+            || self.controller.doc_id() != doc_id
+            || self.driver.durable_head_seq() != body_seq
+            || self.current_source_offset()? != anchor
+        {
+            self.import_writer.rollback(&stored);
+            return Err("插入点已变化，请重试".to_owned());
+        }
+        // 3) 一个编辑事务（整批 Markdown 一次替换 = 一个撤销组）。
+        let request = match self.controller.compose_replace_selection(&stored.markdown) {
+            Ok(request) => request,
+            Err(error) => {
+                self.import_writer.rollback(&stored);
+                return Err(format!("插入失败：{error}"));
+            }
+        };
         match self.submit_request(request) {
             Some(EditOutcome::Applied(_)) => {
-                cx.notify();
-                Ok(start_byte)
+                // 4) 正文已提交：按当前正文整篇对账（预写的引用被精确集合取代）。
+                let source_text = self.controller.source_text();
+                match self.import_writer.commit(&stored, &source_text) {
+                    Ok(summary) => Ok(ImportedSummary {
+                        items: stored.items,
+                        byte_len: stored.byte_len,
+                        refs: summary.refs,
+                    }),
+                    Err(reason) => {
+                        // 正文已经落库：不回滚正文/引用（下次对账会修好），只报告。
+                        eprintln!("[menghunote] 导入后引用对账失败（正文已插入）：{reason}");
+                        Ok(ImportedSummary {
+                            items: stored.items,
+                            byte_len: stored.byte_len,
+                            refs: stored.refs.len(),
+                        })
+                    }
+                }
             }
-            Some(EditOutcome::Rejected(rejected)) => {
-                Err(format!("插入附件被拒（{:?}）", rejected.reason))
+            other => {
+                self.import_writer.rollback(&stored);
+                Err(match other {
+                    Some(EditOutcome::Rejected(rejected)) => {
+                        format!("插入被拒（{:?}）", rejected.reason)
+                    }
+                    Some(EditOutcome::Stale(stale)) => {
+                        format!("插入基准过期（当前 live_rev={}）", stale.current_live_rev.0)
+                    }
+                    _ => "插入未生效（输入被冻结或编辑请求为空）".to_owned(),
+                })
             }
-            Some(EditOutcome::Stale(stale)) => Err(format!(
-                "插入附件基准过期（当前 live_rev={}）",
-                stale.current_live_rev.0
-            )),
-            None => Err("插入附件未生效（输入被冻结或编辑请求为空）".to_owned()),
+        }
+    }
+
+    /// 按当前正文**整篇重建引用**（打开笔记 / 正文 durable / 关闭排空后触发）。
+    ///
+    /// 返回 `None` = 没有对应笔记（正常跳过）或对账失败（已记日志）。
+    /// 集合没变时由实现方短路（不写库），因此可以放心在每次 durable 后调用。
+    pub fn reconcile_asset_refs_now(&mut self) -> Option<AssetRefSummary> {
+        if self.frozen_by_external_commit() {
+            return None;
+        }
+        let doc_id = self.controller.doc_id().to_owned();
+        let body_seq = self.driver.durable_head_seq();
+        let source = self.controller.source_text();
+        self.had_asset_links = source.contains("asset://");
+        match self.import_writer.reconcile(&doc_id, body_seq, &source) {
+            Ok(summary) => summary,
+            Err(reason) => {
+                eprintln!("[menghunote] 引用对账失败：{reason}");
+                None
+            }
         }
     }
 
@@ -2087,10 +2276,25 @@ impl EditorView {
             );
             return;
         }
+        let applied = matches!(&outcome, EditOutcome::Applied(_));
         match self.controller.apply_outcome(outcome) {
             Ok(_) => {}
             Err(error) => eprintln!("[menghunote] 编辑结局未能应用：{error}"),
         }
+        if applied {
+            // 正文变了：引用账本按当前正文重建（ADR 0019 §3：普通编辑 / 撤销 / 重做后）。
+            // 没有资产链接的笔记在这里直接短路，只有真带链接的笔记才会查/写引用。
+            self.reconcile_after_edit();
+        }
+    }
+
+    /// 正文变更后按当前镜像整篇对账（只在"现在或刚才有 `asset://`"时才真的做）。
+    fn reconcile_after_edit(&mut self) {
+        let source = self.controller.source_text();
+        if !self.had_asset_links && !source.contains("asset://") {
+            return;
+        }
+        self.reconcile_asset_refs_now();
     }
 
     /// 光标选区在**虚拟输入文档**里的 UTF-16 区间（平台查询用）。
@@ -2654,6 +2858,11 @@ impl Render for EditorView {
                     .min_h(px(0.0))
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
+                    // 文件拖放（ADR 0019 §2）：GPUI 把平台 CF_HDROP/IDropTarget 转成
+                    // `ExternalPaths`；用**当前 caret** 作为插入点，不弹对话框。
+                    .on_drop(cx.listener(|view, paths: &ExternalPaths, _window, cx| {
+                        view.import_dropped_paths(paths, cx);
+                    }))
                     // 正文被按下：通知宿主（它用这个取消侧栏的行内编辑）。
                     .on_mouse_down(
                         MouseButton::Left,

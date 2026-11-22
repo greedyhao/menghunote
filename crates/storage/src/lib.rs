@@ -57,8 +57,8 @@ mod tree_view;
 pub use actor::{AffectedGuard, Row, Statement, Vault};
 pub use asset_store::{
     asset_content_hash, asset_meta_by_hash, count_unreferenced_assets, insert_asset,
-    link_asset_ref, list_asset_refs, list_referenced_assets, set_asset_orphan_since,
-    unlink_asset_ref, AssetRef,
+    link_asset_ref, list_asset_refs, list_referenced_assets, replace_asset_refs,
+    set_asset_orphan_since, unlink_asset_ref, AssetRef, AssetRefReconcile,
 };
 pub use baseline_apply::{
     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, baseline_apply_state,

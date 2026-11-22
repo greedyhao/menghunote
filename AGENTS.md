@@ -369,8 +369,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > durable `sync.control_pin`（record+bootstrap 各自 rev/CAS）、`RelayContext` 统一全部操作、
 > remote Create/Join 走受限 `InitSession`、安全指纹与 SecurityPaused、启动 pending 对账；
 > 离线 TLS harness 真跑。**真实鉴权 relay/Windows/DPAPI/TLS 系统根仍未验，不打生产 tag。**
-> **附件（开发版）**：路径输入 → 资产 + `asset://` 链接；普通/自动同步增量上传资产，
-> B 可取字节；无内联预览/拖放/系统对话框，无资产 GC。
+> **附件**：旧的侧栏「插入附件…」路径输入条**已移除**；粘贴（`Ctrl+V`/`Ctrl+Shift+V`）
+> 与拖放是唯一导入入口（ADR 0019 §8）。剪贴板分流优先级：本应用元数据文本 → 文件 →
+> 图片 → 普通文本；每批 ≤10 文件 / ≤100 MiB / 单资产 ≤20 MiB，整批一个撤销组；
+> 内容寻址去重；正文提交后按 `asset://` 扫描**整篇对账** `asset_refs`；无资产 GC。
 > **Windows 真机（2026-11-14，用户确认）**：dev-sync Create/Join/自动同步闭环正常；
 > TLS/remote_tls 未测（按用户要求后置）。
 > **邀请链接（ADR 0014 S1）**：创建端生成 15min 一次性 `mn-pair://join?...`（token 仅
@@ -393,18 +395,34 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 356 / sync 605 / app `--features dev-sync` 393 / 默认 160 / editor 148 / markdown 15。
+> 测试：relay 356 / sync 605 / app `--features dev-sync` 414 / 默认 183 / editor 148 / markdown 15。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
 > 回归：无空格 `-`/`1.`/`#` 不成块、列表缩进不画引用条、空列表 Backspace 只删空格、
 > 删到纯数字后不残留惰性续行缩进/空缩进行、空白行不继承列表缩进。
-> 图片粘贴/拖放、引用对账、Mermaid/表格 Object 仍后置（S2b/S3）。
+> **S2b（2026-11-16）**：粘贴/拖放导入、资产入库、单事务插入、引用对账、旧路径输入条
+> 移除已完成（ADR 0019 §8）；Mermaid/表格 Object 与物理资产 GC 仍后置（S3）。
 > S2a：整行图片 Object 投影（占位符 U+FFFC）、后台受控解码（PNG/JPEG/WebP/GIF、
 > 边长≤8192/16MP/128MiB、LRU 128MiB）、选中不展开源码、工具条编辑/复制、
 > 缺失/损坏降级占位；headless 7 个图片集成测试。
+> S2b 测试：app 默认 **183** / `--features dev-sync` **414**；storage+editor+markdown+text
+> **361**；新增 `headless_import`（10：粘贴 PNG/同图去重/多文件单事务+撤销重做/失败整批
+> 回滚/文本与强制文本/IME/对账幂等/拖放/SVG/持闸）、`attachment` 单测 6、
+> `editor::clipboard` 单测 6、`replace_asset_refs` 单测 4。
 > 历史整理：整理前 97 个提交完整保留在 `backup/dev-before-cleanup-20261116`；
 > `v0.4-sync` tag 未移动；`v0.5-sync-web` 打在整理后的 12 组 tip `bcb20e8`。
+> **同步 UI 收口（2026-11-16，`71f0164` + 后续微调）**：主界面不常驻 DevSyncPanel；
+> 侧栏动作行（＋笔记/＋文件夹/导出）移到列表上方；唯一的「⚙ 设置」在侧栏底部，
+> 打开 AppRoot 设置页（relay/实例/安全指纹 + 可展开的同步面板）；底栏只保留紧凑同步状态
+> （点击仍可打开 AppShell 测试用同步设置页），不再有独立齿轮。侧栏旧状态移除；
+> `sync-status` / `settings-panel` / `settings-close` / `settings-toggle-sync` 为固定 selector。
+> worker/持闸/协议未动。
+> **同步卡死修复（2026-11-16，`969a6f7`）**：窗口激活回调把
+> `scheduler.on_network_recovered` 的 `Start` 决策丢弃，scheduler 留在 Running 但没人派发；
+> 手动同步永远 `单操作在途`，重启后激活再次触发。现改为退回 pending（清
+> `last_auto_start`），下一拍 tick 正常派发；另保留“无真实 op 时清理陈旧轮次”保险。
+> 回归：`window_activation_never_leaves_scheduler_running_without_dispatch`。
 > **Windows 真机（Web 管理/claim/App 粘贴）与真实 TLS relay 未验；S4d1c 客户端管理 UI、
 > S4d2 relay 审批收件箱仍未做。**
 

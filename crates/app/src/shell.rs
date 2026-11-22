@@ -182,6 +182,11 @@ pub struct AppShell {
     /// 连类型都不存在（模块被 cfg 掉），因此结构体布局/渲染分支零变化。
     #[cfg(feature = "dev-sync")]
     dev_sync: Option<Entity<crate::dev_sync::DevSyncPanel>>,
+    /// dev-sync 设置页是否打开（默认关闭；面板只在设置页里渲染）。
+    #[cfg(feature = "dev-sync")]
+    settings_open: bool,
+    /// 设置页焦点（Esc 关闭用）。
+    settings_focus: FocusHandle,
     /// 面板事件订阅（切片 4c-2）：「同步」按钮只发出 `SyncRequested`，由本视图持闸后派发。
     #[cfg(feature = "dev-sync")]
     dev_sync_subscription: Option<gpui::Subscription>,
@@ -221,30 +226,13 @@ pub struct AppShell {
     /// 已观测到的活动文档本地编辑代数（自动同步的 debounce 触发源）。
     #[cfg(feature = "dev-sync")]
     dev_sync_auto_edit_seq: u64,
-    /// 附件插入条（dev-sync 构建）：`None` = 收起；`Some` = 路径输入框已展开。
+    /// 上一次打印/观察到的同步阶段（只用于诊断日志，避免每帧重复）。
     #[cfg(feature = "dev-sync")]
-    attachment: Option<AttachmentUi>,
-    /// 下一帧把焦点交给附件路径输入框（事件回调里没有 `&mut Window`）。
-    #[cfg(feature = "dev-sync")]
-    pending_focus_attachment: bool,
-    /// 附件插入的失败原因（`attachment-error` 行；校验失败/持闸/落库失败都写这里）。
-    #[cfg(feature = "dev-sync")]
-    attachment_error: Option<String>,
-    /// 附件插入的成功提示（`attachment-notice` 行）。
-    #[cfg(feature = "dev-sync")]
-    attachment_notice: Option<String>,
-}
-
-/// 附件插入条的展开态（只有 `--features dev-sync` 下存在）。
-///
-/// 输入框复用行内重命名用的单行控件 [`RenameInput`]（已有焦点/IME/选区语义），
-/// 事件语义也一样：`Enter` = 插入、`Esc` = 取消、空白 = 明确提示。
-#[cfg(feature = "dev-sync")]
-struct AttachmentUi {
-    /// 路径输入框。
-    input: Entity<RenameInput>,
-    /// 输入框事件订阅（drop = 取消订阅）。
-    _events: gpui::Subscription,
+    dev_sync_last_stage: Option<crate::dev_sync::SyncOnceStage>,
+    /// 粘贴/拖放导入的失败原因（`import-error` 行；校验失败/持闸/落库失败都写这里）。
+    import_error: Option<String>,
+    /// 粘贴/拖放导入的成功提示（`import-notice` 行）。
+    import_notice: Option<String>,
 }
 
 /// 右键行弹出的上下文菜单。
@@ -392,6 +380,9 @@ impl AppShell {
             #[cfg(feature = "dev-sync")]
             dev_sync: None,
             #[cfg(feature = "dev-sync")]
+            settings_open: false,
+            settings_focus: cx.focus_handle(),
+            #[cfg(feature = "dev-sync")]
             dev_sync_subscription: None,
             #[cfg(feature = "dev-sync")]
             dev_sync_sync: None,
@@ -414,13 +405,9 @@ impl AppShell {
             #[cfg(feature = "dev-sync")]
             dev_sync_auto_edit_seq: 0,
             #[cfg(feature = "dev-sync")]
-            attachment: None,
-            #[cfg(feature = "dev-sync")]
-            pending_focus_attachment: false,
-            #[cfg(feature = "dev-sync")]
-            attachment_error: None,
-            #[cfg(feature = "dev-sync")]
-            attachment_notice: None,
+            dev_sync_last_stage: None,
+            import_error: None,
+            import_notice: None,
         };
         shell.refresh_tree();
         if let Some(index) = shell.tree.iter().position(TreeEntry::is_note) {
@@ -1256,12 +1243,16 @@ impl AppShell {
         // storage，这里注入一个只读闭包（`Vault` 是 Clone + Send + Sync，后台解码线程
         // 可以安全调用 storage 的只读 API）。
         let asset_provider = vault_asset_provider(&self.vault);
+        // ADR 0019 S2b：粘贴/拖放导入的落库能力面（读字节 → 内容寻址 → 写引用 → 对账）。
+        // `EditorView` 只认 trait，不认识 `Vault`；编辑器因此不反向依赖 storage 细节。
+        let import_writer = crate::attachment::VaultAssetWriter::shared(&self.vault);
         let view = cx.new(|cx| {
             EditorView::new(
                 controller,
                 driver,
                 self.vault_label.clone(),
                 asset_provider,
+                import_writer,
                 cx,
             )
         });
@@ -1281,6 +1272,8 @@ impl AppShell {
                 shell.pending_search = true;
                 cx.notify();
             }
+            // 粘贴/拖放导入的结果：只写提示行（正文/引用的成败已在编辑器侧处理完）。
+            EditorEvent::ImportReported(report) => shell.on_import_reported(report, cx),
         });
 
         // 2) 再排空旧文档：超时则**中止切换**，不许静默丢编辑。
@@ -1337,6 +1330,45 @@ impl AppShell {
         cx.notify();
     }
 
+    /// 粘贴/拖放导入的结果 → 侧栏提示行（`import-error` / `import-notice`）。
+    ///
+    /// 编辑器已经完成了全部分流/事务/回滚/对账，这里只做投影：**不读剪贴板、不写库**。
+    fn on_import_reported(
+        &mut self,
+        report: &crate::editor::clipboard::ImportReport,
+        cx: &mut Context<Self>,
+    ) {
+        match &report.result {
+            Ok(summary) => {
+                self.import_error = None;
+                self.import_notice = Some(format!(
+                    "已{} {} 个附件（{} 字节，引用 {} 条）",
+                    report.source.label(),
+                    summary.items,
+                    summary.byte_len,
+                    summary.refs
+                ));
+            }
+            Err(reason) => {
+                self.import_notice = None;
+                self.import_error = Some(format!("{}失败：{reason}", report.source.label()));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 最近一次导入的失败原因（`None` = 没有错误行；headless 断言用）。
+    #[must_use]
+    pub fn import_error_text(&self) -> Option<&str> {
+        self.import_error.as_deref()
+    }
+
+    /// 最近一次导入的成功提示（`None` = 没有提示行；headless 断言用）。
+    #[must_use]
+    pub fn import_notice_text(&self) -> Option<&str> {
+        self.import_notice.as_deref()
+    }
+
     /// 把键盘焦点还给当前编辑器（设置面板关闭时调用；没有活动文档则 no-op）。
     ///
     /// 设置是 `AppRoot` 的覆盖层：它打开时焦点在 relay 输入框，关闭后不重建
@@ -1378,6 +1410,43 @@ impl AppShell {
 
     /// 常驻同步状态（ADR 0012 S3）：`None` = dev-sync 未启用（整块不渲染）。
     ///
+    /// 打开 AppShell 内的同步设置页（测试/程序入口；生产统一入口在 AppRoot 设置页）。
+    /// 默认构建没有面板时是 no-op。
+    #[cfg(feature = "dev-sync")]
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dev_sync.is_none() {
+            return;
+        }
+        self.settings_open = true;
+        self.settings_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// 测试/无窗口入口：只置位，不抢焦点。
+    #[cfg(feature = "dev-sync")]
+    pub fn open_settings_headless(&mut self, cx: &mut Context<Self>) {
+        if self.dev_sync.is_some() {
+            self.settings_open = true;
+            cx.notify();
+        }
+    }
+
+    /// 关闭同步设置页。
+    #[cfg(feature = "dev-sync")]
+    pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_open {
+            self.settings_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 设置页是否打开（测试/诊断用）。
+    #[cfg(feature = "dev-sync")]
+    #[must_use]
+    pub const fn settings_open(&self) -> bool {
+        self.settings_open
+    }
+
     /// 只做投屏：状态由 [`crate::dev_sync::AutoSync`] 决定（`sync-status` / `sync-status-error`
     /// 两个固定 selector）。每轮成功不弹 toast、不抢焦点；"需要处理"才多一行。
     fn dev_sync_status_projection(&self) -> Option<(String, Option<String>)> {
@@ -1531,60 +1600,8 @@ impl AppShell {
             )
             .child(
                 div()
-                    .id("sidebar-tree")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
-            // 提示放在按钮**上方**：按钮位置固定，二次确认时不会"跑掉"
-            // （踩过：提示出现在按钮下面，按钮被顶上去，第二次点击点空 → 只剩超时复位）。
-            .when_some(self.notice.clone(), |this, notice| {
-                this.child(
-                    div()
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(11.0))
-                        .text_color(theme::caret_color())
-                        .child(SharedString::from(notice)),
-                )
-            })
-            // ADR 0012 S3：常驻轻量同步状态（不打扰、不抢焦点、不弹 toast）。
-            // dev-sync 未启用时 `dev_sync_status_projection()` 是 `None`，整块不存在。
-            .when_some(self.dev_sync_status_projection(), |this, (line, error)| {
-                this.child(
-                    div()
-                        .debug_selector(|| "sync-status".to_string())
-                        .w_full()
-                        .px_2()
-                        .pb_1()
-                        .text_size(px(11.0))
-                        .text_color(theme::status_bar_text())
-                        .child(SharedString::from(line)),
-                )
-                .children(error.map(|error| {
-                    div()
-                        .debug_selector(|| "sync-status-error".to_string())
-                        .w_full()
-                        .px_2()
-                        .pb_1()
-                        .text_size(px(11.0))
-                        .text_color(theme::caret_color())
-                        .child(SharedString::from(error))
-                }))
-            })
-            // 附件插入（dev-sync 构建）：默认构建里 `render_attachment_block` 恒 `None`，
-            // 布局/行为零变化。
-            .when_some(self.render_attachment_block(cx), |this, block| {
-                this.child(block)
-            })
-            .child(
-                div()
                     .w_full()
-                    .border_t(px(1.0))
+                    .border_b(px(1.0))
                     .border_color(theme::sidebar_border())
                     .flex()
                     .flex_row()
@@ -1653,6 +1670,54 @@ impl AppShell {
                             ),
                     ),
             )
+            .child(
+                div()
+                    .id("sidebar-tree")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            // 提示放在按钮**上方**：按钮位置固定，二次确认时不会"跑掉"
+            // （踩过：提示出现在按钮下面，按钮被顶上去，第二次点击点空 → 只剩超时复位）。
+            .when_some(self.notice.clone(), |this, notice| {
+                this.child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(11.0))
+                        .text_color(theme::caret_color())
+                        .child(SharedString::from(notice)),
+                )
+            })
+            // 粘贴/拖放导入的提示行（S2b：路径输入条已移除，粘贴/拖放是唯一入口）。
+            .when_some(self.import_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .debug_selector(|| "import-error".to_string())
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(11.0))
+                        .text_color(theme::caret_color())
+                        .child(SharedString::from(error)),
+                )
+            })
+            .when_some(self.import_notice.clone(), |this, notice| {
+                this.child(
+                    div()
+                        .debug_selector(|| "import-notice".to_string())
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(11.0))
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(notice)),
+                )
+            })
     }
 
     /// 右键菜单（根层绝对定位）：透明遮罩负责"点外面关闭"，面板负责菜单项。
@@ -1816,6 +1881,160 @@ impl AppShell {
     }
 
     /// 右侧：当前编辑器；没有笔记时给占位。
+    /// 底部状态栏：左侧 vault；右侧同步状态（只读投影）。设置入口统一在侧栏底部。
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let left = div()
+            .min_w(px(0.0))
+            .truncate()
+            .text_size(px(11.0))
+            .text_color(theme::status_bar_text())
+            .child(SharedString::from(self.vault_label.clone()));
+        let mut right = div().flex().flex_row().items_center().gap_2();
+        // dev-sync 未启用时整块不存在。
+        #[cfg(feature = "dev-sync")]
+        {
+            right = right.when_some(self.dev_sync_status_projection(), |this, (line, error)| {
+                this.child(
+                    div()
+                        .id("sync-status-button")
+                        .debug_selector(|| "sync-status".to_string())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .h_full()
+                        .px_1()
+                        .when(error.is_some(), |this| {
+                            this.text_color(theme::danger_text())
+                        })
+                        .child(SharedString::from(if error.is_some() {
+                            "同步：需处理".to_string()
+                        } else {
+                            format!("同步：{line}")
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &gpui::MouseDownEvent, window, cx| {
+                                shell.open_settings(window, cx);
+                            }),
+                        ),
+                )
+            });
+        }
+        div()
+            .id("status-bar")
+            .debug_selector(|| "status-bar".to_string())
+            .h(px(24.0))
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_2()
+            .border_t(px(1.0))
+            .border_color(theme::sidebar_border())
+            .bg(theme::status_bar_bg())
+            .text_size(px(11.0))
+            .text_color(theme::status_bar_text())
+            .child(left)
+            .child(right)
+            .into_any_element()
+    }
+
+    /// 同步设置页：遮罩 + 居中卡片；面板实体只在打开时挂载。
+    #[cfg(feature = "dev-sync")]
+    fn render_settings(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.settings_open {
+            return None;
+        }
+        let panel = self.dev_sync.clone()?;
+        let card = div()
+            .id("settings-panel")
+            .debug_selector(|| "settings-panel".to_string())
+            .relative()
+            .w(px(540.0))
+            .max_h(px(760.0))
+            .overflow_y_scroll()
+            .rounded_md()
+            .border_1()
+            .border_color(theme::sidebar_border())
+            .bg(theme::sidebar_bg())
+            .shadow_lg()
+            .track_focus(&self.settings_focus)
+            .on_key_down(
+                cx.listener(|shell, event: &gpui::KeyDownEvent, _window, cx| {
+                    if event.keystroke.key.as_str() == "escape" {
+                        cx.stop_propagation();
+                        shell.close_settings(cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b(px(1.0))
+                    .border_color(theme::sidebar_border())
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(theme::text_color())
+                            .child(SharedString::from("设置 · 同步")),
+                    )
+                    .child(
+                        div()
+                            .id("settings-close")
+                            .debug_selector(|| "settings-close".to_string())
+                            .px_2()
+                            .rounded_sm()
+                            .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                            .child(SharedString::from("关闭"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    shell.close_settings(cx);
+                                }),
+                            ),
+                    ),
+            )
+            .child(div().p_2().child(panel));
+        Some(
+            div()
+                .id("settings-overlay")
+                .debug_selector(|| "settings-overlay".to_string())
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(24.0))
+                .bg(gpui::rgba(0x0000001a))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                        shell.close_settings(cx);
+                    }),
+                )
+                .child(card)
+                .into_any_element(),
+        )
+    }
+
     fn render_main(&self) -> impl IntoElement {
         let view = self.active.as_ref().map(|active| active.view.clone());
         div()
@@ -2126,16 +2345,50 @@ impl AppShell {
         self.dev_sync_round_origin
     }
 
+    /// 清理"记账里有轮次、但没有真实 worker op"的陈旧状态。
+    ///
+    /// 宿主先看 `ActiveSyncOnce` 与 service snapshot：任意一个真实在途都返回 false，
+    /// 保证正常同步不会被杀。只有两边都空时才让 AutoSync 撤回 origin/running。
+    fn dev_sync_recover_stale_round(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(service) = self.dev_sync_service(cx) else {
+            return false;
+        };
+        let snapshot = service.snapshot();
+        if self.dev_sync_sync.is_some() || snapshot.in_flight.is_some() || snapshot.worker_stopped {
+            return false;
+        }
+        let Some(auto) = self.dev_sync_auto.as_mut() else {
+            return false;
+        };
+        let now = auto.now();
+        let had_origin = auto.origin().is_some();
+        let scheduler_running = auto.scheduler().is_running();
+        if !had_origin && !scheduler_running {
+            return false;
+        }
+        let recovered = auto.recover_stale_round(now);
+        if recovered {
+            self.dev_sync_round_origin = None;
+            eprintln!(
+                "[menghunote] 同步：清理陈旧轮次（origin 残留={had_origin} scheduler_running={scheduler_running}；没有 ActiveSyncOnce/in_flight）"
+            );
+            cx.notify();
+        }
+        recovered
+    }
+
     /// 自动同步推进一拍：刷新计数 → 观测本地编辑 → 调度决策 → 派发。
     ///
     /// 生产由 [`Self::spawn_dev_sync_ticker`] 每 40ms 调用；headless 测试显式调用
     /// （时钟可注入，故不需要 sleep，也不需要真的推进 GPUI 定时器）。
     pub fn dev_sync_auto_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        // 启动/上一轮收尾的陈旧记账：没有真实 op 时才清理，避免永远卡在"单操作在途"。
+        let recovered = self.dev_sync_recover_stale_round(cx);
         let Some(auto) = self.dev_sync_auto.as_ref() else {
-            return false;
+            return recovered;
         };
         if auto.is_stopped() {
-            return false;
+            return recovered;
         }
         let now = auto.now();
         let mut changed = false;
@@ -2193,6 +2446,7 @@ impl AppShell {
         }
         self.dev_sync_round_origin = None;
         self.dev_sync_auto_deferred = false;
+        self.dev_sync_last_stage = None;
     }
 
     /// 观测活动文档的本地编辑：`DurableAck` 后交给调度器做 2s 尾缘 debounce。
@@ -2249,6 +2503,7 @@ impl AppShell {
         let crate::dev_sync::Decision::Start(trigger) = decision else {
             return false;
         };
+        eprintln!("[menghunote] 自动同步开始：trigger={trigger:?}");
         let Some(service) = self.dev_sync_service(cx) else {
             self.dev_sync_abort_round();
             return true;
@@ -2496,6 +2751,7 @@ impl AppShell {
             .unwrap_or(0);
         match service.try_command_two_phase() {
             Ok(op_id) => {
+                eprintln!("[menghunote] 同步已派发 op={op_id}（两阶段 Prepare）");
                 let origin = self
                     .dev_sync_round_origin
                     .unwrap_or(crate::dev_sync::OpOrigin::Manual);
@@ -2805,6 +3061,7 @@ impl AppShell {
             .unwrap_or(crate::dev_sync::OpOrigin::Manual);
         match service.try_command_no_session() {
             Ok(op_id) => {
+                eprintln!("[menghunote] 同步已派发 op={op_id}（无会话）");
                 self.dev_sync_sync = Some(
                     crate::dev_sync::ActiveSyncOnce::new_no_session(op_id, structure_base_seq)
                         .with_origin(origin),
@@ -2830,6 +3087,19 @@ impl AppShell {
 
     /// 推进一拍同步；返回是否有可视变化（不阻塞、不做网络）。
     fn dev_sync_advance(&mut self, cx: &mut Context<Self>) -> bool {
+        // 阶段变化打一行（不含 secret；op_id 是公开事实），用来定位"卡在哪一步"。
+        let stage = self.dev_sync_sync.as_ref().map(|state| state.stage);
+        if stage != self.dev_sync_last_stage {
+            self.dev_sync_last_stage = stage;
+            if let Some(stage) = stage {
+                let op = self
+                    .dev_sync_sync
+                    .as_ref()
+                    .and_then(|state| state.op_id)
+                    .map_or_else(|| "None".to_owned(), |op| op.to_string());
+                eprintln!("[menghunote] 同步阶段 → {stage:?} op={op}");
+            }
+        }
         let two_phase = self
             .dev_sync_sync
             .as_ref()
@@ -4610,6 +4880,11 @@ impl AppShell {
         };
         let notice = report.notice.clone();
         let ok = report.is_ok();
+        self.dev_sync_last_stage = None;
+        eprintln!(
+            "[menghunote] 同步收尾：task={task:?} ok={ok} changes={} error={:?}",
+            report.changes, report.error
+        );
         // 面板行先写（此时自动轮的来源标记还在，面板显示「自动同步：…」），
         // 再交回调度器记账（退避/续批/状态行）；发布基线不参与。
         self.dev_sync_panel_task_state(cx, task, gate_still_held, line, Some(notice));
@@ -4840,421 +5115,6 @@ fn asset_hash_bytes(hash: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-// ---------------------------------------------------------------------------
-// 附件插入（dev-sync 构建）：本地文件 → `assets`（内容寻址）+ `asset_refs` + 正文链接
-// ---------------------------------------------------------------------------
-//
-// 位置：侧栏底部（按钮放在面板/状态行之上、固定按钮行的上方）。为什么不在编辑器
-// 区域顶部：`editor-pane` 的左上角是既有 headless 测试点击"聚焦正文"的坐标，插一条
-// 工具栏会让那些点击落到工具栏上（回归）。侧栏底部不占编辑器命中区。
-//
-// 可见性：与 dev-sync 面板同一道门禁（`--features dev-sync` + 运行时 gate）。默认构建
-// 里整个模块/状态/渲染分支都不存在。
-#[cfg(feature = "dev-sync")]
-impl AppShell {
-    /// 新建一个路径输入框（打开条与"插入成功后清空"各建一次；旧实体随 `drop` 释放）。
-    fn new_attachment_input(cx: &mut Context<Self>) -> (Entity<RenameInput>, gpui::Subscription) {
-        let input = cx.new(|cx| RenameInput::new("", cx));
-        let events = cx.subscribe(
-            &input,
-            |shell, _input, event: &RenameEvent, cx| match event {
-                RenameEvent::Commit(path) => shell.attachment_submit_path(path, cx),
-                RenameEvent::Blank => {
-                    shell.attachment_error =
-                        Some(crate::attachment::AttachmentError::EmptyPath.to_string());
-                    shell.attachment_notice = None;
-                    cx.notify();
-                }
-                RenameEvent::Cancel => shell.attachment_cancel(cx),
-            },
-        );
-        (input, events)
-    }
-
-    /// 附件插入条是否展开（headless 断言用）。
-    #[must_use]
-    pub fn attachment_is_open(&self) -> bool {
-        self.attachment.is_some()
-    }
-
-    /// `attachment-error` 行当前会显示什么（`None` = 不显示）。
-    #[must_use]
-    pub fn attachment_error_text(&self) -> Option<&str> {
-        self.attachment_error.as_deref()
-    }
-
-    /// `attachment-notice` 行当前会显示什么（`None` = 不显示）。
-    #[must_use]
-    pub fn attachment_notice_text(&self) -> Option<&str> {
-        self.attachment_notice.as_deref()
-    }
-
-    /// 当前插入被禁用的原因（`None` = 可以插入）。
-    ///
-    /// 三条硬前置：
-    /// 1. 必须有**打开的笔记**（没有视图就没有光标/没有 note_id）；
-    /// 2. 编辑器不能处于**同步持闸**（Held）：那是当前唯一的"只读"窗口期，插入会写入
-    ///    正文 + `asset_refs`，必须整段拒绝；
-    /// 3. 结构投影里这个节点必须有 `note_id`（否则 `asset_refs` 没有 note 可挂）。
-    #[must_use]
-    pub fn attachment_disabled_reason(&self, cx: &App) -> Option<String> {
-        let Some(active) = self.active.as_ref() else {
-            return Some(crate::attachment::AttachmentError::NoActiveNote.to_string());
-        };
-        if active.view.read(cx).is_sync_held() {
-            return Some("同步持闸中，暂不能插入附件（同步结束后再试）".to_owned());
-        }
-        if self.note_id_of(&active.node_id).is_none() {
-            return Some(crate::attachment::AttachmentError::MissingNoteId.to_string());
-        }
-        None
-    }
-
-    /// 活动节点的 `note_id`（结构投影里取；目录返回 `None`）。
-    fn note_id_of(&self, node_id: &str) -> Option<String> {
-        self.tree
-            .iter()
-            .find(|entry| entry.node_id == node_id)
-            .and_then(|entry| entry.note_id.clone())
-    }
-
-    /// 展开/收起附件插入条（`None` → 新建输入框并下一帧聚焦）。
-    pub fn attachment_toggle(&mut self, cx: &mut Context<Self>) {
-        if self.attachment.is_some() {
-            self.attachment_cancel(cx);
-            return;
-        }
-        let (input, events) = Self::new_attachment_input(cx);
-        self.attachment = Some(AttachmentUi {
-            input,
-            _events: events,
-        });
-        self.attachment_error = None;
-        self.attachment_notice = None;
-        self.pending_focus_attachment = true;
-        cx.notify();
-    }
-
-    /// 取消（`Esc` / 「取消」按钮）：收起输入，丢弃错误/提示。
-    pub fn attachment_cancel(&mut self, cx: &mut Context<Self>) {
-        self.attachment = None;
-        self.attachment_error = None;
-        self.attachment_notice = None;
-        cx.notify();
-    }
-
-    /// 提交一条路径（等价于输入框回车；headless 测试也直接调它）。
-    ///
-    /// 语义：先读文件并校验（**任何写入之前**），再落资产 + 引用，最后走编辑器事务。
-    /// 编辑器事务失败时回滚引用；资产保留（内容寻址、无副作用），并明确报告。
-    pub fn attachment_submit_path(&mut self, raw_path: &str, cx: &mut Context<Self>) {
-        match self.attachment_insert(raw_path, cx) {
-            Ok(outcome) => {
-                eprintln!(
-                    "[menghunote] 附件已插入：hash={} 字节={} 引用起点={}（{}）",
-                    short_hash(&outcome.asset_hash),
-                    outcome.byte_len,
-                    outcome.start_byte,
-                    if outcome.asset_preexisting {
-                        "复用已有资产"
-                    } else {
-                        "新资产"
-                    }
-                );
-                self.attachment_error = None;
-                self.attachment_notice = Some(format!(
-                    "已插入附件：{}（{} 字节）",
-                    outcome.file_name, outcome.byte_len
-                ));
-                // 清空输入，方便连续插入下一个（同时把焦点还给它）。
-                let (input, events) = Self::new_attachment_input(cx);
-                self.attachment = Some(AttachmentUi {
-                    input,
-                    _events: events,
-                });
-                self.pending_focus_attachment = true;
-            }
-            Err(error) => {
-                // 约束：日志只写类别与文案（不含绝对路径/文件名）。
-                eprintln!("[menghunote] 附件插入失败：{}（{error}）", error.category());
-                self.attachment_error = Some(error.to_string());
-                self.attachment_notice = None;
-                // 错误行常驻渲染（不依赖条是否展开），所以这里不擅自展开输入框：
-                // 没有活动笔记/持闸时那条路径本来也不能用。
-            }
-        }
-        cx.notify();
-    }
-
-    /// 真正的插入：读文件 → 落库 → 编辑器事务（失败回滚引用）。
-    fn attachment_insert(
-        &mut self,
-        raw_path: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<crate::attachment::AttachmentOutcome, crate::attachment::AttachmentError> {
-        use crate::attachment::{
-            rollback_attachment_ref, store_attachment, AttachmentError, AttachmentOutcome,
-        };
-        // 1) 读文件 + 全部校验（失败时没有任何写入）。
-        let pending = crate::attachment::read_attachment(raw_path)?;
-        // 2) 活动笔记 + 光标偏移（持闸/组合中在这一步就失败，同样没有写入）。
-        let (node_id, view) = {
-            let active = self.active.as_ref().ok_or(AttachmentError::NoActiveNote)?;
-            (active.node_id.clone(), active.view.clone())
-        };
-        let note_id = self
-            .note_id_of(&node_id)
-            .ok_or(AttachmentError::MissingNoteId)?;
-        let start_byte = view
-            .update(cx, |view, _cx| view.attachment_insert_offset())
-            .map_err(AttachmentError::Editor)?;
-        let body_seq = view.read(cx).dev_sync_durable_head_seq();
-        // 3) 资产 + 引用（内容寻址；重复插入幂等）。
-        let outcome =
-            store_attachment(&self.vault, &note_id, body_seq, start_byte as u64, &pending)?;
-        // 4) 编辑器事务：一次请求 = 一个撤销单元。
-        match view.update(cx, |view, cx| {
-            view.insert_attachment_markdown(&pending.markdown, cx)
-        }) {
-            Ok(offset) => {
-                if offset != start_byte {
-                    // 同一 tick 内不应发生；保守修正，避免 `asset_refs.start_byte` 指错。
-                    eprintln!(
-                        "[menghunote] 附件插入点与预算偏移不同（预算 {start_byte} / 实际 {offset}）：修正引用"
-                    );
-                    let _ = rollback_attachment_ref(
-                        &self.vault,
-                        &note_id,
-                        &pending.asset_hash,
-                        start_byte as u64,
-                    );
-                    menghunote_storage::link_asset_ref(
-                        &self.vault,
-                        &note_id,
-                        &pending.asset_hash,
-                        offset as u64,
-                        body_seq,
-                    )?;
-                }
-                Ok(AttachmentOutcome {
-                    start_byte: offset as u64,
-                    ..outcome
-                })
-            }
-            Err(reason) => {
-                // 回滚引用；资产保留（内容寻址，删了反而要重算）。
-                let _ = rollback_attachment_ref(
-                    &self.vault,
-                    &note_id,
-                    &pending.asset_hash,
-                    start_byte as u64,
-                );
-                Err(AttachmentError::Editor(reason))
-            }
-        }
-    }
-
-    /// 侧栏底部的附件插入条（`None` = 不渲染；默认构建恒 `None`）。
-    fn render_attachment_block(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let disabled = self.attachment_disabled_reason(cx);
-        let dimmed = disabled.is_some();
-        let open = self.attachment.is_some();
-        let button_label = if open {
-            "附件：收起"
-        } else {
-            "插入附件…"
-        };
-        let block =
-            div()
-                .w_full()
-                .border_t(px(1.0))
-                .border_color(theme::sidebar_border())
-                .px_2()
-                .py_1()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .id("attachment-insert")
-                        .debug_selector(|| "attachment-insert".to_string())
-                        .h(px(22.0))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(theme::input_border())
-                        .bg(theme::input_bg())
-                        .text_size(px(12.0))
-                        .text_color(if dimmed {
-                            theme::status_bar_text()
-                        } else {
-                            theme::text_color()
-                        })
-                        .when(dimmed, |this| this.opacity(0.6))
-                        .child(SharedString::from(button_label))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
-                                // 禁用态也可点：点它要给出**明确原因**（与面板同一风格），
-                                // 而不是静默无反应。
-                                if let Some(reason) = shell.attachment_disabled_reason(cx) {
-                                    // 不展开输入：错误行本身就在按钮下方常驻渲染，展开只会
-                                    // 多一个不可用的路径框。
-                                    shell.attachment_error = Some(reason);
-                                    shell.attachment_notice = None;
-                                    cx.notify();
-                                    return;
-                                }
-                                shell.attachment_toggle(cx);
-                            }),
-                        ),
-                )
-                .when_some(disabled, |this, reason| {
-                    this.child(
-                        div()
-                            .debug_selector(|| "attachment-hint".to_string())
-                            .w_full()
-                            .text_size(px(10.0))
-                            .text_color(theme::status_bar_text())
-                            .child(SharedString::from(reason)),
-                    )
-                })
-                .when_some(
-                    self.attachment.as_ref().map(|ui| ui.input.clone()),
-                    |this, input| {
-                        let focus_input = input.clone();
-                        this.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .id("attachment-path")
-                                .debug_selector(|| "attachment-path".to_string())
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .h(px(22.0))
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(theme::input_border())
-                                .bg(theme::input_bg())
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |_shell,
-                                                      _event: &gpui::MouseDownEvent,
-                                                      window,
-                                                      cx| {
-                                        focus_input
-                                            .update(cx, |input, cx| input.focus(window, cx));
-                                    }),
-                                )
-                                .child(input),
-                        )
-                        .child(
-                            div()
-                                .id("attachment-submit")
-                                .debug_selector(|| "attachment-submit".to_string())
-                                .px(px(6.0))
-                                .h(px(22.0))
-                                .flex()
-                                .items_center()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(theme::input_border())
-                                .bg(theme::input_bg())
-                                .text_size(px(11.0))
-                                .text_color(theme::text_color())
-                                .cursor_pointer()
-                                .child(SharedString::from("插入"))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(
-                                        |shell, _event: &gpui::MouseDownEvent, _window, cx| {
-                                            let Some(ui) = shell.attachment.as_ref() else {
-                                                return;
-                                            };
-                                            let path = ui.input.read(cx).text().to_owned();
-                                            shell.attachment_submit_path(&path, cx);
-                                        },
-                                    ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("attachment-cancel")
-                                .debug_selector(|| "attachment-cancel".to_string())
-                                .px(px(6.0))
-                                .h(px(22.0))
-                                .flex()
-                                .items_center()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(theme::input_border())
-                                .bg(theme::input_bg())
-                                .text_size(px(11.0))
-                                .text_color(theme::status_bar_text())
-                                .cursor_pointer()
-                                .child(SharedString::from("取消"))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(
-                                        |shell, _event: &gpui::MouseDownEvent, _window, cx| {
-                                            shell.attachment_cancel(cx);
-                                        },
-                                    ),
-                                ),
-                        ),
-                )
-                    },
-                )
-                .when_some(self.attachment_error.clone(), |this, error| {
-                    this.child(
-                        div()
-                            .debug_selector(|| "attachment-error".to_string())
-                            .w_full()
-                            .text_size(px(10.0))
-                            .text_color(theme::caret_color())
-                            .child(SharedString::from(error)),
-                    )
-                })
-                .when_some(self.attachment_notice.clone(), |this, notice| {
-                    this.child(
-                        div()
-                            .debug_selector(|| "attachment-notice".to_string())
-                            .w_full()
-                            .text_size(px(10.0))
-                            .text_color(theme::status_bar_text())
-                            .child(SharedString::from(notice)),
-                    )
-                });
-        Some(block.into_any_element())
-    }
-}
-
-/// 非 dev-sync 构建：附件插入条不存在（返回 `None`，侧栏布局与行为零变化）。
-#[cfg(not(feature = "dev-sync"))]
-impl AppShell {
-    fn render_attachment_block(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        None
-    }
-}
-
-/// 日志用的短哈希（前 4 字节 = 8 个十六进制字符；够区分，又不会把整串刷进日志）。
-#[cfg(feature = "dev-sync")]
-fn short_hash(hash: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::with_capacity(8);
-    for byte in &hash[..4] {
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
-}
-
 /// 组装同步报告的材料（notice 由这些字段派生，避免调用点各写一遍）。
 ///
 /// 两条路径共用：持闸路径填 `doc_id`/`changes`/`dispatched_under_gate`；无会话路径
@@ -5426,17 +5286,6 @@ enum SyncOnceFinish {
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 输入框刚创建时拿不到 `&mut Window`（订阅回调里没有），在这一帧补一次焦点。
-        // 附件路径输入框同理：事件回调里没有 `&mut Window`，这一帧补焦点。
-        #[cfg(feature = "dev-sync")]
-        if self.pending_focus_attachment {
-            self.pending_focus_attachment = false;
-            if let Some(ui) = &self.attachment {
-                let input = ui.input.clone();
-                window.defer(cx, move |window, cx| {
-                    input.update(cx, |input, cx| input.focus(window, cx));
-                });
-            }
-        }
         if self.pending_focus_rename {
             self.pending_focus_rename = false;
             if let Some(editing) = &self.editing {
@@ -5493,15 +5342,25 @@ impl Render for AppShell {
 
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main();
+        let content = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(sidebar)
+            .child(main);
+        let status_bar = self.render_status_bar(cx);
         // 浮层同样渲染在根层（侧栏会裁剪子元素）。
         let search = self.search.clone();
         // 菜单渲染在**根层**：侧栏是 `overflow_y_scroll`，放里面会被裁掉。
         let popup = self.render_menu(window, cx);
+        #[cfg(feature = "dev-sync")]
+        let settings = self.render_settings(cx);
         let root = div()
             .relative()
             .size_full()
             .flex()
-            .flex_row()
+            .flex_col()
             .bg(theme::window_bg())
             .font_family(theme::FONT_FAMILY)
             // ---- 窗口级鼠标取证（capture 相，不受命中影响）----
@@ -5531,14 +5390,13 @@ impl Render for AppShell {
                     );
                 }),
             )
-            .child(sidebar)
-            .child(main)
+            .child(content)
+            .child(status_bar)
             .when_some(popup, |this, popup| this.child(popup))
             .when_some(search, |this, search| this.child(search));
-        // dev-only 同步面板（覆盖层）：只有 feature + 运行时门禁都通过才存在；
-        // 未启用时 `None` → 不渲染、不占布局（默认构建里连字段都不存在）。
+        // 同步设置页：只在打开时挂载面板（默认主界面不显示覆盖层）。
         #[cfg(feature = "dev-sync")]
-        let root = root.when_some(self.dev_sync.clone(), |this, panel| this.child(panel));
+        let root = root.when_some(settings, |this, settings| this.child(settings));
         root
     }
 }

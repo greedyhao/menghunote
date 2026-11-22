@@ -277,6 +277,7 @@ fn add_shell_window(
         captured.set(Some(window.window_handle()));
         let shell =
             cx.new(|cx| AppShell::new_with_dev_sync(vault, label.to_owned(), dev_sync, sync, cx));
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     // 借用结束：句柄已带出；`window_cx` 只在本函数尾部被丢弃。
@@ -594,31 +595,22 @@ async fn two_shells_exchange_text_without_reopening(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 /// 真实点击一个 selector（headless：先查 bounds 再点中心，不猜坐标）。
-fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
-    let bounds = cx
-        .debug_bounds(selector)
-        .unwrap_or_else(|| panic!("selector={selector} 必须画出 headless 帧"));
-    cx.simulate_click(bounds.center(), Modifiers::default());
-    cx.run_until_parked();
-}
-
-/// 通过真实 UI 链路在某个 shell 里插入附件：展开 → 点路径框 → 输入 → Enter。
-fn insert_attachment_via_ui(cx: &mut VisualTestContext, host: &Entity<ShellHost>, path: &Path) {
-    let open = read_shell(cx, host, |shell, _app| shell.attachment_is_open());
-    if !open {
-        click_selector(cx, "attachment-insert");
-    }
-    click_selector(cx, "attachment-path");
-    cx.simulate_input(&path.to_string_lossy());
-    cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+/// 通过**真实粘贴链路**在某个 shell 里插入一个本地文件（ADR 0019 S2b：粘贴/拖放是
+/// 唯一导入入口，旧的「插入附件…」路径输入条已移除）。
+fn paste_file_via_clipboard(cx: &mut VisualTestContext, host: &Entity<ShellHost>, path: &Path) {
+    cx.write_to_clipboard(gpui::ClipboardItem {
+        entries: vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+            vec![path.to_path_buf()].into_iter().collect(),
+        ))],
+    });
+    cx.simulate_keystrokes("ctrl-v");
     cx.run_until_parked();
     let error = read_shell(cx, host, |shell, _app| {
         shell
-            .attachment_error_text()
+            .import_error_text()
             .map(std::borrow::ToOwned::to_owned)
     });
-    assert_eq!(error, None, "A 插入附件失败：{error:?}");
+    assert_eq!(error, None, "A 粘贴导入附件失败：{error:?}");
 }
 
 #[gpui::test]
@@ -660,7 +652,7 @@ async fn attachment_asset_bytes_and_link_reach_the_other_shell(cx: &mut TestAppC
     let data = b"menghunote attachment bytes over dev relay".to_vec();
     let file = file_dir.join("报告 最终.txt");
     std::fs::write(&file, &data).expect("写临时附件失败");
-    insert_attachment_via_ui(&mut cx_a, &host_a, &file);
+    paste_file_via_clipboard(&mut cx_a, &host_a, &file);
     let refs =
         menghunote_storage::list_asset_refs(&pair.a_vault, &note_id).expect("读 A asset_refs 失败");
     assert_eq!(refs.len(), 1, "A 必须正好一条资产引用：{refs:?}");
@@ -1681,6 +1673,7 @@ fn add_shell_window_with_service(
         let shell = cx.new(|cx| {
             AppShell::new_with_dev_sync_service(vault, label.to_owned(), sync, service, cx)
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     let handle = slot

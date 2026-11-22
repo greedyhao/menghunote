@@ -157,7 +157,6 @@ impl gpui::EventEmitter<DevSyncPanelEvent> for DevSyncPanel {}
 /// 面板轮询间隔（事件泵；只影响 dev-only 面板，不是业务时钟）。
 const PUMP_INTERVAL: Duration = Duration::from_millis(40);
 /// 面板宽度（逻辑像素）。
-const PANEL_WIDTH: f32 = 300.0;
 /// 顶部固定文案：任何 dev 演示都必须一眼看出"这不是生产"。
 const BANNER: &str = "DEV ONLY / 非生产 / localhost";
 
@@ -1668,10 +1667,7 @@ impl Render for DevSyncPanel {
             .id("dev-sync-panel")
             // 测试元数据：面板根（headless 测试断言存在与尺寸）。
             .debug_selector(|| "dev-sync-panel".to_string())
-            .absolute()
-            .top(px(8.0))
-            .right(px(8.0))
-            .w(px(PANEL_WIDTH))
+            .w_full()
             .flex()
             .flex_col()
             .gap_1()

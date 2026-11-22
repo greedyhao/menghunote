@@ -222,6 +222,7 @@ fn add_shell_window(
         captured.set(Some(window.window_handle()));
         let shell =
             cx.new(|cx| AppShell::new_with_dev_sync(vault, label.to_owned(), dev_sync, sync, cx));
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     let handle = slot
@@ -348,7 +349,10 @@ fn focus_editor(cx: &mut VisualTestContext) {
 }
 
 /// 点面板「发布基线」按钮（真实点击路径）。
-fn click_publish(cx: &mut VisualTestContext) {
+fn click_publish(cx: &mut VisualTestContext, host: &Entity<ShellHost>) {
+    // 设置页是模态的：前面 focus_editor 的点击会落到遮罩上并关闭它；点「发布」前重新打开。
+    with_shell(cx, host, |shell, cx| shell.open_settings_headless(cx));
+    cx.run_until_parked();
     let button = cx
         .debug_bounds("dev-sync-publish")
         .expect("面板必须画出 dev-sync-publish");
@@ -521,7 +525,7 @@ async fn publish_from_panel_then_b_join_sees_the_note(cx: &mut TestAppContext) {
 
     // 2) 点面板「发布基线」：只发请求，AppShell 持闸后派发 worker。
     drive_device_facts(&mut cx, &host);
-    click_publish(&mut cx);
+    click_publish(&mut cx, &host);
     let notice = panel_notice(&mut cx, &host).expect("点击必须写面板 notice");
     assert!(
         notice.contains("请求发布基线"),
@@ -915,7 +919,7 @@ async fn publish_twice_is_idempotent_and_sync_still_works(cx: &mut TestAppContex
     cx.run_until_parked();
     let doc_id = active_doc_id(&mut cx, &host).expect("必须有活动文档");
     drive_device_facts(&mut cx, &host);
-    click_publish(&mut cx);
+    click_publish(&mut cx, &host);
     drive_until_idle(&mut cx, &host, DEADLINE);
     let first = last_publish(&mut cx, &host).expect("第一次发布报告");
     assert!(first.is_ok(), "第一次发布必须成功：{first:?}");

@@ -16,8 +16,8 @@
 use std::path::Path;
 
 use gpui::{
-    div, AppContext as _, Entity, InteractiveElement as _, ParentElement as _, Render, Styled as _,
-    TestAppContext,
+    div, AppContext as _, Entity, InteractiveElement as _, Modifiers, ParentElement as _, Render,
+    Styled as _, TestAppContext,
 };
 use menghunote_app::dev_sync::gate::DevSyncConfig;
 use menghunote_app::dev_sync::service::ServiceConfig;
@@ -83,6 +83,7 @@ async fn dev_sync_panel_and_buttons_are_mounted_when_enabled(cx: &mut TestAppCon
                 cx,
             )
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     cx.run_until_parked();
@@ -143,6 +144,7 @@ async fn dev_sync_panel_is_absent_when_not_enabled(cx: &mut TestAppContext) {
     let vault = dev.vault.clone();
     let (_host, cx) = cx.add_window_view(move |_, cx| {
         let shell = cx.new(|cx| AppShell::new(vault, "dev-sync-ui-disabled".to_owned(), cx));
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     cx.run_until_parked();
@@ -179,4 +181,96 @@ async fn dev_sync_panel_is_absent_when_not_enabled(cx: &mut TestAppContext) {
         "未启用 dev-sync 时右侧编辑器面板必须照旧存在"
     );
     println!("[dev-sync-ui] 未启用：panel 不存在，host = {host:?}");
+}
+
+#[gpui::test]
+async fn sync_settings_can_close_and_reopen_from_the_bottom_status_bar(cx: &mut TestAppContext) {
+    let (_dir, dev) = open_temp_dev_vault();
+    let vault = dev.vault.clone();
+    let config = dev_sync_config();
+    let (_host, cx) = cx.add_window_view(move |_, cx| {
+        let shell = cx.new(|cx| {
+            AppShell::new_with_dev_sync(
+                vault,
+                "dev-sync-ui-settings".to_owned(),
+                config,
+                menghunote_storage::SyncContext::new(dev_vault::DEV_PEER_ID, 1),
+                cx,
+            )
+        });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
+        ShellHost { shell }
+    });
+    cx.run_until_parked();
+
+    let close = cx
+        .debug_bounds("settings-close")
+        .expect("设置页必须有关闭按钮");
+    cx.simulate_click(close.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("settings-panel").is_none(),
+        "关闭后设置卡片必须消失"
+    );
+    assert!(
+        cx.debug_bounds("dev-sync-panel").is_none(),
+        "关闭后同步面板不得继续常驻"
+    );
+    assert!(
+        cx.debug_bounds("sync-status").is_some(),
+        "底栏必须保留同步状态"
+    );
+    let gear = cx
+        .debug_bounds("sync-status")
+        .expect("底栏同步状态必须可见");
+    cx.simulate_click(gear.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("settings-panel").is_some(),
+        "点底部状态必须重新打开设置页"
+    );
+    assert!(
+        cx.debug_bounds("dev-sync-panel").is_some(),
+        "打开设置后同步面板必须可见"
+    );
+}
+
+#[gpui::test]
+async fn sync_panel_is_hidden_until_settings_opened(cx: &mut TestAppContext) {
+    let (_dir, dev) = open_temp_dev_vault();
+    let vault = dev.vault.clone();
+    let config = dev_sync_config();
+    let (_host, cx) = cx.add_window_view(move |_, cx| {
+        let shell = cx.new(|cx| {
+            AppShell::new_with_dev_sync(
+                vault,
+                "dev-sync-ui-hidden".to_owned(),
+                config,
+                menghunote_storage::SyncContext::new(dev_vault::DEV_PEER_ID, 1),
+                cx,
+            )
+        });
+        ShellHost { shell }
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("dev-sync-panel").is_none(),
+        "默认启动不得常驻同步面板"
+    );
+    assert!(
+        cx.debug_bounds("settings-panel").is_none(),
+        "默认启动不得打开设置页"
+    );
+    assert!(
+        cx.debug_bounds("sync-status").is_some(),
+        "底栏必须显示同步状态"
+    );
+    let gear = cx.debug_bounds("sync-status").expect("底栏必须有同步状态");
+    cx.simulate_click(gear.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("dev-sync-panel").is_some(),
+        "点齿轮后同步面板才进入布局"
+    );
 }

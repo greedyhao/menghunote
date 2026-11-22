@@ -96,6 +96,19 @@ fn options_for(layout: &ProfileLayout, relay: &DevRelay) -> AppRootOptions {
 }
 
 fn expect_bounds(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Bounds<gpui::Pixels> {
+    if cx.debug_bounds(selector).is_none() {
+        // 同步面板现在收在统一设置页里：Main 场景下先点「设置」，再断言面板内 selector。
+        if let Some(gear) = cx.debug_bounds("app-root-settings") {
+            cx.simulate_click(gear.center(), Modifiers::default());
+            cx.run_until_parked();
+        }
+        if selector.starts_with("dev-sync-") {
+            if let Some(toggle) = cx.debug_bounds("settings-toggle-sync") {
+                cx.simulate_click(toggle.center(), Modifiers::default());
+                cx.run_until_parked();
+            }
+        }
+    }
     let bounds = cx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("必须画出 selector={selector}"));
@@ -1417,7 +1430,10 @@ async fn failed_auto_publish_keeps_instance_blocks_invite_then_retry_repairs(
         "缺基线时邀请必须先被挡住：{invite_reason:?}"
     );
 
-    // 重试发布：先真实建一篇笔记（发布需要活动文档持闸），再点面板按钮。
+    // 重试发布：先关闭设置遮罩，真实建一篇笔记（发布需要活动文档持闸），再重新打开设置点按钮。
+    let close = expect_bounds(cx, "settings-cancel");
+    cx.simulate_click(close.center(), Modifiers::default());
+    cx.run_until_parked();
     let new_note = expect_bounds(cx, "sidebar-new-note");
     cx.simulate_click(new_note.center(), Modifiers::default());
     cx.run_until_parked();

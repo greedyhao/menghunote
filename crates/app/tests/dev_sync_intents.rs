@@ -111,6 +111,7 @@ async fn app_shell_typing_flushes_intents_with_identity_peer_and_epoch(cx: &mut 
         let shell = cx.new(|cx| {
             AppShell::new_with_dev_sync(vault, "dev-sync-intent".to_owned(), config, sync, cx)
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     cx.run_until_parked();
@@ -236,6 +237,7 @@ async fn structure_writes_produce_structure_intents(cx: &mut TestAppContext) {
         let shell = cx.new(|cx| {
             AppShell::new_with_dev_sync(vault, "dev-sync-intent".to_owned(), config, sync, cx)
         });
+        shell.update(cx, |shell, cx| shell.open_settings_headless(cx));
         ShellHost { shell }
     });
     cx.run_until_parked();

@@ -15,9 +15,9 @@
 #![deny(unsafe_code)]
 
 pub mod dev_vault;
-// 附件插入（任务：开发版附件插入）：只在 `--features dev-sync` 下编译，默认构建里
-// 这个模块不存在（它的 UI 入口也只挂在 dev-sync 面板同一道门禁下）。
-#[cfg(feature = "dev-sync")]
+// 附件/图片导入（ADR 0019 §2/§3，S2b）：读字节 → 内容寻址 `assets` → `asset_refs` →
+// 正文 `asset://` 链接 + 引用对账。**默认构建也编进来**：粘贴/拖放导入不依赖同步，
+// 旧的"路径输入条"UI 已移除，本模块只保留可复用核心与 `VaultAssetWriter`。
 pub mod attachment;
 // dev-only 同步面板（ADR 0009）：只在 `--features dev-sync` 下编译，
 // 默认构建里这个模块不存在、也不引入 `menghunote-sync` 依赖树。
