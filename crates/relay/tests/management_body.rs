@@ -29,7 +29,7 @@ fn block<T>(f: impl FnOnce() -> T) -> T {
 
 /// 真实 Ed25519 的 AppState（管理签名/设备签名都走密码学校验）。
 fn app_ed25519(fx: &Fixture) -> axum::Router {
-    let state = AppState::new(fx.db.clone(), fx.cfg.clone(), Arc::new(Ed25519Hook));
+    let state = AppState::new(fx.db.inner().clone(), fx.cfg.clone(), Arc::new(Ed25519Hook));
     router(state)
 }
 

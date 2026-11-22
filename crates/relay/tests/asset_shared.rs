@@ -14,6 +14,7 @@ use relay::envelope::{self, Header, ObjectType};
 use relay::error::ErrorCode;
 use relay::ids::{Hash32, Id16};
 use relay::objects;
+use relay::scope::VaultScope;
 use relay::sig::SignatureHook;
 use relay::verify::Ed25519Hook;
 use support::*;
@@ -61,6 +62,7 @@ fn device_ctx(fx: &Fixture, device: Id16) -> AuthContext {
         subject: device,
         device_id: Some(device),
         auth_rev: fx.vault().auth_rev,
+        vault: VaultScope::new(fx.vault_id),
     }
 }
 

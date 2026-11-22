@@ -17,12 +17,14 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::Router;
 
+use crate::admin;
 use crate::auth::{self, AuthContext, Realm};
 use crate::checkpoints::{self, CheckpointRole, PublishRequest};
 use crate::config::RelayConfig;
@@ -35,8 +37,11 @@ use crate::ids::{b64url_decode, hex_lower, sha256, Hash32, Id16};
 use crate::management::{self, CanonicalBody, ManagedOutcome};
 use crate::objects;
 use crate::pairing;
+use crate::ratelimit::RateLimiter;
 use crate::refs::RefRole;
 use crate::rotations::{self, AbortRequest, ActivateRequest, BeginRequest, GrantInput, NewManager};
+use crate::scope::ScopeConn;
+use crate::scope::VaultScope;
 use crate::sig::SignatureHook;
 use crate::slots::{self, SlotKind};
 use crate::vault::{self, Vault};
@@ -51,6 +56,12 @@ pub struct AppState {
     pub hook: Arc<dyn SignatureHook>,
     /// 唤醒通道：`/wake` 订阅它；吊销/新 head/epoch 变化时广播（消息可丢，不作为可靠投递）。
     wake: tokio::sync::broadcast::Sender<WakeEvent>,
+    /// v2 `POST /v2/vaults` 入口限流（ADR 0014 §A；只影响 v2，不影响 v1）。
+    v2_create_limiter: RateLimiter,
+    /// v2 `/v2/vaults/{id}/auth/*` 入口限流。
+    v2_auth_limiter: RateLimiter,
+    /// v2 **业务**（数据面/控制面）路由入口限流（ADR 0014 §A「入口先限流」的扩展）。
+    v2_data_limiter: RateLimiter,
 }
 
 /// 唤醒事件（只表示"去看一眼"，不携带业务数据）。
@@ -64,12 +75,36 @@ impl AppState {
     /// 组装状态。
     pub fn new(db: Db, config: Arc<RelayConfig>, hook: Arc<dyn SignatureHook>) -> Arc<Self> {
         let (wake, _) = tokio::sync::broadcast::channel(256);
+        let v2_create_limiter = RateLimiter::new(config.v2_create_limit);
+        let v2_auth_limiter = RateLimiter::new(config.v2_auth_limit);
+        let v2_data_limiter = RateLimiter::new(config.v2_data_limit);
         Arc::new(Self {
             db,
             config,
             hook,
             wake,
+            v2_create_limiter,
+            v2_auth_limiter,
+            v2_data_limiter,
         })
+    }
+
+    /// v2 创建入口限流（超限 → 429 `RATE_LIMITED`）。
+    fn check_v2_create_rate(&self) -> Result<()> {
+        self.v2_create_limiter.acquire()
+    }
+
+    /// v2 鉴权入口限流（超限 → 429 `RATE_LIMITED`）。
+    fn check_v2_auth_rate(&self) -> Result<()> {
+        self.v2_auth_limiter.acquire()
+    }
+
+    /// v2 **业务**路由入口限流；v1 永不受限（ADR 0014 §A：v1 行为不变）。
+    fn check_v2_data_rate(&self, face: ApiFace) -> Result<()> {
+        match face {
+            ApiFace::V1 => Ok(()),
+            ApiFace::V2 => self.v2_data_limiter.acquire(),
+        }
     }
 
     /// 广播一次"变了"（WS 收到后自行重新鉴权并读取最新状态）。
@@ -77,123 +112,169 @@ impl AppState {
         let _ = self.wake.send(WakeEvent::Changed);
     }
 
-    fn write<T, F>(&self, f: F) -> impl std::future::Future<Output = Result<T>>
+    fn write<T, F>(&self, scope: VaultScope, f: F) -> impl std::future::Future<Output = Result<T>>
     where
         T: Send + 'static,
-        F: FnOnce(&rusqlite::Connection, &dyn crate::time::Clock) -> Result<T> + Send + 'static,
+        F: FnOnce(&ScopeConn<'_>, &dyn crate::time::Clock) -> Result<T> + Send + 'static,
     {
         let db = self.db.clone();
         let clock = db.clock_handle();
-        async move { db.write(move |conn| f(conn, clock.as_ref())).await }
+        async move { db.write(scope, move |conn| f(conn, clock.as_ref())).await }
+    }
+}
+
+/// 路由面：`/v1`（legacy 默认 vault）或 `/v2`（显式租户路由）。
+///
+/// ADR 0014 S2c：**业务 handler 实现只写一份**，v1/v2 两个路径注册同一个 handler；
+/// 两面只在这些地方不同：
+/// - 鉴权：v1 保持旧语义；v2 额外强制 `route.vault == auth.vault == signed.vault`；
+/// - 入口限流：只有 v2 业务路由受限（v1 完全不受影响）。
+///
+/// 面由 axum 已匹配的**真实请求路径**（`OriginalUri`）推导，不由 token/subject 推断：
+/// 路径同时是管理签名绑定的事实（`management::run`），因此 v2 客户端签 `/v2/...` 路径
+/// 即天然绑定到该面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiFace {
+    V1,
+    V2,
+}
+
+impl ApiFace {
+    /// 由请求路径前缀判定；`None` 表示不是租户路径（防御性拒绝）。
+    fn of_path(path: &str) -> Option<Self> {
+        if path.starts_with("/v2/") {
+            Some(Self::V2)
+        } else if path.starts_with("/v1/") {
+            Some(Self::V1)
+        } else {
+            None
+        }
+    }
+
+    const fn is_v2(self) -> bool {
+        matches!(self, Self::V2)
+    }
+}
+
+impl<S> FromRequestParts<S> for ApiFace
+where
+    S: Send + Sync,
+{
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let path = match parts.extensions.get::<OriginalUri>() {
+            Some(original) => original.0.path().to_owned(),
+            None => parts.uri.path().to_owned(),
+        };
+        Self::of_path(&path).ok_or_else(|| Error::api(ErrorCode::NotFound))
     }
 }
 
 /// 构建路由。
+///
+/// 两个前缀注册**同一批业务 handler**（[`tenant_routes`]）：`/v1/vaults/{vault}/...` 是
+/// legacy 默认 vault 的旧 API，`/v2/vaults/{vault}/...` 是 ADR 0014 的显式租户路由；
+/// 两者只在 [`ApiFace`]（鉴权严格度 + 入口限流）上不同，业务实现不复制。
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/vaults", post(create_vault))
         .route("/v1/auth/challenges", post(create_challenge))
         .route("/v1/auth/tokens", post(issue_token))
-        .route("/v1/vaults/{vault}/state", get(get_state))
-        .route("/v1/vaults/{vault}/control", get(get_control))
-        .route("/v1/vaults/{vault}/log", get(get_log))
-        .route("/v1/vaults/{vault}/acks", post(post_acks))
-        .route("/v1/vaults/{vault}/updates", post(post_updates))
+        // v2（ADR 0014 §A）：创建票据消费 + 租户鉴权。**不开放**匿名 vault 列表。
+        .route("/v2/vaults", post(create_vault_v2))
         .route(
-            "/v1/vaults/{vault}/objects/{object}/parts/{part}",
+            "/v2/vaults/{vault}/auth/challenges",
+            post(create_challenge_v2),
+        )
+        .route("/v2/vaults/{vault}/auth/tokens", post(issue_token_v2))
+        // 租户业务路由：v1 legacy 与 v2 各注册一份（同一实现，差异见 `ApiFace`）。
+        .merge(tenant_routes("/v1/vaults/"))
+        .merge(tenant_routes("/v2/vaults/"))
+        .layer(DefaultBodyLimit::max(MAX_ASSET_ENVELOPE))
+        .with_state(state)
+}
+
+/// 一个前缀下的**全部**租户业务路由（v1/v2 共用同一 handler 实现）。
+///
+/// 清点口径 = S2a/S2b 之后 `api.rs` 的完整路由表：`/v1/vaults`（genesis）与 `/auth/*`
+/// 不在此列（它们的 v2 形态语义不同：创建票据 / 显式 scope 鉴权）。公开路由
+/// `invites/{invite}/redeem` 也放在这里：它**不需要 token**（授权来自 invite token），
+/// 但 v2 形态仍计入业务入口限流。
+fn tenant_routes(prefix: &str) -> Router<Arc<AppState>> {
+    let path = |suffix: &str| format!("{prefix}{{vault}}{suffix}");
+    Router::new()
+        .route(&path("/state"), get(get_state))
+        .route(&path("/control"), get(get_control))
+        .route(&path("/log"), get(get_log))
+        .route(&path("/acks"), post(post_acks))
+        .route(&path("/updates"), post(post_updates))
+        .route(
+            &path("/objects/{object}/parts/{part}"),
             put(put_part).get(get_part),
         )
-        .route("/v1/vaults/{vault}/objects/{object}", get(get_object))
+        .route(&path("/objects/{object}"), get(get_object))
+        .route(&path("/objects/{object}/complete"), post(complete_object))
+        .route(&path("/objects"), get(list_objects))
+        .route(&path("/checkpoints"), post(create_checkpoint))
         .route(
-            "/v1/vaults/{vault}/objects/{object}/complete",
-            post(complete_object),
-        )
-        .route("/v1/vaults/{vault}/objects", get(list_objects))
-        .route("/v1/vaults/{vault}/checkpoints", post(create_checkpoint))
-        .route(
-            "/v1/vaults/{vault}/checkpoints/{checkpoint}/refs",
+            &path("/checkpoints/{checkpoint}/refs"),
             post(add_checkpoint_refs),
         )
         .route(
-            "/v1/vaults/{vault}/checkpoints/{checkpoint}/publish",
+            &path("/checkpoints/{checkpoint}/publish"),
             post(publish_checkpoint),
         )
-        .route("/v1/vaults/{vault}/bootstrap", post(bootstrap))
-        .route(
-            "/v1/vaults/{vault}/bootstrap-leases/{lease}",
-            patch(renew_lease),
-        )
-        .route(
-            "/v1/vaults/{vault}/devices/self/grants/latest",
-            get(latest_grant),
-        )
-        .route("/v1/vaults/{vault}/invites", post(create_invite))
-        .route(
-            "/v1/vaults/{vault}/invites/{invite}/redeem",
-            post(redeem_invite),
-        )
-        .route(
-            "/v1/vaults/{vault}/devices/{device}/approve",
-            post(approve_device),
-        )
+        .route(&path("/bootstrap"), post(bootstrap))
+        .route(&path("/bootstrap-leases/{lease}"), patch(renew_lease))
+        .route(&path("/devices/self/grants/latest"), get(latest_grant))
+        .route(&path("/invites"), post(create_invite))
+        .route(&path("/invites/{invite}/redeem"), post(redeem_invite))
+        .route(&path("/devices/{device}/approve"), post(approve_device))
         // ADR 0010：管理端独立吊销（只断访问，不轮换密钥；`control_rev` 不变）。
+        .route(&path("/devices/{device}/revoke"), post(revoke_device))
+        .route(&path("/key-slots"), get(list_key_slots))
+        .route(&path("/key-slots/{slot}"), put(put_key_slot))
+        .route(&path("/key-slots/{kind}/activate"), post(activate_key_slot))
+        .route(&path("/rotations"), post(begin_rotation))
+        .route(&path("/rotations/current"), get(get_current_rotation))
+        .route(&path("/rotations/{rotation}"), get(get_rotation))
         .route(
-            "/v1/vaults/{vault}/devices/{device}/revoke",
-            post(revoke_device),
-        )
-        .route("/v1/vaults/{vault}/key-slots", get(list_key_slots))
-        .route("/v1/vaults/{vault}/key-slots/{slot}", put(put_key_slot))
-        .route(
-            "/v1/vaults/{vault}/key-slots/{kind}/activate",
-            post(activate_key_slot),
-        )
-        .route("/v1/vaults/{vault}/rotations", post(begin_rotation))
-        .route(
-            "/v1/vaults/{vault}/rotations/current",
-            get(get_current_rotation),
-        )
-        .route("/v1/vaults/{vault}/rotations/{rotation}", get(get_rotation))
-        .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/restart",
+            &path("/rotations/{rotation}/restart"),
             post(restart_rotation),
         )
         .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/revoke-more",
+            &path("/rotations/{rotation}/revoke-more"),
             post(revoke_more_rotation),
         )
         .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/grants",
+            &path("/rotations/{rotation}/grants"),
             get(list_rotation_grants),
         )
         // §35.4：设备 realm 只读的完整 leaf manifest（B 侧 inclusion 校验）。
         // 必须注册在 `{device}` 动态段之前，避免 `leaves` 被当成设备 id。
         .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/grants/leaves",
+            &path("/rotations/{rotation}/grants/leaves"),
             get(list_rotation_grant_leaves),
         )
         .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/assets",
+            &path("/rotations/{rotation}/assets"),
             get(list_rotation_assets),
         )
+        .route(&path("/checkpoints/{checkpoint}"), get(get_checkpoint))
         .route(
-            "/v1/vaults/{vault}/checkpoints/{checkpoint}",
-            get(get_checkpoint),
-        )
-        .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/grants/{device}",
+            &path("/rotations/{rotation}/grants/{device}"),
             put(stage_grant),
         )
         .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/activate",
+            &path("/rotations/{rotation}/activate"),
             post(activate_rotation),
         )
-        .route(
-            "/v1/vaults/{vault}/rotations/{rotation}/abort",
-            post(abort_rotation),
-        )
-        .route("/v1/vaults/{vault}/wake", get(wake))
-        .layer(DefaultBodyLimit::max(MAX_ASSET_ENVELOPE))
-        .with_state(state)
+        .route(&path("/rotations/{rotation}/abort"), post(abort_rotation))
+        .route(&path("/wake"), get(wake))
 }
 
 // ---------------------------------------------------------------- 响应/解析辅助
@@ -335,16 +416,100 @@ fn bearer(headers: &HeaderMap) -> Result<String> {
     Ok(token.to_string())
 }
 
-fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthContext> {
+fn authenticate(state: &AppState, headers: &HeaderMap, scope: VaultScope) -> Result<AuthContext> {
     let token = bearer(headers)?;
-    let clock = state.db.clock_handle();
-    state
-        .db
-        .read(move |conn| auth::authenticate(conn, clock.as_ref(), &token))
+    authenticate_token(state, &token, scope)
 }
 
-fn require_device(state: &AppState, headers: &HeaderMap) -> Result<AuthContext> {
-    let ctx = authenticate(state, headers)?;
+/// token → `AuthContext`（v1 语义：token 本身有效但属于**别的** vault 时映射成 404）。
+///
+/// 拆分出来是为了 `/wake` 的每轮重鉴权：WS 建立后手里只有 token 字符串，没有 header。
+fn authenticate_token(state: &AppState, token: &str, scope: VaultScope) -> Result<AuthContext> {
+    let clock = state.db.clock_handle();
+    let probe_token = token.to_string();
+    let probe_clock = state.db.clock_handle();
+    let token = token.to_string();
+    match state.db.read(scope, move |conn| {
+        auth::authenticate(conn, clock.as_ref(), &token)
+    }) {
+        Ok(ctx) => Ok(ctx),
+        Err(err) if is_unauthorized(&err) => {
+            // v1 兼容：token 本身有效但属于**别的** vault 时，旧行为是 404（路由 vault
+            // 对调用者不可见），不是 401。这里显式复查，且不回显目标租户任何数据。
+            let elsewhere = state.db.read_instance(move |conn| {
+                auth::token_valid_in_other_vault(conn, probe_clock.as_ref(), &probe_token, scope)
+            })?;
+            if elsewhere {
+                Err(Error::api(ErrorCode::NotFound))
+            } else {
+                Err(err)
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// WS 连接建立后每轮重鉴权：与 [`authenticate_face`] 同一语义（v2 仍强制 route == auth）。
+fn authenticate_token_face(
+    state: &AppState,
+    token: &str,
+    scope: VaultScope,
+    face: ApiFace,
+) -> Result<AuthContext> {
+    let ctx = authenticate_token(state, token, scope)?;
+    if face.is_v2() {
+        ensure_same_vault(&ctx, scope)?;
+    }
+    Ok(ctx)
+}
+
+/// ADR 0014 §A：`route.vault == auth.vault == signed.vault` 的一致性断言。
+///
+/// token 只在签发它的 scope 内有效（`auth::authenticate` 的查询都带 `vault_id`），
+/// 这里再做一次防御性断言：任何 v2 路由忘了显式校验，也会被挡在这里。
+fn ensure_same_vault(ctx: &AuthContext, scope: VaultScope) -> Result<()> {
+    if ctx.vault != scope {
+        return Err(Error::api(ErrorCode::NotFound));
+    }
+    Ok(())
+}
+
+/// v2 路由的鉴权入口：在 v1 语义之上**强制** `route.vault == auth.vault`。
+fn authenticate_v2(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: VaultScope,
+) -> Result<AuthContext> {
+    let ctx = authenticate(state, headers, scope)?;
+    ensure_same_vault(&ctx, scope)?;
+    Ok(ctx)
+}
+
+/// 按**路由面**鉴权：v1 保持旧语义；v2 走 [`authenticate_v2`]（route = auth = signed）。
+fn authenticate_face(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: VaultScope,
+    face: ApiFace,
+) -> Result<AuthContext> {
+    match face {
+        ApiFace::V1 => authenticate(state, headers, scope),
+        ApiFace::V2 => authenticate_v2(state, headers, scope),
+    }
+}
+
+fn is_unauthorized(err: &Error) -> bool {
+    matches!(err, Error::Api(api) if api.code == ErrorCode::Unauthorized)
+}
+
+/// 按路由面要求设备 realm（v2 额外断言 route == auth）。
+fn require_device_face(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: VaultScope,
+    face: ApiFace,
+) -> Result<AuthContext> {
+    let ctx = authenticate_face(state, headers, scope, face)?;
     ctx.device_id()?;
     Ok(ctx)
 }
@@ -359,22 +524,53 @@ fn require_object_read(actor: &AuthContext, object_type: ObjectType) -> Result<(
     }
 }
 
-fn require_management_realm(state: &AppState, headers: &HeaderMap) -> Result<AuthContext> {
-    let ctx = authenticate(state, headers)?;
+/// 按路由面要求管理 realm（v2 额外断言 route == auth）。
+fn require_management_face(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: VaultScope,
+    face: ApiFace,
+) -> Result<AuthContext> {
+    let ctx = authenticate_face(state, headers, scope, face)?;
     ctx.require_management()?;
     Ok(ctx)
 }
 
-fn require_vault(conn: &rusqlite::Connection, vault_id: &Id16) -> Result<Vault> {
-    let vault = vault::load(conn)?;
-    if vault.vault_id != *vault_id {
+/// 按路由 `vault_id` 读该租户行：`conn` 的作用域已由调用方按同一 `vault_id` 建立，
+/// 因此这里只做"路由 vault 与 scope 一致"的防御性断言（不一致绝不回退到别的租户）。
+fn require_vault(conn: &ScopeConn, vault_id: &Id16) -> Result<Vault> {
+    if conn.scope().vault_id() != vault_id {
         return Err(Error::api(ErrorCode::NotFound));
     }
-    Ok(vault)
+    vault::load(conn)
+}
+
+/// v1 旧 API 的 legacy 默认 vault：显式解析（配置覆盖或 `vaults.legacy_default=1`）。
+fn legacy_scope(state: &AppState) -> Result<VaultScope> {
+    let cfg = state.config.clone();
+    state
+        .db
+        .read_instance(move |conn| vault::resolve_legacy_scope(conn, &cfg))
 }
 
 // ---------------------------------------------------------------- vault init
 
+/// v1/v2 创建成功的响应体（字段完全一致，`v1` 客户端无需感知 v2）：
+/// `{0 instance, 1 log, 2 epoch, 3 control_rev, 4 auth_rev, 5 cursor}`。
+fn created_vault_response(outcome: &vault::InitOutcome, vault: &Vault) -> Result<Response> {
+    // 键 5：seq=0 的 HMAC 游标。客户端 genesis 后写入 `sync.relay_cursor`。
+    let cursor = crate::log::cursor_at(vault, 0)?;
+    Ok(cbor_created(vec![
+        (0, cbor_bytes(outcome.instance_id)),
+        (1, cbor_bytes(outcome.log_id)),
+        (2, cbor_uint(outcome.epoch)),
+        (3, cbor_uint(outcome.control_rev)),
+        (4, cbor_uint(outcome.auth_rev)),
+        (5, wire::text(cursor)),
+    ]))
+}
+
+/// v1 genesis：显式 setup secret（ADR 0006 §4），行为不变。
 async fn create_vault(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response> {
     let fields = parse_body(&state, &body)?;
     let request = vault::InitRequest {
@@ -389,23 +585,67 @@ async fn create_vault(State(state): State<Arc<AppState>>, body: Bytes) -> Result
     };
     let config = state.config.clone();
     let hook = state.hook.clone();
+    let scope = VaultScope::new(request.vault_id);
     let (outcome, vault) = state
-        .write(move |conn, clock| {
+        .write(scope, move |conn, clock| {
             let outcome = vault::initialize(conn, clock, &config, hook.as_ref(), &request)?;
             let vault = vault::load(conn)?;
             Ok((outcome, vault))
         })
         .await?;
-    // 键 5：seq=0 的 HMAC 游标。客户端 genesis 后写入 `sync.relay_cursor`。
-    let cursor = crate::log::cursor_at(&vault, 0)?;
-    Ok(cbor_created(vec![
-        (0, cbor_bytes(outcome.instance_id)),
-        (1, cbor_bytes(outcome.log_id)),
-        (2, cbor_uint(outcome.epoch)),
-        (3, cbor_uint(outcome.control_rev)),
-        (4, cbor_uint(outcome.auth_rev)),
-        (5, wire::text(cursor)),
-    ]))
+    created_vault_response(&outcome, &vault)
+}
+
+/// v2 创建（ADR 0014 §A）：**一次性创建票据** + 现有 InitRequest。
+///
+/// 请求字段（CBOR/CDE，键升序；本端点是 v2 新增，不影响 v1 wire）：
+///
+/// | 键 | 字段 |
+/// | --- | --- |
+/// | 0 | `ticket`：运维发行的 32B 明文（库里只有 SHA256） |
+/// | 1 | `vault_id`：票据绑定的 128-bit 公开路由标识 |
+/// | 2 | `device_id` |
+/// | 3 | `sign_pk`（32B Ed25519） |
+/// | 4 | `hpke_pk`（32B X25519） |
+/// | 5 | `manager_pub`（32B Ed25519） |
+/// | 6 | `certificate`：`CDE(DeviceCertV1)` |
+/// | 7 | `certificate_signature`：`MN/v1/device-cert\0` 域签名 |
+///
+/// **没有** setup secret：授权来自票据。响应与 v1 create 完全同形。
+///
+/// 事务：`token_hash` 查票据 → 未过期/未消费/额度/`vault_id` 匹配 → `create_vault_with_ticket`
+/// → 原子扣额度/置 `consumed_at`，四步在**一个** `BEGIN IMMEDIATE` 里：并发双消费只有一个
+/// 成功；创建失败（证书错误/已存在）整体回滚，票据不消费、不留半个 vault。
+async fn create_vault_v2(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response> {
+    // 入口先限流（ADR 0014 §A），再解析 body/查库。
+    state.check_v2_create_rate()?;
+    let fields = parse_body(&state, &body)?;
+    let ticket = wire::bytes_field(&fields, 0)?;
+    let request = vault::InitRequest {
+        vault_id: wire::id16_field(&fields, 1)?,
+        device_id: wire::id16_field(&fields, 2)?,
+        sign_pk: wire::key32_field(&fields, 3)?,
+        hpke_pk: wire::key32_field(&fields, 4)?,
+        manager_pub: wire::key32_field(&fields, 5)?,
+        // v2 的授权是创建票据，不是 setup secret；置空且不参与校验/消费。
+        setup_secret: String::new(),
+        certificate: wire::bytes_field(&fields, 6)?,
+        certificate_signature: wire::bytes_field(&fields, 7)?,
+    };
+    let config = state.config.clone();
+    let hook = state.hook.clone();
+    let scope = VaultScope::new(request.vault_id);
+    let (outcome, vault) = state
+        .write(scope, move |conn, clock| {
+            // 票据消费与 vault genesis 必须同一事务：任何一步失败都整体回滚。
+            admin::consume_create_ticket(conn, clock.now_secs(), &ticket)?;
+            let outcome =
+                vault::create_vault_with_ticket(conn, clock, &config, hook.as_ref(), &request)?;
+            let vault = vault::load(conn)?;
+            Ok((outcome, vault))
+        })
+        .await?;
+    created_vault_response(&outcome, &vault)
 }
 
 // ---------------------------------------------------------------- auth
@@ -417,7 +657,15 @@ fn realm_tag(realm: Realm) -> u64 {
     }
 }
 
-async fn create_challenge(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response> {
+/// 在**显式 scope** 里创建 challenge（v1/v2 共用）。
+///
+/// scope 由调用方决定：v1 是 legacy 默认 vault（`legacy_scope`），v2 是路由 `vault_id`。
+/// challenge 行带 `vault_id`，因此跨 vault 的 challenge 在另一个 scope 里查不到。
+async fn create_challenge_in_scope(
+    state: Arc<AppState>,
+    scope: VaultScope,
+    body: Bytes,
+) -> Result<Response> {
     let fields = parse_body(&state, &body)?;
     let realm = match wire::uint_field(&fields, 0)? {
         1 => Realm::Device,
@@ -426,7 +674,7 @@ async fn create_challenge(State(state): State<Arc<AppState>>, body: Bytes) -> Re
     };
     let subject = wire::id16_field(&fields, 1)?;
     let (challenge, vault, now) = state
-        .write(move |conn, clock| {
+        .write(scope, move |conn, clock| {
             let challenge = auth::create_challenge(conn, clock, realm, &subject)?;
             let vault = vault::load(conn)?;
             Ok((challenge, vault, clock.now_secs()))
@@ -447,14 +695,39 @@ async fn create_challenge(State(state): State<Arc<AppState>>, body: Bytes) -> Re
     ]))
 }
 
-async fn issue_token(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response> {
+/// v1 challenge：显式 legacy 默认 vault（S2a 语义，不按 subject 猜租户）。
+async fn create_challenge(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response> {
+    let scope = legacy_scope(&state)?;
+    create_challenge_in_scope(state, scope, body).await
+}
+
+/// v2 challenge：路由 `vault_id` 即鉴权作用域；未知 vault → 404（不泄露任何其它租户）。
+async fn create_challenge_v2(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_auth_rate()?;
+    let vault_id = parse_id16(&vault_id)?;
+    create_challenge_in_scope(state, VaultScope::new(vault_id), body).await
+}
+
+/// 在**显式 scope** 里兑现 challenge 并签发 token（v1/v2 共用）。
+///
+/// `auth::issue_token` 的 challenge/token 查询都带 `vault_id`（来自 scope），签名校验的
+/// `SignatureCheck.vault_id` 也取自该 scope 的 vault 行——因此跨 vault 的挑战/token 必然被拒。
+async fn issue_token_in_scope(
+    state: Arc<AppState>,
+    scope: VaultScope,
+    body: Bytes,
+) -> Result<Response> {
     let fields = parse_body(&state, &body)?;
     let challenge_id = wire::id16_field(&fields, 0)?;
     let message = wire::bytes_field(&fields, 1)?;
     let signature = wire::bytes_field(&fields, 2)?;
     let hook = state.hook.clone();
     let outcome = state
-        .write(move |conn, clock| {
+        .write(scope, move |conn, clock| {
             auth::issue_token(
                 conn,
                 clock,
@@ -477,17 +750,50 @@ async fn issue_token(State(state): State<Arc<AppState>>, body: Bytes) -> Result<
     ]))
 }
 
+/// v1 token：显式 legacy 默认 vault（行为不变）。
+async fn issue_token(State(state): State<Arc<AppState>>, body: Bytes) -> Result<Response> {
+    let scope = legacy_scope(&state)?;
+    issue_token_in_scope(state, scope, body).await
+}
+
+/// v2 token：路由 `vault_id` 即鉴权作用域；跨 vault 的 challenge 在此 scope 查不到 → 401。
+async fn issue_token_v2(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_auth_rate()?;
+    let vault_id = parse_id16(&vault_id)?;
+    issue_token_in_scope(state, VaultScope::new(vault_id), body).await
+}
+
 // ---------------------------------------------------------------- state / control / log
 
+/// 只读水位（v1/v2 同字段）。
+///
+/// v2 形态是 S2b 里第一个需要鉴权的 v2 路由，也是 `route.vault == auth.vault` 的可测入口；
+/// 现在与其它 v2 业务路由一样走 [`authenticate_face`] + 业务入口限流。
 async fn get_state(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
     let vault_id = parse_id16(&vault_id)?;
-    authenticate(&state, &headers)?;
+    state_payload(&state, &headers, vault_id, face).await
+}
+
+async fn state_payload(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    vault_id: Id16,
+    face: ApiFace,
+) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
+    let scope = VaultScope::new(vault_id);
+    authenticate_face(state, headers, scope, face)?;
     let clock = state.db.clock_handle();
-    let payload = state.db.read(move |conn| {
+    let payload = state.db.read(scope, move |conn| {
         let vault = require_vault(conn, &vault_id)?;
         let usage = crate::quota::usage(conn)?;
         let available = crate::quota::maintenance_available(conn, clock.now_secs())?;
@@ -521,12 +827,16 @@ async fn get_state(
         (14, wire::text(crate::log::cursor_at(&vault, 0)?)),
     ];
     // §28.1 条目 10（评审 §三 1）：当前正在进行的 rotation（让响应丢失的客户端先查询）。
-    if let Some(rotation) = state.db.read(crate::rotations::latest)?.filter(|rotation| {
-        matches!(
-            rotation.state,
-            crate::rotations::RotationState::Frozen | crate::rotations::RotationState::Staging
-        )
-    }) {
+    if let Some(rotation) = state
+        .db
+        .read(scope, crate::rotations::latest)?
+        .filter(|rotation| {
+            matches!(
+                rotation.state,
+                crate::rotations::RotationState::Frozen | crate::rotations::RotationState::Staging
+            )
+        })
+    {
         fields.push((15, cbor_bytes(rotation.rotation_id)));
     }
     fields.sort_by_key(|(key, _)| *key);
@@ -535,157 +845,164 @@ async fn get_state(
 
 async fn get_control(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    authenticate(&state, &headers)?;
+    authenticate_face(&state, &headers, vault_id.into(), face)?;
     let after_rev: u64 = query
         .get("after_rev")
         .map(|value| value.parse::<u64>())
         .transpose()
         .map_err(|_| Error::api(ErrorCode::InvalidRequest))?
         .unwrap_or(0);
-    let (vault, entries, members, slot_chain, manager_chain) = state.db.read(move |conn| {
-        let vault = require_vault(conn, &vault_id)?;
-        let mut stmt = conn.prepare(
-            "SELECT rev, prev_hash, record_hash, signed_record FROM control_commits
-             WHERE rev > ?1 ORDER BY rev ASC LIMIT 256",
-        )?;
-        let rows = stmt.query_map(
-            [i64::try_from(after_rev).map_err(|_| Error::Invariant("after_rev"))?],
-            |row| {
+    let (vault, entries, members, slot_chain, manager_chain) =
+        state.db.read(vault_id.into(), move |conn| {
+            let vault = require_vault(conn, &vault_id)?;
+            let mut stmt = conn.prepare(
+                "SELECT rev, prev_hash, record_hash, signed_record FROM control_commits
+             WHERE rev > ?1 AND vault_id = ?2 ORDER BY rev ASC LIMIT 256",
+            )?;
+            let rows = stmt.query_map(
+                (
+                    i64::try_from(after_rev).map_err(|_| Error::Invariant("after_rev"))?,
+                    conn.scope().as_slice(),
+                ),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )?;
+            let mut entries = Vec::new();
+            for row in rows {
+                let (rev, prev, record, signed) = row?;
+                let kind = control::kind_of(&signed).unwrap_or_else(|| "raw".to_string());
+                let mut entry = vec![
+                    (
+                        0,
+                        cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("rev"))?),
+                    ),
+                    (1, cbor_bytes(prev)),
+                    (2, cbor_bytes(record)),
+                    (3, cbor_bytes(signed)),
+                ];
+                // §28.1 条目 4/10：typed 控制记录（旧记录是裸 CDE → `raw`）。
+                entry.push((4, wire::text(kind)));
+                entries.push(wire::map(entry));
+            }
+            // 成员证书：客户端验 ObjectCommit 需要生产者当前证书（按 device_id 索引）。
+            let mut member_stmt = conn.prepare(
+                "SELECT device_id, certificate, status, sign_pk, hpke_pk, certificate_signature
+             FROM devices WHERE vault_id = ?1 ORDER BY device_id ASC",
+            )?;
+            let member_rows = member_stmt.query_map([conn.scope().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                ))
+            })?;
+            let mut members = Vec::new();
+            for row in member_rows {
+                let (device_id, certificate, status, sign_pk, hpke_pk, certificate_signature) =
+                    row?;
+                let mut member = vec![
+                    (0, cbor_bytes(device_id)),
+                    (1, cbor_bytes(certificate)),
+                    (2, wire::text(status)),
+                    (3, cbor_bytes(sign_pk)),
+                    (4, cbor_bytes(hpke_pk)),
+                ];
+                if let Some(signature) = certificate_signature {
+                    member.push((5, cbor_bytes(signature)));
+                }
+                member.sort_by_key(|(key, _)| *key);
+                members.push(wire::map(member));
+            }
+            // 槽控制链：只暴露描述符/状态/版本（密文本体走对象端点）。
+            let mut slot_stmt = conn.prepare(
+                "SELECT slot_id, epoch, kind, descriptor, state, slot_set_rev FROM key_slots
+             WHERE vault_id = ?1 ORDER BY slot_set_rev ASC, kind ASC",
+            )?;
+            let slot_rows = slot_stmt.query_map([conn.scope().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            let mut slot_chain = Vec::new();
+            for row in slot_rows {
+                let (slot_id, epoch, kind, descriptor, state, rev) = row?;
+                slot_chain.push(wire::map(vec![
+                    (0, cbor_bytes(slot_id)),
+                    (
+                        1,
+                        cbor_uint(u64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?),
+                    ),
+                    (2, wire::text(kind)),
+                    (3, cbor_bytes(descriptor)),
+                    (4, wire::text(state)),
+                    (
+                        5,
+                        cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("slot rev"))?),
+                    ),
+                ]));
+            }
+            // §27.2：管理权转换链（转换记录 + 双签），客户端逐级验证管理权。
+            let mut manager_stmt = conn.prepare(
+                "SELECT rev, pubkey, transition, old_rev, old_signature, new_signature
+             FROM manager_keys WHERE vault_id = ?1 ORDER BY rev ASC",
+            )?;
+            let manager_rows = manager_stmt.query_map([conn.scope().as_slice()], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
-            },
-        )?;
-        let mut entries = Vec::new();
-        for row in rows {
-            let (rev, prev, record, signed) = row?;
-            let kind = control::kind_of(&signed).unwrap_or_else(|| "raw".to_string());
-            let mut entry = vec![
-                (
-                    0,
-                    cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("rev"))?),
-                ),
-                (1, cbor_bytes(prev)),
-                (2, cbor_bytes(record)),
-                (3, cbor_bytes(signed)),
-            ];
-            // §28.1 条目 4/10：typed 控制记录（旧记录是裸 CDE → `raw`）。
-            entry.push((4, wire::text(kind)));
-            entries.push(wire::map(entry));
-        }
-        // 成员证书：客户端验 ObjectCommit 需要生产者当前证书（按 device_id 索引）。
-        let mut member_stmt = conn.prepare(
-            "SELECT device_id, certificate, status, sign_pk, hpke_pk, certificate_signature
-             FROM devices ORDER BY device_id ASC",
-        )?;
-        let member_rows = member_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-            ))
-        })?;
-        let mut members = Vec::new();
-        for row in member_rows {
-            let (device_id, certificate, status, sign_pk, hpke_pk, certificate_signature) = row?;
-            let mut member = vec![
-                (0, cbor_bytes(device_id)),
-                (1, cbor_bytes(certificate)),
-                (2, wire::text(status)),
-                (3, cbor_bytes(sign_pk)),
-                (4, cbor_bytes(hpke_pk)),
-            ];
-            if let Some(signature) = certificate_signature {
-                member.push((5, cbor_bytes(signature)));
+            })?;
+            let mut manager_chain = Vec::new();
+            for row in manager_rows {
+                let (rev, pubkey, transition, old_rev, old_sig, new_sig) = row?;
+                let mut entry = vec![
+                    (
+                        0,
+                        cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("manager rev"))?),
+                    ),
+                    (1, cbor_bytes(pubkey)),
+                    (2, cbor_bytes(transition)),
+                    (
+                        3,
+                        cbor_uint(u64::try_from(old_rev).map_err(|_| Error::Invariant("old rev"))?),
+                    ),
+                ];
+                if let Some(signature) = old_sig {
+                    entry.push((4, cbor_bytes(signature)));
+                }
+                if let Some(signature) = new_sig {
+                    entry.push((5, cbor_bytes(signature)));
+                }
+                entry.sort_by_key(|(key, _)| *key);
+                manager_chain.push(wire::map(entry));
             }
-            member.sort_by_key(|(key, _)| *key);
-            members.push(wire::map(member));
-        }
-        // 槽控制链：只暴露描述符/状态/版本（密文本体走对象端点）。
-        let mut slot_stmt = conn.prepare(
-            "SELECT slot_id, epoch, kind, descriptor, state, slot_set_rev FROM key_slots
-             ORDER BY slot_set_rev ASC, kind ASC",
-        )?;
-        let slot_rows = slot_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
+            Ok((vault, entries, members, slot_chain, manager_chain))
         })?;
-        let mut slot_chain = Vec::new();
-        for row in slot_rows {
-            let (slot_id, epoch, kind, descriptor, state, rev) = row?;
-            slot_chain.push(wire::map(vec![
-                (0, cbor_bytes(slot_id)),
-                (
-                    1,
-                    cbor_uint(u64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?),
-                ),
-                (2, wire::text(kind)),
-                (3, cbor_bytes(descriptor)),
-                (4, wire::text(state)),
-                (
-                    5,
-                    cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("slot rev"))?),
-                ),
-            ]));
-        }
-        // §27.2：管理权转换链（转换记录 + 双签），客户端逐级验证管理权。
-        let mut manager_stmt = conn.prepare(
-            "SELECT rev, pubkey, transition, old_rev, old_signature, new_signature
-             FROM manager_keys ORDER BY rev ASC",
-        )?;
-        let manager_rows = manager_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-            ))
-        })?;
-        let mut manager_chain = Vec::new();
-        for row in manager_rows {
-            let (rev, pubkey, transition, old_rev, old_sig, new_sig) = row?;
-            let mut entry = vec![
-                (
-                    0,
-                    cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("manager rev"))?),
-                ),
-                (1, cbor_bytes(pubkey)),
-                (2, cbor_bytes(transition)),
-                (
-                    3,
-                    cbor_uint(u64::try_from(old_rev).map_err(|_| Error::Invariant("old rev"))?),
-                ),
-            ];
-            if let Some(signature) = old_sig {
-                entry.push((4, cbor_bytes(signature)));
-            }
-            if let Some(signature) = new_sig {
-                entry.push((5, cbor_bytes(signature)));
-            }
-            entry.sort_by_key(|(key, _)| *key);
-            manager_chain.push(wire::map(entry));
-        }
-        Ok((vault, entries, members, slot_chain, manager_chain))
-    })?;
     Ok(cbor_ok(vec![
         (0, wire::array(entries)),
         (1, cbor_uint(vault.control_rev)),
@@ -698,12 +1015,14 @@ async fn get_control(
 
 async fn get_log(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    require_device(&state, &headers)?;
+    require_device_face(&state, &headers, vault_id.into(), face)?;
     let token = query
         .get("after")
         .cloned()
@@ -715,7 +1034,7 @@ async fn get_log(
         .map_err(|_| Error::api(ErrorCode::InvalidRequest))?
         .unwrap_or(256);
     let max_limit = state.config.max_log_page;
-    let page = state.db.read(move |conn| {
+    let page = state.db.read(vault_id.into(), move |conn| {
         let vault = require_vault(conn, &vault_id)?;
         let cursor = crate::cursor::CursorKey::new(vault.cursor_key).decode(&token)?;
         crate::log::page(conn, &vault, &cursor, limit, max_limit)
@@ -754,18 +1073,20 @@ async fn get_log(
 
 async fn post_acks(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     let received_seq = wire::uint_field(&fields, 0)?;
     let integrated_seq = wire::uint_field(&fields, 1)?;
     let epoch = wire::uint_field(&fields, 2)?;
     state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             let vault = require_vault(conn, &vault_id)?;
             if received_seq < integrated_seq {
                 return Err(Error::api(ErrorCode::InvalidRequest));
@@ -778,8 +1099,9 @@ async fn post_acks(
             let device_id = actor.device_id()?;
             let existing: Option<(i64, i64)> = conn
                 .query_row(
-                    "SELECT received_seq, integrated_seq FROM device_acks WHERE device_id = ?1",
-                    [device_id.as_slice()],
+                    "SELECT received_seq, integrated_seq FROM device_acks
+                     WHERE device_id = ?1 AND vault_id = ?",
+                    (device_id.as_slice(), conn.scope().as_slice()),
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .ok();
@@ -792,14 +1114,16 @@ async fn post_acks(
             }
             let now = clock.now_secs();
             conn.execute(
-                "INSERT INTO device_acks(device_id, received_seq, integrated_seq, epoch, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(device_id) DO UPDATE SET
+                "INSERT INTO device_acks(vault_id, device_id, received_seq, integrated_seq,
+                                         epoch, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(vault_id, device_id) DO UPDATE SET
                     received_seq = excluded.received_seq,
                     integrated_seq = excluded.integrated_seq,
                     epoch = excluded.epoch,
                     updated_at = excluded.updated_at",
                 (
+                    conn.scope().as_slice(),
                     device_id.as_slice(),
                     i64::try_from(received_seq).map_err(|_| Error::Invariant("ack"))?,
                     i64::try_from(integrated_seq).map_err(|_| Error::Invariant("ack"))?,
@@ -815,18 +1139,20 @@ async fn post_acks(
 
 async fn post_updates(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     let items = wire::array_field(&fields, 0)?;
     if items.len() > 256 {
         return Err(Error::api(ErrorCode::PayloadTooLarge));
     }
-    state.db.read(move |conn| {
+    state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         Ok(())
     })?;
@@ -858,7 +1184,7 @@ async fn post_updates(
         let hook = state.hook.clone();
         let max_snapshot_bytes = state.config.max_snapshot_bytes;
         let outcome = state
-            .write(move |conn, clock| {
+            .write(vault_id.into(), move |conn, clock| {
                 let object = objects::load(conn, &object_id)?;
                 if object.object_type == ObjectType::Snapshot
                     && object.plain_len > max_snapshot_bytes
@@ -951,14 +1277,16 @@ fn update_failure(fields: &wire::Fields, err: Error) -> wire::CdeValue {
 
 async fn put_part(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, object_id, part_no)): Path<(String, String, u32)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let object_id = parse_hash32(&object_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let reservation = match query.get("reservation") {
         None => None,
         Some(value) => Some(
@@ -970,7 +1298,7 @@ async fn put_part(
     };
     let envelope = body.to_vec();
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             objects::put_part(
                 conn,
                 clock,
@@ -1003,14 +1331,16 @@ async fn put_part(
 
 async fn get_part(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, object_id, part_no)): Path<(String, String, u32)>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let object_id = parse_hash32(&object_id)?;
-    let actor = authenticate(&state, &headers)?;
+    let actor = authenticate_face(&state, &headers, vault_id.into(), face)?;
     let now = state.db.clock().now_secs();
-    let (bytes, digest) = state.db.read(move |conn| {
+    let (bytes, digest) = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         // 先确认对象类型再放行（§22：management 只能读 KEY_SLOT）。
         let object = objects::load(conn, &object_id)?;
@@ -1036,14 +1366,16 @@ async fn get_part(
 
 async fn get_object(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, object_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let object_id = parse_hash32(&object_id)?;
-    let actor = authenticate(&state, &headers)?;
+    let actor = authenticate_face(&state, &headers, vault_id.into(), face)?;
     let now = state.db.clock().now_secs();
-    let view = state.db.read(move |conn| {
+    let view = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         let view = objects::meta(conn, &object_id)?;
         require_object_read(&actor, view.object.object_type)?;
@@ -1095,20 +1427,22 @@ async fn get_object(
 
 async fn complete_object(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, object_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let object_id = parse_hash32(&object_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     let commit = wire::bytes_field(&fields, 0)?;
     let signature = wire::bytes_field(&fields, 1)?;
     let hook = state.hook.clone();
     let max_snapshot_bytes = state.config.max_snapshot_bytes;
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             let object = objects::load(conn, &object_id)?;
             if object.object_type == ObjectType::Snapshot && object.plain_len > max_snapshot_bytes {
                 return Err(Error::api(ErrorCode::PayloadTooLarge));
@@ -1147,12 +1481,14 @@ async fn complete_object(
 
 async fn list_objects(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    require_device(&state, &headers)?;
+    require_device_face(&state, &headers, vault_id.into(), face)?;
     if query.get("type").map(String::as_str) != Some("asset") {
         return Err(Error::api(ErrorCode::InvalidRequest));
     }
@@ -1167,7 +1503,7 @@ async fn list_objects(
         .map(|value| value.parse::<u64>())
         .transpose()
         .map_err(|_| Error::api(ErrorCode::InvalidRequest))?
-        .unwrap_or(state.db.read(vault::load)?.head_seq);
+        .unwrap_or(state.db.read(vault_id.into(), vault::load)?.head_seq);
     let limit: u32 = query
         .get("limit")
         .map(|value| value.parse::<u32>())
@@ -1178,7 +1514,7 @@ async fn list_objects(
         None => None,
         Some(value) => Some(parse_hash32(value)?),
     };
-    let refs = state.db.read(move |conn| {
+    let refs = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         objects::list_assets(conn, epoch, through, after.as_ref(), limit)
     })?;
@@ -1203,12 +1539,14 @@ async fn list_objects(
 
 async fn create_checkpoint(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     let estimated_bytes = wire::uint_field(&fields, 0)?;
     let epoch = wire::opt_uint_field(&fields, 1)?;
@@ -1227,7 +1565,7 @@ async fn create_checkpoint(
     let estimated_bytes =
         i64::try_from(estimated_bytes).map_err(|_| Error::api(ErrorCode::InvalidRequest))?;
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             checkpoints::create(
                 conn,
@@ -1259,13 +1597,15 @@ async fn create_checkpoint(
 
 async fn add_checkpoint_refs(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, checkpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let checkpoint_id = parse_id16(&checkpoint_id)?;
-    require_device(&state, &headers)?;
+    require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     let raw_refs = wire::array_field(&fields, 0)?;
     let max_refs = state.config.max_refs_per_request;
@@ -1277,7 +1617,7 @@ async fn add_checkpoint_refs(
         refs.push((wire::hash32_field(&entry, 0)?, role));
     }
     let inserted = state
-        .write(move |conn, _clock| {
+        .write(vault_id.into(), move |conn, _clock| {
             require_vault(conn, &vault_id)?;
             checkpoints::add_refs(conn, max_refs, &checkpoint_id, &refs)
         })
@@ -1290,13 +1630,15 @@ async fn add_checkpoint_refs(
 
 async fn publish_checkpoint(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, checkpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let checkpoint_id = parse_id16(&checkpoint_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     let covered_seq = wire::uint_field(&fields, 0)?;
     let manifest_oid = wire::hash32_field(&fields, 1)?;
@@ -1305,7 +1647,7 @@ async fn publish_checkpoint(
     let signature = wire::bytes_field(&fields, 4)?;
     let hook = state.hook.clone();
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             checkpoints::publish(
                 conn,
@@ -1362,19 +1704,21 @@ fn checkpoint_fields(checkpoint: &checkpoints::CheckpointRow, cursor: String) ->
 
 async fn bootstrap(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     // §28.1 条目 9：显式降级读回（一基线损坏时读另一基线）；GC 仍被"两份基线"门禁挡住。
     let allow_degraded = matches!(
         query.get("degraded").map(String::as_str),
         Some("1") | Some("true")
     );
     let (vault, outcome) = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             let vault = require_vault(conn, &vault_id)?;
             checkpoints::bootstrap(conn, clock, &actor, allow_degraded)
                 .map(|outcome| (vault, outcome))
@@ -1403,14 +1747,16 @@ async fn bootstrap(
 
 async fn renew_lease(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, lease_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let lease_id = parse_id16(&lease_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let lease = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             checkpoints::renew_lease(conn, clock, &actor, &lease_id)
         })
@@ -1443,13 +1789,15 @@ fn signed_body(fields: &wire::Fields, key: u64) -> Result<SignedBody> {
 
 async fn create_invite(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26：业务字段**只**从唯一 canonical body 解析（`{0: token_hash, 1: expires_at?}`）；
     // 外层 request_id/expected_control_rev 是签名输入的一部分，不接受第二份业务载荷。
@@ -1465,7 +1813,7 @@ async fn create_invite(
     let hook = state.hook.clone();
     let scope = management::scope("invites");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -1504,9 +1852,12 @@ async fn create_invite(
 
 async fn redeem_invite(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, invite_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response> {
+    // 公开路由：授权来自 invite token（不是 bearer），但 v2 形态仍计入业务入口限流。
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let invite_id = parse_id16(&invite_id)?;
     let fields = parse_body(&state, &body)?;
@@ -1525,7 +1876,7 @@ async fn redeem_invite(
     };
     let hook = state.hook.clone();
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             pairing::redeem_invite(conn, clock, hook.as_ref(), &invite_id, &token, &device)
         })
@@ -1539,14 +1890,16 @@ async fn redeem_invite(
 
 async fn approve_device(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, device_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let device_id = parse_id16(&device_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26：canonical body 的字段编号 0..=7 覆盖 approve 的全部业务输入；
     // 外层 3..=8 是旧 wire 的镜像，出现时必须与 body 逐字节一致（否则 403）。
@@ -1563,7 +1916,7 @@ async fn approve_device(
     let hook = state.hook.clone();
     let scope = management::scope("device-approve");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -1615,14 +1968,16 @@ async fn approve_device(
 /// 不追加控制记录、不换 root/epoch、不冻结 vault（同步是 E2E，删凭证只阻断访问）。
 async fn revoke_device(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, device_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let target = parse_id16(&device_id)?;
-    require_management_realm(&state, &headers)?;
+    require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26/ADR 0010：canonical body = `CDE{0: target_device, 1: request_id,
     // 2: expected_control_rev}`；业务字段**只**从这份被签 body 读。外层 1/2 是同一份事实的
@@ -1635,7 +1990,7 @@ async fn revoke_device(
     let hook = state.hook.clone();
     let scope = management::scope("device-revoke");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -1686,15 +2041,17 @@ fn slot_fields(slot: &slots::SlotRow) -> wire::CdeValue {
 
 async fn list_key_slots(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = authenticate(&state, &headers)?;
+    let actor = authenticate_face(&state, &headers, vault_id.into(), face)?;
     // ADR §20.2：device realm 只看 active/retiring；management realm 额外看到 staging。
     let include_staging = actor.realm == Realm::Management;
     let clock = state.db.clock_handle();
-    let rows = state.db.read(move |conn| {
+    let rows = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         if include_staging {
             slots::list_management(conn, clock.now_secs())
@@ -1710,13 +2067,15 @@ async fn list_key_slots(
 
 async fn put_key_slot(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, slot_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let slot_id = parse_hash32(&slot_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     let epoch = wire::uint_field(&fields, 0)?;
     let kind = SlotKind::parse(&wire::text_field(&fields, 1)?)
@@ -1725,7 +2084,7 @@ async fn put_key_slot(
     let signed = signed_body(&fields, 3)?;
     let hook = state.hook.clone();
     let row = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             slots::put(
                 conn,
@@ -1749,15 +2108,17 @@ async fn put_key_slot(
 
 async fn activate_key_slot(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, kind)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     if kind != SlotKind::Password.as_str() {
         return Err(Error::api(ErrorCode::InvalidRequest));
     }
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26：改口令的 canonical body `{0: expected_slot_set_rev, 1: new_slot_id}` 就是
     // **设备签名覆盖的字节**；外层 0/1 是旧 wire 的镜像，不一致 → 403。
@@ -1767,7 +2128,7 @@ async fn activate_key_slot(
     let new_slot_id = management::hash32_field(&fields, 1, &canonical, 1)?;
     let hook = state.hook.clone();
     let rev = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             slots::activate_password(
                 conn,
@@ -1802,7 +2163,7 @@ async fn activate_key_slot(
 /// 25 reservation?（0 reservation_id,1 owner_device,2 expires_at,3 reserved_bytes,
 ///    4 consumed_bytes,5 state）, 26 candidate_ready(uint 0/1)。
 fn rotation_fields(
-    conn: &rusqlite::Connection,
+    conn: &ScopeConn,
     now: i64,
     view: &rotations::RotationView,
 ) -> Result<wire::CdeValue> {
@@ -1911,7 +2272,7 @@ fn rotation_fields(
 
 /// checkpoint 元数据（candidate/GET 与 rotation view 共用）。
 fn checkpoint_meta_value(
-    conn: &rusqlite::Connection,
+    conn: &ScopeConn,
     checkpoint: &checkpoints::CheckpointRow,
 ) -> Result<wire::CdeValue> {
     let mut fields = vec![
@@ -1945,17 +2306,17 @@ fn checkpoint_meta_value(
 
 /// 轮换 reservation 的视图（没有则 None）。
 fn rotation_reservation_value(
-    conn: &rusqlite::Connection,
+    conn: &ScopeConn,
     rotation_id: &Id16,
 ) -> Result<Option<wire::CdeValue>> {
     let mut stmt = conn.prepare(
         "SELECT reservation_id, owner_device, expires_at, reserved_bytes, consumed_bytes, state
          FROM maintenance_reservations
-         WHERE purpose = 'rotation' AND resource_id = ?1
+         WHERE purpose = 'rotation' AND resource_id = ?1 AND vault_id = ?
          ORDER BY rowid DESC LIMIT 1",
     )?;
     let row = stmt
-        .query_row([rotation_id.as_slice()], |row| {
+        .query_row((rotation_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -1981,13 +2342,15 @@ fn rotation_reservation_value(
 
 async fn begin_rotation(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26：canonical body = `{0: expected_epoch, 1: expected_control_rev, 2: request_id,
     // 3: revoke[]}`（与 sync 客户端 `rotation::begin_body` 一致）。外层 1..=4 是旧 wire
@@ -2010,7 +2373,7 @@ async fn begin_rotation(
     let hook = state.hook.clone();
     let scope = management::scope("begin");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -2047,15 +2410,17 @@ async fn begin_rotation(
 
 async fn get_rotation(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
     // §28.1 条目 10：management（恢复）也需要读 r view，不再限 device realm。
-    authenticate(&state, &headers)?;
+    authenticate_face(&state, &headers, vault_id.into(), face)?;
     let clock = state.db.clock_handle();
-    let view = state.db.read(move |conn| {
+    let view = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         let view = rotations::view(conn, &rotation_id)?;
         rotation_fields(conn, clock.now_secs(), &view)
@@ -2065,14 +2430,16 @@ async fn get_rotation(
 
 async fn stage_grant(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id, device_id)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
     let recipient = parse_id16(&device_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26/§17.2：grant 的 canonical 字段就是本请求 map（0 grant_id / 1 hpke_enc /
     // 2 hpke_ciphertext / 3 signed_header / 4 signature / 5 manager_rev），**没有**第二份
@@ -2087,7 +2454,7 @@ async fn stage_grant(
     let manager_rev = wire::uint_field(&fields, 5)?;
     let hook = state.hook.clone();
     let view = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let input = GrantInput {
                 grant_id,
@@ -2115,14 +2482,16 @@ async fn stage_grant(
 
 async fn activate_rotation(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26/§27.2：canonical body = `{0: new_manager{0 transition,1 old_sig,2 new_sig},
     // 1: primary_checkpoint, 2: fallback_checkpoint}`。外层 3 是 new_manager 的旧 wire
@@ -2154,7 +2523,7 @@ async fn activate_rotation(
     let hook = state.hook.clone();
     let scope = management::scope("activate");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -2205,14 +2574,16 @@ async fn activate_rotation(
 
 async fn abort_rotation(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §26：abort 的 canonical body 是**空 map**（没有业务载荷）；request_id /
     // expected_control_rev 由管理签名输入直接绑定。非空 body 属未知键 → 400。
@@ -2226,7 +2597,7 @@ async fn abort_rotation(
     let hook = state.hook.clone();
     let scope = management::scope("abort");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -2262,20 +2633,22 @@ async fn abort_rotation(
 
 async fn get_current_rotation(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     // §28.1 条目 10（评审 §三 1）：management + device 都可读，用于响应丢失后按
     // `request_id` 找回结果（不盲重发 begin/activate）。
-    authenticate(&state, &headers)?;
+    authenticate_face(&state, &headers, vault_id.into(), face)?;
     let request_id = match query.get("request_id") {
         None => None,
         Some(value) => Some(parse_id16(value)?),
     };
     let clock = state.db.clock_handle();
-    let (view, replay) = state.db.read(move |conn| {
+    let (view, replay) = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         let view = match rotations::latest(conn)? {
             None => None,
@@ -2305,14 +2678,16 @@ async fn get_current_rotation(
 
 async fn restart_rotation(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // §28.1 条目 7：restart 的 canonical body 为空（request_id/control_rev 由管理签名绑定）。
     let canonical = CanonicalBody::parse(&fields, 0)?;
@@ -2325,7 +2700,7 @@ async fn restart_rotation(
     let hook = state.hook.clone();
     let scope = management::scope("restart");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -2364,14 +2739,16 @@ async fn restart_rotation(
 
 async fn revoke_more_rotation(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
-    let actor = require_management_realm(&state, &headers)?;
+    let actor = require_management_face(&state, &headers, vault_id.into(), face)?;
     let fields = parse_body(&state, &body)?;
     // canonical body = `{0: revoke[]}`；外层 3 是旧 wire 镜像（必须逐字节一致）。
     let canonical = CanonicalBody::parse(&fields, 0)?;
@@ -2391,7 +2768,7 @@ async fn revoke_more_rotation(
     let hook = state.hook.clone();
     let scope = management::scope("revoke-more");
     let outcome = state
-        .write(move |conn, clock| {
+        .write(vault_id.into(), move |conn, clock| {
             require_vault(conn, &vault_id)?;
             let call = management::ManagementCall {
                 scope: &scope,
@@ -2456,14 +2833,16 @@ fn grant_leaf_fields(grant: &rotations::GrantRow) -> wire::CdeValue {
 
 async fn list_rotation_grants(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
     // §28.1 条目 5 + 评审 §三 4：staged grants **仅 management** 可读。
-    require_management_realm(&state, &headers)?;
-    let (view, grants) = state.db.read(move |conn| {
+    require_management_face(&state, &headers, vault_id.into(), face)?;
+    let (view, grants) = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         let view = rotations::view(conn, &rotation_id)?;
         let grants = rotations::list_grants(conn, view.rotation.to_epoch)?;
@@ -2504,14 +2883,16 @@ fn grant_leaf_evidence_fields(grant: &rotations::GrantRow) -> wire::CdeValue {
 /// 不得信任 relay 自报的 digest。
 async fn list_rotation_grant_leaves(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let requester = actor.device_id()?;
-    let (view, grants) = state.db.read(move |conn| {
+    let (view, grants) = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         let view = rotations::view(conn, &rotation_id)?;
         if !matches!(
@@ -2539,14 +2920,16 @@ async fn list_rotation_grant_leaves(
 
 async fn list_rotation_assets(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, rotation_id)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
     // §28.1 条目 9（评审 §三 8）：冻结时刻的 finalized 资产分页读，不依赖可回收 log。
-    authenticate(&state, &headers)?;
+    authenticate_face(&state, &headers, vault_id.into(), face)?;
     let limit: u32 = query
         .get("limit")
         .map(|value| value.parse::<u32>())
@@ -2557,7 +2940,7 @@ async fn list_rotation_assets(
         None => None,
         Some(value) => Some(parse_hash32(value)?),
     };
-    let (rotation, refs, total) = state.db.read(move |conn| {
+    let (rotation, refs, total) = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         let rotation = rotations::get(conn, &rotation_id)?;
         let refs = objects::list_assets(
@@ -2598,14 +2981,16 @@ async fn list_rotation_assets(
 
 async fn get_checkpoint(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path((vault_id, checkpoint_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let checkpoint_id = parse_id16(&checkpoint_id)?;
     // §28.1 条目 3：候选 checkpoint 元数据/GET（readback-ready 与 published 分离）。
-    authenticate(&state, &headers)?;
-    let detail = state.db.read(move |conn| {
+    authenticate_face(&state, &headers, vault_id.into(), face)?;
+    let detail = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         let checkpoint = checkpoints::get(conn, &checkpoint_id)?;
         let mut fields = vec![
@@ -2645,13 +3030,15 @@ async fn get_checkpoint(
 
 async fn latest_grant(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
-    let actor = require_device(&state, &headers)?;
+    let actor = require_device_face(&state, &headers, vault_id.into(), face)?;
     let device_id = actor.device_id()?;
-    let grant = state.db.read(move |conn| {
+    let grant = state.db.read(vault_id.into(), move |conn| {
         require_vault(conn, &vault_id)?;
         rotations::latest_grant(conn, &device_id)
     })?;
@@ -2685,29 +3072,46 @@ async fn latest_grant(
 
 async fn wake(
     State(state): State<Arc<AppState>>,
+    face: ApiFace,
     Path(vault_id): Path<String>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
+    state.check_v2_data_rate(face)?;
     let vault_id = parse_id16(&vault_id)?;
     let token = bearer(&headers)?;
-    // 升级前先验证一次：无效/已吊销 token 直接 401，不建立 WS。
-    {
-        let clock = state.db.clock_handle();
-        let token = token.clone();
-        state.db.read(move |conn| {
-            auth::authenticate(conn, clock.as_ref(), &token)?;
-            Ok(())
-        })?;
+    // 升级前先验证一次：无效/已吊销/跨 vault 的 token 直接拒绝，不建立 WS。
+    match face {
+        // v1 旧行为逐字节保留：这里历史上**不做**跨 vault 复查，跨 vault token → 401。
+        ApiFace::V1 => {
+            let clock = state.db.clock_handle();
+            let probe = token.clone();
+            state.db.read(vault_id.into(), move |conn| {
+                auth::authenticate(conn, clock.as_ref(), &probe)?;
+                Ok(())
+            })?;
+        }
+        // v2：与其它 v2 路由同一语义（跨 vault token → 404，不泄露目标租户）。
+        ApiFace::V2 => {
+            authenticate_token_face(&state, &token, vault_id.into(), face)?;
+        }
     }
-    Ok(ws.on_upgrade(move |socket| wake_loop(state, vault_id, token, socket)))
+    Ok(ws.on_upgrade(move |socket| wake_loop(state, vault_id, token, face, socket)))
 }
 
-async fn wake_loop(state: Arc<AppState>, vault_id: Id16, token: String, mut socket: WebSocket) {
-    if !push_wake(&state, &vault_id, &token, &mut socket).await {
+async fn wake_loop(
+    state: Arc<AppState>,
+    vault_id: Id16,
+    token: String,
+    face: ApiFace,
+    mut socket: WebSocket,
+) {
+    // 先订阅再推首帧：否则"首帧水位的查询"与"订阅"之间的 notify 会丢
+    // （测试里也会变成依赖时序的偶发失败）。
+    let mut events = state.wake.subscribe();
+    if !push_wake(&state, &vault_id, &token, face, &mut socket).await {
         return;
     }
-    let mut events = state.wake.subscribe();
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -2724,12 +3128,12 @@ async fn wake_loop(state: Arc<AppState>, vault_id: Id16, token: String, mut sock
                 if event.is_err() {
                     return;
                 }
-                if !push_wake(&state, &vault_id, &token, &mut socket).await {
+                if !push_wake(&state, &vault_id, &token, face, &mut socket).await {
                     return;
                 }
             }
             _ = ticker.tick() => {
-                if !push_wake(&state, &vault_id, &token, &mut socket).await {
+                if !push_wake(&state, &vault_id, &token, face, &mut socket).await {
                     return;
                 }
             }
@@ -2737,13 +3141,23 @@ async fn wake_loop(state: Arc<AppState>, vault_id: Id16, token: String, mut sock
     }
 }
 
-/// 重新鉴权并推送最新水位；返回 false 表示应断开（吊销/过期/IO 错误）。
-async fn push_wake(state: &AppState, vault_id: &Id16, token: &str, socket: &mut WebSocket) -> bool {
+/// 重新鉴权并推送最新水位；返回 false 表示应断开（吊销/过期/跨 vault/IO 错误）。
+async fn push_wake(
+    state: &AppState,
+    vault_id: &Id16,
+    token: &str,
+    face: ApiFace,
+    socket: &mut WebSocket,
+) -> bool {
     let vault_id = *vault_id;
     let clock = state.db.clock_handle();
     let token = token.to_string();
-    let snapshot = state.db.read(move |conn| {
-        auth::authenticate(conn, clock.as_ref(), &token)?;
+    let snapshot = state.db.read(vault_id.into(), move |conn| {
+        let ctx = auth::authenticate(conn, clock.as_ref(), &token)?;
+        if face.is_v2() {
+            // v2：route vault 必须就是 token 所属 vault（防御性；查询本身已带 vault_id）。
+            ensure_same_vault(&ctx, conn.scope())?;
+        }
         let vault = require_vault(conn, &vault_id)?;
         Ok((vault.head_seq, vault.active_epoch, vault.control_rev))
     });
@@ -2775,7 +3189,27 @@ async fn push_wake(state: &AppState, vault_id: &Id16, token: &str, socket: &mut 
 
 /// 触发一次 GC tick（部署侧由后台任务定时调用；测试直接调）。
 pub async fn run_gc(state: Arc<AppState>) -> Result<gc::GcOutcome> {
-    state.write(move |conn, clock| gc::tick(conn, clock)).await
+    // 多租户：GC 是**每 vault 独立**的（预算/日志/快照/计划都按 vault 隔离），
+    // 逐个 vault 各跑一个写事务；一个 vault 的失败不影响其它 vault。
+    let vault_ids = state.db.read_instance(crate::db::schema::list_vault_ids)?;
+    let mut total = gc::GcOutcome::default();
+    for vault_id in vault_ids {
+        let scope = VaultScope::new(vault_id);
+        let outcome = state
+            .write(scope, move |conn, clock| gc::tick(conn, clock))
+            .await?;
+        total.deleted_log_rows += outcome.deleted_log_rows;
+        total.retired_update_objects += outcome.retired_update_objects;
+        total.deleted_staging_objects += outcome.deleted_staging_objects;
+        total.purged_slots += outcome.purged_slots;
+        total.pruned_checkpoints += outcome.pruned_checkpoints;
+        total.retired_pruned_objects += outcome.retired_pruned_objects;
+        total.blocked |= outcome.blocked;
+        total.unhealthy.extend(outcome.unhealthy);
+        total.floor = total.floor.max(outcome.floor);
+        total.cut_seq = total.cut_seq.max(outcome.cut_seq);
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

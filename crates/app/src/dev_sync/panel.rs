@@ -27,6 +27,30 @@
 //! - 自动刷新只发生在两个明确时点：面板打开（40 ms 泵的第一拍）与同步完成（宿主置位），
 //!   没有后台轮询；用户也可以点 `dev-sync-refresh-devices`。
 //!
+//! ## 轮换密钥 / 应用轮换（ADR 0009 Phase 2 切片 6b）
+//!
+//! 设备列表区域里有两个**独立**入口——移除设备只删凭证（ADR 0010 默认），轮换只有用户
+//! 显式点这里才会发生，两者不自动串联：
+//!
+//! - `dev-sync-rotate`「轮换密钥…」：仅 creator 可用（`can_manage` + 有活动文档 + 无在途）。
+//!   点它**只展开二次确认**（固定文案 [`ROTATE_CONFIRM_TEXT`]）；确认后才把
+//!   [`RotateRequest`]（恢复码 + revoke 列表）交给宿主持闸派发。
+//! - `dev-sync-apply-epoch`「应用轮换」：非 manager（Join/B 侧）的主动方；同样先展开
+//!   确认（[`APPLY_CONFIRM_TEXT`]）再请求派发。
+//!
+//! 选项：
+//!
+//! | 控件 | 默认 | 语义 |
+//! | --- | --- | --- |
+//! | `dev-sync-rotate-reissue` | 勾选 | 用当前恢复码重封候选 epoch 的 recovery 槽；未勾选时显示固定警告 [`ROTATE_NO_RECOVERY_WARNING`] |
+//! | `dev-sync-rotate-recovery` | 空 | **秘密输入**（遮罩、允许粘贴、不向平台报告正文）；提交后立刻清空，只在请求里留一份 `Zeroizing` |
+//! | `dev-sync-rotate-revoke` | 勾选 | 把**已移除**设备写进 signed revoke 列表；UI 不手选设备（按 `status=revoked` 过滤 members） |
+//!
+//! 不可用时不隐藏按钮，而是置灰 + 一行明确原因（[`DevSyncPanel::rotate_block_reason`] /
+//! [`DevSyncPanel::apply_block_reason`]）：无管理密钥、无活动文档、单操作在途、worker 已停。
+//! 轮换在途时阶段文案固定为 [`ROTATE_STAGES_TEXT`] + worker 的粗粒度明细（另一行
+//! `dev-sync-state` 仍显示 `Phase`），结束后不再显示。
+//!
 //! ## 固定 selector（headless 测试契约，见 `docs/notes/ui-headless-tests.md`）
 //!
 //! | selector | 元素 |
@@ -45,6 +69,20 @@
 //! | `dev-sync-member-<i>-status` | 该行的访问状态（含「本机」标记） |
 //! | `dev-sync-remove-<i>` | 该行的移除按钮（仅 Active 且非本机时渲染） |
 //! | `dev-sync-confirm-revoke` / `dev-sync-cancel-revoke` | 二次确认的确认/取消按钮 |
+//! | `dev-sync-invite` | 「邀请设备…」按钮（ADR 0014 S1；无管理钥/无活动文档/忙时置灰并说明） |
+//! | `dev-sync-invite-link` | 生成的邀请链接明文（**含 token**：只在本机内存/面板显示） |
+//! | `dev-sync-invite-ttl` | 邀请 TTL 文案（公开；不含 token） |
+//! | `dev-sync-copy-invite` | 「复制链接」（显式动作，不自动复制） |
+//! | `dev-sync-approve-<短id>` | pending 行的「批准」按钮（仅管理设备渲染） |
+//! | `dev-sync-approve-confirm` / `dev-sync-approve-cancel` | 批准确认区的确认/取消 |
+//! | `dev-sync-approve-warning` | 批准确认区：目标 device_id + sign/hpke 短 hash（双端比对） |
+//! | `dev-sync-rotation` | 轮换/应用轮换区域（设备列表区域的一部分） |
+//! | `dev-sync-rotate` / `dev-sync-apply-epoch` | 「轮换密钥…」/「应用轮换」按钮（不可用时置灰） |
+//! | `dev-sync-rotate-confirm` / `dev-sync-rotate-cancel` | 轮换确认区的确认/取消 |
+//! | `dev-sync-rotate-reissue` / `dev-sync-rotate-revoke` | 恢复码重封装 / 写入签名撤销列表复选框 |
+//! | `dev-sync-rotate-recovery` | 恢复码**秘密**输入（遮罩；仅勾选重封装时渲染） |
+//! | `dev-sync-rotate-warning` | 轮换确认区的固定警告行 |
+//! | `dev-sync-apply-confirm` / `dev-sync-apply-cancel` | 应用新 epoch 确认区的确认/取消 |
 //!
 //! **`dev-sync-sync` / `dev-sync-publish` 不直接对 service 发命令**（切片 4c-2 / 4c-4）：
 //! 它们只发 [`DevSyncPanelEvent::SyncRequested`] / [`DevSyncPanelEvent::PublishRequested`]，
@@ -56,6 +94,11 @@
 //! 密钥）。没有管理密钥（Join 设备）时按钮置灰，点击只给明确原因、**不**发请求——真正
 //! 的权威拒绝仍由 worker 重新读身份后给出。
 //!
+//! **轮换/应用新 epoch 也一样不直接发命令**：确认后只登记请求并发
+//! [`DevSyncPanelEvent::RotateRequested`] / [`DevSyncPanelEvent::ApplyEpochRequested`]；
+//! 宿主用 [`DevSyncPanel::take_rotate_request`] 取走恢复码（秘密不进事件），再走 6a 的
+//! 持闸状态机。轮换期间输入冻结、自动同步暂停，按钮一律置灰。
+//!
 //! selector 只是测试元数据（`debug_assertions + test-support` 下才有记录），业务逻辑
 //! **不得**依赖它们。
 
@@ -63,15 +106,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{div, px, Context, IntoElement, MouseButton, Render, SharedString, Window};
+use gpui::{
+    div, px, App, ClipboardItem, Context, Entity, IntoElement, MouseButton, Render, SharedString,
+    Window,
+};
 
 use crate::editor::theme;
+use crate::onboarding::input::FormInput;
 
 use menghunote_sync::http_relay::{MemberStatus, MemberView};
 use menghunote_sync::DeviceId;
 
 use super::service::{ServiceConfig, SyncService};
-use super::state::{short_device_id, Command, OpResult, StateSnapshot, REVOKE_UNCHANGED_MARKER};
+use super::state::{
+    short_device_id, Command, InviteLinkView, OpResult, StateSnapshot, REVOKE_UNCHANGED_MARKER,
+};
+use super::sync_once::RotateRequest;
 
 /// 面板 → 宿主（`AppShell`）的请求。
 ///
@@ -87,6 +137,12 @@ pub enum DevSyncPanelEvent {
     SyncRequested,
     /// 用户点了「发布基线」（切片 4c-4：同样必须由宿主先持闸）。
     PublishRequested,
+    /// 用户在轮换确认区点了「确认轮换」（切片 6b）：请求已登记在面板里，宿主用
+    /// [`DevSyncPanel::take_rotate_request`] 取走（恢复码/revoke 列表不在事件里，
+    /// 避免事件被 Debug/日志带走秘密）。
+    RotateRequested,
+    /// 用户在「应用轮换」确认区点了确认（切片 6b）。
+    ApplyEpochRequested,
 }
 
 impl gpui::EventEmitter<DevSyncPanelEvent> for DevSyncPanel {}
@@ -97,6 +153,33 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(40);
 const PANEL_WIDTH: f32 = 300.0;
 /// 顶部固定文案：任何 dev 演示都必须一眼看出"这不是生产"。
 const BANNER: &str = "DEV ONLY / 非生产 / localhost";
+
+/// 轮换确认区的**固定文案**（ADR 0009 Phase 2 切片 6b；一字不改）。
+///
+/// 它把这次操作的四面真相一次说完：重新加密整库、两份候选基线、旧 epoch 谁还能解、
+/// 以及操作期间的输入冻结。任何 UI 改动都不得删句。
+pub const ROTATE_CONFIRM_TEXT: &str = "轮换会用新密钥重新加密整库，并生成两份候选基线；\
+旧 epoch 数据不能再被新设备解密；被移除设备仍可解其已获得的数据；轮换期间输入会冻结。是否继续？";
+
+/// 未勾选「重新封装恢复码」时的**固定警告**（ADR 0009：`None` 不补发）。
+pub const ROTATE_NO_RECOVERY_WARNING: &str = "轮换后新设备将无法用恢复码加入";
+
+/// 已勾选「重新封装恢复码」但输入框为空时的提示（确认会被阻止，不发半截请求）。
+pub const ROTATE_RECOVERY_EMPTY_WARNING: &str =
+    "已勾选重新封装恢复码：请粘贴/输入当前恢复码（空则不提交轮换）";
+
+/// 「应用轮换」（应用新 epoch）确认区的**固定文案**。
+pub const APPLY_CONFIRM_TEXT: &str =
+    "应用新 epoch 需要重新验证授权并导入基线；期间输入会冻结。是否继续？";
+
+/// 轮换进行中的阶段文案（ADR 0009 Phase 2：申请 → 候选基线 → 激活 → 推广）。
+///
+/// 四段是**库级轮换的固定语义**；worker 的粗粒度 `Progress` 明细跟在后面（真正的
+/// 当前步骤），另一行 `dev-sync-state` 仍显示 `Phase` + 明细，不会把"轮换中"画成完成。
+pub const ROTATE_STAGES_TEXT: &str = "轮换中（申请/候选/激活/推广）";
+
+/// 轮换确认区里恢复码输入框的 placeholder（不含任何真实恢复码）。
+const RECOVERY_PLACEHOLDER: &str = "当前恢复码 mnrec1…（只用于本次重封）";
 
 /// 「移除设备（不轮换密钥）」的**固定安全文案**（ADR 0010 §安全边界）。
 ///
@@ -140,6 +223,46 @@ fn revoked_notice(target: &DeviceId, result: &OpResult) -> String {
     }
 }
 
+/// 批准成功/幂等的固定 notice（ADR 0014 S1）。
+fn approved_notice(target: &DeviceId, fingerprint: &str, changed: bool) -> String {
+    let short = short_device_id(target);
+    if changed {
+        format!("已批准 {short}（指纹 {fingerprint}）：请在加入端点「检查状态」导入基线")
+    } else {
+        format!("{short} 此前已批准（幂等；未重复签名，指纹 {fingerprint}）")
+    }
+}
+
+/// 状态行文案：状态 + 在途 op + 关闭门禁（只在有关闭流程时显示）。
+///
+/// 纯投影（只读 [`StateSnapshot`]）：不依赖 GPUI 上下文，单元测试可以直接断言。
+#[must_use]
+pub fn state_text(snapshot: &StateSnapshot) -> String {
+    let mut text = format!("状态：{}", snapshot.state.label());
+    if let Some((op_id, kind)) = snapshot.in_flight {
+        text.push_str(&format!("｜在途 {} {op_id}", kind.label()));
+    }
+    if let Some((phase, detail)) = &snapshot.progress {
+        text.push_str(&format!("｜{}：{detail}", phase.label()));
+    }
+    if snapshot.state.label().starts_with("关闭中") || snapshot.worker_stopped {
+        text.push_str(&format!("｜关闭：{}", snapshot.close.label()));
+    }
+    text
+}
+
+/// 错误行文案（最近错误；没有就显示"无"）。
+///
+/// 纯投影：headless 测试拿不到元素文本，只能从面板投影断言 `dev-sync-error` 会显示什么
+/// （失败原因不得只留在快照里）。
+#[must_use]
+pub fn error_text(snapshot: &StateSnapshot) -> String {
+    match &snapshot.last_error {
+        Some(error) => format!("最近错误：{error}"),
+        None => "最近错误：无".to_owned(),
+    }
+}
+
 /// dev-only 同步面板。
 pub struct DevSyncPanel {
     service: Arc<SyncService>,
@@ -157,8 +280,28 @@ pub struct DevSyncPanel {
     host_busy: bool,
     /// 待二次确认的移除目标（`None` = 没有确认区）。
     pending_revoke: Option<DeviceId>,
+    /// 待二次确认的批准目标（`None` = 没有批准确认区；ADR 0014 S1 §3）。
+    pending_approve: Option<DeviceId>,
+    /// 已消费过的批准事实（避免同一事实重复写 notice）。
+    seen_approval: Option<(DeviceId, String, bool)>,
     /// 面板已经消费过的移除结果（避免同一事实重复写 notice）。
     seen_revocation: Option<(DeviceId, OpResult)>,
+    /// 宿主视图里当前有没有活动文档（切片 6b：轮换/apply 必须在活动文档上持闸）。
+    ///
+    /// 这是**宿主事实**，面板自己不推断：`AppShell` 在打开/关闭文档与每次泵时写入。
+    has_active_document: bool,
+    /// 轮换确认区是否展开（点击只展开，不发命令）。
+    pending_rotate_confirm: bool,
+    /// 「应用轮换」确认区是否展开。
+    pending_apply_confirm: bool,
+    /// 是否重新封装恢复码（默认勾选 = ADR 0009 推荐路径）。
+    rotate_reissue: bool,
+    /// 是否把已移除设备写入签名撤销列表（ADR 0010：默认勾选，UI 不手选设备）。
+    rotate_revoke: bool,
+    /// 恢复码输入（秘密字段：遮罩 + 允许粘贴 + 不报告平台正文）。
+    recovery_input: Entity<FormInput>,
+    /// 已登记、等宿主取走的轮换请求（恢复码在这里，不进事件/Debug/日志）。
+    pending_rotate_request: Option<RotateRequest>,
     /// 待办的自动刷新（面板打开 / 同步完成各置一次；由 40 ms 事件泵派发）。
     ///
     /// 为什么不在构造/事件回调里**立刻**发命令：那会和用户/宿主的同步命令抢单操作
@@ -179,6 +322,13 @@ impl DevSyncPanel {
     pub fn with_service(service: Arc<SyncService>, cx: &mut Context<Self>) -> Self {
         let relay = service.config().relay.clone();
         let snapshot = service.snapshot();
+        // 恢复码输入是**秘密字段**：遮罩、允许粘贴、不向平台报告正文（ADR 0011 的
+        // `FormInput`）。它注册成独立实体，面板只持有句柄，提交后立刻 `clear()`。
+        let recovery_input = cx.new(|cx| {
+            FormInput::new(RECOVERY_PLACEHOLDER, true, cx)
+                .selector("dev-sync-rotate-recovery")
+                .click_to_focus()
+        });
         let panel = Self {
             service,
             relay,
@@ -188,7 +338,16 @@ impl DevSyncPanel {
             task_label: "同步",
             host_busy: false,
             pending_revoke: None,
+            pending_approve: None,
+            seen_approval: None,
             seen_revocation: None,
+            has_active_document: false,
+            pending_rotate_confirm: false,
+            pending_apply_confirm: false,
+            rotate_reissue: true,
+            rotate_revoke: true,
+            recovery_input,
+            pending_rotate_request: None,
             // 面板打开即读一次设备列表（ADR 0010 切片 2a-2）：由 40 ms 泵在空闲时派发。
             refresh_pending: true,
         };
@@ -226,6 +385,12 @@ impl DevSyncPanel {
         self.snapshot.can_manage_devices
     }
 
+    /// 本机设备 id（`None` = worker 还没上报身份；测试用来区分"本机行"）。
+    #[must_use]
+    pub fn self_device(&self) -> Option<DeviceId> {
+        self.snapshot.self_device
+    }
+
     /// 宿主更新**同步**的持闸状态（按钮置灰 + 面板行文案）。
     pub fn set_sync_state(&mut self, busy: bool, line: impl Into<String>) {
         self.set_task_state(busy, "同步", line);
@@ -244,10 +409,159 @@ impl DevSyncPanel {
         self.set_task_state(busy, "发布", line);
     }
 
+    /// 宿主更新**轮换密钥**的持闸状态（同一行，前缀「轮换」；切片 6a）。
+    ///
+    /// 轮换是长操作（同步+重加密+activate+重包）：面板必须能显示「轮换中」，
+    /// 而不是只转个空圈（ADR 0009 Phase 2）。
+    pub fn set_rotate_state(&mut self, busy: bool, line: impl Into<String>) {
+        self.set_task_state(busy, "轮换", line);
+    }
+
+    /// 宿主更新**应用新 epoch**的持闸状态（同一行，前缀「应用 epoch」；切片 6a）。
+    pub fn set_apply_epoch_state(&mut self, busy: bool, line: impl Into<String>) {
+        self.set_task_state(busy, "应用 epoch", line);
+    }
+
     fn set_task_state(&mut self, busy: bool, label: &'static str, line: impl Into<String>) {
         self.host_busy = busy;
         self.task_label = label;
         self.sync_line = Some(line.into());
+    }
+
+    /// 宿主写入"当前有没有活动文档"这个事实（切片 6b：轮换/apply 的硬前置条件）。
+    ///
+    /// 返回是否变化（调用方据此决定要不要 `cx.notify()`）。
+    pub fn set_active_document(&mut self, active: bool) -> bool {
+        if self.has_active_document == active {
+            return false;
+        }
+        self.has_active_document = active;
+        // 文档没了：展开中的轮换确认区必须收起（否则会留下一个提交必然被拒的表单）。
+        if !active {
+            self.pending_rotate_confirm = false;
+            self.pending_apply_confirm = false;
+        }
+        true
+    }
+
+    /// 当前有没有活动文档（宿主写入的事实）。
+    #[must_use]
+    pub const fn has_active_document(&self) -> bool {
+        self.has_active_document
+    }
+
+    /// 轮换按钮**为什么不可用**（`None` = 可用）。面板只做"提前给原因"，
+    /// 权威判定仍在 worker（重读身份/库/闸门）。
+    #[must_use]
+    pub fn rotate_block_reason(&self) -> Option<&'static str> {
+        if self.snapshot.worker_stopped {
+            return Some("dev-sync worker 已停止（请重启实例）");
+        }
+        if self.snapshot.in_flight.is_some() || self.host_busy {
+            return Some("已有操作在途（单操作串行），等面板回到空闲再点");
+        }
+        if self.snapshot.self_device.is_none() {
+            return Some("还没有读到本机设备身份（面板打开后会自动刷新设备列表），请稍后再试");
+        }
+        if !self.snapshot.can_manage_devices {
+            return Some("本机没有管理密钥（Join 设备不能发起轮换）；请用 Create 设备发起");
+        }
+        if !self.has_active_document {
+            return Some(
+                "当前没有打开的笔记；轮换需要先在活动文档上持闸冻结（请先打开一篇笔记再试）",
+            );
+        }
+        None
+    }
+
+    /// 「应用轮换」为什么不可用（`None` = 可用）。
+    ///
+    /// 与轮换不同：**不要求管理密钥**（B/Join 设备正是这一侧的主动方）；只要求 worker
+    /// 活着、单操作槽空闲、已经读到本机身份、并且有活动文档可以持闸。
+    #[must_use]
+    pub fn apply_block_reason(&self) -> Option<&'static str> {
+        if self.snapshot.worker_stopped {
+            return Some("dev-sync worker 已停止（请重启实例）");
+        }
+        if self.snapshot.in_flight.is_some() || self.host_busy {
+            return Some("已有操作在途（单操作串行），等面板回到空闲再点");
+        }
+        if self.snapshot.self_device.is_none() {
+            return Some("还没有读到本机设备身份（面板打开后会自动刷新设备列表），请稍后再试");
+        }
+        if !self.has_active_document {
+            return Some(
+                "当前没有打开的笔记；apply 需要先在活动文档上持闸冻结（请先打开一篇笔记再试）",
+            );
+        }
+        None
+    }
+
+    /// 轮换确认区是否展开。
+    #[must_use]
+    pub const fn rotate_confirm_open(&self) -> bool {
+        self.pending_rotate_confirm
+    }
+
+    /// 「应用轮换」确认区是否展开。
+    #[must_use]
+    pub const fn apply_confirm_open(&self) -> bool {
+        self.pending_apply_confirm
+    }
+
+    /// 「重新封装恢复码」是否勾选（默认 `true`）。
+    #[must_use]
+    pub const fn rotate_reissue_enabled(&self) -> bool {
+        self.rotate_reissue
+    }
+
+    /// 「写入签名撤销列表」是否勾选（默认 `true`，ADR 0010）。
+    #[must_use]
+    pub const fn rotate_revoke_enabled(&self) -> bool {
+        self.rotate_revoke
+    }
+
+    /// 恢复码输入框里的**长度**（测试断言"已粘贴/已清空"；**不暴露正文**）。
+    #[must_use]
+    pub fn rotate_recovery_len(&self, cx: &App) -> usize {
+        self.recovery_input.read(cx).text().len()
+    }
+
+    /// 恢复码输入框是否秘密字段（遮罩 + 不向平台报告正文）。
+    #[must_use]
+    pub fn rotate_recovery_is_secret(&self, cx: &App) -> bool {
+        self.recovery_input.read(cx).is_secret()
+    }
+
+    /// 轮换确认区当前应显示的**固定警告**（`None` = 没有警告）。
+    ///
+    /// 两种来源：未勾选重封装（固定文案）与勾选但输入为空（提交会被阻止）。
+    #[must_use]
+    pub fn rotate_warning_text(&self, cx: &App) -> Option<&'static str> {
+        if !self.rotate_reissue {
+            return Some(ROTATE_NO_RECOVERY_WARNING);
+        }
+        if self.rotate_recovery_len(cx) == 0 {
+            return Some(ROTATE_RECOVERY_EMPTY_WARNING);
+        }
+        None
+    }
+
+    /// 轮换进行中的阶段文案（`None` = 当前不在轮换）。
+    #[must_use]
+    pub fn rotation_stage_text(&self) -> Option<String> {
+        if !self.host_busy || self.task_label != "轮换" {
+            return None;
+        }
+        let detail = self.sync_line.as_deref().unwrap_or("等待 worker");
+        Some(format!("{ROTATE_STAGES_TEXT}：{detail}"))
+    }
+
+    /// 取走已登记的轮换请求（宿主在 `dev_sync_pump` 里调用；**只取一次**）。
+    ///
+    /// 恢复码随请求一起移交给宿主 → `Command::Rotate`，面板不再留副本。
+    pub fn take_rotate_request(&mut self) -> Option<RotateRequest> {
+        self.pending_rotate_request.take()
     }
 
     /// 宿主写一行"最近操作"（同步完成/失败/被拒绝的原因）。
@@ -279,12 +593,23 @@ impl DevSyncPanel {
                 self.notice = Some(revoked_notice(target, result));
             }
         }
+        if self.snapshot.last_approved != self.seen_approval {
+            self.seen_approval = self.snapshot.last_approved.clone();
+            if let Some((target, fingerprint, changed)) = &self.snapshot.last_approved {
+                self.notice = Some(approved_notice(target, fingerprint, *changed));
+            }
+        }
         changed
     }
 
     /// 空闲时派发一次待办的设备列表刷新（只从 40 ms 泵调用，不在渲染里发命令）。
     fn dispatch_pending_refresh(&mut self) {
         if !self.refresh_pending {
+            return;
+        }
+        // 确认区展开时不要抢单操作槽：用户正在填恢复码/做决定，此时插一条刷新会让
+        // 「确认轮换」立刻变成"已有操作在途"。等确认区收起再刷新（待办不丢）。
+        if self.pending_rotate_confirm || self.pending_apply_confirm {
             return;
         }
         // 有在途 op / worker 已停：保留待办，下一拍再试（不与同步抢单操作串行位）。
@@ -301,19 +626,17 @@ impl DevSyncPanel {
     /// `SyncOnce` 例外：它必须由宿主先持闸（切片 4c-2），这里只发一个请求事件。
     /// 「发布基线」走 [`Self::request_publish`]（同样只发请求，4c-4）。
     fn send(&mut self, command: Command, cx: &mut Context<Self>) {
-        if command == Command::SyncOnce {
+        if matches!(&command, Command::SyncOnce) {
             self.notice = Some("请求同步：由 AppShell 持闸后派发 worker".to_owned());
             cx.emit(DevSyncPanelEvent::SyncRequested);
             cx.notify();
             return;
         }
+        // `Command` 不再 `Copy`（`Rotate` 带秘密/列表）：先取标签，再移动。
+        let kind = command.kind();
         self.notice = Some(match self.service.try_command(command) {
-            Ok(op_id) => format!("已排队：{} {op_id}", command.kind().label()),
-            Err(busy) => format!(
-                "已拒绝：{}（{}）",
-                command.kind().label(),
-                busy.reason.label()
-            ),
+            Ok(op_id) => format!("已排队：{} {op_id}", kind.label()),
+            Err(busy) => format!("已拒绝：{}（{}）", kind.label(), busy.reason.label()),
         });
         // 控制命令（Stop）可能已经回执：立刻收一次，别等下一帧。
         self.pump();
@@ -340,17 +663,7 @@ impl DevSyncPanel {
 
     /// 状态行文案：状态 + 在途 op + 关闭门禁（只在有关闭流程时显示）。
     fn state_text(&self) -> String {
-        let mut text = format!("状态：{}", self.snapshot.state.label());
-        if let Some((op_id, kind)) = self.snapshot.in_flight {
-            text.push_str(&format!("｜在途 {} {op_id}", kind.label()));
-        }
-        if let Some((phase, detail)) = &self.snapshot.progress {
-            text.push_str(&format!("｜{}：{detail}", phase.label()));
-        }
-        if self.snapshot.state.label().starts_with("关闭中") || self.snapshot.worker_stopped {
-            text.push_str(&format!("｜关闭：{}", self.snapshot.close.label()));
-        }
-        text
+        state_text(&self.snapshot)
     }
 
     /// 错误行文案（最近错误；没有就显示"无"）。
@@ -359,10 +672,7 @@ impl DevSyncPanel {
     /// `dev-sync-error` 会显示什么（失败原因不得只留在快照里）。
     #[must_use]
     pub fn error_text(&self) -> String {
-        match &self.snapshot.last_error {
-            Some(error) => format!("最近错误：{error}"),
-            None => "最近错误：无".to_owned(),
-        }
+        error_text(&self.snapshot)
     }
 
     /// 一个可点击元素（统一样式；`dimmed` 只影响视觉，真正的拒绝由业务逻辑给原因）。
@@ -426,12 +736,127 @@ impl DevSyncPanel {
         // 面板不自己发明规则（状态机才是唯一真源）。切片 4c-2 起，持闸同步在途
         // （`host_busy`，此时 service 可能还没 Busy）也算"点不动"。
         let dimmed = (self.snapshot.in_flight.is_some() || self.host_busy) && !command.is_control();
+        // `Command` 不再 `Copy`：用一次性槽把它交给点击回调（同一个按钮连点两次时第二次
+        // 无命令可发，面板已经忙/拒绝，语义安全）。
+        let command = std::rc::Rc::new(std::cell::RefCell::new(Some(command)));
         self.action_button(selector, label, danger, dimmed, cx, move |panel, cx| {
-            panel.send(command, cx);
+            if let Some(command) = command.borrow_mut().take() {
+                panel.send(command, cx);
+            }
         })
     }
 
+    /// 当前邀请链接（`None` = 没生成过；token 只在内存）。
+    #[must_use]
+    pub fn invite_link(&self) -> Option<&InviteLinkView> {
+        self.snapshot.invite_link.as_ref()
+    }
+
+    /// 正在等确认的批准目标（`None` = 没有确认区）。
+    #[must_use]
+    pub fn pending_approve_target(&self) -> Option<DeviceId> {
+        self.pending_approve
+    }
+
+    /// 「邀请设备…」为什么不可用（`None` = 可用）。
+    ///
+    /// ADR 0014 S1：无管理钥 / 无活动文档 / 有在途操作 / 宿主持闸忙 都禁用并说明。
+    #[must_use]
+    pub fn invite_block_reason(&self) -> Option<&'static str> {
+        if self.snapshot.worker_stopped {
+            return Some("worker 已停止：不能生成邀请");
+        }
+        if !self.snapshot.can_manage_devices {
+            return Some("本机没有管理密钥（Join/邀请加入的设备）：不能生成邀请链接");
+        }
+        if !self.has_active_document {
+            return Some("没有活动文档：请先打开一篇笔记再生成邀请（避免在途初始化）");
+        }
+        if self.snapshot.in_flight.is_some() || self.host_busy {
+            return Some("有操作在途：等收尾后再生成邀请");
+        }
+        if self.snapshot.state.is_busy() {
+            return Some("同步/轮换在途：等收尾后再生成邀请");
+        }
+        None
+    }
+
+    /// 批准确认区的文案（目标 device_id + sign/hpke 短 hash；双端人工比对用）。
+    ///
+    /// headless 测试拿不到元素文本，靠这个纯投影断言"双端指纹"确实显示了。
+    #[must_use]
+    pub fn approve_confirm_text(&self) -> Option<String> {
+        let target = self.pending_approve?;
+        let member = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|member| member.device_id == target)?;
+        Some(format!(
+            "批准设备 {}｜sign {}｜hpke {}（请与加入端显示的短 hash 逐字核对）",
+            menghunote_sync::ids::hex_of(&target),
+            menghunote_sync::invite_link::key_short_hash(&member.sign_pk),
+            menghunote_sync::invite_link::key_short_hash(&member.hpke_pk)
+        ))
+    }
+
+    /// 点击「邀请设备…」：直接派发 `CreateInvite`（单操作串行，结果经事件回面板）。
+    fn request_invite(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.invite_block_reason() {
+            self.notice = Some(format!("未生成邀请：{reason}"));
+            cx.notify();
+            return;
+        }
+        // 新链接替换旧链接（旧 token 不再展示，避免复制到已过期的那个）。
+        self.send(Command::CreateInvite, cx);
+    }
+
+    /// 「复制链接」：显式动作（不自动复制），并把风险提示写进 notice。
+    fn copy_invite_link(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = self
+            .snapshot
+            .invite_link
+            .as_ref()
+            .map(|link| link.url.clone())
+        else {
+            self.notice = Some("还没有可复制的邀请链接：请先点「邀请设备…」".to_owned());
+            cx.notify();
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+        self.notice = Some(
+            "已复制邀请链接（含一次性令牌）：只发给要加入的那台设备；剪贴板历史可能保留副本"
+                .to_owned(),
+        );
+        cx.notify();
+    }
+
+    /// 点击 pending 行的「批准」：只展开确认区（先核对双端指纹），不发命令。
+    fn request_approve(&mut self, target: DeviceId, cx: &mut Context<Self>) {
+        if !self.snapshot.can_manage_devices {
+            self.notice = Some("未展开批准：本机没有管理密钥".to_owned());
+            cx.notify();
+            return;
+        }
+        self.pending_approve = Some(target);
+        self.pending_revoke = None;
+        self.notice = Some(
+            "等待确认批准：请与加入端核对设备 id 与 sign/hpke 短 hash，再点「确认批准」".to_owned(),
+        );
+        cx.notify();
+    }
+
+    /// 确认批准：清掉确认区并派发命令（失败不清 pending、不重签）。
+    fn confirm_approve(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.pending_approve.take() else {
+            return;
+        };
+        self.send(Command::ApproveDevice { device: target }, cx);
+    }
+
     /// 设备列表区域（ADR 0010 切片 2a-2）：固定警告 + 刷新按钮 + 每台设备一行 + 确认区。
+    ///
+    /// ADR 0014 S1 把邀请/批准入口也放在这里（同一份成员视图，pending 行才渲染批准）。
     fn render_devices(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let self_device = self.snapshot.self_device;
         let can_manage = self.snapshot.can_manage_devices;
@@ -492,6 +917,21 @@ impl DevSyncPanel {
                                 .child(SharedString::from(format!("{short} · {fingerprint}"))),
                         ),
                 );
+            // 批准按钮：**只**给 Pending 行、且本机有管理密钥时渲染（ADR 0014 S1；
+            // 非管理设备连入口都不出现）。
+            if member.status == MemberStatus::Pending && can_manage {
+                let target = member.device_id;
+                let selector = format!("dev-sync-approve-{short}");
+                let dimmed = busy || self.snapshot.state.is_busy();
+                row = row.child(self.action_button(
+                    selector,
+                    "批准…",
+                    false,
+                    dimmed,
+                    cx,
+                    move |panel, cx| panel.request_approve(target, cx),
+                ));
+            }
             // 移除按钮：**只**给 Active 且非本机的行渲染。pending/revoked/expired/本机
             // 连按钮都不出现（确认流入口越少越好）。
             if member.status == MemberStatus::Active && !is_self {
@@ -550,6 +990,111 @@ impl DevSyncPanel {
                 );
         }
 
+        // 批准确认区：先展示目标 device_id 与双端可核对的短 hash，确认后才发命令。
+        if let Some(text) = self.approve_confirm_text() {
+            let target = self.pending_approve;
+            list = list
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme::text_color())
+                        .child(SharedString::from("确认批准这台设备？")),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "dev-sync-approve-warning".to_string())
+                        .text_size(px(10.0))
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(text)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .child(self.action_button(
+                            "dev-sync-approve-confirm",
+                            "确认批准",
+                            false,
+                            false,
+                            cx,
+                            move |panel, cx| panel.confirm_approve(cx),
+                        ))
+                        .child(self.action_button(
+                            "dev-sync-approve-cancel",
+                            "取消",
+                            false,
+                            false,
+                            cx,
+                            move |panel, _cx| panel.pending_approve = None,
+                        )),
+                );
+            let _ = target;
+        }
+
+        // 邀请区（ADR 0014 S1）：按钮常显（不可用时置灰 + 原因）；链接只在内存里展示。
+        let invite_reason = self.invite_block_reason();
+        let mut invite_area = div()
+            .id("dev-sync-invite-area")
+            .debug_selector(|| "dev-sync-invite-area".to_string())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt(px(4.0))
+            .border_t_1()
+            .border_color(theme::sidebar_border())
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::text_color())
+                    .child(SharedString::from("邀请设备（单 vault；创建者批准后生效）")),
+            )
+            .child(self.action_button(
+                "dev-sync-invite",
+                "邀请设备…",
+                false,
+                invite_reason.is_some(),
+                cx,
+                |panel, cx| panel.request_invite(cx),
+            ));
+        if let Some(reason) = invite_reason {
+            invite_area = invite_area.child(
+                div()
+                    .debug_selector(|| "dev-sync-invite-blocked".to_string())
+                    .text_size(px(10.0))
+                    .text_color(theme::status_bar_text())
+                    .child(SharedString::from(reason)),
+            );
+        }
+        if let Some(link) = self.snapshot.invite_link.as_ref() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            invite_area = invite_area
+                .child(
+                    div()
+                        .debug_selector(|| "dev-sync-invite-link".to_string())
+                        .text_size(px(10.0))
+                        .text_color(theme::text_color())
+                        .child(SharedString::from(link.url.clone())),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "dev-sync-invite-ttl".to_string())
+                        .text_size(px(10.0))
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(link.ttl_text(now))),
+                )
+                .child(self.action_button(
+                    "dev-sync-copy-invite",
+                    "复制链接",
+                    false,
+                    false,
+                    cx,
+                    |panel, cx| panel.copy_invite_link(cx),
+                ));
+        }
+
         div()
             .id("dev-sync-devices")
             .debug_selector(|| "dev-sync-devices".to_string())
@@ -584,6 +1129,253 @@ impl DevSyncPanel {
                 |panel, cx| panel.send(Command::ListDevices, cx),
             ))
             .child(list)
+            .child(invite_area)
+            .child(self.render_rotation(cx))
+    }
+
+    /// 轮换密钥 / 应用轮换的入口 + 两段二次确认（ADR 0009 Phase 2 切片 6b）。
+    ///
+    /// 两个动作**独立**于「移除设备」：移除只删凭证（ADR 0010 默认），轮换只有用户显式
+    /// 点这里才会发生；轮换也不会自动串联到移除。
+    fn render_rotation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rotate_dimmed = self.rotate_block_reason().is_some();
+        let apply_dimmed = self.apply_block_reason().is_some();
+        let hint = self.rotation_hint();
+        let mut block = div()
+            .id("dev-sync-rotation")
+            .debug_selector(|| "dev-sync-rotation".to_string())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt(px(4.0))
+            .border_t_1()
+            .border_color(theme::sidebar_border())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(self.action_button(
+                        "dev-sync-rotate",
+                        "轮换密钥…",
+                        true,
+                        rotate_dimmed,
+                        cx,
+                        |panel, cx| panel.request_rotate_confirm(cx),
+                    ))
+                    .child(self.action_button(
+                        "dev-sync-apply-epoch",
+                        "应用轮换",
+                        false,
+                        apply_dimmed,
+                        cx,
+                        |panel, cx| panel.request_apply_confirm(cx),
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme::status_bar_text())
+                    .child(SharedString::from(hint)),
+            );
+
+        if self.pending_rotate_confirm {
+            block = block.child(self.render_rotate_confirm(cx));
+        }
+        if self.pending_apply_confirm {
+            block = block.child(self.render_apply_confirm(cx));
+        }
+        block
+    }
+
+    /// 轮换入口的状态行：先给"正在轮换"的阶段（四段 + worker 明细），再给不可用原因。
+    fn rotation_hint(&self) -> String {
+        if let Some(stage) = self.rotation_stage_text() {
+            return stage;
+        }
+        if let Some(reason) = self.rotate_block_reason() {
+            return format!("轮换不可用：{reason}");
+        }
+        "轮换可用：会重新加密整库并生成两份候选基线（被移除设备仍可解旧数据）".to_owned()
+    }
+
+    /// 轮换二次确认区：固定文案 + 恢复码重封装选项 + 撤销列表选项 + 警告 + 确认/取消。
+    fn render_rotate_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let reissue = self.rotate_reissue;
+        let warning = self.rotate_warning_text(cx);
+        let warning_text = warning.unwrap_or("恢复码将随新 epoch 重封，提交后输入框立即清空");
+        let warning_color = if warning.is_some() {
+            theme::danger_text()
+        } else {
+            theme::status_bar_text()
+        };
+        let revoked = self.revoked_device_ids().len();
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p(px(6.0))
+            .border_1()
+            .border_color(theme::input_border())
+            .rounded_sm()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::text_color())
+                    .child(SharedString::from(ROTATE_CONFIRM_TEXT)),
+            )
+            .child(self.checkbox_row(
+                "dev-sync-rotate-reissue",
+                reissue,
+                "重新封装恢复码（推荐）",
+                cx,
+                |panel, cx| panel.toggle_reissue(cx),
+            ));
+        if reissue {
+            block = block
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(
+                            "当前恢复码（遮罩输入；只用于本次重封，提交后立即清空）",
+                        )),
+                )
+                .child(self.recovery_input.clone());
+        }
+        block
+            .child(self.checkbox_row(
+                "dev-sync-rotate-revoke",
+                self.rotate_revoke,
+                "同时把已移除设备写入签名撤销列表",
+                cx,
+                |panel, cx| panel.toggle_revoke(cx),
+            ))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme::status_bar_text())
+                    .child(SharedString::from(format!(
+                        "已移除设备 {revoked} 台会被写进本次 signed revoke 列表（不手选，按列表状态）"
+                    ))),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "dev-sync-rotate-warning".to_string())
+                    .text_size(px(10.0))
+                    .text_color(warning_color)
+                    .child(SharedString::from(warning_text)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(self.action_button(
+                        "dev-sync-rotate-confirm",
+                        "确认轮换",
+                        true,
+                        false,
+                        cx,
+                        |panel, cx| panel.confirm_rotate(cx),
+                    ))
+                    .child(self.action_button(
+                        "dev-sync-rotate-cancel",
+                        "取消",
+                        false,
+                        false,
+                        cx,
+                        |panel, cx| panel.cancel_rotate(cx),
+                    )),
+            )
+    }
+
+    /// 「应用轮换」二次确认区（固定文案 + 确认/取消）。
+    fn render_apply_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p(px(6.0))
+            .border_1()
+            .border_color(theme::input_border())
+            .rounded_sm()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::text_color())
+                    .child(SharedString::from(APPLY_CONFIRM_TEXT)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(self.action_button(
+                        "dev-sync-apply-confirm",
+                        "确认应用",
+                        false,
+                        false,
+                        cx,
+                        |panel, cx| panel.confirm_apply(cx),
+                    ))
+                    .child(self.action_button(
+                        "dev-sync-apply-cancel",
+                        "取消",
+                        false,
+                        false,
+                        cx,
+                        |panel, cx| panel.cancel_apply(cx),
+                    )),
+            )
+    }
+
+    /// 一行复选框（与 ADR 0011 的向导同一形态；无第三方组件依赖）。
+    fn checkbox_row(
+        &self,
+        selector: &'static str,
+        checked: bool,
+        label: &'static str,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut DevSyncPanel, &mut Context<DevSyncPanel>) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(selector))
+            .debug_selector(move || selector.to_string())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .child(
+                div()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .bg(theme::input_bg())
+                    .text_size(px(11.0))
+                    .text_color(theme::text_color())
+                    .child(SharedString::from(if checked { "✓" } else { " " })),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme::text_color())
+                    .child(SharedString::from(label)),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |panel, _event: &gpui::MouseDownEvent, _window, cx| {
+                    on_click(panel, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            )
     }
 
     /// 点击「移除」：只在有管理密钥时进入二次确认（否则给明确原因）。
@@ -644,6 +1436,149 @@ impl DevSyncPanel {
     fn confirm_revoke(&mut self, target: DeviceId, cx: &mut Context<Self>) {
         self.pending_revoke = None;
         self.send(Command::RevokeDevice { target }, cx);
+    }
+
+    /// 点击「轮换密钥…」：只展开**二次确认区**，不发任何命令（切片 6b）。
+    ///
+    /// 不可用时给明确原因并**不**展开——确认区本身就是"你要为这次重加密签字"的位置，
+    /// 让一个注定被拒的表单展开只会误导。
+    fn request_rotate_confirm(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.rotate_block_reason() {
+            self.pending_rotate_confirm = false;
+            self.notice = Some(format!("未展开轮换确认：{reason}"));
+            cx.notify();
+            return;
+        }
+        // 两个确认区互斥：同时展开会让"确认"按钮指向不明。
+        self.pending_apply_confirm = false;
+        self.pending_rotate_confirm = true;
+        self.notice =
+            Some("等待确认：轮换会用新密钥重新加密整库（期间输入冻结、自动同步暂停）".to_owned());
+        cx.notify();
+    }
+
+    /// 点击「应用轮换」：展开应用新 epoch 的二次确认区（不发命令）。
+    fn request_apply_confirm(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.apply_block_reason() {
+            self.pending_apply_confirm = false;
+            self.notice = Some(format!("未展开应用新 epoch 确认：{reason}"));
+            cx.notify();
+            return;
+        }
+        self.pending_rotate_confirm = false;
+        self.pending_apply_confirm = true;
+        self.notice =
+            Some("等待确认：应用新 epoch 会重新验证授权并导入基线（期间输入冻结）".to_owned());
+        cx.notify();
+    }
+
+    /// 取消轮换：收起确认区、**清空恢复码**、不写任何东西。
+    fn cancel_rotate(&mut self, cx: &mut Context<Self>) {
+        if self.pending_rotate_confirm {
+            self.pending_rotate_confirm = false;
+            self.recovery_input.update(cx, |input, _| input.clear());
+            self.notice = Some("已取消轮换：没有写入任何内容（epoch/身份不变）".to_owned());
+        }
+        cx.notify();
+    }
+
+    /// 取消「应用轮换」：收起确认区，不发命令。
+    fn cancel_apply(&mut self, cx: &mut Context<Self>) {
+        if self.pending_apply_confirm {
+            self.pending_apply_confirm = false;
+            self.notice = Some("已取消应用新 epoch：没有写入任何内容".to_owned());
+        }
+        cx.notify();
+    }
+
+    fn toggle_reissue(&mut self, cx: &mut Context<Self>) {
+        self.rotate_reissue = !self.rotate_reissue;
+        if !self.rotate_reissue {
+            // 不重封就把输入框里的秘密丢掉（不再需要，也不该留在内存里）。
+            self.recovery_input.update(cx, |input, _| input.clear());
+        }
+        cx.notify();
+    }
+
+    fn toggle_revoke(&mut self, cx: &mut Context<Self>) {
+        self.rotate_revoke = !self.rotate_revoke;
+        cx.notify();
+    }
+
+    /// 本次要写进 signed begin body 的吊销列表（ADR 0010）。
+    ///
+    /// UI **不要求手选设备**：后端按 relay 的 `status=revoked` 列表来；接口只接受设备
+    /// 列表，所以这里从当前 members 里过滤已移除设备。
+    fn revoked_device_ids(&self) -> Vec<DeviceId> {
+        self.snapshot
+            .devices
+            .iter()
+            .filter(|member| member.status == MemberStatus::Revoked)
+            .map(|member| member.device_id)
+            .collect()
+    }
+
+    /// 确认轮换：读一次恢复码（按需）→ 清空输入 → 登记请求 → 通知宿主持闸派发。
+    ///
+    /// 顺序理由：恢复码**只读一次**并立刻从输入框清掉（ADR 0009/0011「只显示一次、
+    /// 提交后清除」）；请求里的秘密由 [`RotateRequest`] 的 `Zeroizing` 持有，不进
+    /// 事件/Debug/日志。
+    fn confirm_rotate(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.rotate_block_reason() {
+            self.pending_rotate_confirm = false;
+            self.recovery_input.update(cx, |input, _| input.clear());
+            self.notice = Some(format!("轮换未提交：{reason}"));
+            cx.notify();
+            return;
+        }
+        let recovery = if self.rotate_reissue {
+            let text = self.recovery_input.read(cx).text().trim().to_owned();
+            if text.is_empty() {
+                // 不收起确认区：让用户补输入或取消勾选，而不是派发一个缺恢复码的请求。
+                self.notice = Some(format!("轮换未提交：{ROTATE_RECOVERY_EMPTY_WARNING}"));
+                cx.notify();
+                return;
+            }
+            Some(text)
+        } else {
+            None
+        };
+        // 秘密只读一次：无论后面成功与否，输入框立刻清空。
+        self.recovery_input.update(cx, |input, _| input.clear());
+        self.pending_rotate_confirm = false;
+        let revoke = if self.rotate_revoke {
+            self.revoked_device_ids()
+        } else {
+            Vec::new()
+        };
+        let reissued = recovery.is_some();
+        let revoked = revoke.len();
+        self.pending_rotate_request = Some(RotateRequest::new(recovery, revoke));
+        self.notice = Some(if reissued {
+            format!(
+                "请求轮换：恢复码将随新 epoch 重封（吊销 {revoked} 台）；由 AppShell 持闸后派发 worker"
+            )
+        } else {
+            format!(
+                "请求轮换：不重封恢复码（吊销 {revoked} 台）——{ROTATE_NO_RECOVERY_WARNING}；由 AppShell 持闸后派发 worker"
+            )
+        });
+        cx.emit(DevSyncPanelEvent::RotateRequested);
+        cx.notify();
+    }
+
+    /// 确认「应用轮换」：登记请求并通知宿主持闸派发。
+    fn confirm_apply(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.apply_block_reason() {
+            self.pending_apply_confirm = false;
+            self.notice = Some(format!("应用新 epoch 未提交：{reason}"));
+            cx.notify();
+            return;
+        }
+        self.pending_apply_confirm = false;
+        self.notice = Some("请求应用新 epoch：由 AppShell 持闸后派发 worker".to_owned());
+        cx.emit(DevSyncPanelEvent::ApplyEpochRequested);
+        cx.notify();
     }
 }
 
@@ -763,53 +1698,43 @@ mod tests {
     /// `state_text`/`error_text` 是纯投影：只验"该显示的都在"，不依赖 GPUI 上下文。
     #[test]
     fn state_text_projects_busy_progress_and_close() {
-        let config = ServiceConfig::new("http://127.0.0.1:18080");
-        // 不启动 worker 的轻量构造：本测试只读投影函数，不需要事件泵。
-        let service = SyncService::new(config.clone());
-        let mut panel = DevSyncPanel {
-            service,
-            relay: config.relay.clone(),
-            snapshot: StateSnapshot {
-                state: DevSyncState::Busy {
-                    op_id: super::super::state::OpId::new(3),
-                    kind: super::super::state::CommandKind::SyncOnce,
-                },
-                in_flight: Some((
-                    super::super::state::OpId::new(3),
-                    super::super::state::CommandKind::SyncOnce,
-                )),
-                progress: Some((super::super::state::Phase::Pushing, "推送 2 条".to_owned())),
-                last_completed: None,
-                last_error: None,
-                close: CloseState::Pending,
-                worker_stopped: false,
-                deadline_exceeded: None,
-                cancel_requested: false,
-                two_phase: None,
-                devices: Vec::new(),
-                self_device: None,
-                can_manage_devices: false,
-                last_revoked: None,
+        let mut snapshot = StateSnapshot {
+            state: DevSyncState::Busy {
+                op_id: super::super::state::OpId::new(3),
+                kind: super::super::state::CommandKind::SyncOnce,
             },
-            notice: None,
-            sync_line: None,
-            task_label: "同步",
-            host_busy: false,
-            pending_revoke: None,
-            seen_revocation: None,
-            refresh_pending: false,
+            in_flight: Some((
+                super::super::state::OpId::new(3),
+                super::super::state::CommandKind::SyncOnce,
+            )),
+            progress: Some((super::super::state::Phase::Pushing, "推送 2 条".to_owned())),
+            last_completed: None,
+            last_error: None,
+            close: CloseState::Pending,
+            worker_stopped: false,
+            deadline_exceeded: None,
+            cancel_requested: false,
+            two_phase: None,
+            devices: Vec::new(),
+            self_device: None,
+            can_manage_devices: false,
+            last_revoked: None,
+            invite_link: None,
+            last_approved: None,
+            last_rotation: None,
+            last_rotation_op: None,
         };
-        let text = panel.state_text();
+        let text = state_text(&snapshot);
         assert!(text.contains("执行中"), "必须显示状态：{text}");
         assert!(text.contains("#3"), "必须显示在途 op：{text}");
         assert!(text.contains("推送 2 条"), "必须显示最新进度：{text}");
-        assert_eq!(panel.error_text(), "最近错误：无");
-        panel.snapshot.last_error = Some("切片 4 未实现".to_owned());
-        assert_eq!(panel.error_text(), "最近错误：切片 4 未实现");
+        assert_eq!(error_text(&snapshot), "最近错误：无");
+        snapshot.last_error = Some("切片 4 未实现".to_owned());
+        assert_eq!(error_text(&snapshot), "最近错误：切片 4 未实现");
         // 关闭中要显示关闭门禁（Blocked 的原因必须能看见）。
-        panel.snapshot.state = DevSyncState::Closing;
-        panel.snapshot.close = CloseState::Blocked("durable 未确认".to_owned());
-        let text = panel.state_text();
+        snapshot.state = DevSyncState::Closing;
+        snapshot.close = CloseState::Blocked("durable 未确认".to_owned());
+        let text = state_text(&snapshot);
         assert!(text.contains("关闭"), "关闭中必须显示关闭行：{text}");
         assert!(text.contains("durable 未确认"), "阻断原因必须可见：{text}");
     }
@@ -830,6 +1755,46 @@ mod tests {
             let text = member_status_text(status, false);
             assert!(!text.contains("本机"), "{text}");
         }
+    }
+
+    /// 轮换/应用的固定文案必须一字不漏：它们是这次操作的全部真相（ADR 0009 §安全边界）。
+    #[test]
+    fn rotation_copy_covers_the_operation_boundaries() {
+        for needle in [
+            "轮换会用新密钥重新加密整库",
+            "生成两份候选基线",
+            "旧 epoch 数据不能再被新设备解密",
+            "被移除设备仍可解其已获得的数据",
+            "轮换期间输入会冻结",
+            "是否继续？",
+        ] {
+            assert!(
+                ROTATE_CONFIRM_TEXT.contains(needle),
+                "轮换确认文案必须包含 {needle:?}：{ROTATE_CONFIRM_TEXT}"
+            );
+        }
+        for needle in [
+            "应用新 epoch",
+            "重新验证授权",
+            "导入基线",
+            "输入会冻结",
+            "是否继续？",
+        ] {
+            assert!(
+                APPLY_CONFIRM_TEXT.contains(needle),
+                "apply 确认文案必须包含 {needle:?}：{APPLY_CONFIRM_TEXT}"
+            );
+        }
+        for needle in ["申请", "候选", "激活", "推广"] {
+            assert!(
+                ROTATE_STAGES_TEXT.contains(needle),
+                "轮换阶段文案必须包含 {needle:?}：{ROTATE_STAGES_TEXT}"
+            );
+        }
+        assert!(
+            ROTATE_NO_RECOVERY_WARNING.contains("无法用恢复码加入"),
+            "{ROTATE_NO_RECOVERY_WARNING}"
+        );
     }
 
     /// 固定警告文案必须一字不漏地包含 ADR 0010 的四条边界。

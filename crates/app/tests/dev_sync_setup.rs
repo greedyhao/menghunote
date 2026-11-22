@@ -71,6 +71,7 @@ fn temp_root(prefix: &str) -> TempDir {
 
 fn config_for(relay: &DevRelay, vault_path: &Path) -> DevSyncConfig {
     DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.to_path_buf(),
         service: ServiceConfig::new(relay.base_url()),
     }
@@ -321,6 +322,7 @@ fn existing_mode_without_identity_fails_without_creating_anything() {
     let dir = temp_root("existing-missing");
     let vault_path = dir.path().join("inst-a").join("vault.sqlite3");
     let config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     };
@@ -435,6 +437,7 @@ fn invalid_join_material_fails_without_leftovers() {
     let dir = temp_root("bad-join");
     let vault_path = dir.path().join("inst-b").join("vault.sqlite3");
     let config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     };
@@ -589,6 +592,7 @@ fn info_reads_identity_and_vault_without_network() {
 
     // info 的语义是"只读已有实例"：relay 地址根本不参与（这里故意不可达）。
     let offline_config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:1"),
     };

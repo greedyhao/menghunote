@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use support::*;
 
 use menghunote_storage::ensure_structure_row;
+use menghunote_sync::api_version::{RelayApi, RelayApiVersion};
 use menghunote_sync::base64url;
 use menghunote_sync::cbor;
 use menghunote_sync::checkpoint::StaticAssets;
@@ -477,7 +478,7 @@ fn stage_grants_body_key0_is_grant_id_and_digest_covers_signed_header_only() {
     ]);
     rotation_stage::stage_grants(
         &mut transport,
-        "http://relay.test",
+        &RelayApi::new("http://relay.test", RelayApiVersion::V1),
         VAULT_ID,
         [0x55; 16],
         &manager,

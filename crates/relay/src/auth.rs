@@ -13,6 +13,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::db::schema;
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{b64url_decode, b64url_encode, random_bytes, sha256, Hash32, Id16};
+use crate::scope::{ScopeConn, VaultScope};
 use crate::sig::{require, Expectation, SignDomain, SignatureCheck, SignatureHook};
 use crate::time::{secs, Clock};
 use crate::vault;
@@ -73,6 +74,10 @@ pub struct TokenOutcome {
 }
 
 /// 通过鉴权的请求上下文。
+///
+/// `vault` 是**鉴权发生的作用域**（ADR 0014 §A）：token 只在它被签发的 vault 内有效，
+/// v2 路由必须再断言 `route.vault == auth.vault == signed.vault`（见 `api::authenticate_v2`），
+/// 不允许跨租户复用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthContext {
     pub realm: Realm,
@@ -80,6 +85,8 @@ pub struct AuthContext {
     /// 设备 realm 的 device_id（管理 realm 为 None）。
     pub device_id: Option<Id16>,
     pub auth_rev: u64,
+    /// 鉴权作用域（token 所属租户；绝不跨 scope 复用）。
+    pub vault: VaultScope,
 }
 
 impl AuthContext {
@@ -107,7 +114,7 @@ fn realm_from_str(value: &str) -> Result<Realm> {
 
 /// 创建 challenge（60s 单用）。
 pub fn create_challenge(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     realm: Realm,
     subject: &Id16,
@@ -120,8 +127,8 @@ pub fn create_challenge(
             // 未注册/已吊销一律 403 REVOKED（不区分，避免枚举设备）。
             let status: Option<String> = conn
                 .query_row(
-                    "SELECT status FROM devices WHERE device_id = ?1",
-                    [subject.as_slice()],
+                    "SELECT status FROM devices WHERE device_id = ?1 AND vault_id = ?",
+                    (subject.as_slice(), conn.scope().as_slice()),
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -151,13 +158,14 @@ pub fn create_challenge(
     };
     // 顺手清理过期 challenge（只是诊断卫生，不影响语义）。
     conn.execute(
-        "DELETE FROM challenges WHERE expires_at < ?1 - 86400",
-        [now],
+        "DELETE FROM challenges WHERE expires_at < ?1 - 86400 AND vault_id = ?",
+        (now, conn.scope().as_slice()),
     )?;
     conn.execute(
-        "INSERT INTO challenges(challenge_id, realm, subject, nonce, expires_at, used_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        "INSERT INTO challenges(vault_id, challenge_id, realm, subject, nonce, expires_at, used_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
         (
+            conn.scope().as_slice(),
             challenge.challenge_id.as_slice(),
             realm.as_str(),
             subject.as_slice(),
@@ -169,13 +177,13 @@ pub fn create_challenge(
 }
 
 /// 读 challenge（诊断/测试用）。
-pub fn load_challenge(conn: &Connection, id: &Id16) -> Result<Option<Challenge>> {
+pub fn load_challenge(conn: &ScopeConn, id: &Id16) -> Result<Option<Challenge>> {
     let mut stmt = conn.prepare(
         "SELECT challenge_id, realm, subject, nonce, expires_at, used_at
-         FROM challenges WHERE challenge_id = ?1",
+         FROM challenges WHERE challenge_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([id.as_slice()], |row| {
+        .query_row((id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, String>(1)?,
@@ -210,7 +218,7 @@ pub fn load_challenge(conn: &Connection, id: &Id16) -> Result<Option<Challenge>>
 
 /// 兑现 challenge：验签 + **原子消费** + 建 token（同一事务）。
 pub fn issue_token(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     challenge_id: &Id16,
@@ -222,10 +230,10 @@ pub fn issue_token(
 
     let mut stmt = conn.prepare(
         "SELECT realm, subject, nonce, expires_at, used_at
-         FROM challenges WHERE challenge_id = ?1",
+         FROM challenges WHERE challenge_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([challenge_id.as_slice()], |row| {
+        .query_row((challenge_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -259,10 +267,13 @@ pub fn issue_token(
     let (device_id, public_key) = match realm {
         Realm::Device => {
             let mut stmt = conn.prepare(
-                "SELECT sign_pk FROM devices WHERE device_id = ?1 AND status = 'active'",
+                "SELECT sign_pk FROM devices
+                 WHERE device_id = ?1 AND status = 'active' AND vault_id = ?",
             )?;
             let key: Option<Vec<u8>> = stmt
-                .query_row([subject.as_slice()], |row| row.get(0))
+                .query_row((subject.as_slice(), conn.scope().as_slice()), |row| {
+                    row.get(0)
+                })
                 .optional()?;
             let key: [u8; 32] = key
                 .ok_or_else(|| {
@@ -299,8 +310,9 @@ pub fn issue_token(
 
     // 单用：CAS 消费（并发时只有一个能成功）。
     let consumed = conn.execute(
-        "UPDATE challenges SET used_at = ?1 WHERE challenge_id = ?2 AND used_at IS NULL",
-        (now, challenge_id.as_slice()),
+        "UPDATE challenges SET used_at = ?1
+         WHERE challenge_id = ?2 AND used_at IS NULL AND vault_id = ?",
+        (now, challenge_id.as_slice(), conn.scope().as_slice()),
     )?;
     if consumed != 1 {
         return Err(Error::api(ErrorCode::ChallengeUsed));
@@ -311,9 +323,10 @@ pub fn issue_token(
     let token_hash = sha256(&raw);
     let expires = now + secs::TOKEN_TTL;
     conn.execute(
-        "INSERT INTO tokens(token_hash, realm, subject, auth_rev, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO tokens(vault_id, token_hash, realm, subject, auth_rev, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
+            conn.scope().as_slice(),
             token_hash.as_slice(),
             realm.as_str(),
             subject.as_slice(),
@@ -324,12 +337,15 @@ pub fn issue_token(
     )?;
     if let Some(device_id) = device_id {
         conn.execute(
-            "UPDATE devices SET last_seen = ?1 WHERE device_id = ?2",
-            (now, device_id.as_slice()),
+            "UPDATE devices SET last_seen = ?1 WHERE device_id = ?2 AND vault_id = ?",
+            (now, device_id.as_slice(), conn.scope().as_slice()),
         )?;
     }
     // 顺手清理明显过期的 token（不改变语义）。
-    conn.execute("DELETE FROM tokens WHERE expires_at < ?1 - 86400", [now])?;
+    conn.execute(
+        "DELETE FROM tokens WHERE expires_at < ?1 - 86400 AND vault_id = ?",
+        (now, conn.scope().as_slice()),
+    )?;
     Ok(TokenOutcome {
         token,
         expires_at: expires,
@@ -340,17 +356,19 @@ pub fn issue_token(
 }
 
 /// 校验 `Authorization: Bearer <token>`（调用方只传 token 部分）。
-pub fn authenticate(conn: &Connection, clock: &dyn Clock, token: &str) -> Result<AuthContext> {
+pub fn authenticate(conn: &ScopeConn, clock: &dyn Clock, token: &str) -> Result<AuthContext> {
     let now = clock.now_secs();
     let raw = b64url_decode(token).map_err(|_| Error::api(ErrorCode::Unauthorized))?;
     if raw.len() != 32 {
         return Err(Error::api(ErrorCode::Unauthorized));
     }
     let token_hash: Hash32 = sha256(&raw);
-    let mut stmt = conn
-        .prepare("SELECT realm, subject, auth_rev, expires_at FROM tokens WHERE token_hash = ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT realm, subject, auth_rev, expires_at FROM tokens
+         WHERE token_hash = ?1 AND vault_id = ?",
+    )?;
     let row = stmt
-        .query_row([token_hash.as_slice()], |row| {
+        .query_row((token_hash.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -383,8 +401,8 @@ pub fn authenticate(conn: &Connection, clock: &dyn Clock, token: &str) -> Result
         Realm::Device => {
             let status: Option<String> = conn
                 .query_row(
-                    "SELECT status FROM devices WHERE device_id = ?1",
-                    [subject.as_slice()],
+                    "SELECT status FROM devices WHERE device_id = ?1 AND vault_id = ?",
+                    (subject.as_slice(), conn.scope().as_slice()),
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -398,6 +416,7 @@ pub fn authenticate(conn: &Connection, clock: &dyn Clock, token: &str) -> Result
                 subject,
                 device_id: Some(subject),
                 auth_rev,
+                vault: conn.scope(),
             })
         }
         Realm::Management => {
@@ -412,6 +431,7 @@ pub fn authenticate(conn: &Connection, clock: &dyn Clock, token: &str) -> Result
                 subject,
                 device_id: None,
                 auth_rev,
+                vault: conn.scope(),
             })
         }
     }
@@ -437,7 +457,7 @@ pub struct ManagementProof<'a> {
 /// §26：`unsigned_body` 必须是唯一 canonical body 的原始字节；签名输入由 verify hook
 /// 用 `(method,path,body)` 重新 CDE 得到，调用方不得另行拼装业务字段。
 pub fn verify_management(
-    conn: &Connection,
+    conn: &ScopeConn,
     hook: &dyn SignatureHook,
     proof: &ManagementProof<'_>,
     unsigned_body: &[u8],
@@ -465,7 +485,7 @@ pub fn verify_management(
 }
 
 /// 管理写的 `control_rev` CAS：期望值与 vault 当前值不一致 → 409（带当前值）。
-pub fn require_control_rev(conn: &Connection, expected: u64) -> Result<u64> {
+pub fn require_control_rev(conn: &ScopeConn, expected: u64) -> Result<u64> {
     let vault = vault::load(conn)?;
     if expected != vault.control_rev {
         return Err(Error::Api(
@@ -477,7 +497,7 @@ pub fn require_control_rev(conn: &Connection, expected: u64) -> Result<u64> {
 
 /// 校验管理签名 + CAS（保留给尚未接入 `management::run` 的调用方）。
 pub fn require_management(
-    conn: &Connection,
+    conn: &ScopeConn,
     hook: &dyn SignatureHook,
     proof: &ManagementProof<'_>,
     unsigned_body: &[u8],
@@ -490,11 +510,11 @@ pub fn require_management(
 /// 吊销设备：状态置 revoked、推进 `auth_rev`（旧 token 立即失效）。
 ///
 /// 返回 `true` 表示本次真的从 active/pending 变成 revoked（重复吊销返回 false，幂等）。
-pub fn revoke_device(conn: &Connection, now: i64, device_id: &Id16) -> Result<bool> {
+pub fn revoke_device(conn: &ScopeConn, now: i64, device_id: &Id16) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE devices SET status = 'revoked', revoked_at = ?1
-         WHERE device_id = ?2 AND status != 'revoked'",
-        (now, device_id.as_slice()),
+         WHERE device_id = ?2 AND status != 'revoked' AND vault_id = ?",
+        (now, device_id.as_slice(), conn.scope().as_slice()),
     )?;
     if changed > 0 {
         // 只推进 auth_rev：所有旧 token 立即失效（`authenticate` 会先命中 token 行、再比较
@@ -506,15 +526,53 @@ pub fn revoke_device(conn: &Connection, now: i64, device_id: &Id16) -> Result<bo
 }
 
 /// 设备是否 active。
-pub fn device_active(conn: &Connection, device_id: &Id16) -> Result<bool> {
+pub fn device_active(conn: &ScopeConn, device_id: &Id16) -> Result<bool> {
     let status: Option<String> = conn
         .query_row(
-            "SELECT status FROM devices WHERE device_id = ?1",
-            [device_id.as_slice()],
+            "SELECT status FROM devices WHERE device_id = ?1 AND vault_id = ?",
+            (device_id.as_slice(), conn.scope().as_slice()),
             |row| row.get(0),
         )
         .optional()?;
     Ok(status.as_deref() == Some("active"))
+}
+
+/// 旧 v1 兼容探测：该 token 是否是**另一个 vault** 的有效凭据。
+///
+/// 语义只用于把"跨租户的旧 token"映射回 v1 的 404（而不是 401）：新作用域查询失败后，
+/// 用它显式复查 token 在别处是否有效；**不返回**其它 vault 的任何数据或 id。
+pub fn token_valid_in_other_vault(
+    conn: &rusqlite::Connection,
+    clock: &dyn Clock,
+    token: &str,
+    scope: crate::scope::VaultScope,
+) -> Result<bool> {
+    let raw = b64url_decode(token).map_err(|_| Error::api(ErrorCode::Unauthorized))?;
+    if raw.len() != 32 {
+        return Err(Error::api(ErrorCode::Unauthorized));
+    }
+    let token_hash = sha256(&raw);
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT vault_id FROM tokens WHERE token_hash = ?1 AND vault_id != ?2")?;
+    let rows = stmt.query_map((token_hash.as_slice(), scope.as_slice()), |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let bytes = row?;
+        let vault_id: Id16 = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invariant("tokens.vault_id"))?;
+        candidates.push(vault_id);
+    }
+    for vault_id in candidates {
+        let scoped = crate::scope::ScopeConn::new(conn, crate::scope::VaultScope::new(vault_id));
+        if authenticate(&scoped, clock, token).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 一次性 setup secret 是否已被消费（诊断/测试）。
@@ -541,12 +599,15 @@ mod tests {
 
     #[test]
     fn auth_context_realm_checks() {
+        let scope = VaultScope::new([9u8; 16]);
         let ctx = AuthContext {
             realm: Realm::Device,
             subject: [1u8; 16],
             device_id: Some([1u8; 16]),
             auth_rev: 1,
+            vault: scope,
         };
+        assert_eq!(ctx.vault, scope);
         assert!(ctx.device_id().is_ok());
         assert!(ctx.require_management().is_err());
 
@@ -555,6 +616,7 @@ mod tests {
             subject: [2u8; 16],
             device_id: None,
             auth_rev: 1,
+            vault: scope,
         };
         assert!(mgmt.device_id().is_err());
         assert!(mgmt.require_management().is_ok());

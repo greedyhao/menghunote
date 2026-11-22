@@ -85,6 +85,8 @@ pub enum ErrorCode {
     PayloadTooLarge,
     /// 服务端尚未接入的能力（例如 sync-proto 落地前）。
     NotImplemented,
+    /// 入口限流（ADR 0014 §A：auth/create 入口先限流；只用于 v2，不影响 v1）。
+    RateLimited,
 }
 
 impl ErrorCode {
@@ -126,6 +128,7 @@ impl ErrorCode {
             Self::InvalidRequest => "INVALID_REQUEST",
             Self::PayloadTooLarge => "REQUEST_TOO_LARGE",
             Self::NotImplemented => "NOT_IMPLEMENTED",
+            Self::RateLimited => "RATE_LIMITED",
         }
     }
 
@@ -155,6 +158,7 @@ impl ErrorCode {
             Self::CursorExpired | Self::Expired | Self::LeaseExpired | Self::Retired => 410,
             Self::QuotaExceeded | Self::ReserveExceeded => 507,
             Self::PayloadTooLarge => 413,
+            Self::RateLimited => 429,
             Self::NotImplemented => 501,
             Self::Internal => 500,
         }
@@ -164,7 +168,11 @@ impl ErrorCode {
     pub const fn default_retryable(self) -> bool {
         matches!(
             self,
-            Self::Busy | Self::RelayReset | Self::CursorExpired | Self::NoValidBaseline
+            Self::Busy
+                | Self::RelayReset
+                | Self::CursorExpired
+                | Self::NoValidBaseline
+                | Self::RateLimited
         )
     }
 }
@@ -285,6 +293,8 @@ mod tests {
         assert_eq!(ErrorCode::LeaseExpired.status(), 410);
         assert_eq!(ErrorCode::Incomplete.status(), 409);
         assert_eq!(ErrorCode::NotFound.status(), 404);
+        assert_eq!(ErrorCode::RateLimited.status(), 429);
+        assert!(ErrorCode::RateLimited.default_retryable());
     }
 
     #[test]

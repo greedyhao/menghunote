@@ -73,16 +73,23 @@ use std::time::Duration;
 
 use gpui::Entity;
 use menghunote_storage::session::{ExternalCommitLease, ExternalCommitTicket};
+use zeroize::Zeroizing;
+
+use menghunote_sync::DeviceId;
 
 use crate::editor::view::EditorView;
 
 use super::autosync::OpOrigin;
-use super::state::{Command, OpId};
+use super::state::{Command, OpId, RotationFacts};
 
 /// 同步期间 shell 的泵间隔（只影响 dev-only 面板/状态机，不是业务时钟）。
 pub const SYNC_PUMP_INTERVAL: Duration = Duration::from_millis(40);
 
-/// 持闸任务种类：同一条状态机跑「同步」与「发布基线」（ADR 0009 切片 4c-4）。
+/// 持闸任务种类：同一条状态机跑「同步」「发布基线」，以及 Phase 2 的「轮换」
+/// 「应用新 epoch」（ADR 0009 切片 4c-4 / 6a）。
+///
+/// 四种任务共用同一条 `WaitingGate → WorkerRunning → 交付/adopt → end → 报告` 路径；
+/// 差别只在 worker 命令、报告措辞、以及成功后的收尾（轮换/apply 还要重建活动视图）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GatedTask {
     /// 一轮完整同步（`encrypt_pending → push → pull → integrate → ack`）。
@@ -90,6 +97,10 @@ pub enum GatedTask {
     SyncOnce,
     /// 发布初始基线（worker 内部先跑一轮同步，再发两份同 epoch checkpoint）。
     PublishBaseline,
+    /// A 侧轮换密钥（必须整段持闸；成功后重建活动视图 + 切换 `SyncContext.key_epoch`）。
+    Rotate,
+    /// B 侧把本机身份推进到 relay 最新 epoch（同样整段持闸）。
+    ApplyEpoch,
 }
 
 impl GatedTask {
@@ -99,24 +110,38 @@ impl GatedTask {
         match self {
             Self::SyncOnce => "同步一次",
             Self::PublishBaseline => "发布初始基线",
+            Self::Rotate => "轮换密钥",
+            Self::ApplyEpoch => "应用新 epoch",
         }
     }
 
-    /// 面板持闸任务行的前缀（「同步：…」/「发布：…」）。
+    /// 面板持闸任务行的前缀（「同步：…」/「发布：…」/「轮换：…」/「应用 epoch：…」）。
     #[must_use]
     pub const fn short_label(self) -> &'static str {
         match self {
             Self::SyncOnce => "同步",
             Self::PublishBaseline => "发布",
+            Self::Rotate => "轮换",
+            Self::ApplyEpoch => "应用 epoch",
         }
     }
 
-    /// 对应的 worker 命令（两条都必须带 `HeldGate`；无会话路径不是本枚举）。
+    /// 是否 Phase 2 的轮换类任务（成功后要重建活动视图/切换 epoch）。
     #[must_use]
-    pub const fn command(self) -> Command {
+    pub const fn is_rotation(self) -> bool {
+        matches!(self, Self::Rotate | Self::ApplyEpoch)
+    }
+
+    /// 无参数的 worker 命令（同步/发布基线）。
+    ///
+    /// 轮换/apply 不是无参数命令（`Rotate` 带恢复码与 revoke 列表），由
+    /// [`ActiveSyncOnce::pending_command`] 从在途状态构造；本方法对它们返回 `None`。
+    #[must_use]
+    pub const fn command(self) -> Option<Command> {
         match self {
-            Self::SyncOnce => Command::SyncOnce,
-            Self::PublishBaseline => Command::PublishInitialPair,
+            Self::SyncOnce => Some(Command::SyncOnce),
+            Self::PublishBaseline => Some(Command::PublishInitialPair),
+            Self::Rotate | Self::ApplyEpoch => None,
         }
     }
 
@@ -126,7 +151,47 @@ impl GatedTask {
         match self {
             Self::SyncOnce => "同步已在进行（持闸同步不允许并发）",
             Self::PublishBaseline => "发布基线已在进行（持闸任务不允许并发）",
+            Self::Rotate => "轮换已在进行（持闸任务不允许并发）",
+            Self::ApplyEpoch => "应用新 epoch 已在进行（持闸任务不允许并发）",
         }
+    }
+}
+
+/// 轮换命令的参数（宿主 → worker）。
+///
+/// `recovery_code` 是**秘密**：`Zeroizing<String>` 缓冲、`Debug` 手写脱敏，绝不打印。
+#[derive(Clone, PartialEq, Eq)]
+pub struct RotateRequest {
+    /// 当前管理恢复码（`None` = 不补发；轮换后新设备无法用恢复码加入）。
+    pub recovery_code: Option<Zeroizing<String>>,
+    /// 本次 signed begin body 里要吊销的设备（公开标识）。
+    pub revoke: Vec<DeviceId>,
+}
+
+impl RotateRequest {
+    /// 构造（`recovery_code` 立即进 `Zeroizing`）。
+    #[must_use]
+    pub fn new(recovery_code: Option<String>, revoke: Vec<DeviceId>) -> Self {
+        Self {
+            recovery_code: recovery_code.map(Zeroizing::new),
+            revoke,
+        }
+    }
+}
+
+impl std::fmt::Debug for RotateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotateRequest")
+            .field(
+                "recovery_code",
+                &if self.recovery_code.is_some() {
+                    "Some(<redacted>)"
+                } else {
+                    "None"
+                },
+            )
+            .field("revoke", &self.revoke.len())
+            .finish()
     }
 }
 
@@ -299,6 +364,10 @@ pub struct ActiveSyncOnce {
     /// 结构 CRDT 已 durable、但本地 `tree/notes` 投影没追上：UI 必须先交付已 durable 的
     /// 正文，然后**保持写禁用**（不解闸），等重试收尾把投影补上；不得假装刷新成功。
     pub projection_failed: bool,
+    /// 轮换参数（仅 `GatedTask::Rotate`；`None` = 不是轮换或参数缺失）。
+    pub rotate: Option<RotateRequest>,
+    /// worker 上报的轮换/apply 公开事实（成功/失败都可能有；收尾读它切换 epoch/重建视图）。
+    pub rotation_facts: Option<RotationFacts>,
 }
 
 impl ActiveSyncOnce {
@@ -335,6 +404,8 @@ impl ActiveSyncOnce {
             deadline_noted: false,
             structure_base_seq,
             projection_failed: false,
+            rotate: None,
+            rotation_facts: None,
         }
     }
 
@@ -362,6 +433,8 @@ impl ActiveSyncOnce {
             deadline_noted: false,
             structure_base_seq,
             projection_failed: false,
+            rotate: None,
+            rotation_facts: None,
         }
     }
 
@@ -392,6 +465,31 @@ impl ActiveSyncOnce {
             deadline_noted: false,
             structure_base_seq,
             projection_failed: false,
+            rotate: None,
+            rotation_facts: None,
+        }
+    }
+
+    /// 指定轮换参数（仅 `GatedTask::Rotate`；命令在 `dev_sync_advance_gate` 里构造）。
+    #[must_use]
+    pub fn with_rotate(mut self, request: RotateRequest) -> Self {
+        self.rotate = Some(request);
+        self
+    }
+
+    /// 用本状态构造要派发给 worker 的持闸命令。
+    ///
+    /// 同步/发布走 [`GatedTask::command`]；轮换把恢复码/revoke 带上；apply 无参数。
+    /// 返回 `None` = `Rotate` 缺少参数（内部错误，调用方必须明确失败而不是盲派发）。
+    #[must_use]
+    pub fn pending_command(&self) -> Option<Command> {
+        match self.task {
+            GatedTask::SyncOnce | GatedTask::PublishBaseline => self.task.command(),
+            GatedTask::Rotate => self.rotate.as_ref().map(|request| Command::Rotate {
+                recovery_code: request.recovery_code.clone(),
+                revoke: request.revoke.clone(),
+            }),
+            GatedTask::ApplyEpoch => Some(Command::ApplyEpoch),
         }
     }
 
@@ -451,6 +549,8 @@ pub struct SyncOnceReport {
     pub structure_refreshed: bool,
     /// 同步后自动打开的笔记标题（仅无会话路径 + 树里出现笔记）。
     pub opened_note: Option<String>,
+    /// 轮换 / apply 的公开事实（切片 6a；其它任务为 `None`）。
+    pub rotation: Option<RotationFacts>,
     /// 给面板/状态栏看的单行文案（「同步中/已持闸/N 条变化」）。
     pub notice: String,
 }

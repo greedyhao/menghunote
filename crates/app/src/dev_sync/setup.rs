@@ -53,6 +53,8 @@ use menghunote_storage::Vault;
 use menghunote_sync::dev_local::DevLocal;
 use menghunote_sync::identity::LocalIdentityV1;
 use menghunote_sync::ids;
+use menghunote_sync::init_journal::load_pending;
+use menghunote_sync::init_session::{self, reconcile};
 use menghunote_sync::VaultId;
 
 use super::gate::{DevSyncConfig, CREATE_FLAG, ENABLE_FLAG, INFO_FLAG, JOIN_FLAG, PUBLISH_FLAG};
@@ -263,12 +265,38 @@ fn prepare_existing(config: &DevSyncConfig) -> Result<SetupOutcome, SetupError> 
     let vault_id = identity.vault_id;
     let vault = Vault::open(&config.vault)
         .with_context(|| format!("打开 dev-sync 实例库失败：{}", config.vault.display()))?;
+    // ADR 0013 S2b：启动对账。没有 `sync.init_pending` 时是纯 no-op（不联网、不写库）；
+    // 有未完成的初始化时，用已有身份材料补齐 finalize（不重复 genesis/enroll）或
+    // fail-closed 停住（不自动重建、不删用户数据）。
+    reconcile_pending_init(&vault, &identity).with_context(|| {
+        format!(
+            "dev-sync 初始化对账失败（未完成的初始化必须人工处理，不自动重建）：{}",
+            config.vault.display()
+        )
+    })?;
     Ok(SetupOutcome {
         vault,
         identity,
         vault_id,
         recovery_code: None,
     })
+}
+
+/// 启动对账（ADR 0013 S2b）：只有存在 `sync.init_pending` 时才动作。
+fn reconcile_pending_init(vault: &Vault, identity: &LocalIdentityV1) -> Result<(), SetupError> {
+    if load_pending(vault, Some(identity.vault_id))?.is_none() {
+        return Ok(());
+    }
+    let Some(report) = reconcile(vault, Some(identity))? else {
+        bail!("初始化对账报告与 pending 状态不一致（不静默继续）");
+    };
+    eprintln!(
+        "[menghunote] dev-sync 初始化对账完成：kind={} phase={:?} outcome={:?}",
+        report.kind.as_str(),
+        report.phase_before,
+        report.outcome
+    );
+    Ok(())
 }
 
 /// `--dev-sync-create`：新路径 + setup secret → genesis → 受保护身份落盘。
@@ -280,14 +308,20 @@ fn prepare_create(
     let setup_secret = required_secret(secrets.setup_secret, SETUP_SECRET_ENV, CREATE_FLAG)?;
     require_fresh_paths(&config.vault, "Create")?;
 
-    let created = DevLocal::create(config.relay(), &setup_secret, &config.vault, INSTANCE_LABEL)
-        .with_context(|| {
-            format!(
-                "Create 失败（relay = {}，路径 = {}）",
-                config.relay(),
-                config.vault.display()
-            )
-        })?;
+    // ADR 0013 S3a：身份 rename 成功后再推进 pending（IdentityWritten → Done）。
+    let created = DevLocal::create_deferring_identity(
+        config.relay(),
+        &setup_secret,
+        &config.vault,
+        INSTANCE_LABEL,
+    )
+    .with_context(|| {
+        format!(
+            "Create 失败（relay = {}，路径 = {}）",
+            config.relay(),
+            config.vault.display()
+        )
+    })?;
     // setup secret 只在这一步用；`CreatedVault.setup_secret` 是回显字段，这里显式丢弃，
     // 不随 outcome 继续持有。
     drop(created.setup_secret);
@@ -306,14 +340,15 @@ fn prepare_join(config: &DevSyncConfig, secrets: SetupSecrets) -> Result<SetupOu
     let recovery_code = required_secret(secrets.recovery_code, RECOVERY_CODE_ENV, JOIN_FLAG)?;
     require_fresh_paths(&config.vault, "Join")?;
 
-    let joined = DevLocal::join(config.relay(), &vault_id, &recovery_code, &config.vault)
-        .with_context(|| {
-            format!(
-                "Join 失败（relay = {}，路径 = {}）",
-                config.relay(),
-                config.vault.display()
-            )
-        })?;
+    let joined =
+        DevLocal::join_deferring_identity(config.relay(), &vault_id, &recovery_code, &config.vault)
+            .with_context(|| {
+                format!(
+                    "Join 失败（relay = {}，路径 = {}）",
+                    config.relay(),
+                    config.vault.display()
+                )
+            })?;
     finish(
         joined.vault,
         joined.identity,
@@ -343,6 +378,17 @@ fn finish(
                 parent_dir(vault_path).display()
             )
         });
+    }
+    // 身份已原子落盘：推进 pending（IdentityWritten → Done）。失败**不删文件**：
+    // 实例已可恢复，下一次启动的初始化对账会用身份补齐 finalize（ADR 0013 §2/S3a）。
+    if let Err(error) = init_session::mark_identity_written(&vault)
+        .and_then(|()| init_session::finish_identity_written(&vault))
+    {
+        drop(vault);
+        return Err(error).context(
+            "dev-sync 身份已落盘，但初始化 pending 收尾失败；未删除任何文件，\
+             下次启动会做初始化对账（不自动重建）",
+        );
     }
     Ok(SetupOutcome {
         vault,
@@ -490,6 +536,7 @@ mod tests {
         // 这两个模式不得进入启动生命周期：main 必须先分支，否则会"开窗但什么都没做"。
         let config = DevSyncConfig {
             vault: PathBuf::from("/tmp/menghunote-dev-sync-cli-guard/vault.sqlite3"),
+            relay_mode: menghunote_sync::relay_policy::RelayMode::LocalDev,
             service: crate::dev_sync::service::ServiceConfig::new("http://127.0.0.1:18080"),
         };
         for mode in [SetupMode::Info, SetupMode::Publish] {

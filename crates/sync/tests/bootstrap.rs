@@ -943,6 +943,16 @@ fn control_pin_advances_but_never_rolls_back() {
     let (_dir, source, materials) = setup();
     let mut relay = new_relay(&materials);
     seed_source(&source, &mut relay, &materials);
+    // 真实 relay 的 `/control` 键 5 必然从 rev1 genesis 起；历史锚按"截断到锚 rev 的
+    // 管理链前缀"复算，空链无法复算视图 → 按 ADR 0013 §3 只能 fail-closed。
+    relay.manager_chain = vec![menghunote_sync::relay::ManagerChainEntry {
+        rev: 1,
+        pubkey: materials.manager.public_key(),
+        transition: b"test-genesis".to_vec(),
+        old_rev: 1,
+        old_signature: None,
+        new_signature: None,
+    }];
 
     let (_target_dir, target) = fresh_vault();
     bootstrap::run(
@@ -1955,4 +1965,183 @@ fn fallback_rejects_inflated_actual_vv_and_both_corrupt_writes_nothing() {
         .expect("journal")
         .is_none());
     assert_no_sync_watermarks(&second_target);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0013 §3：bootstrap 历史 anchor（rev 前进不能丢、不能跳过）
+// ---------------------------------------------------------------------------
+
+/// 第一条 rev2 管理转换（`to_epoch = EPOCH + 1`）：比当前 epoch 更晚，属于"未来"。
+fn future_manager_transition(instance_id: [u8; 16]) -> menghunote_sync::relay::ManagerChainEntry {
+    let transition = menghunote_sync::rotation::ManagerTransitionV1 {
+        vault_id: VAULT_ID,
+        instance_id,
+        rotation_id: [0x0b; 16],
+        from_epoch: EPOCH,
+        to_epoch: EPOCH + 1,
+        old_rev: 1,
+        new_rev: 2,
+        new_pubkey: [0x02; 32],
+        covered_seq: 0,
+    }
+    .encode()
+    .expect("管理转换编码");
+    menghunote_sync::relay::ManagerChainEntry {
+        rev: 2,
+        pubkey: [0x02; 32],
+        transition,
+        old_rev: 1,
+        old_signature: Some([0x03; 64]),
+        new_signature: Some([0x04; 64]),
+    }
+}
+
+/// 首次 bootstrap 用一条 rev1 genesis 管理链（真实 relay 的 `/control` 键 5 必然有它）。
+fn seed_manager_chain(relay: &mut FakeRelay, materials: &genesis::GenesisMaterials) {
+    relay.manager_chain = vec![menghunote_sync::relay::ManagerChainEntry {
+        rev: 1,
+        pubkey: materials.manager.public_key(),
+        transition: b"test-genesis".to_vec(),
+        old_rev: 1,
+        old_signature: None,
+        new_signature: None,
+    }];
+}
+
+#[test]
+fn bootstrap_anchor_is_recomputed_from_the_epoch_history_when_rev_advances() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    seed_manager_chain(&mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("首次 bootstrap");
+    let first_rev = relay.control_rev;
+    let anchor_hash = target
+        .get_meta(META_BOOTSTRAP_CONTROL_HASH)
+        .expect("control hash")
+        .expect("锚必须写入");
+
+    // control_rev 前进 + 管理链多一条"未来 epoch"的转换：旧锚必须按旧 epoch 的链前缀
+    // 复算，而不是拿新 rev / 全链复算（那会算出不同摘要），也不能干脆忽略。
+    relay.control_rev = first_rev + 1;
+    relay
+        .manager_chain
+        .push(future_manager_transition(relay.instance_id));
+    let state = relay.state().expect("state");
+    let chain = relay.management_chain().expect("chain");
+    let full_chain_hash = control_head_hash(&state, &chain);
+    assert_ne!(
+        full_chain_hash.as_slice(),
+        anchor_hash.as_slice(),
+        "新 rev + 全链的摘要必须与旧锚不同（否则这条用例证明不了历史视图被用到）"
+    );
+
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("rev 前进但历史前缀未变时必须允许（按 epoch 截断后的旧视图验证）");
+    // pins 前进到新 rev / 新摘要。
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_REV)
+            .expect("control rev")
+            .as_deref(),
+        Some((first_rev + 1).to_be_bytes().as_slice())
+    );
+}
+
+#[test]
+fn bootstrap_anchor_rejects_a_rewritten_prefix_when_rev_advances() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    seed_manager_chain(&mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("首次 bootstrap");
+    let first_rev = relay.control_rev;
+
+    // rev 前进，但 genesis 那条被换掉（历史前缀被重写）。
+    relay.control_rev = first_rev + 1;
+    relay.manager_chain[0].transition = b"rewritten-genesis".to_vec();
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("旧锚未被新链覆盖必须拒绝，不能当 rev 前进就跳过");
+    assert!(
+        matches!(error, menghunote_sync::SyncError::Equivocation(_)),
+        "{error:?}"
+    );
+    // 失败路径不得改写本地 pin。
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_REV)
+            .expect("control rev")
+            .as_deref(),
+        Some(first_rev.to_be_bytes().as_slice())
+    );
+}
+
+#[test]
+fn bootstrap_anchor_same_rev_hash_swap_is_equivocation() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    seed_manager_chain(&mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("首次 bootstrap");
+
+    // 同 rev 换摘要：必须 equivocation（不是"没有锚"、也不是普通 Object 错误）。
+    let mut swapped = target
+        .get_meta(META_BOOTSTRAP_CONTROL_HASH)
+        .expect("control hash")
+        .expect("锚");
+    swapped[0] ^= 0xFF;
+    target
+        .set_meta(META_BOOTSTRAP_CONTROL_HASH, &swapped)
+        .expect("改写摘要");
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("同 rev 换 hash 必须拒绝");
+    assert!(
+        matches!(error, menghunote_sync::SyncError::Equivocation(_)),
+        "{error:?}"
+    );
 }

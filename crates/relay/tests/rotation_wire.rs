@@ -33,7 +33,7 @@ fn block<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn app_ed25519(fx: &Fixture) -> axum::Router {
-    let state = AppState::new(fx.db.clone(), fx.cfg.clone(), Arc::new(Ed25519Hook));
+    let state = AppState::new(fx.db.inner().clone(), fx.cfg.clone(), Arc::new(Ed25519Hook));
     router(state)
 }
 
@@ -1788,7 +1788,7 @@ async fn activate_is_all_or_nothing_at_each_sql_point_and_replays_exact_request(
         ),
         (
             "fail_manager_rev",
-            "CREATE TRIGGER fail_manager_rev BEFORE UPDATE ON vault \
+            "CREATE TRIGGER fail_manager_rev BEFORE UPDATE ON vaults \
              WHEN NEW.manager_rev <> OLD.manager_rev \
              BEGIN SELECT RAISE(ABORT,'injected manager_rev'); END;",
         ),
@@ -1810,7 +1810,7 @@ async fn activate_is_all_or_nothing_at_each_sql_point_and_replays_exact_request(
         ),
         (
             "fail_vault_switch",
-            "CREATE TRIGGER fail_vault_switch BEFORE UPDATE ON vault \
+            "CREATE TRIGGER fail_vault_switch BEFORE UPDATE ON vaults \
              WHEN NEW.active_epoch <> OLD.active_epoch \
              BEGIN SELECT RAISE(ABORT,'injected active epoch'); END;",
         ),
@@ -1973,12 +1973,15 @@ async fn activate_is_all_or_nothing_at_each_sql_point_and_replays_exact_request(
         let clock = fx.clock.clone();
         block(|| relay::db::Db::open(cfg.db.clone(), clock)).expect("reopen")
     };
+    let vault_id = fx.vault_id;
+    let db = TestDb::new(db, relay::VaultScope::new(vault_id));
     let (epoch, manager_rev, rotation_state, commit) = db
         .read(move |conn| {
             let vault = relay::vault::load(conn)?;
             let (state, commit): (String, Option<Vec<u8>>) = conn.query_row(
-                "SELECT state, activation_commit FROM rotations WHERE rotation_id = ?1",
-                [rotation.as_slice()],
+                "SELECT state, activation_commit FROM rotations
+                 WHERE rotation_id = ?1 AND vault_id = ?2",
+                (rotation.as_slice(), conn.scope().as_slice()),
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             Ok((vault.active_epoch, vault.manager_rev, state, commit))

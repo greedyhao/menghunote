@@ -30,8 +30,10 @@ use relay::error::{Error, Result};
 use relay::ids::{self, sha256, Hash32, Id16};
 use relay::objects;
 use relay::quota;
+use relay::ratelimit::RateLimitSpec;
 use relay::refs::RefRole;
 use relay::rotations;
+use relay::scope::{ScopeConn, VaultScope};
 use relay::sig::{Expectation, SignDomain, SignatureCheck, SignatureHook};
 use relay::slots::SlotKind;
 use relay::time::{Clock, FakeClock, SystemClock};
@@ -166,7 +168,7 @@ impl SignatureHook for TestHook {
 /// §34：按 relay 侧事实构造一份与本次 activate 完全一致的 activation T（测试用；签名由
 /// 调用方补）。真实 relay 用 `rotations::activate` 内的同口径函数重建并逐项比对。
 pub fn activation_t_for(
-    conn: &rusqlite::Connection,
+    conn: &ScopeConn,
     vault: &Vault,
     row: &rotations::RotationRow,
     transition: &rotations::ManagerTransition,
@@ -217,9 +219,731 @@ pub fn activation_t_for(
     })
 }
 
+/// 带显式租户作用域的测试 DB 句柄（ADR 0014 §A）。
+///
+/// `read`/`write_blocking` 自动带上夹具的 `VaultScope`；`Deref` 到 [`Db`] 保留
+/// `clock()`/`path()`/`close()` 等实例级能力。测试里因此无需处处手写 scope，
+/// 但**作用域仍是显式的**：跨 vault 的用例必须自己构造另一个 [`TestDb`]。
+#[derive(Debug, Clone)]
+pub struct TestDb {
+    inner: Db,
+    scope: VaultScope,
+}
+
+impl TestDb {
+    pub fn new(inner: Db, scope: VaultScope) -> Self {
+        Self { inner, scope }
+    }
+
+    pub fn scope(&self) -> VaultScope {
+        self.scope
+    }
+
+    pub fn inner(&self) -> &Db {
+        &self.inner
+    }
+
+    pub fn read<T, F>(&self, f: F) -> relay::Result<T>
+    where
+        F: FnOnce(&ScopeConn<'_>) -> relay::Result<T>,
+    {
+        self.inner.read(self.scope, f)
+    }
+
+    pub fn write_blocking<T, F>(&self, f: F) -> relay::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ScopeConn<'_>) -> relay::Result<T> + Send + 'static,
+    {
+        self.inner.write_blocking(self.scope, f)
+    }
+}
+
+impl std::ops::Deref for TestDb {
+    type Target = Db;
+
+    fn deref(&self) -> &Db {
+        &self.inner
+    }
+}
+
+/// schema 9（单 vault）全量 fixture：ADR 0014 S2a 的 9→10 迁移测试基线。
+///
+/// 用途：
+/// - `tests/migration_v10.rs`：逐项断言迁移不丢 ID/密文字节/签名链/rev/cursor/邀请事实；
+/// - `tests/http.rs`：真实 v9 库升级后 HTTP 仍可服务旧 vault。
+///
+/// 这里**原样**保留 v9 的 `vault(singleton=1)` 与全部租户表（无 `vault_id`），
+/// 迁移实现只能靠自己的升级逻辑通过；测试不会用 v10 的表"假装"旧库。
+pub mod v9 {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// 迁移前 schema 版本。
+    pub const SCHEMA_VERSION: i64 = 9;
+    /// 固定 seed：所有断言都用它比对。
+    pub const INSTANCE: Id16 = [0x22u8; 16];
+    pub const VAULT: Id16 = [0x11u8; 16];
+    pub const LOG_ID: Id16 = [0x33u8; 16];
+    pub const LOG_INCARNATION: Id16 = [0x44u8; 16];
+    pub const CURSOR_KEY: Hash32 = [0x55u8; 32];
+    pub const DEVICE_ACTIVE: Id16 = [0xA1u8; 16];
+    pub const DEVICE_PENDING: Id16 = [0xA2u8; 16];
+    pub const DEVICE_REVOKED: Id16 = [0xA3u8; 16];
+    pub const MANAGER_PUB: [u8; 32] = [0x66u8; 32];
+    pub const INVITE_ID: Id16 = [0x12u8; 16];
+    pub const INVITE_TOKEN_HASH: Hash32 = [0x13u8; 32];
+    pub const UPDATE_OBJECT: Hash32 = [0x21u8; 32];
+    pub const ASSET_OBJECT: Hash32 = [0x31u8; 32];
+    pub const SLOT_OBJECT: Hash32 = [0x51u8; 32];
+    pub const CHECKPOINT: Id16 = [0x41u8; 16];
+    pub const ROTATION: Id16 = [0x71u8; 16];
+    pub const RESERVATION: Id16 = [0x14u8; 16];
+    pub const LEASE: Id16 = [0x81u8; 16];
+    pub const CHALLENGE: Id16 = [0xD1u8; 16];
+    pub const TOKEN_HASH: Hash32 = [0xF1u8; 32];
+    pub const PART_ENVELOPE: [u8; 300] = [0x5Au8; 300];
+
+    /// v9 完整 DDL（从 `schema 9` 二进制快照抄出，含索引）。
+    pub const DDL: &str = r#"
+-- ===== 实例元数据 =====
+CREATE TABLE IF NOT EXISTS relay_meta(
+  key   TEXT PRIMARY KEY,
+  value BLOB NOT NULL
+) STRICT;
+
+-- ===== 单 vault（ADE 0006 §6：单实例只允许一个 vault）=====
+CREATE TABLE IF NOT EXISTS vault(
+  singleton         INTEGER PRIMARY KEY CHECK(singleton = 1),
+  vault_id          BLOB NOT NULL CHECK(length(vault_id) = 16),
+  instance_id       BLOB NOT NULL CHECK(length(instance_id) = 16),
+  log_id            BLOB NOT NULL CHECK(length(log_id) = 16),
+  log_incarnation   BLOB NOT NULL CHECK(length(log_incarnation) = 16),
+  cursor_key        BLOB NOT NULL CHECK(length(cursor_key) = 32),
+  state             TEXT NOT NULL CHECK(state IN('initializing','active','rotating')),
+  active_epoch      INTEGER NOT NULL CHECK(active_epoch > 0),
+  next_epoch        INTEGER NOT NULL CHECK(next_epoch > active_epoch),
+  manager_rev       INTEGER NOT NULL CHECK(manager_rev >= 1),
+  control_rev       INTEGER NOT NULL CHECK(control_rev >= 1),
+  auth_rev          INTEGER NOT NULL CHECK(auth_rev >= 1),
+  head_seq          INTEGER NOT NULL CHECK(head_seq >= 0),
+  gc_floor          INTEGER NOT NULL CHECK(gc_floor >= 0 AND gc_floor <= head_seq),
+  normal_limit      INTEGER NOT NULL CHECK(normal_limit > 0),
+  maintenance_limit INTEGER NOT NULL CHECK(maintenance_limit >= normal_limit),
+  created_at        INTEGER NOT NULL
+) STRICT;
+
+-- ===== 管理与控制链（不随密文 GC 消失，ADR §6 末段）=====
+CREATE TABLE IF NOT EXISTS manager_keys(
+  rev           INTEGER PRIMARY KEY CHECK(rev >= 1),
+  pubkey        BLOB NOT NULL CHECK(length(pubkey) = 32),
+  transition    BLOB NOT NULL,
+  old_rev       INTEGER NOT NULL DEFAULT 0 CHECK(old_rev >= 0),
+  old_signature BLOB,
+  new_signature BLOB,
+  created_at    INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS control_commits(
+  rev           INTEGER PRIMARY KEY CHECK(rev >= 1),
+  prev_hash     BLOB NOT NULL CHECK(length(prev_hash) = 32),
+  record_hash   BLOB NOT NULL CHECK(length(record_hash) = 32),
+  signed_record BLOB NOT NULL,
+  created_at    INTEGER NOT NULL
+) STRICT;
+
+-- ===== epoch =====
+CREATE TABLE IF NOT EXISTS epochs(
+  epoch        INTEGER PRIMARY KEY CHECK(epoch > 0),
+  state        TEXT NOT NULL CHECK(state IN('staged','active','retired','aborted')),
+  revoked_once INTEGER NOT NULL DEFAULT 0 CHECK(revoked_once IN (0, 1)),
+  created_at   INTEGER NOT NULL,
+  retire_at    INTEGER
+) STRICT;
+
+-- ===== 设备 =====
+CREATE TABLE IF NOT EXISTS devices(
+  device_id   BLOB PRIMARY KEY CHECK(length(device_id) = 16),
+  sign_pk     BLOB NOT NULL CHECK(length(sign_pk) = 32),
+  hpke_pk     BLOB NOT NULL CHECK(length(hpke_pk) = 32),
+  certificate BLOB NOT NULL,
+  certificate_signature BLOB,
+  status      TEXT NOT NULL CHECK(status IN('pending','active','revoked')),
+  created_at  INTEGER NOT NULL,
+  revoked_at  INTEGER,
+  last_seen   INTEGER
+) STRICT;
+CREATE INDEX IF NOT EXISTS devices_status ON devices(status);
+
+-- ===== 鉴权 =====
+CREATE TABLE IF NOT EXISTS challenges(
+  challenge_id BLOB PRIMARY KEY CHECK(length(challenge_id) = 16),
+  realm        TEXT NOT NULL CHECK(realm IN('device','management')),
+  subject      BLOB NOT NULL CHECK(length(subject) = 16),
+  nonce        BLOB NOT NULL CHECK(length(nonce) = 32),
+  expires_at   INTEGER NOT NULL,
+  used_at      INTEGER
+) STRICT;
+CREATE INDEX IF NOT EXISTS challenges_expiry ON challenges(expires_at);
+
+CREATE TABLE IF NOT EXISTS tokens(
+  token_hash BLOB PRIMARY KEY CHECK(length(token_hash) = 32),
+  realm      TEXT NOT NULL CHECK(realm IN('device','management')),
+  subject    BLOB NOT NULL CHECK(length(subject) = 16),
+  auth_rev   INTEGER NOT NULL CHECK(auth_rev >= 1),
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS tokens_expiry ON tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS invites(
+  invite_id       BLOB PRIMARY KEY CHECK(length(invite_id) = 16),
+  token_hash      BLOB NOT NULL UNIQUE CHECK(length(token_hash) = 32),
+  expires_at      INTEGER NOT NULL,
+  pending_device  BLOB CHECK(pending_device IS NULL OR length(pending_device) = 16),
+  used_at         INTEGER
+) STRICT;
+
+-- ===== 维护预算（ADR §13.2）=====
+CREATE TABLE IF NOT EXISTS maintenance_reservations(
+  reservation_id BLOB PRIMARY KEY CHECK(length(reservation_id) = 16),
+  purpose        TEXT NOT NULL CHECK(purpose IN('checkpoint','rotation')),
+  resource_id    BLOB NOT NULL UNIQUE,
+  owner_device   BLOB NOT NULL REFERENCES devices(device_id),
+  reserved_bytes INTEGER NOT NULL CHECK(reserved_bytes >= 0),
+  consumed_bytes INTEGER NOT NULL CHECK(consumed_bytes >= 0 AND consumed_bytes <= reserved_bytes),
+  state          TEXT NOT NULL CHECK(state IN('active','complete','expired')),
+  expires_at     INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS reservations_state ON maintenance_reservations(state, expires_at);
+
+CREATE TABLE IF NOT EXISTS usage(
+  singleton         INTEGER PRIMARY KEY CHECK(singleton = 1),
+  normal_bytes      INTEGER NOT NULL CHECK(normal_bytes >= 0),
+  maintenance_bytes INTEGER NOT NULL CHECK(maintenance_bytes >= 0)
+) STRICT;
+
+-- ===== 对象与分片 =====
+CREATE TABLE IF NOT EXISTS objects(
+  object_id      BLOB PRIMARY KEY CHECK(length(object_id) = 32),
+  message_id     BLOB NOT NULL CHECK(length(message_id) = 16),
+  producer       BLOB NOT NULL CHECK(length(producer) = 16),
+  epoch          INTEGER NOT NULL CHECK(epoch > 0),
+  type           INTEGER NOT NULL CHECK(type BETWEEN 1 AND 5),
+  generation     INTEGER NOT NULL CHECK(generation >= 0),
+  sender_seq     INTEGER NOT NULL CHECK(sender_seq >= 0),
+  part_count     INTEGER NOT NULL CHECK(part_count >= 1),
+  plain_len      INTEGER NOT NULL CHECK(plain_len >= 1),
+  state          TEXT NOT NULL CHECK(state IN('staging','complete')),
+  budget_class   TEXT NOT NULL CHECK(budget_class IN('normal','maintenance','retired')),
+  digest         BLOB CHECK(digest IS NULL OR length(digest) = 32),
+  signed_commit  BLOB,
+  commit_signature BLOB,
+  reservation_id BLOB REFERENCES maintenance_reservations(reservation_id),
+  created_at     INTEGER NOT NULL,
+  touched_at     INTEGER NOT NULL,
+  completed_at   INTEGER,
+  UNIQUE(epoch, message_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS objects_state ON objects(state, touched_at);
+CREATE INDEX IF NOT EXISTS objects_epoch ON objects(epoch, type);
+
+CREATE TABLE IF NOT EXISTS object_parts(
+  object_id BLOB NOT NULL REFERENCES objects(object_id),
+  part_no   INTEGER NOT NULL CHECK(part_no >= 0),
+  envelope  BLOB NOT NULL CHECK(length(envelope) BETWEEN 212 AND 4194304),
+  digest    BLOB NOT NULL CHECK(length(digest) = 32),
+  PRIMARY KEY(object_id, part_no)
+) STRICT;
+
+-- ===== 日志（`relay_seq` 只表示送达顺序）=====
+CREATE TABLE IF NOT EXISTS log(
+  relay_seq  INTEGER PRIMARY KEY CHECK(relay_seq > 0),
+  kind       TEXT NOT NULL CHECK(kind IN('update','asset','checkpoint','control')),
+  object_id  BLOB CHECK(object_id IS NULL OR length(object_id) = 32),
+  epoch      INTEGER NOT NULL CHECK(epoch > 0),
+  event      BLOB NOT NULL,
+  signature  BLOB,
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS log_epoch ON log(epoch);
+
+-- ===== checkpoint =====
+CREATE TABLE IF NOT EXISTS checkpoints(
+  checkpoint_id      BLOB PRIMARY KEY CHECK(length(checkpoint_id) = 16),
+  epoch              INTEGER NOT NULL CHECK(epoch > 0),
+  covered_seq        INTEGER NOT NULL CHECK(covered_seq >= 0),
+  manifest_oid       BLOB CHECK(manifest_oid IS NULL OR length(manifest_oid) = 32),
+  refs_digest        BLOB CHECK(refs_digest IS NULL OR length(refs_digest) = 32),
+  signed_commit      BLOB,
+  commit_signature   BLOB,
+  state              TEXT NOT NULL CHECK(state IN('staging','candidate','published','aborted','pruned')),
+  role               TEXT CHECK(role IS NULL OR role IN('primary','fallback')),
+  validation_version INTEGER NOT NULL CHECK(validation_version >= 1),
+  health             TEXT NOT NULL CHECK(health IN('unknown','healthy','unhealthy')),
+  created_at         INTEGER NOT NULL,
+  published_at       INTEGER
+) STRICT;
+CREATE INDEX IF NOT EXISTS checkpoints_state ON checkpoints(state, epoch);
+CREATE INDEX IF NOT EXISTS checkpoints_published ON checkpoints(published_at);
+
+CREATE TABLE IF NOT EXISTS checkpoint_refs(
+  checkpoint_id BLOB NOT NULL REFERENCES checkpoints(checkpoint_id),
+  object_id     BLOB NOT NULL CHECK(length(object_id) = 32),
+  role          TEXT NOT NULL CHECK(role IN('data','manifest')),
+  PRIMARY KEY(checkpoint_id, object_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS checkpoint_refs_object ON checkpoint_refs(object_id);
+
+-- §25.1：不透明资产登记（只有 HMAC object_id/ObjectRefV1 元数据；真实 sha256/MIME/byte_len 不进 relay）。
+CREATE TABLE IF NOT EXISTS asset_objects(
+  epoch         INTEGER NOT NULL CHECK(epoch > 0),
+  object_id     BLOB NOT NULL CHECK(length(object_id) = 32),
+  state         TEXT NOT NULL CHECK(state IN('active','retired')),
+  finalized_seq INTEGER NOT NULL CHECK(finalized_seq >= 0),
+  rotation_id   BLOB CHECK(rotation_id IS NULL OR length(rotation_id) = 16),
+  PRIMARY KEY(epoch, object_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS asset_objects_epoch ON asset_objects(epoch, state, finalized_seq);
+
+-- ===== key slot =====
+CREATE TABLE IF NOT EXISTS key_slots(
+  slot_id      BLOB PRIMARY KEY CHECK(length(slot_id) = 32) REFERENCES objects(object_id),
+  epoch        INTEGER NOT NULL CHECK(epoch > 0),
+  kind         TEXT NOT NULL CHECK(kind IN('password','recovery')),
+  descriptor   BLOB NOT NULL,
+  state        TEXT NOT NULL CHECK(state IN('staging','active','retiring')),
+  slot_set_rev INTEGER NOT NULL CHECK(slot_set_rev >= 0),
+  retire_at    INTEGER,
+  created_at   INTEGER NOT NULL
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS active_slot_kind ON key_slots(kind) WHERE state = 'active';
+
+-- ===== HPKE grants（按 epoch）=====
+CREATE TABLE IF NOT EXISTS device_grants(
+  epoch           INTEGER NOT NULL CHECK(epoch > 0),
+  device_id       BLOB NOT NULL REFERENCES devices(device_id),
+  manager_rev     INTEGER NOT NULL CHECK(manager_rev >= 1),
+  hpke_enc        BLOB NOT NULL CHECK(length(hpke_enc) = 32),
+  hpke_ciphertext BLOB NOT NULL,
+  signed_header   BLOB NOT NULL,
+  signature       BLOB,
+  grant_id        BLOB CHECK(grant_id IS NULL OR length(grant_id) = 16),
+  activation_ref  BLOB CHECK(activation_ref IS NULL OR length(activation_ref) = 16),
+  PRIMARY KEY(epoch, device_id)
+) STRICT;
+
+-- ===== 轮换 =====
+CREATE TABLE IF NOT EXISTS rotations(
+  rotation_id    BLOB PRIMARY KEY CHECK(length(rotation_id) = 16),
+  from_epoch     INTEGER NOT NULL CHECK(from_epoch > 0),
+  to_epoch       INTEGER NOT NULL CHECK(to_epoch > from_epoch),
+  freeze_seq     INTEGER NOT NULL CHECK(freeze_seq >= 0),
+  member_set_hash BLOB CHECK(member_set_hash IS NULL OR length(member_set_hash) = 32),
+  asset_set_digest BLOB CHECK(asset_set_digest IS NULL OR length(asset_set_digest) = 32),
+  revoked_count  INTEGER NOT NULL CHECK(revoked_count >= 0),
+  state          TEXT NOT NULL CHECK(state IN('frozen','staging','activated','aborted')),
+  primary_checkpoint BLOB CHECK(primary_checkpoint IS NULL OR length(primary_checkpoint) = 16),
+  fallback_checkpoint BLOB CHECK(fallback_checkpoint IS NULL OR length(fallback_checkpoint) = 16),
+  activation_commit  BLOB CHECK(activation_commit IS NULL OR length(activation_commit) = 32),
+  activated_at       INTEGER,
+  activated_control_rev INTEGER CHECK(activated_control_rev IS NULL OR activated_control_rev >= 0),
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS rotations_state ON rotations(state);
+
+-- ===== bootstrap lease =====
+CREATE TABLE IF NOT EXISTS bootstrap_leases(
+  lease_id           BLOB PRIMARY KEY CHECK(length(lease_id) = 16),
+  device_id          BLOB NOT NULL REFERENCES devices(device_id),
+  primary_checkpoint BLOB NOT NULL CHECK(length(primary_checkpoint) = 16),
+  fallback_checkpoint BLOB NOT NULL CHECK(length(fallback_checkpoint) = 16),
+  floor_seq          INTEGER NOT NULL CHECK(floor_seq >= 0),
+  created_at         INTEGER NOT NULL,
+  expires_at         INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS leases_expiry ON bootstrap_leases(expires_at);
+
+-- ===== 设备 ACK 水位 =====
+CREATE TABLE IF NOT EXISTS device_acks(
+  device_id     BLOB PRIMARY KEY REFERENCES devices(device_id),
+  received_seq  INTEGER NOT NULL CHECK(received_seq >= 0),
+  integrated_seq INTEGER NOT NULL CHECK(integrated_seq >= 0),
+  epoch         INTEGER NOT NULL CHECK(epoch > 0),
+  updated_at    INTEGER NOT NULL,
+  CHECK(received_seq >= integrated_seq)
+) STRICT;
+
+-- ===== 幂等 / tombstone（不随密文 GC 消失，ADR §6 末段）=====
+CREATE TABLE IF NOT EXISTS dedup(
+  scope        TEXT NOT NULL,
+  id           BLOB NOT NULL,
+  request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+  accepted_seq INTEGER,
+  response     BLOB NOT NULL,
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY(scope, id)
+) STRICT;
+
+-- ===== GC 持久计划（ADR §7：后来的 checkpoint 不能重置已有 deadline）=====
+CREATE TABLE IF NOT EXISTS gc_plans(
+  epoch       INTEGER NOT NULL CHECK(epoch > 0),
+  cut_seq     INTEGER NOT NULL CHECK(cut_seq >= 0),
+  eligible_at INTEGER NOT NULL,
+  proof       BLOB NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY(epoch, cut_seq)
+) STRICT;
+"#;
+
+    /// 建一个 schema 9 文件库（已含 `relay_meta` 版本 9）。
+    pub fn create(path: &Path) -> Connection {
+        let conn = Connection::open(path).expect("open v9 db");
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("busy");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        conn.pragma_update(None, "synchronous", "FULL")
+            .expect("sync");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        conn.execute_batch(DDL).expect("v9 ddl");
+        conn.execute(
+            "INSERT INTO relay_meta(key, value) VALUES ('instance_id', ?1)",
+            [INSTANCE.as_slice()],
+        )
+        .expect("instance");
+        conn.execute(
+            "INSERT INTO relay_meta(key, value) VALUES ('schema_version', ?1)",
+            [SCHEMA_VERSION.to_string().as_bytes()],
+        )
+        .expect("version");
+        conn.execute(
+            "INSERT INTO relay_meta(key, value) VALUES ('setup.consumed', ?1)",
+            [b"1".as_slice()],
+        )
+        .expect("setup consumed");
+        conn
+    }
+
+    /// 写入覆盖全部租户表的一整套旧数据（含已消费邀请、游标口径的 head/gc_floor）。
+    pub fn seed(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO vault(singleton, vault_id, instance_id, log_id, log_incarnation,
+                               cursor_key, state, active_epoch, next_epoch, manager_rev,
+                               control_rev, auth_rev, head_seq, gc_floor, normal_limit,
+                               maintenance_limit, created_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, 'active', 1, 3, 2, 2, 4, 3, 1, 1048576, 2097152, 100)",
+            (
+                VAULT.as_slice(),
+                INSTANCE.as_slice(),
+                LOG_ID.as_slice(),
+                LOG_INCARNATION.as_slice(),
+                CURSOR_KEY.as_slice(),
+            ),
+        )
+        .expect("vault");
+        conn.execute(
+            "INSERT INTO manager_keys(rev, pubkey, transition, old_rev, old_signature,
+                                      new_signature, created_at)
+             VALUES (1, ?1, ?2, 0, NULL, NULL, 100)",
+            (MANAGER_PUB.as_slice(), b"genesis-cert".as_slice()),
+        )
+        .expect("manager key");
+        // 控制链按真实公式算 `record_hash = SHA256(prev_hash || signed_record)`，
+        // 迁移后必须仍可逐条重算（签名链不可被重写）。
+        let genesis = relay::ids::sha256_parts(&[[0u8; 32].as_slice(), b"genesis-cert"]);
+        conn.execute(
+            "INSERT INTO control_commits(rev, prev_hash, record_hash, signed_record, created_at)
+             VALUES (1, ?1, ?2, ?3, 100)",
+            (
+                [0u8; 32].as_slice(),
+                genesis.as_slice(),
+                b"genesis-cert".as_slice(),
+            ),
+        )
+        .expect("control rev 1");
+        let begin = relay::ids::sha256_parts(&[genesis.as_slice(), b"rotation-begin"]);
+        conn.execute(
+            "INSERT INTO control_commits(rev, prev_hash, record_hash, signed_record, created_at)
+             VALUES (2, ?1, ?2, ?3, 150)",
+            (
+                genesis.as_slice(),
+                begin.as_slice(),
+                b"rotation-begin".as_slice(),
+            ),
+        )
+        .expect("control rev 2");
+        conn.execute(
+            "INSERT INTO epochs(epoch, state, revoked_once, created_at, retire_at)
+             VALUES (1, 'active', 0, 100, NULL)",
+            [],
+        )
+        .expect("epoch 1");
+        conn.execute(
+            "INSERT INTO epochs(epoch, state, revoked_once, created_at, retire_at)
+             VALUES (2, 'staged', 1, 150, NULL)",
+            [],
+        )
+        .expect("epoch 2");
+        conn.execute(
+            "INSERT INTO devices(device_id, sign_pk, hpke_pk, certificate, certificate_signature,
+                                 status, created_at, revoked_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 100, NULL, 200)",
+            (
+                DEVICE_ACTIVE.as_slice(),
+                [0xB1u8; 32].as_slice(),
+                [0xC1u8; 32].as_slice(),
+                b"cert-active".as_slice(),
+                b"cert-sig-active".as_slice(),
+            ),
+        )
+        .expect("active device");
+        conn.execute(
+            "INSERT INTO devices(device_id, sign_pk, hpke_pk, certificate, certificate_signature,
+                                 status, created_at, revoked_at, last_seen)
+             VALUES (?1, ?2, ?3, X'', NULL, 'pending', 110, NULL, NULL)",
+            (
+                DEVICE_PENDING.as_slice(),
+                [0xB2u8; 32].as_slice(),
+                [0xC2u8; 32].as_slice(),
+            ),
+        )
+        .expect("pending device");
+        conn.execute(
+            "INSERT INTO devices(device_id, sign_pk, hpke_pk, certificate, certificate_signature,
+                                 status, created_at, revoked_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'revoked', 100, 120, 130)",
+            (
+                DEVICE_REVOKED.as_slice(),
+                [0xB3u8; 32].as_slice(),
+                [0xC3u8; 32].as_slice(),
+                b"cert-revoked".as_slice(),
+                b"cert-sig-revoked".as_slice(),
+            ),
+        )
+        .expect("revoked device");
+        // 旧 challenge / token：迁移必须失效（ADR 0014 §A 维护窗口）。
+        conn.execute(
+            "INSERT INTO challenges(challenge_id, realm, subject, nonce, expires_at, used_at)
+             VALUES (?1, 'device', ?2, ?3, 1000, NULL)",
+            (
+                CHALLENGE.as_slice(),
+                DEVICE_ACTIVE.as_slice(),
+                [0xE1u8; 32].as_slice(),
+            ),
+        )
+        .expect("challenge");
+        conn.execute(
+            "INSERT INTO tokens(token_hash, realm, subject, auth_rev, expires_at, created_at)
+             VALUES (?1, 'device', ?2, 4, 1000, 100)",
+            (TOKEN_HASH.as_slice(), DEVICE_ACTIVE.as_slice()),
+        )
+        .expect("token");
+        // 已消费邀请：事实必须保留（used_at + pending_device）。
+        conn.execute(
+            "INSERT INTO invites(invite_id, token_hash, expires_at, pending_device, used_at)
+             VALUES (?1, ?2, 2000, ?3, 150)",
+            (
+                INVITE_ID.as_slice(),
+                INVITE_TOKEN_HASH.as_slice(),
+                DEVICE_PENDING.as_slice(),
+            ),
+        )
+        .expect("invite");
+        conn.execute(
+            "INSERT INTO maintenance_reservations(reservation_id, purpose, resource_id,
+                                                  owner_device, reserved_bytes, consumed_bytes,
+                                                  state, expires_at)
+             VALUES (?1, 'checkpoint', ?2, ?3, 1000, 400, 'active', 2000)",
+            (
+                RESERVATION.as_slice(),
+                [0x15u8; 16].as_slice(),
+                DEVICE_ACTIVE.as_slice(),
+            ),
+        )
+        .expect("reservation");
+        conn.execute(
+            "INSERT INTO usage(singleton, normal_bytes, maintenance_bytes) VALUES (1, 600, 400)",
+            [],
+        )
+        .expect("usage");
+        for (object_id, object_type, message, part_count) in [
+            (UPDATE_OBJECT, 1i64, [0x23u8; 16], 1i64),
+            (ASSET_OBJECT, 4i64, [0x24u8; 16], 1i64),
+            (SLOT_OBJECT, 5i64, [0x25u8; 16], 1i64),
+        ] {
+            conn.execute(
+                "INSERT INTO objects(object_id, message_id, producer, epoch, type, generation,
+                                     sender_seq, part_count, plain_len, state, budget_class,
+                                     digest, signed_commit, commit_signature, reservation_id,
+                                     created_at, touched_at, completed_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, 0, 0, ?5, 300, 'complete', 'normal', ?6, ?7, ?8,
+                         NULL, 100, 100, 100)",
+                (
+                    object_id.as_slice(),
+                    message.as_slice(),
+                    DEVICE_ACTIVE.as_slice(),
+                    object_type,
+                    part_count,
+                    [0x26u8; 32].as_slice(),
+                    b"signed-commit".as_slice(),
+                    b"commit-signature".as_slice(),
+                ),
+            )
+            .expect("object");
+            conn.execute(
+                "INSERT INTO object_parts(object_id, part_no, envelope, digest)
+                 VALUES (?1, 0, ?2, ?3)",
+                (
+                    object_id.as_slice(),
+                    PART_ENVELOPE.to_vec(),
+                    [0x27u8; 32].as_slice(),
+                ),
+            )
+            .expect("part");
+        }
+        conn.execute(
+            "INSERT INTO log(relay_seq, kind, object_id, epoch, event, signature, created_at)
+             VALUES (1, 'update', ?1, 1, ?2, ?3, 100)",
+            (
+                UPDATE_OBJECT.as_slice(),
+                b"event-update".as_slice(),
+                b"sig-update".as_slice(),
+            ),
+        )
+        .expect("log 1");
+        conn.execute(
+            "INSERT INTO log(relay_seq, kind, object_id, epoch, event, signature, created_at)
+             VALUES (2, 'asset', ?1, 1, ?2, ?3, 110)",
+            (
+                ASSET_OBJECT.as_slice(),
+                b"event-asset".as_slice(),
+                b"sig-asset".as_slice(),
+            ),
+        )
+        .expect("log 2");
+        conn.execute(
+            "INSERT INTO log(relay_seq, kind, object_id, epoch, event, signature, created_at)
+             VALUES (3, 'control', NULL, 1, ?1, ?2, 150)",
+            (b"event-control".as_slice(), b"sig-control".as_slice()),
+        )
+        .expect("log 3");
+        conn.execute(
+            "INSERT INTO checkpoints(checkpoint_id, epoch, covered_seq, manifest_oid,
+                                     refs_digest, signed_commit, commit_signature, state, role,
+                                     validation_version, health, created_at, published_at)
+             VALUES (?1, 1, 2, NULL, ?2, ?3, ?4, 'staging', NULL, 1, 'healthy', 100, NULL)",
+            (
+                CHECKPOINT.as_slice(),
+                [0x28u8; 32].as_slice(),
+                b"checkpoint-commit".as_slice(),
+                b"checkpoint-sig".as_slice(),
+            ),
+        )
+        .expect("checkpoint");
+        conn.execute(
+            "INSERT INTO checkpoint_refs(checkpoint_id, object_id, role) VALUES (?1, ?2, 'data')",
+            (CHECKPOINT.as_slice(), UPDATE_OBJECT.as_slice()),
+        )
+        .expect("checkpoint ref");
+        conn.execute(
+            "INSERT INTO asset_objects(epoch, object_id, state, finalized_seq, rotation_id)
+             VALUES (1, ?1, 'active', 2, ?2)",
+            (ASSET_OBJECT.as_slice(), ROTATION.as_slice()),
+        )
+        .expect("asset registry");
+        conn.execute(
+            "INSERT INTO key_slots(slot_id, epoch, kind, descriptor, state, slot_set_rev,
+                                   retire_at, created_at)
+             VALUES (?1, 1, 'password', ?2, 'active', 1, NULL, 100)",
+            (SLOT_OBJECT.as_slice(), b"slot-descriptor".as_slice()),
+        )
+        .expect("key slot");
+        conn.execute(
+            "INSERT INTO device_grants(epoch, device_id, manager_rev, hpke_enc, hpke_ciphertext,
+                                       signed_header, signature, grant_id, activation_ref)
+             VALUES (1, ?1, 2, ?2, ?3, ?4, ?5, ?6, NULL)",
+            (
+                DEVICE_ACTIVE.as_slice(),
+                [0x61u8; 32].as_slice(),
+                b"grant-ciphertext".as_slice(),
+                b"grant-header".as_slice(),
+                b"grant-signature".as_slice(),
+                [0x62u8; 16].as_slice(),
+            ),
+        )
+        .expect("grant");
+        conn.execute(
+            "INSERT INTO rotations(rotation_id, from_epoch, to_epoch, freeze_seq, member_set_hash,
+                                   asset_set_digest, revoked_count, state, primary_checkpoint,
+                                   fallback_checkpoint, activation_commit, activated_at,
+                                   activated_control_rev, created_at, updated_at)
+             VALUES (?1, 1, 2, 2, ?2, ?3, 1, 'frozen', NULL, NULL, NULL, NULL, NULL, 150, 150)",
+            (
+                ROTATION.as_slice(),
+                [0x29u8; 32].as_slice(),
+                [0x2Au8; 32].as_slice(),
+            ),
+        )
+        .expect("rotation");
+        conn.execute(
+            "INSERT INTO bootstrap_leases(lease_id, device_id, primary_checkpoint,
+                                          fallback_checkpoint, floor_seq, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?3, 2, 100, 2000)",
+            (
+                LEASE.as_slice(),
+                DEVICE_ACTIVE.as_slice(),
+                CHECKPOINT.as_slice(),
+            ),
+        )
+        .expect("lease");
+        conn.execute(
+            "INSERT INTO device_acks(device_id, received_seq, integrated_seq, epoch, updated_at)
+             VALUES (?1, 3, 2, 1, 200)",
+            [DEVICE_ACTIVE.as_slice()],
+        )
+        .expect("ack");
+        conn.execute(
+            "INSERT INTO dedup(scope, id, request_hash, accepted_seq, response, created_at)
+             VALUES ('object-complete', ?1, ?2, 1, ?3, 200)",
+            (
+                UPDATE_OBJECT.as_slice(),
+                [0x2Bu8; 32].as_slice(),
+                b"ack-response".as_slice(),
+            ),
+        )
+        .expect("dedup");
+        conn.execute(
+            "INSERT INTO gc_plans(epoch, cut_seq, eligible_at, proof, created_at)
+             VALUES (1, 1, 5000, ?1, 200)",
+            [b"gc-proof".as_slice()],
+        )
+        .expect("gc plan");
+    }
+
+    /// 建库 + 全套种子数据。
+    pub fn fixture(path: &Path) -> Connection {
+        let conn = create(path);
+        seed(&conn);
+        conn
+    }
+}
+
+/// 任意 vault 的管理 realm 上下文（弱夹具的管理 subject 由 `manager_pub` 派生）。
+pub fn manager_ctx_for(fx: &Fixture, vault_id: Id16) -> AuthContext {
+    AuthContext {
+        realm: Realm::Management,
+        subject: Realm::management_subject(&fx.manager_pub),
+        device_id: None,
+        auth_rev: fx.vault().auth_rev,
+        vault: VaultScope::new(vault_id),
+    }
+}
+
 /// 测试夹具：一个已初始化的单 vault + 单设备。
 pub struct Fixture {
-    pub db: Db,
+    pub db: TestDb,
     pub clock: Arc<FakeClock>,
     pub hook: Arc<TestHook>,
     pub cfg: Arc<RelayConfig>,
@@ -287,25 +1011,61 @@ impl Fixture {
         Self::build(label, normal_limit, maintenance_limit, None)
     }
 
+    /// 指定 v2 入口限流的夹具（测试用低阈值证明 429；`None` = 关闭）。
+    pub fn with_v2_rate_limits(
+        label: &str,
+        create: Option<RateLimitSpec>,
+        auth: Option<RateLimitSpec>,
+    ) -> Self {
+        Self::build_with(label, 1024 * 1024, 2 * 1024 * 1024, None, move |cfg| {
+            cfg.with_v2_rate_limits(create, auth)
+        })
+    }
+
+    /// v2 **业务**入口限流（create/auth 关闭）：证明业务 429 且 v1 不受影响。
+    pub fn with_v2_data_limit(label: &str, data: Option<RateLimitSpec>) -> Self {
+        Self::build_with(label, 1024 * 1024, 2 * 1024 * 1024, None, move |cfg| {
+            cfg.with_v2_rate_limits(None, None).with_v2_data_limit(data)
+        })
+    }
+
     fn build(
         label: &str,
         normal_limit: i64,
         maintenance_limit: i64,
         manager_seed: Option<[u8; 32]>,
     ) -> Self {
+        Self::build_with(
+            label,
+            normal_limit,
+            maintenance_limit,
+            manager_seed,
+            |cfg| cfg,
+        )
+    }
+
+    fn build_with(
+        label: &str,
+        normal_limit: i64,
+        maintenance_limit: i64,
+        manager_seed: Option<[u8; 32]>,
+        configure: impl FnOnce(RelayConfig) -> RelayConfig,
+    ) -> Self {
         let clock = Arc::new(FakeClock::new(BASE_TIME));
         let hook = Arc::new(TestHook::new());
-        let cfg = Arc::new(
+        let cfg = Arc::new(configure(
             RelayConfig::new(temp_db_path(label))
                 .with_setup_secret("setup-secret")
                 .with_limits(normal_limit, maintenance_limit),
-        );
+        ));
         let db = Db::open(cfg.db.clone(), clock.clone()).expect("open db");
         let db_path = cfg.db.path.clone();
         // 唯一路径下不应有历史库；若真撞上残留/复用，直接给出可操作的断言而不是 AlreadyInitialized。
-        let existing = db.read(vault::load_opt).expect("read vault before init");
+        let existing = db
+            .read_instance(relay::db::schema::list_vault_ids)
+            .expect("read vault list before init");
         assert!(
-            existing.is_none(),
+            existing.is_empty(),
             "测试库 {} 已初始化（路径复用/上次运行残留）：测试隔离被破坏",
             db_path.display()
         );
@@ -342,6 +1102,7 @@ impl Fixture {
             certificate_signature,
         };
         let db_for_init = db.clone();
+        let scope_for_init = VaultScope::new(vault_id);
         let clock_for_init = clock.clone();
         // 有真实管理私钥时，genesis 证书签名也必须走真实 Ed25519 校验（不再用 TestHook
         // 接受占位签名）；只有弱夹具（无管理私钥）保留 TestHook。
@@ -352,7 +1113,7 @@ impl Fixture {
         };
         let cfg_for_init = cfg.clone();
         db_for_init
-            .write_blocking(move |conn| {
+            .write_blocking(scope_for_init, move |conn| {
                 vault::initialize(
                     conn,
                     clock_for_init.as_ref(),
@@ -363,7 +1124,7 @@ impl Fixture {
             })
             .unwrap_or_else(|err| panic!("initialize vault at {}: {err}", db_path.display()));
         Self {
-            db,
+            db: TestDb::new(db, VaultScope::new(vault_id)),
             clock,
             hook,
             cfg,
@@ -395,6 +1156,7 @@ impl Fixture {
             subject: self.device,
             device_id: Some(self.device),
             auth_rev: self.vault().auth_rev,
+            vault: self.db.scope(),
         }
     }
 
@@ -404,6 +1166,7 @@ impl Fixture {
             subject: Realm::management_subject(&self.manager_pub),
             device_id: None,
             auth_rev: self.vault().auth_rev,
+            vault: self.db.scope(),
         }
     }
 
@@ -1180,8 +1943,9 @@ impl Fixture {
         self.db
             .read(move |conn| {
                 let bytes: Vec<u8> = conn.query_row(
-                    "SELECT reservation_id FROM maintenance_reservations WHERE resource_id = ?1",
-                    [checkpoint.as_slice()],
+                    "SELECT reservation_id FROM maintenance_reservations
+                     WHERE resource_id = ?1 AND vault_id = ?",
+                    (checkpoint.as_slice(), conn.scope().as_slice()),
                     |row| row.get(0),
                 )?;
                 bytes
@@ -1199,8 +1963,9 @@ impl Fixture {
             .read(move |conn| {
                 let bytes: Vec<u8> = conn.query_row(
                     "SELECT reservation_id FROM maintenance_reservations
-                     WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'",
-                    [rotation.as_slice()],
+                     WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'
+                       AND vault_id = ?",
+                    (rotation.as_slice(), conn.scope().as_slice()),
                     |row| row.get(0),
                 )?;
                 bytes
@@ -1257,10 +2022,11 @@ impl Fixture {
         self.db
             .read(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT epoch, cut_seq, eligible_at FROM gc_plans ORDER BY cut_seq ASC",
+                    "SELECT epoch, cut_seq, eligible_at FROM gc_plans
+                     WHERE vault_id = ?1 ORDER BY cut_seq ASC",
                 )?;
                 let rows: Vec<(u64, u64, i64)> = stmt
-                    .query_map([], |row| {
+                    .query_map([conn.scope().as_slice()], |row| {
                         Ok((
                             u64::try_from(row.get::<_, i64>(0)?).expect("epoch"),
                             u64::try_from(row.get::<_, i64>(1)?).expect("cut"),
@@ -1276,9 +2042,10 @@ impl Fixture {
     pub fn log_seqs(&self) -> Vec<u64> {
         self.db
             .read(|conn| {
-                let mut stmt = conn.prepare("SELECT relay_seq FROM log ORDER BY relay_seq")?;
+                let mut stmt = conn
+                    .prepare("SELECT relay_seq FROM log WHERE vault_id = ?1 ORDER BY relay_seq")?;
                 let rows: Vec<u64> = stmt
-                    .query_map([], |row| {
+                    .query_map([conn.scope().as_slice()], |row| {
                         Ok(u64::try_from(row.get::<_, i64>(0)?).expect("seq"))
                     })?
                     .collect::<std::result::Result<_, _>>()?;
@@ -1303,7 +2070,7 @@ impl Fixture {
     pub fn raw_write<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&rusqlite::Connection) -> Result<T> + Send + 'static,
+        F: FnOnce(&ScopeConn<'_>) -> Result<T> + Send + 'static,
     {
         self.db.write_blocking(f)
     }
@@ -1321,9 +2088,11 @@ impl Fixture {
         self.db
             .write_blocking(move |conn| {
                 conn.execute(
-                    "INSERT INTO devices(device_id, sign_pk, hpke_pk, certificate, status, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO devices(vault_id, device_id, sign_pk, hpke_pk, certificate,
+                                        status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     (
+                        conn.scope().as_slice(),
                         device_id.as_slice(),
                         [4u8; 32].as_slice(),
                         [5u8; 32].as_slice(),
@@ -1370,10 +2139,11 @@ impl Fixture {
         self.db
             .read(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT device_id FROM devices WHERE status = 'active' ORDER BY device_id",
+                    "SELECT device_id FROM devices
+                     WHERE status = 'active' AND vault_id = ?1 ORDER BY device_id",
                 )?;
                 let rows: Vec<Vec<u8>> = stmt
-                    .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                    .query_map([conn.scope().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
                     .collect::<std::result::Result<_, _>>()?;
                 rows.into_iter()
                     .map(|bytes| {
@@ -1391,7 +2161,11 @@ impl Fixture {
     pub fn control_count(&self) -> i64 {
         self.db
             .read(|conn| {
-                Ok(conn.query_row("SELECT COUNT(*) FROM control_commits", [], |row| row.get(0))?)
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM control_commits WHERE vault_id = ?1",
+                    [conn.scope().as_slice()],
+                    |row| row.get(0),
+                )?)
             })
             .expect("control count")
     }

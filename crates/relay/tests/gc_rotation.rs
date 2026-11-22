@@ -426,30 +426,41 @@ fn abort_without_revocation_still_unfreezes() {
 }
 
 #[test]
-fn v4_upgrade_backfills_revoked_once_after_abort() {
+fn revoked_once_backfill_survives_restart_after_abort() {
     let fx = Fixture::new("rotation-v4-backfill");
+    let vault_id = fx.vault_id;
     let second = [6u8; 16];
     fx.add_device(second);
     let view = fx.begin_rotation(&[second]);
     fx.abort_rotation(&view.rotation.rotation_id)
         .expect("abort");
-    // 模拟 v4 库：删掉新列并把版本降回 4，然后重开触发 v4→v5 迁移。
-    fx.db
-        .write_blocking(|conn| {
-            conn.execute("ALTER TABLE epochs DROP COLUMN revoked_once", [])?;
-            conn.execute(
-                "UPDATE relay_meta SET value = ?1 WHERE key = 'schema_version'",
-                ["4".as_bytes()],
-            )?;
-            Ok(())
-        })
-        .expect("downgrade to v4");
+    // abort 之后吊销事实必须已落库（不是只在内存里）。
+    assert!(
+        fx.db
+            .read(|conn| relay::vault::epoch_revoked_once(conn, 1))
+            .expect("revoked_once"),
+        "abort 后 from_epoch 的吊销事实必须持久化"
+    );
+    // 模拟旧 v4 库缺这一列的回填值：清零后重放 §27.1 回填，重启仍必须得到同一事实。
+    fx.raw_write(|conn| {
+        conn.execute(
+            "UPDATE epochs SET revoked_once = 0 WHERE epoch = 1 AND vault_id = ?1",
+            [conn.scope().as_slice()],
+        )?;
+        Ok(())
+    })
+    .expect("clear backfill");
     let path = fx.into_db_path();
     let cleanup_path = path.clone();
     let clock = std::sync::Arc::new(relay::time::FakeClock::new(BASE_TIME));
     let db = relay::db::Db::open(relay::db::DbConfig::new(path), clock).expect("reopen");
+    let db = TestDb::new(db, relay::VaultScope::new(vault_id));
     let vault = db.read(relay::vault::load).expect("vault");
     assert_eq!(vault.state, relay::vault::VaultState::Rotating);
+    let changed = db
+        .write_blocking(relay::db::schema::replay_revoked_once_backfill)
+        .expect("replay backfill");
+    assert_eq!(changed, 1, "旧库回填必须命中 from_epoch");
     let backfilled = db
         .read(|conn| relay::vault::epoch_revoked_once(conn, 1))
         .expect("backfilled");
@@ -461,6 +472,7 @@ fn v4_upgrade_backfills_revoked_once_after_abort() {
 #[test]
 fn revoked_epoch_fact_survives_restart() {
     let fx = Fixture::new("rotation-revoked-restart");
+    let vault_id = fx.vault_id;
     let second = [7u8; 16];
     fx.add_device(second);
     let view = fx.begin_rotation(&[second]);
@@ -471,6 +483,7 @@ fn revoked_epoch_fact_survives_restart() {
     let cleanup_path = path.clone();
     let clock = std::sync::Arc::new(relay::time::FakeClock::new(BASE_TIME));
     let db = relay::db::Db::open(relay::db::DbConfig::new(path), clock).expect("reopen");
+    let db = TestDb::new(db, relay::VaultScope::new(vault_id));
     let vault = db.read(relay::vault::load).expect("vault");
     assert_eq!(vault.state, relay::vault::VaultState::Rotating);
     let revoked_once = db

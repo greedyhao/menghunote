@@ -12,6 +12,7 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::api_version::{RelayApi, RelayApiVersion};
 use crate::cbor;
 use crate::device::{verify_signature, ManagementKey};
 use crate::error::SyncError;
@@ -214,6 +215,7 @@ pub fn sign_activate(
     request_id: [u8; 16],
     expected_control_rev: u64,
     body: &menghunote_sync_proto::RotationActivateBodyV1,
+    api_version: RelayApiVersion,
 ) -> Result<SignedActivation, SyncError> {
     if body.member_cert_digest.is_none()
         || body.grants_digest.is_none()
@@ -225,10 +227,12 @@ pub fn sign_activate(
         ));
     }
     let payload = body.encode()?;
-    let path = format!(
-        "/v1/vaults/{}/rotations/{}/activate",
-        crate::base64url::encode(&vault_id),
-        crate::base64url::encode(&rotation_id)
+    let path = RelayApi::new("", api_version).vault_path(
+        &vault_id,
+        &format!(
+            "/rotations/{}/activate",
+            crate::base64url::encode(&rotation_id)
+        ),
     );
     let body_digest: [u8; 32] =
         Sha256::digest(management_request_cde(HttpMethod::Post, &path, &payload)?).into();
@@ -271,12 +275,10 @@ pub fn sign_begin(
     expected_epoch: u64,
     expected_control_rev: u64,
     revoke: &[[u8; 16]],
+    api_version: RelayApiVersion,
 ) -> Result<RotationBegin, SyncError> {
     let body = begin_body(expected_epoch, expected_control_rev, &request_id, revoke)?;
-    let path = format!(
-        "/v1/vaults/{}/rotations",
-        crate::base64url::encode(&vault_id)
-    );
+    let path = RelayApi::new("", api_version).vault_path(&vault_id, "/rotations");
     let body_digest: [u8; 32] =
         Sha256::digest(management_request_cde(HttpMethod::Post, &path, &body)?).into();
     let signature = manager.sign(&management_signing_input(
@@ -299,6 +301,7 @@ pub fn sign_begin(
 /// 阶段 B：发起 begin；响应丢失时只按 request_id 查询。
 ///
 /// 成功（含查询找回）后 journal 进入 `Begun` 并持久化 rotation_id/S/log_id。
+#[allow(clippy::too_many_arguments)]
 pub fn begin_rotation<C: RelayClient>(
     vault: &Vault,
     client: &mut C,
@@ -307,6 +310,7 @@ pub fn begin_rotation<C: RelayClient>(
     manager: &ManagementKey,
     instance_id: &[u8; 16],
     revoke: &[[u8; 16]],
+    api_version: RelayApiVersion,
 ) -> Result<RotationView, SyncError> {
     if journal.phase != RotationPhase::Frozen {
         return Err(SyncError::Unsupported("rotation begin 需要 Frozen journal"));
@@ -337,6 +341,7 @@ pub fn begin_rotation<C: RelayClient>(
         journal.from_epoch,
         journal.control_rev,
         revoke,
+        api_version,
     )?;
     match client.begin_rotation(request) {
         Ok(view) => {

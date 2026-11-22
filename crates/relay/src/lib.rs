@@ -1,6 +1,6 @@
 //! menghunote relay —— 自建**密文中继**（ADR 0006 §5/§6/§7/§8/§13）。
 //!
-//! 定位：一个 Rust 进程 / 一个 vault / 一个 SQLite（WAL + FULL）：
+//! 定位：一个 Rust 进程 / 一个 SQLite（WAL + FULL）/ **同库多 vault**（schema 10，ADR 0014 §A）：
 //! - relay 只见密文：不解析 CDE 载荷、不运行 Argon/Loro/AEAD，不做搜索与因果合并；
 //! - 客户端自己保根、自己验对方、自己证明水位；`key_epoch` 是安全边界，`generation` 是数据边界；
 //! - 依赖边界（§6/§11）：`relay → sync-proto` + rusqlite/HTTP/公钥签名，**不依赖** storage/Loro/
@@ -9,7 +9,10 @@
 //! 模块地图：
 //! | 模块 | 职责 |
 //! | --- | --- |
-//! | [`db`] | 单有界 writer 线程 + 只读连接池 + DDL/PRAGMA |
+//! | [`admin`] | 运维创建票据（`/v2/vaults` 的一次性凭证；不是公开 HTTP）|
+//! | [`ratelimit`] | v2 auth/create 的有界入口限流（固定窗口，不引新依赖）|
+//! | [`db`] | 单有界 writer 线程 + 只读连接池 + DDL/PRAGMA（`ScopeConn` 携带显式租户作用域）|
+//! | [`scope`] | 显式 `VaultScope`/`ScopeConn`：禁止隐式默认 vault、按 subject 猜租户 |
 //! | [`cursor`] | 89 字节不可伪造游标（HMAC） |
 //! | [`quota`] | `Q`/`R` 预算与维护 reservation（逐片原子扣减） |
 //! | [`auth`] | challenge/token/管理签名钩子 |
@@ -28,6 +31,7 @@
 //! 服务端**不写业务日志**（canary 审计要求：日志里不得出现正文/口令/root/真实资产 hash）；
 //! 诊断只暴露计数与不透明 ID。
 
+pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod checkpoints;
@@ -44,9 +48,11 @@ pub mod management;
 pub mod objects;
 pub mod pairing;
 pub mod quota;
+pub mod ratelimit;
 pub mod refs;
 pub mod revocation;
 pub mod rotations;
+pub mod scope;
 pub mod sig;
 pub mod slots;
 pub mod time;
@@ -59,6 +65,7 @@ pub use db::{Db, DbConfig};
 pub use error::{ApiError, Error, ErrorCode, Result};
 pub use ids::{Hash32, Id16};
 pub use menghunote_sync_proto as proto;
+pub use scope::{ScopeConn, VaultScope};
 pub use sig::{Expectation, SignDomain, SignatureCheck, SignatureHook};
 pub use time::{Clock, FakeClock, SystemClock};
 pub use verify::Ed25519Hook;

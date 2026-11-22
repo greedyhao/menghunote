@@ -28,9 +28,11 @@
 //! 语义，不碰 socket；生产部署 = relay 监听 `127.0.0.1` + 反向代理终止 TLS（见 relay 的
 //! `serve --help`）。
 
+use crate::api_version::{RelayApi, RelayApiVersion};
 use crate::base64url;
-use crate::bootstrap::{control_head_hash, BootstrapPins};
+use crate::bootstrap::{control_head_hash, control_head_hash_at, BootstrapPins};
 use crate::cbor;
+use crate::control_pin::{BootstrapAnchorV1, VerifiedHead};
 use crate::device::{verify_signature, DeviceSigningKey};
 use crate::error::SyncError;
 use crate::identity::LocalIdentityV1;
@@ -90,6 +92,11 @@ pub struct HttpRelayConfig {
     ///
     /// 明文/证书/重定向策略由 [`StdTcpTransport`] 在构造时执行，本配置不绕过它们。
     pub base_url: String,
+    /// relay API 面（ADR 0014 S3a）：决定所有业务/鉴权路径与**管理签名**的 path。
+    ///
+    /// 缺省为 v1（`HttpRelayConfig::default()` 不实现）；调用方必须显式给出，
+    /// 生产构造点是 [`crate::relay_context::RelayContext::open`] 与初始化会话。
+    pub api_version: RelayApiVersion,
     /// vault 身份。
     pub vault_id: VaultId,
     /// 本机设备身份。
@@ -120,11 +127,14 @@ const MAX_CONTROL_COMMITS: u64 = 65_536;
 /// - `control_rev` 来自 `identity.control_rev` / `sync.pinned_control_rev`；
 /// - `record_hash` 是 `/control` 链尾 `record_hash`（[`HttpRelayClient::control_head`]
 ///   的第二个返回值），用于识别"同 rev 替换 genesis/重写链"；
-/// - `bootstrap_hash` 是 bootstrap 的 `control_head_hash(state, manager_chain)`
-///   （`sync.pinned_control_hash`），公式不同，同一 rev 下单独比对。
+/// - `bootstrap` 是 bootstrap 的 `control_head_hash(state, manager_chain)`
+///   （`sync.pinned_control_hash`），公式不同：它**独立携带** `rev/epoch/log_id`，
+///   因此 rev 前进时不会被丢，也不会被强行挂到 `max(rev)` 上——而是按自己的历史视图
+///   验证（ADR 0013 §2/§3）。
 ///
-/// 注意：两者都是 **同 rev 完整性**摘要；rev 前进时无法直接比较（rev 是摘要输入），
-/// 因此前进场景只检查"旧 rev 的 record_hash 仍是新链的前缀"。
+/// 两类锚（record 链尾、bootstrap 摘要）**各自独立**验证：同 rev 时都按当前视图比对；
+/// rev 前进时 record 走"旧 hash 仍是新链前缀"，bootstrap 走"按旧 rev/epoch/log/管理链
+/// 视图复算"。两类同时存在就都验，不允许用一类通过掩盖另一类的矛盾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPin {
     /// 已 pin 的 relay instance id（换实例即 fail-stop）。
@@ -133,8 +143,8 @@ pub struct ControlPin {
     pub control_rev: u64,
     /// 已认证 rev 的链尾 `record_hash`（`control_head()` 第二个返回值）。
     pub record_hash: Option<[u8; 32]>,
-    /// 已认证 rev 的 bootstrap 控制头摘要（`sync.pinned_control_hash`）。
-    pub bootstrap_hash: Option<[u8; 32]>,
+    /// 已认证的 bootstrap 锚（rev/epoch/log_id 自带的控制头摘要）。
+    pub bootstrap: Option<BootstrapAnchorV1>,
 }
 
 impl ControlPin {
@@ -145,7 +155,7 @@ impl ControlPin {
             instance_id,
             control_rev,
             record_hash: None,
-            bootstrap_hash: None,
+            bootstrap: None,
         }
     }
 
@@ -156,14 +166,22 @@ impl ControlPin {
     }
 
     /// 用 bootstrap 持久化的 `sync.pinned_*` 构造；缺 instance/rev 时返回 `None`。
-    #[must_use]
-    pub fn from_bootstrap_pins(pins: &BootstrapPins) -> Option<Self> {
-        Some(Self {
-            instance_id: pins.instance_id?,
-            control_rev: pins.control_rev?,
+    ///
+    /// bootstrap 锚由 [`BootstrapPins::control_anchor`] 给出（rev/hash/epoch/log_id 齐全
+    /// 才算锚）；摘要存在但坐标残缺时返回 [`SyncError::LocalCorrupt`]，**不**静默丢弃。
+    pub fn from_bootstrap_pins(pins: &BootstrapPins) -> Result<Option<Self>, SyncError> {
+        let Some(instance_id) = pins.instance_id else {
+            return Ok(None);
+        };
+        let Some(control_rev) = pins.control_rev else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            instance_id,
+            control_rev,
             record_hash: None,
-            bootstrap_hash: pins.control_hash,
-        })
+            bootstrap: pins.control_anchor()?,
+        }))
     }
 
     /// 追加链尾 `record_hash`（同 rev 完整性）。
@@ -173,34 +191,46 @@ impl ControlPin {
         self
     }
 
-    /// 追加 bootstrap 控制头摘要（同 rev 完整性）。
+    /// 追加 bootstrap 锚（独立携带 rev/epoch/log_id；验证见 [`verify_control_pin`]）。
     #[must_use]
-    pub fn with_bootstrap_hash(mut self, hash: [u8; 32]) -> Self {
-        self.bootstrap_hash = Some(hash);
+    pub fn with_bootstrap_anchor(mut self, anchor: BootstrapAnchorV1) -> Self {
+        self.bootstrap = Some(anchor);
         self
     }
 }
 
-/// 是否属于**显式本地开发**基址：`http://` + loopback。
+/// 交给 [`ControlCommitter`] 的**已验证**控制头（ADR 0013 §2）。
 ///
-/// 明文 loopback 本身已由 [`StdTcpTransport`] 的开发策略/环境变量显式放行，因此这里
-/// 只把它当作"无 pin 消费 `/control`"的既有 dev 场景；生产 TLS 基址（`https://`）
-/// 永远不会命中，必须显式注入 [`ControlPin`]。非 loopback 明文在传输层就会被拒绝。
+/// 字段只在 crate 内可见：外部无法用裸响应 hash 拼一个出来，因此 durable 提交只能来自
+/// `refresh_control` 的全链验证之后。
+pub(crate) struct VerifiedControlHead {
+    /// relay instance id（来自 `/state`，已与 pin 比对）。
+    pub instance_id: [u8; 16],
+    /// 已验证链尾 rev。
+    pub rev: u64,
+    /// 已验证链尾 `record_hash`。
+    pub hash: [u8; 32],
+    /// 已验证的管理权转换链（`VerifiedHead::with_bootstrap` 的历史视图输入）。
+    pub manager_chain: Vec<ManagerChainEntry>,
+    /// 本地 pin 携带的 bootstrap 锚；已由 [`verify_control_pin`] 按历史视图验证。
+    pub bootstrap: Option<BootstrapAnchorV1>,
+}
+
+/// durable 提交入口的类型（见 [`HttpRelayClient::with_control_committer`]）。
+///
+/// `Send`：verifier 可能在 worker 线程里构造，闭包捕获的 `Vault` 句柄本身是
+/// `Send + Sync`（storage 的 actor 句柄），不需要额外同步。
+pub(crate) type ControlCommitter =
+    Box<dyn FnMut(VerifiedControlHead) -> Result<(), SyncError> + Send>;
+
+/// 是否属于**显式本地开发**基址：`http://` + 显式 loopback 白名单。
+///
+/// 复用权威 URL 策略（[`crate::relay_policy::parse_relay_url`]），不再维护第二份
+/// 解析逻辑：`localhost` / `127.0.0.1` / `[::1]` 才是本地开发；`https://`、伪 loopback
+/// （`127.0.0.1.evil.example`）与任意 loopback 变体都不算。生产 TLS 基址永远不会命中，
+/// 必须显式注入 [`ControlPin`]。
 fn is_local_dev_base_url(base_url: &str) -> bool {
-    let Some(rest) = base_url.strip_prefix("http://") else {
-        return false;
-    };
-    let authority = rest.split('/').next().unwrap_or_default();
-    // 去掉可选的 `:port`（IPv6 字面量本身含冒号，只有全数字端口才算）。
-    let host = match authority.rsplit_once(':') {
-        Some((host, port))
-            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            host
-        }
-        _ => authority,
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    crate::relay_policy::parse_relay_url(base_url, crate::relay_policy::RelayMode::LocalDev).is_ok()
 }
 
 /// 控制链成员的访问状态（ADR 0010 成员语义；**只读投影**，不是授权来源）。
@@ -378,6 +408,14 @@ pub struct HttpRelayClient<T: HttpTransport, C: Clock = SystemClock> {
     ///
     /// 仍然强制 `manager_pub` 信任锚与逐条管理签名；生产 TLS 构造点不得打开。
     allow_unpinned_control: bool,
+    /// 控制链验证通过后、**安装授权缓存之前**的 durable 提交入口（ADR 0013 §2）。
+    ///
+    /// 由 [`crate::relay_context::RelayContext::open`] 注入：`/control` 的全链验签、
+    /// 分页/前缀连续性与 pin 单调性都通过之后，先把 `VerifiedHead` 落成 durable
+    /// `sync.control_pin`，成功后才把控制链放进 `self.control`。这样后续
+    /// `members`/`epoch_activations`/日志验签等**授权事实消费**只可能发生在 pin 已
+    /// durable 之后；提交失败（CAS 冲突/写失败）直接 fail-stop，不缓存、不消费。
+    control_committer: Option<ControlCommitter>,
     /// 解密 MANIFEST 对象用的当前 epoch 根（可选；`checkpoint_manifest` 需要）。
     root: Option<RootSecretV1>,
 }
@@ -415,8 +453,19 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
             control: None,
             control_pin: None,
             allow_unpinned_control: false,
+            control_committer: None,
             root: None,
         }
+    }
+
+    /// 注入"验证通过 → durable 提交"入口（ADR 0013 §2；只由 `RelayContext::open` 使用）。
+    ///
+    /// 本 crate 外无法构造 [`VerifiedControlHead`]，因此也不存在"绕过验证直接提交"的
+    /// 公开路径。
+    #[must_use]
+    pub(crate) fn with_control_committer(mut self, committer: ControlCommitter) -> Self {
+        self.control_committer = Some(committer);
+        self
     }
 
     /// 注入本地控制头 pin：此后每次拉取 `/control` 都必须从该 `(instance, rev, hash)`
@@ -441,20 +490,24 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
     ///
     /// 缺 `instance_id`/`control_rev` 时返回明确错误（不得静默降级为无 pin）。
     pub fn with_bootstrap_control_pin(mut self, pins: &BootstrapPins) -> Result<Self, SyncError> {
-        let pin = ControlPin::from_bootstrap_pins(pins).ok_or(SyncError::Unsupported(
+        let pin = ControlPin::from_bootstrap_pins(pins)?.ok_or(SyncError::Unsupported(
             "sync.pinned_instance/control_rev 缺失：无法构造 ControlPin",
         ))?;
         self.control_pin = Some(pin);
         Ok(self)
     }
 
-    /// **仅**首次 bootstrap 或本地开发：显式允许无 pin 消费 `/control`。
+    /// **仅**受限初始化能力（ADR 0013 S2b）与本地开发：显式允许无 pin 消费 `/control`。
     ///
     /// 仍然强制 `manager_pub` 信任锚与逐条管理签名；生产 TLS 构造点必须改用
     /// [`Self::with_control_pin`] / [`Self::with_identity_control_pin`] /
     /// [`Self::with_bootstrap_control_pin`]。
+    ///
+    /// **crate 内可见**：唯一调用点是 [`crate::init_session::InitSession`]（FreshRecovery
+    /// 的首次 bootstrap）。外部 crate 无法把普通客户端配成 unpinned，因此"普通 factory
+    /// 无 None/unpin 分支"是**类型/可见性**上的事实，而不只是约定。
     #[must_use]
-    pub fn with_unpinned_bootstrap_control(mut self) -> Self {
+    pub(crate) fn with_unpinned_bootstrap_control(mut self) -> Self {
         self.allow_unpinned_control = true;
         self
     }
@@ -501,8 +554,49 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
             instance_id: control.instance_id,
             control_rev: control.control_rev,
             record_hash: Some(control.head_hash),
-            bootstrap_hash: None,
+            bootstrap: None,
         })
+    }
+
+    /// 已完成**全部校验**的控制链链尾，可交给 durable pin 提交（ADR 0013 §2）。
+    ///
+    /// 只有在 [`Self::control_head`] 成功之后才能拿到：`/control` 的全链管理签名、
+    /// 成员证书、分页/hash 连续性与现有 pin 前缀检查都已通过。返回类型
+    /// [`VerifiedHead`] 的字段私有，无法用裸响应 hash 伪造。
+    ///
+    /// 本地 pin 携带的 bootstrap 锚会一并附加（[`VerifiedHead::with_bootstrap`] 会按锚
+    /// 自己的 `rev/epoch/log` + 管理链前缀再验证一次）：因此返回的 head 同时承载
+    /// record 锚与 bootstrap 锚，`commit_verified_head` 不会因 record rev 前进丢掉旧锚。
+    pub fn verified_head(&mut self) -> Result<VerifiedHead, SyncError> {
+        let anchor = self.control_pin.and_then(|pin| pin.bootstrap);
+        self.verified_head_with_anchor(anchor)
+    }
+
+    /// 同 [`Self::verified_head`]，但由调用方给出 bootstrap 锚（**同一验证视图**）。
+    ///
+    /// ADR 0013 §3 的 FreshRecovery 用它：bootstrap 的 `sync.pinned_*` 锚与 record 锚必须
+    /// 对应同一次 `/state + /control + /management-chain` 验证视图，因此锚由调用方从
+    /// bootstrap 结果里取出，再交给本方法按锚自己的视图复算
+    /// （[`VerifiedHead::with_bootstrap`]；不符即拒绝，不降级成"没有锚"）。
+    pub fn verified_head_with_anchor(
+        &mut self,
+        anchor: Option<BootstrapAnchorV1>,
+    ) -> Result<VerifiedHead, SyncError> {
+        let (record_rev, record_hash) = self.control_head()?;
+        let control = self
+            .control
+            .as_ref()
+            .ok_or(SyncError::RelayWire("control 缓存为空"))?;
+        let mut verified = VerifiedHead::from_verified_control(
+            self.config.vault_id,
+            control.instance_id,
+            record_rev,
+            record_hash,
+        );
+        if let Some(anchor) = anchor {
+            verified = verified.with_bootstrap(anchor, &control.manager_chain)?;
+        }
+        Ok(verified)
     }
 
     /// 本次 rotation 在 `/control` 中**复算通过**的 activation T 与旧/新管理双签。
@@ -776,11 +870,17 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         ))
     }
 
+    /// 发请求/管理签名共用的**唯一**路径生成器（origin + API 面）。
+    fn api(&self) -> RelayApi {
+        RelayApi::new(self.origin(), self.config.api_version)
+    }
+
     fn vault_path(&self, suffix: &str) -> String {
-        format!(
-            "/v1/vaults/{}{suffix}",
-            base64url::encode(&self.config.vault_id)
-        )
+        self.api().vault_path(&self.config.vault_id, suffix)
+    }
+
+    fn auth_path(&self, action: &str) -> String {
+        self.api().auth_path(&self.config.vault_id, action)
     }
 
     fn origin(&self) -> &str {
@@ -811,7 +911,7 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         ])?;
         let response = self.transport.send(&HttpRequest {
             method: "POST",
-            path: "/v1/auth/challenges".to_owned(),
+            path: self.auth_path("challenges"),
             headers: cbor_headers(),
             body,
         })?;
@@ -863,7 +963,7 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         ])?;
         let response = self.transport.send(&HttpRequest {
             method: "POST",
-            path: "/v1/auth/tokens".to_owned(),
+            path: self.auth_path("tokens"),
             headers: cbor_headers(),
             body,
         })?;
@@ -1049,6 +1149,8 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
             &manager_pub,
             // 缓存锚点：这条控制链是在 `/state.auth_rev == state.auth_rev` 时验证的。
             state.auth_rev,
+            // 管理签名没有独立 path 字段：按本 vault 固定的 API 面重建（fail-closed）。
+            self.config.api_version,
         )?;
         // `/state` 先于 `/control` 读取：并发追加只会让控制链更新，不能反而更旧。
         if control.control_rev < state.control_rev {
@@ -1056,6 +1158,19 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         }
         if let Some(pin) = self.control_pin {
             verify_control_pin(&pin, &state, &control)?;
+        }
+        // ADR 0013 §2：已验证 head 必须在**消费授权事实之前** durable 提交。
+        // 这里（`self.control = Some(..)` 之前）是唯一时机：控制链缓存一旦安装，
+        // `members`/`epoch_activations`/日志验签就会以它为授权来源。提交失败
+        // （写失败/CAS 冲突）直接向上传播，控制链不缓存、后续请求也不发。
+        if let Some(committer) = self.control_committer.as_mut() {
+            committer(VerifiedControlHead {
+                instance_id: control.instance_id,
+                rev: control.control_rev,
+                hash: control.head_hash,
+                manager_chain: control.manager_chain.clone(),
+                bootstrap: self.control_pin.and_then(|pin| pin.bootstrap),
+            })?;
         }
         self.control = Some(control);
         Ok(())
@@ -1080,37 +1195,78 @@ fn verify_control_pin(
     if control.control_rev < pin.control_rev {
         return Err(SyncError::RelayWire("控制链低于本地 pin（回退）"));
     }
-    if control.control_rev == pin.control_rev {
-        if let Some(hash) = pin.record_hash {
+    // record 锚与 bootstrap 锚**各自独立**验证：任一不符都 fail-stop。
+    // 顺序检查不等于"选一个通过"——两类都看完之前没有任何成功返回，也不存在
+    // "用另一类通过掩盖这一类矛盾"的分支。
+    if let Some(hash) = pin.record_hash {
+        if control.control_rev == pin.control_rev {
             if control.head_hash != hash {
-                return Err(SyncError::RelayWire(
+                return Err(SyncError::Equivocation(
                     "控制链同 rev 的 record_hash 与本地 pin 不符",
                 ));
             }
+        } else if !matches!(control.record_hashes.get(&pin.control_rev), Some(actual) if *actual == hash)
+        {
+            // 新链必须包含 pin 指向的旧链尾（append-only）；否则是替换 genesis/分叉。
+            return Err(SyncError::Equivocation(
+                "控制链未包含本地 pin 的 record_hash（替换/重排）",
+            ));
         }
-        if let Some(hash) = pin.bootstrap_hash {
-            // bootstrap 摘要只覆盖 vault/instance/log/epoch/control_rev + 管理链；
-            // `/state` 可能早于 `/control` 一瞬，按控制链自己的坐标复算。
-            let mut pinned_state = state.clone();
-            pinned_state.epoch = control.epoch;
-            pinned_state.control_rev = control.control_rev;
-            let computed = control_head_hash(&pinned_state, &control.manager_chain);
-            if computed != hash {
-                return Err(SyncError::RelayWire(
-                    "控制链同 rev 的 bootstrap hash 与本地 pin 不符",
-                ));
-            }
+    }
+    if let Some(anchor) = pin.bootstrap.as_ref() {
+        verify_bootstrap_anchor(anchor, state, control)?;
+    }
+    Ok(())
+}
+
+/// 按锚自己的 `rev/epoch/log_id` + 截断管理链视图校验 bootstrap 锚（ADR 0013 §3）。
+///
+/// 规则（两类视图分开，**不能**把旧 hash 挂到 `max(rev)` 上比较）：
+///
+/// - 锚 rev 超前于当前链尾 → [`SyncError::ControlRollback`]（relay 反而更旧）；
+/// - `anchor.rev == control.control_rev` → 用**当前视图**（控制链自己的 `epoch`、
+///   `/state` 的 `log_id`）复算并与 `anchor.hash` 比对：同 rev 换 epoch/log/管理链都是
+///   equivocation（`/state` 可能早于 `/control` 一瞬，所以 epoch 取控制链的）；
+/// - `anchor.rev <  control.control_rev` → 用锚自己的坐标 + **按生效 epoch 截断**的
+///   管理链复算（见 [`control_head_hash_at`]）：相等即证明当前链仍包含旧锚认证过的
+///   前缀（identity rev 前进不丢 bootstrap）；重建不出该视图 →
+///   [`SyncError::NeedsTrust`]（**不**当成"没有锚"放过）。
+fn verify_bootstrap_anchor(
+    anchor: &BootstrapAnchorV1,
+    state: &RelayState,
+    control: &ControlState,
+) -> Result<(), SyncError> {
+    if anchor.rev > control.control_rev {
+        return Err(SyncError::ControlRollback {
+            expected: anchor.rev,
+            actual: control.control_rev,
+        });
+    }
+    if anchor.rev == control.control_rev {
+        let mut pinned_state = state.clone();
+        pinned_state.epoch = control.epoch;
+        pinned_state.control_rev = control.control_rev;
+        let computed = control_head_hash(&pinned_state, &control.manager_chain);
+        if computed != anchor.hash {
+            return Err(SyncError::Equivocation(
+                "控制链同 rev 的 bootstrap hash 与本地 pin 不符",
+            ));
         }
-    } else if let Some(hash) = pin.record_hash {
-        // 新链必须包含 pin 指向的旧链尾（append-only）；否则是替换 genesis/分叉。
-        match control.record_hashes.get(&pin.control_rev) {
-            Some(actual) if *actual == hash => {}
-            _ => {
-                return Err(SyncError::RelayWire(
-                    "控制链未包含本地 pin 的 record_hash（替换/重排）",
-                ))
-            }
-        }
+        return Ok(());
+    }
+    let computed = control_head_hash_at(
+        state.vault_id,
+        control.instance_id,
+        anchor,
+        &control.manager_chain,
+    )
+    .ok_or(SyncError::NeedsTrust(
+        "管理链视图未覆盖 bootstrap 锚的 rev，无法证明历史前缀",
+    ))?;
+    if computed != anchor.hash {
+        return Err(SyncError::Equivocation(
+            "控制链未包含本地 bootstrap 锚（rev 前进但历史前缀被重写）",
+        ));
     }
     Ok(())
 }
@@ -1201,10 +1357,10 @@ impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
     }
 
     fn part(&mut self, object_id: &ObjectId, part_no: u32) -> Result<Vec<u8>, SyncError> {
-        let path = format!(
-            "/v1/vaults/{}/objects/{}/parts/{part_no}",
-            base64url::encode(&self.config.vault_id),
-            base64url::encode(object_id)
+        let path = self.api().object_path(
+            &self.config.vault_id,
+            object_id,
+            &format!("/parts/{part_no}"),
         );
         let response = self.send("GET", path, None, Vec::new())?;
         match response.status {
@@ -1219,10 +1375,10 @@ impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
         part_no: u32,
         envelope: &[u8],
     ) -> Result<(), SyncError> {
-        let path = format!(
-            "/v1/vaults/{}/objects/{}/parts/{part_no}",
-            base64url::encode(&self.config.vault_id),
-            base64url::encode(object_id)
+        let path = self.api().object_path(
+            &self.config.vault_id,
+            object_id,
+            &format!("/parts/{part_no}"),
         );
         let response = self.send("PUT", path, Some(CONTENT_TYPE_OCTET), envelope.to_vec())?;
         match response.status {
@@ -1241,11 +1397,13 @@ impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
         let Some(reservation) = reservation else {
             return self.put_part(object_id, part_no, envelope);
         };
-        let path = format!(
-            "/v1/vaults/{}/objects/{}/parts/{part_no}?reservation={}",
-            base64url::encode(&self.config.vault_id),
-            base64url::encode(object_id),
-            base64url::encode(reservation)
+        let path = self.api().object_path(
+            &self.config.vault_id,
+            object_id,
+            &format!(
+                "/parts/{part_no}?reservation={}",
+                base64url::encode(reservation)
+            ),
         );
         let response = self.send("PUT", path, Some(CONTENT_TYPE_OCTET), envelope.to_vec())?;
         match response.status {
@@ -2174,6 +2332,7 @@ fn parse_control(
     instance_id: &[u8; 16],
     manager_pub: &[u8; 32],
     auth_rev: u64,
+    api_version: RelayApiVersion,
 ) -> Result<ControlState, SyncError> {
     let first = pages
         .first()
@@ -2191,6 +2350,7 @@ fn parse_control(
         manager_transitions: &verified_chain.transitions,
         vault_id,
         instance_id,
+        api_version,
         genesis: &genesis,
         prev_hash: [0u8; 32],
         last_rev: 0,
@@ -2382,6 +2542,8 @@ struct ControlVerifier<'a> {
     manager_transitions: &'a HashMap<u64, ManagerTransitionV1>,
     vault_id: &'a VaultId,
     instance_id: &'a [u8; 16],
+    /// 本 vault 固定的 API 面（重建管理签名 path 用；ADR 0014 S3a）。
+    api_version: RelayApiVersion,
     /// rev1 genesis 记录原字节（必须与管理链 rev1 的 `transition` 逐字节相等）。
     genesis: &'a [u8],
     prev_hash: [u8; 32],
@@ -2522,6 +2684,7 @@ impl ControlVerifier<'_> {
                         self.prev_hash,
                         self.vault_id,
                         self.instance_id,
+                        self.api_version,
                         rev,
                     )?;
                     // 已签吊销是永久事实（ADR §8）：不因后续加入记录而恢复。
@@ -2737,6 +2900,7 @@ fn verify_typed_control_record(
     previous_record_hash: [u8; 32],
     vault_id: &VaultId,
     instance_id: &[u8; 16],
+    api_version: RelayApiVersion,
     rev: u64,
 ) -> Result<VerifiedControlEffects, SyncError> {
     if record.expected_control_rev.checked_add(1) != Some(rev) {
@@ -2766,7 +2930,8 @@ fn verify_typed_control_record(
         .as_slice()
         .try_into()
         .map_err(|_| SyncError::RelayWire("控制记录管理签名长度非法"))?;
-    let vault_path = format!("/v1/vaults/{}", base64url::encode(vault_id));
+    // 管理签名覆盖完整 path；该 path 由本 vault 固定的 API 面重建（v1/v2 不混用）。
+    let vault_path = RelayApi::new("", api_version).vault_path(vault_id, "");
     let event = record.decoded_event()?;
     let mut effects = VerifiedControlEffects::default();
     let path = match record.kind {
@@ -3720,6 +3885,7 @@ mod tests {
     fn config(manager_pub: Option<[u8; 32]>) -> HttpRelayConfig {
         HttpRelayConfig {
             base_url: "http://127.0.0.1:8080".to_owned(),
+            api_version: RelayApiVersion::V1,
             vault_id: [0x5a; 16],
             device_id: [0x04; 16],
             manager_pub,
@@ -4296,6 +4462,34 @@ mod tests {
         assert_ne!(hash, [0u8; 32]);
     }
 
+    #[test]
+    fn verified_head_reads_the_same_checked_chain_as_control_head() {
+        let manager = DeviceSigningKey::generate(&mut TestRng::new(93)).expect("管理密钥");
+        let chain = ControlChainBuilder::new(manager.clone());
+        let mut responses = auth_responses(1200);
+        // control_head → state() 一次，refresh_control 再读一次 /state，然后 /control；
+        // verified_head → 再一次 control_head 的 /state（此时 control 已缓存）。
+        responses.push(cbor_response(state_fields(1, 0)));
+        responses.push(cbor_response(state_fields(1, 0)));
+        responses.push(cbor_response(chain.fields(vec![member_fields(
+            &test_device(0x5c),
+            true,
+            &manager,
+        )])));
+        responses.push(cbor_response(state_fields(1, 0)));
+        let mut client = client_with(responses, FakeClock::new(900), Some(manager.public_key()));
+        let (rev, hash) = client.control_head().expect("控制链链尾");
+        let verified = client.verified_head().expect("缓存里的已验证 head");
+        assert_eq!(verified.instance_id(), [0x22; 16]);
+        assert_eq!(verified.record_rev(), rev);
+        assert_eq!(verified.record_hash(), hash);
+        assert_eq!(
+            client.control_head_pin().expect("pin").record_hash,
+            Some(hash),
+            "control_head_pin 与 VerifiedHead 必须一致"
+        );
+    }
+
     /// `RotationView` → `GET /rotations/{r}` 响应里的键值（与 relay `rotation_fields` 对齐）。
     fn rotation_view_value(view: &RotationView) -> cbor::CdeValue {
         let mut fields = vec![
@@ -4669,9 +4863,7 @@ mod tests {
             .with_control_pin(ControlPin::new([0x22; 16], 2).with_record_hash(head_hash));
         assert!(matches!(
             RelayClient::control_kinds(&mut client),
-            Err(SyncError::RelayWire(
-                "控制链同 rev 的 record_hash 与本地 pin 不符"
-            ))
+            Err(SyncError::Equivocation(message)) if message.contains("record_hash")
         ));
     }
 
@@ -4697,11 +4889,15 @@ mod tests {
         let bootstrap_hash = crate::bootstrap::control_head_hash(&state, &manager_chain);
         let pins = crate::bootstrap::BootstrapPins {
             instance_id: Some([0x22; 16]),
+            log_id: Some([0x11; 16]),
+            epoch: Some(1),
             control_rev: Some(2),
             control_hash: Some(bootstrap_hash),
-            ..Default::default()
+            highwater: None,
         };
-        let pin = ControlPin::from_bootstrap_pins(&pins).expect("bootstrap pin");
+        let pin = ControlPin::from_bootstrap_pins(&pins)
+            .expect("bootstrap pins 解析")
+            .expect("bootstrap pin");
 
         let mut responses = auth_responses(1200);
         responses.push(cbor_response(state_fields(2, 1)));
@@ -4719,12 +4915,18 @@ mod tests {
         responses.push(cbor_response(state_fields(2, 1)));
         responses.push(cbor_response(fields));
         let mut client = client_with(responses, FakeClock::new(900), Some(manager.public_key()))
-            .with_control_pin(ControlPin::new([0x22; 16], 2).with_bootstrap_hash([0x99; 32]));
+            .with_control_pin(ControlPin::new([0x22; 16], 2).with_bootstrap_anchor(
+                BootstrapAnchorV1 {
+                    rev: 2,
+                    hash: [0x99; 32],
+                    epoch: 1,
+                    log_id: [0x11; 16],
+                },
+            ));
         assert!(matches!(
             RelayClient::control_kinds(&mut client),
-            Err(SyncError::RelayWire(
-                "控制链同 rev 的 bootstrap hash 与本地 pin 不符"
-            ))
+            Err(SyncError::Equivocation(message))
+                if message.contains("bootstrap hash")
         ));
     }
 

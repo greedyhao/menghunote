@@ -97,6 +97,52 @@ pub enum SyncError {
         actual: u64,
     },
 
+    /// relay 配置/URL/模式非法（ADR 0013 §4 `ConfigInvalid`）。
+    ///
+    /// 只含公开定位信息（scheme/host/模式/字段名），不含任何凭据。
+    #[error("同步配置无效：{0}")]
+    ConfigInvalid(String),
+
+    /// 需要重新建立信任（ADR 0013 §3/§4 `NeedsTrust`）。
+    ///
+    /// 出现在"本地没有可证明的信任锚"的路径上：缺失 durable pin、旧 pin 只有
+    /// `(instance, rev)` 下界（同 rev 无 hash）、高 rev 前进缺少旧前缀 anchor。
+    /// **不得**在调用方降级成 unpinned/bootstrap-only 继续。
+    #[error("需要建立信任（不盲信继续）：{0}")]
+    NeedsTrust(&'static str),
+
+    /// durable 控制 pin 损坏/版本不支持/vault 绑定不符（ADR 0013 §2/§4 `PinCorrupt`）。
+    ///
+    /// **不得**当成"没有 pin"：`None` 只表示从未建立过。
+    #[error("控制 pin 损坏：{0}")]
+    PinCorrupt(&'static str),
+
+    /// durable 控制 pin 保存失败（写事务失败或 CAS 未命中后的明确失败）。
+    #[error("控制 pin 保存失败：{0}")]
+    PinSaveFailed(String),
+
+    /// relay instance 与本地 pin/身份不一致（换实例/静默回滚）。
+    #[error("relay 实例与本地 pin 不一致（疑似换实例或静默回滚）")]
+    InstanceMismatch,
+
+    /// 控制链回退：新 head 的 rev 低于已提交 pin（ADR 0006 §35）。
+    #[error("控制链回退：本地 pin rev={expected}，收到 rev={actual}")]
+    ControlRollback {
+        /// 已提交 pin 的 rev。
+        expected: u64,
+        /// 新 head 的 rev。
+        actual: u64,
+    },
+
+    /// 控制链内容不一致（equivocation：换 genesis/重写链/同 rev 换 bootstrap 视图/
+    /// 旧锚未被当前链覆盖）。消息只含公开定位信息。
+    #[error("控制链内容不一致（equivocation）：{0}")]
+    Equivocation(&'static str),
+
+    /// durable pin 的并发 CAS 冲突：重新验证后重试，**不覆盖**赢家。
+    #[error("控制 pin CAS 冲突：已被并发修改，不覆盖赢家")]
+    PinConflict,
+
     /// 改口令流程失败。
     #[error("改口令失败：{0}")]
     PasswordChange(&'static str),
@@ -197,6 +243,12 @@ pub enum SyncError {
         /// 需要重新 bootstrap 时的提示（`RELAY_RESET`/`CURSOR_EXPIRED`）。
         bootstrap_hint: Option<String>,
     },
+
+    /// 邀请链接非法/不可用（ADR 0014 S1）。
+    ///
+    /// 只含**脱敏**定位信息：不含 token、不含完整 URL；对端可据此区分格式/TTL/pin/状态。
+    #[error("邀请链接无效：{0}")]
+    InviteLink(String),
 
     /// relay 响应格式非法（缺字段/ID 不是 16/32 字节等）。
     #[error("relay 响应非法：{0}")]

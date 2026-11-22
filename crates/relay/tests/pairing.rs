@@ -546,7 +546,7 @@ fn genesis_verifies_device_certificate_domain() {
     };
     {
         let cfg = cfg.clone();
-        db.write_blocking(move |conn| {
+        db.write_blocking(relay::VaultScope::new(vault_id), move |conn| {
             vault::initialize(conn, clock.as_ref(), &cfg, hook.as_ref(), &init)
         })
         .expect("genesis with valid certificate");
@@ -568,7 +568,7 @@ fn genesis_verifies_device_certificate_domain() {
     };
     let err = {
         let cfg = cfg.clone();
-        db.write_blocking(move |conn| {
+        db.write_blocking(relay::VaultScope::new(vault_id), move |conn| {
             vault::initialize(conn, clock.as_ref(), &cfg, hook.as_ref(), &init)
         })
         .expect_err("bad certificate signature")
@@ -591,7 +591,7 @@ fn genesis_verifies_device_certificate_domain() {
     };
     let err = {
         let cfg = cfg.clone();
-        db.write_blocking(move |conn| {
+        db.write_blocking(relay::VaultScope::new(vault_id), move |conn| {
             vault::initialize(conn, clock.as_ref(), &cfg, hook.as_ref(), &init)
         })
         .expect_err("cert bound to other device")

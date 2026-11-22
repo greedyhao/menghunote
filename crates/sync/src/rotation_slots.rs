@@ -39,7 +39,7 @@ pub struct CandidateSlots {
     pub new_manager_public: [u8; 32],
 }
 
-/// 生成候选 password/recovery 槽并自检。
+/// 生成候选 password/recovery 槽并自检（恢复种子 `R'` 由本次随机生成）。
 #[allow(clippy::too_many_arguments)]
 pub fn generate_candidate_slots(
     vault_id: VaultId,
@@ -49,6 +49,39 @@ pub fn generate_candidate_slots(
     created_at: u64,
     device_id: DeviceId,
     candidate_root: &RootSecretV1,
+    rng: &mut impl crate::random::RandomSource,
+) -> Result<CandidateSlots, SyncError> {
+    generate_candidate_slots_with_recovery_seed(
+        vault_id,
+        epoch,
+        new_password,
+        manager_rev,
+        created_at,
+        device_id,
+        candidate_root,
+        None,
+        rng,
+    )
+}
+
+/// 同 [`generate_candidate_slots`]，但允许调用方**指定**恢复种子 `R'`。
+///
+/// 用途（ADR 0009 Phase 2 切片 6a）：dev-local 轮换不更换管理 key/恢复码。调用方若持有
+/// 当前管理恢复码，就把它的种子传进来，让候选 epoch 的 recovery 槽**能被同一恢复码解开**
+/// ——否则新设备在轮换后无法再用恢复码加入（随机 `R'` 没人知道）。
+///
+/// 是否允许该种子由调用方（轮换编排）决定：这里只负责按同一套 AAD/KEK 规则包槽并自检。
+/// `None` = 沿用旧的"一次性随机 `R'`"语义（槽集合完整，但旧恢复码打不开）。
+#[allow(clippy::too_many_arguments)]
+pub fn generate_candidate_slots_with_recovery_seed(
+    vault_id: VaultId,
+    epoch: u64,
+    new_password: &str,
+    manager_rev: u64,
+    created_at: u64,
+    device_id: DeviceId,
+    candidate_root: &RootSecretV1,
+    recovery_seed: Option<&RecoverySeed>,
     rng: &mut impl crate::random::RandomSource,
 ) -> Result<CandidateSlots, SyncError> {
     if new_password.is_empty() {
@@ -84,7 +117,11 @@ pub fn generate_candidate_slots(
     };
     validate_slot_descriptor(&password_descriptor)?;
     validate_slot_descriptor(&recovery_descriptor)?;
-    let recovery_seed = RecoverySeed::generate(rng)?;
+    // `Some` = 调用方指定的恢复种子（同一恢复码仍能解开候选根）；`None` = 一次性随机。
+    let recovery_seed = match recovery_seed {
+        Some(seed) => seed.clone(),
+        None => RecoverySeed::generate(rng)?,
+    };
     let recovery_code = recovery_seed.to_code()?;
     let root = candidate_root.clone();
     let aad = slot_aad(device_id);

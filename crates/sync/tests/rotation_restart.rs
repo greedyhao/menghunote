@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use menghunote_storage::{
     ensure_structure_row, pending_encryption, sync_cursor_state, Value, Vault,
 };
+use menghunote_sync::api_version::{RelayApi, RelayApiVersion};
 use menghunote_sync::base64url;
 use menghunote_sync::cbor;
 use menghunote_sync::checkpoint::{
@@ -2397,6 +2398,10 @@ fn grant_then_revoke_forces_higher_epoch_and_old_device_cannot_open_final_data()
 // ---------------------------------------------------------------- 管理 realm HTTP fake
 
 /// 测试用 relay 基址（token 签名绑定 origin，必须与实际请求 base 一致）。
+fn fake_api() -> RelayApi {
+    RelayApi::new(FAKE_BASE, RelayApiVersion::V1)
+}
+
 const FAKE_BASE: &str = "http://relay.test";
 /// fake 时钟（`management_token` 的 `now`）。
 const HTTP_NOW: u64 = 1_700_000_900;
@@ -2955,9 +2960,10 @@ fn http_execute_restart(
     certs: &[MemberCertDigestInputV1],
     freeze_seq: u64,
 ) -> Result<menghunote_sync::rotation_restart::RestartExecution, SyncError> {
+    let api = fake_api();
     let mut management = HttpRestartManagement::new(
         fake,
-        FAKE_BASE,
+        &api,
         VAULT_ID,
         INSTANCE_ID,
         &materials.manager,
@@ -3079,9 +3085,10 @@ fn restart_activated_journal_resumes_with_caller_supplied_new_key_only() {
     let activate_calls = fake.activate_calls;
     fake.accepted_token_subjects.clear();
     // 已激活状态直接 resume：调用方显式传入 journal 派生的新 key。
+    let api = fake_api();
     let mut management = HttpRestartManagement::new(
         &mut fake,
-        FAKE_BASE,
+        &api,
         VAULT_ID,
         INSTANCE_ID,
         &materials.manager,
@@ -3132,9 +3139,10 @@ fn restart_http_outcome_queries_exact_request_and_rejects_other_scope() {
         .expect("restart replay encode");
     fake.restart_replay = Some(replay);
 
+    let api = fake_api();
     let mut management = HttpRestartManagement::new(
         &mut fake,
-        FAKE_BASE,
+        &api,
         VAULT_ID,
         INSTANCE_ID,
         &materials.manager,
@@ -3153,9 +3161,10 @@ fn restart_http_outcome_queries_exact_request_and_rejects_other_scope() {
 
     // 幂等表跨全部管理 scope：同 request_id 若命中 begin/activate 等其它端点，必须拒绝。
     fake.replay_scope = "management/begin".to_owned();
+    let api = fake_api();
     let mut management = HttpRestartManagement::new(
         &mut fake,
-        FAKE_BASE,
+        &api,
         VAULT_ID,
         INSTANCE_ID,
         &materials.manager,
@@ -3274,9 +3283,10 @@ fn restart_old_manager_key_rejected_after_activation_reports_explicit_error() {
     );
 
     // 只带旧 key 的管理对象：旧 key 换 token 被 relay 403 拒绝。
+    let api = fake_api();
     let mut old_only = HttpRestartManagement::new(
         &mut fake,
-        FAKE_BASE,
+        &api,
         VAULT_ID,
         INSTANCE_ID,
         &materials.manager,

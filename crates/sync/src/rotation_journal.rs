@@ -111,6 +111,31 @@ impl RotationPhase {
         })
     }
 
+    /// 中文短标签（app 的轮换失败报告用；只描述**公开阶段名**，不含任何秘密）。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Frozen => "冻结旧 epoch",
+            Self::Begun => "已被 relay 接受（S 固定）",
+            Self::Integrated => "旧根已整合到 S",
+            Self::Reencrypted => "冻结资产已重加密",
+            Self::BaselinesReady => "候选基线已就绪",
+            Self::GrantsReady => "grants 已暂存",
+            Self::Activated => "已激活",
+            Self::Promoted => "身份已推广",
+            Self::Completed => "已完成",
+            Self::Aborted => "已中止",
+            Self::RestartIntentRecorded => "restart：intent 已落盘",
+            Self::RestartPrepared => "restart：新秘密已落盘",
+            Self::RestartSlotsUploaded => "restart：候选槽已上传",
+            Self::RestartPrimaryBaselineReady => "restart：主基线已读回",
+            Self::RestartBaselinesReady => "restart：双基线已读回",
+            Self::RestartGrantsStaged => "restart：grants 已暂存",
+            Self::RestartActivating => "restart：已发 activate",
+            Self::RestartActivated => "restart：relay 已激活",
+        }
+    }
+
     /// 是否为原子 restart 的 phase（区别于普通轮换 A–J）。
     #[must_use]
     pub fn is_restart(self) -> bool {

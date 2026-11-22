@@ -29,7 +29,7 @@ fn block<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn app_ed25519(fx: &Fixture) -> axum::Router {
-    let state = AppState::new(fx.db.clone(), fx.cfg.clone(), Arc::new(Ed25519Hook));
+    let state = AppState::new(fx.db.inner().clone(), fx.cfg.clone(), Arc::new(Ed25519Hook));
     router(state)
 }
 
@@ -202,7 +202,7 @@ const FAILURE_POINTS: &[(&str, &str)] = &[
     ),
     (
         "fail_auth_rev",
-        "CREATE TRIGGER fail_auth_rev BEFORE UPDATE ON vault \
+        "CREATE TRIGGER fail_auth_rev BEFORE UPDATE ON vaults \
          WHEN NEW.auth_rev <> OLD.auth_rev BEGIN SELECT RAISE(ABORT,'injected auth_rev'); END;",
     ),
     (
@@ -222,7 +222,7 @@ const FAILURE_POINTS: &[(&str, &str)] = &[
     ),
     (
         "fail_set_state",
-        "CREATE TRIGGER fail_set_state BEFORE UPDATE ON vault \
+        "CREATE TRIGGER fail_set_state BEFORE UPDATE ON vaults \
          WHEN NEW.state = 'rotating' BEGIN SELECT RAISE(ABORT,'injected state'); END;",
     ),
     (

@@ -109,6 +109,7 @@ impl Render for ShellHost {
 
 fn config_for(relay_url: &str, vault_path: &Path) -> DevSyncConfig {
     DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.to_path_buf(),
         service: ServiceConfig::new(relay_url),
     }
@@ -585,6 +586,184 @@ async fn two_shells_exchange_text_without_reopening(cx: &mut TestAppContext) {
         "落库正文必须同时包含本地键入与两轮远端文字：{:?}",
         &persisted[..persisted.len().min(48)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// 1b) 附件插入：A 插入真实文件 → A 同步 + 发布基线（ASSET 分片上传）→ B 同步后
+//     取到**相同资产字节**，并且正文里的 `asset://` 链接也到了 B（不重开）
+// ---------------------------------------------------------------------------
+
+/// 真实点击一个 selector（headless：先查 bounds 再点中心，不猜坐标）。
+fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("selector={selector} 必须画出 headless 帧"));
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// 通过真实 UI 链路在某个 shell 里插入附件：展开 → 点路径框 → 输入 → Enter。
+fn insert_attachment_via_ui(cx: &mut VisualTestContext, host: &Entity<ShellHost>, path: &Path) {
+    let open = read_shell(cx, host, |shell, _app| shell.attachment_is_open());
+    if !open {
+        click_selector(cx, "attachment-insert");
+    }
+    click_selector(cx, "attachment-path");
+    cx.simulate_input(&path.to_string_lossy());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let error = read_shell(cx, host, |shell, _app| {
+        shell
+            .attachment_error_text()
+            .map(std::borrow::ToOwned::to_owned)
+    });
+    assert_eq!(error, None, "A 插入附件失败：{error:?}");
+}
+
+#[gpui::test]
+async fn attachment_asset_bytes_and_link_reach_the_other_shell(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let pair = establish_pair("attachment-asset");
+    let relay_url = pair.relay.base_url().to_owned();
+    let note_id = list_tree(&pair.a_vault)
+        .expect("读 A 结构树失败")
+        .into_iter()
+        .find(|entry| entry.is_note())
+        .and_then(|entry| entry.note_id)
+        .expect("A 必须有第一篇笔记的 note_id");
+    // A 与 B（同一进程两个 window，各自独立 Vault/身份/服务）。
+    let (host_a, a_handle) = add_shell_window(
+        cx,
+        pair.a_vault.clone(),
+        "dev-sync-a",
+        config_for(&relay_url, &pair.a_path),
+        pair.a_sync,
+    );
+    let (host_b, b_handle) = add_shell_window(
+        cx,
+        pair.b_vault.clone(),
+        "dev-sync-b",
+        config_for(&relay_url, &pair.b_path),
+        pair.b_sync,
+    );
+    let app_cx = cx.clone();
+    let mut cx_a = VisualTestContext::from_window(a_handle, &app_cx);
+    let mut cx_b = VisualTestContext::from_window(b_handle, &app_cx);
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    // --- A：插入一个真实附件（中文 + 空格路径；内容固定便于逐字节比对） ---
+    let dir = temp_root("attachment-asset-file");
+    let file_dir = dir.path().join("附件 目录");
+    std::fs::create_dir_all(&file_dir).expect("创建中文/空格目录失败");
+    let data = b"menghunote attachment bytes over dev relay".to_vec();
+    let file = file_dir.join("报告 最终.txt");
+    std::fs::write(&file, &data).expect("写临时附件失败");
+    insert_attachment_via_ui(&mut cx_a, &host_a, &file);
+    let refs =
+        menghunote_storage::list_asset_refs(&pair.a_vault, &note_id).expect("读 A asset_refs 失败");
+    assert_eq!(refs.len(), 1, "A 必须正好一条资产引用：{refs:?}");
+    let asset_hash = refs[0].asset_hash;
+    let markdown_label = "[附件：报告 最终.txt](asset://";
+    let text_a = current_text(&mut cx_a, &host_a);
+    assert!(
+        text_a.contains(markdown_label),
+        "A 的正文必须出现附件链接：{:?}",
+        text_a.chars().take(80).collect::<String>()
+    );
+
+    // A：持闸同步 → 正文更新（含链接）推到 relay；**普通同步同时增量上传 ASSET 对象**
+    // （不再依赖「发布基线」才上传资产）。
+    start_sync(&mut cx_a, &host_a);
+    drive_sync(&mut cx_a, &host_a);
+    let report_a = last_report(&mut cx_a, &host_a).expect("A 必须有同步报告");
+    assert!(report_a.is_ok(), "A 的同步必须成功：{report_a:?}");
+
+    // 前置：B 此刻**还没有**资产字节（证明确实是同步把它带过去的，不是 bootstrap）。
+    assert_eq!(
+        menghunote_storage::asset_bytes(&pair.b_vault, asset_hash).expect("读 B 资产失败"),
+        None,
+        "B 同步前不应有该资产"
+    );
+
+    // --- B：持闸同步 → 拉正文更新 + ASSET 事件（验证 + 落本地 assets 表）---
+    start_sync(&mut cx_b, &host_b);
+    drive_sync(&mut cx_b, &host_b);
+    let report_b = last_report(&mut cx_b, &host_b).expect("B 必须有同步报告");
+    assert!(report_b.is_ok(), "B 的同步必须成功：{report_b:?}");
+    assert!(
+        report_b.changes >= 1,
+        "B 本轮必须交付至少 1 条变化（A 的正文 update）：{report_b:?}"
+    );
+    assert!(
+        !active_held(&mut cx_b, &host_b),
+        "B 同步完成后闸门必须已释放"
+    );
+
+    // B 不重开文档就能看到 A 插入的链接。
+    let text_b = current_text(&mut cx_b, &host_b);
+    assert!(
+        text_b.contains(markdown_label),
+        "B 的正文必须出现同一条附件链接：{:?}",
+        text_b.chars().take(80).collect::<String>()
+    );
+    // B 取到**相同字节**（内容寻址：哈希由明文算，再用名字查回）。
+    assert_eq!(
+        menghunote_storage::asset_bytes(&pair.b_vault, asset_hash).expect("读 B 资产失败"),
+        Some(data.clone()),
+        "B 必须能取到与 A 完全一致的资产字节"
+    );
+    let meta_b = menghunote_storage::asset_meta(&pair.b_vault, asset_hash)
+        .expect("读 B 资产元数据失败")
+        .expect("B 必须有该资产");
+    assert_eq!(meta_b.byte_len, Some(data.len() as i64));
+    assert_eq!(meta_b.media_type.as_deref(), Some("text/plain"));
+    assert!(
+        !menghunote_storage::list_assets(&pair.b_vault)
+            .expect("列 B 资产失败")
+            .is_empty(),
+        "B 的 assets 表必须有该资产"
+    );
+
+    // --- A：发布基线（回归）：checkpoint 必须复用普通同步已上传的对象，不得 ID_CONFLICT ---
+    let publish = DevLocal::publish_initial_pair_with_identity(
+        relay_url.as_str(),
+        &pair.a_vault,
+        &pair.a_identity,
+    )
+    .expect("普通同步之后发布基线失败（资产对象被重复上传/预算来源冲突）");
+    assert!(
+        !publish.assets.is_empty(),
+        "基线必须包含该资产（复用普通同步已上传的对象）：{publish:?}"
+    );
+
+    // 发布之后再各同步一轮：不重复上传、不冲突，B 的字节保持不变。
+    start_sync(&mut cx_a, &host_a);
+    drive_sync(&mut cx_a, &host_a);
+    let after_publish_a = last_report(&mut cx_a, &host_a).expect("A 必须有同步报告");
+    assert!(
+        after_publish_a.is_ok(),
+        "A 发布后同步必须成功：{after_publish_a:?}"
+    );
+    start_sync(&mut cx_b, &host_b);
+    drive_sync(&mut cx_b, &host_b);
+    let after_publish_b = last_report(&mut cx_b, &host_b).expect("B 必须有同步报告");
+    assert!(
+        after_publish_b.is_ok(),
+        "B 发布后同步必须成功：{after_publish_b:?}"
+    );
+    assert_eq!(
+        menghunote_storage::asset_bytes(&pair.b_vault, asset_hash).expect("读 B 资产失败"),
+        Some(data.clone()),
+        "发布基线不得改写/重复上传 B 已取到的资产"
+    );
+
+    // 收尾：两边都能正常关窗（不把在途同步拖进关窗）。
+    with_shell(&mut cx_a, &host_a, |shell, cx| shell.close_all(cx));
+    with_shell(&mut cx_b, &host_b, |shell, cx| shell.close_all(cx));
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,7 +2301,9 @@ async fn timeout_during_integrate_keeps_the_gate_until_the_real_receipt(cx: &mut
     let gate = PhaseGate::new();
     let clock = TestClock::new();
     let config = ServiceConfig {
+        mode: menghunote_app::onboarding::RelayMode::LocalDev,
         relay: "http://127.0.0.1:1".to_owned(),
+        api_version: menghunote_app::onboarding::RelayApiVersion::V1,
         operation_deadline: Some(Duration::from_secs(10)),
         transport: DEFAULT_TRANSPORT_TIMEOUTS,
     };
@@ -2230,7 +2411,9 @@ async fn cancel_during_integrate_waits_for_the_transaction_and_delivers(cx: &mut
     let gate = PhaseGate::new();
     let clock = TestClock::new();
     let config = ServiceConfig {
+        mode: menghunote_app::onboarding::RelayMode::LocalDev,
         relay: "http://127.0.0.1:1".to_owned(),
+        api_version: menghunote_app::onboarding::RelayApiVersion::V1,
         operation_deadline: Some(Duration::from_secs(10)),
         transport: DEFAULT_TRANSPORT_TIMEOUTS,
     };

@@ -112,13 +112,118 @@ pub fn durable_backlog(vault: &menghunote_storage::Vault) -> Backlog {
     Backlog { outbox, inbox }
 }
 
-/// 失败分类：只有**明确可重试**的才退避重试，其余进入"需要处理"。
+/// 安全暂停的**脱敏类别**（ADR 0013 §4：状态栏只显示类别，不显示秘密/原始响应）。
+///
+/// 这些错误都表示"本地信任事实与 relay 不一致/不可证明"，**不是**网络抖动：
+/// 自动重试与重新连接不会让它们变好，必须人工核对指纹/配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityCategory {
+    /// 缺少可证明的信任锚（无 pin/下界不足/身份缺锚）。
+    NeedsTrust,
+    /// durable pin 损坏/版本未知/vault 绑定不符。
+    PinCorrupt,
+    /// 控制链内容不一致（换 genesis/重写链/同 rev 换 hash）。
+    Equivocation,
+    /// 控制链回退（新 head rev 低于已提交 pin）。
+    ControlRollback,
+    /// relay 实例与本地 pin 不一致（疑似换实例）。
+    InstanceMismatch,
+    /// TLS 校验失败（证书链/主机名/有效期/信任根）。
+    Tls,
+    /// 传输安全策略拒绝（明文/跨 origin/HTTPS 降级等确定性拒绝）。
+    TransportPolicy,
+}
+
+impl SecurityCategory {
+    /// 状态栏/设置页中文短标签（脱敏；不含原始错误细节）。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NeedsTrust => "需要建立信任（NeedsTrust）",
+            Self::PinCorrupt => "控制 pin 损坏（PinCorrupt）",
+            Self::Equivocation => "控制链不一致（Equivocation）",
+            Self::ControlRollback => "控制链回退（ControlRollback）",
+            Self::InstanceMismatch => "relay 实例不一致（InstanceMismatch）",
+            Self::Tls => "TLS 校验失败",
+            Self::TransportPolicy => "传输安全策略拒绝",
+        }
+    }
+
+    /// 稳定英文短名（日志/测试断言用）。
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NeedsTrust => "needs_trust",
+            Self::PinCorrupt => "pin_corrupt",
+            Self::Equivocation => "equivocation",
+            Self::ControlRollback => "control_rollback",
+            Self::InstanceMismatch => "instance_mismatch",
+            Self::Tls => "tls",
+            Self::TransportPolicy => "transport_policy",
+        }
+    }
+
+    /// 设置页「安全指纹」旁边的可操作提示（**不提供**自动清 pin/强制信任）。
+    #[must_use]
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::NeedsTrust => {
+                "还没有可证明的信任锚：请在「设置 → 安全指纹」核对后按新实例/重新 Join 处理；不会自动信任"
+            }
+            Self::PinCorrupt => {
+                "控制 pin 损坏：停止同步，保留 vault/身份/pin；请人工核对，不自动重建/清 pin"
+            }
+            Self::Equivocation => {
+                "控制链与本地 pin 不一致：停止同步并保留全部数据；请人工核对，不覆盖赢家"
+            }
+            Self::ControlRollback => {
+                "relay 控制链回退：停止同步；请人工确认服务器是否被回滚，不自动重新信任"
+            }
+            Self::InstanceMismatch => {
+                "relay 实例与本地 pin 不一致：换服务器需新建实例或重新 Join，不自动清 pin"
+            }
+            Self::Tls => {
+                "TLS 端点认证失败：核对服务器域名/证书/系统时间；不提供忽略证书或一键信任"
+            }
+            Self::TransportPolicy => {
+                "传输安全策略拒绝（明文/跨 origin/降级）：核对 relay URL 与模式；策略不会自动放宽"
+            }
+        }
+    }
+}
+
+/// 失败分类：只有**明确可重试**的才退避重试；安全类进入 `SecurityPaused`；
+/// 其余永久错误进入"需要处理"（两者不混为一谈，ADR 0013 §4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureClass {
     /// 瞬时/并发错误（传输、5xx、BUSY、head CAS…）：退避后自动重试。
     Retryable,
-    /// 鉴权/TLS/签名/epoch/游标异常：不自动重试，等人工处理。
+    /// 信任/TLS/pin 类安全错误：**不自动重试、不重新连接**，进入 `SecurityPaused`。
+    Security(SecurityCategory),
+    /// 非安全的永久错误（鉴权/签名/epoch/游标等）：不自动重试，等人工处理。
     NeedsAttention,
+}
+
+/// 把**类型化**的 `SyncError` 映射成失败分类（ADR 0013 §4）。
+///
+/// 顺序很重要：先认 `is_retryable()`（网络/并发），再认安全变体，其余才是
+/// `NeedsAttention`——这样"网络错误退避 / 安全错误暂停"不会互相污染。
+#[must_use]
+pub fn classify_sync_error(error: &menghunote_sync::error::SyncError) -> FailureClass {
+    use menghunote_sync::error::SyncError as E;
+    if error.is_retryable() {
+        return FailureClass::Retryable;
+    }
+    match error {
+        E::NeedsTrust(_) => FailureClass::Security(SecurityCategory::NeedsTrust),
+        E::PinCorrupt(_) => FailureClass::Security(SecurityCategory::PinCorrupt),
+        E::Equivocation(_) => FailureClass::Security(SecurityCategory::Equivocation),
+        E::ControlRollback { .. } => FailureClass::Security(SecurityCategory::ControlRollback),
+        E::InstanceMismatch => FailureClass::Security(SecurityCategory::InstanceMismatch),
+        E::Tls(_) => FailureClass::Security(SecurityCategory::Tls),
+        E::TransportPolicy(_) => FailureClass::Security(SecurityCategory::TransportPolicy),
+        _ => FailureClass::NeedsAttention,
+    }
 }
 
 /// 把 worker 的失败文案分类（`SyncError` 的 `Display` 前缀；不含 secret）。
@@ -139,7 +244,25 @@ pub fn classify_failure(message: &str) -> FailureClass {
             return FailureClass::Retryable;
         }
     }
-    // 2) HTTP 5xx / 408 / 429：relay 侧瞬时不可用。
+    // 2) 安全类：TLS/信任/pin/控制链/实例/传输策略——**确定性拒绝**，不自动重试。
+    //    必须在 HTTP/业务码判断之前：这些错误的文案不会与瞬时错误前缀重叠。
+    for (marker, category) in [
+        ("TLS 校验失败", SecurityCategory::Tls),
+        ("传输策略拒绝", SecurityCategory::TransportPolicy),
+        ("需要建立信任", SecurityCategory::NeedsTrust),
+        ("控制 pin 损坏", SecurityCategory::PinCorrupt),
+        ("控制链内容不一致", SecurityCategory::Equivocation),
+        ("控制链回退", SecurityCategory::ControlRollback),
+        (
+            "relay 实例与本地 pin 不一致",
+            SecurityCategory::InstanceMismatch,
+        ),
+    ] {
+        if message.contains(marker) {
+            return FailureClass::Security(category);
+        }
+    }
+    // 3) HTTP 5xx / 408 / 429：relay 侧瞬时不可用。
     if let Some(rest) = message.split("relay HTTP 状态 ").nth(1) {
         let code: u16 = rest
             .chars()
@@ -151,7 +274,7 @@ pub fn classify_failure(message: &str) -> FailureClass {
             return FailureClass::Retryable;
         }
     }
-    // 3) relay 业务错误码里只有 4 个是可重试的（见 `ErrorCode::retryable`）。
+    // 4) relay 业务错误码里只有 4 个是可重试的（见 `ErrorCode::retryable`）。
     if let Some(rest) = message.split("relay 拒绝：").nth(1) {
         let code: String = rest
             .chars()
@@ -205,6 +328,16 @@ pub enum StatusState {
         until: Instant,
         /// 连续第几次失败（1 起）。
         attempt: u32,
+    },
+    /// 安全暂停（ADR 0013 §4）：信任/TLS/pin 类错误，**不自动重试、不重新连接**。
+    ///
+    /// 与 [`Self::Retry`]（网络退避）严格分开：进入本状态后自动调度停止，手动同步也会
+    /// 被明确拒绝并指向「设置 → 安全指纹」；不自动清 pin、不盲信。
+    SecurityPaused {
+        /// 脱敏类别（状态栏只显示它）。
+        category: SecurityCategory,
+        /// 脱敏细节（一行；不含 secret/wire 原文）。
+        reason: String,
     },
     /// 需要人工处理（不会自动重试）。
     NeedsAttention {
@@ -266,6 +399,9 @@ impl SyncStatus {
                     remaining.as_secs_f64().ceil().max(0.0)
                 )
             }
+            StatusState::SecurityPaused { category, .. } => {
+                format!("需要处理：安全暂停（{}）", category.label())
+            }
             StatusState::NeedsAttention { reason } => format!("需要处理：{reason}"),
             StatusState::NoProgress { remaining } => {
                 format!("已接收·待应用 {remaining}（续批暂停：无进展）")
@@ -274,7 +410,9 @@ impl SyncStatus {
         // 计数只在主状态没表达它时才追加（"收到"≠"已应用"，两个数分开）。
         let already_shows_pending = matches!(
             self.state,
-            StatusState::NoProgress { .. } | StatusState::NeedsAttention { .. }
+            StatusState::NoProgress { .. }
+                | StatusState::NeedsAttention { .. }
+                | StatusState::SecurityPaused { .. }
         );
         if !already_shows_pending {
             if self.inbox > 0 {
@@ -296,6 +434,12 @@ impl SyncStatus {
             ));
         }
         match &self.state {
+            StatusState::SecurityPaused { category, reason } => Some(format!(
+                "需要处理：安全暂停（{}）· {reason}；{}；请到「设置 → 安全指纹」核对后人工处理\
+                 （手动同步也会被拒绝，不会自动清 pin/信任）",
+                category.label(),
+                category.hint()
+            )),
             StatusState::NeedsAttention { reason } => {
                 Some(format!("需要处理：{reason}；可点「同步」重试"))
             }
@@ -522,6 +666,15 @@ impl AutoSync {
         &self.status
     }
 
+    /// 当前安全暂停的类别（`None` = 没有安全暂停；设置页「错误类别」用）。
+    #[must_use]
+    pub const fn security_category(&self) -> Option<SecurityCategory> {
+        match &self.status.state {
+            StatusState::SecurityPaused { category, .. } => Some(*category),
+            _ => None,
+        }
+    }
+
     /// 在途一轮的来源（`None` = 空闲）。
     #[must_use]
     pub const fn origin(&self) -> Option<OpOrigin> {
@@ -583,7 +736,12 @@ impl AutoSync {
             self.config.unfocused_period
         };
         self.scheduler.set_period(period, now);
-        if active && !self.stopped && self.status.inbox > 0 && self.origin.is_none() {
+        if active
+            && !self.stopped
+            && self.status.inbox > 0
+            && self.origin.is_none()
+            && !matches!(self.status.state, StatusState::SecurityPaused { .. })
+        {
             let _ = self.scheduler.on_network_recovered(now);
         }
     }
@@ -660,6 +818,10 @@ impl AutoSync {
             return Decision::Wait(match origin {
                 OpOrigin::Manual | OpOrigin::Auto => SkipReason::Running,
             });
+        }
+        // 安全暂停不是"用户点一下就能重试"的普通暂停：不自动清 pin、不盲信（ADR 0013 §4）。
+        if matches!(self.status.state, StatusState::SecurityPaused { .. }) {
+            return Decision::Wait(SkipReason::SecurityPaused);
         }
         let decision = if self.scheduler.is_paused() {
             self.scheduler.retry_after_attention(now)
@@ -864,6 +1026,13 @@ impl AutoSync {
                 };
                 decision
             }
+            FailureClass::Security(category) => {
+                // 停止自动重试/不重新连接；保留 vault/身份/pin，允许本地编辑。
+                self.scheduler
+                    .on_finished(Finished::failure_permanent(reason.clone()), now);
+                self.status.state = StatusState::SecurityPaused { category, reason };
+                Decision::Wait(SkipReason::SecurityPaused)
+            }
             FailureClass::NeedsAttention => {
                 self.scheduler
                     .on_finished(Finished::failure_permanent(reason.clone()), now);
@@ -916,10 +1085,46 @@ mod tests {
                 "{retryable}"
             );
         }
+        // 安全类：**不**与网络退避混淆，全部归入 SecurityPaused 的类别。
+        for (message, category) in [
+            (
+                "同步失败（Prepare）：TLS 校验失败：certificate expired",
+                SecurityCategory::Tls,
+            ),
+            (
+                "同步失败（Prepare）：传输策略拒绝：plaintext http",
+                SecurityCategory::TransportPolicy,
+            ),
+            (
+                "同步失败（Prepare）：需要建立信任（不盲信继续）：no pin",
+                SecurityCategory::NeedsTrust,
+            ),
+            (
+                "同步失败（Prepare）：控制 pin 损坏：bad bytes",
+                SecurityCategory::PinCorrupt,
+            ),
+            (
+                "同步失败（Prepare）：控制链内容不一致（equivocation）：genesis replaced",
+                SecurityCategory::Equivocation,
+            ),
+            (
+                "同步失败（Integrate）：控制链回退：本地 pin rev=3，收到 rev=2",
+                SecurityCategory::ControlRollback,
+            ),
+            (
+                "同步失败（Prepare）：relay 实例与本地 pin 不一致（疑似换实例或静默回滚）",
+                SecurityCategory::InstanceMismatch,
+            ),
+        ] {
+            assert_eq!(
+                classify_failure(message),
+                FailureClass::Security(category),
+                "{message}"
+            );
+        }
         for permanent in [
             "同步失败（Prepare）：relay 拒绝：UNAUTHORIZED",
             "同步失败（Prepare）：relay 拒绝：EPOCH",
-            "同步失败（Prepare）：TLS 校验失败：certificate expired",
             "同步失败（Prepare）：签名验证失败",
             "同步失败（Prepare）：同步暂停：游标过期",
             "同步失败（Prepare）：同步已取消：在外部集成前停止（未追加任何本地行）",
@@ -930,6 +1135,85 @@ mod tests {
                 classify_failure(permanent),
                 FailureClass::NeedsAttention,
                 "{permanent}"
+            );
+        }
+    }
+
+    /// 类型化映射（ADR 0013 §4）：每个 `SyncError` 都必须落到 Network(Retryable) /
+    /// Security / Other(NeedsAttention) 三类之一，且安全类不误判成退避。
+    #[test]
+    fn typed_sync_errors_map_to_network_or_security_pauses() {
+        use menghunote_sync::error::SyncError as E;
+
+        let network = [
+            E::Transport("connection reset"),
+            E::Random,
+            E::HeadConflict {
+                doc_id: "d".to_owned(),
+                expected: 1,
+                actual: 2,
+            },
+            E::RelayApi {
+                code: "BUSY".to_owned(),
+                retryable: true,
+                current_epoch: None,
+                current_control_rev: None,
+                bootstrap_hint: None,
+            },
+        ];
+        for error in network {
+            assert_eq!(
+                classify_sync_error(&error),
+                FailureClass::Retryable,
+                "网络/瞬时错误必须退避：{error:?}"
+            );
+        }
+
+        let security = [
+            (E::NeedsTrust("no pin"), SecurityCategory::NeedsTrust),
+            (E::PinCorrupt("bad bytes"), SecurityCategory::PinCorrupt),
+            (E::Equivocation("replaced"), SecurityCategory::Equivocation),
+            (
+                E::ControlRollback {
+                    expected: 3,
+                    actual: 2,
+                },
+                SecurityCategory::ControlRollback,
+            ),
+            (E::InstanceMismatch, SecurityCategory::InstanceMismatch),
+            (
+                E::Tls("certificate expired".to_owned()),
+                SecurityCategory::Tls,
+            ),
+            (
+                E::TransportPolicy("plaintext http".to_owned()),
+                SecurityCategory::TransportPolicy,
+            ),
+        ];
+        for (error, category) in security {
+            assert_eq!(
+                classify_sync_error(&error),
+                FailureClass::Security(category),
+                "安全错误必须暂停而不是退避：{error:?}"
+            );
+        }
+
+        let other = [
+            E::Signature,
+            E::RelayApi {
+                code: "UNAUTHORIZED".to_owned(),
+                retryable: false,
+                current_epoch: None,
+                current_control_rev: None,
+                bootstrap_hint: None,
+            },
+            E::Unsupported("not implemented"),
+        ];
+        for error in other {
+            assert_eq!(
+                classify_sync_error(&error),
+                FailureClass::NeedsAttention,
+                "非安全永久错误保持 NeedsAttention：{error:?}"
             );
         }
     }
@@ -972,10 +1256,24 @@ mod tests {
         assert!(line.contains("第 2 次失败"), "{line}");
         assert_eq!(status.error_line(), None, "普通退避不显示打扰行");
 
-        status.state = StatusState::NeedsAttention {
-            reason: "TLS 校验失败".to_owned(),
+        status.state = StatusState::SecurityPaused {
+            category: SecurityCategory::Tls,
+            reason: "certificate expired".to_owned(),
         };
-        assert_eq!(status.line(now), "需要处理：TLS 校验失败");
+        let line = status.line(now);
+        assert_eq!(line, "需要处理：安全暂停（TLS 校验失败）", "{line}");
+        let error_line = status.error_line().expect("安全暂停必须给出一行可操作提示");
+        assert!(error_line.contains("安全指纹"), "{error_line}");
+        assert!(error_line.contains("不会自动清 pin"), "{error_line}");
+        assert!(
+            !error_line.contains("可点「同步」重试"),
+            "安全暂停不得引导盲点重试"
+        );
+
+        status.state = StatusState::NeedsAttention {
+            reason: "签名验证失败".to_owned(),
+        };
+        assert_eq!(status.line(now), "需要处理：签名验证失败");
         assert!(status
             .error_line()
             .expect("需要处理行")
@@ -1100,6 +1398,84 @@ mod tests {
             StatusState::NoProgress { remaining: 1 }
         ));
         assert!(!decision.is_start(), "defer 只排续批，不立刻启动");
+    }
+
+    /// 安全错误 → `SecurityPaused`：自动调度停止、手动也被拒绝；
+    /// 网络错误仍按 5/10/20… 退避（两类不混）。
+    #[test]
+    fn security_pause_stops_auto_retry_and_refuses_manual_while_network_backs_off() {
+        let clock = TestClock::new();
+        let mut auto = auto_with(&clock, AutoSyncConfig::new().no_ticker());
+        let backlog = Backlog {
+            outbox: 1,
+            inbox: 0,
+        };
+        let start = clock.now();
+        assert!(auto.on_startup(start).is_start());
+        auto.begin_auto_round(Trigger::Startup, backlog);
+        let failed_at = start + Duration::from_secs(1);
+        let decision = auto.finish_round(
+            RoundOutcome {
+                success: false,
+                error: Some("同步失败（Prepare）：TLS 校验失败：certificate expired".to_owned()),
+                deferred_by_gate: false,
+                frozen: None,
+            },
+            backlog,
+            failed_at,
+        );
+        assert_eq!(decision, Decision::Wait(SkipReason::SecurityPaused));
+        assert_eq!(
+            auto.security_category(),
+            Some(SecurityCategory::Tls),
+            "状态必须带脱敏类别"
+        );
+        assert!(matches!(
+            auto.status().state,
+            StatusState::SecurityPaused {
+                category: SecurityCategory::Tls,
+                ..
+            }
+        ));
+        assert!(auto.scheduler().is_paused(), "自动调度必须停止");
+        assert!(auto.status().line(failed_at).contains("需要处理：安全暂停"));
+        assert!(auto
+            .status()
+            .error_line()
+            .expect("安全暂停行")
+            .contains("不会自动清 pin"));
+
+        // 手动同步也明确拒绝（不自动清 pin/不盲信），不派发任何一轮。
+        assert_eq!(
+            auto.request_manual(failed_at + Duration::from_secs(1)),
+            Decision::Wait(SkipReason::SecurityPaused)
+        );
+        assert_eq!(auto.origin(), None, "被拒绝的手动请求不得登记为新轮");
+
+        // 时间推进/周期到期也不会重新连接。
+        clock.advance(Duration::from_secs(120));
+        assert!(!auto.tick(clock.now()).is_start());
+        assert!(!auto.tick(clock.now()).is_start());
+
+        // 对照：网络错误仍然退避（不是 SecurityPaused）。
+        let mut network = auto_with(&clock, AutoSyncConfig::new().no_ticker());
+        let start = clock.now();
+        assert!(network.on_startup(start).is_start());
+        network.begin_auto_round(Trigger::Startup, backlog);
+        let decision = network.finish_round(
+            RoundOutcome {
+                success: false,
+                error: Some("同步失败（Prepare）：relay 传输失败：connection reset".to_owned()),
+                deferred_by_gate: false,
+                frozen: None,
+            },
+            backlog,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(decision, Decision::Wait(SkipReason::Backoff));
+        assert_eq!(network.security_category(), None);
+        assert!(matches!(network.status().state, StatusState::Retry { .. }));
+        assert!(!network.scheduler().is_paused(), "网络错误不得停掉调度器");
     }
 
     #[test]

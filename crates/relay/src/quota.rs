@@ -20,10 +20,11 @@
 //! （调用方 `objects::put_part` 保证）；超限返回 507 且同事务零效应（错误传播即回滚）。
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{random_id16, Id16};
+use crate::scope::ScopeConn;
 use crate::time::Clock;
 use crate::vault;
 
@@ -125,11 +126,11 @@ impl Reservation {
 }
 
 /// 读账本。
-pub fn usage(conn: &Connection) -> Result<Usage> {
+pub fn usage(conn: &ScopeConn) -> Result<Usage> {
     let row = conn
         .query_row(
-            "SELECT normal_bytes, maintenance_bytes FROM usage WHERE singleton = 1",
-            [],
+            "SELECT normal_bytes, maintenance_bytes FROM usage WHERE vault_id = ?1",
+            [conn.scope().as_slice()],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
@@ -141,19 +142,19 @@ pub fn usage(conn: &Connection) -> Result<Usage> {
 }
 
 /// `Σ(active 且未过期).(reserved − consumed)`。
-pub fn active_reserved_remaining(conn: &Connection, now: i64) -> Result<i64> {
+pub fn active_reserved_remaining(conn: &ScopeConn, now: i64) -> Result<i64> {
     let total: i64 = conn.query_row(
         "SELECT COALESCE(SUM(reserved_bytes - consumed_bytes), 0)
          FROM maintenance_reservations
-         WHERE state = 'active' AND expires_at > ?1",
-        [now],
+         WHERE state = 'active' AND expires_at > ?1 AND vault_id = ?",
+        (now, conn.scope().as_slice()),
         |row| row.get(0),
     )?;
     Ok(total)
 }
 
 /// 正常预算剩余。
-pub fn normal_available(conn: &Connection) -> Result<i64> {
+pub fn normal_available(conn: &ScopeConn) -> Result<i64> {
     let vault = vault::load(conn)?;
     Ok(vault.normal_limit - usage(conn)?.normal_bytes)
 }
@@ -161,13 +162,14 @@ pub fn normal_available(conn: &Connection) -> Result<i64> {
 /// 一次"未来 live"计量的基线集合：`incoming` 加上同 epoch 最新若干份 healthy published
 /// （最多补到两份）。publish 传即将发布的 1 份（补 1 份已发布），activate 传被指名的
 /// 两份候选（不再补：激活后它们就是最新两份）。
-fn live_pair_ids(conn: &Connection, epoch: u64, incoming: &[Id16]) -> Result<Vec<Id16>> {
+fn live_pair_ids(conn: &ScopeConn, epoch: u64, incoming: &[Id16]) -> Result<Vec<Id16>> {
     let mut pair = incoming.to_vec();
     let fill = 2usize.saturating_sub(pair.len());
     if fill > 0 {
         let mut stmt = conn.prepare(
             "SELECT checkpoint_id FROM checkpoints
               WHERE state = 'published' AND epoch = ?1 AND health != 'unhealthy'
+                AND vault_id = ?3
               ORDER BY published_at DESC, rowid DESC
               LIMIT ?2",
         )?;
@@ -175,6 +177,7 @@ fn live_pair_ids(conn: &Connection, epoch: u64, incoming: &[Id16]) -> Result<Vec
             (
                 i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
                 i64::try_from(fill).map_err(|_| Error::Invariant("live pair limit"))?,
+                conn.scope().as_slice(),
             ),
             |row| row.get::<_, Vec<u8>>(0),
         )?;
@@ -210,45 +213,54 @@ fn live_cte_sql(pair_len: usize) -> String {
         format!("VALUES {}", values.join(", "))
     };
     let epoch_param = pair_len + 1;
+    // vault_id 在 CTE 的每个分支都要过滤：同一个显式编号复用（参数按编号绑定）。
+    let vault_param = pair_len + 2;
     format!(
         "WITH pair(checkpoint_id) AS ({pair_source}),\n\
          live(object_id) AS (\n\
              SELECT r.object_id FROM checkpoint_refs r\n\
               WHERE r.role IN ('data','manifest')\n\
                 AND r.checkpoint_id IN (SELECT checkpoint_id FROM pair)\n\
+                AND r.vault_id = ?{vault_param}\n\
              UNION\n\
              SELECT l.object_id FROM log l\n\
               WHERE l.kind = 'update' AND l.object_id IS NOT NULL\n\
+                AND l.vault_id = ?{vault_param}\n\
              UNION\n\
              SELECT a.object_id FROM asset_objects a\n\
               WHERE a.epoch = ?{epoch_param} AND a.state != 'retired'\n\
+                AND a.vault_id = ?{vault_param}\n\
                 AND a.object_id NOT IN (\n\
                     SELECT r.object_id FROM checkpoint_refs r\n\
                      WHERE r.role = 'data'\n\
                        AND r.checkpoint_id IN (SELECT checkpoint_id FROM pair)\n\
+                       AND r.vault_id = ?{vault_param}\n\
                 )\n\
          )"
     )
 }
 
-fn pair_params(pair: &[Id16], epoch: u64) -> Result<Vec<Value>> {
+fn pair_params(pair: &[Id16], epoch: u64, conn: &ScopeConn) -> Result<Vec<Value>> {
     let mut params: Vec<Value> = pair.iter().map(|id| Value::Blob(id.to_vec())).collect();
     params.push(Value::Integer(
         i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
     ));
+    params.push(Value::Blob(conn.scope().as_slice().to_vec()));
     Ok(params)
 }
 
-fn live_bytes(conn: &Connection, epoch: u64, pair: &[Id16]) -> Result<i64> {
+fn live_bytes(conn: &ScopeConn, epoch: u64, pair: &[Id16]) -> Result<i64> {
+    let vault_param = pair.len() + 2;
     let sql = format!(
         "{} SELECT COALESCE(SUM(length(p.envelope)), 0)\n\
            FROM object_parts p\n\
-          WHERE p.object_id IN (SELECT object_id FROM live)",
+          WHERE p.object_id IN (SELECT object_id FROM live)\n\
+            AND p.vault_id = ?{vault_param}",
         live_cte_sql(pair.len())
     );
     let bytes = conn.query_row(
         &sql,
-        rusqlite::params_from_iter(pair_params(pair, epoch)?),
+        rusqlite::params_from_iter(pair_params(pair, epoch, conn)?),
         |row| row.get(0),
     )?;
     Ok(bytes)
@@ -264,7 +276,7 @@ fn live_bytes(conn: &Connection, epoch: u64, pair: &[Id16]) -> Result<i64> {
 /// publish 传即将发布的 1 份（函数再补当前同 epoch 最新一份 published）；activate 传
 /// 被指名的两份候选（此刻它们尚未 published，不会再补旧 epoch 的基线）。超预算只拒绝
 /// （507），不删除任何安全根、不建 GC 计划。
-pub fn future_live_bytes(conn: &Connection, epoch: u64, incoming: &[Id16]) -> Result<i64> {
+pub fn future_live_bytes(conn: &ScopeConn, epoch: u64, incoming: &[Id16]) -> Result<i64> {
     let pair = live_pair_ids(conn, epoch, incoming)?;
     live_bytes(conn, epoch, &pair)
 }
@@ -278,7 +290,7 @@ pub fn maintenance_budget(vault: &vault::Vault) -> i64 {
 }
 
 /// 维护额度剩余。
-pub fn maintenance_available(conn: &Connection, now: i64) -> Result<i64> {
+pub fn maintenance_available(conn: &ScopeConn, now: i64) -> Result<i64> {
     let vault = vault::load(conn)?;
     let used = usage(conn)?.maintenance_bytes;
     let reserved = active_reserved_remaining(conn, now)?;
@@ -291,7 +303,7 @@ pub fn maintenance_available(conn: &Connection, now: i64) -> Result<i64> {
 /// 一切增量写入都由 [`charge_normal`] / [`charge_maintenance`] 的峰值门禁拒绝。
 /// 历史数据（旧版本超峰、或运维缩容 `maintenance_limit`）不会被 [`recompute`] 抹平，
 /// 因此恢复写入必须先把真实 bytes 降回峰值以内。
-pub fn peak_exceeded(conn: &Connection) -> Result<bool> {
+pub fn peak_exceeded(conn: &ScopeConn) -> Result<bool> {
     let vault = vault::load(conn)?;
     Ok(!usage(conn)?.within_peak(vault.maintenance_limit))
 }
@@ -316,7 +328,7 @@ fn ensure_peak_charge(vault: &vault::Vault, current: Usage, bytes: i64) -> Resul
 /// - `normal + bytes ≤ Q`（正常桶本身不超预算）；
 /// - `normal + maintenance + bytes ≤ Q+R`（真实总量不超峰值；否则归类后的旧 maintenance
 ///   会让"Q 还装得下"的写入击穿峰值）。
-pub fn charge_normal(conn: &Connection, bytes: i64) -> Result<()> {
+pub fn charge_normal(conn: &ScopeConn, bytes: i64) -> Result<()> {
     if bytes < 0 {
         return Err(Error::Invariant("negative charge"));
     }
@@ -329,8 +341,8 @@ pub fn charge_normal(conn: &Connection, bytes: i64) -> Result<()> {
     }
     ensure_peak_charge(&vault, current, bytes)?;
     conn.execute(
-        "UPDATE usage SET normal_bytes = normal_bytes + ?1 WHERE singleton = 1",
-        [bytes],
+        "UPDATE usage SET normal_bytes = normal_bytes + ?1 WHERE vault_id = ?",
+        (bytes, conn.scope().as_slice()),
     )?;
     Ok(())
 }
@@ -338,7 +350,7 @@ pub fn charge_normal(conn: &Connection, bytes: i64) -> Result<()> {
 /// 写一片**维护**对象的密文：必须落在 active reservation 内，且不超过 `Q+R` 峰值。
 /// **逐片原子扣减**（与 part 写入同一事务）。
 pub fn charge_maintenance(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     reservation_id: &Id16,
     bytes: i64,
@@ -365,25 +377,25 @@ pub fn charge_maintenance(
     ensure_peak_charge(&vault, current, bytes)?;
     conn.execute(
         "UPDATE maintenance_reservations SET consumed_bytes = consumed_bytes + ?1
-         WHERE reservation_id = ?2",
-        (bytes, reservation_id.as_slice()),
+         WHERE reservation_id = ?2 AND vault_id = ?",
+        (bytes, reservation_id.as_slice(), conn.scope().as_slice()),
     )?;
     conn.execute(
-        "UPDATE usage SET maintenance_bytes = maintenance_bytes + ?1 WHERE singleton = 1",
-        [bytes],
+        "UPDATE usage SET maintenance_bytes = maintenance_bytes + ?1 WHERE vault_id = ?",
+        (bytes, conn.scope().as_slice()),
     )?;
     Ok(())
 }
 
 /// 读一条 reservation。
-pub fn reservation(conn: &Connection, id: &Id16) -> Result<Option<Reservation>> {
+pub fn reservation(conn: &ScopeConn, id: &Id16) -> Result<Option<Reservation>> {
     let mut stmt = conn.prepare(
         "SELECT reservation_id, purpose, resource_id, owner_device, reserved_bytes,
                 consumed_bytes, state, expires_at
-         FROM maintenance_reservations WHERE reservation_id = ?1",
+         FROM maintenance_reservations WHERE reservation_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([id.as_slice()], |row| {
+        .query_row((id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, String>(1)?,
@@ -430,7 +442,7 @@ pub fn reservation(conn: &Connection, id: &Id16) -> Result<Option<Reservation>> 
 
 /// 建立维护 reservation：额度不足返回 507 RESERVE（**不删旧数据**）。
 pub fn create_reservation(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     purpose: ReservationPurpose,
     resource_id: &[u8],
@@ -449,10 +461,12 @@ pub fn create_reservation(
     }
     let id = random_id16()?;
     conn.execute(
-        "INSERT INTO maintenance_reservations(reservation_id, purpose, resource_id, owner_device,
-                                              reserved_bytes, consumed_bytes, state, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'active', ?6)",
+        "INSERT INTO maintenance_reservations(vault_id, reservation_id, purpose, resource_id,
+                                              owner_device, reserved_bytes, consumed_bytes,
+                                              state, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'active', ?7)",
         (
+            conn.scope().as_slice(),
             id.as_slice(),
             purpose.as_str(),
             resource_id,
@@ -465,14 +479,17 @@ pub fn create_reservation(
 }
 
 /// 有没有 active（未过期）的 checkpoint 类 reservation——用于"单一 checkpoint writer lease"。
-pub fn active_checkpoint_lease(conn: &Connection, now: i64) -> Result<Option<Id16>> {
+pub fn active_checkpoint_lease(conn: &ScopeConn, now: i64) -> Result<Option<Id16>> {
     let mut stmt = conn.prepare(
         "SELECT resource_id FROM maintenance_reservations
          WHERE purpose = 'checkpoint' AND state = 'active' AND expires_at > ?1
+           AND vault_id = ?
          LIMIT 1",
     )?;
     let row = stmt
-        .query_row([now], |row| row.get::<_, Vec<u8>>(0))
+        .query_row((now, conn.scope().as_slice()), |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
         .optional()?;
     match row {
         None => Ok(None),
@@ -485,31 +502,31 @@ pub fn active_checkpoint_lease(conn: &Connection, now: i64) -> Result<Option<Id1
 }
 
 /// 标记完成（未用完的额度立即归还 R_available；**不删除任何已写数据**）。
-pub fn complete_reservation(conn: &Connection, id: &Id16) -> Result<()> {
+pub fn complete_reservation(conn: &ScopeConn, id: &Id16) -> Result<()> {
     conn.execute(
         "UPDATE maintenance_reservations SET state = 'complete'
-         WHERE reservation_id = ?1 AND state = 'active'",
-        [id.as_slice()],
+         WHERE reservation_id = ?1 AND state = 'active' AND vault_id = ?",
+        (id.as_slice(), conn.scope().as_slice()),
     )?;
     Ok(())
 }
 
 /// 标记过期。
-pub fn expire_reservation(conn: &Connection, id: &Id16) -> Result<()> {
+pub fn expire_reservation(conn: &ScopeConn, id: &Id16) -> Result<()> {
     conn.execute(
         "UPDATE maintenance_reservations SET state = 'expired'
-         WHERE reservation_id = ?1 AND state = 'active'",
-        [id.as_slice()],
+         WHERE reservation_id = ?1 AND state = 'active' AND vault_id = ?",
+        (id.as_slice(), conn.scope().as_slice()),
     )?;
     Ok(())
 }
 
 /// 清扫过期 reservation（只改状态，不删数据；ADR §13.2）。
-pub fn expire_stale_reservations(conn: &Connection, now: i64) -> Result<u64> {
+pub fn expire_stale_reservations(conn: &ScopeConn, now: i64) -> Result<u64> {
     let changed = conn.execute(
         "UPDATE maintenance_reservations SET state = 'expired'
-         WHERE state = 'active' AND expires_at <= ?1",
-        [now],
+         WHERE state = 'active' AND expires_at <= ?1 AND vault_id = ?",
+        (now, conn.scope().as_slice()),
     )?;
     Ok(changed as u64)
 }
@@ -531,10 +548,11 @@ pub fn expire_stale_reservations(conn: &Connection, now: i64) -> Result<u64> {
 /// **不得绕过峰值**：归类后仍按真实 parts 落账，绝不把 `normal + maintenance` 调小来
 /// 恢复可写空间（见 [`peak_exceeded`]）。总量超 `Q+R` 的历史数据保持"只读/可降级"，
 /// 写入由 [`charge_normal`]/[`charge_maintenance`] 的 `ensure_peak_charge` 拒绝。
-pub fn recompute(conn: &Connection) -> Result<Usage> {
+pub fn recompute(conn: &ScopeConn) -> Result<Usage> {
     let vault = vault::load(conn)?;
     let pair = live_pair_ids(conn, vault.active_epoch, &[])?;
-    let params = pair_params(&pair, vault.active_epoch)?;
+    let params = pair_params(&pair, vault.active_epoch, conn)?;
+    let vault_param = pair.len() + 2;
     // 仍有 parts 的对象：live → normal，其余 → maintenance（即使历史类别是 retired，
     // 只要 parts 还在就必须进账本，保证 ledger = 真实 parts）。
     let classify_sql = format!(
@@ -542,7 +560,10 @@ pub fn recompute(conn: &Connection) -> Result<Usage> {
               WHEN object_id IN (SELECT object_id FROM live) THEN 'normal'\n\
               ELSE 'maintenance'\n\
           END\n\
-          WHERE EXISTS (SELECT 1 FROM object_parts p WHERE p.object_id = objects.object_id)",
+          WHERE vault_id = ?{vault_param}\n\
+            AND EXISTS (SELECT 1 FROM object_parts p\n\
+                        WHERE p.object_id = objects.object_id\n\
+                          AND p.vault_id = ?{vault_param})",
         live_cte_sql(pair.len())
     );
     conn.execute(&classify_sql, rusqlite::params_from_iter(params))?;
@@ -551,8 +572,9 @@ pub fn recompute(conn: &Connection) -> Result<Usage> {
         "SELECT
             COALESCE(SUM(CASE WHEN o.budget_class = 'normal' THEN length(p.envelope) ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN o.budget_class = 'maintenance' THEN length(p.envelope) ELSE 0 END), 0)
-         FROM object_parts p JOIN objects o ON o.object_id = p.object_id",
-        [],
+         FROM object_parts p JOIN objects o ON o.object_id = p.object_id
+         WHERE p.vault_id = ?1 AND o.vault_id = ?1",
+        [conn.scope().as_slice()],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let next = Usage {
@@ -565,8 +587,12 @@ pub fn recompute(conn: &Connection) -> Result<Usage> {
     // 超峰事实必须原样落账——读与回收（GC 只会让 total 下降）继续可用，增量写入被
     // 507 拒绝；recompute 本身不返回错误，否则 GC/降级的回收事务会被整体回滚。
     conn.execute(
-        "UPDATE usage SET normal_bytes = ?1, maintenance_bytes = ?2 WHERE singleton = 1",
-        (next.normal_bytes, next.maintenance_bytes),
+        "UPDATE usage SET normal_bytes = ?1, maintenance_bytes = ?2 WHERE vault_id = ?",
+        (
+            next.normal_bytes,
+            next.maintenance_bytes,
+            conn.scope().as_slice(),
+        ),
     )?;
     Ok(next)
 }
@@ -581,17 +607,45 @@ mod tests {
     use super::*;
     use crate::db::schema;
     use crate::envelope::ObjectType;
-    use crate::ids::Hash32;
+    use crate::ids::{Hash32, Id16};
+    use crate::scope::{ScopeConn, VaultScope};
+    use rusqlite::Connection;
+
+    const TEST_VAULT: Id16 = [0xA1u8; 16];
+
+    /// 建 schema + 一个 vault 行 + usage 行；返回作用域连接。
+    fn fixture(conn: &Connection) -> ScopeConn<'_> {
+        conn.execute(
+            "INSERT INTO vaults(vault_id, instance_id, log_id, log_incarnation, cursor_key,
+                                state, active_epoch, next_epoch, manager_rev, control_rev,
+                                auth_rev, head_seq, gc_floor, normal_limit, maintenance_limit,
+                                legacy_default, created_at)
+             VALUES (?1, ?2, ?2, ?2, ?3, 'active', 1, 2, 1, 1, 1, 0, 0, 1048576, 2097152, 1, 0)",
+            (
+                TEST_VAULT.as_slice(),
+                [0u8; 16].as_slice(),
+                [0u8; 32].as_slice(),
+            ),
+        )
+        .expect("vault row");
+        conn.execute(
+            "INSERT INTO usage(vault_id, normal_bytes, maintenance_bytes) VALUES (?1, 0, 0)",
+            [TEST_VAULT.as_slice()],
+        )
+        .expect("usage row");
+        ScopeConn::new(conn, VaultScope::new(TEST_VAULT))
+    }
 
     /// 插入一行 complete 对象 + 单个分片；返回 object_id。
-    fn insert_object(conn: &Connection, seed: u8, kind: ObjectType, envelope_len: usize) -> Hash32 {
+    fn insert_object(conn: &ScopeConn, seed: u8, kind: ObjectType, envelope_len: usize) -> Hash32 {
         let object_id: Hash32 = [seed; 32];
         conn.execute(
-            "INSERT INTO objects(object_id, message_id, producer, epoch, type, generation,
+            "INSERT INTO objects(vault_id, object_id, message_id, producer, epoch, type, generation,
                                  sender_seq, part_count, plain_len, state, budget_class,
                                  created_at, touched_at)
-             VALUES (?1, ?2, ?3, 1, ?4, 0, 0, 1, 1, 'complete', 'maintenance', 0, 0)",
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, 0, 0, 1, 1, 'complete', 'maintenance', 0, 0)",
             (
+                conn.scope().as_slice(),
                 object_id.as_slice(),
                 [seed; 16].as_slice(),
                 [0u8; 16].as_slice(),
@@ -600,9 +654,10 @@ mod tests {
         )
         .expect("insert object");
         conn.execute(
-            "INSERT INTO object_parts(object_id, part_no, envelope, digest)
-             VALUES (?1, 0, ?2, ?3)",
+            "INSERT INTO object_parts(vault_id, object_id, part_no, envelope, digest)
+             VALUES (?1, ?2, 0, ?3, ?4)",
             (
+                conn.scope().as_slice(),
                 object_id.as_slice(),
                 vec![seed; envelope_len],
                 [seed; 32].as_slice(),
@@ -612,65 +667,87 @@ mod tests {
         object_id
     }
 
-    fn insert_checkpoint(conn: &Connection, seed: u8, state: &str, published_at: Option<i64>) {
+    fn insert_checkpoint(conn: &ScopeConn, seed: u8, state: &str, published_at: Option<i64>) {
         conn.execute(
-            "INSERT INTO checkpoints(checkpoint_id, epoch, covered_seq, validation_version,
-                                     health, state, created_at, published_at)
-             VALUES (?1, 1, 0, 1, 'healthy', ?2, 0, ?3)",
-            ([seed; 16].as_slice(), state, published_at),
+            "INSERT INTO checkpoints(vault_id, checkpoint_id, epoch, covered_seq,
+                                     validation_version, health, state, created_at, published_at)
+             VALUES (?1, ?2, 1, 0, 1, 'healthy', ?3, 0, ?4)",
+            (
+                conn.scope().as_slice(),
+                [seed; 16].as_slice(),
+                state,
+                published_at,
+            ),
         )
         .expect("insert checkpoint");
     }
 
-    fn add_ref(conn: &Connection, checkpoint: u8, object_id: &Hash32, role: &str) {
+    fn add_ref(conn: &ScopeConn, checkpoint: u8, object_id: &Hash32, role: &str) {
         conn.execute(
-            "INSERT INTO checkpoint_refs(checkpoint_id, object_id, role) VALUES (?1, ?2, ?3)",
-            ([checkpoint; 16].as_slice(), object_id.as_slice(), role),
+            "INSERT INTO checkpoint_refs(vault_id, checkpoint_id, object_id, role)
+             VALUES (?1, ?2, ?3, ?4)",
+            (
+                conn.scope().as_slice(),
+                [checkpoint; 16].as_slice(),
+                object_id.as_slice(),
+                role,
+            ),
         )
         .expect("insert ref");
     }
 
-    fn add_log(conn: &Connection, relay_seq: i64, object_id: &Hash32, kind: &str) {
+    fn add_log(conn: &ScopeConn, relay_seq: i64, object_id: &Hash32, kind: &str) {
         conn.execute(
-            "INSERT INTO log(relay_seq, kind, object_id, epoch, event, created_at)
-             VALUES (?1, ?2, ?3, 1, x'00', 0)",
-            (relay_seq, kind, object_id.as_slice()),
+            "INSERT INTO log(vault_id, relay_seq, kind, object_id, epoch, event, created_at)
+             VALUES (?1, ?2, ?3, ?4, 1, x'00', 0)",
+            (
+                conn.scope().as_slice(),
+                relay_seq,
+                kind,
+                object_id.as_slice(),
+            ),
         )
         .expect("insert log");
     }
 
-    #[test]
-    fn future_live_counts_latest_pair_data_manifest_and_retained_updates_once() {
+    fn open() -> Connection {
         let mut conn = Connection::open_in_memory().expect("open");
         schema::apply(&mut conn).expect("schema");
+        conn
+    }
 
-        let old_snap = insert_object(&conn, 1, ObjectType::Snapshot, 300);
-        let new_snap = insert_object(&conn, 2, ObjectType::Snapshot, 400);
-        let asset_a = insert_object(&conn, 3, ObjectType::Asset, 500);
-        let asset_b = insert_object(&conn, 4, ObjectType::Asset, 600);
-        let shared = insert_object(&conn, 5, ObjectType::Asset, 700);
-        let manifest = insert_object(&conn, 6, ObjectType::Manifest, 212);
-        let logged_update = insert_object(&conn, 7, ObjectType::Update, 250);
-        let unlogged_update = insert_object(&conn, 8, ObjectType::Update, 260);
+    #[test]
+    fn future_live_counts_latest_pair_data_manifest_and_retained_updates_once() {
+        let conn = open();
+        let scoped = fixture(&conn);
+
+        let old_snap = insert_object(&scoped, 1, ObjectType::Snapshot, 300);
+        let new_snap = insert_object(&scoped, 2, ObjectType::Snapshot, 400);
+        let asset_a = insert_object(&scoped, 3, ObjectType::Asset, 500);
+        let asset_b = insert_object(&scoped, 4, ObjectType::Asset, 600);
+        let shared = insert_object(&scoped, 5, ObjectType::Asset, 700);
+        let manifest = insert_object(&scoped, 6, ObjectType::Manifest, 212);
+        let logged_update = insert_object(&scoped, 7, ObjectType::Update, 250);
+        let unlogged_update = insert_object(&scoped, 8, ObjectType::Update, 260);
 
         // 两份已发布基线：只有"最新一份"进入未来 live；更旧的 baseline 及其独有对象不计。
-        insert_checkpoint(&conn, 11, "published", Some(10));
-        insert_checkpoint(&conn, 12, "published", Some(20));
-        insert_checkpoint(&conn, 13, "staging", None);
-        add_ref(&conn, 11, &old_snap, "data");
-        add_ref(&conn, 12, &asset_a, "data");
-        add_ref(&conn, 12, &shared, "data");
+        insert_checkpoint(&scoped, 11, "published", Some(10));
+        insert_checkpoint(&scoped, 12, "published", Some(20));
+        insert_checkpoint(&scoped, 13, "staging", None);
+        add_ref(&scoped, 11, &old_snap, "data");
+        add_ref(&scoped, 12, &asset_a, "data");
+        add_ref(&scoped, 12, &shared, "data");
         // incoming：新 snapshot + 与最新 published 共享的 asset + manifest（MANIFEST 密文
         // 同样是真实保留的 metadata，必须计入 live）。
-        add_ref(&conn, 13, &new_snap, "data");
-        add_ref(&conn, 13, &asset_b, "data");
-        add_ref(&conn, 13, &shared, "data");
-        add_ref(&conn, 13, &manifest, "manifest");
+        add_ref(&scoped, 13, &new_snap, "data");
+        add_ref(&scoped, 13, &asset_b, "data");
+        add_ref(&scoped, 13, &shared, "data");
+        add_ref(&scoped, 13, &manifest, "manifest");
         // log 仍保留的 UPDATE 计入；未记日志的 UPDATE 不是 live。
-        add_log(&conn, 1, &logged_update, "update");
-        add_log(&conn, 2, &unlogged_update, "control");
+        add_log(&scoped, 1, &logged_update, "update");
+        add_log(&scoped, 2, &unlogged_update, "control");
 
-        let live = future_live_bytes(&conn, 1, &[[13u8; 16]]).expect("live");
+        let live = future_live_bytes(&scoped, 1, &[[13u8; 16]]).expect("live");
         assert_eq!(
             live,
             400 + 500 + 600 + 700 + 212 + 250,
@@ -678,15 +755,23 @@ mod tests {
         );
 
         // 只有 incoming 一份基线时，同样只算它自己的 data refs + log 仍保留的 UPDATE。
-        conn.execute(
-            "DELETE FROM checkpoint_refs WHERE checkpoint_id IN
-             (SELECT checkpoint_id FROM checkpoints WHERE state = 'published')",
-            [],
-        )
-        .expect("delete refs");
-        conn.execute("DELETE FROM checkpoints WHERE state = 'published'", [])
+        scoped
+            .execute(
+                "DELETE FROM checkpoint_refs
+                 WHERE vault_id = ?1 AND checkpoint_id IN (
+                   SELECT checkpoint_id FROM checkpoints
+                   WHERE state = 'published' AND vault_id = ?1
+                 )",
+                [scoped.scope().as_slice()],
+            )
+            .expect("delete refs");
+        scoped
+            .execute(
+                "DELETE FROM checkpoints WHERE state = 'published' AND vault_id = ?1",
+                [scoped.scope().as_slice()],
+            )
             .expect("delete published");
-        let live_first = future_live_bytes(&conn, 1, &[[13u8; 16]]).expect("live first");
+        let live_first = future_live_bytes(&scoped, 1, &[[13u8; 16]]).expect("live first");
         assert_eq!(
             live_first,
             400 + 600 + 700 + 212 + 250,
@@ -696,36 +781,38 @@ mod tests {
 
     #[test]
     fn future_live_counts_only_active_assets_unreferenced_by_pair() {
-        let mut conn = Connection::open_in_memory().expect("open");
-        schema::apply(&mut conn).expect("schema");
+        let conn = open();
+        let scoped = fixture(&conn);
 
-        let snap = insert_object(&conn, 21, ObjectType::Snapshot, 400);
-        let referenced_asset = insert_object(&conn, 22, ObjectType::Asset, 300);
-        let orphan_asset = insert_object(&conn, 23, ObjectType::Asset, 500);
-        let retired_asset = insert_object(&conn, 24, ObjectType::Asset, 600);
-        let other_epoch_asset = insert_object(&conn, 25, ObjectType::Asset, 700);
+        let snap = insert_object(&scoped, 21, ObjectType::Snapshot, 400);
+        let referenced_asset = insert_object(&scoped, 22, ObjectType::Asset, 300);
+        let orphan_asset = insert_object(&scoped, 23, ObjectType::Asset, 500);
+        let retired_asset = insert_object(&scoped, 24, ObjectType::Asset, 600);
+        let other_epoch_asset = insert_object(&scoped, 25, ObjectType::Asset, 700);
 
-        insert_checkpoint(&conn, 31, "staging", None);
-        add_ref(&conn, 31, &snap, "data");
-        add_ref(&conn, 31, &referenced_asset, "data");
+        insert_checkpoint(&scoped, 31, "staging", None);
+        add_ref(&scoped, 31, &snap, "data");
+        add_ref(&scoped, 31, &referenced_asset, "data");
         let register = |object_id: &Hash32, epoch: u64, state: &str| {
-            conn.execute(
-                "INSERT INTO asset_objects(epoch, object_id, state, finalized_seq)
-                 VALUES (?1, ?2, ?3, 0)",
-                (
-                    i64::try_from(epoch).expect("epoch"),
-                    object_id.as_slice(),
-                    state,
-                ),
-            )
-            .expect("asset registry");
+            scoped
+                .execute(
+                    "INSERT INTO asset_objects(vault_id, epoch, object_id, state, finalized_seq)
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                    (
+                        scoped.scope().as_slice(),
+                        i64::try_from(epoch).expect("epoch"),
+                        object_id.as_slice(),
+                        state,
+                    ),
+                )
+                .expect("asset registry");
         };
         register(&referenced_asset, 1, "active");
         register(&orphan_asset, 1, "active");
         register(&retired_asset, 1, "retired");
         register(&other_epoch_asset, 2, "active");
 
-        let live = future_live_bytes(&conn, 1, &[[31u8; 16]]).expect("live");
+        let live = future_live_bytes(&scoped, 1, &[[31u8; 16]]).expect("live");
         assert_eq!(
             live,
             400 + 300 + 500,
@@ -733,13 +820,14 @@ mod tests {
         );
 
         // 登记为 retired（密文已回收）的孤儿资产不再占 live。
-        conn.execute(
-            "UPDATE asset_objects SET state = 'retired'
-              WHERE epoch = 1 AND object_id = ?1",
-            [orphan_asset.as_slice()],
-        )
-        .expect("retire asset");
-        let after = future_live_bytes(&conn, 1, &[[31u8; 16]]).expect("live after retire");
+        scoped
+            .execute(
+                "UPDATE asset_objects SET state = 'retired'
+                  WHERE epoch = 1 AND object_id = ?1 AND vault_id = ?",
+                (orphan_asset.as_slice(), scoped.scope().as_slice()),
+            )
+            .expect("retire asset");
+        let after = future_live_bytes(&scoped, 1, &[[31u8; 16]]).expect("live after retire");
         assert_eq!(after, 400 + 300);
     }
 
@@ -789,5 +877,40 @@ mod tests {
             Some(ReservationState::Expired)
         );
         assert_eq!(ReservationState::parse("bogus"), None);
+    }
+
+    /// 隔离：另一个 vault 的 usage/live 数字绝不进入本作用域。
+    #[test]
+    fn usage_is_scoped_per_vault() {
+        let conn = open();
+        let scoped = fixture(&conn);
+        let other_scope = VaultScope::new([0xB2u8; 16]);
+        conn.execute(
+            "INSERT INTO vaults(vault_id, instance_id, log_id, log_incarnation, cursor_key,
+                                state, active_epoch, next_epoch, manager_rev, control_rev,
+                                auth_rev, head_seq, gc_floor, normal_limit, maintenance_limit,
+                                legacy_default, created_at)
+             VALUES (?1, ?2, ?2, ?2, ?3, 'active', 1, 2, 1, 1, 1, 0, 0, 1048576, 2097152, 0, 0)",
+            (
+                other_scope.vault_id().as_slice(),
+                [0u8; 16].as_slice(),
+                [0u8; 32].as_slice(),
+            ),
+        )
+        .expect("other vault");
+        conn.execute(
+            "INSERT INTO usage(vault_id, normal_bytes, maintenance_bytes) VALUES (?1, 777, 888)",
+            [other_scope.vault_id().as_slice()],
+        )
+        .expect("other usage");
+        assert_eq!(usage(&scoped).expect("usage"), Usage::default());
+        let other = ScopeConn::new(&conn, other_scope);
+        assert_eq!(
+            usage(&other).expect("other usage"),
+            Usage {
+                normal_bytes: 777,
+                maintenance_bytes: 888
+            }
+        );
     }
 }

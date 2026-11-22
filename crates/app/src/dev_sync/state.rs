@@ -93,7 +93,7 @@ pub const REVOKE_UNCHANGED_MARKER: &str = "认证未再次推进";
 ///
 /// `Cancel` / `Stop` 是**控制**命令，其余是**操作**命令；操作命令严格串行，
 /// 同一时刻只允许一个在途（见 [`SyncState::try_begin`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Command {
     /// 新建身份 + 初始 checkpoint（切片 4）。
     Create,
@@ -128,8 +128,40 @@ pub enum Command {
         /// 目标设备 ID（公开标识；本机/非 Active 目标由 UI + worker 双重拒绝）。
         target: DeviceId,
     },
-    /// 轮换（Phase 2）。
-    Rotate,
+    /// 轮换密钥（ADR 0009 Phase 2 切片 6a）：新 epoch / 新根 / 全 active 设备 grant。
+    ///
+    /// **必须**带 [`HeldGate`] 派发（整段持闸，与旧 `SyncOnce` 相同）：轮换内部会先
+    /// `sync_once`（含 `integrate`），绕过本地会话直接写外部行。
+    ///
+    /// - `recovery_code`：`Some` = 用这张恢复码重新封候选 epoch 的 recovery 槽（轮换后
+    ///   新设备还能用恢复码加入）；`None` = 一次性随机种子，**轮换后新设备无法用恢复码
+    ///   加入**（worker 必须如实警告）；
+    /// - `revoke`：本次 signed begin body 里要吊销的设备（ADR 0010：状态吊销；轮换后
+    ///   它们不再拿到新 epoch 的 grant）。
+    Rotate {
+        /// 当前管理恢复码（只在 worker 内使用；`Zeroizing` 缓冲，不打印）。
+        recovery_code: Option<zeroize::Zeroizing<String>>,
+        /// 不进入本次 grants 的设备（公开标识，顺序保留给签名 body 复算）。
+        revoke: Vec<DeviceId>,
+    },
+    /// 应用 relay 上的新 epoch（B 侧；ADR 0009 Phase 2 切片 6a）。
+    ///
+    /// **必须**带 [`HeldGate`] 派发：apply 会合并基线（直接写外部行），必须先把活动
+    /// 文档冻结到 durable。失败不推广、保持旧 epoch 与旧视图。
+    ApplyEpoch,
+    /// 生成一次性邀请链接（ADR 0014 S1；**仅创建端**，需要管理私钥 + 活动文档 + 空闲）。
+    ///
+    /// 链接只经 [`Event::InviteLinkCreated`] 交回面板、只存内存（关闭即丢）；
+    /// 不自动批准、不把恢复码放进链接。
+    CreateInvite,
+    /// 批准一台 PENDING 设备（ADR 0014 S1；需要管理私钥）。
+    ///
+    /// 管理签名 + 封给该 pending 设备 `sign_pk`/`hpke_pk` 的 HPKE grant 都由 worker 完成；
+    /// 成功后刷新设备列表（重复批准幂等：`changed = false`）。
+    ApproveDevice {
+        /// 目标设备 ID（公开标识；必须仍是 `Pending`）。
+        device: DeviceId,
+    },
     /// 恢复/重试被暂停的操作（Phase 2）。
     Resume,
     /// 取消在途操作（本切片只记意图，见 [`InFlight::cancel_requested`]）。
@@ -141,7 +173,7 @@ pub enum Command {
 impl Command {
     /// 命令的种类（面板显示 / 状态机分类用；不含 op_id）。
     #[must_use]
-    pub const fn kind(self) -> CommandKind {
+    pub const fn kind(&self) -> CommandKind {
         match self {
             Self::Create => CommandKind::Create,
             Self::Join => CommandKind::Join,
@@ -151,7 +183,10 @@ impl Command {
             Self::PublishInitialPair => CommandKind::PublishInitialPair,
             Self::ListDevices => CommandKind::ListDevices,
             Self::RevokeDevice { .. } => CommandKind::RevokeDevice,
-            Self::Rotate => CommandKind::Rotate,
+            Self::CreateInvite => CommandKind::CreateInvite,
+            Self::ApproveDevice { .. } => CommandKind::ApproveDevice,
+            Self::Rotate { .. } => CommandKind::Rotate,
+            Self::ApplyEpoch => CommandKind::ApplyEpoch,
             Self::Resume => CommandKind::Resume,
             Self::Cancel => CommandKind::Cancel,
             Self::Stop => CommandKind::Stop,
@@ -162,8 +197,34 @@ impl Command {
     ///
     /// 控制命令不受"单操作在途"限制：`Stop` 必须在 busy 时也能发出去，否则关不掉。
     #[must_use]
-    pub const fn is_control(self) -> bool {
+    pub const fn is_control(&self) -> bool {
         matches!(self, Self::Cancel | Self::Stop)
+    }
+}
+
+/// 手写 `Debug`：`Rotate` 携带恢复码，**绝不能被 `{:?}` 打进日志**。
+///
+/// 其余字段都是公开标识/枚举，照常打印；恢复码只显示"有/无"，revoke 只显示数量。
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rotate {
+                recovery_code,
+                revoke,
+            } => f
+                .debug_struct("Rotate")
+                .field(
+                    "recovery_code",
+                    &if recovery_code.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    },
+                )
+                .field("revoke", &revoke.len())
+                .finish(),
+            other => f.write_str(other.kind().debug_name()),
+        }
     }
 }
 
@@ -186,8 +247,14 @@ pub enum CommandKind {
     ListDevices,
     /// 见 [`Command::RevokeDevice`]。
     RevokeDevice,
+    /// 见 [`Command::CreateInvite`]。
+    CreateInvite,
+    /// 见 [`Command::ApproveDevice`]。
+    ApproveDevice,
     /// 见 [`Command::Rotate`]。
     Rotate,
+    /// 见 [`Command::ApplyEpoch`]。
+    ApplyEpoch,
     /// 见 [`Command::Resume`]。
     Resume,
     /// 见 [`Command::Cancel`]。
@@ -197,6 +264,28 @@ pub enum CommandKind {
 }
 
 impl CommandKind {
+    /// 稳定英文短名（`Command` 的手写 `Debug` 用；不含参数/秘密）。
+    #[must_use]
+    pub const fn debug_name(self) -> &'static str {
+        match self {
+            Self::Create => "Create",
+            Self::Join => "Join",
+            Self::SyncOnce => "SyncOnce",
+            Self::SyncTwoPhase => "SyncTwoPhase",
+            Self::SyncOnceNoSession => "SyncOnceNoSession",
+            Self::PublishInitialPair => "PublishInitialPair",
+            Self::ListDevices => "ListDevices",
+            Self::RevokeDevice => "RevokeDevice",
+            Self::CreateInvite => "CreateInvite",
+            Self::ApproveDevice => "ApproveDevice",
+            Self::Rotate => "Rotate",
+            Self::ApplyEpoch => "ApplyEpoch",
+            Self::Resume => "Resume",
+            Self::Cancel => "Cancel",
+            Self::Stop => "Stop",
+        }
+    }
+
     /// 中文短标签（面板按钮/状态行用）。
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -209,7 +298,10 @@ impl CommandKind {
             Self::PublishInitialPair => "发布初始基线",
             Self::ListDevices => "刷新设备",
             Self::RevokeDevice => "移除设备",
+            Self::CreateInvite => "生成邀请",
+            Self::ApproveDevice => "批准设备",
             Self::Rotate => "轮换",
+            Self::ApplyEpoch => "应用新 epoch",
             Self::Resume => "恢复",
             Self::Cancel => "取消",
             Self::Stop => "停止",
@@ -556,6 +648,132 @@ impl OpOutcome {
     }
 }
 
+/// 轮换 / 应用新 epoch 的种类（面板与报告共用；纯数据，无 IO）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RotationTask {
+    /// A 侧发起一次完整轮换（新 epoch、新根、全 active 设备 grant）。
+    Rotate,
+    /// B 侧把本机身份推进到 relay 的最新 epoch。
+    ApplyEpoch,
+}
+
+impl RotationTask {
+    /// 中文短标签（面板/notice 用）。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rotate => "轮换",
+            Self::ApplyEpoch => "应用新 epoch",
+        }
+    }
+}
+
+/// 轮换 / apply 的**公开事实**（worker → 宿主）。
+///
+/// 只放公开标识/计数：epoch、checkpoint 短 id、是否补发恢复码、移除台数、失败阶段。
+/// **绝不**含根/管理私钥/恢复码本身（`Debug` 也不打印）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationFacts {
+    /// 本次是轮换还是 apply。
+    pub task: RotationTask,
+    /// 操作前的本地 epoch（失败时也如实保留）。
+    pub from_epoch: u64,
+    /// 操作后的 epoch（失败/未知时为 `None`）。
+    pub to_epoch: Option<u64>,
+    /// primary checkpoint 短 id（成功才有）。
+    pub primary_checkpoint: Option<String>,
+    /// fallback checkpoint 短 id（轮换成功才有）。
+    pub fallback_checkpoint: Option<String>,
+    /// 是否用调用方提供的恢复码重新封了候选 recovery 槽（`false` = 新设备无法用恢复码加入）。
+    pub recovery_code_reissued: bool,
+    /// signed begin body 里被吊销的设备数（轮换才有意义）。
+    pub revoked: usize,
+    /// apply 时本机已在最新 epoch（幂等成功，没有推广动作）。
+    pub already_current: bool,
+    /// 失败时停在的公开阶段（成功为 `None`）。
+    pub failure_phase: Option<String>,
+}
+
+impl RotationFacts {
+    /// 失败事实（error 文本由调用方另行给出；这里只补 epoch/阶段）。
+    #[must_use]
+    pub fn failed(task: RotationTask, from_epoch: u64, phase: impl Into<String>) -> Self {
+        Self {
+            task,
+            from_epoch,
+            to_epoch: None,
+            primary_checkpoint: None,
+            fallback_checkpoint: None,
+            recovery_code_reissued: false,
+            revoked: 0,
+            already_current: false,
+            failure_phase: Some(phase.into()),
+        }
+    }
+
+    /// 是否真的推进了 epoch（`false` = 幂等 `AlreadyCurrent`）。
+    #[must_use]
+    pub fn advanced(&self) -> bool {
+        self.to_epoch.is_some_and(|to| to != self.from_epoch)
+    }
+}
+
+/// 面板可见的邀请链接（ADR 0014 S1）。
+///
+/// `url` **含一次性 token**：只存内存、只展示/复制，不写日志/配置；手写 `Debug`
+/// 把 URL 整段遮掉（事件/快照打印时不会泄露）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct InviteLinkView {
+    /// 完整链接（含 fragment token；**不得**打印/落盘）。
+    pub url: String,
+    /// relay 邀请 id（公开标识）。
+    pub invite_id: [u8; 16],
+    /// relay 确认的过期时刻（Unix 秒）。
+    pub expires_at: u64,
+}
+
+impl InviteLinkView {
+    /// 剩余有效期（秒；已过期 = 0）。
+    #[must_use]
+    pub fn expires_in(&self, now: u64) -> u64 {
+        self.expires_at.saturating_sub(now)
+    }
+
+    /// TTL 文案（公开；不含 token）。
+    #[must_use]
+    pub fn ttl_text(&self, now: u64) -> String {
+        let left = self.expires_in(now);
+        if left == 0 {
+            "邀请已过期：请重新生成".to_owned()
+        } else {
+            format!(
+                "邀请 {} 分 {} 秒内有效（一次性；含令牌，关闭面板即丢）",
+                left / 60,
+                left % 60
+            )
+        }
+    }
+
+    /// 邀请 id 的短展示（前 8 位 hex）。
+    #[must_use]
+    pub fn short_invite_id(&self) -> String {
+        menghunote_sync::ids::hex_of(&self.invite_id)
+            .chars()
+            .take(8)
+            .collect()
+    }
+}
+
+impl fmt::Debug for InviteLinkView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InviteLinkView")
+            .field("invite_id", &menghunote_sync::ids::hex_of(&self.invite_id))
+            .field("expires_at", &self.expires_at)
+            .field("url", &"<redacted: contains token>")
+            .finish()
+    }
+}
+
 /// worker → 面板的事件（ADR 0009 `Event`）。
 ///
 /// 只能在 `service.rs` 的 worker 线程里构造；`op_id` 由 worker 统一盖章，
@@ -627,6 +845,16 @@ pub enum Event {
         /// 这次 `Stop` 的 op id。
         op_id: OpId,
     },
+    /// 轮换 / apply 结束后的公开事实（成功或失败都发；切片 6a）。
+    ///
+    /// 事件本身**不是终态**：真实终态仍由随后的 `Completed` 给出。宿主用这份事实
+    /// 更新 `SyncContext.key_epoch` 并重建活动视图（仅成功时）。
+    RotationCompleted {
+        /// 哪次操作（worker 会统一盖章）。
+        op_id: OpId,
+        /// 公开事实（epoch/checkpoint/恢复码/阶段；无秘密）。
+        facts: RotationFacts,
+    },
     /// 设备列表快照（ADR 0010 切片 2a-2；**只读投影**，不含 token/密钥）。
     ///
     /// `self_device` / `can_manage` 由 worker 从**受保护身份**读出后一并上报：
@@ -639,6 +867,24 @@ pub enum Event {
         self_device: DeviceId,
         /// 本机身份是否持有管理密钥（Join 设备 = `false`，移除按钮置灰）。
         can_manage: bool,
+    },
+    /// 邀请链接已生成（ADR 0014 S1；**含 token**，只在面板内存里展示）。
+    ///
+    /// 只在 `CreateInvite` 成功时发；失败走 `Completed(Failed)`。
+    InviteLinkCreated {
+        /// 链接 + 公开 id/TTL（`Debug` 已遮 token）。
+        link: InviteLinkView,
+    },
+    /// 一次批准设备的**明确事实**（成功或幂等；ADR 0014 S1 §3）。
+    ///
+    /// 失败不走本事件：worker 返回 `Err`，由 `Completed(Failed)` 呈现。
+    DeviceApproved {
+        /// 被批准的目标设备。
+        target: DeviceId,
+        /// 设备指纹（32 位 hex，双端比对用）。
+        fingerprint: String,
+        /// `false` = 此前已是 ACTIVE（幂等，没有重复签名）。
+        changed: bool,
     },
     /// 一次移除设备拿到了 relay 的**明确成功**事实（ADR 0010 切片 2a-2）。
     ///
@@ -664,8 +910,10 @@ impl Event {
             | Self::DeadlineExceeded { op_id, .. }
             | Self::NeedGate { op_id, .. }
             | Self::Integrated { op_id, .. }
+            | Self::RotationCompleted { op_id, .. }
             | Self::Completed { op_id, .. }
             | Self::Stopped { op_id } => *op_id,
+            Self::InviteLinkCreated { .. } | Self::DeviceApproved { .. } => OpId::UNASSIGNED,
             Self::DevicesListed { .. } | Self::DeviceRevoked { .. } => OpId::UNASSIGNED,
         }
     }
@@ -718,6 +966,7 @@ impl Event {
                 deferred,
                 summary,
             },
+            Self::RotationCompleted { op_id: _, facts } => Self::RotationCompleted { op_id, facts },
             other => other,
         }
     }
@@ -844,6 +1093,14 @@ pub struct StateSnapshot {
     pub can_manage_devices: bool,
     /// 最近一次**成功**移除的设备与 relay 事实摘要（面板 notice 的来源）。
     pub last_revoked: Option<(DeviceId, OpResult)>,
+    /// 最近一次生成的邀请链接（只存内存；`Debug` 遮 token）。
+    pub invite_link: Option<InviteLinkView>,
+    /// 最近一次批准设备的公开事实（面板 notice 的来源）。
+    pub last_approved: Option<(DeviceId, String, bool)>,
+    /// 最近一次轮换 / apply 的公开事实（成功或失败；切片 6a）。
+    pub last_rotation: Option<RotationFacts>,
+    /// 那份事实属于哪次 op（宿主据此拒绝把上一轮的事实当成本轮结果）。
+    pub last_rotation_op: Option<OpId>,
 }
 
 /// 在途操作。
@@ -928,6 +1185,14 @@ pub struct SyncState {
     can_manage_devices: bool,
     /// 最近一次成功移除（面板 notice 的来源；失败走 `last_error`）。
     last_revoked: Option<(DeviceId, OpResult)>,
+    /// 最近一次生成的邀请链接（只存内存；token 不落盘/不进日志）。
+    invite_link: Option<InviteLinkView>,
+    /// 最近一次批准设备的公开事实（设备 id、指纹、是否真的改变状态）。
+    last_approved: Option<(DeviceId, String, bool)>,
+    /// 最近一次轮换 / apply 的公开事实（成功或失败；切片 6a）。
+    last_rotation: Option<RotationFacts>,
+    /// 那份事实属于哪次 op。
+    last_rotation_op: Option<OpId>,
 }
 
 impl Default for SyncState {
@@ -960,6 +1225,10 @@ impl SyncState {
             self_device: None,
             can_manage_devices: false,
             last_revoked: None,
+            invite_link: None,
+            last_approved: None,
+            last_rotation: None,
+            last_rotation_op: None,
         }
     }
 
@@ -1065,6 +1334,10 @@ impl SyncState {
             self_device: self.self_device,
             can_manage_devices: self.can_manage_devices,
             last_revoked: self.last_revoked.clone(),
+            invite_link: self.invite_link.clone(),
+            last_approved: self.last_approved.clone(),
+            last_rotation: self.last_rotation.clone(),
+            last_rotation_op: self.last_rotation_op,
         }
     }
 
@@ -1087,7 +1360,7 @@ impl SyncState {
     /// - **操作命令**：已有在途 / 正在关闭 / worker 已停 → `Err(Busy)`；
     /// - **`Stop`**：busy 时也接受（否则关不掉），但正在关闭/已停 → `Err(Busy)`；
     /// - **`Cancel`**：只在 busy 时有意义（返回**在途**的 op id），空闲 → `Err(Busy{Idle})`。
-    pub fn try_begin(&mut self, command: Command) -> Result<OpId, Busy> {
+    pub fn try_begin(&mut self, command: &Command) -> Result<OpId, Busy> {
         let current = self.in_flight.map(|in_flight| in_flight.op_id);
         if self.worker_stopped {
             return Err(Busy::new(BusyReason::WorkerStopped, current));
@@ -1349,6 +1622,19 @@ impl SyncState {
                 self.state = DevSyncState::Closing;
                 self.mailbox.push(Event::Stopped { op_id });
             }
+            // 轮换 / apply 的公开事实：只对**在途**的同一 op 生效（迟到/伪造的丢弃）。
+            // 状态机本身不动：真实终态仍由随后的 `Completed` 决定。
+            Event::RotationCompleted { op_id, facts } => {
+                let Some(in_flight) = self.in_flight else {
+                    return;
+                };
+                if in_flight.op_id != op_id {
+                    return;
+                }
+                self.last_rotation = Some(facts.clone());
+                self.last_rotation_op = Some(op_id);
+                self.mailbox.push(Event::RotationCompleted { op_id, facts });
+            }
             // 设备列表/移除事实是**只读领域事件**：不改状态机（在途/关闭/结果都不受
             // 影响），只更新面板投影并进邮箱。它们不像 Progress 那样合并——面板需要
             // 看到"列表真的刷新过"这条事实（`Debug` 也不含密钥）。
@@ -1372,6 +1658,22 @@ impl SyncState {
                     self.last_revoked = Some((target, result.clone()));
                 }
                 self.mailbox.push(Event::DeviceRevoked { target, result });
+            }
+            Event::InviteLinkCreated { link } => {
+                self.invite_link = Some(link.clone());
+                self.mailbox.push(Event::InviteLinkCreated { link });
+            }
+            Event::DeviceApproved {
+                target,
+                fingerprint,
+                changed,
+            } => {
+                self.last_approved = Some((target, fingerprint.clone(), changed));
+                self.mailbox.push(Event::DeviceApproved {
+                    target,
+                    fingerprint,
+                    changed,
+                });
             }
         }
     }
@@ -1464,9 +1766,9 @@ mod tests {
     #[test]
     fn busy_rejects_a_second_operation_but_busy_stop_is_accepted() {
         let mut state = SyncState::new();
-        let first = state.try_begin(Command::Create).expect("第一条命令");
+        let first = state.try_begin(&Command::Create).expect("第一条命令");
         let busy = state
-            .try_begin(Command::SyncOnce)
+            .try_begin(&Command::SyncOnce)
             .expect_err("在途时必须拒绝");
         assert_eq!(
             busy,
@@ -1475,7 +1777,7 @@ mod tests {
         );
         // Stop 是控制命令：busy 时也要能发出去。
         let stop = state
-            .try_begin(Command::Stop)
+            .try_begin(&Command::Stop)
             .expect("busy 时 Stop 必须放行");
         assert!(matches!(state.state(), DevSyncState::Closing));
         assert_eq!(
@@ -1484,7 +1786,7 @@ mod tests {
         );
         assert_eq!(
             state
-                .try_begin(Command::Stop)
+                .try_begin(&Command::Stop)
                 .expect_err("重复 Stop")
                 .reason,
             BusyReason::Closing
@@ -1495,7 +1797,7 @@ mod tests {
     #[test]
     fn progress_is_coalesced_and_completed_events_survive() {
         let mut state = SyncState::new();
-        let op = state.try_begin(Command::SyncOnce).expect("同步");
+        let op = state.try_begin(&Command::SyncOnce).expect("同步");
         for (phase, detail) in [
             (Phase::Preparing, "准备"),
             (Phase::Transport, "连接"),
@@ -1554,7 +1856,7 @@ mod tests {
     #[test]
     fn create_success_waits_for_backup_and_cancel_shows_paused() {
         let mut state = SyncState::new();
-        let create = state.try_begin(Command::Create).expect("创建");
+        let create = state.try_begin(&Command::Create).expect("创建");
         state.apply(Event::Completed {
             op_id: create,
             changed_heads: vec!["head-1".to_owned()],
@@ -1562,8 +1864,8 @@ mod tests {
         });
         assert_eq!(state.state(), &DevSyncState::WaitingBackup);
 
-        let sync = state.try_begin(Command::SyncOnce).expect("同步");
-        let canceled = state.try_begin(Command::Cancel).expect("取消在途");
+        let sync = state.try_begin(&Command::SyncOnce).expect("同步");
+        let canceled = state.try_begin(&Command::Cancel).expect("取消在途");
         assert_eq!(canceled, sync, "Cancel 返回的是在途 op");
         state.apply(Event::Completed {
             op_id: sync,
@@ -1576,7 +1878,7 @@ mod tests {
         );
         assert_eq!(
             state
-                .try_begin(Command::Cancel)
+                .try_begin(&Command::Cancel)
                 .expect_err("空闲取消")
                 .reason,
             BusyReason::Idle
@@ -1586,8 +1888,8 @@ mod tests {
     #[test]
     fn close_becomes_blocked_when_the_in_flight_op_fails() {
         let mut state = SyncState::new();
-        let op = state.try_begin(Command::Join).expect("加入");
-        let _stop = state.try_begin(Command::Stop).expect("停止");
+        let op = state.try_begin(&Command::Join).expect("加入");
+        let _stop = state.try_begin(&Command::Stop).expect("停止");
         let ticket = state.last_ticket().expect("票");
         assert_eq!(state.poll_close(&ticket), CloseState::Pending);
 
@@ -1609,7 +1911,7 @@ mod tests {
     fn two_phase_only_grants_after_need_gate_and_finishes_after_integrated() {
         // ADR 0012 S2a：阶段顺序由状态机把关（错误授权 = 拒绝，不静默接受）。
         let mut state = SyncState::new();
-        let op = state.try_begin(Command::SyncTwoPhase).expect("两阶段同步");
+        let op = state.try_begin(&Command::SyncTwoPhase).expect("两阶段同步");
         assert_eq!(
             state.snapshot().two_phase.map(|status| status.phase),
             Some(SyncPhase::Prepare),
@@ -1666,7 +1968,7 @@ mod tests {
     fn deadline_is_not_a_terminal_and_the_late_receipt_is_recorded() {
         // ADR 0012 S1：看门狗只能产生 Cancelling，不能伪造可解闸的 Completed。
         let mut state = SyncState::new();
-        let op = state.try_begin(Command::SyncOnce).expect("同步");
+        let op = state.try_begin(&Command::SyncOnce).expect("同步");
         state.apply(Event::DeadlineExceeded {
             op_id: op,
             message: "操作超时：超过 120s 未完成".to_owned(),
@@ -1725,12 +2027,12 @@ mod tests {
     #[test]
     fn worker_stopped_is_a_reliable_receipt_and_clears_the_deadline_wait() {
         let mut state = SyncState::new();
-        let op = state.try_begin(Command::SyncOnce).expect("同步");
+        let op = state.try_begin(&Command::SyncOnce).expect("同步");
         state.apply(Event::DeadlineExceeded {
             op_id: op,
             message: "操作超时".to_owned(),
         });
-        let stop = state.try_begin(Command::Stop).expect("停止");
+        let stop = state.try_begin(&Command::Stop).expect("停止");
         state.apply(Event::Stopped { op_id: stop });
         assert!(state.worker_stopped());
         assert!(state.snapshot().deadline_exceeded.is_none());
@@ -1744,8 +2046,8 @@ mod tests {
     #[test]
     fn stopped_after_success_makes_close_ready_and_stale_tickets_are_blocked() {
         let mut state = SyncState::new();
-        let op = state.try_begin(Command::SyncOnce).expect("同步");
-        let stop = state.try_begin(Command::Stop).expect("停止");
+        let op = state.try_begin(&Command::SyncOnce).expect("同步");
+        let stop = state.try_begin(&Command::Stop).expect("停止");
         let ticket = state.last_ticket().expect("票");
         state.apply(Event::Completed {
             op_id: op,
@@ -1765,7 +2067,7 @@ mod tests {
         // worker 已停 → 不再接新命令。
         assert_eq!(
             state
-                .try_begin(Command::Create)
+                .try_begin(&Command::Create)
                 .expect_err("worker 已停")
                 .reason,
             BusyReason::WorkerStopped

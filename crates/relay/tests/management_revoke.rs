@@ -46,7 +46,7 @@ fn setup(label: &str) -> (Fixture, axum::Router) {
     // fixture 初始化会走 `Db::write_blocking`，必须在 runtime 的 blocking 段里做。
     let fx = block(|| Fixture::with_real_manager(label));
     let app = router(AppState::new(
-        fx.db.clone(),
+        fx.db.inner().clone(),
         fx.cfg.clone(),
         Arc::new(Ed25519Hook),
     ));

@@ -13,7 +13,12 @@ license.workspace = true
 # `serde_json`/`serde`：公开配置 `dev-sync.json` 的读写（ADR 0011）。只在 feature 下
 # 引入；两者在 workspace 依赖图里早已存在（relay/sync-proto 用），不是新的重依赖。
 # `zeroize`：Create 的 setup secret 与一次性恢复码用 `Zeroizing` 缓冲（ADR 0011 要求）。
-dev-sync = ["dep:menghunote-sync", "dep:serde", "dep:serde_json", "dep:zeroize"]
+#
+# ADR 0013 §1：新增公共 `sync` feature（默认关闭）；`dev-sync` 包含它并额外开放
+# `local_dev`（`sync_gate::mode_allowed`）。正式包只启 `sync`，不把 dev-relay/开发
+# 明文路径拉进正常依赖图（dev-relay 本来就在 dev-dependencies）。
+sync = ["dep:menghunote-sync"]
+dev-sync = ["sync", "dep:serde", "dep:serde_json", "dep:zeroize"]
 
 [dependencies]
 # 应用层错误汇总（库层用 thiserror，见 AGENTS.md §4）

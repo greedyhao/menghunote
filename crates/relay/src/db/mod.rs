@@ -7,6 +7,10 @@
 //!   oneshot 结果。这样**不存在跨 await 的写事务**（§7 硬要求）。
 //!
 //! 读走独立连接池（WAL 允许并发读），读事务不阻塞 writer。
+//!
+//! **多租户（ADR 0014 §A）**：所有租户读写都要带显式 [`VaultScope`]，回调拿到的是
+//! [`ScopeConn`]（连接 + 作用域）；只有实例/运维元数据走 [`Db::read_instance`] /
+//! [`Db::write_instance_blocking`]（或显式 `ScopeConn::raw`）。
 
 pub mod schema;
 
@@ -18,6 +22,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
+use crate::scope::{ScopeConn, VaultScope};
 use crate::time::{Clock, SystemClock};
 
 /// writer 线程的任务：一个同步闭包，在写事务内运行。
@@ -199,15 +204,16 @@ impl Db {
     /// 异步写：闭包在 writer 线程的一个 `BEGIN IMMEDIATE` 事务内运行，Ok 则 commit、Err 则 rollback。
     ///
     /// 这是 handler 唯一允许的写入口；闭包内不允许 `await`（类型上就不允许）。
-    pub async fn write<T, F>(&self, f: F) -> Result<T>
+    /// `scope` 是显式租户作用域：闭包拿到 [`ScopeConn`]，租户表 SQL 必须带 `vault_id`。
+    pub async fn write<T, F>(&self, scope: VaultScope, f: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        F: FnOnce(&ScopeConn<'_>) -> Result<T> + Send + 'static,
     {
         let sender = self.sender()?;
         let (reply_tx, reply_rx) = oneshot::channel::<Result<T>>();
         let job: Job = Box::new(move |conn: &mut Connection| {
-            let outcome = run_in_transaction(conn, f);
+            let outcome = run_in_transaction(conn, scope, f);
             // 接收端可能已取消（客户端断开）；忽略发送失败。
             let _ = reply_tx.send(outcome);
         });
@@ -216,15 +222,15 @@ impl Db {
     }
 
     /// 同步写（测试/CLI 用；**不得**在 tokio runtime 线程上调用）。
-    pub fn write_blocking<T, F>(&self, f: F) -> Result<T>
+    pub fn write_blocking<T, F>(&self, scope: VaultScope, f: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        F: FnOnce(&ScopeConn<'_>) -> Result<T> + Send + 'static,
     {
         let sender = self.sender()?;
         let (reply_tx, reply_rx) = oneshot::channel::<Result<T>>();
         let job: Job = Box::new(move |conn: &mut Connection| {
-            let outcome = run_in_transaction(conn, f);
+            let outcome = run_in_transaction(conn, scope, f);
             let _ = reply_tx.send(outcome);
         });
         sender.blocking_send(job).map_err(|_| Error::WriterClosed)?;
@@ -232,11 +238,40 @@ impl Db {
     }
 
     /// 只读查询（走只读连接池；短查询，可直接在 handler 内同步调用）。
-    pub fn read<T, F>(&self, f: F) -> Result<T>
+    ///
+    /// `scope` 显式传入；闭包拿到 [`ScopeConn`]，无法"忘记"租户过滤。
+    pub fn read<T, F>(&self, scope: VaultScope, f: F) -> Result<T>
+    where
+        F: FnOnce(&ScopeConn<'_>) -> Result<T>,
+    {
+        self.inner
+            .reads
+            .with_conn(|conn| f(&ScopeConn::new(conn, scope)))
+    }
+
+    /// **实例级**只读：只允许 `relay_meta`/`sqlite_master`/`vaults` 等全局元数据
+    /// （迁移、运维 CLI、legacy 默认 vault 解析）。禁止用它读租户数据。
+    pub fn read_instance<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
         self.inner.reads.with_conn(f)
+    }
+
+    /// **实例级**同步写：只允许实例/运维元数据（`relay_meta` 等）。
+    pub fn write_instance_blocking<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let sender = self.sender()?;
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<T>>();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let outcome = run_in_transaction_instance(conn, f);
+            let _ = reply_tx.send(outcome);
+        });
+        sender.blocking_send(job).map_err(|_| Error::WriterClosed)?;
+        reply_rx.blocking_recv().map_err(|_| Error::WriterClosed)?
     }
 
     /// 显式收尾：关闭 writer 线程并等待退出（测试用它保证"重开同一个库"是干净的）。
@@ -245,11 +280,24 @@ impl Db {
     }
 }
 
-fn run_in_transaction<T, F>(conn: &mut Connection, f: F) -> Result<T>
+fn run_in_transaction<T, F>(conn: &mut Connection, scope: VaultScope, f: F) -> Result<T>
+where
+    F: FnOnce(&ScopeConn<'_>) -> Result<T>,
+{
+    // IMMEDIATE：写事务一开始就拿写锁，避免 SQLITE_BUSY 在 commit 时才暴露。
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let out = {
+        let scoped = ScopeConn::new(&tx, scope);
+        f(&scoped)?
+    };
+    tx.commit()?;
+    Ok(out)
+}
+
+fn run_in_transaction_instance<T, F>(conn: &mut Connection, f: F) -> Result<T>
 where
     F: FnOnce(&Connection) -> Result<T>,
 {
-    // IMMEDIATE：写事务一开始就拿写锁，避免 SQLITE_BUSY 在 commit 时才暴露。
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let out = f(&tx)?;
     tx.commit()?;
@@ -292,13 +340,13 @@ mod tests {
             std::sync::Arc::new(FakeClock::new(1_000)),
         )
         .expect("open");
-        db.write_blocking(|conn| {
+        db.write_instance_blocking(|conn| {
             conn.execute("INSERT INTO relay_meta(key, value) VALUES ('k', X'01')", [])?;
             Ok(())
         })
         .expect("write");
         let value: Vec<u8> = db
-            .read(|conn| {
+            .read_instance(|conn| {
                 Ok(
                     conn.query_row("SELECT value FROM relay_meta WHERE key='k'", [], |row| {
                         row.get(0)
@@ -310,7 +358,7 @@ mod tests {
 
         // 闭包返回错误 → 事务回滚。
         let err = db
-            .write_blocking(|conn| {
+            .write_instance_blocking(|conn| {
                 conn.execute(
                     "INSERT INTO relay_meta(key, value) VALUES ('lost', X'02')",
                     [],
@@ -320,7 +368,7 @@ mod tests {
             .expect_err("must fail");
         assert!(matches!(err, Error::Invariant("boom")));
         let count: i64 = db
-            .read(|conn| {
+            .read_instance(|conn| {
                 Ok(conn.query_row(
                     "SELECT COUNT(*) FROM relay_meta WHERE key='lost'",
                     [],
@@ -351,7 +399,7 @@ mod tests {
         )
         .expect("open");
         for i in 0..32 {
-            db.write_blocking(move |conn| {
+            db.write_instance_blocking(move |conn| {
                 conn.execute(
                     "INSERT INTO relay_meta(key, value) VALUES (?1, X'00')",
                     [format!("key-{i}")],
@@ -361,7 +409,7 @@ mod tests {
             .expect("write");
         }
         let total: i64 = db
-            .read(|conn| {
+            .read_instance(|conn| {
                 Ok(conn.query_row("SELECT COUNT(*) FROM relay_meta", [], |row| row.get(0))?)
             })
             .expect("count");
@@ -377,7 +425,7 @@ mod tests {
             std::sync::Arc::new(FakeClock::new(0)),
         )
         .expect("open");
-        let write_attempt = db.read(|conn| {
+        let write_attempt = db.read_instance(|conn| {
             conn.execute("INSERT INTO relay_meta(key, value) VALUES ('x', X'00')", [])?;
             Ok(())
         });

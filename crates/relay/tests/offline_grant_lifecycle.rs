@@ -180,7 +180,7 @@ async fn offline_device_gets_latest_grant_after_ninety_days_and_gc_but_revoked_i
     });
     // 90 天后 B 重新认证并通过真实 HTTP 读 latest grant；bootstrap 仍返回 active 对。
     let app = router(AppState::new(
-        fx.db.clone(),
+        fx.db.inner().clone(),
         fx.cfg.clone(),
         Arc::new(relay::verify::Ed25519Hook),
     ));

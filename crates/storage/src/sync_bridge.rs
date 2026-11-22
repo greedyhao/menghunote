@@ -27,6 +27,15 @@ pub const META_SYNC_LOG_ID: &str = "sync.log_id";
 /// `meta` 键：已确认高水位（BLOB BE64）。
 pub const META_SYNC_CONFIRMED_HIGHWATER: &str = "sync.confirmed_highwater";
 
+/// `meta` 键前缀：**非 inbox 事件**（当前只有 ASSET）已 durable 消费的标记。
+///
+/// 完整键：`sync.skipped_received.<log_id 32 位十六进制>.<relay_seq 20 位十进制>`。
+/// ASSET 事件不写 `sync_inbox`（它不是文档水位事件），但 `received_seq` 是"连续前缀"：
+/// 若直接把 ASSET 当缺口，`received_seq` 会永久卡在该序号之前，后续 UPDATE 永远无法
+/// 集成。pull 在把 ASSET 落成 durable skipped 记录后写本标记，`advance_received_prefix`
+/// 同时接受 inbox 行与这类标记，保证"已消费"的事件不会把前缀卡住。
+pub const META_SYNC_SKIPPED_RECEIVED_PREFIX: &str = "sync.skipped_received.";
+
 /// 出站意图（A 事务内与 update 一起落库）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncIntent {
@@ -1204,13 +1213,48 @@ fn advance_received_prefix(vault: &Vault) -> Result<(), StorageError> {
              AND state IN('verified','integrated')",
             &[Value::Blob(log_id.clone()), Value::Integer(i64_of(next)?)],
         )?;
-        if rows.is_empty() {
+        let consumed_without_inbox =
+            read_meta(vault, &skipped_received_key(&log_id, next)?)?.is_some();
+        if rows.is_empty() && !consumed_without_inbox {
             break;
         }
         current = next;
         write_meta(vault, META_SYNC_RECEIVED_SEQ, &current.to_be_bytes())?;
     }
     Ok(())
+}
+
+/// 登记一个**不写 inbox**、但已 durable 消费的事件（ASSET），并推进连续接收前缀。
+///
+/// 调用方必须先把该事件的事实（对 ASSET 是 skipped-asset HMAC 记录）durable 化，
+/// 再调用本函数；顺序保证"received 只覆盖已消费的事件"。
+pub fn mark_skipped_event_received(
+    vault: &Vault,
+    log_id: &[u8; 16],
+    relay_seq: u64,
+) -> Result<(), StorageError> {
+    let key = skipped_received_key(log_id, relay_seq)?;
+    write_meta(vault, &key, b"1")?;
+    advance_received_prefix(vault)
+}
+
+/// `sync.skipped_received.<hex log_id>.<seq 20 位>`。
+fn skipped_received_key(log_id: &[u8], relay_seq: u64) -> Result<String, StorageError> {
+    if log_id.len() != 16 {
+        return Err(StorageError::Corrupt {
+            context: format!("sync.log_id 长度不是 16：{}", log_id.len()),
+        });
+    }
+    let mut hex = String::with_capacity(32);
+    for byte in log_id {
+        use core::fmt::Write as _;
+        write!(hex, "{byte:02x}").map_err(|_| StorageError::Corrupt {
+            context: "sync.log_id 十六进制编码失败".to_owned(),
+        })?;
+    }
+    Ok(format!(
+        "{META_SYNC_SKIPPED_RECEIVED_PREFIX}{hex}.{relay_seq:020}"
+    ))
 }
 
 fn advance_integrated_prefix(vault: &Vault) -> Result<(), StorageError> {
@@ -1228,7 +1272,11 @@ fn advance_integrated_prefix(vault: &Vault) -> Result<(), StorageError> {
             "SELECT 1 FROM sync_inbox WHERE log_id=?1 AND relay_seq=?2 AND state='integrated'",
             &[Value::Blob(log_id.clone()), Value::Integer(i64_of(next)?)],
         )?;
-        if rows.is_empty() {
+        // 已收到的非 inbox 事件（ASSET）在被 received 前缀覆盖后同样算"已消费"，
+        // 否则 integrated 水位会永久卡在该序号之前。
+        let consumed_without_inbox =
+            read_meta(vault, &skipped_received_key(&log_id, next)?)?.is_some();
+        if rows.is_empty() && !consumed_without_inbox {
             break;
         }
         current = next;

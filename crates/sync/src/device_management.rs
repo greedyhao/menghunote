@@ -30,6 +30,7 @@
 //!    使全 vault 的旧 token 立即失效；缓存失效由 [`crate::http_relay`] 的 `state()` /
 //!    REVOKED 处理负责，本模块不碰任何缓存。
 
+use crate::api_version::{RelayApi, RelayApiVersion};
 use crate::cbor;
 use crate::device::ManagementKey;
 use crate::error::SyncError;
@@ -44,6 +45,8 @@ use crate::{DeviceId, VaultId};
 pub struct RevokeContext {
     /// relay 基址（`http://127.0.0.1:port` 或 `https://...`，末尾 `/` 会被忽略）。
     pub base_url: String,
+    /// relay API 面（ADR 0014 S3a；缺省 v1，v2 profile 由调用方显式设置）。
+    pub api_version: RelayApiVersion,
     /// vault 身份。
     pub vault_id: VaultId,
     /// 已 pin 的 relay instance（签名绑定它；换实例即拒绝）。
@@ -74,6 +77,7 @@ impl RevokeContext {
     ) -> Self {
         Self {
             base_url: base_url.into(),
+            api_version: RelayApiVersion::V1,
             vault_id: identity.vault_id,
             instance_id: identity.pinned_instance,
             manager_pub: identity.pinned_manager,
@@ -81,6 +85,15 @@ impl RevokeContext {
             expected_control_rev,
             now,
         }
+    }
+}
+
+impl RevokeContext {
+    /// 显式选择 API 面（v2 profile 用；不改变其他字段）。
+    #[must_use]
+    pub fn with_api_version(mut self, api_version: RelayApiVersion) -> Self {
+        self.api_version = api_version;
+        self
     }
 }
 
@@ -128,10 +141,10 @@ pub fn revoke_device<T: HttpTransport>(
         ));
     }
 
-    let base = ctx.base_url.trim_end_matches('/');
+    let api = RelayApi::new(ctx.base_url.trim_end_matches('/'), ctx.api_version);
     // ③ 管理 realm bearer。challenge 响应里的 instance 必须等于本地 pin。
     let (token, instance_id) =
-        crate::recovery_enroll::management_token(transport, base, ctx.vault_id, manager, ctx.now)?;
+        crate::recovery_enroll::management_token(transport, &api, ctx.vault_id, manager, ctx.now)?;
     if instance_id != ctx.instance_id {
         return Err(SyncError::RelayWire("relay instance 与本地 pin 不符"));
     }
@@ -142,11 +155,7 @@ pub fn revoke_device<T: HttpTransport>(
         (1, cbor::bytes(request_id.to_vec())),
         (2, cbor::uint(ctx.expected_control_rev)),
     ])?;
-    let path = format!(
-        "/v1/vaults/{}/devices/{}/revoke",
-        crate::base64url::encode(&ctx.vault_id),
-        crate::base64url::encode(&target)
-    );
+    let path = api.revoke_device_path(&ctx.vault_id, &target);
     // ⑤ 签名绑定 POST=2/完整 path/instance/vault/request_id/expected_control_rev。
     //    复用管理写签名函数，绝不在这里复制一份签名输入拼接。
     let (signed, _signature) = crate::rotation_stage::sign_management(
@@ -163,13 +172,8 @@ pub fn revoke_device<T: HttpTransport>(
         (1, cbor::bytes(request_id.to_vec())),
         (2, cbor::uint(ctx.expected_control_rev)),
     ])?;
-    let response = crate::recovery_enroll::send(
-        transport,
-        "POST",
-        format!("{base}{path}"),
-        Some(&token),
-        body,
-    )?;
+    let response =
+        crate::recovery_enroll::send(transport, "POST", api.url(&path), Some(&token), body)?;
 
     // ⑥ 响应逐字段校验：target 必须与请求一致；`control_rev` 必须没变（CAS 的另一半）；
     //    业务状态字面量按 ADR 固定为 `"revoked"`。

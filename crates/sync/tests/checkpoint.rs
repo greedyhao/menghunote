@@ -12,8 +12,8 @@ use menghunote_storage::{
     META_SYNC_LOG_ID,
 };
 use menghunote_sync::checkpoint::{
-    CheckpointWriter, EmptyAssets, SlotSecrets, StaticAssets, StorageAssets, KIND_BODY,
-    KIND_STRUCTURE,
+    asset_object_id, CheckpointWriter, EmptyAssets, SlotSecrets, StaticAssets, StorageAssets,
+    KIND_BODY, KIND_STRUCTURE,
 };
 use menghunote_sync::engine::{EngineIdentity, SyncEngine, RELAY_CURSOR_META};
 use menghunote_sync::genesis;
@@ -337,6 +337,127 @@ fn asset_nonce_is_deterministic_across_writers() {
             );
         }
     }
+}
+
+fn asset_marker_count(vault: &menghunote_storage::Vault) -> usize {
+    vault
+        .query(
+            "SELECT COUNT(*) FROM meta WHERE substr(key,1,?1)=?2",
+            &[
+                Value::Integer("sync.asset_uploaded.".len() as i64),
+                Value::Text("sync.asset_uploaded.".to_owned()),
+            ],
+        )
+        .expect("读 asset marker")
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|value| match value {
+            Value::Integer(value) => usize::try_from(*value).ok(),
+            _ => None,
+        })
+        .expect("marker 计数")
+}
+
+fn clear_asset_markers(vault: &menghunote_storage::Vault) {
+    vault
+        .exec(
+            "DELETE FROM meta WHERE substr(key,1,?1)=?2",
+            &[
+                Value::Integer("sync.asset_uploaded.".len() as i64),
+                Value::Text("sync.asset_uploaded.".to_owned()),
+            ],
+        )
+        .expect("清 asset marker");
+}
+
+fn asset_part_puts(relay: &FakeRelay, object_id: &[u8; 32]) -> usize {
+    relay
+        .put_history
+        .iter()
+        .filter(|(recorded, _, _)| recorded == object_id)
+        .count()
+}
+
+/// 普通同步已经传过的资产，checkpoint 不得再按维护 reservation 重传（否则真实 relay
+/// 会因"同一对象全部分片必须同预算来源"返回 ID_CONFLICT）；反过来，checkpoint 已完整
+/// 上传的对象，普通同步也只落 durable 标记、不重传。
+#[test]
+fn checkpoint_reuses_assets_uploaded_by_ordinary_sync_and_marks_them_back() {
+    let (_dir, vault, materials) = setup();
+    let mut relay = relay_with(&materials);
+    add_note(
+        &vault,
+        "note-1",
+        materials.peer_id_u64(),
+        "asset note",
+        &uuid_like(306),
+        [0x36; 32],
+    );
+    let data = b"ordinary sync asset before checkpoint";
+    let hash = real_asset(&vault, "note-1", data);
+    let object_id = asset_object_id(&materials.root, &hash, data.len() as u64, "text/plain")
+        .expect("asset object_id");
+
+    // 完整普通同步（含 pull 自己的 ASSET 事件：checkpoint coverage 只认 durable 事实）。
+    {
+        let identity = EngineIdentity {
+            device_id: materials.device_id,
+            signing_key: materials.signing_key.clone(),
+            peer_id: materials.peer_id_u64(),
+        };
+        let mut sync = SyncEngine::new(&vault, &mut relay, identity, materials.root.clone());
+        let report = sync.sync_once().expect("普通同步");
+        assert_eq!(report.assets.uploaded, 1);
+        assert_eq!(report.assets.failed, 0);
+    }
+    assert_eq!(asset_marker_count(&vault), 1);
+    let puts_after_sync = asset_part_puts(&relay, &object_id);
+    assert_eq!(puts_after_sync, 1, "单分片资产");
+
+    // checkpoint：标记复用，不再上传该资产分片。
+    let report = {
+        let mut writer = CheckpointWriter::new(
+            &vault,
+            &mut relay,
+            VAULT_ID,
+            materials.device_id,
+            materials.signing_key.clone(),
+            materials.root.clone(),
+            materials.peer_id_u64(),
+        );
+        writer
+            .create_checkpoint(&StorageAssets)
+            .expect("普通同步之后创建 checkpoint 必须成功（不得 ID_CONFLICT）")
+    };
+    assert!(report.validated);
+    assert_eq!(report.assets.len(), 1);
+    assert_eq!(
+        asset_part_puts(&relay, &object_id),
+        puts_after_sync,
+        "checkpoint 不得重传普通同步已上传的资产"
+    );
+
+    // 反向：清掉标记后，普通同步必须复用 checkpoint 已完整的对象（只提交+落标记）。
+    clear_asset_markers(&vault);
+    let puts_before_adopt = asset_part_puts(&relay, &object_id);
+    {
+        let identity = EngineIdentity {
+            device_id: materials.device_id,
+            signing_key: materials.signing_key.clone(),
+            peer_id: materials.peer_id_u64(),
+        };
+        let mut sync = SyncEngine::new(&vault, &mut relay, identity, materials.root.clone());
+        let report = sync.upload_pending_assets().expect("复用 checkpoint 对象");
+        assert_eq!(report.uploaded, 0);
+        assert_eq!(report.reused_existing, 1);
+        assert_eq!(report.failed, 0);
+    }
+    assert_eq!(
+        asset_part_puts(&relay, &object_id),
+        puts_before_adopt,
+        "checkpoint 已完整上传的对象不得被普通同步重传"
+    );
+    assert_eq!(asset_marker_count(&vault), 1, "复用后必须落 durable 标记");
 }
 
 #[test]

@@ -28,7 +28,7 @@ fn block<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn app(fx: &Fixture) -> axum::Router {
-    let state = AppState::new(fx.db.clone(), fx.cfg.clone(), fx.hook.clone());
+    let state = AppState::new(fx.db.inner().clone(), fx.cfg.clone(), fx.hook.clone());
     router(state)
 }
 
@@ -588,10 +588,16 @@ async fn genesis_and_state_provide_initial_cursor_and_stale_cursor_is_410() {
     let handle = db.clone();
     block(|| {
         handle
-            .write_blocking(|conn| {
+            .write_blocking(relay::VaultScope::new(vault_id), |conn| {
                 // CHECK: gc_floor <= head_seq；先推进 head 再抬 floor。
-                conn.execute("UPDATE vault SET head_seq = 1", [])?;
-                conn.execute("UPDATE vault SET gc_floor = 1", [])?;
+                conn.execute(
+                    "UPDATE vaults SET head_seq = 1 WHERE vault_id = ?1",
+                    [conn.scope().as_slice()],
+                )?;
+                conn.execute(
+                    "UPDATE vaults SET gc_floor = 1 WHERE vault_id = ?1",
+                    [conn.scope().as_slice()],
+                )?;
                 Ok(())
             })
             .expect("bump gc floor")
@@ -763,36 +769,29 @@ async fn control_members_expose_verifiable_certificate_signature() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_database_migrates_to_latest_with_null_signatures() {
-    let fx = block(|| Fixture::new("http-migrate-v2"));
-    let token = block(|| fx.device_token());
-    let vault_id = fx.vault_id;
-    let handle = fx.db.clone();
-    // 模拟 v2 库：删掉新列、版本降为 2，然后重新打开触发就地迁移。
-    block(|| {
-        handle
-            .write_blocking(|conn| {
-                conn.execute("ALTER TABLE devices DROP COLUMN certificate_signature", [])?;
-                conn.execute("ALTER TABLE checkpoints DROP COLUMN commit_signature", [])?;
-                conn.execute("ALTER TABLE epochs DROP COLUMN revoked_once", [])?;
-                conn.execute(
-                    "UPDATE relay_meta SET value = x'32' WHERE key = 'schema_version'",
-                    [],
-                )?;
-                Ok(())
-            })
-            .expect("downgrade to v2");
-    });
-    drop(handle);
-    let path = fx.into_db_path();
+async fn v9_database_migrates_to_10_and_legacy_v1_auth_still_serves() {
+    // 真 schema 9 库（单 vault + 全量租户数据）→ 迁移到 10 后走真实 HTTP：
+    // legacy 默认 vault 解析、v1 challenge/token、/state 与 /control 都能服务旧 vault。
+    let path = temp_db_path("http-migrate-v9");
     let cleanup_path = path.clone();
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let conn = support::v9::fixture(&path);
+    // 旧行 NULL 签名必须保持 NULL（迁移不得补造签名）。
+    conn.execute(
+        "UPDATE devices SET certificate_signature = NULL WHERE device_id = ?1",
+        [support::v9::DEVICE_ACTIVE.as_slice()],
+    )
+    .expect("null cert signature");
+    conn.execute("UPDATE checkpoints SET commit_signature = NULL", [])
+        .expect("null checkpoint signature");
+    drop(conn);
 
     let clock = Arc::new(FakeClock::new(BASE_TIME));
-    let cfg = Arc::new(RelayConfig::new(path).with_setup_secret("setup-secret"));
-    let db = Db::open(cfg.db.clone(), clock).expect("reopen");
+    let cfg = Arc::new(RelayConfig::new(path.clone()).with_setup_secret("setup-secret"));
+    let db = Db::open(cfg.db.clone(), clock).expect("migrate to v10");
     let (version, has_column, has_checkpoint_signature, has_revoked_once, signature) =
         block(|| {
-            db.read(|conn| {
+            db.read_instance(|conn| {
                 let version =
                     relay::db::schema::meta_text(conn, relay::db::schema::META_SCHEMA_VERSION)?;
                 let columns_of =
@@ -806,7 +805,7 @@ async fn v2_database_migrates_to_latest_with_null_signatures() {
                 let epoch_columns = columns_of("epochs")?;
                 let signature: Option<Vec<u8>> = conn.query_row(
                     "SELECT certificate_signature FROM devices WHERE device_id = ?1",
-                    [[2u8; 16]],
+                    [support::v9::DEVICE_ACTIVE.as_slice()],
                     |row| row.get(0),
                 )?;
                 Ok((
@@ -823,25 +822,104 @@ async fn v2_database_migrates_to_latest_with_null_signatures() {
             })
             .expect("migration state")
         });
-    assert_eq!(version.as_deref(), Some("9"));
-    assert!(has_column, "v2→v3 就地补 certificate_signature");
+    assert_eq!(version, Some(relay::db::schema::SCHEMA_VERSION.to_string()));
+    assert!(has_column, "迁移不得丢 devices.certificate_signature");
     assert!(
         has_checkpoint_signature,
-        "v3→v4 就地补 checkpoints.commit_signature"
+        "迁移不得丢 checkpoints.commit_signature"
     );
-    assert!(has_revoked_once, "v4→v5 就地补 epochs.revoked_once");
+    assert!(has_revoked_once, "迁移不得丢 epochs.revoked_once");
     assert!(signature.is_none(), "旧行证书签名保持 NULL");
+    assert_eq!(
+        block(|| db.read_instance(relay::db::schema::list_vault_ids)).expect("vaults"),
+        vec![support::v9::VAULT],
+        "迁移后只有一个 vault 行"
+    );
 
-    // 旧行 NULL 时 /control 省略键 5 且不 panic。
+    // v1 旧 API：无 Bearer → 401；legacy 默认 vault 解析成功即可挑战/签发 token。
     let app = router(AppState::new(
         db.clone(),
         cfg.clone(),
         Arc::new(TestHook::new()),
     ));
+    let (status, _) = call(
+        &app,
+        get(
+            &format!("/v1/vaults/{}/state", b64(&support::v9::VAULT)),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = call(
+        &app,
+        post_cbor(
+            "/v1/auth/challenges",
+            None,
+            vec![
+                (0, wire::uint(1)),
+                (1, wire::bytes(support::v9::DEVICE_ACTIVE)),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "v1 认证必须仍绑定 legacy 默认 vault"
+    );
+    let challenge = cbor_response(&body);
+    let challenge_id = wire::id16_field(&challenge, 0).expect("challenge id");
+    assert_eq!(
+        wire::bytes_field(&challenge, 5).expect("vault id"),
+        support::v9::VAULT.to_vec()
+    );
+    assert_eq!(
+        wire::bytes_field(&challenge, 6).expect("instance id"),
+        support::v9::INSTANCE.to_vec()
+    );
+
+    let (status, body) = call(
+        &app,
+        post_cbor(
+            "/v1/auth/tokens",
+            None,
+            vec![
+                (0, wire::bytes(challenge_id.to_vec())),
+                (1, wire::bytes(b"challenge-message")),
+                (2, wire::bytes(b"signature")),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "v1 token 仍可签发");
+    let token = wire::text_field(&cbor_response(&body), 0).expect("token");
+
+    // /state：迁移保留的 rev/水位与 v9 行逐项一致。
+    let uri = format!("/v1/vaults/{}/state", b64(&support::v9::VAULT));
+    let (status, body) = call(&app, get(&uri, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK);
+    let state = cbor_response(&body);
+    assert_eq!(wire::uint_field(&state, 4).expect("epoch"), 1);
+    assert_eq!(wire::uint_field(&state, 5).expect("control_rev"), 2);
+    assert_eq!(wire::uint_field(&state, 6).expect("auth_rev"), 4);
+    assert_eq!(wire::uint_field(&state, 7).expect("head_seq"), 3);
+    assert_eq!(wire::uint_field(&state, 8).expect("gc_floor"), 1);
+    assert_eq!(wire::uint_field(&state, 9).expect("normal_bytes"), 600);
+    assert_eq!(
+        wire::uint_field(&state, 10).expect("maintenance_bytes"),
+        400
+    );
+
+    // /control：旧行 NULL 签名省略而不是 panic/写空。
     let (status, body) = call(
         &app,
         get(
-            &format!("/v1/vaults/{}/control?after_rev=0", b64(&vault_id)),
+            &format!(
+                "/v1/vaults/{}/control?after_rev=0",
+                b64(&support::v9::VAULT)
+            ),
             Some(&token),
         ),
     )

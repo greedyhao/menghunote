@@ -48,9 +48,13 @@
 //!
 //! ## 安全与非目标
 //!
-//! - relay 必须是 loopback 明文（[`StdTcpTransport::new_local_dev`]）；本模块不提供
-//!   生产 TLS 入口，也不实现验签——测试用 `menghunote-dev-relay`，它是**放行验签**的
-//!   测试脚手架，**非生产**；正式鉴权负例必须走 relay 生产 hook；
+//! - relay 接入统一走 [`crate::relay_context::RelayContext`]：本模块的每个操作都从
+//!   **同一个** context 取客户端/传输（不再各自拼 `StdTcpTransport`）；URL 兼容入口
+//!   只是先构造一个 `local_dev` context。`remote_tls` 的 Create/Join 初始化在
+//!   [`crate::remote_init`]（S3b），本模块保持 local_dev 语义。普通同步的
+//!   生产 TLS 由 app 按公开配置的模式用 `remote_tls` context 打开；本模块不实现验签——测试用
+//!   `menghunote-dev-relay`，它是**放行验签**的测试脚手架，**非生产**；正式鉴权负例
+//!   必须走 relay 生产 hook；
 //! - 不在这里写 app 的受保护身份文件（`DevIdentityStore` 负责 DPAPI/Linux 主钥封装）：
 //!   identity 只经返回值交给调用方，绝不进 vault meta/明文配置/日志；
 //! - 恢复码只以 `String` 形式交给调用方（ADR 0009：仅临时显示，提交后清除），本模块
@@ -74,27 +78,25 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::bootstrap::{self, BootstrapPins};
 use crate::checkpoint::{CheckpointReport, CheckpointWriter, StorageAssets};
 use crate::device::{DeviceSigningKey, ManagementKey};
 use crate::device_management::{RevokeContext, RevokeOutcome};
 use crate::engine::{
-    AckReport, EngineConfig, EngineIdentity, IntegrateConfig, IntegrateReport, PullReport,
-    PushReport, SyncEngine, SyncReport, RELAY_CURSOR_META,
+    AckReport, AssetSyncReport, EngineConfig, EngineIdentity, IntegrateConfig, IntegrateReport,
+    PullReport, PushReport, SyncEngine, SyncReport, RELAY_CURSOR_META,
 };
 use crate::error::SyncError;
 use crate::genesis;
-use crate::http_relay::{
-    Clock, ControlPin, HttpRelayClient, HttpRelayConfig, MemberView, StdTcpTransport, SystemClock,
-};
-use crate::http_transport::TransportTimeouts;
+use crate::http_relay::{Clock, HttpRelayClient, MemberView, SystemClock};
+use crate::http_transport::{HttpTransport, TransportTimeouts, DEFAULT_TRANSPORT_TIMEOUTS};
 use crate::identity::LocalIdentityV1;
-use crate::ids::{self, PeerId};
+use crate::ids;
+use crate::init_session::InitSession;
 use crate::keys::RootSecretV1;
 use crate::random::{array, OsRandom};
 use crate::recovery::{management_seed, RecoverySeed};
-use crate::recovery_enroll;
 use crate::relay::RelayClient as _;
+use crate::relay_context::{RelayContext, RelayTarget};
 use crate::slot::{KeySlotV1, WrappedRoot};
 use crate::{DeviceId, VaultId};
 use menghunote_storage::{
@@ -102,6 +104,9 @@ use menghunote_storage::{
     STRUCTURE_DOC_ID,
 };
 use menghunote_sync_proto::{SlotDescriptorV1, SlotKind};
+
+// ADR 0009 Phase 2（切片 5）：轮换的库级入口与结果类型，与 Create/Join/SyncOnce 同层导出。
+pub use crate::dev_local_rotation::{ApplyOutcome, RotationOutcome};
 
 /// `meta` 键：dev-local 实例的展示标签（仅本机，非 wire；Join 不导入）。
 pub const VAULT_LABEL_META: &str = "dev.local.vault_label";
@@ -211,6 +216,8 @@ pub struct PrepareReport {
     pub encrypted: usize,
     /// 推送结果。
     pub push: PushReport,
+    /// 增量资产上传结果（正文 push 之后、pull 之前）。
+    pub assets: AssetSyncReport,
     /// 拉取结果（游标已 durable 推进）。
     pub pull: PullReport,
 }
@@ -244,8 +251,21 @@ pub struct FinishReport {
 impl DevLocal {
     /// Create：对真实 relay 走 genesis，并新建（**必须是新路径**）本地 vault。
     ///
-    /// 顺序刻意是"先联网、后落地"：genesis 失败时本地连文件都不该出现。
-    /// `vault_label` 只写本机 meta（[`VAULT_LABEL_META`]），不上 wire。
+    /// 初始化走 ADR 0013 S2b 的受限能力 [`InitSession::new_genesis`]：
+    ///
+    /// 1. 先在本地生成 vault/device **材料**（不联网），再开新库并写 durable pending
+    ///    （`sync.init_pending`）——顺序是"先记录意图、再联网"；
+    /// 2. `POST /v1/vaults`（写前先推进 `GenesisRequested`）；成功后**不重复**创建；
+    /// 3. 用本地提交证书复算 rev1 `record_hash`，验证 relay 当前链/前缀，再 durable
+    ///    提交强 pin（`sync.control_pin`，rev1 record 锚）；
+    /// 4. 写本地事实（structure/label/cursor/log_id/初始槽材料）→ 上传初始 recovery 槽
+    ///    → pending 进入 `Done` 并清理（app 走 [`Self::create_deferring_identity`]：
+    ///    停在 `PinCommitted`，身份 rename 成功后再推进 `IdentityWritten → Done`）。
+    ///
+    /// 失败语义沿用 ADR 0009（app 验收依赖它）：**任何返回错误都清掉本次新建的库文件**
+    /// （relay 侧可能留下一个没有槽/没有 checkpoint 的空 vault，重试会建新的）；
+    /// pending 的用途是**崩溃**（进程消失、清理代码没跑）之后的对账，见
+    /// [`crate::init_session::reconcile`]。
     ///
     /// 口令：dev-local 不接收口令，genesis 的 password 槽材料用一次随机口令生成后**丢弃**
     /// （不上传、不落盘），因此该 vault 只能靠恢复码加入——这是 ADR 0009 Phase 1 的
@@ -256,6 +276,33 @@ impl DevLocal {
         vault_path: &Path,
         vault_label: &str,
     ) -> Result<CreatedVault, SyncError> {
+        Self::create_inner(relay_url, setup_secret, vault_path, vault_label, true)
+    }
+
+    /// **app 专用**：与 [`Self::create`] 完全相同，但 pending 停在 `PinCommitted`。
+    ///
+    /// 调用方必须在身份**原子落盘**（`DevIdentityStore::persist_protected` 的临时文件 +
+    /// rename）之后调用 [`crate::init_session::mark_identity_written`] 与
+    /// `finish_identity_written`。这样"relay 已建 vault、本地身份还没落盘"的崩溃窗口
+    /// 有 durable pending 可对账（ADR 0013 §2/S3），而不是靠重跑 genesis。
+    ///
+    /// 失败语义与 [`Self::create`] 一致：返回错误时清掉本次新建的本地文件。
+    pub fn create_deferring_identity(
+        relay_url: &str,
+        setup_secret: &str,
+        vault_path: &Path,
+        vault_label: &str,
+    ) -> Result<CreatedVault, SyncError> {
+        Self::create_inner(relay_url, setup_secret, vault_path, vault_label, false)
+    }
+
+    fn create_inner(
+        relay_url: &str,
+        setup_secret: &str,
+        vault_path: &Path,
+        vault_label: &str,
+        finish_identity: bool,
+    ) -> Result<CreatedVault, SyncError> {
         if vault_path.as_os_str().is_empty() {
             return Err(SyncError::LocalCorrupt("Create 需要明确的 vault 路径"));
         }
@@ -265,18 +312,24 @@ impl DevLocal {
             ));
         }
 
-        // 1. 先联网：genesis 失败时本地不产生任何文件。
-        let mut transport = StdTcpTransport::new_local_dev_with(relay_url, None)?;
+        // 0. 按唯一权威策略构造 context（local_dev 只接受 http + loopback 白名单）。
+        let context = RelayContext::local_dev(relay_url, DEFAULT_TRANSPORT_TIMEOUTS)?;
+
+        // 1. 本地材料：vault_id/device_id 必须**先进 pending**，之后才能发请求。
+        let vault_id: VaultId = array(&mut OsRandom)?;
+        let device_id: DeviceId = array(&mut OsRandom)?;
         let throwaway_password = throwaway_password()?;
-        let outcome = genesis::run(
-            &mut transport,
-            setup_secret,
+        let materials = genesis::build_materials(
+            vault_id,
+            device_id,
             &throwaway_password,
             SystemClock.now_secs(),
             &mut OsRandom,
         )?;
+        let session = InitSession::new_genesis(context, &materials)?;
+        let context = session.context().clone();
 
-        // 2. 再落地：打开（新建）库并写 durable 事实；任何失败都清掉刚建的文件。
+        // 2. 新库（pending 需要 SQLite；genesis 失败时会连同 pending 一起清掉）。
         let vault = match Vault::open(vault_path) {
             Ok(vault) => vault,
             Err(error) => {
@@ -284,49 +337,55 @@ impl DevLocal {
                 return Err(SyncError::Storage(error));
             }
         };
-        let setup = (|| -> Result<(), SyncError> {
+        let created = (|| -> Result<(LocalIdentityV1, String), SyncError> {
+            session.prepare_pending(&vault, SystemClock.now_secs())?;
+            let receipt = session.request_genesis(&vault, &materials, setup_secret)?;
+            let report = session.finalize_genesis(&vault, &materials, &receipt)?;
+
             ensure_structure_row(&vault)?;
             vault.set_meta(VAULT_LABEL_META, vault_label.as_bytes())?;
             // 初始游标：genesis 响应键 5（旧 relay 可能没有 —— 那就留空，publish 时用
             // `GET /state` 键 14 兜底，且绝不把"缺失"当成 0 号游标）。
-            if let Some(cursor) = &outcome.initial_cursor {
+            if let Some(cursor) = &receipt.initial_cursor {
                 vault.set_meta(RELAY_CURSOR_META, cursor.as_bytes())?;
             }
             // log_id 来自 genesis 响应：先钉住 relay 日志代，pull 再复核。
-            set_sync_log_id(&vault, &outcome.log_id)?;
+            set_sync_log_id(&vault, &receipt.log_id)?;
             // 初始 recovery 槽材料（密文）留给发布/Join 复用（同一 slot_id 幂等）。
-            let slot_record = encode_initial_slot(&outcome.materials.recovery_slot)?;
+            let slot_record = encode_initial_slot(&materials.recovery_slot)?;
             vault.set_meta(INITIAL_RECOVERY_SLOT_META, &slot_record)?;
-            Ok(())
+
+            // 初始 recovery 槽必须**现在**上传（ADR 0009 切片 4c-4）：KEY_SLOT 对象的 MNE1
+            // 密钥 `K_slot_mne = HKDF(恢复码种子)` 不可逆，而恢复码只在这一刻还在内存里、不落盘。
+            // 这一步是初始化内部操作（`open_for_init` 跳过 pending 守卫）。
+            Self::upload_initial_slot_during_init(
+                &context,
+                &vault,
+                &report.identity,
+                &materials.recovery_seed,
+            )?;
+
+            // 本地初始化完成：pending → Done → 清理（清理只在 Done）。
+            // app 的延迟路径停在 PinCommitted，等身份 rename 成功后由调用方推进。
+            if finish_identity {
+                session.finish(&vault)?;
+            }
+            Ok((report.identity, materials.recovery_code.as_str().to_owned()))
         })();
-        if let Err(error) = setup {
-            drop(vault);
-            remove_vault_files(vault_path);
-            return Err(error);
+        match created {
+            Ok((identity, recovery_code)) => Ok(CreatedVault {
+                vault,
+                vault_id: identity.vault_id,
+                recovery_code,
+                identity,
+                setup_secret: setup_secret.to_owned(),
+            }),
+            Err(error) => {
+                drop(vault);
+                remove_vault_files(vault_path);
+                Err(error)
+            }
         }
-
-        // 初始 recovery 槽必须**现在**上传（ADR 0009 切片 4c-4）：KEY_SLOT 对象的 MNE1
-        // 密钥 `K_slot_mne = HKDF(恢复码种子)` 不可逆，而恢复码只在这一刻还在内存里、不落盘。
-        // 早传一步的收益：面板「发布基线」只凭受保护身份就能做（不需要恢复码），
-        // 不再要求"关程序 → CLI publish → 重开"；失败沿用 create 的清理语义。
-        if let Err(error) = Self::upload_initial_slot(
-            relay_url,
-            &vault,
-            &outcome.identity,
-            &outcome.materials.recovery_seed,
-        ) {
-            drop(vault);
-            remove_vault_files(vault_path);
-            return Err(error);
-        }
-
-        Ok(CreatedVault {
-            vault,
-            vault_id: outcome.identity.vault_id,
-            recovery_code: outcome.materials.recovery_code.as_str().to_owned(),
-            identity: outcome.identity,
-            setup_secret: setup_secret.to_owned(),
-        })
     }
 
     /// CLI 路径的发布初始基线：**用恢复码**确认管理身份，然后与身份路径共用同一条核心。
@@ -341,16 +400,18 @@ impl DevLocal {
     ///
     /// 这条入口保留给 CLI（`--dev-sync-publish`）、自动化与恢复场景；面板按钮走
     /// [`Self::publish_initial_pair_with_identity`]（不需要恢复码）。
-    pub fn publish_initial_pair(
-        relay_url: &str,
+    pub fn publish_initial_pair<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         recovery_code: &str,
     ) -> Result<CheckpointReport, SyncError> {
         let seed = RecoverySeed::from_code(recovery_code)?;
         verify_recovery_matches(identity, &seed)?;
-        Self::upload_initial_slot(relay_url, vault, identity, &seed)?;
-        Self::publish_baseline_core_with(relay_url, vault, identity, SyncOnceOptions::default())
+        // 预算取历史默认（本入口没有 per-call 预算参数）；显式 context 用自己的预算。
+        let context = target.relay_context(None)?;
+        Self::upload_initial_slot(&context, vault, identity, &seed)?;
+        Self::publish_baseline_core_with(&context, vault, identity, SyncOnceOptions::default())
     }
 
     /// **只凭受保护身份**发布初始基线（ADR 0009 切片 4c-4；面板「发布基线」的库入口）。
@@ -368,13 +429,13 @@ impl DevLocal {
     ///   核心路径（[`Self::publish_baseline_core_with`]），不复制逻辑。
     ///
     /// 幂等语义同 4b：重跑会多一对真实 checkpoint，`/bootstrap` 只取最新两份 published。
-    pub fn publish_initial_pair_with_identity(
-        relay_url: &str,
+    pub fn publish_initial_pair_with_identity<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
     ) -> Result<CheckpointReport, SyncError> {
         Self::publish_initial_pair_with_identity_with(
-            relay_url,
+            target,
             vault,
             identity,
             SyncOnceOptions::default(),
@@ -383,13 +444,14 @@ impl DevLocal {
 
     /// 同 [`Self::publish_initial_pair_with_identity`]，但接收**传输预算 + 集成前守卫**
     /// （ADR 0012 S1：发布内部也跑一轮同步并 `integrate`，所以与同步共用同一条安全纪律）。
-    pub fn publish_initial_pair_with_identity_with(
-        relay_url: &str,
+    pub fn publish_initial_pair_with_identity_with<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         options: SyncOnceOptions<'_>,
     ) -> Result<CheckpointReport, SyncError> {
-        // 先拒 Join 设备（真正原因），再看槽材料/上传标记。
+        // 先拒 Join 设备（真正原因），再看槽材料/上传标记（保持既有错误优先级：
+        // 本地可判定原因先于 URL/网络配置错误）。
         require_manager_identity(identity)?;
         let slot = load_initial_slot(vault, &identity.vault_id)?;
         verify_identity_slot_consistency(identity, &slot)?;
@@ -400,7 +462,8 @@ impl DevLocal {
                  之后面板「发布基线」一直可用",
             ));
         }
-        Self::publish_baseline_core_with(relay_url, vault, identity, options)
+        let context = target.relay_context(options.transport)?;
+        Self::publish_baseline_core_with(&context, vault, identity, options)
     }
 
     /// 上传 genesis 的初始 recovery 槽（staging）并落 durable 标记。
@@ -412,17 +475,42 @@ impl DevLocal {
     ///
     /// message id 确定性派生，整份 KEY_SLOT 对象逐字节可复现，重传 relay 幂等接受。
     fn upload_initial_slot(
-        relay_url: &str,
+        context: &RelayContext,
         vault: &Vault,
         identity: &LocalIdentityV1,
         seed: &RecoverySeed,
+    ) -> Result<(), SyncError> {
+        Self::upload_initial_slot_with(context, vault, identity, seed, false)
+    }
+
+    /// Create 内部的初始槽上传：pending 尚未收尾，走 `open_for_init`（跳过 pending 守卫）。
+    pub(crate) fn upload_initial_slot_during_init(
+        context: &RelayContext,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        seed: &RecoverySeed,
+    ) -> Result<(), SyncError> {
+        Self::upload_initial_slot_with(context, vault, identity, seed, true)
+    }
+
+    fn upload_initial_slot_with(
+        context: &RelayContext,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        seed: &RecoverySeed,
+        during_init: bool,
     ) -> Result<(), SyncError> {
         let slot = load_initial_slot(vault, &identity.vault_id)?;
         verify_identity_slot_consistency(identity, &slot)?;
 
         let root = root_of(identity);
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(relay_url, vault, identity, &root, signing_key.clone(), None)?;
+        let pinned = if during_init {
+            context.open_for_init(vault, identity)?
+        } else {
+            context.open(vault, identity)?
+        };
+        let mut client = pinned.into_client();
         ensure_cursor(&mut client, vault)?;
         let message_id = key_slot_message_id(&slot)?;
         {
@@ -450,21 +538,14 @@ impl DevLocal {
     /// 资产源用 [`StorageAssets`]（真实 storage 资产；空库自然是 0 个资产），不用合成
     /// fixture。返回值是**较新那份** checkpoint 的报告（pair = 前一份 + 这一份）。
     fn publish_baseline_core_with(
-        relay_url: &str,
+        context: &RelayContext,
         vault: &Vault,
         identity: &LocalIdentityV1,
         mut options: SyncOnceOptions<'_>,
     ) -> Result<CheckpointReport, SyncError> {
         let root = root_of(identity);
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(
-            relay_url,
-            vault,
-            identity,
-            &root,
-            signing_key.clone(),
-            options.transport,
-        )?;
+        let mut client = context.open(vault, identity)?.into_client();
         // 缺 `sync.relay_cursor` 时用 `GET /state` 键 14 兜底（旧 relay 兼容）。
         ensure_cursor(&mut client, vault)?;
 
@@ -501,15 +582,48 @@ impl DevLocal {
 
     /// Join：只给 `vault_id + 恢复码 + 新路径`，不读 A 的目录/identity/root。
     ///
-    /// 顺序：恢复码 → 管理密钥（信任锚）→ `self_enroll`（管理签名建 invite/自批 HPKE
-    /// grant，并解出根）→ **然后**才新建本地库 → `bootstrap::run_with_pins` 认证读取、
-    /// 全量校验、staging 导入、单事务推进 pins/cursor。失败时清掉新建的本地文件，
-    /// 不写 cursor/identity（bootstrap 只在全部导入成功后推进水位）。
+    /// 初始化走 ADR 0013 S2b 的受限能力 [`InitSession::new_fresh_recovery`]：
+    ///
+    /// 1. 恢复码 → 恢复种子 →（会话内）管理私钥（管理信任锚）；
+    /// 2. 新库 + durable pending（`Prepared`）→ 写前推进 `GenesisRequested` → `self_enroll`
+    ///    自批新设备（唯一允许 unpinned 消费 `/control` 的路径，仍强制管理锚 + 逐条签名）；
+    /// 3. 认证 `bootstrap::run_with_pins` 导入基线并单事务推进 pins/cursor；
+    /// 4. 用**同一验证视图**提交 record pin + bootstrap 锚（`commit_recovery_pin`）；
+    /// 5. pending → `Done` → 清理（清理只在 Done）；app 走
+    ///    [`Self::join_deferring_identity`] 时停在 `PinCommitted`，身份落盘后再推进。
+    ///
+    /// 失败语义沿用 ADR 0009（app 验收依赖它）：**返回错误时清掉本次新建的本地文件**，
+    /// 不写 cursor/identity（bootstrap 只在全部导入成功后推进水位）；pending 的用途是
+    /// **崩溃**之后的启动对账（[`crate::init_session::reconcile`]）。
     pub fn join(
         relay_url: &str,
         vault_id: &VaultId,
         recovery_code: &str,
         vault_path: &Path,
+    ) -> Result<JoinedVault, SyncError> {
+        Self::join_inner(relay_url, vault_id, recovery_code, vault_path, true)
+    }
+
+    /// **app 专用**：与 [`Self::join`] 相同，但 pending 停在 `PinCommitted`。
+    ///
+    /// 与 [`Self::create_deferring_identity`] 对称：身份原子落盘后由调用方调用
+    /// [`crate::init_session::mark_identity_written`] + `finish_identity_written`，
+    /// 崩溃窗口由启动对账（[`crate::init_session::reconcile`]）补 finalize。
+    pub fn join_deferring_identity(
+        relay_url: &str,
+        vault_id: &VaultId,
+        recovery_code: &str,
+        vault_path: &Path,
+    ) -> Result<JoinedVault, SyncError> {
+        Self::join_inner(relay_url, vault_id, recovery_code, vault_path, false)
+    }
+
+    fn join_inner(
+        relay_url: &str,
+        vault_id: &VaultId,
+        recovery_code: &str,
+        vault_path: &Path,
+        finish_identity: bool,
     ) -> Result<JoinedVault, SyncError> {
         if vault_path.as_os_str().is_empty() {
             return Err(SyncError::LocalCorrupt("Join 需要明确的 vault 路径"));
@@ -520,35 +634,12 @@ impl DevLocal {
             ));
         }
 
-        // 1. 恢复码 → 恢复种子 → 管理私钥（管理信任锚）。
+        // 1. 恢复码 → 恢复种子；管理锚由 InitSession 从种子推导（不信任 relay 的公钥）。
         let seed = RecoverySeed::from_code(recovery_code)?;
-        let manager = ManagementKey::from_recovery(&seed, vault_id)?;
-        let manager_pub = manager.public_key();
+        let context = RelayContext::local_dev(relay_url, DEFAULT_TRANSPORT_TIMEOUTS)?;
+        let session = InitSession::new_fresh_recovery(context, *vault_id, &seed)?;
 
-        // 2. 恢复码自批新设备；root 从恢复槽解出（不需要 A 在线/不需要 A 的目录）。
-        let mut transport = StdTcpTransport::new_local_dev_with(relay_url, None)?;
-        let enrolled = recovery_enroll::self_enroll(
-            &mut transport,
-            relay_url,
-            *vault_id,
-            recovery_code,
-            SystemClock.now_secs(),
-        )?;
-        if enrolled.vault_id != *vault_id {
-            return Err(SyncError::RelayWire("自批返回的 vault 与请求不一致"));
-        }
-
-        // 3. 本地身份先按"peer 的唯一定义"构造（bootstrap 导入文档时必须用同一个 peer）。
-        let peer_bytes = peer_bytes_of(enrolled.peer_id);
-        let peer_id = PeerId::from_bytes(peer_bytes);
-        let device_peer = peer_id.loro_u64();
-        if device_peer != enrolled.peer_id {
-            return Err(SyncError::LocalCorrupt(
-                "自批 peer id 无法按 ADR 0009 的映射稳定复现",
-            ));
-        }
-
-        // 4. 新库（必须在包围/校验之后才创建）。
+        // 2. 新库（pending 需要 SQLite；任何失败都清掉刚建的文件）。
         let vault = match Vault::open(vault_path) {
             Ok(vault) => vault,
             Err(error) => {
@@ -556,48 +647,14 @@ impl DevLocal {
                 return Err(SyncError::Storage(error));
             }
         };
-
         let joined = (|| -> Result<LocalIdentityV1, SyncError> {
-            let transport = StdTcpTransport::new_local_dev_with(relay_url, None)?;
-            let config = HttpRelayConfig {
-                base_url: relay_url.to_owned(),
-                vault_id: *vault_id,
-                device_id: enrolled.device_id,
-                manager_pub: Some(manager_pub),
-            };
-            // 新设备没有任何 pin：只有这条路径允许"无 pin 消费 /control"，且仍强制
-            // 管理公钥信任锚 + 逐条管理签名（ADR 0009 安全边界）。
-            let mut client = HttpRelayClient::new(transport, config, enrolled.signing_key.clone())
-                .with_root(enrolled.root.clone())
-                .with_unpinned_bootstrap_control();
-            let pins = BootstrapPins::from_vault(&vault)?;
-            let report = bootstrap::run_with_pins(
-                &vault,
-                &mut client,
-                *vault_id,
-                device_peer,
-                &enrolled.root,
-                &pins,
-            )?;
-            let state = client.state()?;
-            if report.covered_seq > state.head_seq {
-                return Err(SyncError::RelayWire("bootstrap 覆盖水位高于 relay head"));
+            session.prepare_pending(&vault, SystemClock.now_secs())?;
+            let recovered = session.recover_identity(&vault, SystemClock.now_secs())?;
+            session.commit_recovery_pin(&vault, &recovered.identity)?;
+            if finish_identity {
+                session.finish(&vault)?;
             }
-            Ok(LocalIdentityV1 {
-                vault_id: *vault_id,
-                device_id: enrolled.device_id,
-                peer_id,
-                ed25519_seed: enrolled.signing_key.seed().clone(),
-                x25519_secret: enrolled.hpke_key.secret().clone(),
-                current_epoch: enrolled.root.key_epoch,
-                current_root: enrolled.root.root.clone(),
-                // 普通设备没有管理私钥：恢复码只在 Join 时用过，不留在身份里。
-                manager_seed: None,
-                pinned_instance: state.instance_id,
-                pinned_manager: manager_pub,
-                control_rev: state.control_rev,
-                pending_rotation: None,
-            })
+            Ok(recovered.identity)
         })();
 
         match joined {
@@ -621,12 +678,12 @@ impl DevLocal {
     ///
     /// 这是**向后兼容入口**（CLI/测试/旧调用）：传输预算与集成前守卫都用历史默认
     /// （ADR 0012 S1）。需要可配预算或取消复核时用 [`Self::sync_once_with`]。
-    pub fn sync_once(
-        relay_url: &str,
+    pub fn sync_once<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
     ) -> Result<SyncReport, SyncError> {
-        Self::sync_once_with(relay_url, vault, identity, SyncOnceOptions::default())
+        Self::sync_once_with(target, vault, identity, SyncOnceOptions::default())
     }
 
     /// 同 [`Self::sync_once`]，但由调用方注入**传输预算**与**集成前守卫**（ADR 0012 S1）。
@@ -634,22 +691,16 @@ impl DevLocal {
     /// `options.before_integrate` 在 `integrate` 之前调用一次：返回 `Err` 时本轮
     /// **不会追加任何本地行**（取消/授权已失效），已推送的对象与已拉取的 inbox 保持
     /// durable 事实（重试可复用）。进入 integrate 后事务必须跑完，不再中断。
-    pub fn sync_once_with(
-        relay_url: &str,
+    pub fn sync_once_with<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         mut options: SyncOnceOptions<'_>,
     ) -> Result<SyncReport, SyncError> {
+        let context = target.relay_context(options.transport)?;
         let root = root_of(identity);
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(
-            relay_url,
-            vault,
-            identity,
-            &root,
-            signing_key.clone(),
-            options.transport,
-        )?;
+        let mut client = context.open(vault, identity)?.into_client();
         // pull 必须有游标：B 由 bootstrap 落库，A 由 genesis 落库；旧 relay 两者都没有时
         // 用 `GET /state` 键 14 兜底（绝不把"缺失"当成 0 号游标硬编）。
         ensure_cursor(&mut client, vault)?;
@@ -681,22 +732,16 @@ impl DevLocal {
     ///
     /// 明确**不**做 `integrate`/`ack`：本阶段只把远端变化落成 durable inbox 并推进
     /// pull 游标，正文/结构 head 一律不动。因此 UI 在网络阶段不需要持闸、可以继续编辑。
-    pub fn sync_prepare(
-        relay_url: &str,
+    pub fn sync_prepare<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         transport: Option<TransportTimeouts>,
     ) -> Result<PrepareReport, SyncError> {
+        let context = target.relay_context(transport)?;
         let root = root_of(identity);
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(
-            relay_url,
-            vault,
-            identity,
-            &root,
-            signing_key.clone(),
-            transport,
-        )?;
+        let mut client = context.open(vault, identity)?.into_client();
         ensure_cursor(&mut client, vault)?;
         let engine_identity = EngineIdentity {
             device_id: identity.device_id,
@@ -707,10 +752,14 @@ impl DevLocal {
         let config = EngineConfig::default();
         let encrypted = engine.encrypt_pending(config.send_batch)?;
         let push = engine.push()?;
+        // ADR 0012 两阶段路径的资产上传点：与完整 `sync_once` 同一阶段（正文之后、
+        // pull 之前），保证自动同步（S3）也会增量上传新资产。
+        let assets = engine.upload_pending_assets()?;
         let pull = engine.pull()?;
         Ok(PrepareReport {
             encrypted,
             push,
+            assets,
             pull,
         })
     }
@@ -728,8 +777,8 @@ impl DevLocal {
     ///
     /// 集成本身按 ADR 0012 S2b 的**依赖顺序**收敛（结构 → 只投影 → 正文公平轮转），
     /// 因此调用方不需要"再联网补一轮"来修结构/正文依赖。
-    pub fn sync_integrate(
-        relay_url: &str,
+    pub fn sync_integrate<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         transport: Option<TransportTimeouts>,
@@ -737,7 +786,7 @@ impl DevLocal {
         watch_doc: &str,
     ) -> Result<IntegratePhaseReport, SyncError> {
         Self::sync_integrate_with_config(
-            relay_url,
+            target,
             vault,
             identity,
             transport,
@@ -749,8 +798,8 @@ impl DevLocal {
 
     /// 同 [`Self::sync_integrate`]，但显式指定集成批次预算（测试/诊断用）。
     #[allow(clippy::too_many_arguments)]
-    pub fn sync_integrate_with_config(
-        relay_url: &str,
+    pub fn sync_integrate_with_config<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         transport: Option<TransportTimeouts>,
@@ -767,16 +816,10 @@ impl DevLocal {
             }
         }
         let before = load_head(vault, watch_doc)?.head_seq;
+        let context = target.relay_context(transport)?;
         let root = root_of(identity);
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(
-            relay_url,
-            vault,
-            identity,
-            &root,
-            signing_key.clone(),
-            transport,
-        )?;
+        let mut client = context.open(vault, identity)?.into_client();
         ensure_cursor(&mut client, vault)?;
         let peer_id = identity.loro_peer_id();
         let engine_identity = EngineIdentity {
@@ -808,22 +851,16 @@ impl DevLocal {
     /// 调用方契约：UI 已经把 integrate 的 durable 变化 adopt 进 live、并 `end` 释放闸门。
     /// 本阶段不再 `pull`/`integrate`：它只做 "让 relay 知道本机已经收到/整合到哪" 以及
     /// 清掉本轮 Held 期间新产生的本地意图。
-    pub fn sync_finish(
-        relay_url: &str,
+    pub fn sync_finish<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         transport: Option<TransportTimeouts>,
     ) -> Result<FinishReport, SyncError> {
+        let context = target.relay_context(transport)?;
         let root = root_of(identity);
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(
-            relay_url,
-            vault,
-            identity,
-            &root,
-            signing_key.clone(),
-            transport,
-        )?;
+        let mut client = context.open(vault, identity)?.into_client();
         ensure_cursor(&mut client, vault)?;
         let engine_identity = EngineIdentity {
             device_id: identity.device_id,
@@ -851,14 +888,13 @@ impl DevLocal {
     /// 再决定是否重新拉控制链）；每次新客户端天然读到最新的 `auth_rev`。
     ///
     /// 失败即真实失败（relay 不可达 / 被吊销 `REVOKED` / 控制链 pin 不符），不返回旧快照。
-    pub fn members(
-        relay_url: &str,
+    pub fn members<T: RelayTarget + ?Sized>(
+        target: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
     ) -> Result<Vec<MemberView>, SyncError> {
-        let root = root_of(identity);
-        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(relay_url, vault, identity, &root, signing_key, None)?;
+        let context = target.relay_context(None)?;
+        let mut client = context.open(vault, identity)?.into_client();
         client.members()
     }
 
@@ -879,8 +915,8 @@ impl DevLocal {
     ///
     /// 成功后**重新拉一次成员视图**再返回，调用方（worker）可直接把最新列表投影到面板，
     /// 不需要另发一条列表命令。
-    pub fn revoke_device(
-        relay_url: &str,
+    pub fn revoke_device<T: RelayTarget + ?Sized>(
+        relay: &T,
         vault: &Vault,
         identity: &LocalIdentityV1,
         target: DeviceId,
@@ -900,9 +936,8 @@ impl DevLocal {
         let manager = ManagementKey::from_seed(seed);
 
         // ③ CAS 基准取当前 `/state.control_rev`（独立吊销不推进它；不盲用 identity 里的旧值）。
-        let root = root_of(identity);
-        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-        let mut client = client_for(relay_url, vault, identity, &root, signing_key, None)?;
+        let context = relay.relay_context(None)?;
+        let mut client = context.open(vault, identity)?.into_client();
         let state = client.state()?;
         if state.instance_id != identity.pinned_instance {
             return Err(SyncError::RelayWire("relay instance 与本地 pin 不符"));
@@ -912,12 +947,13 @@ impl DevLocal {
         //    target 在 canonical body 里，跨设备不会碰撞）。
         let request_id: [u8; 16] = array(&mut OsRandom)?;
         let ctx = RevokeContext::from_identity(
-            relay_url,
+            context.origin_str().as_str(),
             identity,
             state.control_rev,
             SystemClock.now_secs(),
-        );
-        let mut transport = StdTcpTransport::new_local_dev_with(relay_url, None)?;
+        )
+        .with_api_version(context.api_version());
+        let mut transport = context.transport()?;
         let outcome = crate::device_management::revoke_device(
             &mut transport,
             &ctx,
@@ -927,7 +963,7 @@ impl DevLocal {
         )?;
 
         // ⑤ 只读刷新：`auth_rev` 已前进，新客户端自然读到吊销后的成员集合。
-        let members = Self::members(relay_url, vault, identity)?;
+        let members = Self::members(&context, vault, identity)?;
         Ok(RevokedDevice { outcome, members })
     }
 
@@ -954,13 +990,13 @@ impl DevLocal {
 
 /// genesis 的 password 槽材料只用于凑齐 `GenesisMaterials`（本模块不上传口令槽）：
 /// 用 32B 随机数的十六进制当一次性口令，构造完立即丢弃。
-fn throwaway_password() -> Result<String, SyncError> {
+pub(crate) fn throwaway_password() -> Result<String, SyncError> {
     let bytes: [u8; 32] = array(&mut OsRandom)?;
     Ok(ids::hex_of(&bytes))
 }
 
 /// 身份的当前 epoch 根。
-fn root_of(identity: &LocalIdentityV1) -> RootSecretV1 {
+pub(crate) fn root_of(identity: &LocalIdentityV1) -> RootSecretV1 {
     RootSecretV1::new(
         identity.vault_id,
         identity.current_epoch,
@@ -1015,50 +1051,18 @@ fn materialize_changed_bodies(
 }
 
 /// 把 `PeerId` 的 u64 映射回 16B（`identity.peer_id` 的存储形态）。
-fn peer_bytes_of(peer_id: u64) -> [u8; 16] {
+///
+/// 受限初始化入口（[`crate::init_session`]）也用同一条映射：Join 的 peer 口径只能有
+/// 一处，不允许各写一套。
+pub(crate) fn peer_bytes_of(peer_id: u64) -> [u8; 16] {
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&peer_id.to_be_bytes());
     bytes
 }
 
-/// 构造设备 realm 的 HTTP 客户端：显式管理信任锚 + 本地控制头 pin（identity 下界，
-/// 有 bootstrap pin 的哈希就一起带上，绝不借 loopback 豁免绕过已有 pin）。
-///
-/// `timeouts` 由调用方（ADR 0012 S1 的 `SyncOnceOptions`）传入；`None` = 历史默认预算。
-fn client_for(
-    relay_url: &str,
-    vault: &Vault,
-    identity: &LocalIdentityV1,
-    root: &RootSecretV1,
-    signing_key: DeviceSigningKey,
-    timeouts: Option<TransportTimeouts>,
-) -> Result<HttpRelayClient<StdTcpTransport>, SyncError> {
-    let transport = StdTcpTransport::new_local_dev_with(relay_url, timeouts)?;
-    let config = HttpRelayConfig {
-        base_url: relay_url.to_owned(),
-        vault_id: identity.vault_id,
-        device_id: identity.device_id,
-        manager_pub: Some(identity.pinned_manager),
-    };
-    Ok(HttpRelayClient::new(transport, config, signing_key)
-        .with_root(root.clone())
-        .with_control_pin(control_pin(vault, identity)?))
-}
-
-/// 本地控制头 pin：identity 的 `(instance, control_rev)` 是下界；bootstrap 落库的
-/// `sync.pinned_control_hash` 提供同 rev 完整性（A 侧没有，就只做下界）。
-fn control_pin(vault: &Vault, identity: &LocalIdentityV1) -> Result<ControlPin, SyncError> {
-    let mut pin = ControlPin::from_identity(identity);
-    let pins = BootstrapPins::from_vault(vault)?;
-    if let Some(hash) = pins.control_hash {
-        pin = pin.with_bootstrap_hash(hash);
-    }
-    Ok(pin)
-}
-
 /// 缺 `sync.relay_cursor` 时用 relay `GET /state` 键 14 兜底（genesis 键 5 的旧 relay 兼容）。
-fn ensure_cursor(
-    client: &mut HttpRelayClient<StdTcpTransport>,
+fn ensure_cursor<T: HttpTransport>(
+    client: &mut HttpRelayClient<T>,
     vault: &Vault,
 ) -> Result<(), SyncError> {
     if vault.get_meta(RELAY_CURSOR_META)?.is_none() {
@@ -1160,7 +1164,7 @@ fn load_initial_slot(vault: &Vault, vault_id: &VaultId) -> Result<KeySlotV1, Syn
 }
 
 /// `magic || u32 BE(descriptor_len) || CDE(descriptor) || nonce||ciphertext`。
-fn encode_initial_slot(slot: &KeySlotV1) -> Result<Vec<u8>, SyncError> {
+pub(crate) fn encode_initial_slot(slot: &KeySlotV1) -> Result<Vec<u8>, SyncError> {
     let descriptor = slot.descriptor.encode()?;
     let descriptor_len = u32::try_from(descriptor.len())
         .map_err(|_| SyncError::LocalCorrupt("初始槽描述符长度超出 u32"))?;
@@ -1314,14 +1318,23 @@ fn decode_published_baseline(bytes: &[u8]) -> Result<PublishedBaseline, SyncErro
     })
 }
 
-/// 清掉"本次调用刚建出来"的 vault 文件（主文件 + WAL 边车）。
+/// 清掉"本次调用刚建出来"的 vault 文件（主文件 + WAL 边车）与**空**实例目录。
 ///
 /// 只允许在调用方已确认路径原本不存在时使用；失败路径尽力而为，不掩盖原始错误。
-fn remove_vault_files(path: &Path) {
+///
+/// 目录只在"刚被本次初始化创建且为空"时删除（`remove_dir` 对非空目录失败，因此用户
+/// 已有内容的目录不会被删）：Create 现在必须**先**建库写 pending、再联网（ADR 0013
+/// S2b 的写前记录），所以"联网失败不该留下实例目录"这条既有验收要靠这里兜住。
+pub(crate) fn remove_vault_files(path: &Path) {
     let _ = std::fs::remove_file(path);
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_os_string();
         sidecar.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }

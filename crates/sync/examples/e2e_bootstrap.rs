@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use menghunote_storage::{
     asset_bytes, list_all_docs, list_assets, load_body_doc, load_structure, Vault,
 };
+use menghunote_sync::api_version::RelayApiVersion;
 use menghunote_sync::bootstrap;
 use menghunote_sync::http_relay::{HttpRelayClient, HttpRelayConfig, StdTcpTransport};
 use menghunote_sync::recovery_enroll;
@@ -59,8 +60,9 @@ fn main() -> AnyResult<()> {
 
     // 1. 恢复码自批（管理 token → invite → redeem → approve）。
     let mut transport = StdTcpTransport::new_local_dev(&relay)?;
+    let api = menghunote_sync::api_version::RelayApi::new(&relay, RelayApiVersion::V1);
     let enrolled =
-        recovery_enroll::self_enroll(&mut transport, &relay, vault_id, &recovery_code, now_secs())?;
+        recovery_enroll::self_enroll(&mut transport, &api, vault_id, &recovery_code, now_secs())?;
     for step in &enrolled.steps {
         println!("[bootstrap] recovery self-approval: {step}");
     }
@@ -71,6 +73,7 @@ fn main() -> AnyResult<()> {
         StdTcpTransport::new_local_dev(&relay)?,
         HttpRelayConfig {
             base_url: relay.clone(),
+            api_version: RelayApiVersion::V1,
             vault_id,
             device_id: enrolled.device_id,
             manager_pub: Some(manager_pub),

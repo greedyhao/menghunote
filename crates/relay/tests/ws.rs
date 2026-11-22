@@ -21,7 +21,7 @@ fn b64(bytes: &[u8]) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wake_pushes_state_and_closes_immediately_on_revoke() {
     let fx = block(|| Fixture::new("ws-wake"));
-    let state = AppState::new(fx.db.clone(), fx.cfg.clone(), fx.hook.clone());
+    let state = AppState::new(fx.db.inner().clone(), fx.cfg.clone(), fx.hook.clone());
     let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

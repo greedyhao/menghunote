@@ -48,7 +48,9 @@
 //!    由 `menghunote_sync::http_transport::StdTcpTransport` 提供；真实请求由
 //!    [`DevLocalRunner`] 在 worker 线程里发起（`DevLocal::sync_once` 内部自己构造传输）。
 
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -56,20 +58,26 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use menghunote_storage::{load_head, Vault, STRUCTURE_DOC_ID};
-use menghunote_sync::dev_local::DevLocal;
+use menghunote_sync::api_version::RelayApiVersion;
+use menghunote_sync::dev_local::{ApplyOutcome, DevLocal};
 use menghunote_sync::error::SyncError;
+use menghunote_sync::http_relay::Clock as _;
 use menghunote_sync::http_transport::StdTcpTransport;
 use menghunote_sync::identity::LocalIdentityV1;
+use menghunote_sync::invite_link::{approve_pending_device, create_invite_link, InviteLink};
+use menghunote_sync::relay_context::RelayContext;
+use menghunote_sync::relay_policy::RelayMode;
 use menghunote_sync::DeviceId;
 
 pub use menghunote_sync::http_transport::{
     TransportTimeouts, AUTOSYNC_TRANSPORT_TIMEOUTS, DEFAULT_TRANSPORT_TIMEOUTS,
 };
 
-use super::identity::DevIdentityStore;
+use super::identity::{DevIdentityStore, IDENTITY_FILE_NAME};
 use super::state::{
-    short_device_id, Busy, BusyReason, CloseState, Command, Event, HeldGate, OpId, OpOutcome,
-    OpResult, Phase, StateSnapshot, StopTicket, SyncPhase, SyncState, REVOKE_UNCHANGED_MARKER,
+    short_device_id, Busy, BusyReason, CloseState, Command, Event, HeldGate, InviteLinkView, OpId,
+    OpOutcome, OpResult, Phase, RotationFacts, RotationTask, StateSnapshot, StopTicket, SyncPhase,
+    SyncState, REVOKE_UNCHANGED_MARKER,
 };
 
 /// 默认操作 deadline：开发演示下 Argon2/首次 bootstrap 可能很慢，但也不能无限挂。
@@ -78,8 +86,12 @@ pub const DEFAULT_OPERATION_DEADLINE: Duration = Duration::from_secs(120);
 /// worker 的配置（门禁产出、面板显示、测试注入）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceConfig {
-    /// relay 基地址（只用于显示与传输配置；**不含 secret**）。
+    /// relay 接入模式（ADR 0013 §1：`local_dev` / `remote_tls`；显式，不从 URL 猜）。
+    pub mode: RelayMode,
+    /// relay 基地址（canonical origin；只用于显示与传输配置；**不含 secret**）。
     pub relay: String,
+    /// relay API 面（ADR 0014 S3a：缺省 v1；v2 profile 由公开配置显式给出）。
+    pub api_version: RelayApiVersion,
     /// 单条命令的 deadline（`None` = 不限制）。
     pub operation_deadline: Option<Duration>,
     /// 传输层超时（ADR 0012 S1：**真实**接到 `DevLocal` 的 transport 构造上）。
@@ -95,10 +107,35 @@ impl ServiceConfig {
     #[must_use]
     pub fn new(relay: impl Into<String>) -> Self {
         Self {
+            mode: RelayMode::LocalDev,
             relay: relay.into(),
+            api_version: RelayApiVersion::V1,
             operation_deadline: Some(DEFAULT_OPERATION_DEADLINE),
             transport: DEFAULT_TRANSPORT_TIMEOUTS,
         }
+    }
+
+    /// 显式选择 relay API 面（v2 profile；默认 v1）。
+    #[must_use]
+    pub fn with_api_version(mut self, api_version: RelayApiVersion) -> Self {
+        self.api_version = api_version;
+        self
+    }
+
+    /// 显式模式（`local_dev` / `remote_tls`）；remote 走 production TLS 策略。
+    #[must_use]
+    pub fn new_for(mode: RelayMode, relay: impl Into<String>) -> Self {
+        Self {
+            mode,
+            ..Self::new(relay)
+        }
+    }
+
+    /// 换 relay 模式（地址不变；调用方负责地址与模式匹配）。
+    #[must_use]
+    pub fn with_mode(mut self, mode: RelayMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// 自动同步场景的建议配置（ADR 0012：连接/IO/请求 = 5/10/30s）。
@@ -124,7 +161,18 @@ impl ServiceConfig {
     /// 与 worker 真实同步用的是**同一个** [`TransportTimeouts`]：这里只是把"配置能不能
     /// 构造出一个合法 transport"也暴露出来（门禁/诊断/测试）。
     pub fn build_transport(&self) -> Result<StdTcpTransport, SyncError> {
-        StdTcpTransport::new_local_dev_with(&self.relay, Some(self.transport))
+        // 唯一权威 URL 策略（ADR 0013 §1/§6）：与 worker 的操作共用同一个 context 构造点
+        // （remote_tls → production TLS；local_dev → 开发明文），不单独拼 transport。
+        self.relay_context()?.transport()
+    }
+
+    /// 按模式构造唯一权威的 relay context（URL/策略/预算只有一处）。
+    pub fn relay_context(&self) -> Result<RelayContext, SyncError> {
+        let context = match self.mode {
+            RelayMode::LocalDev => RelayContext::local_dev(&self.relay, self.transport),
+            RelayMode::RemoteTls => RelayContext::remote_tls(&self.relay, self.transport),
+        }?;
+        Ok(context.with_api_version(self.api_version))
     }
 }
 
@@ -352,6 +400,10 @@ impl SyncRunner for UnimplementedRunner {
 /// （`K_slot_mne` 只能由恢复码派生，事后无法补传）。Create/Join 仍返回"未实现"，走 CLI
 /// （`--dev-sync-create` / `--dev-sync-join`，见 `dev_sync::setup`）。
 pub struct DevLocalRunner {
+    /// relay 接入模式（ADR 0013 §1；remote 走 production TLS）。
+    mode: RelayMode,
+    /// relay API 面（ADR 0014 S3a；缺省 v1）。
+    api_version: RelayApiVersion,
     relay: String,
     vault_path: PathBuf,
     /// 传输预算（ADR 0012 S1：由 `ServiceConfig` 传入，不在 `DevLocal` 内部硬编）。
@@ -378,7 +430,20 @@ impl DevLocalRunner {
         vault_path: PathBuf,
         transport: TransportTimeouts,
     ) -> Self {
+        Self::new_with_mode_and_transport(RelayMode::LocalDev, relay, vault_path, transport)
+    }
+
+    /// 显式模式的构造（app 从公开配置的 `relay_mode` 传入；不按 URL 猜）。
+    #[must_use]
+    pub fn new_with_mode_and_transport(
+        mode: RelayMode,
+        relay: impl Into<String>,
+        vault_path: PathBuf,
+        transport: TransportTimeouts,
+    ) -> Self {
         Self {
+            mode,
+            api_version: RelayApiVersion::V1,
             relay: relay.into(),
             vault_path,
             transport,
@@ -387,10 +452,52 @@ impl DevLocalRunner {
         }
     }
 
+    /// 显式 API 面（app 从公开配置的 `api_version` 传入；默认 v1）。
+    #[must_use]
+    pub fn with_api_version(mut self, api_version: RelayApiVersion) -> Self {
+        self.api_version = api_version;
+        self
+    }
+
+    /// 当前 relay API 面（诊断/测试断言用）。
+    #[must_use]
+    pub const fn api_version(&self) -> RelayApiVersion {
+        self.api_version
+    }
+
+    /// 当前 relay 模式（诊断/测试断言用）。
+    #[must_use]
+    pub const fn relay_mode(&self) -> RelayMode {
+        self.mode
+    }
+
     /// 当前生效的传输预算（配置透传的单测/诊断用）。
     #[must_use]
     pub fn transport_timeouts(&self) -> TransportTimeouts {
         self.transport
+    }
+
+    /// 本 worker 使用的 relay context（ADR 0013 S2/S3）。
+    ///
+    /// 所有同步操作都拿这**同一个** context：模式/URL/预算/pin 策略只有一处来源。
+    /// `remote_tls` 显式走 production TLS；**不会**按 URL 猜模式，也不会降级成本地明文。
+    fn relay_context(&self) -> Result<RelayContext, String> {
+        RelayContext::from_mode(self.mode, &self.relay, self.transport)
+            .map(|context| context.with_api_version(self.api_version))
+            .map_err(|error| format!("relay 配置无效（模式 {}）：{error}", self.mode.as_str()))
+    }
+
+    /// 取一份**独占**的身份（从缓存移出；调用方负责在成功后放回新身份）。
+    ///
+    /// 为什么需要它：`LocalIdentityV1` 刻意不实现 `Clone`（秘密材料不复制），而轮换/apply
+    /// 的库级入口要 `&mut LocalIdentityV1`。移出缓存后如果失败，缓存留空、下一次操作按需
+    /// 重新解封——语义不变，且不会在进程里多留一份秘密副本。
+    fn take_identity(&mut self) -> Result<LocalIdentityV1, String> {
+        self.load_identity()?;
+        Ok(self
+            .identity
+            .take()
+            .expect("load_identity 成功后缓存必然存在"))
     }
 
     /// 读回持久身份（首次从 `dev-identity.bin` 解封，之后复用 worker 内的缓存）。
@@ -409,6 +516,18 @@ impl DevLocalRunner {
             "dev-sync 身份缓存异常（内部错误）".to_owned()
         })
     }
+}
+
+/// 邀请成功摘要（不含 URL/token）：短 invite id + TTL 分钟数。
+fn invite_summary(link: &InviteLink) -> String {
+    format!(
+        "已生成邀请 {}（{} 分钟内一次性有效；链接含令牌，只显示在本机面板）",
+        link.short_invite_id(),
+        (link
+            .expires_at
+            .saturating_sub(menghunote_sync::http_relay::SystemClock.now_secs()))
+            / 60
+    )
 }
 
 impl SyncRunner for DevLocalRunner {
@@ -459,6 +578,20 @@ impl SyncRunner for DevLocalRunner {
             }
             Command::ListDevices => self.list_devices(events),
             Command::RevokeDevice { target } => self.revoke_device(target, events),
+            // 邀请（ADR 0014 S1）：只生成链接 / 批准 pending 设备；都不 integrate。
+            Command::CreateInvite => self.create_invite(events),
+            Command::ApproveDevice { device } => self.approve_device(device, events),
+            // 轮换 / 应用新 epoch（切片 6a）：与旧整轮 `SyncOnce` 一样**整段持闸**。
+            Command::Rotate {
+                recovery_code,
+                revoke,
+            } => self.rotate(
+                gate,
+                recovery_code.as_ref().map(|code| code.as_str()),
+                &revoke,
+                events,
+            ),
+            Command::ApplyEpoch => self.apply_epoch(gate, events),
             control if control.is_control() => Ok(OpOutcome::new("控制命令无同步动作")),
             other => {
                 let label = other.kind().label();
@@ -508,6 +641,7 @@ impl DevLocalRunner {
         });
         let vault = self.open_vault()?;
         let relay = self.relay.clone();
+        let context = self.relay_context()?;
         let identity = self.load_identity()?;
 
         events(Event::Progress {
@@ -515,7 +649,7 @@ impl DevLocalRunner {
             phase: Phase::Transport,
             detail: format!("读取设备列表（{relay}）"),
         });
-        let members = DevLocal::members(&relay, &vault, identity)
+        let members = DevLocal::members(&context, &vault, identity)
             .map_err(|error| format!("读取设备列表失败：{error}"))?;
         let count = members.len();
         let self_device = identity.device_id;
@@ -526,6 +660,110 @@ impl DevLocalRunner {
             can_manage,
         });
         Ok(OpOutcome::new(format!("设备列表已刷新（{count} 台）")))
+    }
+
+    /// 生成一次性邀请链接（ADR 0014 S1；**仅创建端**）。
+    ///
+    /// 守卫：有受保护身份里的管理私钥、库可打开、relay instance 与 pin 一致。链接只经
+    /// `Event::InviteLinkCreated` 交回面板（内存），worker **不**打印/不落盘 URL；失败时
+    /// 明确报错（无管理钥/无 pin/relay 不可达），不返回半成品。
+    fn create_invite(&mut self, events: &mut dyn FnMut(Event)) -> Result<OpOutcome, String> {
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Preparing,
+            detail: "读取持久身份并打开本地库".to_owned(),
+        });
+        let vault = self.open_vault()?;
+        let context = self.relay_context()?;
+        let relay = self.relay.clone();
+        let identity = self.load_identity()?;
+        if identity.manager_seed.is_none() {
+            return Err(
+                "生成邀请被拒绝：本机没有管理密钥（Join/邀请加入的设备）；请在有管理钥的设备上生成"
+                    .to_owned(),
+            );
+        }
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Transport,
+            detail: format!("向 relay 申请一次性邀请（{relay}）"),
+        });
+        let link = create_invite_link(&context, &vault, identity)
+            .map_err(|error| format!("生成邀请失败：{error}"))?;
+        let view = InviteLinkView {
+            url: link.url.clone(),
+            invite_id: link.invite_id,
+            expires_at: link.expires_at,
+        };
+        let summary = invite_summary(&link);
+        events(Event::InviteLinkCreated { link: view });
+        Ok(OpOutcome::new(summary))
+    }
+
+    /// 批准一台 PENDING 设备（ADR 0014 S1 §3；**仅创建端**）。
+    ///
+    /// 管理签名 + HPKE grant 全部在 `menghunote_sync::invite_link` 里完成；worker 只做
+    /// 守卫（管理钥）、派发与刷新后的设备列表投影。失败**不清 pending**、不重签。
+    fn approve_device(
+        &mut self,
+        target: DeviceId,
+        events: &mut dyn FnMut(Event),
+    ) -> Result<OpOutcome, String> {
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Preparing,
+            detail: "读取持久身份并打开本地库".to_owned(),
+        });
+        let vault = self.open_vault()?;
+        let context = self.relay_context()?;
+        let identity = self.load_identity()?;
+        if identity.manager_seed.is_none() {
+            return Err(
+                "批准设备被拒绝：本机没有管理密钥（Join/邀请加入的设备）；请用 Create 设备操作"
+                    .to_owned(),
+            );
+        }
+        let self_device = identity.device_id;
+        let can_manage = identity.manager_seed.is_some();
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Transport,
+            detail: format!("批准设备（目标 {}）", short_device_id(&target)),
+        });
+        let approved = approve_pending_device(
+            &context,
+            &vault,
+            identity,
+            target,
+            menghunote_sync::http_relay::SystemClock.now_secs(),
+        )
+        .map_err(|error| format!("批准设备失败：{error}"))?;
+        let summary = if approved.changed {
+            format!(
+                "已批准 {}（指纹 {}）；请在加入端检查状态",
+                short_device_id(&approved.device_id),
+                approved.fingerprint
+            )
+        } else {
+            format!(
+                "{} 此前已批准（幂等，未重复签名）",
+                short_device_id(&approved.device_id)
+            )
+        };
+        events(Event::DeviceApproved {
+            target: approved.device_id,
+            fingerprint: approved.fingerprint,
+            changed: approved.changed,
+        });
+        // 成功后刷新成员视图（面板直接看到 Pending → Active）。
+        let members = DevLocal::members(&context, &vault, identity)
+            .map_err(|error| format!("批准成功但刷新设备列表失败：{error}"))?;
+        events(Event::DevicesListed {
+            members,
+            self_device,
+            can_manage,
+        });
+        Ok(OpOutcome::new(summary))
     }
 
     /// 移除一台设备对 relay 的访问（ADR 0010：**不轮换密钥**、不删本地身份/outbox）。
@@ -544,7 +782,7 @@ impl DevLocalRunner {
             detail: "读取持久身份并打开本地库".to_owned(),
         });
         let vault = self.open_vault()?;
-        let relay = self.relay.clone();
+        let context = self.relay_context()?;
         let identity = self.load_identity()?;
         if target == identity.device_id {
             return Err("移除设备被拒绝：不能移除本机设备（会立即自断同步与管理访问）".to_owned());
@@ -562,7 +800,7 @@ impl DevLocalRunner {
             phase: Phase::Transport,
             detail: format!("发送管理端移除请求（目标 {}）", short_device_id(&target)),
         });
-        let revoked = DevLocal::revoke_device(&relay, &vault, identity, target)
+        let revoked = DevLocal::revoke_device(&context, &vault, identity, target)
             .map_err(|error| format!("移除设备失败：{error}"))?;
         let summary = if revoked.outcome.changed {
             format!(
@@ -642,6 +880,7 @@ impl DevLocalRunner {
         // 3) 身份（worker 线程内解封/缓存；失败不触发任何网络请求）。
         let relay = self.relay.clone();
         let transport = self.transport;
+        let context = self.relay_context()?;
         let identity = self.load_identity()?;
 
         events(Event::Progress {
@@ -669,12 +908,13 @@ impl DevLocalRunner {
             }
             Ok(())
         };
+        // 预算由 context 携带（单一来源）；这里不再重复传 legacy transport。
         let options = menghunote_sync::dev_local::SyncOnceOptions {
-            transport: Some(transport),
+            transport: None,
             before_integrate: Some(&mut before_integrate),
         };
         let report =
-            DevLocal::sync_once_with(&relay, &vault, identity, options).map_err(|error| {
+            DevLocal::sync_once_with(&context, &vault, identity, options).map_err(|error| {
                 eprintln!("[dev-sync] sync_once 失败：{error}");
                 format!("同步失败：{error}")
             })?;
@@ -740,7 +980,7 @@ impl DevLocalRunner {
 
         // 3) 身份（worker 线程内解封/缓存；失败不触发任何网络请求）。
         let relay = self.relay.clone();
-        let transport = self.transport;
+        let context = self.relay_context()?;
         let identity = self.load_identity()?;
 
         events(Event::Progress {
@@ -758,11 +998,11 @@ impl DevLocalRunner {
             }
         };
         let options = menghunote_sync::dev_local::SyncOnceOptions {
-            transport: Some(transport),
+            transport: None,
             before_integrate: Some(&mut before_integrate),
         };
         let report =
-            DevLocal::sync_once_with(&relay, &vault, identity, options).map_err(|error| {
+            DevLocal::sync_once_with(&context, &vault, identity, options).map_err(|error| {
                 eprintln!("[dev-sync] 无会话 sync_once 失败：{error}");
                 format!("同步失败：{error}")
             })?;
@@ -837,7 +1077,7 @@ impl DevLocalRunner {
 
         // 3) 身份（worker 线程内解封/缓存；失败不触发任何网络请求）。
         let relay = self.relay.clone();
-        let transport = self.transport;
+        let context = self.relay_context()?;
         let identity = self.load_identity()?;
         // UI 会禁用按钮；命令可能来自任何地方，这里再兜一次（权威判定在身份里）。
         if identity.manager_seed.is_none() {
@@ -868,11 +1108,11 @@ impl DevLocalRunner {
             Ok(())
         };
         let options = menghunote_sync::dev_local::SyncOnceOptions {
-            transport: Some(transport),
+            transport: None,
             before_integrate: Some(&mut before_integrate),
         };
         let report =
-            DevLocal::publish_initial_pair_with_identity_with(&relay, &vault, identity, options)
+            DevLocal::publish_initial_pair_with_identity_with(&context, &vault, identity, options)
                 .map_err(|error| {
                     eprintln!("[dev-sync] publish_initial_pair 失败：{error}");
                     format!("发布初始基线失败：{error}")
@@ -899,6 +1139,331 @@ impl DevLocalRunner {
         Ok(OpOutcome::new(summary))
     }
 
+    /// A 侧轮换（ADR 0009 Phase 2 切片 6a）：在**整段持闸**下调用库级
+    /// [`DevLocal::rotate`]，成功后把新身份写回 `dev-identity.bin`（MNID 外层不变）。
+    ///
+    /// ## 顺序（与库级入口逐条对应）
+    ///
+    /// 1. 缺 `HeldGate` → 明确失败（轮换内部先跑 `sync_once`，会 integrate）；
+    /// 2. 复核「库中 head == 持闸时的 durable head」；
+    /// 3. 解封身份 → 提前拒绝 Join 设备（没有管理私钥）；
+    /// 4. 把身份以**裸 `protect()` 字节**交给同目录交接文件（库级入口的 `identity_path`
+    ///    不是 MNID 外层；`apply` 的认证收尾还要读它）；
+    /// 5. `DevLocal::rotate`（失败保留 journal，不推广、不重试）；
+    /// 6. 读回推广后的身份 → [`DevIdentityStore::replace_protected`]（rename 是唯一提交点）
+    ///    → 重新 `load` 身份，保证 worker 缓存与磁盘一致；
+    /// 7. 只上报公开事实（epoch / checkpoint 短 id / 是否补发恢复码 / 失败阶段）。
+    ///
+    /// ## 恢复码
+    ///
+    /// `Some(code)`：库级入口校验收复码派生出的管理 key 就是当前 pin 的管理身份，然后用
+    /// 它重新封候选 epoch 的 recovery 槽——轮换后新设备仍可用**同一恢复码**加入；
+    /// `None`：槽用一次性随机种子封存（relay 契约要求），但**没人能打开它**，这里明确
+    /// 警告"轮换后新设备无法用恢复码加入"。
+    ///
+    /// ## 失败语义
+    ///
+    /// 失败/中断保留 `RotationJournal` 与全部 durable 事实；身份文件**不变**（旧 epoch
+    /// 仍可重试/收尾），**绝不自动重试**。错误里带公开阶段名，不含根/管理私钥/恢复码。
+    fn rotate(
+        &mut self,
+        gate: Option<&HeldGate>,
+        recovery_code: Option<&str>,
+        revoke: &[DeviceId],
+        events: &mut dyn FnMut(Event),
+    ) -> Result<OpOutcome, String> {
+        let gate = require_gate(gate, "轮换")?;
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Preparing,
+            detail: format!(
+                "持闸已确认（{}，基准 head {}），打开本地库",
+                gate.doc_id, gate.durable_head_seq
+            ),
+        });
+        let vault = self.open_vault()?;
+        verify_gate_head(&vault, gate, "轮换")?;
+
+        let mut identity = self.take_identity()?;
+        if identity.manager_seed.is_none() {
+            return Err(
+                "轮换被拒绝：本机没有管理密钥（Join 设备不能发起轮换）；请用 Create 设备/管理设备发起"
+                    .to_owned(),
+            );
+        }
+        let vault_id = identity.vault_id;
+        let device_id = identity.device_id;
+        let from_epoch = identity.current_epoch;
+        let store_path = DevIdentityStore::path_for(&self.vault_path);
+        let handoff = LibraryIdentityHandoff::prepare(&store_path, &identity)?;
+        let relay = self.relay.clone();
+        let context = self.relay_context()?;
+        let resume_after_writeback = |message: String| {
+            format!("{message}；身份已在交接文件中推广，可重试「应用新 epoch」追平（不自动重试）")
+        };
+
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Transport,
+            detail: format!("轮换：relay {relay}（{} 台待吊销）", revoke.len()),
+        });
+        let outcome = match DevLocal::rotate(
+            &context,
+            &vault,
+            &handoff.path,
+            &mut identity,
+            revoke,
+            recovery_code,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let phase = rotation_phase_label(&vault);
+                events(Event::RotationCompleted {
+                    op_id: OpId::UNASSIGNED,
+                    facts: RotationFacts::failed(RotationTask::Rotate, from_epoch, phase.clone()),
+                });
+                return Err(format!("轮换失败（阶段：{phase}）：{error}"));
+            }
+        };
+
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Durability,
+            detail: format!(
+                "轮换已激活（epoch {} → {}），写回受保护身份",
+                outcome.from_epoch, outcome.to_epoch
+            ),
+        });
+        let promoted = handoff.read_promoted(&vault_id, device_id)?;
+        if promoted.current_epoch != outcome.to_epoch {
+            return Err(format!(
+                "轮换推广后的交接身份 epoch 不符（文件 {}，预期 {}）：拒绝写回",
+                promoted.current_epoch, outcome.to_epoch
+            ));
+        }
+        if let Err(error) = DevIdentityStore.replace_protected(&store_path, &promoted) {
+            return Err(resume_after_writeback(format!(
+                "轮换已在新 epoch {} 完成，但受保护身份写回失败：{error:#}",
+                outcome.to_epoch
+            )));
+        }
+        // 内存身份必须立刻与磁盘一致（否则下一次 sync/apply 会用旧 epoch 的缓存）。
+        self.identity = None;
+        let reloaded = self.take_identity()?;
+        if reloaded.current_epoch != outcome.to_epoch
+            || reloaded.device_id != device_id
+            || reloaded.vault_id != vault_id
+        {
+            return Err(format!(
+                "重新加载受保护身份后 epoch/设备不符（epoch {}，预期 {}）",
+                reloaded.current_epoch, outcome.to_epoch
+            ));
+        }
+        self.identity = Some(reloaded);
+
+        let recovery_note = if recovery_code.is_some() {
+            "恢复码已随新 epoch 重封（新设备可用同一恢复码加入）"
+        } else {
+            eprintln!(
+                "[dev-sync] 轮换未提供恢复码：新 epoch 的 recovery 槽用一次性随机种子封装；\
+                 轮换后新设备无法用恢复码加入"
+            );
+            "恢复码未补发（轮换后新设备无法用恢复码加入）"
+        };
+        let facts = RotationFacts {
+            task: RotationTask::Rotate,
+            from_epoch: outcome.from_epoch,
+            to_epoch: Some(outcome.to_epoch),
+            primary_checkpoint: Some(short_checkpoint_id(&outcome.checkpoint_ids[0])),
+            fallback_checkpoint: Some(short_checkpoint_id(&outcome.checkpoint_ids[1])),
+            recovery_code_reissued: recovery_code.is_some(),
+            revoked: outcome.revoked.len(),
+            already_current: false,
+            failure_phase: None,
+        };
+        events(Event::RotationCompleted {
+            op_id: OpId::UNASSIGNED,
+            facts,
+        });
+        let summary = format!(
+            "轮换完成：epoch {} → {}；checkpoint {} / {}；移除 {} 台；{recovery_note}",
+            outcome.from_epoch,
+            outcome.to_epoch,
+            short_checkpoint_id(&outcome.checkpoint_ids[0]),
+            short_checkpoint_id(&outcome.checkpoint_ids[1]),
+            outcome.revoked.len()
+        );
+        Ok(OpOutcome::new(summary))
+    }
+
+    /// B 侧应用 relay 最新 epoch（ADR 0009 Phase 2 切片 6a）：同样**整段持闸**。
+    ///
+    /// 顺序：持闸复核 → 解封身份 → 交接文件 → [`DevLocal::apply_latest_epoch`]（认证
+    /// activation 链 + 本机 grant 解根 + 基线 merge/推广）→ 写回受保护身份 → 重新 `load`。
+    ///
+    /// 结果映射（**不半推广**）：
+    ///
+    /// - `Applied`：写回身份并上报公开事实（from/to epoch、checkpoint 短 id）；
+    /// - `AlreadyCurrent`：幂等成功，不推广、不重建视图（`already_current = true`）；
+    /// - `NotGranted`：本机不在本次 grant 列表（被移除/未授权）→ 明确拒绝，保持旧 epoch；
+    /// - `Paused`：可重试失败（apply 冻结屏障保留）→ 明确错误，身份/视图不变。
+    fn apply_epoch(
+        &mut self,
+        gate: Option<&HeldGate>,
+        events: &mut dyn FnMut(Event),
+    ) -> Result<OpOutcome, String> {
+        let gate = require_gate(gate, "应用新 epoch")?;
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Preparing,
+            detail: format!(
+                "持闸已确认（{}，基准 head {}），打开本地库",
+                gate.doc_id, gate.durable_head_seq
+            ),
+        });
+        let vault = self.open_vault()?;
+        verify_gate_head(&vault, gate, "应用新 epoch")?;
+
+        let mut identity = self.take_identity()?;
+        let vault_id = identity.vault_id;
+        let device_id = identity.device_id;
+        let from_epoch = identity.current_epoch;
+        let store_path = DevIdentityStore::path_for(&self.vault_path);
+        let handoff = LibraryIdentityHandoff::prepare(&store_path, &identity)?;
+        let relay = self.relay.clone();
+        let context = self.relay_context()?;
+
+        events(Event::Progress {
+            op_id: OpId::UNASSIGNED,
+            phase: Phase::Transport,
+            detail: format!("应用新 epoch：认证 activation 链并合并基线（{relay}）"),
+        });
+        let outcome =
+            match DevLocal::apply_latest_epoch(&context, &vault, &handoff.path, &mut identity) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let phase = apply_phase_label(&vault);
+                    events(Event::RotationCompleted {
+                        op_id: OpId::UNASSIGNED,
+                        facts: RotationFacts::failed(
+                            RotationTask::ApplyEpoch,
+                            from_epoch,
+                            phase.clone(),
+                        ),
+                    });
+                    return Err(format!("应用新 epoch 失败（阶段：{phase}）：{error}"));
+                }
+            };
+
+        match outcome {
+            ApplyOutcome::Applied {
+                from_epoch: applied_from,
+                to_epoch,
+                checkpoint_id,
+                baseline_s,
+                ..
+            } => {
+                let promoted = handoff.read_promoted(&vault_id, device_id)?;
+                if promoted.current_epoch != to_epoch {
+                    return Err(format!(
+                        "apply 推广后的交接身份 epoch 不符（文件 {}，预期 {to_epoch}）：拒绝写回",
+                        promoted.current_epoch
+                    ));
+                }
+                if let Err(error) = DevIdentityStore.replace_protected(&store_path, &promoted) {
+                    return Err(format!(
+                        "已应用到新 epoch {to_epoch}，但受保护身份写回失败：{error:#}；                         可重试「应用新 epoch」追平（不自动重试）"
+                    ));
+                }
+                self.identity = None;
+                let reloaded = self.take_identity()?;
+                if reloaded.current_epoch != to_epoch {
+                    return Err(format!(
+                        "重新加载受保护身份后 epoch 不符（{}，预期 {to_epoch}）",
+                        reloaded.current_epoch
+                    ));
+                }
+                self.identity = Some(reloaded);
+                let facts = RotationFacts {
+                    task: RotationTask::ApplyEpoch,
+                    from_epoch: applied_from,
+                    to_epoch: Some(to_epoch),
+                    primary_checkpoint: Some(short_checkpoint_id(&checkpoint_id)),
+                    fallback_checkpoint: None,
+                    recovery_code_reissued: false,
+                    revoked: 0,
+                    already_current: false,
+                    failure_phase: None,
+                };
+                events(Event::RotationCompleted {
+                    op_id: OpId::UNASSIGNED,
+                    facts,
+                });
+                let summary = format!(
+                    "已应用新 epoch：{applied_from} → {to_epoch}；checkpoint {}；基线 S {baseline_s}",
+                    short_checkpoint_id(&checkpoint_id)
+                );
+                Ok(OpOutcome::new(summary))
+            }
+            ApplyOutcome::AlreadyCurrent { epoch } => {
+                self.identity = None;
+                let reloaded = self.take_identity()?;
+                let current_epoch = reloaded.current_epoch;
+                self.identity = Some(reloaded);
+                let facts = RotationFacts {
+                    task: RotationTask::ApplyEpoch,
+                    from_epoch: current_epoch,
+                    to_epoch: Some(epoch),
+                    primary_checkpoint: None,
+                    fallback_checkpoint: None,
+                    recovery_code_reissued: false,
+                    revoked: 0,
+                    already_current: true,
+                    failure_phase: None,
+                };
+                events(Event::RotationCompleted {
+                    op_id: OpId::UNASSIGNED,
+                    facts,
+                });
+                Ok(OpOutcome::new(format!(
+                    "已是最新 epoch：{epoch}（无需 apply）"
+                )))
+            }
+            ApplyOutcome::NotGranted {
+                device_id: target,
+                local_epoch,
+            } => {
+                let phase = apply_phase_label(&vault);
+                events(Event::RotationCompleted {
+                    op_id: OpId::UNASSIGNED,
+                    facts: RotationFacts::failed(
+                        RotationTask::ApplyEpoch,
+                        local_epoch,
+                        phase.clone(),
+                    ),
+                });
+                Err(format!(
+                    "应用新 epoch 被拒绝：本机（{}）不在 relay 最新 epoch 的授权（grant）列表内                     （已被移除/未授权）；保持旧 epoch {local_epoch}，未做任何推广（阶段：{phase}）",
+                    short_device_id(&target)
+                ))
+            }
+            ApplyOutcome::Paused { reason } => {
+                let phase = apply_phase_label(&vault);
+                events(Event::RotationCompleted {
+                    op_id: OpId::UNASSIGNED,
+                    facts: RotationFacts::failed(
+                        RotationTask::ApplyEpoch,
+                        from_epoch,
+                        phase.clone(),
+                    ),
+                });
+                Err(format!(
+                    "应用新 epoch 暂停：{reason}（身份保持旧 epoch，未半推广；阶段：{phase}；可原样重试）"
+                ))
+            }
+        }
+    }
+
     /// ADR 0012 S2a：可暂停的两阶段同步（由 worker 的 `run_two_phase` 调用）。
     ///
     /// ## 顺序（硬约束）
@@ -919,8 +1484,8 @@ impl DevLocalRunner {
         control: &OpControl,
         events: &mut dyn FnMut(Event),
     ) -> Result<OpOutcome, String> {
-        let relay = self.relay.clone();
-        let transport = self.transport;
+        // 三阶段共用同一个 local_dev context（预算/pin 策略只有一处来源）。
+        let context = self.relay_context()?;
 
         // ---------- 1) Prepare：网络阶段，不持闸 ----------
         events(Event::Progress {
@@ -931,7 +1496,7 @@ impl DevLocalRunner {
         let (prepare, ready) = {
             let vault = self.open_vault()?;
             let identity = self.load_identity()?;
-            let prepare = DevLocal::sync_prepare(&relay, &vault, identity, Some(transport))
+            let prepare = DevLocal::sync_prepare(&context, &vault, identity, None)
                 .map_err(|error| format!("同步失败（Prepare）：{error}"))?;
             // "已接收·待应用"：verified 且落在 durable 连续前缀内、尚未集成的行
             // （ADR 0012：收到 ≠ 已应用，面板必须能显示这个数）。
@@ -999,10 +1564,10 @@ impl DevLocalRunner {
             let vault = self.open_vault()?;
             let identity = self.load_identity()?;
             DevLocal::sync_integrate(
-                &relay,
+                &context,
                 &vault,
                 identity,
-                Some(transport),
+                None,
                 Some((gate.doc_id.as_str(), gate.durable_head_seq)),
                 &gate.doc_id,
             )
@@ -1060,7 +1625,7 @@ impl DevLocalRunner {
         let finish = {
             let vault = self.open_vault()?;
             let identity = self.load_identity()?;
-            DevLocal::sync_finish(&relay, &vault, identity, Some(transport))
+            DevLocal::sync_finish(&context, &vault, identity, None)
                 .map_err(|error| format!("同步失败（Finish）：{error}"))?
         };
         let summary = format!(
@@ -1159,6 +1724,136 @@ impl DevLocalRunner {
     }
 }
 
+/// 轮换 / apply 的持闸证明校验（缺证明 → 明确失败，不进入网络或本地写）。
+fn require_gate<'a>(gate: Option<&'a HeldGate>, action: &str) -> Result<&'a HeldGate, String> {
+    gate.ok_or_else(|| {
+        format!(
+            "{action}必须带持闸证明（HeldGate）：UI 未把活动文档冻结到 durable 时，\
+             worker 拒绝在外部事务边界里集成/推广"
+        )
+    })
+}
+
+/// 库中 head 必须就是持闸时的 durable 基准（否则 UI 并没有真的冻结本地写入）。
+fn verify_gate_head(vault: &Vault, gate: &HeldGate, action: &str) -> Result<(), String> {
+    let head = load_head(vault, &gate.doc_id)
+        .map_err(|error| format!("读取持闸文档 head 失败（{}）：{error}", gate.doc_id))?;
+    if head.head_seq != gate.durable_head_seq {
+        return Err(format!(
+            "持闸基准与库中 head 不一致（库中 {}，持闸时 {}）：拒绝在未持闸状态下{action}",
+            head.head_seq, gate.durable_head_seq
+        ));
+    }
+    Ok(())
+}
+
+/// 轮换 journal 的公开阶段名（失败报告用；没有 journal = "未开始"）。
+fn rotation_phase_label(vault: &Vault) -> String {
+    match menghunote_sync::rotation_journal::RotationJournal::load(vault) {
+        Ok(Some(journal)) => journal.phase.label().to_owned(),
+        Ok(None) => "未开始".to_owned(),
+        Err(error) => format!("读取轮换 journal 失败：{error}"),
+    }
+}
+
+/// apply 的 durable phase（失败报告用；没有记录 = "未开始"）。
+fn apply_phase_label(vault: &Vault) -> String {
+    match menghunote_sync::dev_local_rotation::apply_phase(vault) {
+        Ok(Some(phase)) => phase.as_str().to_owned(),
+        Ok(None) => "未开始".to_owned(),
+        Err(error) => format!("读取 apply phase 失败：{error}"),
+    }
+}
+
+/// 库级轮换入口的**身份交接文件**（`DevIdentityStore` 的 MNID 外层与库级
+/// `identity_path` 的"裸 `protect()` 字节"不同）。
+///
+/// 为什么需要它：`promote_identity_with_material` / `apply_epoch_change_with_client` 的
+/// 唯一提交点是对**给定路径**的原子 rename；把 MNID 外层交给它们会直接破坏本地格式，
+/// 而只做"内存推广"就是半推广。所以：
+///
+/// 1. 同目录临时文件（0600）先写入当前身份的裸字节（`apply` 的 same-epoch 认证收尾要读）；
+/// 2. 库级入口在推广时原子替换它（rename 是唯一提交点）；
+/// 3. worker 读回新身份后由 `DevIdentityStore::replace_protected` 写回 MNID 外层
+///    （再一个原子 rename）——**两个提交点**，任一步失败旧身份文件都逐字节保留；
+/// 4. drop 时清掉交接文件与库级 promotion 的 `<name>.promote.tmp` 兄弟文件。
+struct LibraryIdentityHandoff {
+    path: PathBuf,
+    /// `identity_path.with_extension("promote.tmp")`（库级推广的临时名，失败可能残留）。
+    promote_tmp: PathBuf,
+}
+
+impl LibraryIdentityHandoff {
+    /// 在身份文件同目录建交接文件，并写入当前身份的裸 `protect()` 字节。
+    fn prepare(store_path: &Path, identity: &LocalIdentityV1) -> Result<Self, String> {
+        let dir = match store_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let suffix: [u8; 8] =
+            menghunote_sync::random::array(&mut menghunote_sync::random::OsRandom)
+                .map_err(|error| format!("生成身份交接文件临时名失败：{error}"))?;
+        let path = dir.join(format!(
+            ".{IDENTITY_FILE_NAME}.handoff.{}.{}",
+            std::process::id(),
+            menghunote_sync::ids::hex_of(&suffix)
+        ));
+        let promote_tmp = path.with_extension("promote.tmp");
+        let blob = identity
+            .protect()
+            .map_err(|error| format!("封装本地身份失败（交接文件用）：{error}"))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let handoff = Self { path, promote_tmp };
+        let result = (|| -> Result<(), String> {
+            let mut file = options.open(&handoff.path).map_err(|error| {
+                format!(
+                    "创建身份交接文件失败（{}）：{error}",
+                    handoff.path.display()
+                )
+            })?;
+            file.write_all(&blob)
+                .map_err(|error| format!("写身份交接文件失败：{error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("fsync 身份交接文件失败：{error}"))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(handoff),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 读回库级入口推广后的身份（裸 `protect()` 字节）并解封。
+    fn read_promoted(
+        &self,
+        vault_id: &menghunote_sync::VaultId,
+        device_id: DeviceId,
+    ) -> Result<LocalIdentityV1, String> {
+        let blob = fs::read(&self.path).map_err(|error| {
+            format!(
+                "读取轮换后的身份交接文件失败（{}）：{error}",
+                self.path.display()
+            )
+        })?;
+        LocalIdentityV1::unprotect(&blob, vault_id, &device_id)
+            .map_err(|error| format!("解封轮换后的身份失败：{error}"))
+    }
+}
+
+impl Drop for LibraryIdentityHandoff {
+    fn drop(&mut self) {
+        // 交接文件里是身份密文：无论成功失败都不留（promotion 的临时兄弟文件同理）。
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.promote_tmp);
+    }
+}
+
 /// checkpoint id 的短展示形式（前 8 位小写 hex；checkpoint id 是公开事实）。
 fn short_checkpoint_id(checkpoint_id: &[u8; 16]) -> String {
     menghunote_sync::ids::hex_of(checkpoint_id)
@@ -1216,8 +1911,13 @@ impl SyncService {
     #[must_use]
     pub fn new_dev_local(config: ServiceConfig, vault_path: PathBuf) -> Arc<Self> {
         // ADR 0012 S1：传输预算真的透传给 `DevLocal`（不再由 `DevLocal` 内部硬编默认）。
-        let runner =
-            DevLocalRunner::new_with_transport(config.relay.clone(), vault_path, config.transport);
+        let runner = DevLocalRunner::new_with_mode_and_transport(
+            config.mode,
+            config.relay.clone(),
+            vault_path,
+            config.transport,
+        )
+        .with_api_version(config.api_version);
         Self::with_runner(config, Box::new(runner))
     }
 
@@ -1393,16 +2093,19 @@ impl SyncService {
     }
 
     fn try_command_with(&self, command: Command, gate: Option<HeldGate>) -> Result<OpId, Busy> {
+        // `command` 不再实现 `Copy`（`Rotate` 带恢复码/设备列表）：先把分类算出来再移动。
+        let is_control = command.is_control();
+        let is_cancel = matches!(command, Command::Cancel);
         let mut inner = self.lock_inner();
         // 放弃过的 op 还在 worker 手里跑：仍然算"在途"，不能再排一条（保持单操作串行）。
         // 语义比 `InFlight` 更明确：已经超时/取消，在等 worker 真实收尾。
-        if !command.is_control() {
+        if !is_control {
             if let Some(abandoned) = inner.abandoned {
                 return Err(Busy::new(BusyReason::Cancelling, Some(abandoned)));
             }
         }
-        let op_id = inner.state.try_begin(command)?;
-        if command == Command::Cancel {
+        let op_id = inner.state.try_begin(&command)?;
+        if is_cancel {
             // `Cancel` 不是一条 worker 任务：它给在途 op 置取消标志（旧路径在首次外部
             // 集成前复核）+ 发一条控制消息（两阶段 worker 可能正停在 NeedGate/Integrated
             // 的等待里，必须能把取消穿透过去；ADR 0012 S2a）。
@@ -1416,8 +2119,8 @@ impl SyncService {
             return Ok(op_id);
         }
         // 控制命令没有"外部提交"语义：一律不带证明（runner 也不会用）。
-        let gate = if command.is_control() { None } else { gate };
-        let control = if command.is_control() {
+        let gate = if is_control { None } else { gate };
+        let control = if is_control {
             OpControl::default()
         } else {
             OpControl::new()
@@ -1432,7 +2135,7 @@ impl SyncService {
             inner.state.abort_dispatch(op_id, reason);
             return Err(Busy::new(BusyReason::WorkerStopped, None));
         }
-        if !command.is_control() {
+        if !is_control {
             inner.deadline = Some((op_id, self.clock.now()));
             inner.control = Some((op_id, control));
         }
@@ -1525,7 +2228,7 @@ impl SyncService {
         // 再走 job 队列的 `Stop`（关闭语义：回执 Stopped 后退出）。
         let _ = self.send_control(SyncControl::Stop);
         let mut inner = self.lock_inner();
-        match inner.state.try_begin(Command::Stop) {
+        match inner.state.try_begin(&Command::Stop) {
             Ok(op_id) => {
                 if !self.dispatch(Job {
                     op_id,
@@ -1675,7 +2378,11 @@ mod tests {
             Command::PublishInitialPair,
             Command::ListDevices,
             Command::RevokeDevice { target: [0x11; 16] },
-            Command::Rotate,
+            Command::Rotate {
+                recovery_code: None,
+                revoke: Vec::new(),
+            },
+            Command::ApplyEpoch,
             Command::Resume,
         ] {
             let error = runner
@@ -1701,6 +2408,37 @@ mod tests {
                 .all(|event| matches!(event, Event::Progress { .. })),
             "runner 只能上报 Progress（终态由 worker 生成）"
         );
+    }
+
+    #[test]
+    fn config_defaults_to_v1_and_can_select_the_v2_api_face() {
+        let v1 = ServiceConfig::new("http://127.0.0.1:18080");
+        assert_eq!(v1.api_version, RelayApiVersion::V1);
+        assert_eq!(
+            v1.relay_context().expect("ctx").api_version(),
+            RelayApiVersion::V1
+        );
+        let v1_path = v1.relay_context().expect("ctx").api().create_vault_path();
+        assert_eq!(v1_path, "/v1/vaults");
+
+        let v2 = v1.clone().with_api_version(RelayApiVersion::V2);
+        assert_eq!(
+            v2.relay_context().expect("ctx").api_version(),
+            RelayApiVersion::V2
+        );
+        assert_eq!(
+            v2.relay_context().expect("ctx").api().create_vault_path(),
+            "/v2/vaults"
+        );
+        // worker 的 context 同样带上显式面（缺省仍是 v1）。
+        let runner = DevLocalRunner::new_with_transport(
+            "http://127.0.0.1:18080",
+            std::path::PathBuf::from("/tmp/not-opened.sqlite3"),
+            DEFAULT_TRANSPORT_TIMEOUTS,
+        );
+        assert_eq!(runner.api_version(), RelayApiVersion::V1);
+        let runner = runner.with_api_version(RelayApiVersion::V2);
+        assert_eq!(runner.api_version(), RelayApiVersion::V2);
     }
 
     #[test]
@@ -1788,6 +2526,29 @@ mod tests {
             error.contains("打开本地库失败"),
             "无会话同步必须点明打不开库：{error}"
         );
+
+        // 轮换 / 应用新 epoch（切片 6a）同样**必须带持闸证明**：裸命令一律拒绝，
+        // 且不进入任何网络/本地写（先于打开库/读身份）。
+        for error in [
+            runner
+                .run_gated(
+                    Command::Rotate {
+                        recovery_code: None,
+                        revoke: Vec::new(),
+                    },
+                    None,
+                    &mut emit,
+                )
+                .expect_err("裸 Rotate 必须被拒绝"),
+            runner
+                .run_gated(Command::ApplyEpoch, None, &mut emit)
+                .expect_err("裸 ApplyEpoch 必须被拒绝"),
+        ] {
+            assert!(
+                error.contains("持闸"),
+                "轮换/apply 缺持闸证明必须明确失败：{error}"
+            );
+        }
 
         // 发布基线（切片 4c-4）与同步一样**必须带持闸证明**：裸命令一律拒绝。
         let error = runner

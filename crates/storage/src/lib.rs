@@ -56,7 +56,8 @@ mod tree_view;
 
 pub use actor::{AffectedGuard, Row, Statement, Vault};
 pub use asset_store::{
-    asset_meta_by_hash, insert_asset, link_asset_ref, list_asset_refs, set_asset_orphan_since,
+    asset_content_hash, asset_meta_by_hash, count_unreferenced_assets, insert_asset,
+    link_asset_ref, list_asset_refs, list_referenced_assets, set_asset_orphan_since,
     unlink_asset_ref, AssetRef,
 };
 pub use baseline_apply::{
@@ -101,14 +102,15 @@ pub use structure_store::{ensure_structure_row, load_structure, StructureWriter}
 pub use sync_bridge::{
     allocate_local_seq_for_import, append_updates_with_sync_intents, can_recycle_update,
     count_inbox_ready, enqueue_sync_intent, intent_message_id, intent_object_id, local_sync_intent,
-    mark_acked, mark_inbox_quarantine, mark_integrated, mark_sent, outbox_parts,
-    outbox_repack_candidates, outbox_row, outbox_rows, pending_encryption, pending_send,
-    repack_outbox, repack_required, set_confirmed_highwater, set_repack_required, set_sync_log_id,
-    store_encrypted_parts, store_inbox_verified, sync_cursor_state, take_inbox_ready,
-    take_inbox_ready_where, update_referenced_by_outbox, OutboxKey, OutboxRepackCandidate,
-    RepackOutcome, RepackPart, RepackPartSummary, RepackSpec, SyncContext, SyncCursorState,
-    SyncEncryptedPart, SyncInboxRow, SyncInboxState, SyncIntent, SyncOutboxPart, SyncOutboxRow,
-    SyncOutboxState, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
-    META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED, SYNC_INTENT_ID_DOMAIN,
+    mark_acked, mark_inbox_quarantine, mark_integrated, mark_sent, mark_skipped_event_received,
+    outbox_parts, outbox_repack_candidates, outbox_row, outbox_rows, pending_encryption,
+    pending_send, repack_outbox, repack_required, set_confirmed_highwater, set_repack_required,
+    set_sync_log_id, store_encrypted_parts, store_inbox_verified, sync_cursor_state,
+    take_inbox_ready, take_inbox_ready_where, update_referenced_by_outbox, OutboxKey,
+    OutboxRepackCandidate, RepackOutcome, RepackPart, RepackPartSummary, RepackSpec, SyncContext,
+    SyncCursorState, SyncEncryptedPart, SyncInboxRow, SyncInboxState, SyncIntent, SyncOutboxPart,
+    SyncOutboxRow, SyncOutboxState, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
+    META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED,
+    META_SYNC_SKIPPED_RECEIVED_PREFIX, SYNC_INTENT_ID_DOMAIN,
 };
 pub use tree_view::{list_notes, list_tree, NodeKind, TreeEntry};

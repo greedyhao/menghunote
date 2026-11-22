@@ -17,11 +17,12 @@
 //! 幂等：目标已 revoked 时返回 `changed=false` 且**不推进任何版本**——该判断必须早于
 //! rotating/initializing 守卫，否则轮换期间的重复请求会变成 409。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::auth;
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::Id16;
+use crate::scope::ScopeConn;
 use crate::time::Clock;
 use crate::vault::{self, VaultState};
 
@@ -46,11 +47,11 @@ enum DeviceStatus {
     Revoked,
 }
 
-fn device_status(conn: &Connection, device_id: &Id16) -> Result<Option<DeviceStatus>> {
+fn device_status(conn: &ScopeConn, device_id: &Id16) -> Result<Option<DeviceStatus>> {
     let status: Option<String> = conn
         .query_row(
-            "SELECT status FROM devices WHERE device_id = ?1",
-            [device_id.as_slice()],
+            "SELECT status FROM devices WHERE device_id = ?1 AND vault_id = ?",
+            (device_id.as_slice(), conn.scope().as_slice()),
             |row| row.get(0),
         )
         .optional()?;
@@ -67,7 +68,7 @@ fn device_status(conn: &Connection, device_id: &Id16) -> Result<Option<DeviceSta
 ///
 /// 顺序是语义相关的：存在性（404）→ 已 revoked（幂等 200）→ pending（409）→
 /// vault 状态（rotating/initializing）→ ACTIVE 计数守卫 → 状态迁移 + `auth_rev`。
-pub fn revoke_access(conn: &Connection, clock: &dyn Clock, target: &Id16) -> Result<RevokeOutcome> {
+pub fn revoke_access(conn: &ScopeConn, clock: &dyn Clock, target: &Id16) -> Result<RevokeOutcome> {
     let vault = vault::load(conn)?;
     let status = device_status(conn, target)?.ok_or_else(|| Error::api(ErrorCode::NotFound))?;
 
@@ -96,8 +97,8 @@ pub fn revoke_access(conn: &Connection, clock: &dyn Clock, target: &Id16) -> Res
     //    （relay 无法识别哪台设备持有管理私钥，所以这里不能做"最后一个管理设备"守卫；
     //    保留一台 ACTIVE 也不证明管理密钥仍被保存——ADR 0010 要求用户保留最新恢复码。）
     let active: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM devices WHERE status = 'active'",
-        [],
+        "SELECT COUNT(*) FROM devices WHERE status = 'active' AND vault_id = ?1",
+        [conn.scope().as_slice()],
         |row| row.get(0),
     )?;
     if active <= 1 {

@@ -20,6 +20,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use menghunote_sync::error::SyncError;
+use menghunote_sync::relay_policy::{parse_relay_url, RelayMode, RelayOrigin, RelayUrlError};
+
 use super::service::ServiceConfig;
 
 /// 启用开关（命令行）。
@@ -72,7 +75,9 @@ impl Gate {
 pub struct DevSyncConfig {
     /// 本实例的独立 vault 文件路径（来自 `MENGHUNOTE_DEV_VAULT`，必须显式）。
     pub vault: PathBuf,
-    /// worker 配置（relay + 操作 deadline + 传输超时）。
+    /// relay 接入模式（运行时门禁只产出 `local_dev`；`remote_tls` 由公开配置/设置给出）。
+    pub relay_mode: RelayMode,
+    /// worker 配置（模式 + relay + 操作 deadline + 传输超时）。
     pub service: ServiceConfig,
 }
 
@@ -81,6 +86,17 @@ impl DevSyncConfig {
     #[must_use]
     pub fn relay(&self) -> &str {
         &self.service.relay
+    }
+
+    /// relay 模式（`local_dev` / `remote_tls`；公开配置）。
+    #[must_use]
+    pub const fn relay_mode(&self) -> RelayMode {
+        self.relay_mode
+    }
+
+    /// 本配置的 canonical origin（唯一权威 parser 校验）。
+    pub fn origin(&self) -> Result<RelayOrigin, SyncError> {
+        parse_relay_url(&self.service.relay, self.relay_mode).map_err(Into::into)
     }
 }
 
@@ -108,11 +124,8 @@ impl fmt::Display for GateError {
                 "dev-sync 的 relay 只允许明文 loopback（http://127.0.0.1 / http://[::1] / \
                  http://localhost，端口任意），收到 {url:?}；非 loopback 或 https 一律拒绝"
             ),
-            Self::RelayInvalid(url) => {
-                write!(
-                    f,
-                    "dev-sync 的 relay 地址非法：{url}（{url:?} 未通过传输策略校验）"
-                )
+            Self::RelayInvalid(detail) => {
+                write!(f, "dev-sync 的 relay 地址非法：{detail}")
             }
         }
     }
@@ -174,11 +187,12 @@ pub fn resolve(
     validate_relay(&relay)?;
     let service = ServiceConfig::new(relay.clone());
     // 3. 再让 transport 的策略兜一遍（端口/路径/userinfo/策略），错误里不回显口令。
-    service
-        .build_transport()
-        .map_err(|_| GateError::RelayInvalid(redact_userinfo(&relay)))?;
+    service.build_transport().map_err(|error| {
+        GateError::RelayInvalid(format!("{}（{error}）", redact_userinfo(&relay)))
+    })?;
     Ok(Gate::Enabled(DevSyncConfig {
         vault: PathBuf::from(vault),
+        relay_mode: service.mode,
         service,
     }))
 }
@@ -208,33 +222,22 @@ pub fn validate_relay_url(url: &str) -> Result<(), GateError> {
     validate_relay(url)
 }
 
-/// relay 必须是 `http://` + loopback 主机（`127.0.0.1` / `::1` / `localhost`）。
+/// relay 必须是 `http://` + **显式 loopback 白名单**（`localhost` / `127.0.0.1` / `[::1]`）。
+///
+/// 解析逻辑唯一权威在 `menghunote-sync::relay_policy`（ADR 0013 §1）：这里不再复制
+/// URL 语法，只把错误映射成门禁的两类文案（非 loopback / 地址非法）。白名单不是
+/// `is_loopback()`：`127.0.0.2`、`[::2]` 之类也不会被接受。
 fn validate_relay(url: &str) -> Result<(), GateError> {
     let shown = redact_userinfo(url);
-    let Some(rest) = url.strip_prefix("http://") else {
-        return Err(GateError::RelayNotLoopback(shown));
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return Err(GateError::RelayInvalid(shown));
+    match parse_relay_url(url, RelayMode::LocalDev) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(match error {
+            RelayUrlError::SchemeNotAllowed { .. } | RelayUrlError::HostNotAllowed(_) => {
+                GateError::RelayNotLoopback(shown)
+            }
+            other => GateError::RelayInvalid(format!("{shown}（{other}）")),
+        }),
     }
-    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
-        // IPv6 字面量必须写成 [::1]:port。
-        after_bracket.split(']').next().unwrap_or("")
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, _port)) => host,
-            None => authority,
-        }
-    };
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    if !is_loopback {
-        return Err(GateError::RelayNotLoopback(shown));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

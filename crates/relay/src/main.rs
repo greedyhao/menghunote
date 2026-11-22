@@ -43,6 +43,7 @@ use relay::config::RelayConfig;
 use relay::db::{schema, Db, DbConfig};
 use relay::ids::{b64url_encode, hex_lower, random_bytes, sha256, Hash32};
 use relay::quota;
+use relay::scope::VaultScope;
 use relay::time::SystemClock;
 use relay::vault;
 use relay::verify::Ed25519Hook;
@@ -354,13 +355,13 @@ fn serve(config_path: &Path, dev: bool) -> Result<(), String> {
     let db = Db::open(validated.config.db.clone(), Arc::new(SystemClock))
         .map_err(|err| format!("打开数据库 {} 失败: {err}", db_path.display()))?;
 
-    let vault_row = db
-        .read(vault::load_opt)
-        .map_err(|err| format!("读 vault 失败: {err}"))?;
+    let vault_ids = db
+        .read_instance(schema::list_vault_ids)
+        .map_err(|err| format!("读 vault 列表失败: {err}"))?;
     let mut config = validated.config;
-    if vault_row.is_none() {
+    if vault_ids.is_empty() {
         let stored_hash = db
-            .read(vault::setup_secret_hash)
+            .read_instance(vault::setup_secret_hash)
             .map_err(|err| format!("读 setup secret 哈希失败: {err}"))?;
         let Some(hash) = stored_hash else {
             return Err(format!(
@@ -451,10 +452,10 @@ async fn shutdown_signal() {
 fn init(db_path: &Path) -> Result<(), String> {
     let db = Db::open(DbConfig::new(db_path), Arc::new(SystemClock))
         .map_err(|err| format!("打开数据库 {} 失败: {err}", db_path.display()))?;
-    if db
-        .read(vault::load_opt)
-        .map_err(|err| format!("读 vault 失败: {err}"))?
-        .is_some()
+    if !db
+        .read_instance(schema::list_vault_ids)
+        .map_err(|err| format!("读 vault 列表失败: {err}"))?
+        .is_empty()
     {
         return Err(format!(
             "数据库 {} 已有 vault；如需重建请先 `delete-vault --db {} --yes`",
@@ -463,7 +464,7 @@ fn init(db_path: &Path) -> Result<(), String> {
         ));
     }
     if db
-        .read(vault::setup_secret_hash)
+        .read_instance(vault::setup_secret_hash)
         .map_err(|err| format!("读 setup secret 哈希失败: {err}"))?
         .is_some()
     {
@@ -477,10 +478,10 @@ fn init(db_path: &Path) -> Result<(), String> {
         .map_err(|err| format!("CSPRNG 不可用，无法生成 setup secret: {err}"))?;
     let secret = b64url_encode(&secret_bytes);
     let hash = sha256(secret.as_bytes());
-    db.write_blocking(move |conn| vault::store_setup_secret_hash(conn, &hash))
+    db.write_instance_blocking(move |conn| vault::store_setup_secret_hash(conn, &hash))
         .map_err(|err| format!("写 setup secret 哈希失败: {err}"))?;
     let instance = db
-        .read(schema::instance_id)
+        .read_instance(schema::instance_id)
         .map_err(|err| format!("读 instance_id 失败: {err}"))?;
 
     println!("db={}", db_path.display());
@@ -502,92 +503,102 @@ fn status(db_path: &Path) -> Result<(), String> {
         .map_err(|err| format!("打开数据库 {} 失败: {err}", db_path.display()))?;
     println!("db={}", db_path.display());
     let version = db
-        .read(|conn| schema::meta_text(conn, schema::META_SCHEMA_VERSION))
+        .read_instance(|conn| schema::meta_text(conn, schema::META_SCHEMA_VERSION))
         .map_err(|err| format!("读 schema_version 失败: {err}"))?
         .unwrap_or_else(|| "unknown".to_string());
     println!("schema_version={version}");
     let instance = db
-        .read(schema::instance_id)
+        .read_instance(schema::instance_id)
         .map_err(|err| format!("读 instance_id 失败: {err}"))?;
     println!("instance_id={}", hex_lower(&instance));
 
-    let Some(vault) = db
-        .read(vault::load_opt)
-        .map_err(|err| format!("读 vault 失败: {err}"))?
-    else {
+    let vault_ids = db
+        .read_instance(schema::list_vault_ids)
+        .map_err(|err| format!("读 vault 列表失败: {err}"))?;
+    println!("vaults={}", vault_ids.len());
+    if vault_ids.is_empty() {
         println!("state=uninitialized");
+        return Ok(());
+    }
+    // 多租户：逐 vault 打印（v1 单 vault 库里就是一段，关键字段名保持不变）。
+    for vault_id in vault_ids {
+        let scope = VaultScope::new(vault_id);
+        let vault = db
+            .read(scope, vault::load)
+            .map_err(|err| format!("读 vault 失败: {err}"))?;
+        println!("state={}", vault.state.as_str());
+        println!("vault_id={}", hex_lower(&vault.vault_id));
+        println!("epoch={}", vault.active_epoch);
+        println!("control_rev={}", vault.control_rev);
+        println!("head_seq={}", vault.head_seq);
+        println!("gc_floor={}", vault.gc_floor);
+
+        let checkpoints = db
+            .read(scope, |conn| checkpoints::published_newest_first(conn, 2))
+            .map_err(|err| format!("读 checkpoint 失败: {err}"))?;
+        for (label, checkpoint) in [
+            ("primary", checkpoints.first()),
+            ("fallback", checkpoints.get(1)),
+        ] {
+            match checkpoint {
+                Some(checkpoint) => {
+                    println!(
+                        "{label}_checkpoint={}",
+                        hex_lower(&checkpoint.checkpoint_id)
+                    );
+                    println!("{label}_checkpoint_epoch={}", checkpoint.epoch);
+                    println!("{label}_checkpoint_covered_seq={}", checkpoint.covered_seq);
+                }
+                None => println!("{label}_checkpoint=none"),
+            }
+        }
+
+        let now = db.clock_handle().now_secs();
+        let usage = db
+            .read(scope, quota::usage)
+            .map_err(|err| format!("读配额用量失败: {err}"))?;
+        let available = db
+            .read(scope, move |conn| quota::maintenance_available(conn, now))
+            .map_err(|err| format!("读维护预算失败: {err}"))?;
+        println!("normal_bytes={}", usage.normal_bytes);
+        println!("maintenance_bytes={}", usage.maintenance_bytes);
+        println!("normal_limit={}", vault.normal_limit);
+        println!("maintenance_limit={}", vault.maintenance_limit);
+        println!("maintenance_available={available}");
+
         let devices = db
-            .read(count_devices)
+            .read(scope, count_devices)
             .map_err(|err| format!("统计设备失败: {err}"))?;
         println!("devices={devices}");
-        return Ok(());
-    };
-
-    println!("state={}", vault.state.as_str());
-    println!("vault_id={}", hex_lower(&vault.vault_id));
-    println!("epoch={}", vault.active_epoch);
-    println!("control_rev={}", vault.control_rev);
-    println!("head_seq={}", vault.head_seq);
-    println!("gc_floor={}", vault.gc_floor);
-
-    let checkpoints = db
-        .read(|conn| checkpoints::published_newest_first(conn, 2))
-        .map_err(|err| format!("读 checkpoint 失败: {err}"))?;
-    for (label, checkpoint) in [
-        ("primary", checkpoints.first()),
-        ("fallback", checkpoints.get(1)),
-    ] {
-        match checkpoint {
-            Some(checkpoint) => {
-                println!(
-                    "{label}_checkpoint={}",
-                    hex_lower(&checkpoint.checkpoint_id)
-                );
-                println!("{label}_checkpoint_epoch={}", checkpoint.epoch);
-                println!("{label}_checkpoint_covered_seq={}", checkpoint.covered_seq);
-            }
-            None => println!("{label}_checkpoint=none"),
+        let statuses = db
+            .read(scope, |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT status, COUNT(*) FROM devices
+                     WHERE vault_id = ?1 GROUP BY status",
+                )?;
+                let rows = stmt.query_map([conn.scope().as_slice()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                let mut counts = Vec::new();
+                for row in rows {
+                    counts.push(row?);
+                }
+                Ok(counts)
+            })
+            .map_err(|err| format!("统计设备状态失败: {err}"))?;
+        for (status, count) in statuses {
+            println!("devices_{status}={count}");
         }
-    }
-
-    let now = db.clock_handle().now_secs();
-    let usage = db
-        .read(quota::usage)
-        .map_err(|err| format!("读配额用量失败: {err}"))?;
-    let available = db
-        .read(move |conn| quota::maintenance_available(conn, now))
-        .map_err(|err| format!("读维护预算失败: {err}"))?;
-    println!("normal_bytes={}", usage.normal_bytes);
-    println!("maintenance_bytes={}", usage.maintenance_bytes);
-    println!("normal_limit={}", vault.normal_limit);
-    println!("maintenance_limit={}", vault.maintenance_limit);
-    println!("maintenance_available={available}");
-
-    let devices = db
-        .read(count_devices)
-        .map_err(|err| format!("统计设备失败: {err}"))?;
-    println!("devices={devices}");
-    let statuses = db
-        .read(|conn| {
-            let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM devices GROUP BY status")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            let mut counts = Vec::new();
-            for row in rows {
-                counts.push(row?);
-            }
-            Ok(counts)
-        })
-        .map_err(|err| format!("统计设备状态失败: {err}"))?;
-    for (status, count) in statuses {
-        println!("devices_{status}={count}");
     }
     Ok(())
 }
 
-fn count_devices(conn: &rusqlite::Connection) -> relay::Result<i64> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM devices", [], |row| row.get(0))?)
+fn count_devices(conn: &relay::ScopeConn) -> relay::Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM devices WHERE vault_id = ?1",
+        [conn.scope().as_slice()],
+        |row| row.get(0),
+    )?)
 }
 
 // ---------------------------------------------------------------- delete-vault

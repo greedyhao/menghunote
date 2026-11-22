@@ -100,6 +100,7 @@ impl Render for ShellHost {
 
 fn config_for(relay_url: &str, vault_path: &Path) -> DevSyncConfig {
     DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.to_path_buf(),
         service: ServiceConfig::new(relay_url),
     }

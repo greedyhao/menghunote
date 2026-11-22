@@ -207,6 +207,186 @@ fn upload_object_inner<C: RelayClient>(
     key_override: Option<&crate::keys::Secret32>,
     reservation: Option<&[u8; 16]>,
 ) -> Result<UploadedObject, SyncError> {
+    // 流式：加密一片就 PUT 一片，不把整个对象（SNAPSHOT 上限 4GiB）全留在内存里。
+    let summary = encrypt_object_parts(
+        root,
+        vault_id,
+        producer_device_id,
+        object_type,
+        object_id,
+        message_id,
+        generation,
+        sender_seq,
+        plaintext,
+        descriptor,
+        nonce_override,
+        key_override,
+        |part_no, envelope, _digest| {
+            client.put_part_with_reservation(&object_id, part_no, envelope, reservation)
+        },
+    )?;
+    submit_prepared_object(
+        client,
+        vault_id,
+        signing_key,
+        object_type,
+        object_id,
+        message_id,
+        generation,
+        root.key_epoch,
+        sender_seq,
+        summary.part_count,
+        summary.total_plain_len,
+        &summary.object_digest,
+    )?;
+    Ok(UploadedObject {
+        object_id,
+        part_count: summary.part_count,
+        total_plain_len: summary.total_plain_len,
+        object_digest: summary.object_digest,
+    })
+}
+
+/// 加密完成的对象事实（不含分片字节；ASSET 需要分片时由 [`encrypt_asset_parts`] 收集）。
+pub(crate) struct EncryptedObjectSummary {
+    /// 分片数。
+    pub(crate) part_count: u32,
+    /// 明文总长。
+    pub(crate) total_plain_len: u64,
+    /// 密文对象摘要（§2）。
+    pub(crate) object_digest: [u8; 32],
+}
+
+/// 已加密对象：固定切片后的全部分片 + 提交所需事实。
+///
+/// 抽出来是为了让"先检查 relay 上是否已有同一对象"的调用方（增量资产上传 /
+/// checkpoint 复用）能**本地重算确定性密文**并逐片比对，而不是重写一套加密逻辑。
+pub(crate) struct EncryptedObjectParts {
+    /// 分片数。
+    pub(crate) part_count: u32,
+    /// 明文总长。
+    pub(crate) total_plain_len: u64,
+    /// `(part_no, envelope, part_digest)`。
+    pub(crate) parts: EncryptedLocalParts,
+    /// 密文对象摘要（§2）。
+    pub(crate) object_digest: [u8; 32],
+}
+
+impl EncryptedObjectSummary {
+    /// 转换为"带全部分片"的资产结果（ASSET ≤64MiB，可整体留在内存里做逐片比对）。
+    pub(crate) fn with_parts(self, parts: EncryptedLocalParts) -> EncryptedObjectParts {
+        EncryptedObjectParts {
+            part_count: self.part_count,
+            total_plain_len: self.total_plain_len,
+            parts,
+            object_digest: self.object_digest,
+        }
+    }
+}
+
+/// 用当前根把一段 ASSET 明文头加密成**确定性** MNE1 分片（ADR §19/§31）。
+///
+/// 与 [`upload_object`] 的 ASSET 分支共用同一条加密实现：确定性 nonce、producer=0、
+/// 确定性 message_id、generation/sender_seq=0。因此同一 `(root, object_id, 明文)`
+/// 在任何设备/任何进程重算出的分片字节都相同，relay 可以幂等接受、普通同步与
+/// checkpoint 上传也可以逐片比对/复用。
+pub(crate) fn encrypt_asset_parts(
+    root: &RootSecretV1,
+    vault_id: VaultId,
+    object_id: ObjectId,
+    plaintext: &[u8],
+) -> Result<EncryptedObjectParts, SyncError> {
+    let message_id = asset_message_id(root, &object_id)?;
+    let mut parts = Vec::new();
+    let summary = encrypt_object_parts(
+        root,
+        vault_id,
+        [0u8; 16],
+        ObjectType::Asset,
+        object_id,
+        message_id,
+        0,
+        0,
+        plaintext,
+        &[],
+        None,
+        None,
+        |part_no, envelope, digest| {
+            parts.push((part_no, envelope.to_vec(), digest));
+            Ok(())
+        },
+    )?;
+    Ok(summary.with_parts(parts))
+}
+
+/// 提交已上传完分片的对象（`ObjectCommit` + 设备签名 + `submit_object`）。
+///
+/// 与 [`upload_object`] 尾部完全同口径；分片已由调用方按需上传（含"跳过 relay 上
+/// 已存在的幂等分片"）后调用。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submit_prepared_object<C: RelayClient>(
+    client: &mut C,
+    vault_id: VaultId,
+    signing_key: &DeviceSigningKey,
+    object_type: ObjectType,
+    object_id: ObjectId,
+    message_id: [u8; 16],
+    generation: u64,
+    key_epoch: u64,
+    sender_seq: u64,
+    part_count: u32,
+    total_plain_len: u64,
+    object_digest: &[u8; 32],
+) -> Result<(), SyncError> {
+    let commit = ObjectCommit {
+        vault_id,
+        object_id,
+        message_id,
+        object_type,
+        generation,
+        key_epoch,
+        sender_seq,
+        part_count,
+        total_len: total_plain_len,
+        object_digest: *object_digest,
+    };
+    let signed_commit = commit.encode()?;
+    let signature = signing_key.sign(&object_commit_signing_input(&commit)?);
+    let outcome = client.submit_object(ObjectSubmission {
+        object_id,
+        commit,
+        signed_commit,
+        signature,
+    })?;
+    match outcome.status {
+        UpdateStatus::Accepted { .. } | UpdateStatus::Duplicate => Ok(()),
+        UpdateStatus::Failed { code, retryable } => Err(SyncError::RelayApi {
+            code: code.unwrap_or_else(|| "OBJECT_FAILED".to_owned()),
+            retryable,
+            current_epoch: None,
+            current_control_rev: None,
+            bootstrap_hint: None,
+        }),
+    }
+}
+
+/// 固定切片 + MNE1 加密（`upload_object` 与增量资产上传共用）。
+#[allow(clippy::too_many_arguments)]
+fn encrypt_object_parts(
+    root: &RootSecretV1,
+    vault_id: VaultId,
+    producer_device_id: DeviceId,
+    object_type: ObjectType,
+    object_id: ObjectId,
+    message_id: [u8; 16],
+    generation: u64,
+    sender_seq: u64,
+    plaintext: &[u8],
+    descriptor: &[u8],
+    nonce_override: Option<[u8; 24]>,
+    key_override: Option<&crate::keys::Secret32>,
+    mut emit: impl FnMut(u32, &[u8], [u8; 32]) -> Result<(), SyncError>,
+) -> Result<EncryptedObjectSummary, SyncError> {
     if plaintext.is_empty() {
         return Err(SyncError::LocalCorrupt("对象明文为空"));
     }
@@ -280,45 +460,12 @@ fn upload_object_inner<C: RelayClient>(
             .map_err(|_| SyncError::Object("对象加密失败"))?;
         let envelope = Envelope::new(header, ciphertext)?.encode()?;
         let digest: [u8; 32] = Sha256::digest(&envelope).into();
-        client.put_part_with_reservation(&object_id, index, &envelope, reservation)?;
         digests.push(digest);
+        emit(index, &envelope, digest)?;
     }
     let digest_input = object_digest_input(part_count, &digests)?;
     let object_digest: [u8; 32] = Sha256::digest(&digest_input).into();
-    let commit = ObjectCommit {
-        vault_id,
-        object_id,
-        message_id,
-        object_type,
-        generation,
-        key_epoch: root.key_epoch,
-        sender_seq,
-        part_count,
-        total_len: total,
-        object_digest,
-    };
-    let signed_commit = commit.encode()?;
-    let signature = signing_key.sign(&object_commit_signing_input(&commit)?);
-    let outcome = client.submit_object(ObjectSubmission {
-        object_id,
-        commit,
-        signed_commit,
-        signature,
-    })?;
-    match outcome.status {
-        UpdateStatus::Accepted { .. } | UpdateStatus::Duplicate => {}
-        UpdateStatus::Failed { code, retryable } => {
-            return Err(SyncError::RelayApi {
-                code: code.unwrap_or_else(|| "OBJECT_FAILED".to_owned()),
-                retryable,
-                current_epoch: None,
-                current_control_rev: None,
-                bootstrap_hint: None,
-            })
-        }
-    }
-    Ok(UploadedObject {
-        object_id,
+    Ok(EncryptedObjectSummary {
         part_count,
         total_plain_len: total,
         object_digest,
@@ -379,10 +526,11 @@ pub(crate) struct AssetExpectation<'a> {
     pub key_epoch: u64,
 }
 
-/// 一次 ASSET 真实验证通过后的**最小事实集**：不含明文、不含密文。
+/// 一次 ASSET 真实验证通过后的**事实集**：不含明文、不含密文。
 ///
-/// 只由 [`fetch_verified_asset`] 产出；调用方可以把它们写进本地记录/缓存，
-/// 但不得据此重放任何明文。
+/// 由 [`fetch_verified_asset`] / [`fetch_verified_asset_data`] 产出；调用方可以把它们
+/// 写进本地记录/缓存。需要把资产真正落进本地 `assets` 表的调用方（engine pull）走
+/// [`fetch_verified_asset_data`] 拿到**已完成校验**的数据字节，不得从事实集反推明文。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedAssetFacts {
     /// 资产数据真实 SHA256（来自解密后的 canonical 明文头）。
@@ -425,6 +573,34 @@ pub(crate) fn fetch_verified_asset<C: RelayClient>(
     max_total_len: u64,
     expected: &AssetExpectation<'_>,
 ) -> Result<VerifiedAssetFacts, SyncError> {
+    fetch_verified_asset_inner(client, root, vault_id, max_total_len, expected)
+        .map(|(facts, _data)| facts)
+}
+
+/// 同 [`fetch_verified_asset`]，但**额外交还**本机验证过的资产数据字节。
+///
+/// 只有"要真正把资产落到本地 `assets` 表"的调用方（engine pull 的 ASSET 消费）用这个
+/// 入口；checkpoint writer 的 coverage 复核仍然只用事实集，不碰明文。
+///
+/// 返回的 `Vec<u8>` 已经过完整校验：长度 = 明文头声明、SHA-256 = `real_sha256`、根派生
+/// `object_id` 与声明一致。调用方可以把它直接写进内容寻址的资产表。
+pub(crate) fn fetch_verified_asset_data<C: RelayClient>(
+    client: &mut C,
+    root: &RootSecretV1,
+    vault_id: VaultId,
+    max_total_len: u64,
+    expected: &AssetExpectation<'_>,
+) -> Result<(VerifiedAssetFacts, Vec<u8>), SyncError> {
+    fetch_verified_asset_inner(client, root, vault_id, max_total_len, expected)
+}
+
+fn fetch_verified_asset_inner<C: RelayClient>(
+    client: &mut C,
+    root: &RootSecretV1,
+    vault_id: VaultId,
+    max_total_len: u64,
+    expected: &AssetExpectation<'_>,
+) -> Result<(VerifiedAssetFacts, Vec<u8>), SyncError> {
     if expected.object_type != ObjectType::Asset {
         return Err(SyncError::Object("共享 ASSET 验证器只接受 ASSET 声明"));
     }
@@ -500,12 +676,22 @@ pub(crate) fn fetch_verified_asset<C: RelayClient>(
             "ASSET 明文头重算的 object_id 与声明不一致",
         ));
     }
-    Ok(VerifiedAssetFacts {
-        real_sha256,
-        byte_len,
-        media_type,
-        object_digest: *expected.object_digest,
-    })
+    // data 段：明文头长度 32+8+2 + MIME 字节。`decode_asset_plaintext` 已校验尾部长度与
+    // SHA-256，这里只做切片（越界/长度不符都已在上一步 fail-closed）。
+    let data_start = 42 + media_type.len();
+    let data = plaintext
+        .get(data_start..)
+        .ok_or(SyncError::Object("ASSET 明文数据越界"))?
+        .to_vec();
+    Ok((
+        VerifiedAssetFacts {
+            real_sha256,
+            byte_len,
+            media_type,
+            object_digest: *expected.object_digest,
+        },
+        data,
+    ))
 }
 
 /// ADR §20：用调用方给定的 `K_slot_mne` 读回 KEY_SLOT。

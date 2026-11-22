@@ -5,6 +5,7 @@ mod support;
 use support::*;
 
 use menghunote_storage::Vault;
+use menghunote_sync::api_version::RelayApiVersion;
 use menghunote_sync::relay::{RelayClient, RelayState, RotationView};
 use menghunote_sync::rotation_apply::{
     apply_verified_baseline, decide_epoch_action, detect_epoch_change, verify_activation_commit,
@@ -3794,6 +3795,7 @@ fn control_client(
         },
         HttpRelayConfig {
             base_url: "http://127.0.0.1:8080".to_owned(),
+            api_version: RelayApiVersion::V1,
             vault_id: CONTROL_VAULT,
             device_id: CONTROL_DEVICE,
             manager_pub: Some(manager.public_key()),
@@ -4262,9 +4264,7 @@ fn control_pin_rejects_lower_rev_and_replaced_genesis() {
         .with_control_pin(ControlPin::new(CONTROL_INSTANCE, 2).with_record_hash(original_hash));
     assert!(matches!(
         RelayClient::control_kinds(&mut client),
-        Err(menghunote_sync::SyncError::RelayWire(
-            "控制链同 rev 的 record_hash 与本地 pin 不符"
-        ))
+        Err(menghunote_sync::SyncError::Equivocation(message)) if message.contains("record_hash")
     ));
 
     // head 前进但旧 rev 被替换：pin 的 record_hash 必须仍是新链前缀 → fail-stop。
@@ -4278,9 +4278,7 @@ fn control_pin_rejects_lower_rev_and_replaced_genesis() {
         .with_control_pin(ControlPin::new(CONTROL_INSTANCE, 2).with_record_hash(original_hash));
     assert!(matches!(
         RelayClient::control_kinds(&mut client),
-        Err(menghunote_sync::SyncError::RelayWire(
-            "控制链未包含本地 pin 的 record_hash（替换/重排）"
-        ))
+        Err(menghunote_sync::SyncError::Equivocation(message)) if message.contains("record_hash")
     ));
 }
 

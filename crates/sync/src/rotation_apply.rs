@@ -343,6 +343,7 @@ fn apply_verified_and_promote(
     identity: &LocalIdentityV1,
     verified: &VerifiedApplyPayload,
     candidate_root: &RootSecretV1,
+    new_manager_seed: Option<crate::keys::Secret32>,
 ) -> Result<BaselineApplyState, SyncError> {
     let state = apply_verified_baseline(vault, verified.baseline(), verified.baseline_cursor())?;
     verified.receipt(identity).store(vault)?;
@@ -353,7 +354,10 @@ fn apply_verified_and_promote(
     };
     let material = crate::rotation_activate::PromotionMaterial {
         candidate_root: candidate_root.clone(),
-        new_manager_seed: None,
+        // 非管理设备为 `None`；管理设备只有在**新管理 key 与本地一致**时才由调用方
+        // 传入自己的 seed（promotion 会再验 `seed -> pubkey == material.new_manager_public`），
+        // 否则保持 `None` 并 fail-closed（不许拿旧 seed 冒充新管理权）。
+        new_manager_seed,
         new_manager_public: verified.new_manager_public(),
         new_manager_rev: verified.new_manager_rev(),
         control_rev: verified.control_rev(),
@@ -403,6 +407,49 @@ pub fn apply_epoch_change(
     verified: &VerifiedApplyPayload,
     candidate_root: &RootSecretV1,
 ) -> Result<ApplyOutcome, SyncError> {
+    apply_epoch_change_inner(
+        vault,
+        identity_path,
+        identity,
+        verified,
+        candidate_root,
+        None,
+    )
+}
+
+/// 同 [`apply_epoch_change`]，但允许**管理设备**用本地管理 seed 完成推广。
+///
+/// 只在本片"管理 key 不变"的前提下使用：调用方必须满足
+/// `ManagementKey::from_seed(seed).public_key() == new_manager_public`（promotion 会再验一次），
+/// 否则 `promote_identity_with_material` 明确失败，绝不把旧 seed 当新管理权。
+#[allow(clippy::too_many_arguments)]
+pub fn apply_epoch_change_with_manager_seed(
+    vault: &menghunote_storage::Vault,
+    identity_path: &std::path::Path,
+    identity: &LocalIdentityV1,
+    verified: &VerifiedApplyPayload,
+    candidate_root: &RootSecretV1,
+    new_manager_seed: crate::keys::Secret32,
+) -> Result<ApplyOutcome, SyncError> {
+    apply_epoch_change_inner(
+        vault,
+        identity_path,
+        identity,
+        verified,
+        candidate_root,
+        Some(new_manager_seed),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_epoch_change_inner(
+    vault: &menghunote_storage::Vault,
+    identity_path: &std::path::Path,
+    identity: &LocalIdentityV1,
+    verified: &VerifiedApplyPayload,
+    candidate_root: &RootSecretV1,
+    new_manager_seed: Option<crate::keys::Secret32>,
+) -> Result<ApplyOutcome, SyncError> {
     // 候选根必须正是本次 activation 的目标 epoch：否则 merge 会写进错误 epoch 的根，
     // 身份推广后也无法用该根解开新 outbox。
     if candidate_root.key_epoch != verified.to_epoch() {
@@ -417,7 +464,14 @@ pub fn apply_epoch_change(
     // 阶段 I 的 durable 冻结屏障：同一事务清旧 receipt + 落 applying，必须在任何
     // merge/写库之前完成。
     RotationApplyPhase::begin_apply(vault)?;
-    match apply_verified_and_promote(vault, identity_path, identity, verified, candidate_root) {
+    match apply_verified_and_promote(
+        vault,
+        identity_path,
+        identity,
+        verified,
+        candidate_root,
+        new_manager_seed,
+    ) {
         Ok(state) => {
             // 只有 merge + promotion 都成功才允许转 applied（engine 据此解冻）。
             RotationApplyPhase::Applied.store(vault)?;
@@ -1693,6 +1747,74 @@ pub fn apply_epoch_change_with_client<C: RelayClient>(
     new_manager_rev: u64,
     restart_reason: Option<RestartReason>,
 ) -> Result<ApplyOutcome, SyncError> {
+    apply_epoch_change_with_client_inner(
+        client,
+        vault,
+        identity_path,
+        identity,
+        checkpoint_id,
+        baseline_s,
+        baseline_cursor,
+        candidate_root,
+        manager_public,
+        new_manager_public,
+        new_manager_rev,
+        restart_reason,
+        None,
+    )
+}
+
+/// 同 [`apply_epoch_change_with_client`]，但允许**管理设备**在"新管理 key 与本地一致"时
+/// 用自己的 seed 完成推广（本片管理 key 不变；见 [`apply_epoch_change_with_manager_seed`]）。
+#[allow(clippy::too_many_arguments)]
+pub fn apply_epoch_change_with_client_and_manager_seed<C: RelayClient>(
+    client: &mut C,
+    vault: &menghunote_storage::Vault,
+    identity_path: &std::path::Path,
+    identity: &crate::identity::LocalIdentityV1,
+    checkpoint_id: [u8; 16],
+    baseline_s: u64,
+    baseline_cursor: &str,
+    candidate_root: &RootSecretV1,
+    manager_public: [u8; 32],
+    new_manager_public: [u8; 32],
+    new_manager_rev: u64,
+    restart_reason: Option<RestartReason>,
+    new_manager_seed: crate::keys::Secret32,
+) -> Result<ApplyOutcome, SyncError> {
+    apply_epoch_change_with_client_inner(
+        client,
+        vault,
+        identity_path,
+        identity,
+        checkpoint_id,
+        baseline_s,
+        baseline_cursor,
+        candidate_root,
+        manager_public,
+        new_manager_public,
+        new_manager_rev,
+        restart_reason,
+        Some(new_manager_seed),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_epoch_change_with_client_inner<C: RelayClient>(
+    client: &mut C,
+    vault: &menghunote_storage::Vault,
+    identity_path: &std::path::Path,
+    identity: &crate::identity::LocalIdentityV1,
+    checkpoint_id: [u8; 16],
+    baseline_s: u64,
+    baseline_cursor: &str,
+    candidate_root: &RootSecretV1,
+    manager_public: [u8; 32],
+    new_manager_public: [u8; 32],
+    new_manager_rev: u64,
+    restart_reason: Option<RestartReason>,
+    new_manager_seed: Option<crate::keys::Secret32>,
+) -> Result<ApplyOutcome, SyncError> {
     let state = client.state()?;
     // same-epoch 重入（评审 0003 P1-C/P1-D）：rename 已提交、`applied` 未写时，relay 与
     // 本地身份已是同一 epoch，下面必然会看到 "no epoch change"。必须先凭 durable receipt
@@ -2114,7 +2236,17 @@ pub fn apply_epoch_change_with_client<C: RelayClient>(
         new_manager_rev,
         payload,
     );
-    apply_epoch_change(vault, identity_path, identity, &verified, candidate_root)
+    match new_manager_seed {
+        Some(seed) => apply_epoch_change_with_manager_seed(
+            vault,
+            identity_path,
+            identity,
+            &verified,
+            candidate_root,
+            seed,
+        ),
+        None => apply_epoch_change(vault, identity_path, identity, &verified, candidate_root),
+    }
 }
 
 /// B 看到 epoch 变化后的下一步动作。

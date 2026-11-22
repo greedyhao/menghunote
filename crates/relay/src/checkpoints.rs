@@ -9,7 +9,7 @@
 //! - 新 pair 产生**持久** GC 计划 `{cut_seq = S_old, eligible_at = C_new.published_at + 7d}`，
 //!   后来的 checkpoint **不能重置已有计划 deadline**（`INSERT OR IGNORE`，键为 `(epoch, cut_seq)`）。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::auth::AuthContext;
 use crate::envelope::ObjectType;
@@ -18,6 +18,7 @@ use crate::ids::{be64, sha256, sha256_parts, Hash32, Id16};
 use crate::objects;
 use crate::quota::{self, ReservationPurpose};
 use crate::refs::RefRole;
+use crate::scope::ScopeConn;
 use crate::sig::{require, Expectation, SignDomain, SignatureCheck, SignatureHook};
 use crate::time::{secs, Clock};
 use crate::vault;
@@ -170,15 +171,15 @@ fn u64_of(value: i64, field: &'static str) -> Result<u64> {
 }
 
 /// 读 checkpoint 行；不存在 404。
-pub fn get(conn: &Connection, checkpoint_id: &Id16) -> Result<CheckpointRow> {
+pub fn get(conn: &ScopeConn, checkpoint_id: &Id16) -> Result<CheckpointRow> {
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id, epoch, covered_seq, manifest_oid, refs_digest, signed_commit,
                 commit_signature, state, validation_version, health, created_at, published_at,
                 role
-         FROM checkpoints WHERE checkpoint_id = ?1",
+         FROM checkpoints WHERE checkpoint_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([checkpoint_id.as_slice()], |row| {
+        .query_row((checkpoint_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
@@ -240,12 +241,12 @@ pub fn get(conn: &Connection, checkpoint_id: &Id16) -> Result<CheckpointRow> {
 }
 
 /// refs 列表（按 object_id 升序）。
-pub fn refs(conn: &Connection, checkpoint_id: &Id16) -> Result<Vec<(Hash32, RefRole)>> {
+pub fn refs(conn: &ScopeConn, checkpoint_id: &Id16) -> Result<Vec<(Hash32, RefRole)>> {
     let mut stmt = conn.prepare(
-        "SELECT object_id, role FROM checkpoint_refs WHERE checkpoint_id = ?1
-         ORDER BY object_id ASC",
+        "SELECT object_id, role FROM checkpoint_refs
+         WHERE checkpoint_id = ?1 AND vault_id = ? ORDER BY object_id ASC",
     )?;
-    let rows = stmt.query_map([checkpoint_id.as_slice()], |row| {
+    let rows = stmt.query_map((checkpoint_id.as_slice(), conn.scope().as_slice()), |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
     })?;
     let mut out = Vec::new();
@@ -265,11 +266,13 @@ pub fn refs(conn: &Connection, checkpoint_id: &Id16) -> Result<Vec<(Hash32, RefR
 /// checkpoint 创建的幂等 scope（§28.1 条目 3：request-id 创建 + 固定 role）。
 const DEDUP_CHECKPOINT_CREATE: &str = "checkpoint/create";
 
-fn dedup_lookup(conn: &Connection, scope: &str, id: &[u8]) -> Result<Option<(Hash32, Vec<u8>)>> {
-    let mut stmt =
-        conn.prepare("SELECT request_hash, response FROM dedup WHERE scope = ?1 AND id = ?2")?;
+fn dedup_lookup(conn: &ScopeConn, scope: &str, id: &[u8]) -> Result<Option<(Hash32, Vec<u8>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT request_hash, response FROM dedup
+         WHERE scope = ?1 AND id = ?2 AND vault_id = ?3",
+    )?;
     let row = stmt
-        .query_row((scope, id), |row| {
+        .query_row((scope, id, conn.scope().as_slice()), |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
         .optional()?;
@@ -286,7 +289,7 @@ fn dedup_lookup(conn: &Connection, scope: &str, id: &[u8]) -> Result<Option<(Has
 
 /// 候选 checkpoint 是否 **readback-ready**（candidate + 覆盖冻结 S + refs 完整性通过）。
 /// ready 与 published 是两件事：ready 前不能 activate，published 只由 activate 产生。
-pub fn candidate_ready(conn: &Connection, checkpoint: &CheckpointRow) -> Result<bool> {
+pub fn candidate_ready(conn: &ScopeConn, checkpoint: &CheckpointRow) -> Result<bool> {
     if checkpoint.state != CheckpointState::Candidate || checkpoint.health == Health::Unhealthy {
         return Ok(false);
     }
@@ -301,7 +304,7 @@ pub fn candidate_ready(conn: &Connection, checkpoint: &CheckpointRow) -> Result<
 
 /// 候选 epoch 的轮换维护 reservation：同一 rotation 复用一份（槽与两份基线共享预算）。
 fn rotation_reservation(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     device_id: &Id16,
     to_epoch: u64,
@@ -312,8 +315,9 @@ fn rotation_reservation(
     let existing: Option<Vec<u8>> = conn
         .query_row(
             "SELECT reservation_id FROM maintenance_reservations
-             WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'",
-            [rotation_id.as_slice()],
+             WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'
+               AND vault_id = ?",
+            (rotation_id.as_slice(), conn.scope().as_slice()),
             |row| row.get(0),
         )
         .optional()?;
@@ -340,7 +344,7 @@ fn rotation_reservation(
 /// `request_id` 时创建幂等（同 id 同请求 → 回原结果，同 id 不同请求 → 409）。
 #[allow(clippy::too_many_arguments)]
 pub fn create(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     actor: &AuthContext,
     estimated_bytes: i64,
@@ -398,8 +402,13 @@ pub fn create(
     if let Some(role) = role {
         let existing: i64 = conn.query_row(
             "SELECT COUNT(*) FROM checkpoints
-             WHERE epoch = ?1 AND role = ?2 AND state IN ('staging','candidate','published')",
-            (i64_of(target_epoch, "epoch")?, role.as_str()),
+             WHERE epoch = ?1 AND role = ?2 AND state IN ('staging','candidate','published')
+               AND vault_id = ?3",
+            (
+                i64_of(target_epoch, "epoch")?,
+                role.as_str(),
+                conn.scope().as_slice(),
+            ),
             |row| row.get(0),
         )?;
         if existing != 0 {
@@ -442,11 +451,12 @@ pub fn create(
 
     let checkpoint_id = crate::ids::random_id16()?;
     conn.execute(
-        "INSERT INTO checkpoints(checkpoint_id, epoch, covered_seq, manifest_oid, refs_digest,
-                                signed_commit, state, role, validation_version, health, created_at,
-                                published_at)
-         VALUES (?1, ?2, ?3, NULL, NULL, NULL, 'staging', ?4, 1, 'unknown', ?5, NULL)",
+        "INSERT INTO checkpoints(vault_id, checkpoint_id, epoch, covered_seq, manifest_oid,
+                                refs_digest, signed_commit, state, role, validation_version,
+                                health, created_at, published_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, 'staging', ?5, 1, 'unknown', ?6, NULL)",
         (
+            conn.scope().as_slice(),
             checkpoint_id.as_slice(),
             i64_of(target_epoch, "epoch")?,
             i64_of(covered_seq, "covered_seq")?,
@@ -484,9 +494,11 @@ pub fn create(
         }
         let response = wire::encode(fields)?;
         conn.execute(
-            "INSERT INTO dedup(scope, id, request_hash, accepted_seq, response, created_at)
-             VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+            "INSERT INTO dedup(vault_id, scope, id, request_hash, accepted_seq, response,
+                               created_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
             (
+                conn.scope().as_slice(),
                 DEDUP_CHECKPOINT_CREATE,
                 request_id.as_slice(),
                 request_hash.as_slice(),
@@ -507,7 +519,7 @@ pub fn create(
 
 /// 追加 refs（≤1024/请求；只接受 complete 且同 epoch 的对象）。
 pub fn add_refs(
-    conn: &Connection,
+    conn: &ScopeConn,
     max_refs: usize,
     checkpoint_id: &Id16,
     refs_in: &[(Hash32, RefRole)],
@@ -547,8 +559,13 @@ pub fn add_refs(
         }
         let existing: Option<String> = conn
             .query_row(
-                "SELECT role FROM checkpoint_refs WHERE checkpoint_id = ?1 AND object_id = ?2",
-                (checkpoint_id.as_slice(), object_id.as_slice()),
+                "SELECT role FROM checkpoint_refs
+                 WHERE checkpoint_id = ?1 AND object_id = ?2 AND vault_id = ?",
+                (
+                    checkpoint_id.as_slice(),
+                    object_id.as_slice(),
+                    conn.scope().as_slice(),
+                ),
                 |row| row.get(0),
             )
             .optional()?;
@@ -560,8 +577,8 @@ pub fn add_refs(
                 if *role == RefRole::Manifest {
                     let manifests: i64 = conn.query_row(
                         "SELECT COUNT(*) FROM checkpoint_refs
-                         WHERE checkpoint_id = ?1 AND role = 'manifest'",
-                        [checkpoint_id.as_slice()],
+                         WHERE checkpoint_id = ?1 AND role = 'manifest' AND vault_id = ?",
+                        (checkpoint_id.as_slice(), conn.scope().as_slice()),
                         |row| row.get(0),
                     )?;
                     if manifests > 0 {
@@ -569,8 +586,14 @@ pub fn add_refs(
                     }
                 }
                 conn.execute(
-                    "INSERT INTO checkpoint_refs(checkpoint_id, object_id, role) VALUES (?1, ?2, ?3)",
-                    (checkpoint_id.as_slice(), object_id.as_slice(), role.as_str()),
+                    "INSERT INTO checkpoint_refs(vault_id, checkpoint_id, object_id, role)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    (
+                        conn.scope().as_slice(),
+                        checkpoint_id.as_slice(),
+                        object_id.as_slice(),
+                        role.as_str(),
+                    ),
                 )?;
                 inserted += 1;
             }
@@ -580,10 +603,7 @@ pub fn add_refs(
 }
 
 /// 完整性校验（§13.3）：全部 refs 存在、对象 complete、分片密文摘要与记录一致。
-pub fn integrity_issues(
-    conn: &Connection,
-    checkpoint: &CheckpointRow,
-) -> Result<Vec<&'static str>> {
+pub fn integrity_issues(conn: &ScopeConn, checkpoint: &CheckpointRow) -> Result<Vec<&'static str>> {
     let refs = refs(conn, &checkpoint.checkpoint_id)?;
     if refs.is_empty() {
         return Ok(vec!["no_refs"]);
@@ -611,8 +631,13 @@ pub fn integrity_issues(
         let pinned: Option<i64> = conn
             .query_row(
                 "SELECT COUNT(*) FROM checkpoint_refs
-                 WHERE checkpoint_id = ?1 AND object_id = ?2 AND role = 'manifest'",
-                (checkpoint.checkpoint_id.as_slice(), manifest_oid.as_slice()),
+                 WHERE checkpoint_id = ?1 AND object_id = ?2 AND role = 'manifest'
+                   AND vault_id = ?",
+                (
+                    checkpoint.checkpoint_id.as_slice(),
+                    manifest_oid.as_slice(),
+                    conn.scope().as_slice(),
+                ),
                 |row| row.get(0),
             )
             .optional()?;
@@ -625,7 +650,7 @@ pub fn integrity_issues(
 
 /// 发布 checkpoint：校验 refs/摘要/签名/未来 live，原子标 published 并生成持久 GC 计划。
 pub fn publish(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -743,7 +768,7 @@ pub fn publish(
         "UPDATE checkpoints SET state = ?1, published_at = ?2, signed_commit = ?3,
                                 commit_signature = ?4, manifest_oid = ?5, refs_digest = ?6,
                                 health = 'healthy'
-         WHERE checkpoint_id = ?7 AND state = 'staging'",
+         WHERE checkpoint_id = ?7 AND state = 'staging' AND vault_id = ?",
         (
             target_state,
             now,
@@ -752,13 +777,15 @@ pub fn publish(
             request.manifest_oid.as_slice(),
             request.refs_digest.as_slice(),
             checkpoint_id.as_slice(),
+            conn.scope().as_slice(),
         ),
     )?;
     // 释放该 checkpoint 的维护 reservation（剩余额度回到 R_available；不删数据）。
     conn.execute(
         "UPDATE maintenance_reservations SET state = 'complete'
-         WHERE resource_id = ?1 AND purpose = 'checkpoint' AND state = 'active'",
-        [checkpoint_id.as_slice()],
+         WHERE resource_id = ?1 AND purpose = 'checkpoint' AND state = 'active'
+           AND vault_id = ?",
+        (checkpoint_id.as_slice(), conn.scope().as_slice()),
     )?;
     if target_state == "published" {
         schedule_gc_plan(conn, now, checkpoint.epoch, checkpoint_id)?;
@@ -775,7 +802,7 @@ pub fn publish(
 }
 
 /// 新 pair 产生持久 GC 计划；**已有计划不重置 deadline**（ADR §7）。
-fn schedule_gc_plan(conn: &Connection, now: i64, epoch: u64, new_checkpoint: &Id16) -> Result<()> {
+fn schedule_gc_plan(conn: &ScopeConn, now: i64, epoch: u64, new_checkpoint: &Id16) -> Result<()> {
     let published = published_newest_first_for_epoch(conn, epoch, 2)?;
     if published.len() < 2 {
         return Ok(());
@@ -805,14 +832,16 @@ pub struct CandidatePair {
 }
 
 /// 候选 epoch 的全部候选 checkpoint（诊断/自动提名；按角色、S、创建序排序）。
-pub fn candidates_for_epoch(conn: &Connection, epoch: u64) -> Result<Vec<CheckpointRow>> {
+pub fn candidates_for_epoch(conn: &ScopeConn, epoch: u64) -> Result<Vec<CheckpointRow>> {
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id FROM checkpoints
-         WHERE epoch = ?1 AND state = 'candidate'
+         WHERE epoch = ?1 AND state = 'candidate' AND vault_id = ?
          ORDER BY role IS NULL, role ASC, covered_seq DESC, rowid DESC",
     )?;
     let ids: Vec<Vec<u8>> = stmt
-        .query_map([i64_of(epoch, "epoch")?], |row| row.get::<_, Vec<u8>>(0))?
+        .query_map((i64_of(epoch, "epoch")?, conn.scope().as_slice()), |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut rows = Vec::with_capacity(ids.len());
     for id in ids {
@@ -827,7 +856,7 @@ pub fn candidates_for_epoch(conn: &Connection, epoch: u64) -> Result<Vec<Checkpo
 
 /// 某 checkpoint 引用的 SNAPSHOT 数据对象（§28.1 条目 3：两个候选基线的 snapshot
 /// refs 必须不相交；同 epoch ASSET 允许共享，因为资产复制是同一份已校验对象）。
-fn snapshot_refs(conn: &Connection, checkpoint: &CheckpointRow) -> Result<Vec<Hash32>> {
+fn snapshot_refs(conn: &ScopeConn, checkpoint: &CheckpointRow) -> Result<Vec<Hash32>> {
     let mut out = Vec::new();
     for (object_id, role) in refs(conn, &checkpoint.checkpoint_id)? {
         if role != RefRole::Data {
@@ -881,7 +910,7 @@ fn commit_binding_issues(checkpoint: &CheckpointRow) -> Vec<&'static str> {
 ///   `signed_commit`/`refs_digest` 与行逐字段绑定；
 /// - 其余候选 checkpoint 标 `aborted`（永不复用），只有指名的两份变 published。
 pub fn promote_named_candidates(
-    conn: &Connection,
+    conn: &ScopeConn,
     epoch: u64,
     primary_id: &Id16,
     fallback_id: &Id16,
@@ -954,11 +983,12 @@ pub fn promote_named_candidates(
     conn.execute(
         "UPDATE checkpoints SET state = 'aborted'
          WHERE epoch = ?1 AND state = 'candidate'
-           AND checkpoint_id NOT IN (?2, ?3)",
+           AND checkpoint_id NOT IN (?2, ?3) AND vault_id = ?",
         (
             i64_of(epoch, "epoch")?,
             primary.checkpoint_id.as_slice(),
             fallback.checkpoint_id.as_slice(),
+            conn.scope().as_slice(),
         ),
     )?;
     for (checkpoint, role) in [
@@ -967,8 +997,13 @@ pub fn promote_named_candidates(
     ] {
         conn.execute(
             "UPDATE checkpoints SET state = 'published', role = ?1, published_at = ?2
-             WHERE checkpoint_id = ?3 AND state = 'candidate'",
-            (role.as_str(), now, checkpoint.checkpoint_id.as_slice()),
+             WHERE checkpoint_id = ?3 AND state = 'candidate' AND vault_id = ?",
+            (
+                role.as_str(),
+                now,
+                checkpoint.checkpoint_id.as_slice(),
+                conn.scope().as_slice(),
+            ),
         )?;
     }
     let cut_seq = primary.covered_seq.min(fallback.covered_seq);
@@ -1008,16 +1043,16 @@ pub struct PruneOutcome {
 ///   不在这里回收（同 epoch 孤儿删除仍按评审"可后置"处理）。
 /// - ASSET 对象被回收时同步把 `asset_objects.state` 标 `retired`（历史事实保留，但
 ///   枚举不再声称密文可用）。
-pub fn prune_retired(conn: &Connection, now: i64, keep: &[Id16]) -> Result<PruneOutcome> {
+pub fn prune_retired(conn: &ScopeConn, now: i64, keep: &[Id16]) -> Result<PruneOutcome> {
     let vault = vault::load(conn)?;
     let cutoff = now - secs::GC_GRACE;
     let mut leased: Vec<Id16> = Vec::new();
     {
         let mut stmt = conn.prepare(
             "SELECT primary_checkpoint, fallback_checkpoint FROM bootstrap_leases
-             WHERE expires_at > ?1",
+             WHERE expires_at > ?1 AND vault_id = ?",
         )?;
-        let rows = stmt.query_map([now], |row| {
+        let rows = stmt.query_map((now, conn.scope().as_slice()), |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
         for row in rows {
@@ -1036,9 +1071,10 @@ pub fn prune_retired(conn: &Connection, now: i64, keep: &[Id16]) -> Result<Prune
         let mut stmt = conn.prepare(
             "SELECT checkpoint_id, epoch, state, published_at, created_at FROM checkpoints
              WHERE state IN ('published','staging','candidate','aborted')
+               AND vault_id = ?1
              ORDER BY epoch ASC, rowid ASC",
         )?;
-        let mapped = stmt.query_map([], |row| {
+        let mapped = stmt.query_map([conn.scope().as_slice()], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
@@ -1082,12 +1118,13 @@ pub fn prune_retired(conn: &Connection, now: i64, keep: &[Id16]) -> Result<Prune
             continue;
         }
         conn.execute(
-            "DELETE FROM checkpoint_refs WHERE checkpoint_id = ?1",
-            [checkpoint_id.as_slice()],
+            "DELETE FROM checkpoint_refs WHERE checkpoint_id = ?1 AND vault_id = ?",
+            (checkpoint_id.as_slice(), conn.scope().as_slice()),
         )?;
         conn.execute(
-            "UPDATE checkpoints SET state = 'pruned' WHERE checkpoint_id = ?1",
-            [checkpoint_id.as_slice()],
+            "UPDATE checkpoints SET state = 'pruned'
+             WHERE checkpoint_id = ?1 AND vault_id = ?",
+            (checkpoint_id.as_slice(), conn.scope().as_slice()),
         )?;
         outcome.pruned_checkpoints += 1;
     }
@@ -1096,7 +1133,7 @@ pub fn prune_retired(conn: &Connection, now: i64, keep: &[Id16]) -> Result<Prune
 }
 
 /// 回收"无 refs、无 log、完成超过 7 天"的对象 parts；见 [`prune_retired`] 的规则说明。
-fn retire_unreferenced_objects(conn: &Connection, active_epoch: u64, cutoff: i64) -> Result<u64> {
+fn retire_unreferenced_objects(conn: &ScopeConn, active_epoch: u64, cutoff: i64) -> Result<u64> {
     let mut stmt = conn.prepare(
         "SELECT o.object_id, o.epoch, o.type FROM objects o
          WHERE o.state = 'complete'
@@ -1104,18 +1141,30 @@ fn retire_unreferenced_objects(conn: &Connection, active_epoch: u64, cutoff: i64
            AND o.type BETWEEN 1 AND 4
            AND o.completed_at IS NOT NULL
            AND o.completed_at <= ?1
-           AND NOT EXISTS (SELECT 1 FROM checkpoint_refs r WHERE r.object_id = o.object_id)
-           AND NOT EXISTS (SELECT 1 FROM log l WHERE l.object_id = o.object_id)
-           AND o.epoch NOT IN (SELECT to_epoch FROM rotations WHERE state IN ('frozen','staging'))
-           AND o.epoch != ?2",
+           AND NOT EXISTS (SELECT 1 FROM checkpoint_refs r
+                           WHERE r.object_id = o.object_id AND r.vault_id = o.vault_id)
+           AND NOT EXISTS (SELECT 1 FROM log l
+                           WHERE l.object_id = o.object_id AND l.vault_id = o.vault_id)
+           AND o.epoch NOT IN (SELECT to_epoch FROM rotations
+                               WHERE state IN ('frozen','staging')
+                                 AND vault_id = o.vault_id)
+           AND o.epoch != ?2
+           AND o.vault_id = ?3",
     )?;
-    let rows = stmt.query_map((cutoff, i64_of(active_epoch, "epoch")?), |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        (
+            cutoff,
+            i64_of(active_epoch, "epoch")?,
+            conn.scope().as_slice(),
+        ),
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
     let mut collected: Vec<(Hash32, u64, i64)> = Vec::new();
     for row in rows {
         let (object_id, epoch, object_type) = row?;
@@ -1131,19 +1180,24 @@ fn retire_unreferenced_objects(conn: &Connection, active_epoch: u64, cutoff: i64
     let mut retired = 0u64;
     for (object_id, epoch, object_type) in collected {
         conn.execute(
-            "DELETE FROM object_parts WHERE object_id = ?1",
-            [object_id.as_slice()],
+            "DELETE FROM object_parts WHERE object_id = ?1 AND vault_id = ?",
+            (object_id.as_slice(), conn.scope().as_slice()),
         )?;
         conn.execute(
-            "UPDATE objects SET budget_class = 'retired' WHERE object_id = ?1",
-            [object_id.as_slice()],
+            "UPDATE objects SET budget_class = 'retired'
+             WHERE object_id = ?1 AND vault_id = ?",
+            (object_id.as_slice(), conn.scope().as_slice()),
         )?;
         // ASSET 副本：登记行保留为历史事实，但不再声称密文可用。
         if object_type == ObjectType::Asset.as_i64() {
             conn.execute(
                 "UPDATE asset_objects SET state = 'retired'
-                 WHERE epoch = ?1 AND object_id = ?2",
-                (i64_of(epoch, "epoch")?, object_id.as_slice()),
+                 WHERE epoch = ?1 AND object_id = ?2 AND vault_id = ?",
+                (
+                    i64_of(epoch, "epoch")?,
+                    object_id.as_slice(),
+                    conn.scope().as_slice(),
+                ),
             )?;
         }
         retired += 1;
@@ -1151,28 +1205,29 @@ fn retire_unreferenced_objects(conn: &Connection, active_epoch: u64, cutoff: i64
     Ok(retired)
 }
 
-pub fn abort_candidates(conn: &Connection, epoch: u64) -> Result<u64> {
+pub fn abort_candidates(conn: &ScopeConn, epoch: u64) -> Result<u64> {
     let changed = conn.execute(
         "UPDATE checkpoints SET state = 'aborted'
-         WHERE epoch = ?1 AND state IN ('staging','candidate')",
-        [i64_of(epoch, "epoch")?],
+         WHERE epoch = ?1 AND state IN ('staging','candidate') AND vault_id = ?",
+        (i64_of(epoch, "epoch")?, conn.scope().as_slice()),
     )?;
     u64::try_from(changed).map_err(|_| Error::Invariant("aborted checkpoints"))
 }
 
 /// 为已 promote 的 pair 写持久 GC 计划（幂等：deadline 不重置）。
 pub fn schedule_plan_for_pair(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     epoch: u64,
     cut_seq: u64,
     proof: &[u8],
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO gc_plans(epoch, cut_seq, eligible_at, proof, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(epoch, cut_seq) DO NOTHING",
+        "INSERT INTO gc_plans(vault_id, epoch, cut_seq, eligible_at, proof, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(vault_id, epoch, cut_seq) DO NOTHING",
         (
+            conn.scope().as_slice(),
             i64_of(epoch, "epoch")?,
             i64_of(cut_seq, "cut_seq")?,
             now + secs::GC_GRACE,
@@ -1205,39 +1260,14 @@ fn pair_proof(newer: &CheckpointRow, older: &CheckpointRow) -> Vec<u8> {
 }
 
 /// active epoch 下已发布（且未被标 unhealthy）的 checkpoint，按 published_at 倒序。
-pub fn published_newest_first(conn: &Connection, limit: u32) -> Result<Vec<CheckpointRow>> {
+pub fn published_newest_first(conn: &ScopeConn, limit: u32) -> Result<Vec<CheckpointRow>> {
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id FROM checkpoints
-         WHERE state = 'published' AND health != 'unhealthy'
+         WHERE state = 'published' AND health != 'unhealthy' AND vault_id = ?2
          ORDER BY published_at DESC, rowid DESC LIMIT ?1",
     )?;
     let ids: Vec<Vec<u8>> = stmt
-        .query_map([i64::from(limit.max(1))], |row| row.get::<_, Vec<u8>>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        let id: Id16 = id
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::Invariant("checkpoint_id"))?;
-        out.push(get(conn, &id)?);
-    }
-    Ok(out)
-}
-
-/// 指定 epoch 的已发布基线（GC 计划用），按 published_at 倒序。
-pub fn published_newest_first_for_epoch(
-    conn: &Connection,
-    epoch: u64,
-    limit: u32,
-) -> Result<Vec<CheckpointRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT checkpoint_id FROM checkpoints
-         WHERE state = 'published' AND health != 'unhealthy' AND epoch = ?1
-         ORDER BY published_at DESC, rowid DESC LIMIT ?2",
-    )?;
-    let ids: Vec<Vec<u8>> = stmt
-        .query_map((i64_of(epoch, "epoch")?, i64::from(limit.max(1))), |row| {
+        .query_map((i64::from(limit.max(1)), conn.scope().as_slice()), |row| {
             row.get::<_, Vec<u8>>(0)
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1252,8 +1282,41 @@ pub fn published_newest_first_for_epoch(
     Ok(out)
 }
 
+/// 指定 epoch 的已发布基线（GC 计划用），按 published_at 倒序。
+pub fn published_newest_first_for_epoch(
+    conn: &ScopeConn,
+    epoch: u64,
+    limit: u32,
+) -> Result<Vec<CheckpointRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT checkpoint_id FROM checkpoints
+         WHERE state = 'published' AND health != 'unhealthy' AND epoch = ?1
+           AND vault_id = ?3
+         ORDER BY published_at DESC, rowid DESC LIMIT ?2",
+    )?;
+    let ids: Vec<Vec<u8>> = stmt
+        .query_map(
+            (
+                i64_of(epoch, "epoch")?,
+                i64::from(limit.max(1)),
+                conn.scope().as_slice(),
+            ),
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id: Id16 = id
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invariant("checkpoint_id"))?;
+        out.push(get(conn, &id)?);
+    }
+    Ok(out)
+}
+
 /// bootstrap 用的两份基线：必须属于当前活动 epoch，且恰好两份可独立导入。
-pub fn active_baselines(conn: &Connection) -> Result<Vec<CheckpointRow>> {
+pub fn active_baselines(conn: &ScopeConn) -> Result<Vec<CheckpointRow>> {
     let vault = vault::load(conn)?;
     let all = published_newest_first(conn, 8)?;
     let mut out: Vec<CheckpointRow> = all
@@ -1265,20 +1328,25 @@ pub fn active_baselines(conn: &Connection) -> Result<Vec<CheckpointRow>> {
 }
 
 /// 标记健康度。
-pub fn mark_health(conn: &Connection, checkpoint_id: &Id16, health: Health) -> Result<()> {
+pub fn mark_health(conn: &ScopeConn, checkpoint_id: &Id16, health: Health) -> Result<()> {
     conn.execute(
-        "UPDATE checkpoints SET health = ?1 WHERE checkpoint_id = ?2",
-        (health.as_str(), checkpoint_id.as_slice()),
+        "UPDATE checkpoints SET health = ?1 WHERE checkpoint_id = ?2 AND vault_id = ?",
+        (
+            health.as_str(),
+            checkpoint_id.as_slice(),
+            conn.scope().as_slice(),
+        ),
     )?;
     Ok(())
 }
 
 /// 某 epoch 已发布 checkpoint 的 `(数量, 最小 covered_seq)`。
-pub fn published_for_epoch(conn: &Connection, epoch: u64) -> Result<(u64, u64)> {
+pub fn published_for_epoch(conn: &ScopeConn, epoch: u64) -> Result<(u64, u64)> {
     let (count, min_seq): (i64, Option<i64>) = conn.query_row(
         "SELECT COUNT(*), MIN(covered_seq) FROM checkpoints
-         WHERE epoch = ?1 AND state IN ('published','candidate') AND health != 'unhealthy'",
-        [i64_of(epoch, "epoch")?],
+         WHERE epoch = ?1 AND state IN ('published','candidate') AND health != 'unhealthy'
+           AND vault_id = ?",
+        (i64_of(epoch, "epoch")?, conn.scope().as_slice()),
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok((
@@ -1323,7 +1391,7 @@ pub struct BootstrapOutcome {
 ///
 /// `allow_degraded=true` 时允许"只有一份健康基线"的降级读回（另一份损坏/缺失）。
 pub fn bootstrap(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     actor: &AuthContext,
     allow_degraded: bool,
@@ -1377,10 +1445,11 @@ pub fn bootstrap(
         expires_at: now + secs::BOOTSTRAP_LEASE_TTL,
     };
     conn.execute(
-        "INSERT INTO bootstrap_leases(lease_id, device_id, primary_checkpoint, fallback_checkpoint,
-                                      floor_seq, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO bootstrap_leases(vault_id, lease_id, device_id, primary_checkpoint,
+                                      fallback_checkpoint, floor_seq, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
+            conn.scope().as_slice(),
             lease.lease_id.as_slice(),
             lease.device_id.as_slice(),
             lease.primary_checkpoint.as_slice(),
@@ -1403,7 +1472,7 @@ pub fn bootstrap(
 
 /// 续租：只能延长到 `created_at + 7d`（ADR §7 上限），过期 lease → 410 LEASE_EXPIRED。
 pub fn renew_lease(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     actor: &AuthContext,
     lease_id: &Id16,
@@ -1413,10 +1482,10 @@ pub fn renew_lease(
     let mut stmt = conn.prepare(
         "SELECT lease_id, device_id, primary_checkpoint, fallback_checkpoint, floor_seq,
                 created_at, expires_at
-         FROM bootstrap_leases WHERE lease_id = ?1",
+         FROM bootstrap_leases WHERE lease_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([lease_id.as_slice()], |row| {
+        .query_row((lease_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -1464,8 +1533,8 @@ pub fn renew_lease(
     let max_expiry = lease.created_at + secs::BOOTSTRAP_LEASE_MAX;
     let expires_at = (now + secs::BOOTSTRAP_LEASE_TTL).min(max_expiry);
     conn.execute(
-        "UPDATE bootstrap_leases SET expires_at = ?1 WHERE lease_id = ?2",
-        (expires_at, lease_id.as_slice()),
+        "UPDATE bootstrap_leases SET expires_at = ?1 WHERE lease_id = ?2 AND vault_id = ?",
+        (expires_at, lease_id.as_slice(), conn.scope().as_slice()),
     )?;
     Ok(LeaseRow {
         expires_at,
@@ -1474,11 +1543,12 @@ pub fn renew_lease(
 }
 
 /// 当前有效（未过期）的 lease 最小 floor_seq（GC 用）。
-pub fn active_lease_floor(conn: &Connection, now: i64) -> Result<Option<u64>> {
+pub fn active_lease_floor(conn: &ScopeConn, now: i64) -> Result<Option<u64>> {
     let value: Option<Option<i64>> = conn
         .query_row(
-            "SELECT MIN(floor_seq) FROM bootstrap_leases WHERE expires_at > ?1",
-            [now],
+            "SELECT MIN(floor_seq) FROM bootstrap_leases
+             WHERE expires_at > ?1 AND vault_id = ?",
+            (now, conn.scope().as_slice()),
             |row| row.get(0),
         )
         .optional()?;
@@ -1499,7 +1569,7 @@ pub fn pair_digest(primary: &CheckpointRow, fallback: &CheckpointRow) -> Hash32 
 }
 
 /// refs 集合的摘要（诊断用，不用于 wire；wire 的 `refs_digest` 由 hook 按 CDE 计算）。
-pub fn refs_fingerprint(conn: &Connection, checkpoint_id: &Id16) -> Result<Hash32> {
+pub fn refs_fingerprint(conn: &ScopeConn, checkpoint_id: &Id16) -> Result<Hash32> {
     let refs = refs(conn, checkpoint_id)?;
     let mut buf = Vec::new();
     for (object_id, role) in refs {

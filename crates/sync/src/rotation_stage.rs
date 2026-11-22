@@ -11,6 +11,7 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::api_version::RelayApi;
 use crate::checkpoint::{asset_object_id, asset_plaintext, AssetSource, CheckpointWriter};
 use crate::device::{DeviceSigningKey, ManagementKey};
 use crate::error::SyncError;
@@ -97,6 +98,16 @@ pub fn reencrypt_assets<C: RelayClient>(
                 None,
             )?
         };
+        crate::asset_sync::mark_uploaded(
+            vault,
+            &crate::asset_sync::AssetUploadedFact {
+                object_id: object.object_id,
+                part_count: object.part_count,
+                total_plain_len: object.total_plain_len,
+                object_digest: object.object_digest,
+                key_epoch: new_root.key_epoch,
+            },
+        )?;
         out.push(ReencryptedAsset {
             real_sha256: real,
             byte_len: meta.byte_len,
@@ -285,7 +296,7 @@ pub type ReencryptedAssets = (Vec<ReencryptedAsset>, Option<[u8; 32]>, u64);
 #[allow(clippy::too_many_arguments)]
 pub fn begin_rotation_http<T: crate::http_relay::HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault: &Vault,
     journal: &mut crate::rotation_journal::RotationJournal,
     vault_id: VaultId,
@@ -296,7 +307,7 @@ pub fn begin_rotation_http<T: crate::http_relay::HttpTransport>(
     now: u64,
 ) -> Result<StartedRotation, SyncError> {
     let (token, _) =
-        crate::recovery_enroll::management_token(transport, base, vault_id, manager, now)?;
+        crate::recovery_enroll::management_token(transport, api, vault_id, manager, now)?;
     let begin = crate::rotation::sign_begin(
         manager,
         instance_id,
@@ -305,6 +316,7 @@ pub fn begin_rotation_http<T: crate::http_relay::HttpTransport>(
         journal.from_epoch,
         journal.control_rev,
         revoke,
+        api.version(),
     )?;
     let signed = crate::cbor::CdeValue::Map(vec![
         (0, crate::cbor::bytes(begin.signed_body.clone())),
@@ -313,10 +325,7 @@ pub fn begin_rotation_http<T: crate::http_relay::HttpTransport>(
     let response = crate::recovery_enroll::send(
         transport,
         "POST",
-        format!(
-            "{base}/v1/vaults/{}/rotations",
-            crate::base64url::encode(&vault_id)
-        ),
+        api.url(&api.vault_path(&vault_id, "/rotations")),
         Some(&token),
         crate::cbor::encode(vec![
             (0, signed),
@@ -465,6 +474,16 @@ pub fn reencrypt_frozen_assets<C: RelayClient>(
                 None,
             )?
         };
+        crate::asset_sync::mark_uploaded(
+            vault,
+            &crate::asset_sync::AssetUploadedFact {
+                object_id: object.object_id,
+                part_count: object.part_count,
+                total_plain_len: object.total_plain_len,
+                object_digest: object.object_digest,
+                key_epoch: new_root.key_epoch,
+            },
+        )?;
         out.push(ReencryptedAsset {
             real_sha256: real,
             byte_len,
@@ -473,7 +492,6 @@ pub fn reencrypt_frozen_assets<C: RelayClient>(
             object_digest: object.object_digest,
         });
     }
-    let _ = vault;
     Ok((out, digest, total))
 }
 
@@ -522,7 +540,7 @@ pub fn assert_candidate_ready<C: RelayClient>(
 #[allow(clippy::too_many_arguments)]
 pub fn restart_rotation<T: crate::http_relay::HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: VaultId,
     rotation_id: [u8; 16],
     manager: &ManagementKey,
@@ -532,11 +550,13 @@ pub fn restart_rotation<T: crate::http_relay::HttpTransport>(
     now: u64,
 ) -> Result<(), SyncError> {
     let (token, _) =
-        crate::recovery_enroll::management_token(transport, base, vault_id, manager, now)?;
-    let path = format!(
-        "/v1/vaults/{}/rotations/{}/restart",
-        crate::base64url::encode(&vault_id),
-        crate::base64url::encode(&rotation_id)
+        crate::recovery_enroll::management_token(transport, api, vault_id, manager, now)?;
+    let path = api.vault_path(
+        &vault_id,
+        &format!(
+            "/rotations/{}/restart",
+            crate::base64url::encode(&rotation_id)
+        ),
     );
     let body = cbor_empty();
     let (signed, signature) = sign_management(
@@ -551,7 +571,7 @@ pub fn restart_rotation<T: crate::http_relay::HttpTransport>(
     let response = crate::recovery_enroll::send(
         transport,
         "POST",
-        format!("{base}{path}"),
+        api.url(&path),
         Some(&token),
         crate::cbor::encode(vec![
             (0, signed),
@@ -569,7 +589,7 @@ pub fn restart_rotation<T: crate::http_relay::HttpTransport>(
 #[allow(clippy::too_many_arguments)]
 pub fn revoke_more<T: crate::http_relay::HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: VaultId,
     rotation_id: [u8; 16],
     manager: &ManagementKey,
@@ -580,11 +600,13 @@ pub fn revoke_more<T: crate::http_relay::HttpTransport>(
     now: u64,
 ) -> Result<u64, SyncError> {
     let (token, _) =
-        crate::recovery_enroll::management_token(transport, base, vault_id, manager, now)?;
-    let path = format!(
-        "/v1/vaults/{}/rotations/{}/revoke-more",
-        crate::base64url::encode(&vault_id),
-        crate::base64url::encode(&rotation_id)
+        crate::recovery_enroll::management_token(transport, api, vault_id, manager, now)?;
+    let path = api.vault_path(
+        &vault_id,
+        &format!(
+            "/rotations/{}/revoke-more",
+            crate::base64url::encode(&rotation_id)
+        ),
     );
     let body = crate::cbor::encode(vec![(
         0,
@@ -607,7 +629,7 @@ pub fn revoke_more<T: crate::http_relay::HttpTransport>(
     let response = crate::recovery_enroll::send(
         transport,
         "POST",
-        format!("{base}{path}"),
+        api.url(&path),
         Some(&token),
         crate::cbor::encode(vec![
             (0, signed),
@@ -635,7 +657,7 @@ pub type StagedGrants = (Vec<Vec<u8>>, [u8; 32], u64);
 /// §30.3：management 读 staged grants（叶子 manifest + digest/count）。
 pub fn list_staged_grants<T: crate::http_relay::HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: VaultId,
     rotation_id: [u8; 16],
     manager: &ManagementKey,
@@ -643,14 +665,16 @@ pub fn list_staged_grants<T: crate::http_relay::HttpTransport>(
 ) -> Result<StagedGrants, SyncError> {
     // 返回值即 relay `{0 leaves,1 grants_digest,2 count}`。
     let (token, _) =
-        crate::recovery_enroll::management_token(transport, base, vault_id, manager, now)?;
+        crate::recovery_enroll::management_token(transport, api, vault_id, manager, now)?;
     let response = crate::recovery_enroll::send(
         transport,
         "GET",
-        format!(
-            "{base}/v1/vaults/{}/rotations/{}/grants",
-            crate::base64url::encode(&vault_id),
-            crate::base64url::encode(&rotation_id)
+        api.vault_path(
+            &vault_id,
+            &format!(
+                "/rotations/{}/grants",
+                crate::base64url::encode(&rotation_id)
+            ),
         ),
         Some(&token),
         Vec::new(),
@@ -820,7 +844,7 @@ pub(crate) fn decode_asset_plaintext(bytes: &[u8]) -> Result<([u8; 32], u64, Str
 /// 阶段 F：把 grant leaf stage 到 relay（management realm；§28.1 条目 5）。
 pub fn stage_grants<T: crate::http_relay::HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: VaultId,
     rotation_id: [u8; 16],
     manager: &ManagementKey,
@@ -828,7 +852,7 @@ pub fn stage_grants<T: crate::http_relay::HttpTransport>(
     now: u64,
 ) -> Result<(), SyncError> {
     let (token, _) =
-        crate::recovery_enroll::management_token(transport, base, vault_id, manager, now)?;
+        crate::recovery_enroll::management_token(transport, api, vault_id, manager, now)?;
     for leaf in leaves {
         // URL 里的 `{device_id}` 只是设备维度；body 键 0 是**真实 grant_id**（grant AAD
         // 里绑定的那个），relay 按 grant_id 验签/落库，不能拿 device_id 顶替。
@@ -844,12 +868,14 @@ pub fn stage_grants<T: crate::http_relay::HttpTransport>(
         let response = crate::recovery_enroll::send(
             transport,
             "PUT",
-            format!(
-                "{base}/v1/vaults/{}/rotations/{}/grants/{}",
-                crate::base64url::encode(&vault_id),
-                crate::base64url::encode(&rotation_id),
-                crate::base64url::encode(&leaf.device_id)
-            ),
+            api.url(&api.vault_path(
+                &vault_id,
+                &format!(
+                    "/rotations/{}/grants/{}",
+                    crate::base64url::encode(&rotation_id),
+                    crate::base64url::encode(&leaf.device_id)
+                ),
+            )),
             Some(&token),
             body,
         )?;

@@ -226,16 +226,19 @@ fn crash_replay_after_parts_and_after_complete() {
     let commit = commit_for(&digest);
 
     // "重启"：关闭 writer 线程，重新打开同一个库（同一 FakeClock）。
+    let vault_id = fx.vault_id;
     let path = fx.into_db_path();
     let cleanup_path = path.clone();
     let clock = std::sync::Arc::new(relay::time::FakeClock::new(BASE_TIME));
     let db = relay::db::Db::open(relay::db::DbConfig::new(path), clock.clone()).expect("reopen");
+    let db = TestDb::new(db, relay::VaultScope::new(vault_id));
     let vault = db.read(relay::vault::load).expect("vault");
     let ctx = relay::auth::AuthContext {
         realm: relay::auth::Realm::Device,
         subject: [2u8; 16],
         device_id: Some([2u8; 16]),
         auth_rev: vault.auth_rev,
+        vault: relay::VaultScope::new(vault_id),
     };
     let hook = std::sync::Arc::new(TestHook::new());
     let vault_id = vault.vault_id;
@@ -287,8 +290,8 @@ fn crash_replay_after_parts_and_after_complete() {
     let head: u64 = db
         .read(|conn| {
             let value: i64 = conn.query_row(
-                "SELECT head_seq FROM vault WHERE singleton = 1",
-                [],
+                "SELECT head_seq FROM vaults WHERE vault_id = ?1",
+                [conn.scope().as_slice()],
                 |row| row.get(0),
             )?;
             Ok(u64::try_from(value).expect("head"))

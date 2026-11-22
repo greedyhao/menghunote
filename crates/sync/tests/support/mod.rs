@@ -393,6 +393,13 @@ pub struct FakeRelay {
     pub acks: Vec<(u64, u64, u64)>,
     /// 每次 `put_part` 的记录（重试字节一致性断言）。
     pub put_history: Vec<(ObjectId, u32, Vec<u8>)>,
+    /// 单次注入的 `put_part` 失败：`(object_id, part_no)` → relay 错误码；命中即消费。
+    ///
+    /// 用于"多片资产传到一半失败、下一轮从缺失片续传"的确定性测试。
+    pub fail_put_parts: HashMap<(ObjectId, u32), &'static str>,
+    /// 被维护 reservation 持有的对象：普通 `put_part` 一律 `ID_CONFLICT`（模拟真实
+    /// relay 对"同一对象全部分片必须同预算来源"的拒绝）。
+    pub reserved_objects: std::collections::HashSet<ObjectId>,
     /// 每次 `part`（GET）的记录：`(object_id, part_no)`（读回次数断言）。
     pub part_gets: Vec<(ObjectId, u32)>,
     /// 指定对象在 `submit_updates` 中失败一次/永久。
@@ -465,6 +472,8 @@ impl FakeRelay {
             acks: Vec::new(),
             put_history: Vec::new(),
             part_gets: Vec::new(),
+            fail_put_parts: HashMap::new(),
+            reserved_objects: std::collections::HashSet::new(),
             fail_submit: HashMap::new(),
             truncate_next_log: false,
             freeze_next_cursor: false,
@@ -687,6 +696,24 @@ impl RelayClient for FakeRelay {
         part_no: u32,
         envelope: &[u8],
     ) -> Result<(), menghunote_sync::SyncError> {
+        if self.reserved_objects.contains(object_id) {
+            return Err(menghunote_sync::SyncError::RelayApi {
+                code: "ID_CONFLICT".to_owned(),
+                retryable: false,
+                current_epoch: None,
+                current_control_rev: None,
+                bootstrap_hint: None,
+            });
+        }
+        if let Some(code) = self.fail_put_parts.remove(&(*object_id, part_no)) {
+            return Err(menghunote_sync::SyncError::RelayApi {
+                code: code.to_owned(),
+                retryable: false,
+                current_epoch: None,
+                current_control_rev: None,
+                bootstrap_hint: None,
+            });
+        }
         match self.parts.get(&(*object_id, part_no)) {
             Some(existing) if existing != envelope => {
                 return Err(menghunote_sync::SyncError::RelayApi {

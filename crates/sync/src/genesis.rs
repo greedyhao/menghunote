@@ -16,6 +16,8 @@
 //! 两者都没有时返回明确错误，调用方必须走 bootstrap（`gc_floor > 0` 时同样必须
 //! bootstrap，relay 对 `cursor_at(0)` 会返回 410 CURSOR_EXPIRED）。
 
+use sha2::{Digest, Sha256};
+
 use crate::cbor;
 use crate::device::{
     default_rights, sign_device_cert, DeviceHpkeKey, DeviceSigningKey, ManagementKey,
@@ -131,6 +133,27 @@ impl core::fmt::Debug for GenesisMaterials {
             .field("managers", &"<redacted>")
             .finish()
     }
+}
+
+/// genesis 响应里的 relay 事实（**不含**本地秘密材料）。
+///
+/// 拆出来的理由（ADR 0013 S2b）：初始化必须先 durable 记录 pending 材料，再发网络请求；
+/// 请求只依赖本地材料，回执只需要这些公开事实，因此"造材料 / 提交请求 / 收事实"可以
+/// 分三步走，pending 与身份落盘的先后关系才可对账。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenesisReceipt {
+    /// relay 实例 id（pin 用）。
+    pub instance_id: [u8; 16],
+    /// relay 日志 id。
+    pub log_id: [u8; 16],
+    /// 活动 epoch。
+    pub epoch: u64,
+    /// 控制链版本。
+    pub control_rev: u64,
+    /// 鉴权版本。
+    pub auth_rev: u64,
+    /// 初始游标（relay 响应键 5；旧版 relay 可能没有）。
+    pub initial_cursor: Option<String>,
 }
 
 /// genesis 成功后的结果。
@@ -307,6 +330,108 @@ pub fn genesis_request_bytes(
     cbor::encode(genesis_fields(materials, setup_secret)?)
 }
 
+/// rev1 控制记录摘要：`record_hash = SHA256(零32 || 设备证书)`（ADR 0013 §3 / §35）。
+///
+/// 与 relay `vault::init` 里插入 rev1 控制记录时用的公式**逐字节相同**：第一条控制记录的
+/// `prev_hash` 是 32 字节全零，`signed_record` 就是 genesis 设备证书的 CDE 字节。客户端在
+/// **发请求之前**就能用本地提交的证书复算它，因此 Create 可以把"rev1 强 pin"作为
+/// 第一次联网的信任起点，而不需要任何 unpinned 消费。
+///
+/// 证书编码失败（CDE 契约）返回 [`SyncError::Proto`]，不做任何降级。
+pub fn rev1_record_hash(
+    certificate: &menghunote_sync_proto::DeviceCertV1,
+) -> Result<[u8; 32], SyncError> {
+    let cert_bytes = certificate.encode()?;
+    let mut input = Vec::with_capacity(32 + cert_bytes.len());
+    input.extend_from_slice(&[0u8; 32]);
+    input.extend_from_slice(&cert_bytes);
+    Ok(Sha256::digest(&input).into())
+}
+
+/// v2 创建票据请求的 CBOR 字段：`{0:ticket, 1..7: 与 v1 genesis 同序}`。
+///
+/// 与 v1 的唯一差别是**授权字段**：v2 没有 setup secret，键 0 是 32B 创建票据，
+/// 原有字段整体后移一位（relay `api::create_vault_v2` 逐字段对齐）。
+pub fn ticket_genesis_fields(
+    materials: &GenesisMaterials,
+    ticket: &[u8; 32],
+) -> Result<cbor::Fields, SyncError> {
+    Ok(vec![
+        (0, cbor::bytes(*ticket)),
+        (1, cbor::bytes(materials.vault_id)),
+        (2, cbor::bytes(materials.device_id)),
+        (3, cbor::bytes(materials.certificate().sign_ed25519_pub)),
+        (4, cbor::bytes(materials.certificate().hpke_x25519_pub)),
+        (5, cbor::bytes(materials.manager_pub())),
+        (6, cbor::bytes(materials.signed_cert.cert_bytes()?)),
+        (7, cbor::bytes(materials.signed_cert.signature)),
+    ])
+}
+
+/// v2 创建票据请求体（CBOR；测试 golden 用）。
+pub fn ticket_genesis_request_bytes(
+    materials: &GenesisMaterials,
+    ticket: &[u8; 32],
+) -> Result<Vec<u8>, SyncError> {
+    cbor::encode(ticket_genesis_fields(materials, ticket)?)
+}
+
+/// 对 relay 执行 genesis：`POST /v1/vaults`，并返回回执（不含本地材料）。
+///
+/// S2b 的受限初始化入口用它把"本地材料已 durable 记录"与"远端已创建"分成两步；
+/// 传统入口 [`run`] 只是"造材料 + 调本函数"。
+pub fn submit<T: HttpTransport>(
+    transport: &mut T,
+    materials: &GenesisMaterials,
+    setup_secret: &str,
+) -> Result<GenesisReceipt, SyncError> {
+    let body = genesis_request_bytes(materials, setup_secret)?;
+    let path = crate::api_version::RelayApi::new("", crate::api_version::RelayApiVersion::V1)
+        .create_vault_path();
+    submit_request(transport, path, body)
+}
+
+/// 对 relay 执行 **v2** 票据创建：`POST /v2/vaults`（ADR 0014 S3a）。
+///
+/// 授权来自 32B 一次性票据（只在内存里；不落库/日志/配置）。响应与 v1 create 同形，
+/// 因此回执解析复用 [`submit_request`]；路径来自统一 [`RelayApi`] 生成器。
+pub fn submit_with_ticket<T: HttpTransport>(
+    transport: &mut T,
+    materials: &GenesisMaterials,
+    ticket: &[u8; 32],
+) -> Result<GenesisReceipt, SyncError> {
+    let body = ticket_genesis_request_bytes(materials, ticket)?;
+    let path = crate::api_version::RelayApi::new("", crate::api_version::RelayApiVersion::V2)
+        .create_vault_path();
+    submit_request(transport, path, body)
+}
+
+/// 发送创建请求并解析同形回执（v1/v2 共用，避免两份解析）。
+fn submit_request<T: HttpTransport>(
+    transport: &mut T,
+    path: String,
+    body: Vec<u8>,
+) -> Result<GenesisReceipt, SyncError> {
+    let response: HttpResponse = transport.send(&HttpRequest {
+        method: "POST",
+        path,
+        headers: vec![("content-type".to_owned(), CONTENT_TYPE_CBOR.to_owned())],
+        body,
+    })?;
+    if !(200..300).contains(&response.status) {
+        return Err(error_from_response(&response));
+    }
+    let fields = cbor::decode(&response.body)?;
+    Ok(GenesisReceipt {
+        instance_id: cbor::bytes_fixed(&fields, 0)?,
+        log_id: cbor::bytes_fixed(&fields, 1)?,
+        epoch: cbor::uint_field(&fields, 2)?,
+        control_rev: cbor::uint_field(&fields, 3)?,
+        auth_rev: cbor::uint_field(&fields, 4)?,
+        initial_cursor: cbor::opt_text_field(&fields, 5)?,
+    })
+}
+
 /// 对 relay 执行 genesis：`POST /v1/vaults`。
 pub fn run<T: HttpTransport>(
     transport: &mut T,
@@ -318,32 +443,16 @@ pub fn run<T: HttpTransport>(
     let vault_id: VaultId = crate::random::array::<16>(rng)?;
     let device_id: DeviceId = crate::random::array::<16>(rng)?;
     let materials = build_materials(vault_id, device_id, password, now, rng)?;
-    let body = genesis_request_bytes(&materials, setup_secret)?;
-    let response: HttpResponse = transport.send(&HttpRequest {
-        method: "POST",
-        path: "/v1/vaults".to_owned(),
-        headers: vec![("content-type".to_owned(), CONTENT_TYPE_CBOR.to_owned())],
-        body,
-    })?;
-    if !(200..300).contains(&response.status) {
-        return Err(error_from_response(&response));
-    }
-    let fields = cbor::decode(&response.body)?;
-    let instance_id: [u8; 16] = cbor::bytes_fixed(&fields, 0)?;
-    let log_id: [u8; 16] = cbor::bytes_fixed(&fields, 1)?;
-    let epoch = cbor::uint_field(&fields, 2)?;
-    let control_rev = cbor::uint_field(&fields, 3)?;
-    let auth_rev = cbor::uint_field(&fields, 4)?;
-    let initial_cursor = cbor::opt_text_field(&fields, 5)?;
-    let identity = materials.identity(instance_id, control_rev)?;
+    let receipt = submit(transport, &materials, setup_secret)?;
+    let identity = materials.identity(receipt.instance_id, receipt.control_rev)?;
     Ok(GenesisOutcome {
         materials,
-        instance_id,
-        log_id,
-        epoch,
-        control_rev,
-        auth_rev,
-        initial_cursor,
+        instance_id: receipt.instance_id,
+        log_id: receipt.log_id,
+        epoch: receipt.epoch,
+        control_rev: receipt.control_rev,
+        auth_rev: receipt.auth_rev,
+        initial_cursor: receipt.initial_cursor,
         identity,
     })
 }
@@ -467,6 +576,38 @@ mod tests {
             };
             Ok(header.aad(&descriptor.encode()?)?)
         }
+    }
+
+    /// rev1 控制记录摘要：**已知证书向量**（与 relay `vault::init` 的公式逐字节一致）。
+    ///
+    /// 固定一份证书的 CDE 编码 → `SHA256(零32 || cert)`；期望值是常量，因此任何对证书
+    /// 编码/公式的静默修改（哪怕只改一个字段编号）都会让本测试失败。
+    #[test]
+    fn rev1_record_hash_has_a_known_answer() {
+        let cert = menghunote_sync_proto::DeviceCertV1 {
+            vault_id: [0x11; 16],
+            device_id: [0x22; 16],
+            sign_ed25519_pub: [0x33; 32],
+            hpke_x25519_pub: [0x44; 32],
+            cert_serial: 7,
+            issued_manager_rev: 1,
+            rights: default_rights(),
+        };
+        let hash = rev1_record_hash(&cert).expect("rev1 摘要");
+        assert_eq!(
+            crate::ids::hex_of(&hash),
+            "c0cfd56ee351ad4cb96d9070734f63d04e8e27539cbf3dd551b9f4981eaec8e4",
+            "已知证书向量的 rev1 record_hash 变了：公式/证书编码被改动"
+        );
+        // 公式本身就是 `SHA256(零32 || CDE(cert))`：用独立实现复算一遍。
+        let mut input = vec![0u8; 32];
+        input.extend_from_slice(&cert.encode().expect("证书编码"));
+        let expected: [u8; 32] = Sha256::digest(&input).into();
+        assert_eq!(hash, expected);
+        // 换任何一个字段都必须变（防止常量折叠式的假实现）。
+        let mut other = cert.clone();
+        other.cert_serial = 8;
+        assert_ne!(rev1_record_hash(&other).expect("摘要"), hash);
     }
 
     #[test]

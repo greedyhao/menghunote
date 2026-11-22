@@ -58,6 +58,7 @@ fn open_temp_dev_vault() -> (TempDir, DevVault) {
 /// 运行时门禁通过时用的配置（relay 只做显示/校验，不发起网络请求）。
 fn dev_sync_config() -> DevSyncConfig {
     DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: std::path::PathBuf::from("/tmp/menghunote-dev-sync-ui/vault.sqlite3"),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     }
@@ -101,6 +102,9 @@ async fn dev_sync_panel_and_buttons_are_mounted_when_enabled(cx: &mut TestAppCon
         "dev-sync-sync",
         "dev-sync-publish",
         "dev-sync-stop",
+        // 切片 6b：轮换入口常显（不可用时置灰 + 原因），必须在真实布局里占位。
+        "dev-sync-rotate",
+        "dev-sync-apply-epoch",
     ] {
         let bounds = cx
             .debug_bounds(selector)
@@ -147,6 +151,8 @@ async fn dev_sync_panel_is_absent_when_not_enabled(cx: &mut TestAppContext) {
         "dev-sync-sync",
         "dev-sync-publish",
         "dev-sync-stop",
+        "dev-sync-rotate",
+        "dev-sync-apply-epoch",
     ] {
         assert!(
             cx.debug_bounds(selector).is_none(),

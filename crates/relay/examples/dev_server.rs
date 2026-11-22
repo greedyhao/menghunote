@@ -7,6 +7,7 @@
 //! cargo run -p menghunote-relay --example dev_server
 //! cargo run -p menghunote-relay --example dev_server -- --listen 127.0.0.1:18080 --reset
 //! cargo run -p menghunote-relay --example dev_server -- --setup-only   # 让客户端自己做 genesis
+//! cargo run -p menghunote-relay --example dev_server -- --issue-ticket # 只发行 /v2/vaults 创建票据后退出
 //! ```
 //!
 //! - 默认 profile 是 debug（`cfg!(debug_assertions)`），release 构建必须显式 `--dev` 才启动；
@@ -20,6 +21,9 @@
 //! - `--reset` / `RELAY_DEV_RESET=1`
 //! - `--setup-only` / `RELAY_DEV_SETUP_ONLY=1`：不自动 genesis，只打印 setup secret 等客户端初始化
 //! - `--dev`：release 构建下的显式解锁
+//! - `--issue-ticket`：**只**发行一张 `/v2/vaults` 创建票据并打印（vault_id/票据/过期/额度），
+//!   不启动服务器；可与 `--vault <hex>` / `--ticket-ttl <secs>` / `--ticket-quota <n>` 组合。
+//!   明文票据只打印这一次，不落库、不进请求日志。
 //! - `--allow-plaintext` / `RELAY_DEV_ALLOW_PLAINTEXT=1`：允许非 loopback 明文监听。
 //!   **默认只允许 127.0.0.1/[::1]**（与生产 `serve` 同一门禁）；开发服务器仅用于本机联调，
 //!   对外暴露必须走反向代理 TLS，不能直接把放行验签的 dev server 暴露到网络。
@@ -39,7 +43,7 @@ use relay::config::RelayConfig;
 use relay::db::{schema, Db};
 use relay::ids::{b64url_encode, hex_lower, random_bytes, random_id16};
 use relay::sig::{SignatureCheck, SignatureHook};
-use relay::time::SystemClock;
+use relay::time::{Clock, SystemClock};
 use relay::vault;
 use relay::verify;
 
@@ -64,6 +68,14 @@ struct Args {
     dev: bool,
     setup_only: bool,
     allow_plaintext: bool,
+    /// 只发行创建票据后退出（ADR 0014 §A 运维入口）。
+    issue_ticket: bool,
+    /// `--issue-ticket` 的绑定 vault_id（缺省随机 128-bit）。
+    vault: Option<String>,
+    /// `--issue-ticket` 的 TTL（秒；默认 900 = 15min，上限 24h）。
+    ticket_ttl: u64,
+    /// `--issue-ticket` 允许的创建次数（默认 1；一次性票据）。
+    ticket_quota: u32,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -97,6 +109,10 @@ fn usage() -> String {
            --db <path>       sqlite path (default target/tmp/relay-dev/relay.sqlite3, env RELAY_DEV_DB)\n\
            --reset           delete the sqlite file (and -wal/-shm) before starting\n\
            --setup-only      do not auto-genesis; print a setup secret for the client\n\
+           --issue-ticket    issue one /v2/vaults create ticket and exit (no server)\n\
+           --vault <hex>     vault_id for --issue-ticket (32 hex chars; default random)\n\
+           --ticket-ttl <s>  ticket TTL seconds for --issue-ticket (default 900, max 86400)\n\
+           --ticket-quota <n> allowed create count for --issue-ticket (default 1, max 16)\n\
            --allow-plaintext allow non-loopback plaintext listen (env RELAY_DEV_ALLOW_PLAINTEXT)\n\
            --dev             allow running in release builds (DEV ONLY)\n\
            -h, --help        print this help"
@@ -113,6 +129,10 @@ fn parse_args() -> std::result::Result<Args, String> {
     let mut dev = false;
     let mut setup_only = env_flag("RELAY_DEV_SETUP_ONLY");
     let mut allow_plaintext = env_flag("RELAY_DEV_ALLOW_PLAINTEXT");
+    let mut issue_ticket = false;
+    let mut vault: Option<String> = None;
+    let mut ticket_ttl = relay::admin::DEFAULT_CREATE_TICKET_TTL_SECS as u64;
+    let mut ticket_quota = 1u32;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -127,6 +147,26 @@ fn parse_args() -> std::result::Result<Args, String> {
             "--dev" => dev = true,
             "--setup-only" => setup_only = true,
             "--allow-plaintext" => allow_plaintext = true,
+            "--issue-ticket" => issue_ticket = true,
+            "--vault" => {
+                vault = Some(args.next().ok_or_else(|| "--vault 需要参数".to_string())?);
+            }
+            "--ticket-ttl" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--ticket-ttl 需要参数".to_string())?;
+                ticket_ttl = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("--ticket-ttl 不是合法秒数: {value}"))?;
+            }
+            "--ticket-quota" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--ticket-quota 需要参数".to_string())?;
+                ticket_quota = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--ticket-quota 不是合法整数: {value}"))?;
+            }
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("未知参数 {other}\n\n{}", usage())),
         }
@@ -138,7 +178,95 @@ fn parse_args() -> std::result::Result<Args, String> {
         dev,
         setup_only,
         allow_plaintext,
+        issue_ticket,
+        vault,
+        ticket_ttl,
+        ticket_quota,
     })
+}
+
+/// 解析 `--vault`：32 个十六进制字符（可带 UUID 连字符）或 base64url 的 16B ID。
+fn parse_vault_id(text: &str) -> std::result::Result<relay::ids::Id16, String> {
+    let compact: String = text.chars().filter(|c| *c != '-').collect();
+    if compact.len() == 32 && compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let mut out = [0u8; 16];
+        let bytes = compact.as_bytes();
+        for index in 0..16 {
+            let high = (bytes[index * 2] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("--vault 含非法十六进制字符: {text}"))?;
+            let low = (bytes[index * 2 + 1] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("--vault 含非法十六进制字符: {text}"))?;
+            out[index] = ((high << 4) | low) as u8;
+        }
+        return Ok(out);
+    }
+    let bytes = relay::ids::b64url_decode(text)
+        .map_err(|_| format!("--vault 必须是 32 个十六进制字符或 base64url 的 16B ID: {text}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("--vault 必须是 16 字节 ID: {text}"))
+}
+
+/// `--issue-ticket` 模式：打开库（触发迁移）→ 发行一张创建票据 → 打印 → 退出。
+///
+/// **不是**公开 HTTP 接口：票据明文只出现在这一行 stdout，不落库、不进请求日志。
+fn issue_ticket_and_exit(args: &Args) -> ! {
+    let config = relay::config::RelayConfig::new(args.db.clone());
+    let db = match relay::db::Db::open(config.db.clone(), Arc::new(SystemClock)) {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("cannot open {}: {err}", args.db.display());
+            std::process::exit(1);
+        }
+    };
+    let vault_id = match args.vault.as_deref() {
+        Some(text) => match parse_vault_id(text) {
+            Ok(vault_id) => vault_id,
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        },
+        None => match relay::ids::random_id16() {
+            Ok(vault_id) => vault_id,
+            Err(err) => {
+                eprintln!("csprng unavailable: {err}");
+                std::process::exit(1);
+            }
+        },
+    };
+    let ttl = std::time::Duration::from_secs(args.ticket_ttl);
+    let ticket = match relay::admin::issue_create_ticket(&db, vault_id, ttl, args.ticket_quota) {
+        Ok(ticket) => ticket,
+        Err(err) => {
+            eprintln!(
+                "issue create ticket failed: {err}（--ticket-ttl 必须 1..={}，--ticket-quota 必须 1..={}）",
+                relay::admin::MAX_CREATE_TICKET_TTL_SECS,
+                relay::admin::MAX_CREATE_TICKET_QUOTA
+            );
+            std::process::exit(2);
+        }
+    };
+    let expires_at = SystemClock.now_secs() + i64::try_from(args.ticket_ttl).unwrap_or(0);
+    println!("============================================================");
+    println!("  DEV ONLY —— /v2/vaults 创建票据（明文只打印这一次）");
+    println!("============================================================");
+    println!("db              : {}", args.db.display());
+    println!("vault_id        : {}", hex_lower(&vault_id));
+    println!("ticket          : {}", hex_lower(&ticket));
+    println!(
+        "expires_at      : {expires_at}（unix 秒；TTL {}s）",
+        args.ticket_ttl
+    );
+    println!("quota           : {}", args.ticket_quota);
+    println!("next step       : POST /v2/vaults（CBOR: 0=ticket bytes, 1..7=InitRequest）");
+    println!("note            : 库里只有 SHA256(ticket)；重启/再次运行无法找回明文");
+    println!("============================================================");
+    db.close();
+    std::process::exit(0);
 }
 
 fn remove_sqlite_files(path: &std::path::Path) {
@@ -200,8 +328,9 @@ fn auto_genesis(
     };
     let db_handle = db.clone();
     let clock = db.clock_handle();
+    let scope = relay::VaultScope::new(vault_id);
     db_handle
-        .write_blocking(move |conn| {
+        .write_blocking(scope, move |conn| {
             vault::initialize(conn, clock.as_ref(), &config, hook.as_ref(), &request)
         })
         .map_err(|err| format!("genesis: {err}"))?;
@@ -226,7 +355,10 @@ fn print_identity(
     println!("listen          : {}", args.listen);
     println!("db              : {}", args.db.display());
     println!("vault_id        : {}", hex_lower(&vault.vault_id));
-    println!("instance_id     : {}", hex_lower(&vault.instance_id));
+    println!(
+        "relay_instance_id: {}（服务器标识，不是 vault_id）",
+        hex_lower(&vault.instance_id)
+    );
     println!("log_id          : {}", hex_lower(&vault.log_id));
     println!("epoch           : {}", vault.active_epoch);
     println!("control_rev     : {}", vault.control_rev);
@@ -324,6 +456,11 @@ fn main() {
         remove_sqlite_files(&args.db);
     }
 
+    // 运维创建票据模式：只碰 SQLite，不生成 setup secret、不监听端口（ADR 0014 §A）。
+    if args.issue_ticket {
+        issue_ticket_and_exit(&args);
+    }
+
     let setup_secret = match random_bytes::<32>() {
         Ok(bytes) => b64url_encode(&bytes),
         Err(err) => {
@@ -342,12 +479,24 @@ fn main() {
     };
     let hook = Arc::new(DevPermissiveHook);
 
-    let existing = match db.read(vault::load_opt) {
-        Ok(vault) => vault,
+    // 多租户（ADR 0014）：先显式列出库里的 vault，再按 scope 读；不按"第一行"猜租户。
+    let existing_ids = match db.read_instance(schema::list_vault_ids) {
+        Ok(ids) => ids,
         Err(err) => {
-            eprintln!("cannot read vault: {err}");
+            eprintln!("cannot list vaults: {err}");
             std::process::exit(1);
         }
+    };
+    let existing_scope = existing_ids.first().map(|id| relay::VaultScope::new(*id));
+    let existing = match existing_scope {
+        Some(scope) => match db.read(scope, vault::load) {
+            Ok(vault) => Some(vault),
+            Err(err) => {
+                eprintln!("cannot read vault: {err}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
     };
 
     let mut started_identity = None;
@@ -361,7 +510,7 @@ fn main() {
         }
         None if args.setup_only => {
             println!("[dev] --setup-only：不自动 genesis，等待客户端 POST /v1/vaults");
-            let instance = match db.read(schema::instance_id) {
+            let instance = match db.read_instance(schema::instance_id) {
                 Ok(instance) => instance,
                 Err(err) => {
                     eprintln!("cannot read instance_id: {err}");
@@ -383,7 +532,20 @@ fn main() {
                 }
             };
             started_identity = Some(identity);
-            match db.read(vault::load) {
+            let scope = match db.read_instance(schema::list_vault_ids) {
+                Ok(ids) => match ids.first() {
+                    Some(id) => relay::VaultScope::new(*id),
+                    None => {
+                        eprintln!("genesis produced no vault row");
+                        std::process::exit(1);
+                    }
+                },
+                Err(err) => {
+                    eprintln!("cannot list vaults: {err}");
+                    std::process::exit(1);
+                }
+            };
+            match db.read(scope, vault::load) {
                 Ok(vault) => vault,
                 Err(err) => {
                     eprintln!("cannot reload vault: {err}");
@@ -408,7 +570,10 @@ fn print_setup_only_banner(args: &Args, setup_secret: &str, instance: &relay::id
     println!("============================================================");
     println!("listen          : {}", args.listen);
     println!("db              : {}", args.db.display());
-    println!("instance_id     : {}", hex_lower(instance));
+    println!(
+        "relay_instance_id: {}（服务器标识，不是 vault_id；vault_id 由客户端 POST /v1/vaults 创建）",
+        hex_lower(instance)
+    );
     println!("setup secret    : {setup_secret}");
     println!("next step       : POST /v1/vaults（CBOR, application/cbor）");
     println!("============================================================");

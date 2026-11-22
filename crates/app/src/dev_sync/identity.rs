@@ -170,6 +170,61 @@ impl DevIdentityStore {
         bytes.extend_from_slice(&protected);
         publish_replace(&dir, &path, &bytes)
     }
+
+    /// 原子**替换**已有身份，且只允许**同 vault / 同 device**（ADR 0009 Phase 2 切片 6a）。
+    ///
+    /// 与 [`Self::persist_protected`] 的差别（不是重复实现，是更窄的契约）：
+    ///
+    /// - 调用方给的是**身份文件路径**（不是 vault 路径），因为轮换/apply 的提交点是
+    ///   某个具体文件；
+    /// - 目标**必须已存在**且是常规文件：解析 MNID header 后要求
+    ///   `vault_id`/`device_id` 与传入身份**完全一致**，否则明确拒绝（不换设备/不换库）；
+    /// - 加密与发布沿用同一套：`identity_wrap::protect`（header 里的 id 就是 entropy 输入）
+    ///   → 0600 临时文件 → write → fsync → 原子 `rename` → 父目录 fsync；
+    /// - 任意一步失败都**不触碰旧文件**（所有写入发生在临时名上，`rename` 是唯一提交点）。
+    ///
+    /// 轮换/apply 成功后由 worker 调用；失败时旧身份逐字节保留，内存身份也不更新。
+    pub fn replace_protected(&self, path: &Path, identity: &LocalIdentityV1) -> Result<()> {
+        ensure_supported()?;
+        identity_wrap::initialize_user_key()
+            .context("初始化本地身份封装主键失败（Linux 见 ADR 0008；Windows 为 DPAPI）")?;
+
+        // 1) 目标必须已存在（替换语义，不负责创建）且是常规文件。
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("待替换的 dev identity 不存在或不可读：{}", path.display()))?;
+        reject_non_regular(&metadata, path)?;
+
+        // 2) header 的 vault/device 必须与传入身份一致：轮换/apply 只推进 epoch/root/pin，
+        //    永远不换设备、不换库（换了就是另一份身份，必须走 Create/Join）。
+        let existing = fs::read(path)
+            .with_context(|| format!("读取待替换的 dev identity 失败：{}", path.display()))?;
+        {
+            let (vault_id, device_id, _protected) = parse_header(&existing, path)?;
+            ensure!(
+                vault_id == identity.vault_id && device_id == identity.device_id,
+                "拒绝替换不同 vault/device 的 dev identity：文件里是 {}/{}，传入的是 {}/{}；\
+                 轮换/apply 不得更换设备或库（不覆盖、不迁移）",
+                menghunote_sync::ids::hex_of(&vault_id),
+                menghunote_sync::ids::hex_of(&device_id),
+                menghunote_sync::ids::hex_of(&identity.vault_id),
+                menghunote_sync::ids::hex_of(&identity.device_id)
+            );
+        }
+        drop(existing);
+
+        // 3) 同一个 MNID 外层：header 只放非秘密 id，密文由 identity_wrap 生成。
+        let protected = identity
+            .protect()
+            .context("封装轮换后的 dev 身份失败（本地主键/DPAPI 不可用）")?;
+        let header = encode_header(&identity.vault_id, &identity.device_id, protected.len())?;
+        let mut bytes = header;
+        bytes.extend_from_slice(&protected);
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        publish_replace(dir, path, &bytes)
+    }
 }
 
 /// 旧/非空开发库拒绝（ADR 0009「只接受修复后新库」，切片 2a 遗留项）。

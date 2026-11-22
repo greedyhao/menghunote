@@ -14,9 +14,10 @@ use std::path::Path;
 
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
-    append_updates_with_sync_intents, count_inbox_ready, list_tree, load_body_doc, load_body_state,
-    load_head, load_structure, local_sync_intent, sync_cursor_state, BodyDoc, HeadState,
-    StructureWriter, SyncContext, UpdateRecord, Vault, STRUCTURE_DOC_ID,
+    append_updates_with_sync_intents, asset_bytes, asset_content_hash, count_inbox_ready,
+    insert_asset, link_asset_ref, list_tree, load_body_doc, load_body_state, load_head,
+    load_structure, local_sync_intent, sync_cursor_state, BodyDoc, HeadState, StructureWriter,
+    SyncContext, UpdateRecord, Vault, STRUCTURE_DOC_ID,
 };
 use menghunote_sync::dev_local::{
     CreatedVault, DevLocal, JoinedVault, INITIAL_RECOVERY_SLOT_META, INITIAL_SLOT_UPLOADED_META,
@@ -150,6 +151,24 @@ fn establish(prefix: &str) -> Fixture {
         b,
         note,
     }
+}
+
+/// `list_tree` 里某个正文文档对应的 note_id（`asset_refs.note_id` 用的键）。
+fn note_id_for_body(vault: &Vault, doc_id: &str) -> String {
+    list_tree(vault)
+        .expect("读结构树失败")
+        .into_iter()
+        .find(|entry| entry.body_doc_id.as_deref() == Some(doc_id))
+        .and_then(|entry| entry.note_id)
+        .expect("结构树必须有该正文的 note 节点")
+}
+
+/// 在 A 的正文里插入一份真实资产（等价于 app 的 attachment-insert 写库部分）。
+fn insert_referenced_asset(vault: &Vault, note_id: &str, data: &[u8]) -> [u8; 32] {
+    let hash = asset_content_hash(data);
+    insert_asset(vault, &hash, data.len() as u64, Some("text/plain"), data).expect("insert_asset");
+    link_asset_ref(vault, note_id, &hash, 0, 1).expect("link_asset_ref");
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,5 +1167,113 @@ fn stale_authorization_keeps_inbox_and_retry_delivers_without_data_loss() {
     assert!(
         text.contains("来自 A 的冲突前正文") && text.contains("B 本地写入"),
         "重试必须交付 durable 更新且不丢本地写入：{text:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7) attachment-insert 缺口：发布基线之后新插入的资产，普通同步就要增量上传
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ordinary_sync_uploads_new_asset_and_peer_gets_bytes_without_publish() {
+    let fixture = establish("asset-ordinary-sync");
+    let note_id = note_id_for_body(&fixture.a.vault, &fixture.note.doc_id);
+    let data = b"ordinary sync attachment bytes";
+    let hash = insert_referenced_asset(&fixture.a.vault, &note_id, data);
+
+    // 普通同步（不是发布基线）：正文先推、资产后置上传。
+    let report = DevLocal::sync_once(
+        fixture.relay.base_url(),
+        &fixture.a.vault,
+        &fixture.a.identity,
+    )
+    .expect("A 普通同步失败");
+    assert_eq!(report.assets.referenced, 1);
+    assert_eq!(report.assets.uploaded, 1, "普通同步必须增量上传新资产");
+    assert_eq!(report.assets.failed, 0);
+    assert_eq!(report.assets.deferred, 0);
+    assert!(report.assets.parts_uploaded >= 1);
+
+    // B：不发布基线，只普通同步 → 取到逐字节一致的资产。
+    let report_b = DevLocal::sync_once(
+        fixture.relay.base_url(),
+        &fixture.b.vault,
+        &fixture.b.identity,
+    )
+    .expect("B 普通同步失败");
+    assert_eq!(report_b.push.failed, 0);
+    assert_eq!(
+        asset_bytes(&fixture.b.vault, hash).expect("读 B 资产"),
+        Some(data.to_vec()),
+        "B 必须通过普通同步拿到 ASSET 字节，而不是只拿到 asset:// 链接"
+    );
+
+    // 再同步一轮：不重复上传、不冲突（标记命中）。
+    let again = DevLocal::sync_once(
+        fixture.relay.base_url(),
+        &fixture.a.vault,
+        &fixture.a.identity,
+    )
+    .expect("A 第二轮同步失败");
+    assert_eq!(again.assets.uploaded, 0, "不得重复上传");
+    assert_eq!(again.assets.deferred, 0);
+    assert_eq!(again.assets.failed, 0);
+    assert_eq!(
+        again.assets.already_uploaded, 1,
+        "已有 durable 标记的资产应直接跳过"
+    );
+
+    // 发布基线回归：checkpoint 必须复用普通同步已上传的对象，不得 ID_CONFLICT。
+    let published = DevLocal::publish_initial_pair_with_identity(
+        fixture.relay.base_url(),
+        &fixture.a.vault,
+        &fixture.a.identity,
+    )
+    .expect("普通同步之后发布基线不得冲突");
+    assert!(published.validated);
+    assert!(
+        published
+            .assets
+            .iter()
+            .any(|asset| asset.real_sha256 == hash),
+        "checkpoint 的资产集合必须包含该资产"
+    );
+    assert_eq!(
+        asset_bytes(&fixture.b.vault, hash).expect("读 B 资产"),
+        Some(data.to_vec())
+    );
+}
+
+/// ADR 0012 两阶段路径（app 自动同步 S3 的真实网络阶段）：同样在 prepare 里上传资产。
+#[test]
+fn two_phase_prepare_uploads_incremental_asset_and_peer_gets_bytes() {
+    let fixture = establish("asset-two-phase");
+    let note_id = note_id_for_body(&fixture.a.vault, &fixture.note.doc_id);
+    let data = b"two phase auto sync attachment bytes";
+    let hash = insert_referenced_asset(&fixture.a.vault, &note_id, data);
+
+    let prepare = DevLocal::sync_prepare(
+        fixture.relay.base_url(),
+        &fixture.a.vault,
+        &fixture.a.identity,
+        None,
+    )
+    .expect("两阶段 prepare 失败");
+    assert_eq!(prepare.assets.referenced, 1);
+    assert_eq!(
+        prepare.assets.uploaded, 1,
+        "自动同步（S3 prepare）必须增量上传资产"
+    );
+    assert_eq!(prepare.assets.failed, 0);
+
+    DevLocal::sync_once(
+        fixture.relay.base_url(),
+        &fixture.b.vault,
+        &fixture.b.identity,
+    )
+    .expect("B 普通同步失败");
+    assert_eq!(
+        asset_bytes(&fixture.b.vault, hash).expect("读 B 资产"),
+        Some(data.to_vec())
     );
 }

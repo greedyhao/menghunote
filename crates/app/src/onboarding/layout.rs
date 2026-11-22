@@ -24,10 +24,13 @@
 //! ## 配置结构
 //!
 //! ```json
-//! { "version": 1, "active_instance": "inst-...",
-//!   "instances": [{ "instance_id": "...", "relay_url": "...", "vault_path": "...",
-//!                   "vault_id": "...", "device_id": "..." }] }
+//! { "version": 2, "active_instance": "inst-...",
+//!   "instances": [{ "instance_id": "...", "relay_mode": "local_dev", "relay_url": "...",
+//!                   "vault_path": "...", "vault_id": "...", "device_id": "..." }] }
 //! ```
+//!
+//! v1（没有 `relay_mode`）只在 [`ProfileStore::load`] 里**显式迁移**为 `local_dev`
+//! 并写回 v2；未知版本/模式一律明确报错（ADR 0013 §1）。
 //!
 //! ## 原子写
 //!
@@ -41,8 +44,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// 配置格式版本。读到其它版本一律明确报错（**不迁移、不重建**）。
-pub const PROFILE_VERSION: u32 = 1;
+use crate::sync_gate::parse_for_build;
+
+/// 单一权威的 relay API 面类型（ADR 0014 S3a；配置里只存数字 1/2）。
+pub use menghunote_sync::api_version::RelayApiVersion;
+/// 单一权威的 relay 模式类型（定义在 `menghunote-sync`；这里重新导出给 UI/配置使用）。
+pub use menghunote_sync::relay_policy::RelayMode;
+
+/// 公开配置的当前版本（ADR 0013 §1：每实例显式 `relay_mode` + `relay_url`）。
+pub const PROFILE_VERSION: u32 = 2;
+/// v1 旧配置（没有 `relay_mode`）：只允许**显式迁移**为 `local_dev` 并写回 v2。
+pub const PROFILE_VERSION_V1: u32 = 1;
 
 /// 实例目录里固定的库文件名。
 pub const VAULT_FILE_NAME: &str = "vault.sqlite3";
@@ -71,6 +83,13 @@ pub enum ProfileError {
     UnknownActive { instance_id: String },
     /// 实例 id 非法（含路径分隔符/`.`/`..`，防止配置把路径带出 instances 目录）。
     InvalidInstanceId(String),
+    /// 实例的 relay 模式/URL 不可用（未知模式、与构建能力不符、非 canonical origin）。
+    InvalidRelay {
+        /// 出问题的实例 id。
+        instance_id: String,
+        /// 原因（已脱敏；不含 userinfo/凭据）。
+        detail: String,
+    },
     /// IO 失败（读写配置/建目录）。
     Io {
         path: PathBuf,
@@ -106,6 +125,13 @@ impl std::fmt::Display for ProfileError {
             Self::InvalidInstanceId(id) => {
                 write!(f, "实例 id 非法：{id:?}（只允许字母/数字/`-`/`_`）")
             }
+            Self::InvalidRelay {
+                instance_id,
+                detail,
+            } => write!(
+                f,
+                "实例 {instance_id} 的 relay 配置无效：{detail}；不自动改写配置，请人工修正"
+            ),
             Self::Io { path, source } => {
                 write!(f, "同步配置 IO 失败：{}（{source}）", path.display())
             }
@@ -233,7 +259,19 @@ pub fn generate_instance_id() -> String {
 pub struct InstanceEntry {
     /// 本机实例 id（与服务器 `vault_id` 分离）。
     pub instance_id: String,
-    /// relay 基地址（loopback；公开）。
+    /// relay 接入模式（ADR 0013 §1）：`local_dev` / `remote_tls`。
+    ///
+    /// 未知模式在反序列化时就被拒绝（serde 错误进 [`ProfileError::Corrupt`]），
+    /// 不做"猜一个默认值"。
+    #[serde(with = "relay_mode_json")]
+    pub relay_mode: RelayMode,
+    /// relay API 面（ADR 0014 S3a）：`1`=v1（缺省，旧配置兼容）、`2`=v2。
+    ///
+    /// 旧配置没有该字段 → 显式按 **v1** 解读（不是"猜"，v1 是唯一既有 wire）；
+    /// 未知数字在反序列化阶段失败（`ProfileError::Corrupt`），不回退。
+    #[serde(default, with = "relay_api_version_json")]
+    pub api_version: RelayApiVersion,
+    /// relay **canonical origin**（不含路径/query/userinfo；公开）。
     pub relay_url: String,
     /// 库文件绝对路径。
     pub vault_path: String,
@@ -365,7 +403,14 @@ impl ProfileStore {
         &self.path
     }
 
-    /// 读取配置：文件不存在 → `Ok(None)`；损坏/版本不支持 → 明确错误。
+    /// 读取配置（ADR 0013 §1 的版本/模式规则）。
+    ///
+    /// - 文件不存在 → `Ok(None)`（不是错误）；
+    /// - v2 → 校验后返回；
+    /// - v1 → **显式迁移**为 v2（每实例 `local_dev`，URL canonical 化）并**原子写回**；
+    ///   写回失败返回错误（不继续用旧格式跑）；
+    /// - 未知版本 / 未知模式 / 坏 JSON / 悬空 active / 非法 relay → 明确错误，
+    ///   不重建、不默认回退。
     pub fn load(&self) -> Result<Option<DevSyncProfile>, ProfileError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -377,24 +422,51 @@ impl ProfileStore {
                 })
             }
         };
-        let profile: DevSyncProfile =
+        let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|error| ProfileError::Corrupt {
                 path: self.path.clone(),
                 // serde 的错误只提"第几行第几列"与期望字段，不含文件内容。
                 detail: error.to_string(),
             })?;
-        if profile.version != PROFILE_VERSION {
-            return Err(ProfileError::UnsupportedVersion {
+        let Some(version) = value.get("version").and_then(serde_json::Value::as_u64) else {
+            return Err(ProfileError::Corrupt {
                 path: self.path.clone(),
-                version: profile.version,
+                detail: "缺少 version 字段".to_owned(),
             });
+        };
+        match u32::try_from(version).unwrap_or(u32::MAX) {
+            PROFILE_VERSION => {
+                let profile: DevSyncProfile =
+                    serde_json::from_value(value).map_err(|error| ProfileError::Corrupt {
+                        path: self.path.clone(),
+                        detail: error.to_string(),
+                    })?;
+                validate_profile(&profile)?;
+                Ok(Some(profile))
+            }
+            PROFILE_VERSION_V1 => {
+                let legacy: DevSyncProfileV1 =
+                    serde_json::from_value(value).map_err(|error| ProfileError::Corrupt {
+                        path: self.path.clone(),
+                        detail: error.to_string(),
+                    })?;
+                // 防御性再核对一次（正常走不到：上面的 match 已按 version 分派）。
+                if legacy.version != PROFILE_VERSION_V1 {
+                    return Err(ProfileError::UnsupportedVersion {
+                        path: self.path.clone(),
+                        version: legacy.version,
+                    });
+                }
+                let profile = migrate_v1(legacy)?;
+                // 显式迁移：v1 只允许变成 local_dev，并立即写回 v2（失败即错误）。
+                self.save(&profile)?;
+                Ok(Some(profile))
+            }
+            other => Err(ProfileError::UnsupportedVersion {
+                path: self.path.clone(),
+                version: other,
+            }),
         }
-        // 提前校验索引一致性：坏配置在打开实例之前就暴露，而不是打开后神秘失败。
-        let _ = profile.active()?;
-        for entry in &profile.instances {
-            validate_instance_id(&entry.instance_id)?;
-        }
-        Ok(Some(profile))
     }
 
     /// 原子写入配置：同目录临时文件 → write/fsync → rename → 父目录 fsync。
@@ -403,6 +475,19 @@ impl ProfileStore {
     pub fn save(&self, profile: &DevSyncProfile) -> Result<(), ProfileError> {
         let mut profile = profile.clone();
         profile.version = PROFILE_VERSION;
+        // 写前校验 + canonical 化：配置里只存权威 parser 认可的模式/地址，
+        // 手改的非法值在写回前就失败（不把坏值落盘）。
+        for entry in &mut profile.instances {
+            validate_instance_id(&entry.instance_id)?;
+            let origin = parse_for_build(&entry.relay_url, entry.relay_mode).map_err(|error| {
+                ProfileError::InvalidRelay {
+                    instance_id: entry.instance_id.clone(),
+                    detail: error.to_string(),
+                }
+            })?;
+            entry.relay_url = origin.as_str();
+        }
+        let _ = profile.active()?;
         let json = serde_json::to_vec_pretty(&profile).map_err(|error| ProfileError::Corrupt {
             path: self.path.clone(),
             detail: format!("序列化失败：{error}"),
@@ -461,6 +546,129 @@ impl ProfileStore {
         fsync_dir(&parent).map_err(|source| ProfileError::Io {
             path: parent,
             source,
+        })
+    }
+}
+
+/// v1 配置里的一条实例（**没有** `relay_mode`）。
+///
+/// 只用于读取旧配置；迁移目标恒为 `local_dev`（ADR 0013 §1）。
+#[derive(Deserialize)]
+struct InstanceEntryV1 {
+    instance_id: String,
+    relay_url: String,
+    vault_path: String,
+    vault_id: String,
+    device_id: String,
+}
+
+/// v1 公开配置（ADR 0011）。
+#[derive(Deserialize)]
+struct DevSyncProfileV1 {
+    version: u32,
+    #[serde(default)]
+    active_instance: Option<String>,
+    #[serde(default)]
+    instances: Vec<InstanceEntryV1>,
+}
+
+/// v1 → v2：**只允许** `local_dev`；URL 由权威 parser canonical 化。
+fn migrate_v1(legacy: DevSyncProfileV1) -> Result<DevSyncProfile, ProfileError> {
+    let mut profile = DevSyncProfile {
+        version: PROFILE_VERSION,
+        active_instance: legacy.active_instance,
+        instances: Vec::with_capacity(legacy.instances.len()),
+    };
+    for entry in legacy.instances {
+        validate_instance_id(&entry.instance_id)?;
+        let origin = parse_for_build(&entry.relay_url, RelayMode::LocalDev).map_err(|error| {
+            ProfileError::InvalidRelay {
+                instance_id: entry.instance_id.clone(),
+                detail: format!("v1 配置只能显式迁移为 local_dev：{error}"),
+            }
+        })?;
+        profile.instances.push(InstanceEntry {
+            instance_id: entry.instance_id,
+            relay_mode: RelayMode::LocalDev,
+            api_version: RelayApiVersion::V1,
+            relay_url: origin.as_str(),
+            vault_path: entry.vault_path,
+            vault_id: entry.vault_id,
+            device_id: entry.device_id,
+        });
+    }
+    let _ = profile.active()?;
+    Ok(profile)
+}
+
+/// v2 配置校验：index、实例 id、模式/URL 与 canonical 形态。
+fn validate_profile(profile: &DevSyncProfile) -> Result<(), ProfileError> {
+    let _ = profile.active()?;
+    for entry in &profile.instances {
+        validate_instance_id(&entry.instance_id)?;
+        let origin = parse_for_build(&entry.relay_url, entry.relay_mode).map_err(|error| {
+            ProfileError::InvalidRelay {
+                instance_id: entry.instance_id.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+        // 存储只接受 canonical origin；手改出的尾斜杠/默认端口不静默改写。
+        if origin.as_str() != entry.relay_url {
+            return Err(ProfileError::InvalidRelay {
+                instance_id: entry.instance_id.clone(),
+                detail: format!(
+                    "relay_url 不是 canonical origin（应为 {:?}）",
+                    origin.as_str()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `RelayApiVersion` 的 serde 桥：配置里存数字 `1`/`2`（旧配置缺省 = 1）。
+///
+/// 未知数字在反序列化阶段失败（`ProfileError::Corrupt`），不静默降级到 v1。
+mod relay_api_version_json {
+    use super::RelayApiVersion;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        version: &RelayApiVersion,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(version.as_number())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<RelayApiVersion, D::Error> {
+        let value = u32::deserialize(deserializer)?;
+        RelayApiVersion::from_number(value).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "未知 relay API 版本 {value}：只支持 1（v1）/ 2（v2）"
+            ))
+        })
+    }
+}
+
+/// `RelayMode` 的 serde 桥：单一权威类型在 `menghunote-sync`，这里只做字符串编解码。
+///
+/// 未知模式在反序列化阶段就失败（`ProfileError::Corrupt`），不会落到默认值。
+mod relay_mode_json {
+    use super::RelayMode;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(mode: &RelayMode, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(mode.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<RelayMode, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        RelayMode::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "未知 relay 模式 {text:?}：只支持 local_dev / remote_tls"
+            ))
         })
     }
 }
@@ -586,6 +794,8 @@ mod tests {
         let mut profile = DevSyncProfile::default();
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-a".to_owned(),
+            relay_mode: RelayMode::LocalDev,
+            api_version: RelayApiVersion::V1,
             relay_url: "http://127.0.0.1:18080".to_owned(),
             vault_path: "/data/instances/inst-a/vault.sqlite3".to_owned(),
             vault_id: "00112233445566778899aabbccddeeff".to_owned(),
@@ -613,6 +823,8 @@ mod tests {
         // 再写一次（覆盖）后旧内容不应残留。
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-b".to_owned(),
+            relay_mode: RelayMode::LocalDev,
+            api_version: RelayApiVersion::V1,
             relay_url: "http://localhost:18080".to_owned(),
             vault_path: "/data/instances/inst-b/vault.sqlite3".to_owned(),
             vault_id: "11112222333344445555666677778888".to_owned(),
@@ -661,6 +873,236 @@ mod tests {
             matches!(error, ProfileError::UnknownActive { .. }),
             "{error}"
         );
+    }
+
+    /// v1（无 relay_mode）→ 显式迁移为 local_dev，并**写回 v2**。
+    #[test]
+    fn v1_profile_is_migrated_to_local_dev_and_written_back_as_v2() {
+        let dir = temp_dir("migrate-v1");
+        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        std::fs::write(
+            layout.config_path.clone(),
+            br#"{
+              "version": 1,
+              "active_instance": "inst-old",
+              "instances": [{
+                "instance_id": "inst-old",
+                "relay_url": "http://127.0.0.1:18080/",
+                "vault_path": "/data/instances/inst-old/vault.sqlite3",
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+              }]
+            }"#,
+        )
+        .expect("写 v1 配置");
+
+        let loaded = layout
+            .store()
+            .load()
+            .expect("v1 必须可显式迁移")
+            .expect("配置存在");
+        assert_eq!(loaded.version, PROFILE_VERSION);
+        let entry = loaded.active().expect("active 合法").expect("有 active");
+        assert_eq!(entry.relay_mode, RelayMode::LocalDev);
+        assert_eq!(
+            entry.relay_url, "http://127.0.0.1:18080",
+            "迁移时 canonical 化"
+        );
+
+        // 文件已经写回 v2（不是只做内存兼容）。
+        let raw = std::fs::read_to_string(layout.config_path.clone()).expect("读回");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("v2 JSON");
+        assert_eq!(value["version"], serde_json::json!(2));
+        assert_eq!(value["instances"][0]["relay_mode"], "local_dev");
+        // 再读一次走 v2 分支且稳定。
+        let again = layout.store().load().expect("v2 读取").expect("存在");
+        assert_eq!(again, loaded);
+    }
+
+    /// v1 里的非 local_dev relay **不能**被静默迁移（只允许显式 local_dev）。
+    #[test]
+    fn v1_with_non_local_relay_is_rejected_instead_of_reinterpreted() {
+        let dir = temp_dir("migrate-v1-bad");
+        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        for relay in ["https://relay.example", "http://relay.example:18080"] {
+            std::fs::write(
+                layout.config_path.clone(),
+                format!(
+                    "{{\"version\":1,\"active_instance\":\"inst-x\",\"instances\":[\
+                     {{\"instance_id\":\"inst-x\",\"relay_url\":\"{relay}\",\
+                     \"vault_path\":\"/data/instances/inst-x/vault.sqlite3\",\
+                     \"vault_id\":\"00112233445566778899aabbccddeeff\",\
+                     \"device_id\":\"ffeeddccbbaa99887766554433221100\"}}]}}"
+                ),
+            )
+            .expect("写 v1 配置");
+            let error = layout
+                .store()
+                .load()
+                .expect_err("非 local_dev 的 v1 必须拒绝");
+            assert!(
+                matches!(error, ProfileError::InvalidRelay { .. }),
+                "{error}"
+            );
+            // 失败不改写配置（用户可人工修正）。
+            let raw = std::fs::read_to_string(layout.config_path.clone()).expect("读回");
+            assert!(raw.contains("\"version\":1"), "失败不得改写配置：{raw}");
+        }
+    }
+
+    /// 未知版本 / 未知模式必须明确拒绝，不能默认 local_dev。
+    #[test]
+    fn unknown_profile_versions_and_modes_are_rejected() {
+        let dir = temp_dir("unknown-v2");
+        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        std::fs::write(
+            layout.config_path.clone(),
+            br#"{ "version": 3, "instances": [] }"#,
+        )
+        .expect("写未知版本");
+        let error = layout.store().load().expect_err("未知版本必须拒绝");
+        assert!(
+            matches!(error, ProfileError::UnsupportedVersion { version: 3, .. }),
+            "{error}"
+        );
+
+        std::fs::write(
+            layout.config_path.clone(),
+            br#"{
+              "version": 2,
+              "active_instance": "inst-x",
+              "instances": [{
+                "instance_id": "inst-x",
+                "relay_mode": "carrier_pigeon",
+                "relay_url": "http://127.0.0.1:18080",
+                "vault_path": "/data/instances/inst-x/vault.sqlite3",
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+              }]
+            }"#,
+        )
+        .expect("写未知模式");
+        let error = layout.store().load().expect_err("未知模式必须拒绝");
+        match error {
+            ProfileError::Corrupt { detail, .. } => {
+                assert!(detail.contains("未知 relay 模式"), "{detail}");
+            }
+            other => panic!("错误类型不对：{other}"),
+        }
+
+        // 手改出非 canonical 的 relay_url 也要拒绝（不静默改写）。
+        std::fs::write(
+            layout.config_path.clone(),
+            br#"{
+              "version": 2,
+              "active_instance": "inst-x",
+              "instances": [{
+                "instance_id": "inst-x",
+                "relay_mode": "local_dev",
+                "relay_url": "http://127.0.0.1:18080/",
+                "vault_path": "/data/instances/inst-x/vault.sqlite3",
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+              }]
+            }"#,
+        )
+        .expect("写非 canonical");
+        let error = layout.store().load().expect_err("非 canonical 必须拒绝");
+        assert!(
+            matches!(error, ProfileError::InvalidRelay { .. }),
+            "{error}"
+        );
+    }
+
+    /// save 也会校验：未知模式/非法地址不会落盘。
+    #[test]
+    fn save_rejects_invalid_relay_before_writing() {
+        let dir = temp_dir("save-invalid");
+        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        let store = layout.store();
+        let mut profile = DevSyncProfile::default();
+        profile.upsert_active(InstanceEntry {
+            instance_id: "inst-bad".to_owned(),
+            relay_mode: RelayMode::LocalDev,
+            api_version: RelayApiVersion::V1,
+            // local_dev 只允许 http + loopback 白名单。
+            relay_url: "https://relay.example".to_owned(),
+            vault_path: "/data/instances/inst-bad/vault.sqlite3".to_owned(),
+            vault_id: "00112233445566778899aabbccddeeff".to_owned(),
+            device_id: "ffeeddccbbaa99887766554433221100".to_owned(),
+        });
+        let error = store.save(&profile).expect_err("非法 relay 不得落盘");
+        assert!(
+            matches!(error, ProfileError::InvalidRelay { .. }),
+            "{error}"
+        );
+        assert!(!store.path().exists(), "失败不能留下配置");
+    }
+
+    /// ADR 0014 S3a：旧 v2 配置没有 `api_version` → 显式按 v1 打开；新 v2 配置写 2；
+    /// 未知数字是明确错误（不静默降级）。
+    #[test]
+    fn profile_api_version_defaults_to_v1_and_roundtrips_v2() {
+        let dir = temp_dir("api-version");
+        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        std::fs::write(
+            layout.config_path.clone(),
+            br#"{
+              "version": 2,
+              "active_instance": "inst-old",
+              "instances": [{
+                "instance_id": "inst-old",
+                "relay_mode": "local_dev",
+                "relay_url": "http://127.0.0.1:18080",
+                "vault_path": "/data/instances/inst-old/vault.sqlite3",
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+              }]
+            }"#,
+        )
+        .expect("写旧 v2 配置");
+        let loaded = layout.store().load().expect("读取").expect("存在");
+        assert_eq!(
+            loaded.instances[0].api_version,
+            RelayApiVersion::V1,
+            "缺 api_version 的旧配置必须按 v1 打开（既有 wire）"
+        );
+
+        // 保存一个 v2 实例：JSON 里是数字 2，读回仍是 v2。
+        let mut profile = loaded;
+        profile.upsert_active(InstanceEntry {
+            instance_id: "inst-v2".to_owned(),
+            relay_mode: RelayMode::LocalDev,
+            api_version: RelayApiVersion::V2,
+            relay_url: "http://127.0.0.1:18080".to_owned(),
+            vault_path: "/data/instances/inst-v2/vault.sqlite3".to_owned(),
+            vault_id: "11112222333344445555666677778888".to_owned(),
+            device_id: "88887777666655554444333322221111".to_owned(),
+        });
+        layout.store().save(&profile).expect("写 v2 配置");
+        let raw = std::fs::read_to_string(layout.config_path.clone()).expect("读回");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("v2 JSON");
+        assert_eq!(value["instances"][1]["api_version"], serde_json::json!(2));
+        assert_eq!(
+            layout
+                .store()
+                .load()
+                .expect("读取")
+                .expect("存在")
+                .find("inst-v2")
+                .expect("v2 实例")
+                .api_version,
+            RelayApiVersion::V2
+        );
+
+        // 未知版本：明确拒绝，不默认回退。
+        let broken = raw.replace("\"api_version\": 2", "\"api_version\": 3");
+        std::fs::write(layout.config_path.clone(), broken).expect("写坏版本");
+        let error = layout
+            .store()
+            .load()
+            .expect_err("未知 api_version 必须拒绝");
+        assert!(matches!(error, ProfileError::Corrupt { .. }), "{error}");
     }
 
     #[test]

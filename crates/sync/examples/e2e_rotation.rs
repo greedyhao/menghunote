@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use menghunote_storage::{
     enqueue_sync_intent, ensure_structure_row, mark_acked, sync_cursor_state, Value, Vault,
 };
+use menghunote_sync::api_version::{RelayApi, RelayApiVersion};
 use menghunote_sync::checkpoint::StaticAssets;
 use menghunote_sync::device::{DeviceHpkeKey, DeviceSigningKey, ManagementKey};
 use menghunote_sync::genesis;
@@ -230,6 +231,7 @@ pub fn run(relay: &str, dir: &Path) -> AnyResult<Summary> {
         StdTcpTransport::new_local_dev(relay)?,
         HttpRelayConfig {
             base_url: relay.to_owned(),
+            api_version: RelayApiVersion::V1,
             vault_id,
             device_id,
             manager_pub: Some(manager.public_key()),
@@ -296,9 +298,10 @@ pub fn run(relay: &str, dir: &Path) -> AnyResult<Summary> {
         control_pin,
     )?;
     let instance_id = state0.instance_id;
+    let api = RelayApi::new(relay, RelayApiVersion::V1);
     let begin = rotation_stage::begin_rotation_http(
         &mut StdTcpTransport::new_local_dev(relay)?,
-        relay,
+        &api,
         &vault,
         &mut journal,
         vault_id,
@@ -487,7 +490,7 @@ pub fn run(relay: &str, dir: &Path) -> AnyResult<Summary> {
     rotation_stage::attach_grants(&mut journal, &vault, &grants)?;
     rotation_stage::stage_grants(
         &mut StdTcpTransport::new_local_dev(relay)?,
-        relay,
+        &api,
         vault_id,
         begin.rotation_id,
         &manager,
@@ -555,7 +558,7 @@ pub fn run(relay: &str, dir: &Path) -> AnyResult<Summary> {
     };
     let outcome = activate_http(
         &mut StdTcpTransport::new_local_dev(relay)?,
-        relay,
+        &api,
         vault_id,
         &instance_id,
         &manager,
@@ -595,7 +598,7 @@ pub fn run(relay: &str, dir: &Path) -> AnyResult<Summary> {
     let hpke_key = DeviceHpkeKey::from_secret(identity.x25519_secret.clone());
     verify_latest_grant_root(
         &mut StdTcpTransport::new_local_dev(relay)?,
-        relay,
+        &api,
         vault_id,
         device_id,
         &signing_key,

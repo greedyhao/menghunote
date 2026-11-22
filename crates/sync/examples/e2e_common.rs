@@ -16,6 +16,7 @@ use menghunote_storage::{
     ensure_structure_row, insert_asset, load_body_doc, load_head, BodyDoc, SyncIntent,
     UpdateRecord, Value, Vault,
 };
+use menghunote_sync::api_version::{RelayApi, RelayApiVersion};
 use menghunote_sync::bootstrap::{self, BootstrapReport};
 use menghunote_sync::checkpoint::{
     CheckpointReport, CheckpointWriter, EmptyAssets, SlotSecrets, StorageAssets,
@@ -126,6 +127,7 @@ pub fn make_client(
         StdTcpTransport::new_local_dev(relay)?,
         HttpRelayConfig {
             base_url: relay.to_owned(),
+            api_version: RelayApiVersion::V1,
             vault_id,
             device_id,
             manager_pub,
@@ -408,8 +410,9 @@ pub fn bootstrap_from_recovery(
     let manager_pub = manager.public_key();
     // approve 已把 grant 外层签名落库，直接走 relay 真实响应，不再使用测试垫片。
     let mut transport = StdTcpTransport::new_local_dev(relay)?;
+    let api = RelayApi::new(relay, RelayApiVersion::V1);
     let enrolled =
-        recovery_enroll::self_enroll(&mut transport, relay, vault_id, recovery_code, now_secs())?;
+        recovery_enroll::self_enroll(&mut transport, &api, vault_id, recovery_code, now_secs())?;
     println!(
         "[two-device] B self-enroll device={} steps={}",
         ids::hex_of(&enrolled.device_id),
@@ -422,6 +425,7 @@ pub fn bootstrap_from_recovery(
         StdTcpTransport::new_local_dev(relay)?,
         HttpRelayConfig {
             base_url: relay.to_owned(),
+            api_version: RelayApiVersion::V1,
             vault_id,
             device_id: enrolled.device_id,
             manager_pub: Some(manager_pub),

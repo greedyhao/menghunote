@@ -825,8 +825,8 @@ fn facts(fx: &Fixture, rotation: &Id16) -> Facts {
             let (vault_state, active_epoch, control_rev, auth_rev, manager_rev, head_seq, gc_floor):
                 (String, i64, i64, i64, i64, i64, i64) = conn.query_row(
                 "SELECT state, active_epoch, control_rev, auth_rev, manager_rev, head_seq, gc_floor
-                   FROM vault WHERE singleton = 1",
-                [],
+                   FROM vaults WHERE vault_id = ?1",
+                [conn.scope().as_slice()],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -872,8 +872,8 @@ fn facts(fx: &Fixture, rotation: &Id16) -> Facts {
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
             let usage = conn.query_row(
-                "SELECT normal_bytes, maintenance_bytes FROM usage WHERE singleton = 1",
-                [],
+                "SELECT normal_bytes, maintenance_bytes FROM usage WHERE vault_id = ?1",
+                [conn.scope().as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             Ok(Facts {
@@ -1521,8 +1521,9 @@ fn recompute_does_not_mask_historical_over_peak_and_blocks_writes() {
     // 运维缩容：真实数据 24488 > 新峰值 20000（历史超峰）。
     fx.raw_write(|conn| {
         conn.execute(
-            "UPDATE vault SET normal_limit = 10000, maintenance_limit = 20000 WHERE singleton = 1",
-            [],
+            "UPDATE vaults SET normal_limit = 10000, maintenance_limit = 20000
+             WHERE vault_id = ?1",
+            [conn.scope().as_slice()],
         )?;
         Ok(())
     })

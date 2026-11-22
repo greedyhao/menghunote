@@ -172,6 +172,50 @@ Phase 1 的面板/同步已能跑，但手工演示缺"操作者能拿到恢复�
 - 遇到已知 metadata 必须验签绑定并 durable 记录消费前缀后才推进 cursor；未知仍 pause；`CursorExpired` 走认证 rebaseline/resume，不能 `set_meta`。
 - 验收：轮换后双向文本、B 离线旧 outbox、apply 中断重启、repack 幂等、连续 Sync/发布 pair 后继续、注入 metadata/未知事件/游标过期；鉴权负例用 `Ed25519Hook`。
 
+## 实施记录（Phase 2 切片 6a/6b：轮换接入，2026-11-13）
+
+**6a（机制层，`2ff7605`）**：`DevIdentityStore::replace_protected`（只允许同 vault/device 的
+身份替换，0600 临时文件 → fsync → rename → 父目录 fsync；失败时旧身份逐字节保留）+
+worker `Command::Rotate { recovery_code, revoke }` / `Command::ApplyEpoch`（**整段持闸**、
+派发前复核库中 head、成功后把新身份写回 `dev-identity.bin` 并重新 load、失败保留 journal
+与全部 durable 事实、只上报公开事实）+ `DevLocal::rotate` 的可选恢复码重封（`Some` 时先
+校验该码派生的管理 key 就是当前 pin 的管理身份，再重封候选 epoch 的 recovery 槽；`None`
+沿用一次性随机种子）+ `AppShell::dev_sync_rotate/replace_after` 与成功后活动视图重建
+（关旧 `EditorView`/`SessionDriver`，用新 epoch 重新 `open_entry`）。
+
+**6b（设备面板 UI）**：
+
+| selector | 行为 |
+| --- | --- |
+| `dev-sync-rotate` / `dev-sync-apply-epoch` | 设备列表区里的两个**独立**入口；不可用时置灰 + 一行明确原因（无管理密钥 / 无活动文档 / 单操作在途 / worker 已停），点击只给原因、不展开确认 |
+| `dev-sync-rotate-confirm` / `-cancel` | 二次确认的确认/取消；取消**不写**、清空恢复码输入 |
+| `dev-sync-rotate-reissue` / `-recovery` | 「重新封装恢复码（推荐）」默认勾选；输入是**秘密字段**（遮罩、允许粘贴、不报告平台正文），提交后立刻清空，只在 `RotateRequest` 里留一份 `Zeroizing` |
+| `dev-sync-rotate-revoke` | 「同时把已移除设备写入签名撤销列表」默认勾选（ADR 0010）；UI **不手选设备**，按设备列表 `status=revoked` 过滤后传给 `Command::Rotate` |
+| `dev-sync-rotate-warning` | 未勾选重封装时的固定警告「轮换后新设备将无法用恢复码加入」；勾选但输入为空时的提示 |
+| `dev-sync-apply-confirm` / `-cancel` | 应用新 epoch 的二次确认（固定文案见常量 `APPLY_CONFIRM_TEXT`） |
+
+固定确认文案（一字不改）：
+
+> 轮换会用新密钥重新加密整库，并生成两份候选基线；旧 epoch 数据不能再被新设备解密；
+> 被移除设备仍可解其已获得的数据；轮换期间输入会冻结。是否继续？
+
+交互约束：
+
+- 面板**不直接**发 `Command::Rotate`：确认后只登记请求并发 `RotateRequested` /
+  `ApplyEpochRequested` 事件，由 `AppShell::dev_sync_pump` 取走（秘密不进事件）再走 6a 的
+  持闸状态机；同一时刻只允许一条持闸任务。
+- 轮换/apply 在途：整段持闸（编辑器输入/结构/切换冻结）、两个入口置灰、自动同步暂停；
+  面板任务行显示「轮换中（申请/候选/激活/推广）+ worker 明细」。
+- 成功：视图重建、树/状态刷新，notice 显示新 epoch + checkpoint 短 id + 恢复码是否补发；
+  失败：保持旧身份/旧视图，明确错误；停在 journal 之后的失败额外提示"重试前需重启实例"，
+  apply 可原样重试（不自动重试）。
+- **移除与轮换不串联**：默认移除仍只删凭证；轮换只有用户显式点击才发生。
+- 不显示 root/manager/恢复码；恢复码输入只读一次、提交/取消后清空。
+
+**验证**：`cargo test -p menghunote-app --features dev-sync --test dev_sync_rotation`（9 个：
+6a 4 + 6b 5，真实 dev-relay 两 AppShell）；app --features dev-sync 311 / 默认 134 /
+sync 459 / storage 171；`clippy --all-targets --features dev-sync -- -D warnings` 干净。
+
 ## 测试与验证
 
 - 切片验收命令（新增测试）：`cargo test -p menghunote-storage sync_intent` / `committed_adoption`；`cargo test -p menghunote-sync dev_local`；`cargo test -p menghunote-app --features dev-sync --test dev_sync_service` / `sync_ui`。

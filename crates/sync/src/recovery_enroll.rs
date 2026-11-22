@@ -14,6 +14,7 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::api_version::RelayApi;
 use crate::cbor;
 use crate::device::{verify_signature, DeviceHpkeKey, DeviceSigningKey, ManagementKey};
 use crate::error::SyncError;
@@ -57,22 +58,21 @@ const CONTENT_TYPE: &str = "application/cbor";
 /// 执行恢复码自批；返回新设备身份和 root。
 pub fn self_enroll<T: HttpTransport>(
     transport: &mut T,
-    base_url: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     recovery_code: &str,
     now: u64,
 ) -> Result<EnrolledDevice, SyncError> {
-    let base = base_url.trim_end_matches('/');
     let seed = RecoverySeed::from_code(recovery_code)?;
     let manager = ManagementKey::from_recovery(&seed, &vault_id)?;
     let mut steps = Vec::new();
 
     // 1. 管理 realm token。
-    let (token, instance_id) = management_token(transport, base, vault_id, &manager, now)?;
+    let (token, instance_id) = management_token(transport, api, vault_id, &manager, now)?;
     steps.push("management token ok".to_owned());
 
     // 2. 读 staging recovery 槽并解 root（§20 KEK 派生）。
-    let slots = list_slots(transport, base, vault_id, &token)?;
+    let slots = list_slots(transport, api, vault_id, &token)?;
     let recovery_slot = slots
         .iter()
         .find(|slot| slot.kind == ProtoSlotKind::Recovery)
@@ -82,7 +82,7 @@ pub fn self_enroll<T: HttpTransport>(
         .clone();
     let descriptor = recovery_slot_descriptor(&recovery_slot)?;
     // ADR §22：管理 realm 可只读 KEY_SLOT 对象；先解出真实 root，再封真实 grant。
-    let root = unwrap_recovery_slot(transport, base, vault_id, &token, &recovery_slot, &seed)?;
+    let root = unwrap_recovery_slot(transport, api, vault_id, &token, &recovery_slot, &seed)?;
     steps.push("recovery slot unwrapped (management realm)".to_owned());
 
     // 3. 本地生成新设备密钥（不信任 relay 的任何公钥）。
@@ -96,21 +96,22 @@ pub fn self_enroll<T: HttpTransport>(
     let manager_rev = descriptor.manager_rev;
 
     // 4. 读取 state（control_rev/epoch）。
-    let state = get_state(transport, base, vault_id, &token)?;
+    let state = get_state(transport, api, vault_id, &token)?;
     let invitation = create_invite(
         transport,
-        base,
+        api,
         vault_id,
         &manager,
         &token,
         state.0,
         instance_id,
         now,
+        None,
     )?;
     steps.push(format!("invite created id={}", hex16(&invitation.0)));
     redeem_invite(
         transport,
-        base,
+        api,
         vault_id,
         invitation.0,
         &invitation.1,
@@ -122,23 +123,23 @@ pub fn self_enroll<T: HttpTransport>(
     // ADR §22：grant 必须封真实 root（占位 grant 是协议错误）。
     approve_device(
         transport,
-        base,
+        api,
         vault_id,
         &manager,
         &token,
         state.0,
         instance_id,
         device_id,
-        &signing_key,
-        &hpke_key,
+        signing_key.public_key(),
+        hpke_key.public_key(),
         manager_rev,
         &root,
     )?;
     steps.push("recovery self-approval: device active (real root grant)".to_owned());
-    let device_token = device_token(transport, base, vault_id, device_id, &signing_key, now)?;
+    let device_token = device_token(transport, api, vault_id, device_id, &signing_key, now)?;
     verify_latest_grant(
         transport,
-        base,
+        api,
         vault_id,
         device_id,
         &device_token,
@@ -161,7 +162,7 @@ pub fn self_enroll<T: HttpTransport>(
 
 pub(crate) fn management_token<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     manager: &ManagementKey,
     now: u64,
@@ -174,7 +175,7 @@ pub(crate) fn management_token<T: HttpTransport>(
     let response = send(
         transport,
         "POST",
-        format!("{base}/v1/auth/challenges"),
+        api.url(&api.auth_path(&vault_id, "challenges")),
         None,
         body,
     )?;
@@ -195,7 +196,7 @@ pub(crate) fn management_token<T: HttpTransport>(
     if response_vault != vault_id || expires_at <= now {
         return Err(SyncError::RelayWire("management challenge 过期/vault 不符"));
     }
-    let origin_sha256: [u8; 32] = Sha256::digest(base.as_bytes()).into();
+    let origin_sha256: [u8; 32] = Sha256::digest(api.origin().as_bytes()).into();
     let challenge = Challenge {
         pv: 1,
         relay_instance_id: instance,
@@ -217,7 +218,7 @@ pub(crate) fn management_token<T: HttpTransport>(
     let response = send(
         transport,
         "POST",
-        format!("{base}/v1/auth/tokens"),
+        api.url(&api.auth_path(&vault_id, "tokens")),
         None,
         body,
     )?;
@@ -232,7 +233,7 @@ pub(crate) fn management_token<T: HttpTransport>(
 
 fn verify_latest_grant<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     device_id: DeviceId,
     token: &str,
@@ -242,10 +243,7 @@ fn verify_latest_grant<T: HttpTransport>(
     let response = send(
         transport,
         "GET",
-        format!(
-            "{base}/v1/vaults/{}/devices/self/grants/latest",
-            b64(&vault_id)
-        ),
+        api.url(&api.vault_path(&vault_id, "/devices/self/grants/latest")),
         Some(token),
         Vec::new(),
     )?;
@@ -319,14 +317,25 @@ fn verify_latest_grant<T: HttpTransport>(
     Ok(())
 }
 
-pub(crate) fn device_token<T: HttpTransport>(
+/// 设备 realm 认证的完整回执（邀请加入端要核对 vault/instance pin）。
+pub(crate) struct DeviceAuth {
+    /// bearer token。
+    pub token: String,
+    /// challenge 响应的 vault（必须与请求一致）。
+    pub vault_id: [u8; 16],
+    /// relay instance（必须与邀请链接的 pin 一致，**不自动换 pin**）。
+    pub instance_id: [u8; 16],
+}
+
+/// 设备 realm challenge/token；返回完整回执（vault/instance 供调用方核对）。
+pub(crate) fn device_auth<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     device_id: DeviceId,
     signing_key: &DeviceSigningKey,
     now: u64,
-) -> Result<String, SyncError> {
+) -> Result<DeviceAuth, SyncError> {
     let body = cbor::encode(vec![
         (0, cbor::uint(u64::from(AuthRealm::Device as u8))),
         (1, cbor::bytes(device_id.to_vec())),
@@ -334,7 +343,7 @@ pub(crate) fn device_token<T: HttpTransport>(
     let response = send(
         transport,
         "POST",
-        format!("{base}/v1/auth/challenges"),
+        api.url(&api.auth_path(&vault_id, "challenges")),
         None,
         body,
     )?;
@@ -347,7 +356,7 @@ pub(crate) fn device_token<T: HttpTransport>(
     if response_vault != vault_id || expires_at <= now {
         return Err(SyncError::RelayWire("device challenge 过期/vault 不符"));
     }
-    let origin_sha256: [u8; 32] = Sha256::digest(base.as_bytes()).into();
+    let origin_sha256: [u8; 32] = Sha256::digest(api.origin().as_bytes()).into();
     let challenge = Challenge {
         pv: 1,
         relay_instance_id: instance,
@@ -369,24 +378,40 @@ pub(crate) fn device_token<T: HttpTransport>(
     let response = send(
         transport,
         "POST",
-        format!("{base}/v1/auth/tokens"),
+        api.url(&api.auth_path(&vault_id, "tokens")),
         None,
         body,
     )?;
     let fields = decode(&response)?;
-    cbor::text_field(&fields, 0)
+    Ok(DeviceAuth {
+        token: cbor::text_field(&fields, 0)?,
+        vault_id: response_vault,
+        instance_id: instance,
+    })
+}
+
+/// 只要 bearer token 的薄封装（恢复码自批路径；instance pin 由调用方另外核对）。
+pub(crate) fn device_token<T: HttpTransport>(
+    transport: &mut T,
+    api: &RelayApi,
+    vault_id: [u8; 16],
+    device_id: DeviceId,
+    signing_key: &DeviceSigningKey,
+    now: u64,
+) -> Result<String, SyncError> {
+    Ok(device_auth(transport, api, vault_id, device_id, signing_key, now)?.token)
 }
 
 fn list_slots<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     token: &str,
 ) -> Result<Vec<SlotRecord>, SyncError> {
     let response = send(
         transport,
         "GET",
-        format!("{base}/v1/vaults/{}/key-slots", b64(&vault_id)),
+        api.url(&api.vault_path(&vault_id, "/key-slots")),
         Some(token),
         Vec::new(),
     )?;
@@ -409,7 +434,7 @@ fn list_slots<T: HttpTransport>(
 
 fn unwrap_recovery_slot<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     token: &str,
     record: &SlotRecord,
@@ -433,11 +458,8 @@ fn unwrap_recovery_slot<T: HttpTransport>(
     let mut part_count = 1u32;
     let mut index = 0u32;
     while index < part_count {
-        let path = format!(
-            "{base}/v1/vaults/{}/objects/{}/parts/{index}",
-            b64(&vault_id),
-            b64(&record.slot_id)
-        );
+        let path =
+            api.url(&api.object_path(&vault_id, &record.slot_id, &format!("/parts/{index}")));
         let response = send(transport, "GET", path, Some(token), Vec::new())?;
         let envelope = Envelope::decode(&response.body)?;
         if envelope.header.object_type != ObjectType::KeySlot
@@ -503,21 +525,33 @@ fn unwrap_recovery_slot<T: HttpTransport>(
         .map_err(|_| SyncError::Object("KEY_SLOT KEK 解封失败"))
 }
 
+/// 创建邀请（管理签名 canonical body）。
+///
+/// `expires_at = Some(ts)` 时把 TTL 明确写进被签名的 body（ADR 0014 S1：默认 15 分钟，
+/// 上限 relay 的 24h）；`None` 保持历史语义（relay 缺省 = now + 24h）。
+///
+/// 返回 `(invite_id, token, expires_at)`：`expires_at` 优先取 relay 回执（权威事实），
+/// 旧 relay 不带该字段时回退到请求值/`now + 24h`。
 #[allow(clippy::too_many_arguments)]
-fn create_invite<T: HttpTransport>(
+pub(crate) fn create_invite<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     manager: &ManagementKey,
     token: &str,
     control_rev: u64,
     instance: [u8; 16],
-    _now: u64,
-) -> Result<([u8; 16], [u8; 32]), SyncError> {
+    now: u64,
+    expires_at: Option<u64>,
+) -> Result<([u8; 16], [u8; 32], u64), SyncError> {
     let raw: [u8; 32] = crate::random::array(&mut crate::random::OsRandom)?;
     let token_hash = Sha256::digest(raw);
-    let payload = cbor::encode(vec![(0, cbor::bytes(token_hash.to_vec()))])?;
-    let path = format!("/v1/vaults/{}/invites", b64(&vault_id));
+    let mut payload_fields = vec![(0, cbor::bytes(token_hash.to_vec()))];
+    if let Some(expires_at) = expires_at {
+        payload_fields.push((1, cbor::uint(expires_at)));
+    }
+    let payload = cbor::encode(payload_fields)?;
+    let path = api.vault_path(&vault_id, "/invites");
     let request_id: [u8; 16] = crate::random::array(&mut crate::random::OsRandom)?;
     let body_digest: [u8; 32] =
         Sha256::digest(management_request_cde(HttpMethod::Post, &path, &payload)?).into();
@@ -539,22 +573,21 @@ fn create_invite<T: HttpTransport>(
         (1, cbor::bytes(request_id.to_vec())),
         (2, cbor::uint(control_rev)),
     ])?;
-    let response = send(
-        transport,
-        "POST",
-        format!("{base}{path}"),
-        Some(token),
-        body,
-    )?;
+    let response = send(transport, "POST", api.url(&path), Some(token), body)?;
     let fields = decode(&response)?;
     let invite_id = cbor::bytes_fixed(&fields, 0)?;
-    Ok((invite_id, raw))
+    // 回退值只用于**展示**（旧 relay 不回 TTL 时与 relay 缺省一致 = 24h）；
+    // 真实一次性/过期语义始终由 relay 判定，本地从不据此放行。
+    let confirmed_expires_at = cbor::opt_uint_field(&fields, 1)?
+        .or(expires_at)
+        .unwrap_or(now.saturating_add(24 * 60 * 60));
+    Ok((invite_id, raw, confirmed_expires_at))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn redeem_invite<T: HttpTransport>(
+pub(crate) fn redeem_invite<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     invite_id: [u8; 16],
     token: &[u8; 32],
@@ -575,11 +608,7 @@ fn redeem_invite<T: HttpTransport>(
     let response = send(
         transport,
         "POST",
-        format!(
-            "{base}/v1/vaults/{}/invites/{}/redeem",
-            b64(&vault_id),
-            b64(&invite_id)
-        ),
+        api.vault_path(&vault_id, &format!("/invites/{}/redeem", b64(&invite_id))),
         None,
         body,
     )?;
@@ -591,26 +620,30 @@ fn redeem_invite<T: HttpTransport>(
     Ok(())
 }
 
+/// 批准一台 PENDING 设备（管理签名证书 + 封给它的 HPKE grant）。
+///
+/// 只接收**公钥**：恢复码自批路径用本地刚生成的密钥，邀请路径用管理端从成员视图读到的
+/// pending 设备公钥（ADR 0014 S1 §3）。两条路径共用同一份签名/canonical body 逻辑。
 #[allow(clippy::too_many_arguments)]
-fn approve_device<T: HttpTransport>(
+pub(crate) fn approve_device<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     manager: &ManagementKey,
     token: &str,
     control_rev: u64,
     instance: [u8; 16],
     device_id: DeviceId,
-    signing_key: &DeviceSigningKey,
-    hpke_key: &DeviceHpkeKey,
+    sign_pk: [u8; 32],
+    hpke_pk: [u8; 32],
     manager_rev: u64,
     root: &RootSecretV1,
 ) -> Result<(), SyncError> {
     let cert = DeviceCertV1 {
         vault_id,
         device_id,
-        sign_ed25519_pub: signing_key.public_key(),
-        hpke_x25519_pub: hpke_key.public_key(),
+        sign_ed25519_pub: sign_pk,
+        hpke_x25519_pub: hpke_pk,
         cert_serial: 1,
         issued_manager_rev: manager_rev,
         rights: Rights(Rights::ALL),
@@ -623,11 +656,11 @@ fn approve_device<T: HttpTransport>(
         vault_id,
         epoch: root.key_epoch,
         recipient_device_id: device_id,
-        recipient_x25519_pub: hpke_key.public_key(),
+        recipient_x25519_pub: hpke_pk,
         manager_rev,
         grant_id,
     };
-    let sealed = seal_epoch_grant(&hpke_key.public_key(), root, &aad)?;
+    let sealed = seal_epoch_grant(&hpke_pk, root, &aad)?;
     let grant_signature = manager.sign(&sealed.signature_input(&aad)?);
     let request_id: [u8; 16] = crate::random::array(&mut crate::random::OsRandom)?;
     let payload = cbor::encode(vec![
@@ -640,11 +673,7 @@ fn approve_device<T: HttpTransport>(
         (6, cbor::bytes(request_id.to_vec())),
         (7, cbor::uint(control_rev)),
     ])?;
-    let path = format!(
-        "/v1/vaults/{}/devices/{}/approve",
-        b64(&vault_id),
-        b64(&device_id)
-    );
+    let path = api.vault_path(&vault_id, &format!("/devices/{}/approve", b64(&device_id)));
     let body_digest: [u8; 32] =
         Sha256::digest(management_request_cde(HttpMethod::Post, &path, &payload)?).into();
     let management_signature = manager.sign(&management_signing_input(
@@ -671,13 +700,7 @@ fn approve_device<T: HttpTransport>(
         (7, cbor::bytes(sealed.ciphertext)),
         (8, cbor::bytes(grant_signature.to_vec())),
     ])?;
-    let response = send(
-        transport,
-        "POST",
-        format!("{base}{path}"),
-        Some(token),
-        body,
-    )?;
+    let response = send(transport, "POST", api.url(&path), Some(token), body)?;
     let fields = decode(&response)?;
     let approved: [u8; 16] = cbor::bytes_fixed(&fields, 0)?;
     if approved != device_id {
@@ -692,16 +715,16 @@ fn approve_device<T: HttpTransport>(
     Ok(())
 }
 
-fn get_state<T: HttpTransport>(
+pub(crate) fn get_state<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: [u8; 16],
     token: &str,
 ) -> Result<(u64, u64), SyncError> {
     let response = send(
         transport,
         "GET",
-        format!("{base}/v1/vaults/{}/state", b64(&vault_id)),
+        api.url(&api.vault_path(&vault_id, "/state")),
         Some(token),
         Vec::new(),
     )?;
@@ -820,7 +843,7 @@ mod tests {
         let mut transport = FixedTransport(grant_body(&root, &hpke, device_id));
         verify_latest_grant(
             &mut transport,
-            "http://relay",
+            &RelayApi::new("http://relay", crate::api_version::RelayApiVersion::V1),
             root.vault_id,
             device_id,
             "token",
@@ -838,7 +861,7 @@ mod tests {
         assert!(
             verify_latest_grant(
                 &mut transport,
-                "http://relay",
+                &RelayApi::new("http://relay", crate::api_version::RelayApiVersion::V1),
                 root.vault_id,
                 device_id,
                 "token",

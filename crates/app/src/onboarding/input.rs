@@ -84,6 +84,8 @@ pub struct FormInput {
     secret: bool,
     /// 测试元数据 selector（宿主传入，便于 headless 断言）。
     selector: SharedString,
+    /// 点击输入框时把焦点给它（默认关：向导由宿主决定焦点；面板里的秘密输入需要）。
+    click_to_focus: bool,
 }
 
 impl FormInput {
@@ -91,10 +93,13 @@ impl FormInput {
     pub fn new(placeholder: impl Into<SharedString>, secret: bool, cx: &mut Context<Self>) -> Self {
         Self {
             state: RenameState::selecting_all(""),
-            focus_handle: cx.focus_handle(),
+            // 必须设置在 FocusHandle 上；div 的 `.tab_stop(true)` 只影响交互元数据，
+            // 不会把 handle 登记成键盘可达的 tab stop。
+            focus_handle: cx.focus_handle().tab_stop(true),
             placeholder: placeholder.into(),
             secret,
             selector: SharedString::from("onboarding-input"),
+            click_to_focus: false,
         }
     }
 
@@ -102,6 +107,16 @@ impl FormInput {
     #[must_use]
     pub fn selector(mut self, selector: impl Into<SharedString>) -> Self {
         self.selector = selector.into();
+        self
+    }
+
+    /// 点击输入框时把焦点给它（链式；默认关）。
+    ///
+    /// 向导的输入框由宿主在进入表单时统一聚焦，不需要点击聚焦；dev-sync 面板里的
+    /// 恢复码输入是"展开了确认区再点进去粘贴"的形态，必须有这条路径。
+    #[must_use]
+    pub fn click_to_focus(mut self) -> Self {
+        self.click_to_focus = true;
         self
     }
 
@@ -347,11 +362,16 @@ impl Render for FormInput {
             .h(px(28.0))
             .debug_selector(move || selector.to_string())
             .track_focus(&self.focus_handle)
+            // 没有 tab_stop，`window.focus_next/prev` 找不到这个输入框（Tab 会原地不动）。
+            .tab_stop(true)
             .on_key_down(cx.listener(Self::on_key_down))
             // 点输入框内部不算"点空白"：拦住冒泡。
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_input, _event: &MouseDownEvent, _window, cx| {
+                cx.listener(|input, _event: &MouseDownEvent, window, cx| {
+                    if input.click_to_focus {
+                        input.focus(window, cx);
+                    }
                     cx.stop_propagation();
                 }),
             )

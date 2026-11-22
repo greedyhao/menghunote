@@ -8,13 +8,14 @@
 //!   （ADR §3 改口令：commit 后立即移除旧槽）；失败 409，不留长期双 active；
 //! - recovery 槽不参与 password 激活（v1 只做 password 重包）。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::auth::AuthContext;
 use crate::envelope::ObjectType;
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{sha256, Id16};
 use crate::objects;
+use crate::scope::ScopeConn;
 use crate::sig::{require, Expectation, SignDomain, SignatureCheck, SignatureHook};
 use crate::time::Clock;
 use crate::vault;
@@ -128,14 +129,16 @@ fn read_row(
 }
 
 /// `GET key-slots`：返回 active 槽 + 未过期 retiring 槽（旧槽仅对迁移授权）。
-pub fn list(conn: &Connection, now: i64) -> Result<Vec<SlotRow>> {
+pub fn list(conn: &ScopeConn, now: i64) -> Result<Vec<SlotRow>> {
     let mut stmt = conn.prepare(
         "SELECT slot_id, epoch, kind, descriptor, state, slot_set_rev, retire_at
          FROM key_slots
-         WHERE state = 'active' OR (state = 'retiring' AND (retire_at IS NULL OR retire_at > ?1))
+         WHERE (state = 'active' OR (state = 'retiring'
+                AND (retire_at IS NULL OR retire_at > ?1)))
+           AND vault_id = ?
          ORDER BY kind ASC, slot_set_rev DESC",
     )?;
-    let rows = stmt.query_map([now], |row| {
+    let rows = stmt.query_map((now, conn.scope().as_slice()), |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, i64>(1)?,
@@ -169,7 +172,7 @@ pub struct SlotPutRequest {
 
 /// `PUT key-slots/{s}`：登记候选槽（staging），对象必须已 `complete`。
 pub fn put(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -236,10 +239,11 @@ pub fn put(
     }
     let next_rev = next_slot_set_rev(conn, kind)?;
     conn.execute(
-        "INSERT INTO key_slots(slot_id, epoch, kind, descriptor, state, slot_set_rev, retire_at,
-                               created_at)
-         VALUES (?1, ?2, ?3, ?4, 'staging', ?5, NULL, ?6)",
+        "INSERT INTO key_slots(vault_id, slot_id, epoch, kind, descriptor, state, slot_set_rev,
+                               retire_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'staging', ?6, NULL, ?7)",
         (
+            conn.scope().as_slice(),
             slot_id.as_slice(),
             i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
             kind.as_str(),
@@ -252,13 +256,13 @@ pub fn put(
 }
 
 /// 读单个 slot。
-pub fn get(conn: &Connection, slot_id: &[u8; 32]) -> Result<Option<SlotRow>> {
+pub fn get(conn: &ScopeConn, slot_id: &[u8; 32]) -> Result<Option<SlotRow>> {
     let mut stmt = conn.prepare(
         "SELECT slot_id, epoch, kind, descriptor, state, slot_set_rev, retire_at
-         FROM key_slots WHERE slot_id = ?1",
+         FROM key_slots WHERE slot_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([slot_id.as_slice()], |row| {
+        .query_row((slot_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
@@ -278,10 +282,11 @@ pub fn get(conn: &Connection, slot_id: &[u8; 32]) -> Result<Option<SlotRow>> {
     )?))
 }
 
-fn next_slot_set_rev(conn: &Connection, kind: SlotKind) -> Result<u64> {
+fn next_slot_set_rev(conn: &ScopeConn, kind: SlotKind) -> Result<u64> {
     let value: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(slot_set_rev), 0) FROM key_slots WHERE kind = ?1",
-        [kind.as_str()],
+        "SELECT COALESCE(MAX(slot_set_rev), 0) FROM key_slots
+         WHERE kind = ?1 AND vault_id = ?",
+        (kind.as_str(), conn.scope().as_slice()),
         |row| row.get(0),
     )?;
     Ok(u64::try_from(value)
@@ -290,11 +295,11 @@ fn next_slot_set_rev(conn: &Connection, kind: SlotKind) -> Result<u64> {
 }
 
 /// 当前 active password 槽的 `slot_set_rev`（没有则为 0）。
-pub fn active_password_rev(conn: &Connection) -> Result<u64> {
+pub fn active_password_rev(conn: &ScopeConn) -> Result<u64> {
     let value: i64 = conn.query_row(
         "SELECT COALESCE(MAX(slot_set_rev), 0) FROM key_slots
-         WHERE kind = 'password' AND state = 'active'",
-        [],
+         WHERE kind = 'password' AND state = 'active' AND vault_id = ?1",
+        [conn.scope().as_slice()],
         |row| row.get(0),
     )?;
     u64::try_from(value).map_err(|_| Error::Invariant("slot_set_rev"))
@@ -312,7 +317,7 @@ pub struct PasswordActivateRequest {
 
 /// `POST key-slots/password:activate`：CAS `slot_set_rev` 并在同一事务里切换 active 指针。
 pub fn activate_password(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -351,16 +356,18 @@ pub fn activate_password(
     }
     // 改口令 commit 后旧槽立即移除（ADR §3：不存在长期双 active）。
     conn.execute(
-        "DELETE FROM key_slots WHERE kind = 'password' AND state = 'active'",
-        [],
+        "DELETE FROM key_slots
+         WHERE kind = 'password' AND state = 'active' AND vault_id = ?",
+        [conn.scope().as_slice()],
     )?;
     let next_rev = expected_slot_set_rev.saturating_add(1);
     conn.execute(
         "UPDATE key_slots SET state = 'active', slot_set_rev = ?1, retire_at = NULL
-         WHERE slot_id = ?2",
+         WHERE slot_id = ?2 AND vault_id = ?",
         (
             i64::try_from(next_rev).map_err(|_| Error::Invariant("slot rev"))?,
             new_slot_id.as_slice(),
+            conn.scope().as_slice(),
         ),
     )?;
     // 槽指针更新进控制链（永久保留）。
@@ -370,20 +377,22 @@ pub fn activate_password(
 
 /// 轮换 activate 前置条件：候选 epoch 必须已发布**新槽**（password + recovery 各至少一个
 /// staging），ADR §8 步 5。返回缺失原因（空 = 齐备）。
-pub fn rotation_slots_ready(conn: &Connection, epoch: u64) -> Result<Vec<&'static str>> {
+pub fn rotation_slots_ready(conn: &ScopeConn, epoch: u64) -> Result<Vec<&'static str>> {
     let mut issues = Vec::new();
     let epoch = i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?;
     let password: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM key_slots WHERE epoch = ?1 AND kind = 'password' AND state = 'staging'",
-        [epoch],
+        "SELECT COUNT(*) FROM key_slots
+         WHERE epoch = ?1 AND kind = 'password' AND state = 'staging' AND vault_id = ?",
+        (epoch, conn.scope().as_slice()),
         |row| row.get(0),
     )?;
     if password == 0 {
         issues.push("missing_password_slot");
     }
     let recovery: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM key_slots WHERE epoch = ?1 AND kind = 'recovery' AND state = 'staging'",
-        [epoch],
+        "SELECT COUNT(*) FROM key_slots
+         WHERE epoch = ?1 AND kind = 'recovery' AND state = 'staging' AND vault_id = ?",
+        (epoch, conn.scope().as_slice()),
         |row| row.get(0),
     )?;
     if recovery == 0 {
@@ -394,30 +403,36 @@ pub fn rotation_slots_ready(conn: &Connection, epoch: u64) -> Result<Vec<&'stati
 
 /// 清理过期 retiring 槽：删 `key_slots` 行 + KEY_SLOT 对象 body/parts（保留 objects 行 tombstone，
 /// 让"知道 slot_id 直接 GET"得到 410 而不是 404；§25.2）。
-pub fn purge_retired_slots(conn: &Connection, now: i64) -> Result<u64> {
+pub fn purge_retired_slots(conn: &ScopeConn, now: i64) -> Result<u64> {
     let mut stmt = conn.prepare(
         "SELECT slot_id FROM key_slots
-         WHERE state = 'retiring' AND retire_at IS NOT NULL AND retire_at <= ?1",
+         WHERE state = 'retiring' AND retire_at IS NOT NULL AND retire_at <= ?1
+           AND vault_id = ?",
     )?;
     let ids: Vec<Vec<u8>> = stmt
-        .query_map([now], |row| row.get::<_, Vec<u8>>(0))?
+        .query_map((now, conn.scope().as_slice()), |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for id in &ids {
         conn.execute(
-            "DELETE FROM object_parts WHERE object_id = ?1",
-            [id.as_slice()],
+            "DELETE FROM object_parts WHERE object_id = ?1 AND vault_id = ?",
+            (id.as_slice(), conn.scope().as_slice()),
         )?;
-        conn.execute("DELETE FROM key_slots WHERE slot_id = ?1", [id.as_slice()])?;
+        conn.execute(
+            "DELETE FROM key_slots WHERE slot_id = ?1 AND vault_id = ?",
+            (id.as_slice(), conn.scope().as_slice()),
+        )?;
     }
     u64::try_from(ids.len()).map_err(|_| Error::Invariant("purged slots"))
 }
 
 /// §25.2：KEY_SLOT 对象是否仍可读（active/staging，或 retiring 且未到 retire_at）。
-pub fn slot_object_readable(conn: &Connection, slot_id: &[u8; 32], now: i64) -> Result<bool> {
+pub fn slot_object_readable(conn: &ScopeConn, slot_id: &[u8; 32], now: i64) -> Result<bool> {
     let row: Option<(String, Option<i64>)> = conn
         .query_row(
-            "SELECT state, retire_at FROM key_slots WHERE slot_id = ?1",
-            [slot_id.as_slice()],
+            "SELECT state, retire_at FROM key_slots WHERE slot_id = ?1 AND vault_id = ?",
+            (slot_id.as_slice(), conn.scope().as_slice()),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -440,10 +455,12 @@ pub fn descriptor_context_hash(descriptor: &[u8]) -> [u8; 32] {
 pub type SlotTimeline = Vec<(Vec<u8>, String, String, u64)>;
 
 /// 诊断：所有槽的 `(slot_id, kind, state, rev)`。
-pub fn timeline(conn: &Connection) -> Result<SlotTimeline> {
-    let mut stmt =
-        conn.prepare("SELECT slot_id, kind, state, slot_set_rev FROM key_slots ORDER BY slot_id")?;
-    let rows = stmt.query_map([], |row| {
+pub fn timeline(conn: &ScopeConn) -> Result<SlotTimeline> {
+    let mut stmt = conn.prepare(
+        "SELECT slot_id, kind, state, slot_set_rev FROM key_slots
+             WHERE vault_id = ?1 ORDER BY slot_id",
+    )?;
+    let rows = stmt.query_map([conn.scope().as_slice()], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, String>(1)?,
@@ -465,12 +482,12 @@ pub fn timeline(conn: &Connection) -> Result<SlotTimeline> {
 }
 
 /// 便捷：当前 active 的 password/recovery slot（诊断/配对客户端用）。
-pub fn active_slots(conn: &Connection) -> Result<Vec<SlotRow>> {
+pub fn active_slots(conn: &ScopeConn) -> Result<Vec<SlotRow>> {
     let mut stmt = conn.prepare(
         "SELECT slot_id, epoch, kind, descriptor, state, slot_set_rev, retire_at
-         FROM key_slots WHERE state = 'active' ORDER BY kind",
+         FROM key_slots WHERE state = 'active' AND vault_id = ?1 ORDER BY kind",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([conn.scope().as_slice()], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, i64>(1)?,
@@ -493,21 +510,22 @@ pub fn active_slots(conn: &Connection) -> Result<Vec<SlotRow>> {
 
 /// 设备可见的 slot 列表（recovery 槽对普通成员也可见——客户端需要找到自己的槽描述符；
 /// 密文本体只能解密旧根，泄露描述符不泄露密钥）。
-pub fn list_visible(conn: &Connection, now: i64) -> Result<Vec<SlotRow>> {
+pub fn list_visible(conn: &ScopeConn, now: i64) -> Result<Vec<SlotRow>> {
     list(conn, now)
 }
 
 /// 管理 realm 可见的 slot 列表：active / retiring + **staging**（ADR §20.2，恢复设备自批
 /// 需要读 recovery staging 槽；普通设备仍走 `list_visible`，看不到候选槽）。
-pub fn list_management(conn: &Connection, now: i64) -> Result<Vec<SlotRow>> {
+pub fn list_management(conn: &ScopeConn, now: i64) -> Result<Vec<SlotRow>> {
     let mut stmt = conn.prepare(
         "SELECT slot_id, epoch, kind, descriptor, state, slot_set_rev, retire_at
          FROM key_slots
-         WHERE state IN ('active', 'staging')
-            OR (state = 'retiring' AND (retire_at IS NULL OR retire_at > ?1))
+         WHERE (state IN ('active', 'staging')
+            OR (state = 'retiring' AND (retire_at IS NULL OR retire_at > ?1)))
+           AND vault_id = ?
          ORDER BY kind ASC, slot_set_rev DESC",
     )?;
-    let rows = stmt.query_map([now], |row| {
+    let rows = stmt.query_map((now, conn.scope().as_slice()), |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, i64>(1)?,

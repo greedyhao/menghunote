@@ -266,7 +266,7 @@ fn with_token(request: Request<Body>, token: &str) -> Request<Body> {
 async fn old_device_and_management_tokens_are_dead_on_every_endpoint_after_begin_and_activate() {
     let mut fx = block(|| Fixture::new("token-scope"));
     let app = router(AppState::new(
-        fx.db.clone(),
+        fx.db.inner().clone(),
         fx.cfg.clone(),
         fx.hook.clone(),
     ));
@@ -391,7 +391,7 @@ async fn old_device_and_management_tokens_are_dead_on_every_endpoint_after_begin
     );
 
     // WS /wake：旧 token 连升级都建立不了；新 token 能收到 epoch=2 水位。
-    let state = AppState::new(fx.db.clone(), fx.cfg.clone(), fx.hook.clone());
+    let state = AppState::new(fx.db.inner().clone(), fx.cfg.clone(), fx.hook.clone());
     let ws_app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

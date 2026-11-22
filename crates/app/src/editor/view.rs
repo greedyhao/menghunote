@@ -865,10 +865,82 @@ impl EditorView {
             return;
         }
         match self.controller.compose_replace_selection(text) {
-            Ok(request) => self.submit_request(request),
+            Ok(request) => {
+                self.submit_request(request);
+            }
             Err(error) => eprintln!("[menghunote] 插入文本失败：{error}"),
         }
         cx.notify();
+    }
+
+    /// 附件插入的目标偏移（**不产生编辑**）。
+    ///
+    /// 先做与 [`Self::insert_attachment_markdown`] 完全相同的闸门检查（持闸 / 组合中），
+    /// 再返回选区起点在 **source 字节**坐标下的值——宿主用它算 `asset_refs.start_byte`，
+    /// 因此"读文件/换算失败"必须发生在任何落库之前。
+    #[cfg(feature = "dev-sync")]
+    pub(crate) fn attachment_insert_offset(&mut self) -> Result<usize, String> {
+        if self.frozen_by_external_commit() {
+            return Err("同步持闸中，暂不能插入附件".to_owned());
+        }
+        if self.is_composing() {
+            return Err("输入法组合中：请先上屏或按 Esc".to_owned());
+        }
+        let source = self.controller.source_text();
+        self.controller
+            .selection()
+            .start()
+            .to_source_byte(&source)
+            .map(|byte| byte.get())
+            .map_err(|error| format!("光标位置换算失败：{error}"))
+    }
+
+    /// 附件插入：在光标/选区处插入一段 Markdown（**一个编辑事务**）。
+    ///
+    /// 与普通输入走**同一条** [`Self::submit_request`] 路径（Held/组合/闸门语义一致），
+    /// 因此"插入成功"在这里就能判定，而"一次插入 = 一个撤销单元"由驱动保证。
+    ///
+    /// 返回这段 Markdown 在 **source 字节**里的起点（`asset_refs.start_byte` 要用它）。
+    /// 失败（持闸 / 组合中 / 编辑被拒）返回人类可读原因，**不产生半链接**：调用方在
+    /// 收到错误时会回滚刚写下的 `asset_refs` 行。
+    #[cfg(feature = "dev-sync")]
+    pub(crate) fn insert_attachment_markdown(
+        &mut self,
+        markdown: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        if self.frozen_by_external_commit() {
+            return Err("同步持闸中，暂不能插入附件".to_owned());
+        }
+        if self.is_composing() {
+            return Err("输入法组合中：请先上屏或按 Esc".to_owned());
+        }
+        let source = self.controller.source_text();
+        let start_byte = self
+            .controller
+            .selection()
+            .start()
+            .to_source_byte(&source)
+            .map_err(|error| format!("光标位置换算失败：{error}"))?
+            .get();
+        let request = self
+            .controller
+            .compose_replace_selection(markdown)
+            .map_err(|error| format!("插入附件失败：{error}"))?;
+        match self.submit_request(request) {
+            Some(EditOutcome::Applied(_)) => {
+                cx.notify();
+                Ok(start_byte)
+            }
+            Some(EditOutcome::Rejected(rejected)) => {
+                Err(format!("插入附件被拒（{:?}）", rejected.reason))
+            }
+            Some(EditOutcome::Stale(stale)) => Err(format!(
+                "插入附件基准过期（当前 live_rev={}）",
+                stale.current_live_rev.0
+            )),
+            None => Err("插入附件未生效（输入被冻结或编辑请求为空）".to_owned()),
+        }
     }
 
     /// 本次删除在 **source** 坐标下的最小区间（display 取相邻可见 grapheme）。
@@ -1033,7 +1105,10 @@ impl EditorView {
 
     /// **所有** `EditRequest` 的唯一出口：组合期挂起、`CompositionActive` 不污染控制器、
     /// 每次请求打一行日志（`请求#N … edits=M` 就是"一次 commit 只有一个请求"的证据）。
-    fn submit_request(&mut self, request: Option<EditRequest>) {
+    ///
+    /// 返回**已交给驱动的结局**（`None` = 没有产生请求：Held 丢弃 / no-op / 组合期挂起）。
+    /// 普通输入不关心返回值；附件插入要用它判断"这次事务是否真的生效"。
+    fn submit_request(&mut self, request: Option<EditRequest>) -> Option<EditOutcome> {
         if self.frozen_by_external_commit() {
             // 兜底：任何绕到这里的请求（例如组合结束时重试的挂起请求）在 Held 期间都
             // 不能被驱动受理。`Rejected{NotReady}` 会让控制器 `needs_resync`，
@@ -1044,12 +1119,12 @@ impl EditorView {
                     request.command_id
                 );
             }
-            return;
+            return None;
         }
         let Some(request) = request else {
             // 空选区 + 空替换是 no-op：不产生请求，但要留痕，避免被误读成"丢请求"。
             eprintln!("[menghunote] 本次输入是 no-op（空选区 + 空文本），不产生 EditRequest");
-            return;
+            return None;
         };
         self.request_seq = self.request_seq.saturating_add(1);
         let seq = self.request_seq;
@@ -1060,7 +1135,7 @@ impl EditorView {
                 request.command_id
             );
             self.composition.pending_retry = Some(request);
-            return;
+            return None;
         }
 
         let command_id = request.command_id.clone();
@@ -1075,7 +1150,7 @@ impl EditorView {
                 "[menghunote] 请求#{seq} 未受理（CompositionActive）：挂起 command_id={command_id}，组合结束后用同一 id 重试"
             );
             self.composition.pending_retry = Some(request);
-            return;
+            return None;
         }
         match &outcome {
             EditOutcome::Applied(applied) => {
@@ -1098,7 +1173,8 @@ impl EditorView {
                 stale.current_live_rev.0
             ),
         }
-        self.apply_outcome_guarded(outcome);
+        self.apply_outcome_guarded(outcome.clone());
+        Some(outcome)
     }
 
     /// 调试：模拟"输入法组合 → 上屏"（F9，仅 debug 构建）。

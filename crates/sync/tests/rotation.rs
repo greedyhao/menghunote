@@ -9,6 +9,7 @@ use menghunote_storage::{
     pending_send, set_confirmed_highwater, store_encrypted_parts, store_inbox_verified,
     SyncEncryptedPart, Vault, META_SYNC_INTEGRATED_SEQ,
 };
+use menghunote_sync::api_version::RelayApiVersion;
 use menghunote_sync::device::ManagementKey;
 use menghunote_sync::engine::{EngineIdentity, SyncEngine};
 use menghunote_sync::genesis;
@@ -111,6 +112,7 @@ fn begin_response_loss_is_recovered_by_request_id() {
         &manager,
         &instance_id,
         &[],
+        RelayApiVersion::V1,
     );
     let view = result.expect("丢响应后应按 request_id 找回");
     assert_eq!(journal.rotation_id, Some(view.rotation_id));
@@ -165,6 +167,7 @@ fn integrate_refuses_ready_when_log_does_not_reach_s() {
         &manager,
         &instance_id,
         &[],
+        RelayApiVersion::V1,
     )
     .expect("begin");
     let s = journal.freeze_seq.expect("S") + 5;
@@ -547,6 +550,7 @@ fn activate_body_binds_four_digests_and_signature() {
         [0x77; 16],
         3,
         &body,
+        RelayApiVersion::V1,
     )
     .expect("sign activate");
     let decoded = RotationActivateBodyV1::decode(&signed.body).expect("decode activate");
@@ -565,6 +569,7 @@ fn activate_body_binds_four_digests_and_signature() {
         [0x77; 16],
         3,
         &body,
+        RelayApiVersion::V1,
     )
     .is_err());
 }

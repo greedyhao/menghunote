@@ -8,14 +8,13 @@
 //! - 只删 `<= floor` 的日志前缀和**无根引用的 update 对象**的密文（保留幂等 tombstone 行）；
 //! - v1 不做资产孤儿删除；只清 24h 未 finalize 的暂存对象。
 
-use rusqlite::Connection;
-
 use crate::checkpoints::{self, Health};
 use crate::error::{Error, Result};
 use crate::ids::Id16;
 use crate::log;
 use crate::objects;
 use crate::quota;
+use crate::scope::ScopeConn;
 use crate::slots;
 use crate::time::{secs, Clock};
 use crate::vault;
@@ -43,7 +42,7 @@ pub struct GcOutcome {
 }
 
 /// 执行一次 GC（写事务内；调用方：`Db::write` 或后台 tick）。
-pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
+pub fn tick(conn: &ScopeConn, clock: &dyn Clock) -> Result<GcOutcome> {
     let now = clock.now_secs();
     let mut outcome = GcOutcome::default();
     quota::expire_stale_reservations(conn, now)?;
@@ -98,8 +97,8 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
     // 1) 到期计划里最大的 cut_seq。
     let eligible_cut: Option<i64> = conn
         .query_row(
-            "SELECT MAX(cut_seq) FROM gc_plans WHERE eligible_at <= ?1",
-            [now],
+            "SELECT MAX(cut_seq) FROM gc_plans WHERE eligible_at <= ?1 AND vault_id = ?",
+            (now, conn.scope().as_slice()),
             |row| row.get(0),
         )
         .unwrap_or(None);
@@ -146,20 +145,24 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
             "SELECT o.object_id FROM objects o
              WHERE o.type = 1
                AND o.budget_class != 'retired'
-               AND NOT EXISTS (SELECT 1 FROM checkpoint_refs r WHERE r.object_id = o.object_id)
-               AND NOT EXISTS (SELECT 1 FROM log l WHERE l.object_id = o.object_id)",
+               AND o.vault_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM checkpoint_refs r
+                               WHERE r.object_id = o.object_id AND r.vault_id = o.vault_id)
+               AND NOT EXISTS (SELECT 1 FROM log l
+                               WHERE l.object_id = o.object_id AND l.vault_id = o.vault_id)",
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let rows = stmt.query_map([conn.scope().as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for object_id in candidates {
         conn.execute(
-            "DELETE FROM object_parts WHERE object_id = ?1",
-            [object_id.as_slice()],
+            "DELETE FROM object_parts WHERE object_id = ?1 AND vault_id = ?",
+            (object_id.as_slice(), conn.scope().as_slice()),
         )?;
         conn.execute(
-            "UPDATE objects SET budget_class = 'retired' WHERE object_id = ?1",
-            [object_id.as_slice()],
+            "UPDATE objects SET budget_class = 'retired'
+             WHERE object_id = ?1 AND vault_id = ?",
+            (object_id.as_slice(), conn.scope().as_slice()),
         )?;
         outcome.retired_update_objects += 1;
     }
@@ -177,20 +180,23 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
     // 7) 账本对账 + 推进 gc_floor。
     quota::recompute(conn)?;
     conn.execute(
-        "UPDATE vault SET gc_floor = ?1 WHERE singleton = 1",
-        [i64::try_from(floor).map_err(|_| Error::Invariant("gc floor"))?],
+        "UPDATE vaults SET gc_floor = ?1 WHERE vault_id = ?",
+        (
+            i64::try_from(floor).map_err(|_| Error::Invariant("gc floor"))?,
+            conn.scope().as_slice(),
+        ),
     )?;
     Ok(outcome)
 }
 /// 含 unhealthy 的已发布基线（GC 专用；健康过滤由调用方做，否则损坏基线会被"跳过"而非阻止）。
 pub fn published_any_newest_first(
-    conn: &Connection,
+    conn: &ScopeConn,
     epoch: u64,
     limit: u32,
 ) -> Result<Vec<checkpoints::CheckpointRow>> {
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id FROM checkpoints
-         WHERE state = 'published' AND epoch = ?1
+         WHERE state = 'published' AND epoch = ?1 AND vault_id = ?3
          ORDER BY published_at DESC, rowid DESC LIMIT ?2",
     )?;
     let ids: Vec<Vec<u8>> = stmt
@@ -198,6 +204,7 @@ pub fn published_any_newest_first(
             (
                 i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
                 i64::from(limit.max(1)),
+                conn.scope().as_slice(),
             ),
             |row| row.get::<_, Vec<u8>>(0),
         )?

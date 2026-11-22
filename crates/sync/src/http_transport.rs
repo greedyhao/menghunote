@@ -223,7 +223,12 @@ pub struct StdTcpTransport {
 }
 
 impl StdTcpTransport {
-    /// 按环境变量策略构造（生产默认只允许 https）。
+    /// 按**环境变量**策略构造（默认只允许 https）。
+    ///
+    /// ⚠️ 生产入口**不得**调用本函数：它读 [`ALLOW_PLAINTEXT_HTTP_ENV`]，等于允许
+    /// 环境变量放宽传输策略（ADR 0013 §1 禁止）。生产统一走
+    /// [`crate::relay_policy::production_transport`]（显式
+    /// [`TransportPolicy::production`]）；本函数只保留给既有测试/历史调用点。
     pub fn new(base_url: &str) -> Result<Self, SyncError> {
         Self::new_with_policy(base_url, TransportPolicy::from_env())
     }

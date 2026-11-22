@@ -1,11 +1,12 @@
-//! 同步设置面板的**状态与校验**（ADR 0011 S4）。
+//! 同步设置面板的**状态与校验**（ADR 0011 S4；ADR 0013 S3 增加 relay 模式/安全指纹）。
 //!
 //! ## 为什么单独一层
 //!
-//! 设置面板只做三件事：列出公开配置、切换 `active_instance`、修改 active 实例的
-//! `relay_url`。三件事都不涉及秘密材料，也不触碰 Vault/worker：
+//! 设置面板只做四件事：列出公开配置、切换 `active_instance`、修改 active 实例的
+//! `relay_mode`/`relay_url`、展示**公开**安全指纹。四件事都不涉及秘密材料，也不触碰
+//! Vault/worker：
 //!
-//! - 列表直接读 [`DevSyncProfile`] 的公开条目（`instance_id` / `relay_url` /
+//! - 列表直接读 [`DevSyncProfile`] 的公开条目（`instance_id` / `relay_mode` / `relay_url` /
 //!   `vault_path` / `vault_id` / `device_id`）；
 //! - 写配置走既有的 [`ProfileStore::save`]（同目录临时文件 + fsync + rename），
 //!   失败时旧配置原样保留；
@@ -14,19 +15,25 @@
 //! 本文件只放状态与纯函数校验；渲染/动作在 [`super::app_root`]（它持有 `AppRoot`
 //! 的上下文），避免在 UI 文件里再抄一份 URL 策略。
 //!
+//! ## 模式与 URL（ADR 0013 §1）
+//!
+//! 两者都走**唯一权威 parser**（`menghunote-sync::relay_policy::parse_relay_url`）：
+//! `local_dev` 只接受明文 loopback，`remote_tls` 只接受 HTTPS + canonical origin；
+//! userinfo/query/fragment/非根路径一律拒绝。`remote_tls` 是**显式选择**（需要用户
+//! 勾选"远程服务器/HTTPS"确认），默认仍是 `local_dev`。
+//!
 //! ## 安全边界
 //!
 //! 设置面板**没有** setup secret / 恢复码 / root / manager seed 字段：这些材料
 //! 根本不在 [`InstanceEntry`] 里（[`super::layout`] 的类型上就写不进去）。允许
-//! 复制的是 `vault_id` / `device_id` / 库路径这类公开值，并明确提示不要分享秘密。
+//! 复制的是 `vault_id` / `device_id` / 库路径与 pin 指纹这类公开值，并明确提示不要
+//! 分享秘密。安全指纹只读，**不提供**「重置 pin / 强制信任」按钮。
 
 use gpui::{Entity, Subscription};
 
-use crate::dev_sync::gate::validate_relay_url;
-use crate::dev_sync::service::ServiceConfig;
-
+use super::fingerprint::FingerprintState;
 use super::input::FormInput;
-use super::layout::InstanceEntry;
+use super::layout::{InstanceEntry, RelayMode};
 
 /// 设置面板运行期状态（**只有公开信息**）。
 ///
@@ -35,8 +42,16 @@ use super::layout::InstanceEntry;
 pub(crate) struct SettingsState {
     /// 打开面板/切换 active 时 active 实例的快照（`None` = 配置里没有 active）。
     pub(crate) active: Option<InstanceEntry>,
+    /// 正在编辑的 relay 模式（保存时才写回配置）。
+    pub(crate) mode: RelayMode,
+    /// 远程模式确认（ADR 0013 §1：`remote_tls` 必须显式同意"远程服务器/HTTPS"）。
+    pub(crate) remote_consent: bool,
     /// relay 输入框（`settings-relay`）。
     pub(crate) relay: Entity<FormInput>,
+    /// 安全指纹（打开面板时的只读快照；`None` = 没有打开实例，无法读取）。
+    pub(crate) fingerprint: Option<FingerprintState>,
+    /// 安全暂停类别（打开面板时的快照；渲染时尽量读实时值）。
+    pub(crate) security: Option<crate::dev_sync::SecurityCategory>,
     /// 内联错误（`settings-error`；脱敏后的公开文案）。
     pub(crate) error: Option<String>,
     /// 内联提示（`settings-notice`；含「重启后生效」）。
@@ -47,38 +62,43 @@ pub(crate) struct SettingsState {
     pub(crate) _subs: Vec<Subscription>,
 }
 
-/// 校验设置面板里的 relay 编辑值；成功返回**去掉首尾空白后**的地址。
+/// 本构建是否提供 `remote_tls` 选项（ADR 0013 §1：模式能力来自编译期，不看环境变量）。
 ///
-/// 与运行时门禁（[`crate::dev_sync::gate::validate_relay_url`] + transport 策略）
-/// 用同一套规则，不复制 URL 解析：
+/// `onboarding` 只在 `dev-sync` feature 下编译（它隐含 `sync`），因此当前构建恒为
+/// `true`；保留这个单一判定点，默认构建没有任何 sync UI（选项在类型上不存在）。
+#[must_use]
+pub(crate) const fn remote_option_available() -> bool {
+    cfg!(feature = "sync") && crate::sync_gate::mode_allowed(RelayMode::RemoteTls)
+}
+
+/// 校验设置面板里的 relay 编辑值；成功返回**canonical origin**。
+///
+/// 与运行时门禁/worker 共用唯一权威 parser（ADR 0013 §1），不复制 URL 解析：
 ///
 /// 1. 空值明确报「不能为空」；
-/// 2. 必须 `http://` + loopback 主机（`127.0.0.1` / `::1` / `localhost`）；
-/// 3. 再过一遍 transport 策略（端口/路径/query/userinfo 等），与
-///    [`crate::dev_sync::gate::resolve`] 的兜底一致。
+/// 2. 模式与 scheme 必须匹配（local_dev → `http://` + loopback 白名单；
+///    remote_tls → `https://` + DNS/IP）；
+/// 3. 路径/query/fragment/userinfo/端口一并由 parser 拒绝；
+/// 4. 解析成功返回 canonical origin（默认端口省略、无尾斜杠）。
 ///
-/// 错误文案**不打印原始 URL 的 userinfo**：`validate_relay` 已负责脱敏
-/// （`scheme://user:pass@host` → `scheme://host`）；transport 错误只给固定说明，
-/// 不回显输入。
-pub(crate) fn validate_relay_edit(raw: &str) -> Result<String, String> {
+/// 错误文案**不打印原始 URL 的 userinfo**：parser 只含 scheme/host 等公开定位信息。
+pub(crate) fn validate_relay_edit(raw: &str, mode: RelayMode) -> Result<String, String> {
     let relay = raw.trim();
     if relay.is_empty() {
-        return Err(
-            "relay 不能为空：当前 dev-sync 只支持明文 loopback（例如 http://127.0.0.1:18080）"
-                .to_owned(),
-        );
+        return Err(match mode {
+            RelayMode::LocalDev => {
+                "relay 不能为空：local_dev 只支持明文 loopback（例如 http://127.0.0.1:18080）"
+                    .to_owned()
+            }
+            RelayMode::RemoteTls => {
+                "relay 不能为空：remote_tls 需要 HTTPS 服务器（例如 https://relay.example）"
+                    .to_owned()
+            }
+        });
     }
-    validate_relay_url(relay).map_err(|error| error.to_string())?;
-    // 门禁的第二道兜底：`http://127.0.0.1:18080/api` 这类主机合法但路径非法的地址，
-    // 只靠 `validate_relay` 会漏掉。
-    ServiceConfig::new(relay.to_owned())
-        .build_transport()
-        .map_err(|_| {
-            "relay 未通过传输策略校验：只允许 http://127.0.0.1 / http://localhost / \
-             http://[::1] 加可选端口，不要带路径、查询或用户信息"
-                .to_owned()
-        })?;
-    Ok(relay.to_owned())
+    let origin =
+        crate::sync_gate::parse_for_build(relay, mode).map_err(|error| error.to_string())?;
+    Ok(origin.as_str())
 }
 
 /// 公开标识的短展示（10 个字符以内原样，否则前 8 个 + `…`）。
@@ -107,31 +127,84 @@ mod tests {
             "http://[::1]:18080",
             "http://127.0.0.1:1",
         ] {
-            let relay =
-                validate_relay_edit(good).unwrap_or_else(|error| panic!("{good:?}：{error}"));
+            let relay = validate_relay_edit(good, RelayMode::LocalDev)
+                .unwrap_or_else(|error| panic!("{good:?}：{error}"));
             assert_eq!(relay, good.trim());
         }
     }
 
-    /// 空值/非 loopback/https/userinfo/路径都拒绝；错误不回显 userinfo。
+    /// 合法 remote：HTTPS + DNS/IP，canonical 化（默认端口/尾斜杠）。
+    #[test]
+    fn remote_relays_require_https_and_canonical_origin() {
+        for (good, canonical) in [
+            ("https://relay.example", "https://relay.example"),
+            ("https://relay.example:8443/", "https://relay.example:8443"),
+            ("https://203.0.113.7", "https://203.0.113.7"),
+            ("https://[2001:db8::1]:443", "https://[2001:db8::1]"),
+        ] {
+            assert_eq!(
+                validate_relay_edit(good, RelayMode::RemoteTls).expect(good),
+                canonical
+            );
+        }
+    }
+
+    /// 空值/模式不符/userinfo/路径都拒绝；错误不回显 userinfo。
     #[test]
     fn invalid_relays_are_rejected_without_echoing_credentials() {
-        for (bad, needle) in [
-            ("", "不能为空"),
-            ("https://127.0.0.1:18080", "loopback"),
-            ("http://relay.example:18080", "loopback"),
-            ("http://192.168.1.9:18080", "loopback"),
-            ("http://0.0.0.0:18080", "loopback"),
-            ("http://user:pass@127.0.0.1:18080", "loopback"),
-            ("http://127.0.0.1:18080/api", "传输策略"),
+        for (bad, mode, needle) in [
+            ("", RelayMode::LocalDev, "不能为空"),
+            ("https://127.0.0.1:18080", RelayMode::LocalDev, "http://"),
+            (
+                "http://relay.example:18080",
+                RelayMode::LocalDev,
+                "loopback",
+            ),
+            ("http://192.168.1.9:18080", RelayMode::LocalDev, "loopback"),
+            ("http://0.0.0.0:18080", RelayMode::LocalDev, "loopback"),
+            ("http://127.0.0.2:18080", RelayMode::LocalDev, "loopback"),
+            (
+                "http://user:pass@127.0.0.1:18080",
+                RelayMode::LocalDev,
+                "userinfo",
+            ),
+            (
+                "http://127.0.0.1:18080/api",
+                RelayMode::LocalDev,
+                "canonical origin",
+            ),
+            ("http://relay.example", RelayMode::RemoteTls, "https"),
+            (
+                "https://user:pass@relay.example",
+                RelayMode::RemoteTls,
+                "userinfo",
+            ),
+            (
+                "https://relay.example/api",
+                RelayMode::RemoteTls,
+                "canonical origin",
+            ),
+            ("https://relay.example?x=1", RelayMode::RemoteTls, "query"),
+            (
+                "https://relay.example#frag",
+                RelayMode::RemoteTls,
+                "fragment",
+            ),
         ] {
-            let error = validate_relay_edit(bad).expect_err("必须拒绝");
+            let error = validate_relay_edit(bad, mode).expect_err("必须拒绝");
             assert!(error.contains(needle), "{bad:?} → {error}");
             if bad.contains("pass") {
                 assert!(!error.contains("pass"), "不得回显 userinfo：{error}");
                 assert!(!error.contains("user:"), "不得回显 userinfo：{error}");
             }
         }
+    }
+
+    #[test]
+    fn remote_option_is_compile_time_capability() {
+        // dev-sync 构建隐含 sync：remote_tls 一定可用；local_dev 只在 dev-sync 构建可用。
+        assert!(remote_option_available());
+        assert!(crate::sync_gate::mode_allowed(RelayMode::RemoteTls));
     }
 
     #[test]

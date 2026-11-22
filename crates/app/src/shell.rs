@@ -194,6 +194,15 @@ pub struct AppShell {
     /// 已收到「发布基线」按钮请求、还没在 `dev_sync_pump` 里消费（切片 4c-4）。
     #[cfg(feature = "dev-sync")]
     dev_sync_publish_requested: bool,
+    /// 已收到「轮换密钥」确认请求、还没在 `dev_sync_pump` 里消费（切片 6b）。
+    ///
+    /// 事件只带"用户确认了"，真正的恢复码/revoke 列表留在面板里，由泵取走
+    /// （[`crate::dev_sync::DevSyncPanel::take_rotate_request`]）——秘密不进事件/日志。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_rotate_requested: bool,
+    /// 已收到「应用轮换」确认请求、还没在 `dev_sync_pump` 里消费（切片 6b）。
+    #[cfg(feature = "dev-sync")]
+    dev_sync_apply_requested: bool,
     /// 最近一次持闸同步的报告（面板文案 + 测试断言）。
     #[cfg(feature = "dev-sync")]
     dev_sync_last_report: Option<crate::dev_sync::SyncOnceReport>,
@@ -212,6 +221,30 @@ pub struct AppShell {
     /// 已观测到的活动文档本地编辑代数（自动同步的 debounce 触发源）。
     #[cfg(feature = "dev-sync")]
     dev_sync_auto_edit_seq: u64,
+    /// 附件插入条（dev-sync 构建）：`None` = 收起；`Some` = 路径输入框已展开。
+    #[cfg(feature = "dev-sync")]
+    attachment: Option<AttachmentUi>,
+    /// 下一帧把焦点交给附件路径输入框（事件回调里没有 `&mut Window`）。
+    #[cfg(feature = "dev-sync")]
+    pending_focus_attachment: bool,
+    /// 附件插入的失败原因（`attachment-error` 行；校验失败/持闸/落库失败都写这里）。
+    #[cfg(feature = "dev-sync")]
+    attachment_error: Option<String>,
+    /// 附件插入的成功提示（`attachment-notice` 行）。
+    #[cfg(feature = "dev-sync")]
+    attachment_notice: Option<String>,
+}
+
+/// 附件插入条的展开态（只有 `--features dev-sync` 下存在）。
+///
+/// 输入框复用行内重命名用的单行控件 [`RenameInput`]（已有焦点/IME/选区语义），
+/// 事件语义也一样：`Enter` = 插入、`Esc` = 取消、空白 = 明确提示。
+#[cfg(feature = "dev-sync")]
+struct AttachmentUi {
+    /// 路径输入框。
+    input: Entity<RenameInput>,
+    /// 输入框事件订阅（drop = 取消订阅）。
+    _events: gpui::Subscription,
 }
 
 /// 右键行弹出的上下文菜单。
@@ -367,6 +400,10 @@ impl AppShell {
             #[cfg(feature = "dev-sync")]
             dev_sync_publish_requested: false,
             #[cfg(feature = "dev-sync")]
+            dev_sync_rotate_requested: false,
+            #[cfg(feature = "dev-sync")]
+            dev_sync_apply_requested: false,
+            #[cfg(feature = "dev-sync")]
             dev_sync_last_report: None,
             #[cfg(feature = "dev-sync")]
             dev_sync_auto: None,
@@ -376,6 +413,14 @@ impl AppShell {
             dev_sync_auto_deferred: false,
             #[cfg(feature = "dev-sync")]
             dev_sync_auto_edit_seq: 0,
+            #[cfg(feature = "dev-sync")]
+            attachment: None,
+            #[cfg(feature = "dev-sync")]
+            pending_focus_attachment: false,
+            #[cfg(feature = "dev-sync")]
+            attachment_error: None,
+            #[cfg(feature = "dev-sync")]
+            attachment_notice: None,
         };
         shell.refresh_tree();
         if let Some(index) = shell.tree.iter().position(TreeEntry::is_note) {
@@ -409,12 +454,14 @@ impl AppShell {
     ) -> Self {
         let crate::dev_sync::gate::DevSyncConfig {
             vault: vault_path,
+            relay_mode,
             service,
         } = dev_sync;
         eprintln!(
-            "[menghunote] dev-sync 已启用（自动同步）：vault = {}，relay = {}（DEV ONLY / localhost）",
+            "[menghunote] dev-sync 已启用（自动同步）：vault = {}，relay = {}，模式 = {}",
             vault_path.display(),
-            service.relay
+            service.relay,
+            relay_mode.as_str()
         );
         let service = crate::dev_sync::service::SyncService::new_dev_local(service, vault_path);
         let auto = crate::dev_sync::AutoSync::with_system_clock(std::time::Instant::now());
@@ -434,12 +481,14 @@ impl AppShell {
     ) -> Self {
         let crate::dev_sync::gate::DevSyncConfig {
             vault: vault_path,
+            relay_mode,
             service,
         } = dev_sync;
         eprintln!(
-            "[menghunote] dev-sync 已启用：vault = {}，relay = {}（DEV ONLY / 非生产 / localhost）",
+            "[menghunote] dev-sync 已启用：vault = {}，relay = {}，模式 = {}",
             vault_path.display(),
-            service.relay
+            service.relay,
+            relay_mode.as_str()
         );
         // 切片 4c-2：生产 runner —— 同步在 worker 线程里真实执行
         // （自己的 `Vault` 连接 + 第一次同步时解封身份）；UI 线程不碰网络/Argon2。
@@ -506,10 +555,24 @@ impl AppShell {
                     crate::dev_sync::panel::DevSyncPanelEvent::PublishRequested => {
                         shell.dev_sync_publish_requested = true;
                     }
+                    // 切片 6b：面板只登记请求（含恢复码/revoke 列表），这里只置标记；
+                    // 持闸与派发在 `dev_sync_pump` 里（同一时刻只允许一条持闸任务）。
+                    crate::dev_sync::panel::DevSyncPanelEvent::RotateRequested => {
+                        shell.dev_sync_rotate_requested = true;
+                    }
+                    crate::dev_sync::panel::DevSyncPanelEvent::ApplyEpochRequested => {
+                        shell.dev_sync_apply_requested = true;
+                    }
                 }
                 cx.notify();
             },
         );
+        // 切片 6b：把"当前有没有活动文档"这个宿主事实写给面板（轮换/apply 按钮的硬
+        // 前置）。构造顺序里 `open_entry` 早于面板创建，所以这里补一次初始投影。
+        let has_active_document = shell.active.is_some();
+        panel.update(cx, |panel, _cx| {
+            panel.set_active_document(has_active_document);
+        });
         shell.dev_sync = Some(panel);
         shell.dev_sync_subscription = Some(subscription);
         // ADR 0012 S3：启动合并一次（只有 durable outbox/inbox 有待办才排队）。
@@ -1002,6 +1065,10 @@ impl AppShell {
             }
         }
 
+        // 切片 6b：删掉的若是当前打开的笔记，`active` 已经清空——面板的轮换/apply
+        // 前置条件必须跟着变（否则按钮还显示可用，点了才被拒）。
+        #[cfg(feature = "dev-sync")]
+        self.dev_sync_push_active_document(cx);
         let deleted = self
             .write_structure("删除笔记", |writer| {
                 writer.doc().delete_note(&entry.node_id, now_millis())?;
@@ -1252,6 +1319,9 @@ impl AppShell {
         self.notice = None;
         // 3) 切换完成后刷新侧栏（投影表在 commit 之后才是准的）。
         self.refresh_tree();
+        // 切片 6b：活动文档变了（轮换/apply 的前置条件）。
+        #[cfg(feature = "dev-sync")]
+        self.dev_sync_push_active_document(cx);
         cx.notify();
     }
 
@@ -1484,6 +1554,11 @@ impl AppShell {
                         .text_color(theme::caret_color())
                         .child(SharedString::from(error))
                 }))
+            })
+            // 附件插入（dev-sync 构建）：默认构建里 `render_attachment_block` 恒 `None`，
+            // 布局/行为零变化。
+            .when_some(self.render_attachment_block(cx), |this, block| {
+                this.child(block)
             })
             .child(
                 div()
@@ -1852,6 +1927,9 @@ impl AppShell {
                 pumped
             });
         }
+        // 0b) 切片 6b：把"有没有活动文档"这个宿主事实同步给面板（轮换/apply 的硬前置）。
+        //     每拍都写一次是幂等的（`set_active_document` 不变就不通知），不引入轮询。
+        self.dev_sync_push_active_document(cx);
         // 1) 面板只发请求：真正的"先持闸、再派发"在这里（见 dev_sync::sync_once）。
         if std::mem::take(&mut self.dev_sync_requested) {
             // 失败原因已经写进面板/报告；这里只关心"有没有变化"。
@@ -1861,6 +1939,41 @@ impl AppShell {
         if std::mem::take(&mut self.dev_sync_publish_requested) {
             // 同一套持闸状态机，只换 worker 命令与报告种类（切片 4c-4）。
             let _ = self.dev_sync_publish_baseline(cx);
+            changed = true;
+        }
+        // 1b) 切片 6b：轮换 / 应用新 epoch 的确认请求。面板把恢复码/revoke 列表留在
+        //     自己的 `pending_rotate_request` 里（事件不带秘密），这里取走并派发。
+        if std::mem::take(&mut self.dev_sync_rotate_requested) {
+            let request = self
+                .dev_sync
+                .clone()
+                .and_then(|panel| panel.update(cx, |panel, _cx| panel.take_rotate_request()));
+            match request {
+                Some(request) => {
+                    // 拒绝原因由 `dev_sync_start_gated` 写进面板（不吞、不 panic）。
+                    let _ = self.dev_sync_start_gated(
+                        crate::dev_sync::GatedTask::Rotate,
+                        Some(request),
+                        cx,
+                    );
+                    changed = true;
+                }
+                None => {
+                    // 面板没有登记请求（重复事件/已被消费）：绝不派发空轮换（那会丢掉
+                    // 恢复码选项、变成"意外不补发"）。
+                    if let Some(panel) = self.dev_sync.clone() {
+                        panel.update(cx, |panel, _cx| {
+                            panel.set_notice(
+                                "轮换未派发：面板没有登记请求（请重新点击「轮换密钥…」）",
+                            );
+                        });
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if std::mem::take(&mut self.dev_sync_apply_requested) {
+            let _ = self.dev_sync_apply_epoch(cx);
             changed = true;
         }
         // 2) 持闸同步推进（gate + service 事件都在这一步收敛）。
@@ -1917,6 +2030,22 @@ impl AppShell {
             .is_some_and(|state| state.task == crate::dev_sync::GatedTask::PublishBaseline)
     }
 
+    /// 轮换 / 应用新 epoch 是否在途（测试收敛判据；切片 6a）。
+    #[must_use]
+    pub fn dev_sync_rotation_in_progress(&self) -> bool {
+        self.dev_sync_sync
+            .as_ref()
+            .is_some_and(|state| state.task.is_rotation())
+    }
+
+    /// 最近一次轮换 / apply 的报告（成功或失败都保留；切片 6a）。
+    #[must_use]
+    pub fn dev_sync_last_rotation(&self) -> Option<&crate::dev_sync::SyncOnceReport> {
+        self.dev_sync_last_report
+            .as_ref()
+            .filter(|report| report.task.is_rotation())
+    }
+
     // ---- ADR 0012 S3：自动同步接线（调度/状态 UX/重启恢复/跨操作续批）----
 
     /// 自动同步接线的只读投影（`None` = dev-sync 未启用）。
@@ -1942,11 +2071,32 @@ impl AppShell {
 
     /// 「需要处理」行文案（selector `sync-status-error`；`None` = 不渲染）。
     ///
-    /// 只有"需要人工处理 / 交付失败仍持有闸门"才出现：普通退避与每轮成功都不打扰。
+    /// 只有"需要人工处理 / 安全暂停 / 交付失败仍持有闸门"才出现：普通退避与每轮
+    /// 成功都不打扰。
     #[must_use]
     pub fn dev_sync_status_error_line(&self) -> Option<String> {
         let auto = self.dev_sync_auto.as_ref()?;
         auto.status().error_line()
+    }
+
+    /// 当前安全暂停的脱敏类别（设置页「错误类别」用；`None` = 没有安全暂停）。
+    #[must_use]
+    pub fn dev_sync_security_category(&self) -> Option<crate::dev_sync::SecurityCategory> {
+        self.dev_sync_auto
+            .as_ref()
+            .and_then(crate::dev_sync::AutoSync::security_category)
+    }
+
+    /// 读取本实例 durable `sync.control_pin`（设置页安全指纹的唯一来源；**只读**）。
+    ///
+    /// `Ok(None)` = 从未建立（未建立信任），`Err` = 损坏/绑定不符（**不是**没有 pin）。
+    #[cfg(feature = "dev-sync")]
+    pub fn dev_sync_control_pin(
+        &self,
+        vault_id: [u8; 16],
+    ) -> Result<Option<menghunote_sync::control_pin::PinV1>, menghunote_sync::error::SyncError>
+    {
+        menghunote_sync::control_pin::load_control_pin(&self.vault, vault_id)
     }
 
     /// 当前这一轮的来源（`None` = 没有登记过在途轮）。
@@ -2376,7 +2526,50 @@ impl AppShell {
     /// 额外前置条件：本机身份必须有管理密钥（Join 设备不能发布）。面板按钮已置灰，这里
     /// 再兜一次；权威判定在 worker（它重新读身份）。
     pub fn dev_sync_publish_baseline(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        self.dev_sync_start_gated(crate::dev_sync::GatedTask::PublishBaseline, cx)
+        self.dev_sync_start_gated(crate::dev_sync::GatedTask::PublishBaseline, None, cx)
+    }
+
+    /// A 侧**轮换密钥**（ADR 0009 Phase 2 切片 6a；dev-sync feature）。
+    ///
+    /// 仅供测试与 6b 的设备列表按钮调用：**不做**独立按钮、不自动轮换、不自动重试。
+    /// `recovery_code` 是当前管理恢复码（`None` = 不补发；轮换后新设备无法用恢复码加入，
+    /// 报告/面板会明确警告）。没有 revoke 列表时用本方法；需要一并吊销设备时用
+    /// [`Self::dev_sync_rotate_revoking`]。
+    ///
+    /// 顺序：面板/服务可用、无在途 → 活动文档 `begin_external_commit` 到 `Held` →
+    /// 派发 `Command::Rotate`（整段持闸）→ worker 完成后 `prepare/adopt/end` →
+    /// **重建活动视图**（新 `EditorView`/`SessionDriver` 用新 epoch）→ 刷新树/状态。
+    /// 失败保持旧身份/旧视图，错误原文写进面板。
+    pub fn dev_sync_rotate(
+        &mut self,
+        recovery_code: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.dev_sync_rotate_revoking(recovery_code, Vec::new(), cx)
+    }
+
+    /// 同 [`Self::dev_sync_rotate`]，并附带本次 signed revoke 列表（ADR 0010 的轮换入口，
+    /// 供测试/6b 的设备列表按钮；不在本片做 UI）。
+    pub fn dev_sync_rotate_revoking(
+        &mut self,
+        recovery_code: Option<String>,
+        revoke: Vec<menghunote_sync::DeviceId>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let request = crate::dev_sync::RotateRequest::new(recovery_code, revoke);
+        self.dev_sync_start_gated(crate::dev_sync::GatedTask::Rotate, Some(request), cx)
+    }
+
+    /// B 侧**应用 relay 最新 epoch**（ADR 0009 Phase 2 切片 6a；dev-sync feature）。
+    ///
+    /// 与轮换共用同一条持闸状态机：活动文档冻结到 durable → 派发 `Command::ApplyEpoch`
+    /// → worker 认证 activation 链 + 本机 grant 解根 + 基线 merge/推广 → UI 交付/解闸 →
+    /// 重建活动视图并切换 `SyncContext.key_epoch`。
+    ///
+    /// 本机不在本次 grant 列表（被移除/吊销）时 worker 明确拒绝：身份与视图保持旧
+    /// epoch，**不半推广**。
+    pub fn dev_sync_apply_epoch(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        self.dev_sync_start_gated(crate::dev_sync::GatedTask::ApplyEpoch, None, cx)
     }
 
     /// 持闸任务的公共启动路径：登记闸门 → 第一拍推进（不阻塞 UI）。
@@ -2391,6 +2584,7 @@ impl AppShell {
     fn dev_sync_start_gated(
         &mut self,
         task: crate::dev_sync::GatedTask,
+        rotation: Option<crate::dev_sync::RotateRequest>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let label = task.label();
@@ -2487,26 +2681,43 @@ impl AppShell {
             self.dev_sync_panel_task_state(cx, task, true, line, Some(message.clone()));
             return Err(message);
         }
-        // 1b) 发布基线需要管理密钥：面板按钮已置灰，这里再兜一次（权威判定在 worker）。
+        // 1b) 发布基线/轮换需要管理密钥：面板按钮已置灰，这里再兜一次（权威判定在 worker）。
         //     只在 worker 已经上报过身份时提前拒绝；否则交给 worker 给真正原因。
-        if task == crate::dev_sync::GatedTask::PublishBaseline
-            && snapshot.self_device.is_some()
+        if matches!(
+            task,
+            crate::dev_sync::GatedTask::PublishBaseline | crate::dev_sync::GatedTask::Rotate
+        ) && snapshot.self_device.is_some()
             && !snapshot.can_manage_devices
         {
-            let message =
-                "发布基线被拒绝：本机没有管理密钥（Join 设备）；请用 Create 设备发布".to_owned();
+            let message = match task {
+                crate::dev_sync::GatedTask::Rotate => {
+                    "轮换被拒绝：本机没有管理密钥（Join 设备）；请用 Create 设备/管理设备发起"
+                        .to_owned()
+                }
+                _ => {
+                    "发布基线被拒绝：本机没有管理密钥（Join 设备）；请用 Create 设备发布".to_owned()
+                }
+            };
             self.dev_sync_panel_task_state(cx, task, false, "没有管理密钥", Some(message.clone()));
             return Err(message);
         }
         // 2) 没有活动文档：同步走无会话路径（空库/还没打开笔记也能拿到远端结构与正文）；
-        //    发布必须有活动文档（它读 durable 快照，先持闸 flush）。
+        //    发布基线/轮换/应用 epoch 必须有活动文档——它们要在活动文档上持闸冻结写入，
+        //    没有会话就没有闸门目标（无会话路径没有 `HeldGate` 证明，轮换不得降级）。
         let Some(active) = self.active.as_ref() else {
             if task == crate::dev_sync::GatedTask::SyncOnce {
                 return self.dev_sync_dispatch_no_session(cx, &service);
             }
-            let message = "发布基线失败：当前没有打开的笔记（发布需要先在活动文档上持闸；\
+            let message = if task.is_rotation() {
+                format!(
+                    "{label}被拒绝：当前没有打开的笔记；{label}需要先在活动文档上持闸冻结\
+                     （请先打开一篇笔记再试）"
+                )
+            } else {
+                "发布基线失败：当前没有打开的笔记（发布需要先在活动文档上持闸；\
                  请先打开一篇笔记）"
-                .to_owned();
+                    .to_owned()
+            };
             self.dev_sync_panel_task_state(cx, task, false, "没有活动文档", Some(message.clone()));
             return Err(message);
         };
@@ -2526,18 +2737,27 @@ impl AppShell {
                 return Err(message);
             }
         };
-        self.dev_sync_sync = Some(crate::dev_sync::ActiveSyncOnce::new(
+        let mut state = crate::dev_sync::ActiveSyncOnce::new(
             task,
             doc_id.clone(),
             view,
             ticket,
             structure_base_seq,
-        ));
+        );
+        if let Some(rotation) = rotation {
+            state = state.with_rotate(rotation);
+        }
+        self.dev_sync_sync = Some(state);
+        let waiting = if task.is_rotation() {
+            format!("{}中（等待持闸，{doc_id}）", task.short_label())
+        } else {
+            format!("等待持闸（{doc_id}）")
+        };
         self.dev_sync_panel_task_state(
             cx,
             task,
             true,
-            format!("等待持闸（{doc_id}）"),
+            waiting,
             Some(format!("{}：已提交持闸请求，等待落盘", task.short_label())),
         );
         // 5) 第一拍：没有脏数据时直接就 Held 并派发；否则等下一帧继续 poll。
@@ -2650,6 +2870,10 @@ impl AppShell {
             if *completed_op == op_id {
                 if let Some(state) = self.dev_sync_sync.as_mut() {
                     state.worker_settled = true;
+                    state.rotation_facts = snapshot
+                        .last_rotation
+                        .clone()
+                        .filter(|_| snapshot.last_rotation_op == Some(op_id));
                 }
                 return match result.clone() {
                     crate::dev_sync::OpResult::Ok { summary } => {
@@ -3681,6 +3905,29 @@ impl AppShell {
         else {
             return false;
         };
+        // 命令从在途状态构造（轮换要带恢复码/revoke；同步/发布是无参命令）。
+        let Some(command) = self
+            .dev_sync_sync
+            .as_ref()
+            .and_then(crate::dev_sync::ActiveSyncOnce::pending_command)
+        else {
+            // 参数缺失是内部错误：绝不能盲派发（会退化成一条无参数的轮换）。
+            self.dev_sync_sync = None;
+            self.dev_sync_finish_report(
+                cx,
+                ReportParts {
+                    task,
+                    doc_id: Some(doc_id),
+                    error: Some(format!(
+                        "{}失败：在途任务缺少派发参数（内部错误，未派发任何命令）",
+                        task.short_label()
+                    )),
+                    ..ReportParts::default()
+                }
+                .report(),
+            );
+            return true;
+        };
         match view.update(cx, |view, cx| view.dev_sync_poll_external(&ticket, cx)) {
             GateState::WaitingIME | GateState::Flushing => {
                 // 等 IME 自然结束 / flush 到明确 durable：不改状态，下一帧继续 poll。
@@ -3701,8 +3948,8 @@ impl AppShell {
                     lease.durable_head_seq(),
                     lease.generation().0,
                 );
-                // 发布基线也走这条路径：命令不同，持闸证明完全相同（切片 4c-4）。
-                match service.try_command_with_gate(task.command(), gate) {
+                // 发布基线/轮换/apply 也走这条路径：命令不同，持闸证明完全相同。
+                match service.try_command_with_gate(command, gate) {
                     Ok(op_id) => {
                         if let Some(state) = self.dev_sync_sync.as_mut() {
                             state.lease = Some(lease);
@@ -3859,6 +4106,12 @@ impl AppShell {
                 // 真实 `Completed` = worker 已结束本轮外部写：这是允许解闸的可靠回执。
                 if let Some(state) = self.dev_sync_sync.as_mut() {
                     state.worker_settled = true;
+                    // 轮换/apply 的公开事实（事件先于 Completed 入状态）：只接受**本次 op**
+                    // 的事实，避免把上一轮成功轮换的 epoch 当成这一轮的结果。
+                    state.rotation_facts = snapshot
+                        .last_rotation
+                        .clone()
+                        .filter(|_| snapshot.last_rotation_op == Some(op_id));
                 }
                 return match result.clone() {
                     crate::dev_sync::OpResult::Ok { summary } => {
@@ -4085,15 +4338,66 @@ impl AppShell {
             return true;
         }
 
-        // 5) 结构树：只有结构 head 真的变了才重放 + 重投影 + 刷新侧栏（不假刷新）。
+        // 5) 轮换/apply 成功（切片 6a）：先把 `SyncContext.key_epoch` 切到新 epoch，
+        //    再按需重投影结构，最后重建活动视图。
+        //
+        //    顺序理由：新视图的 `SessionDriver`/结构写入都从 `self.sync` 取 epoch；先换
+        //    epoch 才不会让重开后的第一次 flush 写出旧 epoch 的 intent。视图重建放在
+        //    结构重投影之后，才能按最新树定位同一篇笔记。
+        let succeeded = matches!(&finish, SyncOnceFinish::Ok(_));
+        let rotation_facts = state.rotation_facts.clone();
+        let mut rotation_advanced = false;
+        let mut rotation_error: Option<String> = None;
+        if state.task.is_rotation() && succeeded {
+            match &rotation_facts {
+                Some(facts) => {
+                    if let Some(to_epoch) = facts.to_epoch {
+                        if let Some(context) = self.sync {
+                            self.sync = Some(SyncContext::new(context.peer_id, to_epoch));
+                        }
+                    } else {
+                        rotation_error = Some(format!(
+                            "{}已完成但没有拿到新 epoch（内部错误）：保持旧视图，请重启实例",
+                            state.task.short_label()
+                        ));
+                    }
+                    rotation_advanced = facts.advanced();
+                }
+                None => {
+                    rotation_error = Some(format!(
+                        "{}已完成但缺少公开事实（内部错误）：保持旧视图，请重启实例",
+                        state.task.short_label()
+                    ));
+                }
+            }
+        }
+
+        // 6) 结构树：只有结构 head 真的变了才重放 + 重投影 + 刷新侧栏（不假刷新）。
         let structure_refreshed =
             self.dev_sync_refresh_structure_if_needed(cx, state.structure_base_seq);
 
-        // 6) 最终报告 + 面板文案。
-        let (error, worker_summary) = match finish {
+        // 7) 重建活动视图（旧 `EditorView`/`SessionDriver` 属于旧 epoch；新意图必须带新
+        //    epoch）。失败不吞：身份已推广，必须如实报告（旧视图已关闭，请重开/重启）。
+        if rotation_advanced && rotation_error.is_none() {
+            if let Err(error) = self.dev_sync_rebuild_after_rotation(cx, &doc_id) {
+                rotation_error = Some(format!(
+                    "{}已完成（epoch 已切换），但重建活动视图失败：{error}",
+                    state.task.short_label()
+                ));
+            }
+        }
+
+        // 8) 最终报告 + 面板文案。
+        let (mut error, worker_summary) = match finish {
             SyncOnceFinish::Ok(summary) => (None, Some(summary)),
             SyncOnceFinish::Failed(message) => (Some(message), None),
         };
+        if let Some(rotation_error) = rotation_error {
+            error = Some(match error {
+                Some(message) => format!("{message}；{rotation_error}"),
+                None => rotation_error,
+            });
+        }
         self.dev_sync_finish_report(
             cx,
             ReportParts {
@@ -4104,11 +4408,80 @@ impl AppShell {
                 worker_summary,
                 error,
                 structure_refreshed,
+                rotation: rotation_facts,
                 ..ReportParts::default()
             }
             .report(),
         );
         true
+    }
+
+    /// 轮换/apply 成功后重建活动视图：关掉旧 `EditorView`/`SessionDriver`，用**新身份
+    /// epoch/root** 重新 `open_entry`，让新意图（正文 flush + 结构提交）带新 epoch。
+    ///
+    /// 只在 worker 成功、闸门已释放、`self.sync.key_epoch` 已切到新 epoch 后调用。
+    ///
+    /// 失败语义：不再回退旧视图（旧 session 属于旧 epoch，回退就等于让新写入用旧根），
+    /// 直接关掉它并明确报错（调用方把错误写进报告/面板）；用户可重新打开笔记或重启实例。
+    fn dev_sync_rebuild_after_rotation(
+        &mut self,
+        cx: &mut Context<Self>,
+        doc_id: &str,
+    ) -> Result<(), String> {
+        let Some(old) = self.active.take() else {
+            // 没有活动视图就没有"用新 epoch 重开"的对象（本片轮换要求有活动文档）。
+            return Ok(());
+        };
+        let old_node = old.node_id.clone();
+        // 优先按 node_id 找回同一篇；树被重投影后 node 仍在，但 body doc id 是兜底。
+        let index = self
+            .tree
+            .iter()
+            .position(|entry| entry.node_id == old_node)
+            .or_else(|| {
+                self.tree
+                    .iter()
+                    .position(|entry| entry.body_doc_id.as_deref() == Some(doc_id))
+            })
+            .or_else(|| self.tree.iter().position(TreeEntry::is_note));
+        let Some(index) = index else {
+            let report = old
+                .view
+                .update(cx, |view, _| view.drain_and_close(SWITCH_CLOSE_TIMEOUT));
+            eprintln!(
+                "[menghunote] 轮换后结构树里没有可重开的笔记：已关闭旧 epoch 视图（durable={} timed_out={}）",
+                report.durable.is_some(),
+                report.timed_out
+            );
+            self.refresh_tree();
+            return Err("结构树里没有可重新打开的笔记（旧 epoch 视图已关闭）".to_owned());
+        };
+        let expected_node = self.tree[index].node_id.clone();
+        // `self.active` 已是 None：`open_entry` 不会去排空旧视图（我们自己关）。
+        self.selected_node_id = Some(expected_node.clone());
+        self.open_entry(index, cx);
+        // 旧视图代表旧 epoch：无论如何都要关掉（它没有未落盘的本地编辑——闸门在 Held
+        // 之前已经 flush 到 durable，end 也只补 Held 期间的新行）。
+        let report = old
+            .view
+            .update(cx, |view, _| view.drain_and_close(SWITCH_CLOSE_TIMEOUT));
+        if report.timed_out {
+            eprintln!(
+                "[menghunote] 轮换后关闭旧视图超时（durable={}）：旧 epoch session 可能仍有后台任务",
+                report.durable.is_some()
+            );
+        }
+        if self.active.as_ref().is_some_and(|active| {
+            active.node_id == expected_node && active.view.read(cx).dev_sync_doc_id() == doc_id
+        }) {
+            eprintln!(
+                "[menghunote] 轮换后已重建活动视图（新 epoch；node={expected_node} doc={doc_id}）"
+            );
+            Ok(())
+        } else {
+            self.refresh_tree();
+            Err("重新打开活动文档失败（旧 epoch 视图已关闭；详见 stderr）".to_owned())
+        }
     }
 
     /// 无会话同步的收尾（没有活动文档）：重投影结构树 → 自动打开第一篇。
@@ -4200,6 +4573,10 @@ impl AppShell {
                 "完成（无会话同步）".to_owned()
             } else if task == crate::dev_sync::GatedTask::PublishBaseline {
                 "初始基线已发布".to_owned()
+            } else if task == crate::dev_sync::GatedTask::Rotate {
+                "轮换完成（epoch 已切换）".to_owned()
+            } else if task == crate::dev_sync::GatedTask::ApplyEpoch {
+                "已应用新 epoch".to_owned()
             } else {
                 format!("完成（{} 条变化）", report.changes)
             }
@@ -4279,6 +4656,23 @@ impl AppShell {
             .map(|panel| panel.read(cx).service().clone())
     }
 
+    /// 把"当前有没有活动文档"这个宿主事实写给面板（切片 6b）。
+    ///
+    /// 轮换/应用新 epoch 都必须先在一篇**活动文档**上持闸冻结；面板只有知道这个事实，
+    /// 才能在按钮上提前给原因（而不是让用户点完才被 worker 拒绝）。写在三点：
+    /// 构造期（`open_entry` 早于面板）、打开/删除文档后、以及每次泵。
+    fn dev_sync_push_active_document(&self, cx: &mut Context<Self>) {
+        let Some(panel) = self.dev_sync.clone() else {
+            return;
+        };
+        let has_active = self.active.is_some();
+        panel.update(cx, |panel, cx| {
+            if panel.set_active_document(has_active) {
+                cx.notify();
+            }
+        });
+    }
+
     /// 写面板的「同步行 + 最近操作」（只在 tick 上下文调用，不能在面板事件回调里调用）。
     fn dev_sync_panel_state(
         &mut self,
@@ -4318,6 +4712,10 @@ impl AppShell {
                 }
                 crate::dev_sync::GatedTask::SyncOnce => panel.set_sync_state(busy, line),
                 crate::dev_sync::GatedTask::PublishBaseline => panel.set_publish_state(busy, line),
+                crate::dev_sync::GatedTask::Rotate => panel.set_rotate_state(busy, line),
+                crate::dev_sync::GatedTask::ApplyEpoch => {
+                    panel.set_apply_epoch_state(busy, line);
+                }
             }
             if let Some(notice) = notice {
                 panel.set_notice(notice);
@@ -4349,6 +4747,8 @@ impl AppShell {
                     || shell.dev_sync_sync.is_some()
                     || shell.dev_sync_requested
                     || shell.dev_sync_publish_requested
+                    || shell.dev_sync_rotate_requested
+                    || shell.dev_sync_apply_requested
                 {
                     shell.dev_sync_pump(cx);
                 }
@@ -4381,6 +4781,421 @@ impl AppShell {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 附件插入（dev-sync 构建）：本地文件 → `assets`（内容寻址）+ `asset_refs` + 正文链接
+// ---------------------------------------------------------------------------
+//
+// 位置：侧栏底部（按钮放在面板/状态行之上、固定按钮行的上方）。为什么不在编辑器
+// 区域顶部：`editor-pane` 的左上角是既有 headless 测试点击"聚焦正文"的坐标，插一条
+// 工具栏会让那些点击落到工具栏上（回归）。侧栏底部不占编辑器命中区。
+//
+// 可见性：与 dev-sync 面板同一道门禁（`--features dev-sync` + 运行时 gate）。默认构建
+// 里整个模块/状态/渲染分支都不存在。
+#[cfg(feature = "dev-sync")]
+impl AppShell {
+    /// 新建一个路径输入框（打开条与"插入成功后清空"各建一次；旧实体随 `drop` 释放）。
+    fn new_attachment_input(cx: &mut Context<Self>) -> (Entity<RenameInput>, gpui::Subscription) {
+        let input = cx.new(|cx| RenameInput::new("", cx));
+        let events = cx.subscribe(
+            &input,
+            |shell, _input, event: &RenameEvent, cx| match event {
+                RenameEvent::Commit(path) => shell.attachment_submit_path(path, cx),
+                RenameEvent::Blank => {
+                    shell.attachment_error =
+                        Some(crate::attachment::AttachmentError::EmptyPath.to_string());
+                    shell.attachment_notice = None;
+                    cx.notify();
+                }
+                RenameEvent::Cancel => shell.attachment_cancel(cx),
+            },
+        );
+        (input, events)
+    }
+
+    /// 附件插入条是否展开（headless 断言用）。
+    #[must_use]
+    pub fn attachment_is_open(&self) -> bool {
+        self.attachment.is_some()
+    }
+
+    /// `attachment-error` 行当前会显示什么（`None` = 不显示）。
+    #[must_use]
+    pub fn attachment_error_text(&self) -> Option<&str> {
+        self.attachment_error.as_deref()
+    }
+
+    /// `attachment-notice` 行当前会显示什么（`None` = 不显示）。
+    #[must_use]
+    pub fn attachment_notice_text(&self) -> Option<&str> {
+        self.attachment_notice.as_deref()
+    }
+
+    /// 当前插入被禁用的原因（`None` = 可以插入）。
+    ///
+    /// 三条硬前置：
+    /// 1. 必须有**打开的笔记**（没有视图就没有光标/没有 note_id）；
+    /// 2. 编辑器不能处于**同步持闸**（Held）：那是当前唯一的"只读"窗口期，插入会写入
+    ///    正文 + `asset_refs`，必须整段拒绝；
+    /// 3. 结构投影里这个节点必须有 `note_id`（否则 `asset_refs` 没有 note 可挂）。
+    #[must_use]
+    pub fn attachment_disabled_reason(&self, cx: &App) -> Option<String> {
+        let Some(active) = self.active.as_ref() else {
+            return Some(crate::attachment::AttachmentError::NoActiveNote.to_string());
+        };
+        if active.view.read(cx).is_sync_held() {
+            return Some("同步持闸中，暂不能插入附件（同步结束后再试）".to_owned());
+        }
+        if self.note_id_of(&active.node_id).is_none() {
+            return Some(crate::attachment::AttachmentError::MissingNoteId.to_string());
+        }
+        None
+    }
+
+    /// 活动节点的 `note_id`（结构投影里取；目录返回 `None`）。
+    fn note_id_of(&self, node_id: &str) -> Option<String> {
+        self.tree
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .and_then(|entry| entry.note_id.clone())
+    }
+
+    /// 展开/收起附件插入条（`None` → 新建输入框并下一帧聚焦）。
+    pub fn attachment_toggle(&mut self, cx: &mut Context<Self>) {
+        if self.attachment.is_some() {
+            self.attachment_cancel(cx);
+            return;
+        }
+        let (input, events) = Self::new_attachment_input(cx);
+        self.attachment = Some(AttachmentUi {
+            input,
+            _events: events,
+        });
+        self.attachment_error = None;
+        self.attachment_notice = None;
+        self.pending_focus_attachment = true;
+        cx.notify();
+    }
+
+    /// 取消（`Esc` / 「取消」按钮）：收起输入，丢弃错误/提示。
+    pub fn attachment_cancel(&mut self, cx: &mut Context<Self>) {
+        self.attachment = None;
+        self.attachment_error = None;
+        self.attachment_notice = None;
+        cx.notify();
+    }
+
+    /// 提交一条路径（等价于输入框回车；headless 测试也直接调它）。
+    ///
+    /// 语义：先读文件并校验（**任何写入之前**），再落资产 + 引用，最后走编辑器事务。
+    /// 编辑器事务失败时回滚引用；资产保留（内容寻址、无副作用），并明确报告。
+    pub fn attachment_submit_path(&mut self, raw_path: &str, cx: &mut Context<Self>) {
+        match self.attachment_insert(raw_path, cx) {
+            Ok(outcome) => {
+                eprintln!(
+                    "[menghunote] 附件已插入：hash={} 字节={} 引用起点={}（{}）",
+                    short_hash(&outcome.asset_hash),
+                    outcome.byte_len,
+                    outcome.start_byte,
+                    if outcome.asset_preexisting {
+                        "复用已有资产"
+                    } else {
+                        "新资产"
+                    }
+                );
+                self.attachment_error = None;
+                self.attachment_notice = Some(format!(
+                    "已插入附件：{}（{} 字节）",
+                    outcome.file_name, outcome.byte_len
+                ));
+                // 清空输入，方便连续插入下一个（同时把焦点还给它）。
+                let (input, events) = Self::new_attachment_input(cx);
+                self.attachment = Some(AttachmentUi {
+                    input,
+                    _events: events,
+                });
+                self.pending_focus_attachment = true;
+            }
+            Err(error) => {
+                // 约束：日志只写类别与文案（不含绝对路径/文件名）。
+                eprintln!("[menghunote] 附件插入失败：{}（{error}）", error.category());
+                self.attachment_error = Some(error.to_string());
+                self.attachment_notice = None;
+                // 错误行常驻渲染（不依赖条是否展开），所以这里不擅自展开输入框：
+                // 没有活动笔记/持闸时那条路径本来也不能用。
+            }
+        }
+        cx.notify();
+    }
+
+    /// 真正的插入：读文件 → 落库 → 编辑器事务（失败回滚引用）。
+    fn attachment_insert(
+        &mut self,
+        raw_path: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::attachment::AttachmentOutcome, crate::attachment::AttachmentError> {
+        use crate::attachment::{
+            rollback_attachment_ref, store_attachment, AttachmentError, AttachmentOutcome,
+        };
+        // 1) 读文件 + 全部校验（失败时没有任何写入）。
+        let pending = crate::attachment::read_attachment(raw_path)?;
+        // 2) 活动笔记 + 光标偏移（持闸/组合中在这一步就失败，同样没有写入）。
+        let (node_id, view) = {
+            let active = self.active.as_ref().ok_or(AttachmentError::NoActiveNote)?;
+            (active.node_id.clone(), active.view.clone())
+        };
+        let note_id = self
+            .note_id_of(&node_id)
+            .ok_or(AttachmentError::MissingNoteId)?;
+        let start_byte = view
+            .update(cx, |view, _cx| view.attachment_insert_offset())
+            .map_err(AttachmentError::Editor)?;
+        let body_seq = view.read(cx).dev_sync_durable_head_seq();
+        // 3) 资产 + 引用（内容寻址；重复插入幂等）。
+        let outcome =
+            store_attachment(&self.vault, &note_id, body_seq, start_byte as u64, &pending)?;
+        // 4) 编辑器事务：一次请求 = 一个撤销单元。
+        match view.update(cx, |view, cx| {
+            view.insert_attachment_markdown(&pending.markdown, cx)
+        }) {
+            Ok(offset) => {
+                if offset != start_byte {
+                    // 同一 tick 内不应发生；保守修正，避免 `asset_refs.start_byte` 指错。
+                    eprintln!(
+                        "[menghunote] 附件插入点与预算偏移不同（预算 {start_byte} / 实际 {offset}）：修正引用"
+                    );
+                    let _ = rollback_attachment_ref(
+                        &self.vault,
+                        &note_id,
+                        &pending.asset_hash,
+                        start_byte as u64,
+                    );
+                    menghunote_storage::link_asset_ref(
+                        &self.vault,
+                        &note_id,
+                        &pending.asset_hash,
+                        offset as u64,
+                        body_seq,
+                    )?;
+                }
+                Ok(AttachmentOutcome {
+                    start_byte: offset as u64,
+                    ..outcome
+                })
+            }
+            Err(reason) => {
+                // 回滚引用；资产保留（内容寻址，删了反而要重算）。
+                let _ = rollback_attachment_ref(
+                    &self.vault,
+                    &note_id,
+                    &pending.asset_hash,
+                    start_byte as u64,
+                );
+                Err(AttachmentError::Editor(reason))
+            }
+        }
+    }
+
+    /// 侧栏底部的附件插入条（`None` = 不渲染；默认构建恒 `None`）。
+    fn render_attachment_block(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let disabled = self.attachment_disabled_reason(cx);
+        let dimmed = disabled.is_some();
+        let open = self.attachment.is_some();
+        let button_label = if open {
+            "附件：收起"
+        } else {
+            "插入附件…"
+        };
+        let block =
+            div()
+                .w_full()
+                .border_t(px(1.0))
+                .border_color(theme::sidebar_border())
+                .px_2()
+                .py_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .id("attachment-insert")
+                        .debug_selector(|| "attachment-insert".to_string())
+                        .h(px(22.0))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme::input_border())
+                        .bg(theme::input_bg())
+                        .text_size(px(12.0))
+                        .text_color(if dimmed {
+                            theme::status_bar_text()
+                        } else {
+                            theme::text_color()
+                        })
+                        .when(dimmed, |this| this.opacity(0.6))
+                        .child(SharedString::from(button_label))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                // 禁用态也可点：点它要给出**明确原因**（与面板同一风格），
+                                // 而不是静默无反应。
+                                if let Some(reason) = shell.attachment_disabled_reason(cx) {
+                                    // 不展开输入：错误行本身就在按钮下方常驻渲染，展开只会
+                                    // 多一个不可用的路径框。
+                                    shell.attachment_error = Some(reason);
+                                    shell.attachment_notice = None;
+                                    cx.notify();
+                                    return;
+                                }
+                                shell.attachment_toggle(cx);
+                            }),
+                        ),
+                )
+                .when_some(disabled, |this, reason| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "attachment-hint".to_string())
+                            .w_full()
+                            .text_size(px(10.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(reason)),
+                    )
+                })
+                .when_some(
+                    self.attachment.as_ref().map(|ui| ui.input.clone()),
+                    |this, input| {
+                        let focus_input = input.clone();
+                        this.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("attachment-path")
+                                .debug_selector(|| "attachment-path".to_string())
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h(px(22.0))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(theme::input_border())
+                                .bg(theme::input_bg())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |_shell,
+                                                      _event: &gpui::MouseDownEvent,
+                                                      window,
+                                                      cx| {
+                                        focus_input
+                                            .update(cx, |input, cx| input.focus(window, cx));
+                                    }),
+                                )
+                                .child(input),
+                        )
+                        .child(
+                            div()
+                                .id("attachment-submit")
+                                .debug_selector(|| "attachment-submit".to_string())
+                                .px(px(6.0))
+                                .h(px(22.0))
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(theme::input_border())
+                                .bg(theme::input_bg())
+                                .text_size(px(11.0))
+                                .text_color(theme::text_color())
+                                .cursor_pointer()
+                                .child(SharedString::from("插入"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        |shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                            let Some(ui) = shell.attachment.as_ref() else {
+                                                return;
+                                            };
+                                            let path = ui.input.read(cx).text().to_owned();
+                                            shell.attachment_submit_path(&path, cx);
+                                        },
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("attachment-cancel")
+                                .debug_selector(|| "attachment-cancel".to_string())
+                                .px(px(6.0))
+                                .h(px(22.0))
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(theme::input_border())
+                                .bg(theme::input_bg())
+                                .text_size(px(11.0))
+                                .text_color(theme::status_bar_text())
+                                .cursor_pointer()
+                                .child(SharedString::from("取消"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        |shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                            shell.attachment_cancel(cx);
+                                        },
+                                    ),
+                                ),
+                        ),
+                )
+                    },
+                )
+                .when_some(self.attachment_error.clone(), |this, error| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "attachment-error".to_string())
+                            .w_full()
+                            .text_size(px(10.0))
+                            .text_color(theme::caret_color())
+                            .child(SharedString::from(error)),
+                    )
+                })
+                .when_some(self.attachment_notice.clone(), |this, notice| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "attachment-notice".to_string())
+                            .w_full()
+                            .text_size(px(10.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(notice)),
+                    )
+                });
+        Some(block.into_any_element())
+    }
+}
+
+/// 非 dev-sync 构建：附件插入条不存在（返回 `None`，侧栏布局与行为零变化）。
+#[cfg(not(feature = "dev-sync"))]
+impl AppShell {
+    fn render_attachment_block(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        None
+    }
+}
+
+/// 日志用的短哈希（前 4 字节 = 8 个十六进制字符；够区分，又不会把整串刷进日志）。
+#[cfg(feature = "dev-sync")]
+fn short_hash(hash: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(8);
+    for byte in &hash[..4] {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
 /// 组装同步报告的材料（notice 由这些字段派生，避免调用点各写一遍）。
 ///
 /// 两条路径共用：持闸路径填 `doc_id`/`changes`/`dispatched_under_gate`；无会话路径
@@ -4406,6 +5221,8 @@ struct ReportParts {
     structure_refreshed: bool,
     /// 同步后自动打开的笔记标题（仅无会话路径 + 树里出现笔记）。
     opened_note: Option<String>,
+    /// 轮换 / apply 的公开事实（切片 6a；其它任务为 `None`）。
+    rotation: Option<crate::dev_sync::RotationFacts>,
 }
 
 #[cfg(feature = "dev-sync")]
@@ -4438,6 +5255,10 @@ impl ReportParts {
                 .worker_summary
                 .clone()
                 .unwrap_or_else(|| "初始基线已发布（B 现在可以 Join）".to_owned()),
+            (None, crate::dev_sync::GatedTask::Rotate) => rotation_notice(self.rotation.as_ref()),
+            (None, crate::dev_sync::GatedTask::ApplyEpoch) => {
+                apply_epoch_notice(self.rotation.as_ref())
+            }
             (Some(error), _) if self.no_session => format!("同步失败：{error}{structure}"),
             (Some(error), crate::dev_sync::GatedTask::SyncOnce) => format!(
                 "同步失败：{error}（已交付 {} 条已落盘变化{structure}）",
@@ -4447,6 +5268,25 @@ impl ReportParts {
                 "发布基线失败：{error}（已交付 {} 条已落盘变化{structure}）",
                 self.changes
             ),
+            (Some(error), crate::dev_sync::GatedTask::Rotate) => {
+                // 失败停在 journal 之后（阶段不是「未开始」）时，库级入口保留了 rotation
+                // journal：同一实例再点轮换会被 "已有未完成 rotation journal" 拒绝，
+                // 必须先重启实例再走恢复流程。这里如实说清，别让用户反复点。
+                let journal = match self
+                    .rotation
+                    .as_ref()
+                    .and_then(|facts| facts.failure_phase.as_deref())
+                {
+                    Some(phase) if phase != "未开始" => format!(
+                        "；失败停在「{phase}」，保留了 rotation journal：重试前需重启实例（不自动恢复/重试）"
+                    ),
+                    _ => String::new(),
+                };
+                format!("轮换失败：{error}（身份/视图保持旧 epoch；未自动重试）{journal}")
+            }
+            (Some(error), crate::dev_sync::GatedTask::ApplyEpoch) => {
+                format!("应用新 epoch 失败：{error}（身份/视图保持旧 epoch；未自动重试）")
+            }
         };
         crate::dev_sync::SyncOnceReport {
             task: self.task,
@@ -4458,9 +5298,60 @@ impl ReportParts {
             error: self.error,
             structure_refreshed: self.structure_refreshed,
             opened_note: self.opened_note,
+            rotation: self.rotation,
             notice,
         }
     }
+}
+
+/// 轮换成功的面板文案（epoch / checkpoint 短 id / 恢复码是否补发）。
+#[cfg(feature = "dev-sync")]
+fn rotation_notice(facts: Option<&crate::dev_sync::RotationFacts>) -> String {
+    let Some(facts) = facts else {
+        return "轮换完成（缺少公开事实）".to_owned();
+    };
+    let epoch = match facts.to_epoch {
+        Some(to) => format!("epoch {} → {to}", facts.from_epoch),
+        None => format!("epoch {}（未知新 epoch）", facts.from_epoch),
+    };
+    let checkpoint = match (&facts.primary_checkpoint, &facts.fallback_checkpoint) {
+        (Some(primary), Some(fallback)) => format!("checkpoint {primary}/{fallback}"),
+        (Some(primary), None) => format!("checkpoint {primary}"),
+        _ => "checkpoint 未知".to_owned(),
+    };
+    let recovery = if facts.recovery_code_reissued {
+        "恢复码已补发（新设备可用恢复码加入）"
+    } else {
+        "恢复码未补发（轮换后新设备无法用恢复码加入）"
+    };
+    let revoked = if facts.revoked == 0 {
+        String::new()
+    } else {
+        format!("；移除 {} 台", facts.revoked)
+    };
+    format!("轮换完成：{epoch}；{checkpoint}{revoked}；{recovery}")
+}
+
+/// apply 成功的面板文案（epoch / checkpoint 短 id；幂等 AlreadyCurrent 单独措辞）。
+#[cfg(feature = "dev-sync")]
+fn apply_epoch_notice(facts: Option<&crate::dev_sync::RotationFacts>) -> String {
+    let Some(facts) = facts else {
+        return "已应用新 epoch（缺少公开事实）".to_owned();
+    };
+    let Some(to) = facts.to_epoch else {
+        return format!(
+            "已应用新 epoch（epoch {}，新 epoch 未知）",
+            facts.from_epoch
+        );
+    };
+    if facts.already_current {
+        return format!("已是最新 epoch：{to}（无需 apply）");
+    }
+    let checkpoint = facts.primary_checkpoint.as_ref().map_or_else(
+        || "checkpoint 未知".to_owned(),
+        |id| format!("checkpoint {id}"),
+    );
+    format!("已应用新 epoch：{} → {to}；{checkpoint}", facts.from_epoch)
 }
 
 /// 持闸同步的终态（worker 回执；`Ok` 带 worker 摘要，`Failed` 带明确原因）。
@@ -4476,6 +5367,17 @@ enum SyncOnceFinish {
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 输入框刚创建时拿不到 `&mut Window`（订阅回调里没有），在这一帧补一次焦点。
+        // 附件路径输入框同理：事件回调里没有 `&mut Window`，这一帧补焦点。
+        #[cfg(feature = "dev-sync")]
+        if self.pending_focus_attachment {
+            self.pending_focus_attachment = false;
+            if let Some(ui) = &self.attachment {
+                let input = ui.input.clone();
+                window.defer(cx, move |window, cx| {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                });
+            }
+        }
         if self.pending_focus_rename {
             self.pending_focus_rename = false;
             if let Some(editing) = &self.editing {

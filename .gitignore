@@ -18,3 +18,6 @@ desktop.ini
 
 # dev agent 独立 target（避免被误提交；构建完应删除）
 /target-publish-ui/
+
+# 打包产物（源码 zip，按需生成，不入库）
+/*.zip

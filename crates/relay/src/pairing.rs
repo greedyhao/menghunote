@@ -8,11 +8,12 @@
 //! - 设备指纹 = `SHA256(vault_id || device_id || sign_pk || hpke_pk)` 前 128bit（32 hex）；
 //! - relay 只验签名与引用，不解析 HPKE 明文。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::auth::AuthContext;
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{ct_eq, hex_lower, random_id16, sha256, Hash32, Id16};
+use crate::scope::ScopeConn;
 use crate::sig::{require, Expectation, SignDomain, SignatureCheck, SignatureHook};
 use crate::time::Clock;
 use crate::vault;
@@ -51,12 +52,13 @@ pub struct InviteRow {
 }
 
 /// 读邀请。
-pub fn invite(conn: &Connection, invite_id: &Id16) -> Result<Option<InviteRow>> {
+pub fn invite(conn: &ScopeConn, invite_id: &Id16) -> Result<Option<InviteRow>> {
     let mut stmt = conn.prepare(
-        "SELECT invite_id, token_hash, expires_at, pending_device, used_at FROM invites WHERE invite_id = ?1",
+        "SELECT invite_id, token_hash, expires_at, pending_device, used_at FROM invites
+         WHERE invite_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([invite_id.as_slice()], |row| {
+        .query_row((invite_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -109,7 +111,7 @@ pub struct InviteRequest {
 
 /// 创建邀请：管理签名 + `SHA256(T)` + 24h 有效期。
 pub fn create_invite(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -138,13 +140,14 @@ pub fn create_invite(
     let invite_id = random_id16()?;
     // 顺手清理一年前的过期邀请（只是诊断卫生）。
     conn.execute(
-        "DELETE FROM invites WHERE expires_at < ?1 - 31536000",
-        [now],
+        "DELETE FROM invites WHERE expires_at < ?1 - 31536000 AND vault_id = ?",
+        (now, conn.scope().as_slice()),
     )?;
     conn.execute(
-        "INSERT INTO invites(invite_id, token_hash, expires_at, pending_device, used_at)
-         VALUES (?1, ?2, ?3, NULL, NULL)",
+        "INSERT INTO invites(vault_id, invite_id, token_hash, expires_at, pending_device, used_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
         (
+            conn.scope().as_slice(),
             invite_id.as_slice(),
             request.token_hash.as_slice(),
             expires_at,
@@ -187,7 +190,7 @@ pub struct RedeemOutcome {
 
 /// 兑换邀请：验 T、原子消费、创建 PENDING 设备。
 pub fn redeem_invite(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     invite_id: &Id16,
@@ -209,16 +212,16 @@ pub fn redeem_invite(
     }
     // 设备 id 永不复用。
     let exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM devices WHERE device_id = ?1",
-        [device.device_id.as_slice()],
+        "SELECT COUNT(*) FROM devices WHERE device_id = ?1 AND vault_id = ?",
+        (device.device_id.as_slice(), conn.scope().as_slice()),
         |row| row.get(0),
     )?;
     if exists != 0 {
         return Err(Error::api(ErrorCode::IdConflict));
     }
     let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM devices WHERE status != 'revoked'",
-        [],
+        "SELECT COUNT(*) FROM devices WHERE status != 'revoked' AND vault_id = ?1",
+        [conn.scope().as_slice()],
         |row| row.get(0),
     )?;
     proto::check_device_count(usize::try_from(total).unwrap_or(usize::MAX))
@@ -239,16 +242,23 @@ pub fn redeem_invite(
     // 原子一次性消费。
     let consumed = conn.execute(
         "UPDATE invites SET used_at = ?1, pending_device = ?2
-         WHERE invite_id = ?3 AND used_at IS NULL AND expires_at > ?1",
-        (now, device.device_id.as_slice(), invite_id.as_slice()),
+         WHERE invite_id = ?3 AND used_at IS NULL AND expires_at > ?1 AND vault_id = ?",
+        (
+            now,
+            device.device_id.as_slice(),
+            invite_id.as_slice(),
+            conn.scope().as_slice(),
+        ),
     )?;
     if consumed != 1 {
         return Err(Error::api(ErrorCode::InviteUsed));
     }
     conn.execute(
-        "INSERT INTO devices(device_id, sign_pk, hpke_pk, certificate, status, created_at)
-         VALUES (?1, ?2, ?3, X'', 'pending', ?4)",
+        "INSERT INTO devices(vault_id, device_id, sign_pk, hpke_pk, certificate, status,
+                             created_at)
+         VALUES (?1, ?2, ?3, ?4, X'', 'pending', ?5)",
         (
+            conn.scope().as_slice(),
             device.device_id.as_slice(),
             device.sign_pk.as_slice(),
             device.hpke_pk.as_slice(),
@@ -300,7 +310,7 @@ pub struct ApproveOutcome {
 
 /// 批准设备：验证书域签名 + grant，PENDING → ACTIVE。
 pub fn approve_device(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -325,8 +335,9 @@ pub fn approve_device(
 
     let (status, sign_pk, hpke_pk): (String, Vec<u8>, Vec<u8>) = conn
         .query_row(
-            "SELECT status, sign_pk, hpke_pk FROM devices WHERE device_id = ?1",
-            [device_id.as_slice()],
+            "SELECT status, sign_pk, hpke_pk FROM devices
+             WHERE device_id = ?1 AND vault_id = ?",
+            (device_id.as_slice(), conn.scope().as_slice()),
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| Error::api(ErrorCode::NotFound))?;
@@ -406,21 +417,22 @@ pub fn approve_device(
 
     conn.execute(
         "UPDATE devices SET status = 'active', certificate = ?1, certificate_signature = ?2
-         WHERE device_id = ?3",
+         WHERE device_id = ?3 AND vault_id = ?",
         (
             request.certificate.as_slice(),
             request.certificate_signature.as_slice(),
             device_id.as_slice(),
+            conn.scope().as_slice(),
         ),
     )?;
     conn.execute(
         // §24.2/评审 §三 4：外层管理签名（`AAD || enc || SHA256(ciphertext)` 的签名）与
         // grant_id 必须一并落库，否则 `GET devices/self/grants/latest` 拿不到 signature64，
         // 客户端 `verify_latest_grant` 无法验签（真实恢复/自批路径会失败）。
-        "INSERT INTO device_grants(epoch, device_id, manager_rev, hpke_enc, hpke_ciphertext,
-                                   signed_header, signature, grant_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(epoch, device_id) DO UPDATE SET
+        "INSERT INTO device_grants(vault_id, epoch, device_id, manager_rev, hpke_enc,
+                                   hpke_ciphertext, signed_header, signature, grant_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(vault_id, epoch, device_id) DO UPDATE SET
            manager_rev = excluded.manager_rev,
            hpke_enc = excluded.hpke_enc,
            hpke_ciphertext = excluded.hpke_ciphertext,
@@ -428,6 +440,7 @@ pub fn approve_device(
            signature = excluded.signature,
            grant_id = excluded.grant_id",
         (
+            conn.scope().as_slice(),
             i64::try_from(vault.active_epoch).map_err(|_| Error::Invariant("epoch"))?,
             device_id.as_slice(),
             i64::try_from(vault.manager_rev).map_err(|_| Error::Invariant("manager_rev"))?,
@@ -455,10 +468,11 @@ pub fn approve_device(
 }
 
 /// PENDING 设备列表（诊断/测试）。
-pub fn pending_devices(conn: &Connection) -> Result<Vec<Id16>> {
-    let mut stmt = conn.prepare("SELECT device_id FROM devices WHERE status = 'pending'")?;
+pub fn pending_devices(conn: &ScopeConn) -> Result<Vec<Id16>> {
+    let mut stmt =
+        conn.prepare("SELECT device_id FROM devices WHERE status = 'pending' AND vault_id = ?1")?;
     let rows: Vec<Vec<u8>> = stmt
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+        .query_map([conn.scope().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<std::result::Result<_, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for bytes in rows {

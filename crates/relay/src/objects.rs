@@ -9,7 +9,7 @@
 //! relay 不解析密文（不解 AEAD/CDE 载荷），只验：信封结构（§16）、固定 header 上下文、
 //! 分片齐全、密文 SHA256 聚合摘要（§2）、以及签名 hook 的结论。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::auth::AuthContext;
 use crate::envelope::{self, Header, ObjectType};
@@ -18,6 +18,7 @@ use crate::ids::{be64, sha256, Hash32, Id16};
 use crate::log::{self, LogKind};
 use crate::quota::{self, ReservationPurpose};
 use crate::refs::ObjectRefMeta;
+use crate::scope::ScopeConn;
 use crate::sig::{require, Expectation, SignDomain, SignatureCheck, SignatureHook};
 use crate::time::Clock;
 use crate::vault;
@@ -150,20 +151,20 @@ fn u64_of(value: i64, field: &'static str) -> Result<u64> {
 }
 
 /// 读对象行；不存在 404。
-pub fn load(conn: &Connection, object_id: &Hash32) -> Result<ObjectRow> {
+pub fn load(conn: &ScopeConn, object_id: &Hash32) -> Result<ObjectRow> {
     load_opt(conn, object_id)?.ok_or_else(|| Error::api(ErrorCode::NotFound))
 }
 
 /// 读对象行（可不存在）。
-pub fn load_opt(conn: &Connection, object_id: &Hash32) -> Result<Option<ObjectRow>> {
+pub fn load_opt(conn: &ScopeConn, object_id: &Hash32) -> Result<Option<ObjectRow>> {
     let mut stmt = conn.prepare(
         "SELECT object_id, message_id, producer, epoch, type, generation, sender_seq,
                 part_count, plain_len, state, budget_class, digest, signed_commit,
                 commit_signature, reservation_id, created_at, touched_at, completed_at
-         FROM objects WHERE object_id = ?1",
+         FROM objects WHERE object_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([object_id.as_slice()], |row| {
+        .query_row((object_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -259,12 +260,12 @@ pub fn load_opt(conn: &Connection, object_id: &Hash32) -> Result<Option<ObjectRo
 }
 
 /// 读全部分片元数据（按片号升序）。
-pub fn parts(conn: &Connection, object_id: &Hash32) -> Result<Vec<PartView>> {
+pub fn parts(conn: &ScopeConn, object_id: &Hash32) -> Result<Vec<PartView>> {
     let mut stmt = conn.prepare(
         "SELECT part_no, digest, length(envelope) FROM object_parts
-         WHERE object_id = ?1 ORDER BY part_no ASC",
+         WHERE object_id = ?1 AND vault_id = ? ORDER BY part_no ASC",
     )?;
-    let rows = stmt.query_map([object_id.as_slice()], |row| {
+    let rows = stmt.query_map((object_id.as_slice(), conn.scope().as_slice()), |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, Vec<u8>>(1)?,
@@ -287,13 +288,20 @@ pub fn parts(conn: &Connection, object_id: &Hash32) -> Result<Vec<PartView>> {
 }
 
 /// 单片摘要（不存在则 None）。
-fn part_digest(conn: &Connection, object_id: &Hash32, part_no: u32) -> Result<Option<Hash32>> {
-    let mut stmt =
-        conn.prepare("SELECT digest FROM object_parts WHERE object_id = ?1 AND part_no = ?2")?;
+fn part_digest(conn: &ScopeConn, object_id: &Hash32, part_no: u32) -> Result<Option<Hash32>> {
+    let mut stmt = conn.prepare(
+        "SELECT digest FROM object_parts
+             WHERE object_id = ?1 AND part_no = ?2 AND vault_id = ?",
+    )?;
     let row = stmt
-        .query_row((object_id.as_slice(), i64::from(part_no)), |row| {
-            row.get::<_, Vec<u8>>(0)
-        })
+        .query_row(
+            (
+                object_id.as_slice(),
+                i64::from(part_no),
+                conn.scope().as_slice(),
+            ),
+            |row| row.get::<_, Vec<u8>>(0),
+        )
         .optional()?;
     match row {
         None => Ok(None),
@@ -307,7 +315,7 @@ fn part_digest(conn: &Connection, object_id: &Hash32, part_no: u32) -> Result<Op
 }
 
 /// 重算 `object_digest`（缺片 → 409 INCOMPLETE）。
-pub fn recompute_digest(conn: &Connection, object: &ObjectRow) -> Result<Hash32> {
+pub fn recompute_digest(conn: &ScopeConn, object: &ObjectRow) -> Result<Hash32> {
     let parts = parts(conn, &object.object_id)?;
     if parts.len() != object.part_count as usize {
         return Err(Error::api(ErrorCode::Incomplete));
@@ -317,7 +325,7 @@ pub fn recompute_digest(conn: &Connection, object: &ObjectRow) -> Result<Hash32>
 }
 
 /// 公开 ref（§2/§15）。
-pub fn object_ref_meta(conn: &Connection, object_id: &Hash32) -> Result<ObjectRefMeta> {
+pub fn object_ref_meta(conn: &ScopeConn, object_id: &Hash32) -> Result<ObjectRefMeta> {
     let object = load(conn, object_id)?;
     let digest = object
         .digest
@@ -335,22 +343,23 @@ pub fn object_ref_meta(conn: &Connection, object_id: &Hash32) -> Result<ObjectRe
 
 /// reservation 对应的目标 epoch（checkpoint 的 epoch / rotation 的 to_epoch）。
 fn reservation_target_epoch(
-    conn: &Connection,
+    conn: &ScopeConn,
     purpose: ReservationPurpose,
     resource_id: &[u8],
 ) -> Result<Option<u64>> {
     let value: Option<i64> = match purpose {
         ReservationPurpose::Checkpoint => conn
             .query_row(
-                "SELECT epoch FROM checkpoints WHERE checkpoint_id = ?1",
-                [resource_id],
+                "SELECT epoch FROM checkpoints WHERE checkpoint_id = ?1 AND vault_id = ?",
+                (resource_id, conn.scope().as_slice()),
                 |row| row.get(0),
             )
             .optional()?,
         ReservationPurpose::Rotation => conn
             .query_row(
-                "SELECT to_epoch FROM rotations WHERE rotation_id = ?1",
-                [resource_id],
+                "SELECT to_epoch FROM rotations
+                 WHERE rotation_id = ?1 AND vault_id = ?",
+                (resource_id, conn.scope().as_slice()),
                 |row| row.get(0),
             )
             .optional()?,
@@ -362,7 +371,7 @@ fn reservation_target_epoch(
 }
 
 /// 当前可写的 epoch：活动 epoch，或轮换中的候选 epoch（只允许维护对象）。
-fn check_writable_epoch(conn: &Connection, vault: &vault::Vault, header: &Header) -> Result<bool> {
+fn check_writable_epoch(conn: &ScopeConn, vault: &vault::Vault, header: &Header) -> Result<bool> {
     if vault.state == vault::VaultState::Rotating {
         // 冻结期：旧 epoch（= 当前 active_epoch）一律 409；只有候选 epoch 可写（走维护预算）。
         if vault::candidate_epoch(conn)? == Some(header.key_epoch) {
@@ -382,7 +391,7 @@ fn check_writable_epoch(conn: &Connection, vault: &vault::Vault, header: &Header
 
 /// 校验维护 reservation 可用于该完整 header。
 fn validate_reservation(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     actor_device: &Id16,
     reservation_id: &Id16,
@@ -428,7 +437,7 @@ pub struct PartUpload<'a> {
 
 /// 写一个分片（**独立短事务**；调用方把它放进 `Db::write`）。
 pub fn put_part(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     upload: &PartUpload<'_>,
 ) -> Result<PartPutOutcome> {
@@ -509,12 +518,14 @@ pub fn put_part(
                 }
             };
             conn.execute(
-                "INSERT INTO objects(object_id, message_id, producer, epoch, type, generation,
-                                     sender_seq, part_count, plain_len, state, budget_class,
-                                     digest, signed_commit, reservation_id, created_at, touched_at,
-                                     completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'staging', ?10, NULL, NULL, ?11, ?12, ?12, NULL)",
+                "INSERT INTO objects(vault_id, object_id, message_id, producer, epoch, type,
+                                     generation, sender_seq, part_count, plain_len, state,
+                                     budget_class, digest, signed_commit, reservation_id,
+                                     created_at, touched_at, completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'staging', ?11, NULL, NULL, ?12,
+                         ?13, ?13, NULL)",
                 (
+                    conn.scope().as_slice(),
                     header.object_id.as_slice(),
                     header.message_id.as_slice(),
                     stored_producer.as_slice(),
@@ -563,8 +574,10 @@ pub fn put_part(
         BudgetClass::Retired => return Err(Error::api(ErrorCode::Retired)),
     }
     conn.execute(
-        "INSERT INTO object_parts(object_id, part_no, envelope, digest) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO object_parts(vault_id, object_id, part_no, envelope, digest)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         (
+            conn.scope().as_slice(),
             header.object_id.as_slice(),
             i64::from(path_part),
             envelope,
@@ -572,8 +585,8 @@ pub fn put_part(
         ),
     )?;
     conn.execute(
-        "UPDATE objects SET touched_at = ?1 WHERE object_id = ?2",
-        (now, header.object_id.as_slice()),
+        "UPDATE objects SET touched_at = ?1 WHERE object_id = ?2 AND vault_id = ?",
+        (now, header.object_id.as_slice(), conn.scope().as_slice()),
     )?;
     Ok(PartPutOutcome {
         object_id: header.object_id,
@@ -601,7 +614,7 @@ pub struct CompleteUpload<'a> {
 
 /// 完成对象：校验全部分片 + 签名 + digest，然后**原子**标 complete / 分配 seq / 写 log / 幂等 ACK。
 pub fn complete(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     upload: &CompleteUpload<'_>,
@@ -721,16 +734,23 @@ pub fn complete(
     conn.execute(
         "UPDATE objects SET state = 'complete', digest = ?1, signed_commit = ?2,
                             completed_at = ?3, touched_at = ?3
-         WHERE object_id = ?4",
-        (digest.as_slice(), commit, now, object_id.as_slice()),
+         WHERE object_id = ?4 AND vault_id = ?",
+        (
+            digest.as_slice(),
+            commit,
+            now,
+            object_id.as_slice(),
+            conn.scope().as_slice(),
+        ),
     )?;
     // §25.1：ASSET complete 同事务写不透明登记表（log 只做唤醒；GC 后枚举仍完整）。
     if object.object_type == ObjectType::Asset {
         let rotation_id: Option<Vec<u8>> = if is_candidate {
             conn.query_row(
                 "SELECT rotation_id FROM rotations
-                 WHERE to_epoch = ?1 AND state IN ('frozen','staging') LIMIT 1",
-                [i64_of(object.epoch, "epoch")?],
+                 WHERE to_epoch = ?1 AND state IN ('frozen','staging') AND vault_id = ?
+                 LIMIT 1",
+                (i64_of(object.epoch, "epoch")?, conn.scope().as_slice()),
                 |row| row.get(0),
             )
             .optional()?
@@ -738,10 +758,12 @@ pub fn complete(
             None
         };
         conn.execute(
-            "INSERT INTO asset_objects(epoch, object_id, state, finalized_seq, rotation_id)
-             VALUES (?1, ?2, 'active', ?3, ?4)
-             ON CONFLICT(epoch, object_id) DO NOTHING",
+            "INSERT INTO asset_objects(vault_id, epoch, object_id, state, finalized_seq,
+                                       rotation_id)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5)
+             ON CONFLICT(vault_id, epoch, object_id) DO NOTHING",
             (
+                conn.scope().as_slice(),
                 i64_of(object.epoch, "epoch")?,
                 object_id.as_slice(),
                 i64::try_from(relay_seq.unwrap_or(0)).map_err(|_| Error::Invariant("relay_seq"))?,
@@ -771,18 +793,24 @@ pub fn complete(
 }
 
 /// 读分片密文（`ETag` 用 digest 的十六进制）。
-pub fn read_part(conn: &Connection, object_id: &Hash32, part_no: u32) -> Result<(Vec<u8>, Hash32)> {
+pub fn read_part(conn: &ScopeConn, object_id: &Hash32, part_no: u32) -> Result<(Vec<u8>, Hash32)> {
     let object = load(conn, object_id)?;
     if object.budget_class == BudgetClass::Retired {
         return Err(Error::api(ErrorCode::Retired));
     }
     let mut stmt = conn.prepare(
-        "SELECT envelope, digest FROM object_parts WHERE object_id = ?1 AND part_no = ?2",
+        "SELECT envelope, digest FROM object_parts
+         WHERE object_id = ?1 AND part_no = ?2 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row((object_id.as_slice(), i64::from(part_no)), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
+        .query_row(
+            (
+                object_id.as_slice(),
+                i64::from(part_no),
+                conn.scope().as_slice(),
+            ),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
         .optional()?;
     let Some((envelope, digest)) = row else {
         return Err(Error::api(ErrorCode::NotFound));
@@ -795,7 +823,7 @@ pub fn read_part(conn: &Connection, object_id: &Hash32, part_no: u32) -> Result<
 }
 
 /// `GET objects/{o}`：不可变元数据 + 各片 digest（已上传 bitmap 由 parts 列表隐含）。
-pub fn meta(conn: &Connection, object_id: &Hash32) -> Result<ObjectMetaView> {
+pub fn meta(conn: &ScopeConn, object_id: &Hash32) -> Result<ObjectMetaView> {
     Ok(ObjectMetaView {
         object: load(conn, object_id)?,
         parts: parts(conn, object_id)?,
@@ -806,7 +834,7 @@ pub fn meta(conn: &Connection, object_id: &Hash32) -> Result<ObjectMetaView> {
 /// 每片固定 header 上下文与对象行一致。
 ///
 /// 返回**不含密文**的问题列表（空 = 健康）。这是 GC 删除前的前置门禁。
-pub fn integrity_issues(conn: &Connection, object: &ObjectRow) -> Result<Vec<&'static str>> {
+pub fn integrity_issues(conn: &ScopeConn, object: &ObjectRow) -> Result<Vec<&'static str>> {
     let mut issues = Vec::new();
     if object.state != ObjectState::Complete {
         issues.push("object_not_complete");
@@ -818,15 +846,19 @@ pub fn integrity_issues(conn: &Connection, object: &ObjectRow) -> Result<Vec<&'s
     };
     let mut stmt = conn.prepare(
         "SELECT part_no, envelope, digest FROM object_parts
-         WHERE object_id = ?1 ORDER BY part_no ASC",
+         WHERE object_id = ?1 AND vault_id = ?
+         ORDER BY part_no ASC",
     )?;
-    let rows = stmt.query_map([object.object_id.as_slice()], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        (object.object_id.as_slice(), conn.scope().as_slice()),
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        },
+    )?;
     let mut digests: Vec<(u32, Hash32)> = Vec::new();
     for row in rows {
         let (part_no, envelope, digest) = row?;
@@ -919,16 +951,21 @@ where
 
 /// §25.1：冻结时刻的资产集合摘要：`SHA256(CDE(sorted ObjectRefV1[ASSET]))`。
 /// 只使用不透明登记 + ObjectRefV1 元数据；真实文件 hash/MIME/长度不在 relay。
-pub fn asset_set_digest(conn: &Connection, epoch: u64, through_seq: u64) -> Result<Hash32> {
+pub fn asset_set_digest(conn: &ScopeConn, epoch: u64, through_seq: u64) -> Result<Hash32> {
     let mut stmt = conn.prepare(
         "SELECT o.object_id, o.type, o.generation, o.epoch, o.part_count, o.plain_len, o.digest
          FROM asset_objects a JOIN objects o ON o.object_id = a.object_id
          WHERE a.epoch = ?1 AND a.state = 'active' AND a.finalized_seq <= ?2
            AND o.state = 'complete' AND o.digest IS NOT NULL
+           AND a.vault_id = ?3 AND o.vault_id = ?3
          ORDER BY o.object_id ASC",
     )?;
     let rows = stmt.query_map(
-        (i64_of(epoch, "epoch")?, i64_of(through_seq, "through_seq")?),
+        (
+            i64_of(epoch, "epoch")?,
+            i64_of(through_seq, "through_seq")?,
+            conn.scope().as_slice(),
+        ),
         |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
@@ -953,7 +990,7 @@ pub fn asset_set_digest(conn: &Connection, epoch: u64, through_seq: u64) -> Resu
 /// complete 的资产（`asset_objects.rotation_id` 绑定），供 activation T 的
 /// `new_asset_set_digest` 与 relay DB 事实逐项比对。
 pub fn candidate_asset_set_digest(
-    conn: &Connection,
+    conn: &ScopeConn,
     epoch: u64,
     rotation_id: &Id16,
 ) -> Result<Hash32> {
@@ -962,19 +999,27 @@ pub fn candidate_asset_set_digest(
          FROM asset_objects a JOIN objects o ON o.object_id = a.object_id
          WHERE a.epoch = ?1 AND a.state = 'active' AND a.rotation_id = ?2
            AND o.state = 'complete' AND o.digest IS NOT NULL
+           AND a.vault_id = ?3 AND o.vault_id = ?3
          ORDER BY o.object_id ASC",
     )?;
-    let rows = stmt.query_map((i64_of(epoch, "epoch")?, rotation_id.as_slice()), |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, Vec<u8>>(6)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        (
+            i64_of(epoch, "epoch")?,
+            rotation_id.as_slice(),
+            conn.scope().as_slice(),
+        ),
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+            ))
+        },
+    )?;
     let refs = collect_asset_refs(rows)?;
     let input = proto::refs_digest_input(&refs)
         .map_err(|_| Error::Invariant("candidate_asset_set_digest input"))?;
@@ -982,12 +1027,17 @@ pub fn candidate_asset_set_digest(
 }
 
 /// §25.1：某 epoch 在 `through_seq` 之前已 finalize 的资产数量（opaque 登记表口径）。
-pub fn asset_count(conn: &Connection, epoch: u64, through_seq: u64) -> Result<u64> {
+pub fn asset_count(conn: &ScopeConn, epoch: u64, through_seq: u64) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM asset_objects a JOIN objects o ON o.object_id = a.object_id
          WHERE a.epoch = ?1 AND a.state = 'active' AND a.finalized_seq <= ?2
-           AND o.state = 'complete' AND o.digest IS NOT NULL",
-        (i64_of(epoch, "epoch")?, i64_of(through_seq, "through_seq")?),
+           AND o.state = 'complete' AND o.digest IS NOT NULL
+           AND a.vault_id = ?3 AND o.vault_id = ?3",
+        (
+            i64_of(epoch, "epoch")?,
+            i64_of(through_seq, "through_seq")?,
+            conn.scope().as_slice(),
+        ),
         |row| row.get(0),
     )?;
     u64_of(count, "asset count")
@@ -995,7 +1045,7 @@ pub fn asset_count(conn: &Connection, epoch: u64, through_seq: u64) -> Result<u6
 
 /// 分页列出某 epoch 在 `through_seq` 之前完成的资产（轮换复制基线用）。
 pub fn list_assets(
-    conn: &Connection,
+    conn: &ScopeConn,
     epoch: u64,
     through_seq: u64,
     after_object_id: Option<&Hash32>,
@@ -1008,6 +1058,7 @@ pub fn list_assets(
          WHERE a.epoch = ?1 AND a.state = 'active' AND a.finalized_seq <= ?2
            AND o.state = 'complete' AND o.digest IS NOT NULL
            AND (?3 IS NULL OR o.object_id > ?3)
+           AND a.vault_id = ?5 AND o.vault_id = ?5
          ORDER BY o.object_id ASC LIMIT ?4",
     )?;
     let rows = stmt.query_map(
@@ -1016,6 +1067,7 @@ pub fn list_assets(
             i64_of(through_seq, "through_seq")?,
             after_object_id.map(|id| id.as_slice()),
             i64::from(limit.clamp(1, 1024)),
+            conn.scope().as_slice(),
         ),
         |row| {
             Ok((
@@ -1053,22 +1105,26 @@ pub fn list_assets(
 }
 
 /// GC：删除从未 finalize 的暂存对象（ADR §7：24h 可删）与它们的密文。
-pub fn cleanup_staging(conn: &Connection, older_than: i64) -> Result<u64> {
+pub fn cleanup_staging(conn: &ScopeConn, older_than: i64) -> Result<u64> {
     let staged: Vec<Vec<u8>> = {
-        let mut stmt = conn
-            .prepare("SELECT object_id FROM objects WHERE state = 'staging' AND touched_at < ?1")?;
-        let rows = stmt.query_map([older_than], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT object_id FROM objects
+             WHERE state = 'staging' AND touched_at < ?1 AND vault_id = ?",
+        )?;
+        let rows = stmt.query_map((older_than, conn.scope().as_slice()), |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut deleted = 0u64;
     for object_id in staged {
         conn.execute(
-            "DELETE FROM object_parts WHERE object_id = ?1",
-            [object_id.as_slice()],
+            "DELETE FROM object_parts WHERE object_id = ?1 AND vault_id = ?",
+            (object_id.as_slice(), conn.scope().as_slice()),
         )?;
         conn.execute(
-            "DELETE FROM objects WHERE object_id = ?1",
-            [object_id.as_slice()],
+            "DELETE FROM objects WHERE object_id = ?1 AND vault_id = ?",
+            (object_id.as_slice(), conn.scope().as_slice()),
         )?;
         deleted += 1;
     }
@@ -1077,15 +1133,13 @@ pub fn cleanup_staging(conn: &Connection, older_than: i64) -> Result<u64> {
 
 // ---------- dedup ----------
 
-fn dedup_lookup(
-    conn: &Connection,
-    scope: &str,
-    id: &[u8],
-) -> Result<Option<(Hash32, Option<u64>)>> {
-    let mut stmt =
-        conn.prepare("SELECT request_hash, accepted_seq FROM dedup WHERE scope = ?1 AND id = ?2")?;
+fn dedup_lookup(conn: &ScopeConn, scope: &str, id: &[u8]) -> Result<Option<(Hash32, Option<u64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT request_hash, accepted_seq FROM dedup
+         WHERE scope = ?1 AND id = ?2 AND vault_id = ?3",
+    )?;
     let row = stmt
-        .query_row((scope, id), |row| {
+        .query_row((scope, id, conn.scope().as_slice()), |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<i64>>(1)?))
         })
         .optional()?;
@@ -1106,7 +1160,7 @@ fn dedup_lookup(
 }
 
 fn dedup_put(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     scope: &str,
     id: &[u8],
@@ -1115,9 +1169,10 @@ fn dedup_put(
     response: &[u8],
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO dedup(scope, id, request_hash, accepted_seq, response, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO dedup(vault_id, scope, id, request_hash, accepted_seq, response, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
+            conn.scope().as_slice(),
             scope,
             id,
             request_hash.as_slice(),

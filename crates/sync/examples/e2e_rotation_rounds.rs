@@ -35,6 +35,7 @@ use std::path::Path;
 
 use e2e_common::AnyResult;
 use menghunote_storage::{set_repack_required, Vault};
+use menghunote_sync::api_version::{RelayApi, RelayApiVersion};
 use menghunote_sync::checkpoint::StaticAssets;
 use menghunote_sync::device::{DeviceHpkeKey, DeviceSigningKey, ManagementKey};
 use menghunote_sync::engine::{EngineIdentity, SyncEngine};
@@ -230,9 +231,10 @@ pub fn run_a_rotation_round(
     let (state, mut journal) = prepare_round(vault, client, params)?;
 
     // 阶段 B：管理 realm begin（旧 device token 全部失效，必须重新认证）。
+    let api = RelayApi::new(params.relay, RelayApiVersion::V1);
     let started = begin_rotation_http(
         &mut StdTcpTransport::new_local_dev(params.relay)?,
-        params.relay,
+        &api,
         vault,
         &mut journal,
         params.vault_id,
@@ -282,7 +284,7 @@ pub fn run_a_restart_round(
     let (state, mut journal) = prepare_round(vault, client, params)?;
     let begin = begin_rotation_http(
         &mut StdTcpTransport::new_local_dev(params.relay)?,
-        params.relay,
+        &RelayApi::new(params.relay, RelayApiVersion::V1),
         vault,
         &mut journal,
         params.vault_id,
@@ -306,7 +308,7 @@ pub fn run_a_restart_round(
     let restart_request_id: [u8; 16] = array(&mut OsRandom)?;
     restart_rotation(
         &mut StdTcpTransport::new_local_dev(params.relay)?,
-        params.relay,
+        &RelayApi::new(params.relay, RelayApiVersion::V1),
         params.vault_id,
         begin.rotation_id,
         params.old_manager,
@@ -521,7 +523,7 @@ fn run_round_body(
     attach_grants(journal, vault, &grants)?;
     stage_grants(
         &mut StdTcpTransport::new_local_dev(params.relay)?,
-        params.relay,
+        &RelayApi::new(params.relay, RelayApiVersion::V1),
         params.vault_id,
         started.rotation_id,
         params.old_manager,
@@ -600,7 +602,7 @@ fn run_round_body(
     };
     let outcome = activate_http(
         &mut StdTcpTransport::new_local_dev(params.relay)?,
-        params.relay,
+        &RelayApi::new(params.relay, RelayApiVersion::V1),
         params.vault_id,
         &instance_id,
         params.old_manager,
@@ -669,7 +671,7 @@ fn run_round_body(
     println!("[rotation-round] A control activation T 双签复算通过");
     verify_latest_grant_root(
         &mut StdTcpTransport::new_local_dev(params.relay)?,
-        params.relay,
+        &RelayApi::new(params.relay, RelayApiVersion::V1),
         params.vault_id,
         params.device_id,
         params.signing_key,

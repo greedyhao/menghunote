@@ -37,7 +37,8 @@ use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use menghunote_app::dev_sync::DevIdentityStore;
 use menghunote_app::onboarding::{
     AppRoot, AppRootOptions, DevSyncProfile, InstanceEntry, InstanceLock, ProfileLayout,
-    ProfileStore, RootStateLabel, DEFAULT_OPERATION_BUDGET, LOCK_FILE_NAME,
+    ProfileStore, RelayApiVersion, RelayMode, RootStateLabel, DEFAULT_OPERATION_BUDGET,
+    LOCK_FILE_NAME,
 };
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
@@ -45,9 +46,13 @@ use menghunote_storage::{
     SyncContext, UpdateRecord, Vault,
 };
 use menghunote_sync::dev_local::DevLocal;
+use menghunote_sync::http_transport::DEFAULT_TRANSPORT_TIMEOUTS;
 use menghunote_sync::identity::LocalIdentityV1;
 use menghunote_sync::random::OsRandom;
 use menghunote_sync::recovery::RecoverySeed;
+use menghunote_sync::relay_context::RelayContext;
+use menghunote_sync::remote_init::create_remote;
+use menghunote_sync::SyncError;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 /// 测试进程级的 `XDG_DATA_HOME`（Linux 用户主键；Windows 是 no-op）。
@@ -137,6 +142,75 @@ async fn onboarding_welcome_is_shown_without_any_config(cx: &mut TestAppContext)
     assert!(
         !layout.config_path.exists(),
         "读不到配置不算错误，也不得写配置"
+    );
+}
+
+/// 回归：Create 表单可以用 Tab 从 relay 切到 setup secret，也可以鼠标点击聚焦。
+///
+/// 之前 `FormInput` 只有 `track_focus`、没有 `tab_stop(true)`，并且向导字段
+/// `click_to_focus=false`：键盘 Tab 与鼠标点击都进不了 setup secret，用户无法创建。
+#[gpui::test]
+async fn create_form_tab_and_click_can_focus_setup_secret(cx: &mut TestAppContext) {
+    let (_dir, layout) = temp_layout("create-focus");
+    let options = AppRootOptions::for_test(
+        layout.clone(),
+        "http://127.0.0.1:18080",
+        "inst-create-focus",
+    );
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    let create = expect_bounds(cx, "app-root-create");
+    cx.simulate_click(create.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::CreateForm);
+    let initial_relay = root
+        .update(cx, |root, cx| root.form_relay_text(cx))
+        .expect("表单必须有 relay");
+
+    // 进入表单时宿主聚焦 relay；Tab 必须切到 setup secret。
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    cx.simulate_input("tabbed-secret");
+    cx.run_until_parked();
+    let (relay_after_tab, secret_after_tab) = root.update(cx, |root, cx| {
+        (root.form_relay_text(cx), root.form_secret_text(cx))
+    });
+    assert_eq!(
+        secret_after_tab.as_deref(),
+        Some("tabbed-secret"),
+        "Tab 后输入必须进入 setup secret"
+    );
+    assert_eq!(
+        relay_after_tab.as_deref(),
+        Some(initial_relay.as_str()),
+        "Tab 后 relay 不能被继续输入"
+    );
+
+    // 鼠标点击 relay → 输入进 relay；再点 setup secret → 输入进 secret。
+    let relay_bounds = expect_bounds(cx, "app-root-relay-input");
+    cx.simulate_click(relay_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("-relay-click");
+    cx.run_until_parked();
+    let relay_after_click = root
+        .update(cx, |root, cx| root.form_relay_text(cx))
+        .expect("表单必须有 relay");
+    assert!(
+        relay_after_click.contains("-relay-click"),
+        "点击 relay 后输入必须进入 relay：{relay_after_click}"
+    );
+
+    let secret_bounds = expect_bounds(cx, "app-root-secret-input");
+    cx.simulate_click(secret_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("-secret-click");
+    cx.run_until_parked();
+    let secret_after_click = root
+        .update(cx, |root, cx| root.form_secret_text(cx))
+        .expect("表单必须有 secret");
+    assert!(
+        secret_after_click.contains("-secret-click"),
+        "点击 setup secret 后输入必须进入 secret：{secret_after_click}"
     );
 }
 
@@ -467,6 +541,8 @@ fn write_profile(layout: &ProfileLayout, created: &CreatedInstance, active: &str
     let mut profile = DevSyncProfile::default();
     profile.upsert_active(InstanceEntry {
         instance_id: created.instance_id.clone(),
+        relay_mode: RelayMode::LocalDev,
+        api_version: RelayApiVersion::V1,
         relay_url: created.relay_url.clone(),
         vault_path: created.vault_path.to_string_lossy().into_owned(),
         vault_id: created.vault_id.clone(),
@@ -1213,13 +1289,9 @@ async fn join_unreachable_relay_is_retryable(cx: &mut TestAppContext) {
     seed_creator_note(&creator, "不可达测试笔记", "正文\n");
     publish_creator_baseline(&relay, &creator);
 
-    // 选一个当前没人监听的 loopback 端口（绑定后立刻释放）：连接会被拒绝。
-    let dead_relay = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口失败");
-        let addr = listener.local_addr().expect("取本地地址失败");
-        drop(listener);
-        format!("http://{addr}")
-    };
+    // 固定不可达端口（拒绝连接）：不要“绑定后释放动态端口”，否则并行测试可能
+    // 抢到该端口，让第一次 Join 变成可达/挂起，重试时又会与旧 worker 的目录锁冲突。
+    let dead_relay = "http://127.0.0.1:1".to_owned();
 
     let instance_id = "inst-unreach-b";
     let options = AppRootOptions {
@@ -1484,6 +1556,8 @@ fn write_profile_multi(layout: &ProfileLayout, created: &[&CreatedInstance], act
     for item in created {
         profile.upsert_active(InstanceEntry {
             instance_id: item.instance_id.clone(),
+            relay_mode: RelayMode::LocalDev,
+            api_version: RelayApiVersion::V1,
             relay_url: item.relay_url.clone(),
             vault_path: item.vault_path.to_string_lossy().into_owned(),
             vault_id: item.vault_id.clone(),
@@ -1727,12 +1801,13 @@ async fn settings_rejects_invalid_relay_without_writing(cx: &mut TestAppContext)
 
     let cases = [
         ("", "不能为空"),
-        ("https://127.0.0.1:18080", "loopback"),
+        ("https://127.0.0.1:18080", "http://"),
         ("http://relay.example:18080", "loopback"),
         ("http://192.168.1.9:18080", "loopback"),
         ("http://0.0.0.0:18080", "loopback"),
-        ("http://user:pass@127.0.0.1:18080", "loopback"),
-        ("http://127.0.0.1:18080/api", "传输策略"),
+        ("http://127.0.0.2:18080", "loopback"),
+        ("http://user:pass@127.0.0.1:18080", "userinfo"),
+        ("http://127.0.0.1:18080/api", "canonical origin"),
     ];
     for (bad, needle) in cases {
         root.update(cx, |root, cx| {
@@ -2031,4 +2106,1136 @@ async fn settings_cancel_keeps_main_shell_and_document(cx: &mut TestAppContext) 
         .update(|_window, app| shell.read(app).dev_sync_current_text(app))
         .expect("关闭设置后当前正文必须仍在");
     assert_eq!(text_after, text_before, "关闭设置不得重置当前文档内容");
+}
+
+// ---------------------------------------------------------------------------
+// S3a（ADR 0013）：remote 模式 UI / 安全指纹 / 启动 pending 对账
+// ---------------------------------------------------------------------------
+
+/// 在已存在的实例库上写一条指定阶段的 `sync.init_pending`（测试夹具）。
+fn seed_pending(
+    vault_path: &Path,
+    phase: menghunote_sync::init_journal::InitPhase,
+    created: &CreatedInstance,
+) {
+    use menghunote_sync::init_journal::{
+        advance_phase, begin_pending, InitKind, InitPendingV1, InitPhase,
+    };
+    let vault = Vault::open(vault_path).expect("打开夹具库");
+    let vault_id = menghunote_sync::ids::parse_hex::<16>(&created.vault_id).expect("vault id");
+    let device_id = menghunote_sync::ids::parse_hex::<16>(&created.device_id).expect("device id");
+    let pending = InitPendingV1::prepared(
+        InitKind::NewGenesis,
+        menghunote_app::onboarding::RelayMode::LocalDev,
+        created.relay_url.clone(),
+        vault_id,
+        device_id,
+        1,
+    );
+    begin_pending(&vault, &pending).expect("写 pending");
+    match phase {
+        InitPhase::Prepared => {}
+        InitPhase::GenesisRequested => {
+            advance_phase(&vault, InitPhase::Prepared, InitPhase::GenesisRequested)
+                .expect("请求已发");
+        }
+        InitPhase::IdentityWritten => {
+            advance_phase(&vault, InitPhase::Prepared, InitPhase::GenesisRequested)
+                .expect("请求已发");
+            advance_phase(
+                &vault,
+                InitPhase::GenesisRequested,
+                InitPhase::IdentityWritten,
+            )
+            .expect("身份已写");
+        }
+        InitPhase::PinCommitted => {
+            advance_phase(&vault, InitPhase::Prepared, InitPhase::GenesisRequested)
+                .expect("请求已发");
+            advance_phase(&vault, InitPhase::GenesisRequested, InitPhase::PinCommitted)
+                .expect("pin 已提交");
+        }
+        InitPhase::Done => {
+            advance_phase(&vault, InitPhase::Prepared, InitPhase::GenesisRequested)
+                .expect("请求已发");
+            advance_phase(&vault, InitPhase::GenesisRequested, InitPhase::PinCommitted)
+                .expect("pin 已提交");
+            advance_phase(&vault, InitPhase::PinCommitted, InitPhase::Done).expect("done");
+        }
+    }
+    assert_eq!(
+        menghunote_sync::init_journal::load_pending(&vault, None)
+            .expect("读 pending")
+            .expect("pending 仍在")
+            .phase,
+        phase
+    );
+}
+
+fn pending_phase(vault_path: &Path) -> Option<menghunote_sync::init_journal::InitPhase> {
+    let vault = Vault::open(vault_path).expect("打开库");
+    menghunote_sync::init_journal::load_pending(&vault, None)
+        .expect("读 pending")
+        .map(|pending| pending.phase)
+}
+
+fn corrupt_pending(vault_path: &Path) {
+    let vault = Vault::open(vault_path).expect("打开库");
+    vault
+        .set_meta(
+            menghunote_sync::init_journal::META_INIT_PENDING,
+            b"definitely-not-a-cde-pending",
+        )
+        .expect("写坏 pending");
+}
+
+/// remote 模式：必须显式确认才能保存；保存后提示重启；配置写 ProfileV2；重启后按新
+/// 模式打开（不降级 local_dev）。
+#[gpui::test]
+async fn settings_remote_mode_requires_consent_saves_and_restarts(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("settings-remote");
+    let created = create_instance(&relay, &layout, "inst-settings-remote");
+    write_profile(&layout, &created, "inst-settings-remote");
+    let options =
+        AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-settings-remote");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+    open_settings(&root, cx);
+
+    // 没勾选「远程服务器/HTTPS」→ 拒绝保存，配置原样。
+    root.update(cx, |root, cx| {
+        root.settings_set_mode(menghunote_app::onboarding::RelayMode::RemoteTls, cx);
+        root.settings_set_relay("https://relay.example", cx);
+        root.settings_save(cx);
+    });
+    cx.run_until_parked();
+    let error = root
+        .update(cx, |root, _| root.settings_error().map(str::to_owned))
+        .expect("缺确认必须内联报错");
+    assert!(error.contains("远程服务器"), "{error}");
+    let profile = layout.store().load().expect("读配置").expect("配置存在");
+    assert_eq!(
+        profile
+            .find("inst-settings-remote")
+            .expect("实例条目")
+            .relay_mode,
+        RelayMode::LocalDev,
+        "缺确认不得写 remote_tls"
+    );
+
+    // 勾选后保存：模式/URL 都写入，提示重启生效。
+    root.update(cx, |root, cx| {
+        root.settings_set_remote_consent(true, cx);
+        root.settings_save(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        root.update(cx, |root, _| root.settings_error().map(str::to_owned))
+            .is_none(),
+        "确认后必须能保存"
+    );
+    let notice = root
+        .update(cx, |root, _| root.settings_notice().map(str::to_owned))
+        .expect("保存后必须有提示");
+    assert!(notice.contains("重启后生效"), "{notice}");
+    assert!(notice.contains("不会清 pin"), "{notice}");
+    let profile = layout.store().load().expect("读配置").expect("配置存在");
+    let entry = profile.find("inst-settings-remote").expect("实例条目");
+    assert_eq!(entry.relay_mode, RelayMode::RemoteTls);
+    assert_eq!(entry.relay_url, "https://relay.example");
+
+    // 重启：同一份配置按 remote_tls 打开（vault/identity/pin 都在，不降级）。
+    assert!(cx.simulate_close(), "Main 状态允许关窗（释放实例锁）");
+    cx.run_until_parked();
+    let restarted = cx.update(|window, cx| {
+        let options = AppRootOptions::for_test(
+            layout.clone(),
+            "https://relay.example".to_owned(),
+            "inst-settings-remote",
+        );
+        window.replace_root(cx, move |_window, cx| AppRoot::new(options, cx))
+    });
+    cx.run_until_parked();
+    let root = restarted;
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "重启后必须按保存的 remote 模式打开已存在实例"
+    );
+    assert_eq!(
+        root.update(cx, |root, _| root
+            .active_entry()
+            .map(|entry| entry.relay_mode)),
+        Some(RelayMode::RemoteTls)
+    );
+}
+
+/// 模式与 URL 必须匹配（唯一权威 parser）；非法值不写配置、不回显 userinfo。
+#[gpui::test]
+async fn settings_rejects_mode_mismatched_or_noncanonical_relays(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("settings-mode-url");
+    let created = create_instance(&relay, &layout, "inst-mode-url");
+    write_profile(&layout, &created, "inst-mode-url");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-mode-url");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    open_settings(&root, cx);
+
+    // local_dev + https → 拒绝。
+    root.update(cx, |root, cx| {
+        root.settings_set_relay("https://relay.example", cx);
+        root.settings_save(cx);
+    });
+    cx.run_until_parked();
+    let error = root
+        .update(cx, |root, _| root.settings_error().map(str::to_owned))
+        .expect("local_dev + https 必须拒绝");
+    assert!(error.contains("http"), "{error}");
+
+    // remote_tls + http → 拒绝。
+    root.update(cx, |root, cx| {
+        root.settings_set_mode(menghunote_app::onboarding::RelayMode::RemoteTls, cx);
+        root.settings_set_remote_consent(true, cx);
+        root.settings_set_relay("http://relay.example", cx);
+        root.settings_save(cx);
+    });
+    cx.run_until_parked();
+    let error = root
+        .update(cx, |root, _| root.settings_error().map(str::to_owned))
+        .expect("remote_tls + http 必须拒绝");
+    assert!(error.contains("https"), "{error}");
+
+    // remote_tls + userinfo/path 也拒绝，且不回显口令。
+    for (bad, needle) in [
+        ("https://user:pass@relay.example", "userinfo"),
+        ("https://relay.example/api", "canonical origin"),
+        ("https://relay.example?x=1", "query"),
+    ] {
+        root.update(cx, |root, cx| {
+            root.settings_set_relay(bad, cx);
+            root.settings_save(cx);
+        });
+        cx.run_until_parked();
+        let error = root
+            .update(cx, |root, _| root.settings_error().map(str::to_owned))
+            .expect("非法 remote URL 必须拒绝");
+        assert!(error.contains(needle), "{bad} → {error}");
+        assert!(!error.contains("pass"), "不得回显 userinfo：{error}");
+    }
+
+    // 配置始终没有被写坏。
+    let profile = layout.store().load().expect("读配置").expect("配置存在");
+    let entry = profile.find("inst-mode-url").expect("实例条目");
+    assert_eq!(entry.relay_mode, RelayMode::LocalDev);
+    assert_eq!(entry.relay_url, created.relay_url);
+}
+
+/// 有 pin：设置页显示公开指纹、可复制完整公开值、无秘密/无重置按钮。
+#[gpui::test]
+async fn settings_fingerprint_shows_and_copies_only_public_values(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("settings-fingerprint");
+    let created = create_instance(&relay, &layout, "inst-fingerprint");
+    write_profile(&layout, &created, "inst-fingerprint");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-fingerprint");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    open_settings(&root, cx);
+
+    for selector in [
+        "settings-fingerprint",
+        "settings-fingerprint-headline",
+        "settings-copy-fingerprint",
+        "settings-security-category",
+        "settings-mode-local_dev",
+        "settings-mode-remote_tls",
+    ] {
+        expect_bounds(cx, selector);
+    }
+    // 只读：没有任何重置 pin / 强制信任 / 接受无效证书的按钮。
+    for absent in [
+        "settings-reset-pin",
+        "settings-trust-any",
+        "settings-accept-invalid-cert",
+        "settings-force-trust",
+    ] {
+        assert!(cx.debug_bounds(absent).is_none(), "设置页不得提供 {absent}");
+    }
+    let state = root
+        .update(cx, |root, _| root.settings_fingerprint_state())
+        .expect("设置必须带指纹快照");
+    assert!(state.has_pin(), "Create 后必须已有 durable pin");
+    let headline = state.headline();
+    assert!(headline.contains("durable"), "{headline}");
+    let previous_notice = root.update(cx, |root, _| root.settings_notice().map(str::to_owned));
+    let _ = previous_notice;
+    root.update(cx, |root, cx| root.settings_copy_fingerprint(cx));
+    cx.run_until_parked();
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("复制后剪贴板必须有文本");
+    for forbidden in ["mnrec1", "secret", "root", "private", "token"] {
+        assert!(
+            !copied.to_ascii_lowercase().contains(forbidden),
+            "指纹复制不得含 {forbidden}：{copied}"
+        );
+    }
+    assert!(copied.contains("relay instance"), "{copied}");
+    assert!(copied.contains("record：rev 1"), "{copied}");
+    let notice = root
+        .update(cx, |root, _| root.settings_notice().map(str::to_owned))
+        .expect("复制后必须有提示");
+    assert!(notice.contains("已复制安全指纹"), "{notice}");
+
+    // 公开配置里也不能出现秘密。
+    let raw = std::fs::read_to_string(&layout.config_path).expect("配置存在");
+    for forbidden in ["mnrec1", "secret", "root", "private"] {
+        assert!(!raw.to_ascii_lowercase().contains(forbidden), "{raw}");
+    }
+}
+
+/// 无 pin：显示「未建立信任/NeedsTrust」，不提供自动信任；复制也只给公开说明。
+#[gpui::test]
+async fn settings_fingerprint_without_pin_says_not_trusted(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("settings-no-pin");
+    let created = create_instance(&relay, &layout, "inst-no-pin");
+    // 删掉 durable pin（模拟还没建立信任的历史实例），不动库/身份。
+    {
+        let vault = Vault::open(&created.vault_path).expect("打开库");
+        vault
+            .exec_transaction(
+                &[menghunote_storage::Statement::new(
+                    "DELETE FROM meta WHERE key = ?1",
+                    vec![menghunote_storage::Value::Text(
+                        "sync.control_pin".to_owned(),
+                    )],
+                )],
+                &[],
+            )
+            .expect("删除 pin");
+    }
+    write_profile(&layout, &created, "inst-no-pin");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-no-pin");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "无 pin 仍可打开（未同步）"
+    );
+    open_settings(&root, cx);
+    let state = root
+        .update(cx, |root, _| root.settings_fingerprint_state())
+        .expect("设置必须带指纹快照");
+    assert!(!state.has_pin());
+    let headline = state.headline();
+    assert!(headline.contains("未建立信任"), "{headline}");
+    assert!(headline.contains("NeedsTrust"), "{headline}");
+    assert!(headline.contains("不会自动信任"), "{headline}");
+    assert!(cx.debug_bounds("settings-copy-fingerprint").is_some());
+    expect_bounds(cx, "settings-security-category");
+    for absent in ["settings-reset-pin", "settings-trust-any"] {
+        assert!(cx.debug_bounds(absent).is_none());
+    }
+}
+
+/// v1 公开配置（没有 relay_mode）在启动时**显式迁移**为 v2/local_dev 并写回。
+#[gpui::test]
+async fn v1_profile_is_migrated_on_boot_without_recreating(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("v1-migrate");
+    let created = create_instance(&relay, &layout, "inst-v1");
+    std::fs::create_dir_all(layout.config_path.parent().expect("父目录")).expect("建配置目录");
+    std::fs::write(
+        &layout.config_path,
+        format!(
+            "{{\"version\":1,\"active_instance\":\"inst-v1\",\"instances\":[\
+             {{\"instance_id\":\"inst-v1\",\"relay_url\":\"{}\",\
+             \"vault_path\":\"{}\",\"vault_id\":\"{}\",\"device_id\":\"{}\"}}]}}",
+            created.relay_url,
+            created.vault_path.to_string_lossy(),
+            created.vault_id,
+            created.device_id,
+        ),
+    )
+    .expect("写 v1 配置");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-v1");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+    let raw = std::fs::read_to_string(&layout.config_path).expect("配置必须写回");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("v2 JSON");
+    assert_eq!(value["version"], serde_json::json!(2));
+    assert_eq!(value["instances"][0]["relay_mode"], "local_dev");
+    assert!(created.vault_path.is_file(), "迁移不得重建/删除库");
+}
+
+// ---------------------------------------------------------------------------
+// S3b（ADR 0013）：remote_tls 的真实 TLS Create/Join（进程内 TLS relay + 显式自签根）
+// ---------------------------------------------------------------------------
+
+/// 远端 Create 的 A 侧夹具：真实 TLS relay + 真实 `remote_init::create_remote`。
+struct RemoteCreator {
+    identity: LocalIdentityV1,
+    vault_id: [u8; 16],
+    recovery_code: String,
+    vault_path: PathBuf,
+}
+
+impl RemoteCreator {
+    fn vault_id_hex(&self) -> String {
+        menghunote_sync::ids::hex_of(&self.vault_id)
+    }
+}
+
+/// 远端 A：TLS context（显式注入自签根）+ `create_remote` + 真实身份落盘 + 一篇笔记 + 基线。
+fn create_remote_creator(
+    relay: &DevRelay,
+    layout: &ProfileLayout,
+    instance_id: &str,
+) -> RemoteCreator {
+    let ca = relay.tls_ca_der().expect("必须是 TLS relay").to_vec();
+    let ctx = RelayContext::remote_tls(relay.base_url(), DEFAULT_TRANSPORT_TIMEOUTS)
+        .expect("remote_tls context")
+        .with_test_extra_roots(vec![ca])
+        .expect("注入自签根");
+    let vault_path = layout.vault_path(instance_id).expect("合法实例 id");
+    let store = DevIdentityStore;
+    let persist_path = vault_path.clone();
+    let created = create_remote(
+        ctx.clone(),
+        relay.setup_secret(),
+        &vault_path,
+        "onboarding-ui remote A",
+        move |identity| {
+            store
+                .persist_protected(&persist_path, identity)
+                .map_err(|error| SyncError::Io(format!("dev 身份持久化失败：{error:#}")))
+        },
+    )
+    .expect("远端 A Create 失败");
+    // A 的笔记（结构 + 正文 + sync intent）：B Join 后必须能自动打开它。
+    let peer = created.identity.loro_peer_id();
+    let epoch = created.identity.current_epoch;
+    let mut writer =
+        StructureWriter::open_with_sync(&created.vault, peer, Some(SyncContext::new(peer, epoch)))
+            .expect("打开结构写入口失败");
+    let seed = writer
+        .doc()
+        .create_note("A 的远端笔记", 1)
+        .expect("结构 CRDT 新建笔记失败");
+    writer
+        .commit("onboarding-ui-remote-seed")
+        .expect("结构提交失败");
+    let (doc, head) =
+        load_body_doc(&created.vault, &seed.body_doc_id, peer, None).expect("加载正文文档失败");
+    doc.insert_scalars(0, "A 的远端正文\n")
+        .expect("写入正文失败");
+    let base = head.version_vector().expect("解码 head VV 失败");
+    let update = doc.pending_update(&base).expect("导出正文增量失败");
+    let seq = head.head_seq.saturating_add(1);
+    let intent = local_sync_intent(
+        &seed.body_doc_id,
+        seq,
+        "onboarding-ui-remote-body",
+        SyncContext::new(peer, epoch),
+    )
+    .expect("派生 sync intent 失败");
+    append_updates_with_sync_intents(
+        &created.vault,
+        &seed.body_doc_id,
+        head.head_seq,
+        &[UpdateRecord::new(intent.batch_id.clone(), update)],
+        &[intent],
+    )
+    .expect("正文 + intent 事务失败");
+    // 发布初始基线（两份 checkpoint；B 的 bootstrap 需要它）。
+    let published =
+        DevLocal::publish_initial_pair_with_identity(&ctx, &created.vault, &created.identity)
+            .expect("A 发布基线失败");
+    assert!(published.validated, "初始基线必须真实读回/导入通过");
+    // A 的库句柄在夹具里不再需要（B 用自己的库；pending 夹具会重新打开）。
+    drop(created.vault);
+    RemoteCreator {
+        identity: created.identity,
+        vault_id: created.vault_id,
+        recovery_code: created.recovery_code,
+        vault_path,
+    }
+}
+
+/// 打开 AppRoot 并注入 TLS relay 的自签根（只加显式信任根，不关闭证书校验）。
+fn open_remote_root<'a>(
+    cx: &'a mut TestAppContext,
+    relay: &DevRelay,
+    layout: &ProfileLayout,
+    instance_id: &str,
+) -> (Entity<AppRoot>, &'a mut VisualTestContext) {
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), instance_id);
+    let (root, cx) = open_root(cx, options);
+    let ca = relay.tls_ca_der().expect("必须是 TLS relay").to_vec();
+    root.update(cx, |root, _| root.set_test_relay_roots(vec![ca]));
+    cx.run_until_parked();
+    (root, cx)
+}
+
+/// 填好 remote Create 表单并提交（调用方负责等待终态）。
+fn submit_remote_create(
+    root: &Entity<AppRoot>,
+    cx: &mut VisualTestContext,
+    relay_url: &str,
+    secret: &str,
+    dir: &str,
+) {
+    let relay_url = relay_url.to_owned();
+    let secret = secret.to_owned();
+    let dir = dir.to_owned();
+    root.update(cx, |root, cx| {
+        root.enter_create_form(cx);
+        root.form_set_mode(RelayMode::RemoteTls, cx);
+        root.form_set_remote_consent(true, cx);
+        root.form_set_relay(&relay_url, cx);
+        root.form_set_secret(&secret, cx);
+        root.form_set_dir(&dir, cx);
+        root.form_set_consent(true, cx);
+        root.submit_create(cx);
+    });
+    cx.run_until_parked();
+}
+
+/// 填好 remote Join 表单并提交（调用方负责等待终态）。
+fn submit_remote_join(
+    root: &Entity<AppRoot>,
+    cx: &mut VisualTestContext,
+    relay_url: &str,
+    vault_id: &str,
+    recovery_code: &str,
+    dir: &str,
+) {
+    let relay_url = relay_url.to_owned();
+    let vault_id = vault_id.to_owned();
+    let recovery_code = recovery_code.to_owned();
+    let dir = dir.to_owned();
+    root.update(cx, |root, cx| {
+        root.enter_join_form(cx);
+        root.join_form_set_mode(RelayMode::RemoteTls, cx);
+        root.join_form_set_remote_consent(true, cx);
+        root.join_form_set_relay(&relay_url, cx);
+        root.join_form_set_vault_id(&vault_id, cx);
+        root.join_form_set_recovery_code(&recovery_code, cx);
+        root.join_form_set_dir(&dir, cx);
+        root.submit_join(cx);
+    });
+    cx.run_until_parked();
+}
+
+/// 在已有库上写一条 **remote_tls** 的 pending（测试夹具；覆盖 HTTPS origin/模式编码）。
+fn seed_remote_pending(
+    vault_path: &Path,
+    phase: menghunote_sync::init_journal::InitPhase,
+    origin: &str,
+    vault_id: [u8; 16],
+    device_id: [u8; 16],
+) {
+    use menghunote_sync::init_journal::{
+        advance_phase, begin_pending, load_pending, InitKind, InitPendingV1, InitPhase,
+    };
+    let vault = Vault::open(vault_path).expect("打开夹具库");
+    // 已完成初始化的库没有 pending；这里直接写一条新的 remote pending（模拟崩溃窗口）。
+    assert_eq!(
+        load_pending(&vault, None).expect("读 pending"),
+        None,
+        "夹具库不应已有 pending"
+    );
+    let pending = InitPendingV1::prepared(
+        InitKind::NewGenesis,
+        RelayMode::RemoteTls,
+        origin,
+        vault_id,
+        device_id,
+        1,
+    );
+    begin_pending(&vault, &pending).expect("写 remote pending");
+    match phase {
+        InitPhase::Prepared => {}
+        InitPhase::GenesisRequested => {
+            advance_phase(&vault, InitPhase::Prepared, InitPhase::GenesisRequested)
+                .expect("请求已发");
+        }
+        other => panic!("本夹具只支持 Prepared/GenesisRequested：{other:?}"),
+    }
+}
+
+/// remote 模式：必须显式确认（缺确认不建目录/不联网）；确认后表单可用并显示 DEV 状态。
+#[gpui::test]
+async fn remote_mode_requires_consent_and_shows_dev_status_notice(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start_tls().expect("起进程内 TLS relay 失败");
+    let (_dir, layout) = temp_layout("remote-consent");
+    let (root, cx) = open_remote_root(cx, &relay, &layout, "inst-remote-consent");
+    assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
+
+    let dir = layout
+        .instance_dir("inst-remote-consent")
+        .expect("合法实例 id")
+        .display()
+        .to_string();
+    root.update(cx, |root, cx| {
+        root.enter_create_form(cx);
+        root.form_set_mode(RelayMode::RemoteTls, cx);
+        root.form_set_relay(relay.base_url(), cx);
+        root.form_set_secret(relay.setup_secret(), cx);
+        root.form_set_dir(&dir, cx);
+        root.form_set_consent(true, cx);
+        root.submit_create(cx);
+    });
+    cx.run_until_parked();
+    // 缺「我确认要连接远程服务器」→ 表单内拒绝，不进入后台、不建目录。
+    assert_eq!(state_of(&root, cx), RootStateLabel::CreateForm);
+    let error = root
+        .update(cx, |root, _| root.form_error().map(str::to_owned))
+        .expect("缺远程确认必须给表单错误");
+    assert!(error.contains("远程服务器"), "{error}");
+    assert!(
+        !layout
+            .instance_dir("inst-remote-consent")
+            .expect("目录")
+            .exists(),
+        "缺确认不得建实例目录/库"
+    );
+    assert!(!layout.config_path.exists(), "缺确认不得写配置");
+
+    // 远程模式的 DEV 状态标注（未在真实 relay/Windows 验证）必须可见。
+    root.update(cx, |root, cx| {
+        root.form_set_remote_consent(true, cx);
+    });
+    cx.run_until_parked();
+    expect_bounds(cx, "app-root-remote-dev-notice");
+}
+
+/// remote Create 真实 TLS 全链路：genesis → 强 pin → 备份页 → Main → ProfileV2（remote_tls）
+/// → 设置页指纹 → 重启自动 Main。
+#[gpui::test]
+async fn remote_create_over_tls_writes_remote_profile_pin_and_restarts(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start_tls().expect("起进程内 TLS relay 失败");
+    let (_dir, layout) = temp_layout("remote-create");
+    let instance_id = "inst-remote-create";
+    let (root, cx) = open_remote_root(cx, &relay, &layout, instance_id);
+
+    let dir = layout
+        .instance_dir(instance_id)
+        .expect("合法实例 id")
+        .display()
+        .to_string();
+    submit_remote_create(&root, cx, relay.base_url(), relay.setup_secret(), &dir);
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Working,
+        "remote Create 必须真实进入后台（不再被 S3b 边界拒绝）"
+    );
+    let finished = root.update(cx, |root, cx| {
+        root.wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)
+    });
+    cx.run_until_parked();
+    assert!(finished, "remote Create 必须在预算内到达终态");
+    assert_eq!(state_of(&root, cx), RootStateLabel::BackupRequired);
+    let vault_id = root
+        .update(cx, |root, _| root.vault_id().map(str::to_owned))
+        .expect("备份页必须有 vault_id");
+    let recovery_code = root
+        .update(cx, |root, _| root.recovery_code().map(str::to_owned))
+        .expect("备份页必须有恢复码");
+    assert_eq!(vault_id.len(), 32);
+    assert!(recovery_code.starts_with("mnrec1"));
+    assert!(!layout.config_path.exists(), "备份确认前不得写配置");
+
+    root.update(cx, |root, cx| {
+        root.set_backup_confirmed(true, cx);
+        root.confirm_backup(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+
+    // 配置：ProfileV2 + remote_tls + canonical https origin（不降级 local_dev）。
+    let profile = layout.store().load().expect("读配置").expect("必须有配置");
+    let entry = profile.find(instance_id).expect("实例条目");
+    assert_eq!(entry.relay_mode, RelayMode::RemoteTls);
+    assert_eq!(entry.relay_url, relay.base_url());
+    assert_eq!(entry.vault_id, vault_id);
+    let raw = std::fs::read_to_string(&layout.config_path).expect("读配置原文");
+    for forbidden in ["mnrec1", "recovery", "secret", "manager", "private"] {
+        assert!(
+            !raw.to_ascii_lowercase().contains(forbidden),
+            "公开配置不得出现 {forbidden}：{raw}"
+        );
+    }
+
+    // 强 pin：rev1 + record hash（本地证书复算，TLS 后验证链前缀）。
+    let vault_path = layout.vault_path(instance_id).expect("库路径");
+    let vault_id_bytes = menghunote_sync::ids::parse_hex::<16>(&vault_id).expect("vault id");
+    let pin = {
+        let vault = Vault::open(&vault_path).expect("打开 remote 实例库");
+        menghunote_sync::control_pin::load_control_pin(&vault, vault_id_bytes)
+            .expect("读 pin")
+            .expect("remote Create 必须提交强 pin")
+    };
+    assert_eq!(pin.record.rev, 1);
+    assert!(pin.record.hash.is_some(), "强 pin 必须带 record hash");
+    assert!(pin.bootstrap.is_none(), "genesis 还没有历史锚");
+
+    // 设置页安全指纹出现（只读，无自动信任按钮）。
+    open_settings(&root, cx);
+    expect_bounds(cx, "settings-fingerprint");
+    let fingerprint = root
+        .update(cx, |root, _| root.settings_fingerprint_state())
+        .expect("设置页必须有指纹快照");
+    match fingerprint {
+        menghunote_app::onboarding::FingerprintState::Pin(pin) => {
+            assert_eq!(pin.mode, RelayMode::RemoteTls);
+            assert_eq!(pin.origin, relay.base_url());
+            assert_eq!(pin.record_rev, 1);
+            assert!(pin.record_hash.is_some());
+        }
+        other => panic!("remote Create 后必须显示 pin 指纹：{other:?}"),
+    }
+    root.update(cx, |root, cx| root.close_settings(cx));
+    cx.run_until_parked();
+
+    // 重启：同一份 remote 配置 + 身份 + pin → 自动 Main。
+    assert!(cx.simulate_close(), "Main 状态允许关窗");
+    cx.run_until_parked();
+    let restarted = cx.update(|window, cx| {
+        let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), instance_id);
+        window.replace_root(cx, move |_window, cx| AppRoot::new(options, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(state_of(&restarted, cx), RootStateLabel::Main);
+    assert_eq!(
+        restarted.update(cx, |root, _| root
+            .active_entry()
+            .map(|entry| entry.relay_mode)),
+        Some(RelayMode::RemoteTls)
+    );
+}
+
+/// remote Join 真实 TLS 全链路：A（create_remote + 基线）→ B 用恢复码 Join → Main
+/// 自动打开 A 的笔记 → ProfileV2（remote_tls）→ pin（record + bootstrap 同视图）→ 重启。
+#[gpui::test]
+async fn remote_join_over_tls_opens_creator_note_and_writes_remote_profile(
+    cx: &mut TestAppContext,
+) {
+    ensure_test_user_key();
+    let relay = DevRelay::start_tls().expect("起进程内 TLS relay 失败");
+    let (_dir, layout) = temp_layout("remote-join");
+    let creator = create_remote_creator(&relay, &layout, "inst-remote-a");
+    let instance_id = "inst-remote-b";
+    let (root, cx) = open_remote_root(cx, &relay, &layout, instance_id);
+
+    let dir = layout
+        .instance_dir(instance_id)
+        .expect("合法实例 id")
+        .display()
+        .to_string();
+    submit_remote_join(
+        &root,
+        cx,
+        relay.base_url(),
+        &creator.vault_id_hex(),
+        &creator.recovery_code,
+        &dir,
+    );
+    assert_eq!(state_of(&root, cx), RootStateLabel::Working);
+    let finished = root.update(cx, |root, cx| {
+        root.wait_for_join_terminal(cx, DEFAULT_OPERATION_BUDGET)
+    });
+    cx.run_until_parked();
+    assert!(finished, "remote Join 必须在预算内到达终态");
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "remote Join 成功必须直接进 Main"
+    );
+    // 自动打开 A 的笔记（真实基线导入，不是 mock）。
+    let shell = root
+        .update(cx, |root, _| root.main_shell().cloned())
+        .expect("Main 必须有真实 AppShell");
+    let text = cx
+        .update(|_window, app| shell.read(app).dev_sync_current_text(app))
+        .expect("Join 后必须自动打开第一篇");
+    assert!(
+        text.contains("A 的远端正文"),
+        "正文必须来自 A 的基线：{text:?}"
+    );
+
+    // 配置：remote_tls + canonical origin。
+    let profile = layout.store().load().expect("读配置").expect("必须有配置");
+    let entry = profile.find(instance_id).expect("实例条目");
+    assert_eq!(entry.relay_mode, RelayMode::RemoteTls);
+    assert_eq!(entry.relay_url, relay.base_url());
+    assert_eq!(entry.vault_id, creator.vault_id_hex());
+
+    // pin：record hash + bootstrap 锚（同 rev），说明 Join 用了同一验证视图。
+    let b_vault_path = layout.vault_path(instance_id).expect("库路径");
+    let pin = {
+        let vault = Vault::open(&b_vault_path).expect("打开 B 的库");
+        menghunote_sync::control_pin::load_control_pin(&vault, creator.vault_id)
+            .expect("读 pin")
+            .expect("remote Join 必须提交 durable pin")
+    };
+    assert!(pin.record.hash.is_some(), "Join 必须提交 record hash");
+    let anchor = pin.bootstrap.expect("Join 必须带 bootstrap 锚");
+    assert_eq!(anchor.rev, pin.record.rev, "record 与 bootstrap 必须同视图");
+
+    // 设置页指纹出现。
+    open_settings(&root, cx);
+    expect_bounds(cx, "settings-fingerprint");
+    root.update(cx, |root, cx| root.close_settings(cx));
+    cx.run_until_parked();
+
+    // 重启 → Main。
+    assert!(cx.simulate_close(), "Main 状态允许关窗");
+    cx.run_until_parked();
+    let restarted = cx.update(|window, cx| {
+        let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), instance_id);
+        window.replace_root(cx, move |_window, cx| AppRoot::new(options, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(state_of(&restarted, cx), RootStateLabel::Main);
+}
+
+/// remote 失败路径：未信任 TLS / 错 setup secret → 不建库/不写配置；错误提示安全暂停。
+#[gpui::test]
+async fn remote_create_failures_leave_no_vault_or_profile(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start_tls().expect("起进程内 TLS relay 失败");
+    let (_dir, layout) = temp_layout("remote-create-fail");
+
+    // (a) 未注入自签根 = 系统根拒绝 → TLS 失败且不建库。
+    let instance_id = "inst-remote-untrusted";
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), instance_id);
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    let dir = layout
+        .instance_dir(instance_id)
+        .expect("合法实例 id")
+        .display()
+        .to_string();
+    submit_remote_create(&root, cx, relay.base_url(), relay.setup_secret(), &dir);
+    let finished = root.update(cx, |root, cx| {
+        root.wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)
+    });
+    cx.run_until_parked();
+    assert!(finished);
+    assert_eq!(state_of(&root, cx), RootStateLabel::Error);
+    let title = root
+        .update(cx, |root, _| root.error_title().map(str::to_owned))
+        .expect("Error 页必须有标题");
+    assert!(
+        title.contains("安全暂停"),
+        "TLS 失败必须标安全暂停：{title}"
+    );
+    let message = root
+        .update(cx, |root, _| root.error_message().map(str::to_owned))
+        .expect("Error 页必须有文案");
+    assert!(message.contains("TLS"), "{message}");
+    assert!(
+        !layout.vault_path(instance_id).expect("库路径").exists(),
+        "TLS 失败不得留下库文件"
+    );
+    assert!(!layout.config_path.exists(), "失败不得写配置");
+
+    // (b) 注入自签根但 setup secret 错 → relay 明确拒绝；同样不建库/不写配置。
+    let instance_id = "inst-remote-bad-secret";
+    let (root, cx) = open_remote_root(cx, &relay, &layout, instance_id);
+    let dir = layout
+        .instance_dir(instance_id)
+        .expect("合法实例 id")
+        .display()
+        .to_string();
+    submit_remote_create(&root, cx, relay.base_url(), "wrong-setup-secret", &dir);
+    let finished = root.update(cx, |root, cx| {
+        root.wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)
+    });
+    cx.run_until_parked();
+    assert!(finished);
+    assert_eq!(state_of(&root, cx), RootStateLabel::Error);
+    assert!(
+        !layout.vault_path(instance_id).expect("库路径").exists(),
+        "错 setup secret 不得留下库文件"
+    );
+    assert!(!layout.config_path.exists(), "失败不得写配置");
+}
+
+/// remote Join 失败：错（格式合法）恢复码 → 不建库/不写配置、保留表单公开字段。
+#[gpui::test]
+async fn remote_join_with_wrong_recovery_code_keeps_form_and_leaves_no_vault(
+    cx: &mut TestAppContext,
+) {
+    ensure_test_user_key();
+    let relay = DevRelay::start_tls().expect("起进程内 TLS relay 失败");
+    let (_dir, layout) = temp_layout("remote-join-fail");
+    let creator = create_remote_creator(&relay, &layout, "inst-remote-join-a");
+    let instance_id = "inst-remote-join-b";
+    let (root, cx) = open_remote_root(cx, &relay, &layout, instance_id);
+
+    let wrong_code = RecoverySeed::generate(&mut OsRandom)
+        .expect("生成错误种子")
+        .to_code()
+        .expect("编码错误恢复码")
+        .as_str()
+        .to_owned();
+    let dir = layout
+        .instance_dir(instance_id)
+        .expect("合法实例 id")
+        .display()
+        .to_string();
+    submit_remote_join(
+        &root,
+        cx,
+        relay.base_url(),
+        &creator.vault_id_hex(),
+        &wrong_code,
+        &dir,
+    );
+    let finished = root.update(cx, |root, cx| {
+        root.wait_for_join_terminal(cx, DEFAULT_OPERATION_BUDGET)
+    });
+    cx.run_until_parked();
+    assert!(finished);
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::JoinForm,
+        "失败必须回 Join 表单（可重试）"
+    );
+    let error = root
+        .update(cx, |root, _| root.join_form_error().map(str::to_owned))
+        .expect("必须给表单错误");
+    assert!(
+        error.contains("恢复码") || error.contains("relay 拒绝"),
+        "{error}"
+    );
+    assert!(
+        !error.contains(&wrong_code),
+        "错误文案不得回显恢复码：{error}"
+    );
+    assert_eq!(
+        root.update(cx, |root, cx| root.join_form_vault_id(cx)),
+        Some(creator.vault_id_hex())
+    );
+    assert!(
+        !layout.vault_path(instance_id).expect("库路径").exists(),
+        "错恢复码不得留下库文件"
+    );
+    assert!(!layout.config_path.exists(), "失败不得写配置");
+}
+
+/// 启动对账（remote）：`Prepared` pending 在**不联网**的情况下安全放弃，然后正常进 Main。
+#[gpui::test]
+async fn startup_remote_pending_prepared_is_aborted_without_network(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start_tls().expect("起进程内 TLS relay 失败");
+    let (_dir, layout) = temp_layout("remote-pending-prepared");
+    let creator = create_remote_creator(&relay, &layout, "inst-remote-pending");
+    // 夹具 A 已经完成初始化；再手工塞一条 Prepared 的 remote pending（模拟写前记录后崩溃）。
+    seed_remote_pending(
+        &creator.vault_path,
+        menghunote_sync::init_journal::InitPhase::Prepared,
+        relay.base_url(),
+        creator.vault_id,
+        creator.identity.device_id,
+    );
+    // 公开配置按 remote 模式登记（remote Create 成功后 app 会写这份配置）。
+    let mut profile = DevSyncProfile::default();
+    profile.upsert_active(InstanceEntry {
+        instance_id: "inst-remote-pending".to_owned(),
+        relay_mode: RelayMode::RemoteTls,
+        api_version: RelayApiVersion::V1,
+        relay_url: relay.base_url().to_owned(),
+        vault_path: creator.vault_path.to_string_lossy().into_owned(),
+        vault_id: creator.vault_id_hex(),
+        device_id: menghunote_sync::ids::hex_of(&creator.identity.device_id),
+    });
+    layout.store().save(&profile).expect("写配置失败");
+
+    let options = AppRootOptions::for_test(
+        layout.clone(),
+        relay.base_url().to_owned(),
+        "inst-remote-pending",
+    );
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "Prepared pending 必须被安全放弃（不联网、不重建）后进 Main"
+    );
+    let vault = Vault::open(&creator.vault_path).expect("重开库");
+    assert_eq!(
+        menghunote_sync::init_journal::load_pending(&vault, None).expect("读 pending"),
+        None,
+        "abort 后不得留下 pending"
+    );
+}
+
+/// 启动对账：`Prepared`（请求未发）= 安全放弃；无身份 → Error 恢复页（不重建/不删库）。
+#[gpui::test]
+async fn startup_pending_prepared_is_aborted_and_reports_missing_identity(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("pending-prepared");
+    let created = create_instance(&relay, &layout, "inst-prep");
+    // 崩溃点：写前记录已落盘，但身份文件还没写。
+    std::fs::remove_file(menghunote_app::dev_sync::DevIdentityStore::path_for(
+        &created.vault_path,
+    ))
+    .expect("删除身份");
+    seed_pending(
+        &created.vault_path,
+        menghunote_sync::init_journal::InitPhase::Prepared,
+        &created,
+    );
+    write_profile(&layout, &created, "inst-prep");
+    let before_len = std::fs::metadata(&created.vault_path)
+        .expect("库存在")
+        .len();
+
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-prep");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Error);
+    assert!(
+        !root.update(cx, |root, _| root.has_main_shell()),
+        "对账失败不得启动同步 worker"
+    );
+    assert!(
+        pending_phase(&created.vault_path).is_none(),
+        "Prepared 必须在请求发出前安全放弃（清 pending）"
+    );
+    let after_len = std::fs::metadata(&created.vault_path)
+        .expect("库仍在")
+        .len();
+    assert!(
+        after_len >= before_len,
+        "放弃 pending 不得截断/重建用户库（{before_len} → {after_len}）"
+    );
+    let message = root
+        .update(cx, |root, _| root.error_message().map(str::to_owned))
+        .expect("必须显示错误");
+    assert!(message.contains("身份"), "{message}");
+}
+
+/// 启动对账：`Done` 只清理 pending，随后正常进入 Main（不联网）。
+#[gpui::test]
+async fn startup_pending_done_is_cleared_and_opens_main(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("pending-done");
+    let created = create_instance(&relay, &layout, "inst-done");
+    seed_pending(
+        &created.vault_path,
+        menghunote_sync::init_journal::InitPhase::Done,
+        &created,
+    );
+    write_profile(&layout, &created, "inst-done");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-done");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+    assert!(root.update(cx, |root, _| root.has_main_shell()));
+    assert!(
+        pending_phase(&created.vault_path).is_none(),
+        "Done 必须清理 pending"
+    );
+}
+
+/// 启动对账：请求已发 + 有身份 → 用已有材料补 finalize（不重复 genesis），随后 Done。
+#[gpui::test]
+async fn startup_pending_requested_with_identity_finishes_and_opens(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("pending-pin");
+    let created = create_instance(&relay, &layout, "inst-pin");
+    seed_pending(
+        &created.vault_path,
+        menghunote_sync::init_journal::InitPhase::PinCommitted,
+        &created,
+    );
+    write_profile(&layout, &created, "inst-pin");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-pin");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "已请求 + 有身份必须能补 finalize 并进入 Main"
+    );
+    assert!(
+        pending_phase(&created.vault_path).is_none(),
+        "finalize 后必须 Done + 清理"
+    );
+    assert!(created.vault_path.is_file());
+    assert!(menghunote_app::dev_sync::DevIdentityStore::path_for(&created.vault_path).is_file());
+}
+
+/// 启动对账：损坏 pending → Error（PinCorrupt/ConfigInvalid 类），不自动重建/删库。
+#[gpui::test]
+async fn startup_corrupt_pending_lands_on_error_without_deleting_data(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("pending-corrupt");
+    let created = create_instance(&relay, &layout, "inst-bad-pending");
+    corrupt_pending(&created.vault_path);
+    write_profile(&layout, &created, "inst-bad-pending");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-bad-pending");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Error);
+    assert!(!root.update(cx, |root, _| root.has_main_shell()));
+    let message = root
+        .update(cx, |root, _| root.error_message().map(str::to_owned))
+        .expect("必须显示错误");
+    assert!(message.contains("对账失败"), "{message}");
+    assert!(created.vault_path.is_file(), "不得删除用户库");
+    assert!(
+        menghunote_app::dev_sync::DevIdentityStore::path_for(&created.vault_path).is_file(),
+        "不得删除用户身份"
+    );
+}
+
+/// 无 pending 的普通启动：不因对账联网（relay 指向未监听端口也能进入 Main）。
+#[gpui::test]
+async fn startup_without_pending_does_not_contact_the_relay(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("no-pending-offline");
+    let created = create_instance(&relay, &layout, "inst-offline");
+    assert!(
+        pending_phase(&created.vault_path).is_none(),
+        "Create 成功后 pending 必须已清理"
+    );
+    // 配置指向一个当前没有监听的 loopback 端口：若启动对账擅自联网，这里会失败。
+    let mut offline = created.clone();
+    offline.relay_url = free_loopback_url();
+    write_profile(&layout, &offline, "inst-offline");
+    let options =
+        AppRootOptions::for_test(layout.clone(), offline.relay_url.clone(), "inst-offline");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "无 pending 时启动对账必须纯 no-op（不联网）"
+    );
+    assert!(root.update(cx, |root, _| root.has_main_shell()));
 }

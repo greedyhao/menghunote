@@ -28,10 +28,9 @@
 //! （`proto::SignedControlRecord` / `proto::RotationAborted`）；本模块只保留 relay
 //! 语义类型并委托给 proto，避免两处字段编号漂移。
 
-use rusqlite::Connection;
-
 use crate::error::{Error, Result};
 use crate::ids::Id16;
+use crate::scope::ScopeConn;
 use crate::vault;
 use crate::wire;
 use menghunote_sync_proto as proto;
@@ -116,7 +115,7 @@ impl SignedControlRecord {
 }
 
 /// 追加一条 signed 控制记录，返回控制链新 rev。
-pub fn append(conn: &Connection, now: i64, record: &SignedControlRecord) -> Result<u64> {
+pub fn append(conn: &ScopeConn, now: i64, record: &SignedControlRecord) -> Result<u64> {
     vault::append_control(conn, now, &record.encode()?)
 }
 

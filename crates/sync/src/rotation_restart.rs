@@ -42,6 +42,7 @@ use std::collections::BTreeSet;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::api_version::RelayApi;
 use crate::checkpoint::{AssetSource, PreparedCheckpoint};
 use crate::device::{DeviceSigningKey, ManagementKey};
 use crate::error::SyncError;
@@ -587,7 +588,8 @@ impl core::fmt::Debug for RestartExecution {
 ///   `signed_commit` 以及已激活 resume：新管理 key。
 pub struct HttpRestartManagement<'a, T: HttpTransport> {
     transport: &'a mut T,
-    base: &'a str,
+    /// origin + API 面（路径/签名/管理认证的唯一来源；ADR 0014 S3a）。
+    api: &'a RelayApi,
     vault_id: VaultId,
     instance_id: [u8; 16],
     old_manager: &'a ManagementKey,
@@ -601,7 +603,7 @@ impl<'a, T: HttpTransport> HttpRestartManagement<'a, T> {
     /// [`RestartManagement::adopt_new_manager`] 注入）。
     pub fn new(
         transport: &'a mut T,
-        base: &'a str,
+        api: &'a RelayApi,
         vault_id: VaultId,
         instance_id: [u8; 16],
         manager: &'a ManagementKey,
@@ -609,7 +611,7 @@ impl<'a, T: HttpTransport> HttpRestartManagement<'a, T> {
     ) -> Self {
         Self {
             transport,
-            base,
+            api,
             vault_id,
             instance_id,
             old_manager: manager,
@@ -642,7 +644,7 @@ impl<'a, T: HttpTransport> HttpRestartManagement<'a, T> {
         let manager = self.manager_for(stage)?.clone();
         let (token, _) = crate::recovery_enroll::management_token(
             self.transport,
-            self.base,
+            self.api,
             self.vault_id,
             &manager,
             self.now,
@@ -659,12 +661,10 @@ impl<'a, T: HttpTransport> HttpRestartManagement<'a, T> {
         let response = crate::recovery_enroll::send(
             self.transport,
             "GET",
-            format!(
-                "{}/v1/vaults/{}/rotations/{}",
-                self.base,
-                crate::base64url::encode(&self.vault_id),
-                crate::base64url::encode(rotation_id)
-            ),
+            self.api.url(&self.api.vault_path(
+                &self.vault_id,
+                &format!("/rotations/{}", crate::base64url::encode(rotation_id)),
+            )),
             Some(token),
             Vec::new(),
         )?;
@@ -698,10 +698,12 @@ impl<T: HttpTransport> RestartManagement for HttpRestartManagement<'_, T> {
         // 旧候选 epoch 只能从 restart 前旧 rotation view 读取（restart 响应不含它）。
         let previous = self.previous_rotation_view(&token, &request.previous_rotation_id)?;
 
-        let path = format!(
-            "/v1/vaults/{}/rotations/{}/restart",
-            crate::base64url::encode(&self.vault_id),
-            crate::base64url::encode(&request.previous_rotation_id)
+        let path = self.api.vault_path(
+            &self.vault_id,
+            &format!(
+                "/rotations/{}/restart",
+                crate::base64url::encode(&request.previous_rotation_id)
+            ),
         );
         let body = crate::cbor::encode(Vec::new())?;
         let body_digest: [u8; 32] = Sha256::digest(menghunote_sync_proto::management_request_cde(
@@ -731,7 +733,7 @@ impl<T: HttpTransport> RestartManagement for HttpRestartManagement<'_, T> {
         let response = crate::recovery_enroll::send(
             self.transport,
             "POST",
-            format!("{}{}", self.base, path),
+            self.api.url(&path),
             Some(&token),
             fields,
         )?;
@@ -754,12 +756,13 @@ impl<T: HttpTransport> RestartManagement for HttpRestartManagement<'_, T> {
         // 管理 realm（含管理写入）都可读；丢响应恢复时旧的 POST 已经提交，旧管理 key
         // 仍然有效（activate 之前不会被 relay 拒）。
         let token = self.token_for(ManagerKeyStage::PreActivation)?;
-        let path = format!(
-            "{}/v1/vaults/{}/rotations/current?request_id={}",
-            self.base,
-            crate::base64url::encode(&self.vault_id),
-            crate::base64url::encode(&request_id)
-        );
+        let path = self.api.url(&self.api.vault_path(
+            &self.vault_id,
+            &format!(
+                "/rotations/current?request_id={}",
+                crate::base64url::encode(&request_id)
+            ),
+        ));
         let response =
             crate::recovery_enroll::send(self.transport, "GET", path, Some(&token), Vec::new())?;
         let fields = crate::recovery_enroll::decode(&response)?;
@@ -794,7 +797,7 @@ impl<T: HttpTransport> RestartManagement for HttpRestartManagement<'_, T> {
         // grants 在 activate 之前 stage，relay 此时仍只认旧管理 key。
         stage_grants(
             self.transport,
-            self.base,
+            self.api,
             self.vault_id,
             rotation_id,
             self.old_manager,
@@ -806,7 +809,7 @@ impl<T: HttpTransport> RestartManagement for HttpRestartManagement<'_, T> {
     fn activate(&mut self, input: &ActivationInput) -> Result<ActivatedOutcome, SyncError> {
         match activate_http(
             self.transport,
-            self.base,
+            self.api,
             self.vault_id,
             &self.instance_id,
             self.old_manager,
@@ -846,11 +849,8 @@ impl<T: HttpTransport> RestartManagement for HttpRestartManagement<'_, T> {
         let response = match crate::recovery_enroll::send(
             self.transport,
             "GET",
-            format!(
-                "{}/v1/vaults/{}/rotations/current",
-                self.base,
-                crate::base64url::encode(&self.vault_id)
-            ),
+            self.api
+                .url(&self.api.vault_path(&self.vault_id, "/rotations/current")),
             Some(&token),
             Vec::new(),
         ) {
@@ -901,11 +901,8 @@ impl<T: HttpTransport> RestartManagement for HttpRestartManagement<'_, T> {
         let response = crate::recovery_enroll::send(
             self.transport,
             "GET",
-            format!(
-                "{}/v1/vaults/{}/control?after_rev=0",
-                self.base,
-                crate::base64url::encode(&self.vault_id)
-            ),
+            self.api
+                .url(&self.api.vault_path(&self.vault_id, "/control?after_rev=0")),
             Some(&token),
             Vec::new(),
         )?;

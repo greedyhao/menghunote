@@ -256,6 +256,7 @@ async fn app_shell_uses_identity_peer_for_structure_and_session(cx: &mut TestApp
     // 3) 真实 AppShell（dev-sync 启用路径，显式注入身份 peer + epoch）。
     let vault = dev.vault.clone();
     let config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     };
@@ -366,5 +367,124 @@ async fn app_shell_uses_identity_peer_for_structure_and_session(cx: &mut TestApp
     assert!(
         !structure_peers.contains(&dev_vault::DEV_PEER_ID),
         "结构写入不得再用默认常量 1，实际 VV peers = {structure_peers:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5) 轮换身份写回（ADR 0009 Phase 2 切片 6a）：原子替换 + 同 vault/device 约束
+// ---------------------------------------------------------------------------
+
+/// `DevIdentityStore::replace_protected` 的契约：
+///
+/// - 只允许**同 vault / 同 device** 的身份替换（轮换/apply 只推进 epoch/root/pin）；
+/// - 成功：MNID 外层不变、可重载、新字节真的落盘、目录里没有临时文件残留；
+/// - 失败（不同 device/vault、目标缺失/损坏）：**旧文件逐字节不变**，不半写。
+#[test]
+fn replace_protected_is_atomic_and_only_accepts_same_vault_device() {
+    ensure_test_user_key();
+    let dir = temp_root("replace");
+    let vault_path = dir.path().join("vault.sqlite3");
+    let store = DevIdentityStore;
+    let base = DevIdentityStore::load_or_create(&vault_path).expect("创建 dev identity 失败");
+    let path = DevIdentityStore::path_for(&vault_path);
+    let before = std::fs::read(&path).expect("读身份文件失败");
+
+    // 同 vault/device、只推进 epoch/control_rev（轮换/apply 之后就是这种形状）。
+    // `LocalIdentityV1` 刻意不实现 `Clone`（秘密不复制）：从磁盘再解封一份。
+    let mut promoted = store.load(&vault_path).expect("重新解封身份失败");
+    promoted.current_epoch = base.current_epoch + 1;
+    promoted.control_rev = base.control_rev + 3;
+    store
+        .replace_protected(&path, &promoted)
+        .expect("同 vault/device 的替换必须成功");
+
+    let after = std::fs::read(&path).expect("替换后读身份文件失败");
+    assert_ne!(before, after, "新身份必须真的写进身份文件");
+    assert_eq!(&after[..4], b"MNID", "MNID 外层格式不得变化");
+    assert_eq!(after[4], 1, "header 版本不得变化");
+    let reloaded = store.load(&vault_path).expect("替换后的身份必须可重载");
+    assert_eq!(reloaded.current_epoch, promoted.current_epoch);
+    assert_eq!(reloaded.control_rev, promoted.control_rev);
+    assert_eq!(reloaded.device_id, base.device_id);
+    assert_eq!(
+        reloaded.loro_peer_id(),
+        base.loro_peer_id(),
+        "替换不得改变 peer（peer 是设备的稳定映射）"
+    );
+    assert!(
+        reloaded.current_root.ct_eq(&base.current_root),
+        "本用例只换 epoch 元数据，根不变"
+    );
+
+    // 失败路径都不能碰旧文件；成功路径不留临时文件。
+    for entry in std::fs::read_dir(dir.path()).expect("读实例目录失败") {
+        let name = entry
+            .expect("目录项")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            !name.starts_with(".dev-identity.bin"),
+            "身份替换不得残留临时文件：{name}"
+        );
+    }
+
+    // 换设备：拒绝，且旧文件逐字节不变。
+    let mut other_device = store.load(&vault_path).expect("重新解封身份失败");
+    other_device.device_id = [0xab; 16];
+    let error = store
+        .replace_protected(&path, &other_device)
+        .expect_err("不同 device 的替换必须拒绝");
+    assert!(
+        error.to_string().contains("vault/device"),
+        "拒绝原因必须说清同 vault/device 约束：{error}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("拒绝后读身份文件失败"),
+        after,
+        "拒绝替换时旧文件必须逐字节不变"
+    );
+
+    // 换库：同样拒绝。
+    let mut other_vault = store.load(&vault_path).expect("重新解封身份失败");
+    other_vault.vault_id = [0xcd; 16];
+    let error = store
+        .replace_protected(&path, &other_vault)
+        .expect_err("不同 vault 的替换必须拒绝");
+    assert!(
+        error.to_string().contains("vault/device"),
+        "拒绝原因必须说清同 vault/device 约束：{error}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("拒绝后读身份文件失败"),
+        after,
+        "拒绝替换时旧文件必须逐字节不变"
+    );
+
+    // 目标不存在：替换语义不负责创建（Create/Join 才创建身份）。
+    let missing = dir.path().join("missing-identity.bin");
+    let error = store
+        .replace_protected(&missing, &promoted)
+        .expect_err("目标不存在必须拒绝");
+    assert!(
+        error.to_string().contains("不存在"),
+        "错误必须说清目标缺失：{error}"
+    );
+    assert!(!missing.exists(), "拒绝不得凭空创建身份文件");
+
+    // 损坏的 header：拒绝，旧文件保留。
+    let corrupt_path = dir.path().join("corrupt-identity.bin");
+    std::fs::write(&corrupt_path, b"NOT-MNID").expect("写损坏身份失败");
+    let error = store
+        .replace_protected(&corrupt_path, &promoted)
+        .expect_err("损坏身份必须拒绝替换");
+    assert!(
+        error.to_string().contains("header") || error.to_string().contains("magic"),
+        "错误必须点明 header/magic 损坏：{error}"
+    );
+    assert_eq!(
+        std::fs::read(&corrupt_path).expect("读损坏身份失败"),
+        b"NOT-MNID",
+        "拒绝替换不得改写损坏文件（不覆盖、不迁移、不删除）"
     );
 }

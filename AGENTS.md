@@ -363,8 +363,26 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **自动同步（ADR 0012 S1–S3，2026-11-13，HEAD `ce31854`）**：两阶段（网络不持闸、
 > integrate/adopt 短持闸）+ 编辑 debounce 2s/周期 45s/退避 + 状态栏 + 重启待应用恢复；
 > 手动同步与发布/设备命令优先。并行测试改为显式事件收敛（连续 10 次全绿）。
+> **轮换 UI（ADR 0009 Phase 2 / 切片 6a–6b）**：设备面板「轮换密钥…」/「应用轮换」、
+> 确认/警告、可选恢复码重封装、signed revoke；轮换期间整段持闸，成功后重建活动视图切新 epoch。
+> **生产 relay 机制（ADR 0013 S1–S3b）**：ProfileV2 的 `local_dev|remote_tls`、唯一 URL parser、
+> durable `sync.control_pin`（record+bootstrap 各自 rev/CAS）、`RelayContext` 统一全部操作、
+> remote Create/Join 走受限 `InitSession`、安全指纹与 SecurityPaused、启动 pending 对账；
+> 离线 TLS harness 真跑。**真实鉴权 relay/Windows/DPAPI/TLS 系统根仍未验，不打生产 tag。**
+> **附件（开发版）**：路径输入 → 资产 + `asset://` 链接；普通/自动同步增量上传资产，
+> B 可取字节；无内联预览/拖放/系统对话框，无资产 GC。
+> **Windows 真机（2026-11-14，用户确认）**：dev-sync Create/Join/自动同步闭环正常；
+> TLS/remote_tls 未测（按用户要求后置）。
+> **邀请链接（ADR 0014 S1）**：创建端生成 15min 一次性 `mn-pair://join?...`（token 仅
+> fragment）；加入端 redeem 为 PENDING（durable、可重启，token 不落盘）；创建端批准后
+> 加入端取 self grant/bootstrap 进 Main。
+> **多 vault（ADR 0014 S2–S3b，2026-11-14，HEAD `2e028fb`）**：relay schema 11、
+> 22 张租户表带 `vault_id` + `VaultScope`、v1→v10→v11 迁移；`/v2` 全数据面 +
+> 一次性创建票据 + v2 租户鉴权/限流；客户端 `api_version`（v1 默认，v2 显式）、
+> `mn-pair://create` 票据创建、同 relay 多实例、v2 邀请链接 `api=2`。
 > 手工步骤见 [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md)；
-> app feature 300 / 默认 134 / sync 451+1 / storage 171。**Windows 真机未验**；轮换/metadata 属后续。
+> app feature 365 / 默认 134 / sync 579+1 / relay 246 / storage 173。
+> **Windows 多 vault/创建链接真机未验；S4 能力授权未做；真实 TLS/鉴权 relay 后置。**
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
 - **版本管理**：当前开发分支 **`dev`**（2026-11-11 重建：折叠全部 `wip:`，0 wip，36 条提交）；

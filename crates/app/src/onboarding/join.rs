@@ -3,11 +3,20 @@
 //! ## 顺序（硬约束，与 Create 同构）
 //!
 //! ```text
-//! Worker 线程
-//!   1. DevLocal::join（恢复码自批设备 + bootstrap 导入基线；先联网后落地）
+//! Worker 线程（local_dev）：
+//!   1. DevLocal::join_deferring_identity（恢复码自批设备 + bootstrap 导入基线）
 //!   2. DevIdentityStore::persist_protected（受保护身份落盘）
+//!   3. 推进 pending（IdentityWritten → Done）→ 把 Vault + 公开事实交回 UI
+//!
+//! Worker 线程（remote_tls，ADR 0013 S3b）：
+//!   1. remote_init::join_remote（production TLS：self_enroll → 认证 bootstrap →
+//!      身份回调落盘 → `IdentityWritten` → record/bootstrap 同视图强 pin）
+//!   2. 身份回调就是 DevIdentityStore::persist_protected（原子 rename）
 //!   3. 把 Vault + 公开事实交回 UI（Main 直接打开第一篇）
 //! ```
+//!
+//! `remote_tls` 的清理语义由 `remote_init` 决定（拿不到身份材料之前失败 → 清本次新库；
+//! 拿到身份材料之后失败，含身份落盘失败 → 保留 pending/库与已落盘事实，不删用户数据）。
 //!
 //! 与 Create 的差别只有两点：**没有一次性恢复码要展示**（用户自己输入的），以及
 //! `join` 成功后**立即**写公开配置并进 Main（没有备份确认页）。身份仍必须先受保护
@@ -50,10 +59,16 @@ use zeroize::Zeroizing;
 
 use menghunote_storage::Vault;
 use menghunote_sync::dev_local::DevLocal;
+use menghunote_sync::http_transport::DEFAULT_TRANSPORT_TIMEOUTS;
+use menghunote_sync::identity::LocalIdentityV1;
+use menghunote_sync::relay_context::RelayContext;
+use menghunote_sync::relay_policy::RelayMode;
+use menghunote_sync::remote_init::join_remote;
 use menghunote_sync::SyncError;
 
 use super::lock::InstanceLock;
 use super::sanitize_error;
+use crate::dev_sync::{classify_sync_error, FailureClass, SecurityCategory};
 
 /// worker 线程名（诊断用；日志里出现时一眼能认出是谁）。
 const WORKER_THREAD_NAME: &str = "menghunote-onboarding-join";
@@ -92,6 +107,10 @@ pub enum JoinFailureKind {
     NoBaseline,
     /// relay 不可达或超时（连接被拒、读超时、5xx）。
     Unreachable,
+    /// TLS 端点认证失败（证书链/主机名/有效期/信任根；ADR 0013 §4）。
+    ///
+    /// **不提供**忽略证书/一键信任；`remote_tls` 只能用系统信任根（或显式导入的私有 CA）。
+    Tls,
     /// 其它（本地存储/身份封装/未预期错误）。
     Other,
 }
@@ -111,7 +130,10 @@ impl JoinFailureKind {
                 "relay 上没有可用的初始基线：若 vault_id 写错请核对；若实例刚创建，请创建者先在同步面板点「发布基线」（需要两份 checkpoint），再重试"
             }
             Self::Unreachable => {
-                "relay 不可达或超时：请确认 relay 已启动、地址是 loopback 明文（例如 http://127.0.0.1:18080），然后重试"
+                "relay 不可达或超时：请确认 relay 已启动、地址与模式匹配（local_dev 是 loopback 明文；remote_tls 是 HTTPS），然后重试"
+            }
+            Self::Tls => {
+                "TLS 端点认证失败（证书链/主机名/有效期）：核对 relay 域名与系统时间；本程序不提供忽略证书或一键信任"
             }
             Self::Other => "加入失败",
         }
@@ -130,8 +152,10 @@ impl JoinFailureKind {
 pub struct JoinRequest {
     /// 目标库文件路径（实例目录里的 `vault.sqlite3`）。
     pub vault_path: std::path::PathBuf,
-    /// relay 基地址（公开，已在校验阶段确认是 loopback）。
+    /// relay 基地址（公开；local_dev 是 loopback 明文，remote_tls 是 HTTPS canonical origin）。
     pub relay_url: String,
+    /// relay 接入模式（ADR 0013 §1：显式配置，不从 URL 猜）。
+    pub relay_mode: RelayMode,
     /// 服务器 vault id（16B；公开标识，成功后会以 32 位十六进制写进配置）。
     pub vault_id: [u8; 16],
     /// 用户输入的 vault id 文本（公开标识；只用于错误文案，原样是十六进制）。
@@ -140,6 +164,8 @@ pub struct JoinRequest {
     pub recovery_code: Zeroizing<String>,
     /// 实例目录锁（移交给 worker，保证加入期间独占）。
     pub lock: InstanceLock,
+    /// **测试专用**：远程初始化追加的显式信任根（DER；本地 TLS harness）。
+    pub test_extra_roots: Vec<Vec<u8>>,
 }
 
 /// Join 成功后的产物。
@@ -152,6 +178,10 @@ pub struct JoinOutcome {
     pub lock: InstanceLock,
     /// 库文件路径。
     pub vault_path: std::path::PathBuf,
+    /// 本次实例的 relay 模式（写 ProfileV2；remote_tls 不降级 local_dev）。
+    pub relay_mode: RelayMode,
+    /// canonical relay origin（公开；写 ProfileV2）。
+    pub relay_url: String,
     /// 服务器 vault id（32 位十六进制）。
     pub vault_id: String,
     /// 本机设备 id（32 位十六进制）。
@@ -160,15 +190,20 @@ pub struct JoinOutcome {
     pub peer_id: u64,
     /// 持久身份的当前 key epoch。
     pub key_epoch: u64,
+    /// 非致命告警（身份已落盘但 pending 收尾失败：重启对账补齐，不丢实例）。
+    pub warning: Option<String>,
 }
 
 impl JoinOutcome {
     /// 公开事实（可写进配置的那部分；**不含**恢复码/root/私钥）。
     #[must_use]
-    pub fn public_facts(&self, instance_id: &str, relay_url: &str) -> super::layout::InstanceEntry {
+    pub fn public_facts(&self, instance_id: &str) -> super::layout::InstanceEntry {
         super::layout::InstanceEntry {
             instance_id: instance_id.to_owned(),
-            relay_url: relay_url.to_owned(),
+            relay_mode: self.relay_mode,
+            // S3a：现有 Create/Join/Invite 流程仍是 v1 wire（v2 票据创建是库级入口）。
+            api_version: super::layout::RelayApiVersion::V1,
+            relay_url: self.relay_url.clone(),
             vault_path: self.vault_path.to_string_lossy().into_owned(),
             vault_id: self.vault_id.clone(),
             device_id: self.device_id.clone(),
@@ -188,6 +223,9 @@ pub enum JoinEvent {
         kind: JoinFailureKind,
         /// 已脱敏的完整文案（调用方直接显示）。
         message: String,
+        /// 安全类失败（TLS/NeedsTrust/Equivocation/InstanceMismatch/PinCorrupt）；
+        /// 与 autosync 的 `SecurityPaused` 同一分类，**不自动信任/重试**。
+        security: Option<SecurityCategory>,
     },
 }
 
@@ -215,32 +253,43 @@ impl JoinJob {
         let JoinRequest {
             vault_path,
             relay_url,
+            relay_mode,
             vault_id,
             vault_id_hex,
             recovery_code,
             lock,
+            test_extra_roots,
         } = request;
         let thread = thread::Builder::new()
             .name(WORKER_THREAD_NAME.to_owned())
             .spawn(move || {
                 let events = tx;
-                match run_join(
-                    &relay_url,
-                    &vault_id,
-                    &vault_id_hex,
-                    &recovery_code,
-                    &vault_path,
-                    lock,
-                    &events,
-                ) {
+                let boot = JoinBoot {
+                    relay_url: &relay_url,
+                    relay_mode,
+                    vault_id: &vault_id,
+                    vault_id_hex: &vault_id_hex,
+                    recovery_code: &recovery_code,
+                    test_extra_roots: &test_extra_roots,
+                };
+                match run_join(boot, &vault_path, lock, &events) {
                     Ok(outcome) => drop(events.send(JoinEvent::Finished(Box::new(outcome)))),
                     Err(failure) => {
+                        // 先释放实例锁再发终态：UI 收到 Failed 后可以立刻重试；
+                        // 反过来（先发事件）会留下“终态已到、锁还占着”的窗口，
+                        // 快速重试会误报“另一进程占用”。
+                        let Failure {
+                            kind,
+                            message,
+                            security,
+                            lock,
+                        } = failure;
+                        drop(lock);
                         drop(events.send(JoinEvent::Failed {
-                            kind: failure.kind,
-                            message: failure.message,
+                            kind,
+                            message,
+                            security,
                         }));
-                        // 失败时锁随局部变量 drop（删掉本次自己创建的锁文件）。
-                        drop(failure.lock);
                     }
                 }
             })?;
@@ -267,63 +316,195 @@ impl JoinJob {
 struct Failure {
     kind: JoinFailureKind,
     message: String,
+    /// 安全类失败（在包装成文案之前按 `SyncError` 分类）。
+    security: Option<SecurityCategory>,
     lock: InstanceLock,
 }
 
-/// worker 线程主体：join → 身份落盘 → outcome。
+/// 把 `SyncError` 映射成 UI 的安全暂停类别（与 autosync 的 `SecurityPaused` 同一映射）。
+fn security_of(error: &SyncError) -> Option<SecurityCategory> {
+    match classify_sync_error(error) {
+        FailureClass::Security(category) => Some(category),
+        FailureClass::Retryable | FailureClass::NeedsAttention => None,
+    }
+}
+
+/// worker 线程的公开/秘密输入（把"同一批字段"收成一个结构，避免长参数列表）。
+struct JoinBoot<'a> {
+    relay_url: &'a str,
+    relay_mode: RelayMode,
+    vault_id: &'a [u8; 16],
+    vault_id_hex: &'a str,
+    recovery_code: &'a str,
+    test_extra_roots: &'a [Vec<u8>],
+}
+
+/// worker 线程主体：远端/local_dev 两条编排 → 身份落盘 → outcome。
 fn run_join(
-    relay_url: &str,
-    vault_id: &[u8; 16],
-    vault_id_hex: &str,
-    recovery_code: &str,
+    boot: JoinBoot<'_>,
     vault_path: &std::path::Path,
     lock: InstanceLock,
     events: &mpsc::Sender<JoinEvent>,
 ) -> Result<JoinOutcome, Failure> {
+    let JoinBoot {
+        relay_url,
+        relay_mode,
+        vault_id,
+        vault_id_hex,
+        recovery_code,
+        test_extra_roots,
+    } = boot;
     let _ = events.send(JoinEvent::Progress(JoinStage::Bootstrap));
-    let joined = match DevLocal::join(relay_url, vault_id, recovery_code, vault_path) {
-        Ok(joined) => joined,
+
+    // 0) 先按模式构造 context（非法 URL/模式在**建库之前**失败；测试可注入自签根）。
+    let context = match RelayContext::from_mode(relay_mode, relay_url, DEFAULT_TRANSPORT_TIMEOUTS)
+        .and_then(|context| {
+            if test_extra_roots.is_empty() {
+                Ok(context)
+            } else {
+                context.with_test_extra_roots(test_extra_roots.iter())
+            }
+        }) {
+        Ok(context) => context,
         Err(error) => {
-            // 先把**底层**错误分类（`anyhow` 包装后就再也 downcast 不回去了）。
             let kind = classify_join_error(&error);
             let error = anyhow::Error::new(error).context(format!(
-                "Join 失败（relay = {relay_url}，vault_id = {vault_id_hex}，路径 = {}）",
+                "Join 失败（模式 {relay_mode:?}，relay = {relay_url}，vault_id = {vault_id_hex}，路径 = {}）",
                 vault_path.display()
             ));
             return Err(Failure {
                 kind,
                 message: failure_message(kind, &error, recovery_code),
+                security: None,
                 lock,
             });
         }
     };
-
-    let _ = events.send(JoinEvent::Progress(JoinStage::PersistingIdentity));
+    let canonical_relay = context.origin_str();
     let store = crate::dev_sync::DevIdentityStore;
-    if let Err(error) = store.persist_protected(vault_path, &joined.identity) {
-        // 身份没落盘 = 本次加入无效：关库后清掉本次新建的库/身份文件（目录保留）。
-        drop(joined.vault);
-        cleanup_created_files(vault_path);
-        let error = error.context(format!(
-            "设备身份持久化失败（已清理本次新建的库文件/身份文件；实例目录保留：{}）",
-            vault_path.display()
-        ));
-        return Err(Failure {
-            kind: JoinFailureKind::Other,
-            message: failure_message(JoinFailureKind::Other, &error, recovery_code),
-            lock,
-        });
-    }
+
+    let joined: JoinedData = match relay_mode {
+        RelayMode::LocalDev => {
+            // ADR 0013 S3a：pending 停在 `PinCommitted`，身份 rename 成功后推进 `IdentityWritten → Done`。
+            let joined = match DevLocal::join_deferring_identity(
+                relay_url,
+                vault_id,
+                recovery_code,
+                vault_path,
+            ) {
+                Ok(joined) => joined,
+                Err(error) => {
+                    // 先把**底层**错误分类（`anyhow` 包装后就再也 downcast 不回去了）。
+                    let kind = classify_join_error(&error);
+                    let security = security_of(&error);
+                    let error = anyhow::Error::new(error).context(format!(
+                        "Join 失败（relay = {relay_url}，vault_id = {vault_id_hex}，路径 = {}）",
+                        vault_path.display()
+                    ));
+                    return Err(Failure {
+                        kind,
+                        message: failure_message(kind, &error, recovery_code),
+                        security,
+                        lock,
+                    });
+                }
+            };
+
+            let _ = events.send(JoinEvent::Progress(JoinStage::PersistingIdentity));
+            if let Err(error) = store.persist_protected(vault_path, &joined.identity) {
+                // 身份没落盘 = 本次加入无效：关库后清掉本次新建的库/身份文件（目录保留）。
+                drop(joined.vault);
+                cleanup_created_files(vault_path);
+                let error = error.context(format!(
+                    "设备身份持久化失败（已清理本次新建的库文件/身份文件；实例目录保留：{}）",
+                    vault_path.display()
+                ));
+                return Err(Failure {
+                    kind: JoinFailureKind::Other,
+                    message: failure_message(JoinFailureKind::Other, &error, recovery_code),
+                    security: None,
+                    lock,
+                });
+            }
+            // 身份已原子落盘：推进 pending；失败不删数据（启动对账会用身份补齐 finalize）。
+            let warning =
+                match menghunote_sync::init_session::mark_identity_written(&joined.vault)
+                    .and_then(|()| {
+                        menghunote_sync::init_session::finish_identity_written(&joined.vault)
+                    }) {
+                    Ok(()) => None,
+                    Err(error) => Some(format!(
+                        "身份已落盘，但初始化 pending 收尾失败（{error}）：实例保留可用，重启后会启动对账补齐；\
+                         本次启动的同步可能被 pending 保护挡住"
+                    )),
+                };
+            JoinedData {
+                vault: joined.vault,
+                identity: joined.identity,
+                vault_id: joined.vault_id,
+                warning,
+            }
+        }
+        RelayMode::RemoteTls => {
+            // ADR 0013 S3b：受限初始化 + 身份回调；失败清理语义由 `remote_init` 决定。
+            let progress = events.clone();
+            let joined = join_remote(
+                context,
+                *vault_id,
+                recovery_code,
+                vault_path,
+                move |identity: &LocalIdentityV1| {
+                    let _ = progress.send(JoinEvent::Progress(JoinStage::PersistingIdentity));
+                    store
+                        .persist_protected(vault_path, identity)
+                        .map_err(|error| SyncError::Io(format!("dev 身份持久化失败：{error:#}")))
+                },
+            );
+            match joined {
+                Ok(joined) => JoinedData {
+                    vault: joined.vault,
+                    identity: joined.identity,
+                    vault_id: joined.vault_id,
+                    warning: joined.warning,
+                },
+                Err(error) => {
+                    let kind = classify_join_error(&error);
+                    let security = security_of(&error);
+                    let error = anyhow::Error::new(error).context(format!(
+                        "远端 Join 失败（模式 remote_tls，relay = {canonical_relay}，vault_id = {vault_id_hex}，路径 = {}）",
+                        vault_path.display()
+                    ));
+                    return Err(Failure {
+                        kind,
+                        message: failure_message(kind, &error, recovery_code),
+                        security,
+                        lock,
+                    });
+                }
+            }
+        }
+    };
 
     Ok(JoinOutcome {
         vault: joined.vault,
         lock,
         vault_path: vault_path.to_path_buf(),
+        relay_mode,
+        relay_url: canonical_relay,
         vault_id: menghunote_sync::ids::hex_of(&joined.vault_id),
         device_id: menghunote_sync::ids::hex_of(&joined.identity.device_id),
         peer_id: joined.identity.loro_peer_id(),
         key_epoch: joined.identity.current_epoch,
+        warning: joined.warning,
     })
+}
+
+/// 两条编排的共同产物（避免在末尾对两套类型重复取值）。
+struct JoinedData {
+    vault: Vault,
+    identity: LocalIdentityV1,
+    vault_id: [u8; 16],
+    warning: Option<String>,
 }
 
 /// 把 `DevLocal::join` 的底层错误映射成用户可操作的类别。
@@ -335,6 +516,8 @@ pub fn classify_join_error(error: &SyncError) -> JoinFailureKind {
     match error {
         // 恢复码 Bech32m/长度非法：在任何网络请求之前。
         SyncError::RecoveryCode(_) => JoinFailureKind::RecoveryCodeFormat,
+        // TLS 链/主机名/有效期失败（ADR 0013 §4）：明确显示，不自动信任。
+        SyncError::Tls(_) | SyncError::TransportPolicy(_) => JoinFailureKind::Tls,
         // 连接被拒/读超时/响应截断。
         SyncError::Transport(_) => JoinFailureKind::Unreachable,
         SyncError::RelayApi {
@@ -443,6 +626,15 @@ mod tests {
             )),
             JoinFailureKind::NoBaseline
         );
+        // TLS 端点认证失败：明确显示，不自动信任。
+        assert_eq!(
+            classify_join_error(&SyncError::Tls("invalid peer certificate".to_owned())),
+            JoinFailureKind::Tls
+        );
+        assert_eq!(
+            classify_join_error(&SyncError::TransportPolicy("https→http".to_owned())),
+            JoinFailureKind::Tls
+        );
         // 不可达 / 5xx / 瞬时。
         assert_eq!(
             classify_join_error(&SyncError::Transport("连接被拒")),
@@ -502,6 +694,7 @@ mod tests {
             JoinFailureKind::Credentials,
             JoinFailureKind::NoBaseline,
             JoinFailureKind::Unreachable,
+            JoinFailureKind::Tls,
             JoinFailureKind::Other,
         ] {
             assert!(!kind.hint().is_empty(), "{kind:?} 必须有文案");

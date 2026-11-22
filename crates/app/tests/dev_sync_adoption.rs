@@ -339,6 +339,7 @@ async fn app_shell_adopts_external_commit_without_reopening(cx: &mut TestAppCont
     let writer = dev.vault.clone();
     let vault = dev.vault.clone();
     let config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     };
@@ -471,6 +472,7 @@ async fn adopt_failures_keep_text_and_held_then_cancel_releases(cx: &mut TestApp
     let writer = dev.vault.clone();
     let vault = dev.vault.clone();
     let config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     };

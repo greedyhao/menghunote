@@ -26,11 +26,16 @@
 // 除 DPAPI 的 Win32 FFI（`dpapi.rs` 内 `#[allow(unsafe_code)]`）外，本 crate 不用 unsafe。
 #![deny(unsafe_code)]
 
+pub mod api_version;
+pub(crate) mod asset_sync;
 pub mod base64url;
 pub mod bootstrap;
 pub mod cbor;
 pub mod checkpoint;
+pub mod control_pin;
+pub mod create_link;
 pub mod dev_local;
+pub mod dev_local_rotation;
 pub mod device;
 pub mod device_management;
 pub mod domain;
@@ -44,12 +49,18 @@ pub mod http_transport;
 pub mod identity;
 pub mod identity_wrap;
 pub mod ids;
+pub mod init_journal;
+pub mod init_session;
+pub mod invite_link;
 pub mod kdf;
 pub mod keys;
 pub mod random;
 pub mod recovery;
 pub mod recovery_enroll;
 pub mod relay;
+pub mod relay_context;
+pub mod relay_policy;
+pub mod remote_init;
 pub mod rotation;
 pub mod rotation_activate;
 pub mod rotation_apply;

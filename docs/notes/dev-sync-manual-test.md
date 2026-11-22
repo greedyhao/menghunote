@@ -330,7 +330,46 @@ B pull/integrate。
 
 ⚠️ 这条操作的真相就是警告里写的：**它不是密码学撤销**，也不撤销管理权（若目标持有
 `manager_seed`/恢复码，它仍可能管理认证）。真要隔离管理密钥，得**显式轮换**——
-轮换入口是下一片（Phase 2），本片**不提供**。
+入口见下一节（§2.11，ADR 0009 Phase 2 切片 6b）。
+
+### 2.11 轮换密钥 / 应用轮换（ADR 0009 Phase 2 切片 6b）
+
+仍用 §2 的 A（Create，管理设备）/B（Join，普通设备）两个实例；A/B 都要**打开一篇笔记**
+（轮换与 apply 都在活动文档上持闸冻结，空库/没打开笔记时按钮置灰并提示"请先打开一篇"）。
+
+1. **A 点「轮换密钥…」**（面板设备列表区域）→ 只展开二次确认，**还没有**任何写入：
+   - 固定文案（一字不改）：轮换会用新密钥重新加密整库，并生成两份候选基线；旧 epoch
+     数据不能再被新设备解密；被移除设备仍可解其已获得的数据；轮换期间输入会冻结。是否继续？
+   - `重新封装恢复码（推荐）`：默认勾选。勾选时下面出现**恢复码输入框**（遮罩显示 `•`，
+     可粘贴 `Ctrl+V` / `Shift+Insert`，不显示明文、不进日志）；不勾选时出现固定警告
+     `轮换后新设备将无法用恢复码加入`。
+   - `同时把已移除设备写入签名撤销列表`：默认勾选（ADR 0010）。**不需要手选设备**：
+     面板把当前设备列表里 `已移除` 的行收集进 signed revoke 列表。
+   - `取消`：确认区消失、恢复码输入框清空、epoch/身份不变。
+2. 点「确认轮换」→ 面板任务行出现「轮换中（申请/候选/激活/推广）+ worker 明细」，
+   编辑器输入冻结、自动同步暂停，「同步」「发布基线」等按钮置灰；成功后：
+   - `dev-sync-notice` 显示 `轮换完成：epoch 1 → 2；checkpoint <短 id>/<短 id>；…`；
+   - 面板任务行 `轮换完成（epoch 已切换）`，输入恢复，活动文档用**新 epoch** 重开
+     （同一篇笔记重新打开，正文与 durable 一致）。
+3. **B 点「应用轮换」**→ 二次确认（`应用新 epoch 需要重新验证授权并导入基线；期间输入会冻结。是否继续？`）
+   → 确认后 B 持闸 → apply → `已应用新 epoch：1 → 2；checkpoint <短 id>`；B 的活动文档
+   同样按新 epoch 重开。
+4. 双方继续输入并各自点「同步」：E2 里双向可见（与 §2.9 相同，只是 epoch 变成 2）。
+5. **恢复码两种结果**：第 1 步勾选并粘贴当前恢复码 → 轮换后新设备 C 仍可用
+   `vault_id + 同一恢复码` Join 到 E2；不勾选（`None`）→ 轮换后新设备用旧恢复码 Join
+   **明确失败**（恢复槽只由一次性随机种子封着，没人能解开）。
+6. **失败语义**：
+   - 错恢复码：确认后立即失败（`轮换失败…恢复码与当前管理身份不符`），身份文件与视图
+     逐字节/逐实体不变，可直接改对恢复码**重试**；
+   - 失败停在 journal 之后（阶段不是「未开始」）：提示里会写明「保留了 rotation journal：
+     重试前需重启实例」（同一实例再点轮换会被"已有未完成 rotation journal"拒绝）；
+   - 被移除设备点「应用轮换」：明确失败（不在 grant 列表 / 认证被拒），身份/视图保持旧
+     epoch，可再点重试（不会半推广、不自动重试）。
+7. **移除与轮换是两件事**：移除设备仍然**只删凭证**（§2.10），不会自动轮换；轮换也不会
+   自动移除任何设备。要"未来数据连旧设备也解不开"，先移除（或同时勾选撤销列表）再轮换。
+
+恢复码输入的两个已知限制（与向导一致）：秘密字段里的输入法组合提交不完善（请直接键入
+ASCII 或粘贴）；输入框只用于**本次**重封，提交/取消后立即清空。
 
 ---
 
@@ -373,11 +412,21 @@ cargo run -p menghunote-app --features dev-sync -- --dev-sync-info
   文档。只有**没有活动文档**（空库/还没打开笔记）时，同步结束才会自动打开第一篇。
 - **CLI 发布必须 app 已关闭**；面板发布（§2.4）不需要。重复发布允许但会积累
   checkpoint（4b 语义，`/bootstrap` 只取最新两份）。
-- **没有自动同步/自动发布/轮换**；轮换与 metadata 对账是 Phase 2。
-- **移除设备 = 只断访问**（ADR 0010）：不轮换 root/epoch、不撤销管理材料、不能追回旧数据；
-  本片**没有轮换入口**，「轮换密钥」是独立动作、需要显式调用。
+- **没有自动轮换/自动发布**：自动同步（ADR 0012）已接线，但**不会**自动触发轮换、
+  应用新 epoch 或发布；这些都必须由用户显式点面板按钮。
+- **移除设备 = 只断访问**（ADR 0010）：不轮换 root/epoch、不撤销管理材料、不能追回旧数据。
+  「轮换密钥」是独立动作（§2.11），只有显式点击才发生，**不会**被移除设备自动串联。
+- **轮换/apply 必须有活动文档**：它们要在活动文档上持闸冻结；空库/没打开笔记时按钮置灰
+  并提示先打开一篇（无会话路径没有 `HeldGate` 证明，不降级）。
+- **轮换失败保留 journal**：停在 journal 之后的失败不会自动恢复/重试，面板会明确提示
+  "重试前需重启实例"；验证阶段（未开始）失败可直接重试。
+- **恢复码只重封不重发**：轮换时可选"重新封装恢复码"（需要粘贴当前恢复码）；本片
+  **没有**独立的恢复码重发流程，轮换不会更换管理密钥/恢复码本身。
 - **pending 设备不能在这里移除**：没有移除按钮（relay 对 pending 返回 `409 INVALID_STATE`），
   取消待批准设备属于后续切片。
+- **附件插入只在 dev-sync 构建可见**：见本文末「附件插入」一节；无内联预览/无拖放/
+  无系统文件对话框；普通 `SyncOnce` **不**上传新资产（只能随「发布基线」/轮换上传播），
+  所以"另一台设备拿不到字节"先看 A 有没有发布过包含该资产的基线。
 - **旧开发库不支持**：只接受修复后新建的 vault/身份（ADR 0009），不做隐式迁移。
 - **Linux 安全弱于 Windows**：0600 裸用户主钥（ADR 0008），不宣称等价 DPAPI；
   SQLite 正文仍非静态加密。
@@ -431,6 +480,27 @@ cargo test -p menghunote-sync --all-targets
 - `publish_cli_requires_matching_recovery_code_and_keeps_the_vault_unchanged`：
   缺码/错码 → 明确错误、身份文件与库不变；正确码 → 发布成功、B 可见；
 - `info_reads_identity_and_vault_without_network`：relay 指到不可达端口仍能打印公开标识。
+
+轮换密钥 / 应用轮换（ADR 0009 Phase 2 切片 6b，`--test dev_sync_rotation`）对应：
+
+- `ui_rotate_then_apply_keeps_both_sides_editing`：两个真实 `AppShell` + 真实 dev relay →
+  A 点 `dev-sync-rotate`（只展开确认：固定文案/全部 selector/不写库）→ 取消 → 取消勾选
+  重封装（固定警告）→ 确认 → E2；B 点 `dev-sync-apply-epoch`（确认/取消）→ E2；双方继续
+  编辑并用面板「同步」按钮双向可见；轮换后设备列表/移除入口仍在；
+- `ui_recovery_reissue_controls_whether_new_devices_can_join`：默认勾选重封装但空输入 →
+  确认被阻止；剪贴板粘贴（`Ctrl+V`）→ 秘密输入（遮罩）→ 提交后立刻清空 → 报告
+  "恢复码已补发"、新设备 C 用同一恢复码 Join 到 E2；不勾选再轮换到 E3 → 新设备 Join
+  明确失败；所有公开投影都不含恢复码正文；
+- `ui_rotation_buttons_reflect_manager_document_and_busy`：Join B 轮换不可用（原因+
+  点不开确认区）、但「应用轮换」可用；空库（无活动文档）两个入口都不可用并提示先打开
+  一篇；黑洞 relay 让设备列表卡在在途时两个入口都禁用；
+- `ui_cancelled_and_failed_rotation_keep_state_then_retry_succeeds`：取消不写；错恢复码
+  明确失败（身份文件逐字节不变、旧视图保留、不谎称有 journal），随后用正确恢复码重试成功；
+- `ui_removed_device_apply_epoch_reports_error_and_keeps_identity`：A 面板移除 B（只删凭证）
+  → A 轮换并勾选撤销列表（`facts.revoked=1`，B 不在 grant 列表）→ B 点「应用轮换」明确
+  失败、身份/视图保持 E1，再点一次仍明确失败（不粘死、不半推广）；
+- `rotation_freezes_input_structure_and_switch_and_failure_keeps_old_state`（6a，已扩）：
+  轮换在途时阶段文案为「轮换中（申请/候选/激活/推广）…」，两个入口都给"在途"原因。
 
 设备列表 / 移除设备（ADR 0010 切片 2a-2）对应：
 
@@ -516,5 +586,492 @@ durable），最多等**约 2s**；拿不到空闲就 **defer**：释放闸门�
    只在 integrate+adopt 期间出现）。
 
 > **已知边界**：自动同步是 dev-only 功能；Windows 真机的输入法/失焦降频仍需人工复核
-> （headless 用 debug 钩子模拟组合）。轮换（`key_epoch`）与 metadata 事件认证/对账
-> （task-121…124）尚未接线，自动同步不触发它们。
+> （headless 用 debug 钩子模拟组合）。轮换（`key_epoch`）已由面板按钮接入（§2.11），但
+> **自动同步不触发轮换/apply**（轮换期间自动轮暂停）；metadata 事件认证/对账
+> （task-121…124）仍是后续。
+
+## 远程模式、安全指纹与 SecurityPaused（ADR 0013 S3a，2026-11-13）
+
+> **范围与状态**：本节对应 ADR 0013 **S3a**：公开配置的模式 UI、设置里的安全指纹、
+> SecurityPaused 状态与启动 pending 对账。**远端 Create/Join 的网络接线仍属 S3b**，
+> 本轮**没有接真实远端 relay**，也**没有 Windows 真机 / 真实 TLS 服务器实测**；
+> 下面步骤只验证"配置/界面/失败语义"，不能当作生产可发布证明。
+>
+> 明确不做：私有 CA 导入 UI、`accept-invalid-cert`、自动"信任并继续"、自动清 pin、
+> 自动重建实例。TLS 端点认证使用系统可信根；TLS 与控制链 pin 是两层独立校验。
+
+### 1. 模式选择（`local_dev` / `remote_tls`）
+
+- Create/Join 表单与设置都有「relay 模式」选择；**默认 `local_dev`**（dev 构建），
+  它仍然只接受明文 loopback（`http://localhost` / `127.0.0.1` / `[::1]`）。
+- `remote_tls` 只接受 `https://` + canonical origin（DNS/IP；拒绝 userinfo/query/
+  fragment/非根路径）；**必须显式勾选**「我确认要连接远程服务器（HTTPS）」。
+  确认端点 ≠ 授权接受服务器任意 hash：durable `sync.control_pin` 仍独立校验。
+- ~~Create/Join 选择 remote_tls 会被明确拒绝~~ —— **S3b 起已放开**（见下一节）；
+  S3a 当时不发起任何远程初始化请求、不建库、不写配置，也不静默降级 local_dev。
+- 已有实例可以在**设置**里切换模式/URL：保存写 `ProfileV2`（`relay_mode` +
+  canonical `relay_url`），提示「重启后生效」；当前窗口不热切换 Vault/worker。
+- 手工演示（不需要远端服务器）：打开一个已存在的 local 实例 → 设置 → 勾选 remote 确认
+  → URL 填 `https://relay.example`（或任意合法地址）→ 保存 → 关窗重启。重启后会按
+  `remote_tls` 打开该实例；**不会**降级成本地明文。若随后触发同步，会走 production
+  TLS 策略并（没有真实服务器时）失败——这正是下面 SecurityPaused 的路径。
+- 需要切回本地：设置里选 `local_dev`、改回 `http://127.0.0.1:18080` → 保存 → 重启。
+  切模式/换 origin **不会**清 pin；换 relay instance 要按新实例或重新 Join 处理。
+
+### 2. 安全指纹（设置页只读区）
+
+设置页新增「安全指纹（公开、只读）」：`relay 模式`、canonical origin、
+relay `instance`（短）、record `rev` + hash（短）、bootstrap `rev`/`epoch`/`log_id` +
+hash（短）；「复制安全指纹」给**完整公开值**（不含 token/恢复码/主密钥）。
+旁边显示当前**错误类别**（安全暂停时）与固定说明「换服务器/清 pin 都不会自动发生」。
+
+- 有 pin：显示上述公开指纹（来自 durable `sync.control_pin`）。
+- **无 pin**：显示「未建立信任（NeedsTrust）：还没有 durable 控制 pin；不会自动信任，
+  也不提供『信任并继续』」。
+- pin 损坏：显示「控制 pin 损坏（PinCorrupt）…」并停止同步，**不**当成"没有 pin"。
+- 设置页**没有**「重置 pin / 强制信任 / 接受无效证书」按钮；指纹区只读。
+- 手工演示：Create 成功并进入 Main → 设置 → 指纹区应显示 record rev=1 与 hash；
+  点复制后核对剪贴板里没有 `mnrec1`/root/私钥形态内容。
+
+### 3. SecurityPaused（安全暂停）
+
+遇到 `NeedsTrust` / `PinCorrupt` / `Equivocation` / `ControlRollback` /
+`InstanceMismatch` / TLS（含传输策略拒绝）时：
+
+- 自动同步进入 **SecurityPaused**：**停止自动重试、不重新连接**；状态行显示
+  `需要处理：安全暂停（<脱敏类别>）`，`sync-status-error` 指向「设置 → 安全指纹」。
+- 允许**本地编辑**（不持闸、不冻结编辑器）。
+- **手动同步也会被明确拒绝**并给出原因；**不会**自动清 pin、不会盲信、不会重建实例。
+- 网络类错误（连接失败/超时/5xx/BUSY/head CAS…）仍走 5/10/20/40… 退避，两者不混淆。
+- 手工演示（无真实远端）：按 §1 把实例切到 `remote_tls` 并重启，触发一次同步：
+  预期看到 SecurityPaused（TLS/传输策略），再点「同步」被拒绝；本地仍可输入文字。
+
+### 4. 启动 pending 对账
+
+Main/AppRoot 在**构造 `AppShell` 之前**调用 `init_session::reconcile`（无 pending 时
+纯 no-op、**不联网**）：
+
+| pending 阶段 | 启动行为 |
+| --- | --- |
+| 无 pending | 直接打开；不联网、不写库 |
+| `Prepared`（请求未发） | 安全放弃（清 pending）；无身份时进 Error 恢复页 |
+| `Done` | 清理 pending 后正常打开 |
+| 已请求 + 有身份 | 用已有材料补 finalize（不重复 genesis/enroll）→ Done |
+| 无身份 / 损坏 / 绑定矛盾 | Error 恢复页；**不自动重建、不删库/身份/pin、不启动同步 worker** |
+
+身份落盘的 app 路径：Create/Join 让 pending 停在 `PinCommitted`，身份"临时文件 +
+原子 rename"成功后推进 `IdentityWritten → Done`；若这一步前崩溃，下次启动对账补齐。
+`local_dev` 的 Create/Join 先提交 pin 再落盘身份（`PinCommitted` 在阶段序上晚于
+`IdentityWritten`，`mark_identity_written` 视为已满足、不回退）；远端 S3b 的规范顺序
+（先身份、后 pin）会真正推进 `GenesisRequested → IdentityWritten`。
+
+### 5. 未验证/后置
+
+- **没有** Windows 真机与真实 TLS relay 实测；TLS 证书链/主机名/系统根只由
+  `tests/tls_transport.rs` 的离线负例覆盖。
+- 真实鉴权 relay、私有 CA 导入 UI、Windows DPAPI 真机均后置；本节不得作为生产验收依据。
+
+## 远端模式（remote_tls）的 Create / Join（ADR 0013 S3b，2026-11-14）
+
+> **范围与状态**：本节对应 ADR 0013 **S3b**：把 onboarding 的 remote Create/Join 接到
+> `InitSession`（NewGenesis / FreshRecovery，production TLS + HTTP canonical origin）。
+> 已验证的是**进程内真实 TLS relay**（自签 CA 显式注入客户端信任根）上的 A 创建 / B
+> 恢复码 Join / pin 落盘 / 重启；**没有**连接任何真实远端 relay，也**没有** Windows
+> 真机验证。因此这只是 dev 状态，不是生产可发布证明。
+>
+> 明确不做：私有 CA 导入 UI、`accept-invalid-cert`、自动"信任并继续"、自动清 pin、
+> 自动重建实例、local_dev 与 remote_tls 之间的自动降级。TLS 端点认证使用系统可信根；
+> TLS 与 ControlPin 是两层独立校验。
+
+### 1. 前置（无真实远端时）
+
+需要一个**支持 TLS 的 relay**。当前仓库内的 `menghunote-dev-relay` 只给测试用
+（`DevRelay::start_tls()`：自签 CA + `localhost` 叶子证书，放行验签 hook）。手工演示
+可在测试里跑，或自备一个带可信证书的 HTTPS relay（受系统根信任；本程序没有忽略证书
+的开关）。**没有**内置的"启动 TLS dev relay"命令行——不要把它当成产品功能。
+
+### 2. remote Create（NewGenesis）
+
+UI：Welcome →「创建新的同步实例」→ 模式选 `remote_tls` → 勾选「我确认要连接远程
+服务器（HTTPS）」→ 填 canonical `https://` origin、setup secret、实例目录 → 勾选
+开发同步 →「创建」。
+
+预期（真实顺序，可从设置/指纹与日志核对）：
+
+1. 新建本地库并写 durable pending（`Prepared`，只含公开 id/模式/origin/阶段）；
+2. `POST /v1/vaults`（写前推进 `GenesisRequested`）；relay 单事务创建 vault/设备；
+3. 身份用「临时文件 + 原子 rename」受保护落盘（`DevIdentityStore`），随后推进
+   `IdentityWritten`（**先身份、后 pin**）；
+4. 用本地提交证书复算 `rev1 record_hash = SHA256(零32 || CDE(cert))`，在 TLS 上验证
+   `/state + /control` 全链/分页连续性/rev1 前缀，`commit_verified_head` 提交强 pin
+   （`PinCommitted`）；
+5. 上传初始 recovery 槽；pending → `Done` 清理；
+6. UI 停在**恢复码备份页**（与 local_dev 相同），确认后才写 `ProfileV2`
+   （`relay_mode=remote_tls` + canonical `relay_url`）并进 Main。
+
+失败语义（与 local_dev 不同，是有意的）：
+
+- **拿到 genesis 回执/身份之前**失败（URL/模式非法、TLS 不受信、relay 明确拒绝如
+  错 setup secret、传输中断）：清理本次新建的库文件与 pending（远端最多留下不可用的
+  空 vault），**不写配置**，Error 页可回表单换目录重试。
+- **拿到回执/身份材料之后**失败（控制链/前缀校验、pin 提交、身份落盘失败、槽上传等）：
+  **保留** `pending`/库与已落盘事实（不删用户数据、不 unpin、不降级）；Error 页显示
+  安全暂停类别；`Done` 之前的 pending 留给下次启动对账。初始槽上传/收尾失败降级为
+  告警（实例可用，但其他设备用恢复码 Join 可能失败，恢复码仍在备份页）。
+- TLS / NeedsTrust / PinCorrupt / Equivocation / InstanceMismatch 一律**不自动重试、
+  不自动信任、不自动清 pin**。
+
+### 3. remote Join（FreshRecovery）
+
+UI：Welcome →「加入已有同步实例」→ 模式 `remote_tls` + 远程确认 → 填 HTTPS origin、
+`vault_id`（32 位十六进制）、恢复码（`mnrec1…`）、新目录 →「加入」。
+
+预期：
+
+1. 恢复码格式在**建库之前**校验（错格式不建库/不联网）；
+2. 新建本地库 + pending（`Prepared`）→ `self_enroll`（唯一一次 unpinned `/control`
+   消费，仍强制恢复码推导的管理锚 + 逐条签名）→ 写前推进 `GenesisRequested`；
+3. `bootstrap::run_with_pins` 认证导入基线（控制链/checkpoint/对象验证），pins/cursor
+   单事务推进；
+4. 身份原子落盘（`IdentityWritten`）→ 用**同一验证视图**复算 record pin + bootstrap
+   锚 → `commit_verified_head`（`PinCommitted`）→ `Done`；
+5. 写 `ProfileV2`（`remote_tls`）→ 进 Main，自动打开创建者的第一篇。
+
+失败：错格式/错恢复码、TLS 不受信、无基线等**拿到身份材料之前**的失败都会清掉本次
+新建的库文件（不留半初始化库，可换目录重试）；返回 JoinForm 并保留公开字段（relay/
+`vault_id`/目录），恢复码已从输入框清空需重输。恢复码正文与 `mnrec1…` token 不出现在
+错误文案里。
+
+### 4. 配置与状态
+
+- 配置：`ProfileV2` 每实例保存 `relay_mode` + canonical `relay_url`；Create/Join
+  成功后写 active；**重启后生效**（当前 Main 不热切换模式/URL）。
+- 安全指纹：remote Create 后应显示 record `rev=1` + hash（无 bootstrap 锚）；
+  remote Join 后应显示 record hash + bootstrap 锚（**同 rev**）。
+- SecurityPaused：初始化失败若属安全类，Error 页标题带「安全暂停（<类别>）」并给出
+  类别提示；Join 表单同样标注，**不提供**信任/重置按钮。
+- 启动对账：remote pending 与 local_dev 共用同一套 `reconcile`（`Prepared` 安全放弃；
+  已请求 + 身份 → 补 finalize；无身份/损坏 → Error 恢复页，不重建/不删数据）。
+
+### 5. 未验证/后置（S3b）
+
+- **未**在真实鉴权 relay（`Ed25519Hook` 生产路径）上跑过 remote Create/Join；
+  只用了进程内放行验签的测试 relay。
+- **未**在 Windows 真机验证（DPAPI 身份封装、系统证书存储、原子 rename 语义）。
+- **未**做私有 CA 导入 UI：目前用系统信任根；测试用自签根是**测试专用**
+  注入（`with_test_extra_roots`，只加显式信任、不关闭链/SAN/有效期校验）。
+- 跨机器网络抖动/代理/时钟偏差等真实环境因素未验证。
+
+---
+
+## 附件插入（dev-sync 构建，2026-11-14）
+
+**只在 `--features dev-sync` 的构建里可见**（与 dev-sync 面板同一道门禁：运行时还要
+`--dev-sync` / `MENGHUNOTE_DEV_SYNC=1` 才进 Main）。默认构建里没有这个按钮，也没有
+`crates/app/src/attachment.rs`。
+
+### 看哪里
+
+| 位置 | 说明 |
+| --- | --- |
+| 侧栏底部「插入附件…」 | 点开路径输入（`attachment-path`），回车 / 「插入」提交，「取消」/ `Esc` 收起 |
+| `attachment-error` | 失败原因（相对路径、不存在、不是普通文件、空文件、超过 20 MiB、文件名非 UTF-8、同步持闸、写入失败） |
+| `attachment-notice` | 成功提示：文件名 + 字节数（不含绝对路径） |
+| 正文 | 插入 `[附件：<文件名>](asset://<64 位十六进制 sha256>)` |
+
+### 步骤（两个实例，A 建 B Join 之后）
+
+1. **A**：打开任意一篇笔记（按钮要求有活动笔记；没有就整块置灰并说明原因）。
+2. **A**：点侧栏底部「插入附件…」→ 粘贴/输入一个**绝对路径**（例如
+   `/home/you/报告 最终.pdf`，中文与空格都可以）→ 回车。
+   - 正文光标处出现 `[附件：报告 最终.pdf](asset://…)`；
+   - 提示「已插入附件：报告 最终.pdf（N 字节）」；
+   - 成功后可以 `Ctrl+Z` **一次**撤销这次插入（隐藏的资产不删，内容寻址无副作用）。
+3. **A**：点面板「同步」（必要时再点「发布基线」）。**资产字节由「发布基线」上传**：
+   `CheckpointWriter::prepare` 用 `StorageAssets` 读 `assets` 表 → ASSET 分片上传 →
+   relay 为每个 ASSET 追加一条 `asset` 日志事件（本任务**没有**新增 wire 消息/DDL，
+   这条上传路径本来就存在）。
+4. **B**：点面板「同步」。B 的 pull 会真正下载并**验证**每条 ASSET 事件，然后把明文写进
+   本地 `assets` 表（本任务补的最小接线；此前只验证不落地）。同步完成后：
+   - B 的正文出现同一条 `[附件：…](asset://…)` 链接（普通 update，不重开文档）；
+   - B 的 `asset_bytes(hash)` 与 A **逐字节一致**。
+5. 收尾：两边关窗；资产留在 `assets`（没有删除/GC 入口）。
+
+### 限制（非目标，别当 bug）
+
+- **无内联图片预览**：`asset://` 只是普通链接文本，编辑器不解析、不渲染图片。
+- **无拖放、无系统文件对话框**：`rfd` 在本仓库被禁用；路径只能手工输入/粘贴。
+- **路径必须是绝对路径**；相对路径按 cwd 解释会漂移，直接拒绝。
+- **单文件上限 20 MiB**（UI 边界，与 wire 的 64 MiB ASSET 上限无关）；空文件拒绝。
+- **重复文件内容 = 单资产 + 多条引用**（内容寻址幂等）：插入两次只有一份资产字节，
+  `asset_refs` 两条（按位置各一条）。
+- **普通 SyncOnce 不会新上传资产**：ASSET 对象只能由「发布基线」/轮换这些维护路径上传
+  （relay 的预算分类要求同一对象的全部分片归属一致，普通上传会和 checkpoint 的
+  reservation 冲突）。因此「A 插入 → B 立刻同步」在 A 没发布基线时只能拿到链接，
+  **拿不到字节**；这是已知限制，不是回归。
+- **B 能拿到字节的前提**：B 的 `pull` 必须遇到 ASSET 日志事件（即 A 发布过包含该资产的
+  基线）且 epoch 相同；轮换后由轮换路径重新上传。
+- **文件名不是 UTF-8**（Unix 才可能）会被拒绝；Windows 路径用 UTF-16，不受影响。
+- **没有"附件管理"UI**：不列、不删、不重命名资产；`asset_refs` 只是账面行。
+
+### 自动化覆盖
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `crates/app/tests/attachment_ui.rs`（4 个） | 真实点击/按键插入（中文+空格+`[]()` 路径）、`asset_refs`/`asset_bytes`/`media_type`、重复插入幂等、undo/redo、上限/空/不存在/非普通文件/相对路径/非 UTF-8 文件名（零写入）、无活动笔记与同步持闸禁用 |
+| `crates/app/tests/dev_sync_sync_once.rs::attachment_asset_bytes_and_link_reach_the_other_shell` | 两 AppShell + dev-relay：A 插入 → A 同步 + 发布基线 → B 同步后取到相同字节与链接（同步前 B 无资产） |
+| `crates/sync`（既有 + 本次改动） | pull 消费 ASSET 时验证后落 `assets`（`skipped-asset` 记录语义不变） |
+| `crates/app/src/attachment.rs` 单测 | Markdown 转义、MIME 映射、相对路径拒绝 |
+
+### Windows 真机验点（未在本机验证）
+
+- 绝对路径形如 `C:\Users\you\报告 最终.pdf`（反斜杠 + 中文 + 空格）能被接受并插入；
+  相对路径被拒。
+- `\\server\share\...`（UNC）是绝对路径，但网络盘读取失败/超时要给出明确错误（不 panic）。
+- IME：路径里的中文由输入法上屏；组合中按回车不应插入（当前在「组合中」直接拒绝并提示）。
+- 文件对话框/拖放**不应**出现（本片不实现）。
+
+## 邀请链接（ADR 0014 S1，2026-11-14）
+
+> **单 vault、现有管理钥。** 本片只把「加入」换成一次性邀请链接：兑换只产生 `PENDING`，
+> 仍必须由创建端（有管理钥的设备）在设备面板**显式批准**，加入端才拿到数据。
+> 不做多 vault / 创建链接（`mn-pair://create`）/ 系统 scheme 注册 / QR / 能力授权（v2）。
+
+### 1. 创建端生成链接（A 的面板）
+
+前提：A 是 **Create 设备**（身份里有管理钥）、实例已发布基线、**有活动文档**、当前没有
+在途操作（同步/轮换/发布都算）。
+
+1. A 打开同步面板 → 设备区域底部「邀请设备…」（selector `dev-sync-invite`）；
+   按钮不可用时下方会说明原因（无管理钥 / 无活动文档 / 有操作在途 / worker 已停止）；
+2. 点击后 worker 向 relay 申请一次性邀请，面板出现：
+   - `dev-sync-invite-link`：完整链接
+     `mn-pair://join?v=1&relay=<percent-encoded canonical origin>&vault=<hex32>&iid=<hex32>&pin=<hex32>#token=<base64url>`；
+   - `dev-sync-invite-ttl`：TTL 文案（默认 **15 分钟**、上限 24h；过期只影响兑换）；
+   - `dev-sync-copy-invite`：「复制链接」**显式**动作（不会自动复制）。
+3. **链接只在内存**：关闭窗口/面板即丢；恢复码**绝不**进链接；完整 URL 不进日志/Debug/
+   公开配置。token 只在 fragment，relay 只存 `SHA256(T)`。
+
+### 2. 加入端兑换为 PENDING（B 的向导）
+
+1. B 启动（同一二进制，`--features dev-sync`，无需 env/flag）→ Welcome →
+   「加入已有同步实例」；
+2. 在新字段「邀请链接（可选）」粘贴整段链接（**不需要**填 vault_id/恢复码）；
+3. 提交后 worker 解析链接（严格 host/scheme/vault/iid/pin/token；拒绝 userinfo/未知
+   query/额外 path）、生成**新设备**签名/HPKE key 与 peer、`redeem` 到 `PENDING`，
+   并把 pending 材料（受保护）写进**新实例自己的**库；
+4. 向导停在等待页（`app-root-invite-pending`）：显示 relay/vault/设备 id/**设备指纹**/
+   sign 与 hpke 短 hash + 有效期；此时**没有**身份文件、**没有**公开配置；
+5. 「检查状态」（`app-root-invite-check`）在创建者批准前只会得到「尚未批准」（relay 对
+   pending 与已移除都回 `REVOKED`，不区分）。
+
+### 3. 创建端批准（A 的面板）
+
+1. A 点「刷新设备」→ 列表出现 `待批准` 行（ADR 0010 的成员视图已包含 pending 空证书行）；
+2. pending 行出现「批准…」（selector `dev-sync-approve-<短id>`；**非管理设备不渲染**）；
+3. 点击先展开确认区（`dev-sync-approve-warning`）：**目标 device_id + sign/hpke 短 hash**。
+   把这两个短 hash 与加入端等待页显示的逐字核对，再点「确认批准」
+   （`dev-sync-approve-confirm`）；
+4. worker 用**现有管理钥**签 §17.1 设备证书 + 把当前 epoch 根封成 §17.2 HPKE grant；
+   成功后 pending 行变 `可用`，notice 写「已批准 …（指纹 …）」；重复批准是幂等的
+   （`changed=false`，不重复签名）。
+
+### 4. 加入端批准后 bootstrap
+
+1. B 点「检查状态」：设备认证成功 → 取 self grant → 用 pending 的 HPKE 私钥解出 root →
+   `bootstrap::run_with_pins`（pin = 链接里的 relay instance）→ 提交 durable
+   `sync.control_pin` → 写入受保护身份 → 写公开配置（active 指向新实例）→ **进入 Main**；
+2. Main 自动打开基线里的第一篇（A 的笔记），之后双向编辑/同步与普通 Join 完全一致；
+3. 失败保留 pending 可重试；bootstrap 成功但配置写失败 → Error 页「重试保存」
+   （**只重写配置**，不重新联网/bootstrap）。
+
+### 5. 重启与 PENDING 恢复
+
+- PENDING 期间关闭窗口/PENDING 页点「返回（保留 PENDING）」：pending 已在库里 durable；
+  再次启动 → 「加入已有同步实例」→ 粘贴**同一链接** → 走 **resume**（纯本地，
+  **不重复兑换**、不会再造一台 pending 设备，`INVITE_USED` 不会出现）；
+- 已批准但 bootstrap 未完成/已 bootstrap 但配置未写入：同样可以 resume；阶段
+  `Bootstrapped` 时直接读回已落盘身份补齐配置（不重复联网）。
+
+### 6. 失败矩阵（都对用户明确）
+
+| 情况 | 表现 |
+| --- | --- |
+| 链接格式/host/scheme/vault/iid/pin/token 非法 | Join 表单内联错误；**不联网**、不建目录 |
+| token 已用（`INVITE_USED`）| 明确「邀请已被使用或无效：请让创建者重新生成链接」；清掉本次新建库文件 |
+| token 过期（`EXPIRED`）| 明确「邀请已过期（默认 15 分钟）」；清掉本次新建库文件 |
+| 错 vault / 错 pin | relay 明确拒绝 / `InstanceMismatch`（**不自动换 pin**）|
+| relay 不可达 / TLS 失败 | 可重试的分类提示；不建身份/配置 |
+| 非管理设备批准/生成邀请 | 明确「本机没有管理密钥」；不发管理请求 |
+
+### 7. 本片未做（明确）
+
+- **多 vault**（relay 仍是单 vault schema 9）、`mn-pair://create` 创建链接、Windows
+  scheme/深链注册、QR；
+- 自动轮询批准状态（只有用户点「检查状态」；不做高频轮询）；
+- 恢复码**链接**（明确拒绝；恢复码只作手工应急，不进 URL）；
+- 能力授权/ManagementCap v2（仍是现有管理钥批准；普通设备不获得管理权）；
+- 真实鉴权 relay / Windows DPAPI / TLS 系统根的真机验收（S0 后置）。
+
+### 8. 自动化覆盖
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `crates/sync/tests/invite_links.rs`（5） | 链接→PENDING→批准→bootstrap→双向同步；durable resume（不重复兑换，含不可达 context）；已用/过期/错 vault/错 pin；非管理设备不能邀请/批准 |
+| `crates/sync/src/invite_link.rs` 单测（8） | URL 编码/解析/恶意形态拒绝、token 不进 Debug/错误文案、TTL 边界、指纹/短 hash 稳定 |
+| `crates/app/tests/dev_sync_invite.rs`（4） | 面板生成链接/复制文案/TTL、pending 行批准确认（device_id + 双端短 hash）、批准后 B 变 Active 并能同步、非管理设备无入口、无活动文档置灰 |
+| `crates/app/tests/onboarding_invite.rs`（3） | 粘贴→PENDING→重启 resume→批准→Main（配置/笔记/身份事实）→再重启直接 Main；非法/恶意链接本地拒绝；已用链接明确失败 |
+
+## ADR 0014 S3a：票据创建（`mn-pair://create`）手工步骤
+
+> 本片只到**库级**：App UI 表单/多实例面板是 S3b。下面是当前可用的手工验证路径
+> （Linux 本机、in-process/dev relay；真实 TLS relay 与 Windows 仍未验）。
+
+### 1. 发行一次性创建票据（运维侧）
+
+```bash
+# 只发行票据后退出，不启动服务器；缺省随机 vault_id / 900s / quota=1
+cargo run -p menghunote-relay --example dev_server -- --issue-ticket
+# 指定预留 vault_id、TTL 与额度（同一票据可多次尝试；成功创建才扣 1）
+cargo run -p menghunote-relay --example dev_server -- \
+  --issue-ticket --vault 00112233445566778899aabbccddeeff --ticket-ttl 600 --ticket-quota 2
+```
+
+输出含 `vault_id`、32B 票据明文（base64url 或 hex）、过期时刻与额度。**明文只打印这一次**；
+relay 库只有 `SHA256(ticket)`。票据绑定 `vault_id`，跨 vault 创建会统一 403 `FORBIDDEN`。
+
+### 2. 生成创建链接（创建端/运维）
+
+链接格式（ticket **只在 fragment**，`relay` 必须百分号编码）：
+
+```text
+mn-pair://create?v=1&relay=http%3A%2F%2F127.0.0.1%3A18080&vault=<hex32>[&pin=<hex32>]#ticket=<base64url>
+```
+
+- `pin` 可选：创建方已保存的 relay instance 公开锚；创建回执的 `instance_id` 必须与它相等，
+  否则 `InstanceMismatch`（**不会**自动换 pin）；
+- 解析复用唯一 relay URL parser：远端只接受 `https` canonical origin，`http` 只接受
+  loopback 白名单；拒绝 userinfo/额外 path/未知或重复 query 字段；
+- 链接/Debug/错误文案都不回显 ticket。
+
+### 3. 用票据创建（当前库级入口）
+
+```rust
+let link = CreateLink::parse(text)?;                    // 或 CreateLink::encode(..) 生成
+let context = link.relay_context(DEFAULT_TRANSPORT_TIMEOUTS)?; // 固定 v2 面
+let created = create_vault_with_ticket(
+    context,
+    link.vault_id,
+    &link.ticket,
+    link.pin,             // 公开锚可选；None = 不要求同实例
+    &vault_path,
+    "实例标签",
+    persist_identity,     // app 的原子落盘回调（S3b 才接 UI）
+)?;
+// created.vault / created.identity / created.recovery_code / created.warning
+```
+
+成功后：本地库已建、rev1 强 pin 已 durable、初始恢复码槽已上传、pending 已清理；
+身份/公开配置由调用方决定是否落盘（库只返回事实）。403/409/429 分别对应
+`FORBIDDEN` / `ALREADY_INITIALIZED` / `RATE_LIMITED`（`retryable=true`）；
+失败不消费票据、不建本地库（回执前失败会清掉本次新建的库文件）。
+
+### 4. API 面（v1/v2）
+
+- 旧 ProfileV2（无 `api_version`）→ 显式 v1；新配置写 `"api_version": 2` 才走 v2；
+- 同一 vault 的签名面在创建时固定：v2 创建的控制记录用 `/v2/...` 管理签名，
+  用 v1 path 读取/复算会验签失败（fail-closed）；**不支持** v1 库中途切 v2；
+- v2 的鉴权是租户内路径 `/v2/vaults/{id}/auth/{challenges,tokens}`，不是全局 `/v2/auth`。
+
+### 5. 本片未做（明确）
+
+- App UI 的创建表单、多实例面板、Windows scheme 注册/QR（S3b）；
+- 自动创建票据（必须运维发行）；
+- 真实鉴权 relay/Windows DPAPI/TLS 系统根真机验收（S0 后置）；
+- 本机测试仍用放行验签的 dev relay，结论不含鉴权验收。
+
+## ADR 0014 S3b：创建链接 UI、多实例与 v2 邀请（2026-11-14）
+
+> 本片把 S3a 的库级能力接到 App：Create 表单的「粘贴创建链接」、同一 relay 多实例、
+> v2 邀请链接（`api=2`）与设置页的 API 面展示。仍只做 **粘贴**（不做 Windows scheme/QR）；
+> 测试全部是 Linux 本机 + 进程内 dev relay（放行验签），**不是**鉴权/Windows/TLS 验收。
+
+### 1. 发行票据（运维侧，与 S3a 相同）
+
+```bash
+# 只发行票据后退出；缺省随机 vault_id / 900s / quota=1
+cargo run -p menghunote-relay --example dev_server -- --issue-ticket
+# 指定预留 vault_id / TTL / 额度（quota>1 = 同一票据允许成功创建 N 次，但同一 vault 只能成功一次）
+cargo run -p menghunote-relay --example dev_server -- \
+  --issue-ticket --vault 00112233445566778899aabbccddeeff --ticket-ttl 600 --ticket-quota 2
+```
+
+输出里的票据明文**只打印这一次**；relay 只存 `SHA256(ticket)`。把明文按 S3a 的格式
+编成创建链接（**不在 App 里发行票据**）：
+
+```text
+mn-pair://create?v=1&relay=http%3A%2F%2F127.0.0.1%3A18080&vault=<hex32>[&pin=<hex32>]#ticket=<base64url>
+```
+
+### 2. App 用创建链接 Create（Gui）
+
+1. 启动（`--features dev-sync`，无需 env/flag）→ Welcome；
+2. 点「粘贴创建链接（v2 票据）」（selector `app-root-create-link`）→ Create 表单；
+3. 在「创建链接」字段（`app-root-create-link-input`，遮罩、允许粘贴）粘贴整段链接 →
+   点「应用创建链接」（`app-root-create-link-apply`，或在该字段按 Enter）；
+4. 应用成功后表单切到**票据模式**：
+   - `app-root-create-link-warning`：一次性票据（默认 15 分钟）/不写配置日志/失败不消费票据；
+   - `app-root-create-link-facts`：预填的 canonical relay + vault_id + 「API 面：v2」；
+   - **setup secret 字段隐藏**（票据模式不需要）；链接输入框**立刻清空**（票据只在内存）；
+   - 实例目录默认仍是 `instances/<自动 id>/`（可改；必须不存在或空目录）；
+   - 勾选「同意开发同步」（`app-root-consent`）；`remote_tls` 链接还需勾选远程确认；
+5. 点「用一次性票据创建」→ Working → **备份页**（恢复码只显示一次）→ 勾选备份 → Main。
+   配置写入 `"api_version": 2`、`relay_mode` 与链接一致（`http`=local_dev / `https`=remote_tls）。
+
+失败：403（`FORBIDDEN`，含已用/过期/错 vault，relay 统一不区分）、409
+（`ALREADY_INITIALIZED`，同一 vault 重复）、429（`RATE_LIMITED`）都会带明确分类文案进
+Error 页；**不建库/身份/配置**，票据不会被保存。配置写失败走既有「重试保存」（只重写配置，
+不重跑创建）。
+
+### 3. 同一 relay 第二个 vault（多实例）
+
+1. 回到 Welcome（Main 右上「设置」不是必须；退出/返回即可）；
+2. Welcome → `app-root-instance-<i>` 列表在创建第二个实例后出现两行（active 优先，
+   行内显示 `v1/v2`、vault_id 短值、relay）；
+3. 再走一次「粘贴创建链接」+ 新实例目录 → 第二个 profile **追加**（不删除/覆盖第一个），
+   active 指向新实例；两个实例目录/身份/pin 各自独立；
+4. 重启 → 自动打开 active；Welcome 列表可点开任一个（**不热切换**：打开另一个实例 = 关掉当前
+   `AppShell` + 取目标目录锁；设置页「设为默认」只写配置，重启后生效）。
+
+设置页（`app-root-settings` → `dev-sync-settings`）：
+- 每行显示 `API v1/v2 · relay 模式 · vault_id 短值 · device_id 短值` + 库路径；
+- active 实例另有 `settings-api-version`（API 面）与既有 `settings-fingerprint`
+  （relay instance / record rev+hash / bootstrap 锚，全部公开只读）。
+
+### 4. v2 邀请链接（`api=2`）
+
+- A 是**票据创建**的 v2 vault：设备面板「邀请设备…」生成的链接自动带 `&api=2`：
+  `mn-pair://join?v=1&relay=…&vault=<hex32>&iid=<hex32>&pin=<hex32>&api=2#token=…`；
+- v1 vault 生成的链接仍**省略** `api`（旧链接逐字节兼容）；未知 `api` 值（如 `api=3`）
+  在本地解析阶段拒绝，不联网；
+- B 粘贴后：解析 → PENDING（库里的 pending 记录持久 `api_version=2`）→ A 在设备面板批准
+  （v2 管理签名 `/v2/.../devices/{d}/approve`）→ B「检查状态」→ bootstrap 走 v2 数据面
+  （租户内 auth / bootstrap / grants）→ Main；配置写 `"api_version": 2`；
+- 面不一致（v2 pending 用 v1 context 检查）会 `ConfigInvalid` 拒绝，不会静默降级。
+
+### 5. 已知限制 / 未做
+
+- 只有「粘贴整段链接」：Windows scheme/深链注册、QR、系统剪贴板监听都未做；
+- 不自动发行票据（必须运维 `--issue-ticket`）；App 不生成 `mn-pair://create` 链接；
+- v2 创建入口有实例级限流（默认 6 次/分钟）：批量演练会撞 429，等窗口过去再试；
+- v1→v2 中途切换不支持（面在创建时固定）；多实例共用**同一个**进程内的 relay/身份封装；
+- 真实鉴权 relay / Windows DPAPI / TLS 系统根的真机验收仍未做（S0 后置）。
+
+### 6. 自动化覆盖（本片）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `crates/app/tests/onboarding_create_link.rs`（5） | 同 relay 两票据 vault：profile/api_version=2/身份/pin/目录独立、笔记互不可见、重启分别进 Main、Welcome 列表分别打开；v2 邀请 `api=2` → PENDING → 批准 → Main → v2 面同步；403/409/429 失败矩阵（不建库/身份/配置）；票据不落配置/实例目录/错误文案；配置写失败只重试保存（不重跑创建） |
+| `crates/sync/tests/invite_links.rs`（+1 = 6） | v2 链接 api=2、pending 持久 api=2、v1 context 拒绝（不降级）、v2 面批准/bootstrap、未知 api 本地拒绝 |
+| `crates/sync/src/invite_link.rs` 单测（+1 = 9） | `api` 编码/解析/缺省 v1/未知拒绝/无 token 回显 |
+| 既有 v1 回归 | `onboarding_ui.rs` / `onboarding_invite.rs` / `dev_sync_*` 全部不改语义 |

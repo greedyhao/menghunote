@@ -159,6 +159,7 @@ impl Render for ShellHost {
 
 fn config_for(relay_url: &str, vault_path: &Path) -> DevSyncConfig {
     DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.to_path_buf(),
         service: ServiceConfig::new(relay_url),
     }
@@ -1327,10 +1328,10 @@ async fn backoff_jitter_and_permanent_failures_pause_for_attention(cx: &mut Test
     };
     assert_eq!(attempt, 2, "失败计数只增不减");
 
-    // 鉴权/TLS 类：不自动重试，进入"需要处理"。
+    // 鉴权类（非安全）：不自动重试，进入「需要处理」；手动重试**允许**。
     {
         let mut script = shared.0.lock().expect("脚本锁");
-        script.fail = Some("同步失败（Prepare）：TLS 校验失败：certificate expired".to_owned());
+        script.fail = Some("同步失败（Prepare）：relay 拒绝：UNAUTHORIZED".to_owned());
         shared.1.notify_all();
     }
     clock.advance(Duration::from_secs(30));
@@ -1342,7 +1343,7 @@ async fn backoff_jitter_and_permanent_failures_pause_for_attention(cx: &mut Test
         &mut c,
         &host,
         Some(&shared),
-        "TLS 失败进入需要处理",
+        "鉴权失败进入需要处理",
         |cx, host| {
             !in_progress(cx, host)
                 && matches!(status(cx, host).state, StatusState::NeedsAttention { .. })
@@ -1351,9 +1352,9 @@ async fn backoff_jitter_and_permanent_failures_pause_for_attention(cx: &mut Test
     let line = status_line(&mut c, &host);
     assert!(
         line.contains("需要处理："),
-        "TLS 失败必须进入需处理：{line}"
+        "鉴权失败必须进入需处理：{line}"
     );
-    assert!(line.contains("TLS 校验失败"), "{line}");
+    assert!(line.contains("UNAUTHORIZED"), "{line}");
     let error_line = status_error_line(&mut c, &host).expect("需要处理必须给出一行可操作提示");
     assert!(error_line.contains("可点「同步」重试"), "{error_line}");
     assert_eq!(
@@ -1373,14 +1374,14 @@ async fn backoff_jitter_and_permanent_failures_pause_for_attention(cx: &mut Test
         "需处理状态不能再让 worker 进入新一轮"
     );
 
-    // 用户显式重试：清掉暂停、按手动语义启动；成功后状态恢复"已同步"。
+    // 用户显式重试（非安全错误）：清掉暂停、按手动语义启动；成功后恢复"已同步"。
     {
         let mut script = shared.0.lock().expect("脚本锁");
         script.fail = None;
         shared.1.notify_all();
     }
     with_shell(&mut c, &host, |shell, cx| shell.dev_sync_sync_once(cx))
-        .expect("手动重试必须被接受");
+        .expect("非安全「需要处理」必须允许手动重试");
     pump_until(
         &mut c,
         &host,
@@ -1393,6 +1394,77 @@ async fn backoff_jitter_and_permanent_failures_pause_for_attention(cx: &mut Test
     let line = status_line(&mut c, &host);
     assert!(line.starts_with("已同步"), "手动重试成功后状态行：{line}");
     assert_eq!(status_error_line(&mut c, &host), None);
+
+    // 安全类（TLS）：进入 `SecurityPaused`，**不自动重试、也不允许手动重试**；
+    // 状态行/错误行指向「设置 → 安全指纹」，且不引导盲点「同步」。
+    {
+        let mut script = shared.0.lock().expect("脚本锁");
+        script.fail = Some("同步失败（Prepare）：TLS 校验失败：certificate expired".to_owned());
+        shared.1.notify_all();
+    }
+    clock.advance(Duration::from_secs(45));
+    tick(&mut c, &host);
+    wait_script(&shared, "周期到期应再试一次", |script| {
+        script.entered >= 5
+    });
+    pump_until(
+        &mut c,
+        &host,
+        Some(&shared),
+        "TLS 失败进入安全暂停",
+        |cx, host| {
+            !in_progress(cx, host)
+                && matches!(status(cx, host).state, StatusState::SecurityPaused { .. })
+        },
+    );
+    let line = status_line(&mut c, &host);
+    assert_eq!(line, "需要处理：安全暂停（TLS 校验失败）", "{line}");
+    let error_line = status_error_line(&mut c, &host).expect("安全暂停必须给出一行可操作提示");
+    assert!(error_line.contains("安全指纹"), "{error_line}");
+    assert!(error_line.contains("不会自动清 pin"), "{error_line}");
+    assert!(
+        !error_line.contains("可点「同步」重试"),
+        "安全暂停不得引导盲点重试：{error_line}"
+    );
+    assert_eq!(
+        read_shell(&mut c, &host, |shell, _app| shell
+            .dev_sync_auto()
+            .map(|auto| auto.scheduler().is_paused())),
+        Some(true)
+    );
+    assert_eq!(
+        read_shell(&mut c, &host, |shell, _app| shell
+            .dev_sync_auto()
+            .and_then(|auto| auto.security_category())
+            .map(|category| category.code())),
+        Some("tls"),
+        "设置页/状态必须能看到脱敏类别"
+    );
+
+    // 不自动重试：推进周期 + 单次 tick 都不启动。
+    clock.advance(Duration::from_secs(120));
+    tick(&mut c, &host);
+    assert!(!in_progress(&mut c, &host), "安全暂停不能自动重试");
+    assert_eq!(
+        script_snapshot(&shared).entered,
+        5,
+        "安全暂停不能再让 worker 进入新一轮"
+    );
+
+    // 手动同步也被明确拒绝（不自动清 pin/不盲信），并指向设置/指纹。
+    let rejected = with_shell(&mut c, &host, |shell, cx| shell.dev_sync_sync_once(cx))
+        .expect_err("安全暂停必须拒绝手动同步");
+    assert!(rejected.contains("安全暂停"), "{rejected}");
+    assert!(rejected.contains("安全指纹"), "{rejected}");
+    assert_eq!(
+        script_snapshot(&shared).entered,
+        5,
+        "被拒绝的手动同步不得派发 worker"
+    );
+    assert!(matches!(
+        status(&mut c, &host).state,
+        StatusState::SecurityPaused { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------

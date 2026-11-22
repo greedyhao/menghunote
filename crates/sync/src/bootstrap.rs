@@ -41,6 +41,7 @@ use loro::VersionVector;
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{verify_asset_plaintext, AssetRef, KIND_BODY, KIND_STRUCTURE};
+use crate::control_pin::BootstrapAnchorV1;
 use crate::device::verify_signature;
 use crate::engine::RELAY_CURSOR_META;
 use crate::error::SyncError;
@@ -48,6 +49,7 @@ use crate::keys::RootSecretV1;
 use crate::relay::{
     BootstrapBundle, BootstrapCheckpoint, ManagerChainEntry, RelayClient, RelayState,
 };
+use crate::rotation::ManagerTransitionV1;
 use crate::upload::fetch_object;
 use menghunote_storage::{
     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, asset_bytes,
@@ -132,6 +134,36 @@ impl BootstrapPins {
             control_hash: read_meta_array::<32>(vault, META_BOOTSTRAP_CONTROL_HASH)?,
             highwater: cursor.confirmed_highwater,
         })
+    }
+
+    /// 把 `sync.pinned_*` 读成一个**带自己 rev/epoch/log** 的 bootstrap 锚（ADR 0013 §2）。
+    ///
+    /// 语义：
+    /// - `control_hash` 与 `control_rev` 必须成对：只有 hash 没有 rev 是本地损坏
+    ///   （既有行为）；只有 rev 没有 hash 时返回 `None`——rev 只是下界，不构成摘要锚；
+    /// - hash 存在时 `epoch` / `log_id` 必须齐全：历史视图复算需要锚**自己的**坐标，
+    ///   缺任一项都不能把摘要当"同 rev 校验"用（否则旧锚会在 rev 前进后被静默忽略）。
+    ///   这是 fail-closed：缺字段报 [`SyncError::LocalCorrupt`]，**不**降级成"没有锚"。
+    pub fn control_anchor(&self) -> Result<Option<BootstrapAnchorV1>, SyncError> {
+        let Some(hash) = self.control_hash else {
+            // 只有 rev 下界（历史实例/未写摘要）不构成摘要锚；单调性仍由 control_rev 保证。
+            return Ok(None);
+        };
+        let rev = self.control_rev.ok_or(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 control_rev",
+        ))?;
+        let epoch = self.epoch.ok_or(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 epoch（无法按历史视图复算摘要）",
+        ))?;
+        let log_id = self.log_id.ok_or(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 log_id（无法按历史视图复算摘要）",
+        ))?;
+        Ok(Some(BootstrapAnchorV1 {
+            rev,
+            hash,
+            epoch,
+            log_id,
+        }))
     }
 }
 
@@ -268,7 +300,7 @@ fn run_inner<C: RelayClient>(
     let report_docs = apply_selected(vault, peer_id, &selected, fault)?;
 
     // 全部实际写入 + 读回校验通过后，才在一个事务里推进水位（max 语义 + CAS）。
-    finalize(vault, &selected, &state, &control_hash, pins, fault)?;
+    finalize(vault, &selected, &state, &chain, &control_hash, pins, fault)?;
 
     // 成功后才清 staging journal；若这里失败，重试会幂等重放并再次清理。
     let _cleared = abort_baseline_apply(vault)?;
@@ -282,6 +314,46 @@ fn run_inner<C: RelayClient>(
         cursor: selected.checkpoint.cursor,
         signed_checkpoint: true,
     })
+}
+
+/// 校验本地 durable bootstrap 锚（ADR 0013 §3；`validate_remote`/`finalize` 共用）。
+///
+/// 两类视图必须分开，**不能**把旧 hash 挂到 `max(rev)` 上比较：
+///
+/// - `anchor.rev == state.control_rev`：摘要必须逐字节等于当前视图（`epoch`/`log_id`
+///   由当前 state 决定；同 rev 换 epoch/log/hash 都是 equivocation）；
+/// - `anchor.rev <  state.control_rev`：**不能忽略**旧锚，也不能拿新 rev 的坐标复算；
+///   按锚自己的 `rev/epoch/log` + 截断到该 rev 的管理链复算，证明当前链仍包含旧锚
+///   认证过的前缀；复算不出视图 → [`SyncError::NeedsTrust`]，摘要不符 → equivocation。
+fn verify_bootstrap_anchor(
+    anchor: &BootstrapAnchorV1,
+    state: &RelayState,
+    chain: &[ManagerChainEntry],
+    current_hash: &[u8; 32],
+) -> Result<(), SyncError> {
+    if anchor.rev > state.control_rev {
+        return Err(SyncError::ControlRollback {
+            expected: anchor.rev,
+            actual: state.control_rev,
+        });
+    }
+    if anchor.rev == state.control_rev {
+        if anchor.hash != *current_hash {
+            return Err(SyncError::Equivocation(
+                "bootstrap 控制头同 rev 但 hash 变化（同 rev 历史不完整）",
+            ));
+        }
+        return Ok(());
+    }
+    let computed = control_head_hash_at(state.vault_id, state.instance_id, anchor, chain).ok_or(
+        SyncError::NeedsTrust("bootstrap 旧锚的 rev 不在当前管理链视图内，无法证明历史前缀"),
+    )?;
+    if computed != anchor.hash {
+        return Err(SyncError::Equivocation(
+            "bootstrap 旧锚未被当前管理链覆盖（rev 前进但前缀被重写）",
+        ));
+    }
+    Ok(())
 }
 
 /// relay 侧与本地 pins 的写前校验：任何不满足都必须在写库前失败。
@@ -335,13 +407,8 @@ fn validate_remote(
         if rev > state.control_rev {
             return Err(SyncError::Object("bootstrap 不允许回退 control_rev"));
         }
-        // rev 前进时旧摘要属于旧前缀，不能与新链逐字节比较；单调性由 rev 保证。
-        if rev == state.control_rev {
-            if let Some(old_hash) = pins.control_hash {
-                if old_hash != *control_hash {
-                    return Err(SyncError::Object("bootstrap 控制头同 rev 但 hash 变化"));
-                }
-            }
+        if let Some(anchor) = pins.control_anchor()? {
+            verify_bootstrap_anchor(&anchor, state, chain, control_hash)?;
         }
     } else if pins.control_hash.is_some() {
         return Err(SyncError::LocalCorrupt(
@@ -374,13 +441,37 @@ fn validate_remote(
 /// 本模块只做"同 rev 不得换内容"的回退检测。
 #[must_use]
 pub fn control_head_hash(state: &RelayState, chain: &[ManagerChainEntry]) -> [u8; 32] {
+    control_head_hash_parts(
+        state.vault_id,
+        state.instance_id,
+        state.log_id,
+        state.epoch,
+        state.control_rev,
+        chain,
+    )
+}
+
+/// [`control_head_hash`] 的**坐标化**输入：调用方可以显式给出历史视图的坐标
+/// （ADR 0013 §3「按旧 rev/epoch/log/管理链视图验证」）。
+///
+/// 摘要公式与 [`control_head_hash`] 逐字节相同；`chain` 必须是**该 rev 下**的管理链
+/// （即按 `entry.rev <= control_rev` 截断后的前缀）。
+#[must_use]
+pub fn control_head_hash_parts(
+    vault_id: [u8; 16],
+    instance_id: [u8; 16],
+    log_id: [u8; 16],
+    epoch: u64,
+    control_rev: u64,
+    chain: &[ManagerChainEntry],
+) -> [u8; 32] {
     let mut input = Vec::new();
     input.extend_from_slice(b"menghunote/bootstrap/control-head/v1\0");
-    input.extend_from_slice(&state.vault_id);
-    input.extend_from_slice(&state.instance_id);
-    input.extend_from_slice(&state.log_id);
-    input.extend_from_slice(&state.epoch.to_be_bytes());
-    input.extend_from_slice(&state.control_rev.to_be_bytes());
+    input.extend_from_slice(&vault_id);
+    input.extend_from_slice(&instance_id);
+    input.extend_from_slice(&log_id);
+    input.extend_from_slice(&epoch.to_be_bytes());
+    input.extend_from_slice(&control_rev.to_be_bytes());
     input.extend_from_slice(&u32::try_from(chain.len()).unwrap_or(u32::MAX).to_be_bytes());
     for entry in chain {
         input.extend_from_slice(&entry.rev.to_be_bytes());
@@ -395,6 +486,54 @@ pub fn control_head_hash(state: &RelayState, chain: &[ManagerChainEntry]) -> [u8
         push_optional_signature(&mut input, entry.new_signature);
     }
     Sha256::digest(&input).into()
+}
+
+/// 按 bootstrap 锚**自己的** rev/epoch/log 视图复算控制头摘要（ADR 0013 §3）。
+///
+/// 为什么不能用当前 head 的坐标：摘要把 `(epoch, control_rev)` 也哈希进去，rev 前进后
+/// 同一条历史管理链会算出不同摘要。历史锚只能按"它当初记录的坐标 + 当时的管理链"复算：
+///
+/// - `epoch` / `log_id` / `rev` 取自锚本身（本地 durable 事实，relay 不能改）；
+/// - 管理链按**生效 epoch** 截断：`/control` 键 5 的 `rev` 是**管理 rev**（不是 control
+///   rev），每条转换记录 `from_epoch → to_epoch`；epoch 只能由 activation 推进，因此
+///   "锚当时的链" = rev1 genesis + `to_epoch <= anchor.epoch` 的转换（必须仍是链前缀）；
+/// - `instance_id` 取自本地 pin/身份（换实例另有独立检查）。
+///
+/// 返回 `None` = 无法重建该历史视图（链不完整/非前缀/转换不可解码），调用方必须
+/// fail-closed，不能把"视图不可用"当成"验证通过"。
+#[must_use]
+pub fn control_head_hash_at(
+    vault_id: [u8; 16],
+    instance_id: [u8; 16],
+    anchor: &BootstrapAnchorV1,
+    chain: &[ManagerChainEntry],
+) -> Option<[u8; 32]> {
+    if chain.first().is_none_or(|entry| entry.rev != 1) {
+        return None;
+    }
+    // rev1 的 `transition` 是 genesis 原字节（不是 ManagerTransitionV1），不参与解码。
+    let mut end = 1usize;
+    for (index, entry) in chain.iter().enumerate().skip(1) {
+        let transition = ManagerTransitionV1::decode(&entry.transition).ok()?;
+        if transition.new_rev != entry.rev {
+            return None;
+        }
+        if transition.to_epoch <= anchor.epoch {
+            if index != end {
+                // 更早的转换不属于历史视图，后面却又出现属于它的转换 = 非前缀，拒绝。
+                return None;
+            }
+            end = index + 1;
+        }
+    }
+    Some(control_head_hash_parts(
+        vault_id,
+        instance_id,
+        anchor.log_id,
+        anchor.epoch,
+        anchor.rev,
+        &chain[..end],
+    ))
 }
 
 fn push_optional_signature(input: &mut Vec<u8>, signature: Option<[u8; 64]>) {
@@ -1045,6 +1184,7 @@ fn finalize(
     vault: &Vault,
     selected: &SelectedBaseline,
     state: &RelayState,
+    chain: &[ManagerChainEntry],
     control_hash: &[u8; 32],
     pins: &BootstrapPins,
     fault: Option<BootstrapFault>,
@@ -1076,12 +1216,10 @@ fn finalize(
         if rev > state.control_rev {
             return Err(SyncError::Object("bootstrap 不允许回退 control_rev"));
         }
-        if rev == state.control_rev {
-            if let Some(old_hash) = stored.control_hash {
-                if old_hash != *control_hash {
-                    return Err(SyncError::Object("bootstrap 控制头同 rev 但 hash 变化"));
-                }
-            }
+        // 与 `validate_remote` 同一口径：两类视图（同 rev 摘要 / 异 rev 历史锚）都验，
+        // 不因 rev 前进就跳过旧摘要（ADR 0013 §3）。
+        if let Some(anchor) = stored.control_anchor()? {
+            verify_bootstrap_anchor(&anchor, state, chain, control_hash)?;
         }
     }
     if let Some(highwater) = pins.highwater {

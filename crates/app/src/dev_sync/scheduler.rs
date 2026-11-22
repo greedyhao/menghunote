@@ -201,6 +201,8 @@ pub enum SkipReason {
     Running,
     /// 已人工暂停。
     Paused,
+    /// 安全暂停（信任/TLS/pin 类）：不自动重试，手动也被拒绝（ADR 0013 §4）。
+    SecurityPaused,
     /// 宿主的单操作位/外部提交闸门被占用（Held）。
     HostBusy,
     /// 网络退避还没到期。
@@ -221,6 +223,9 @@ impl SkipReason {
             Self::NotDue => "还没到时间",
             Self::Running => "单操作在途",
             Self::Paused => "需要人工处理",
+            Self::SecurityPaused => {
+                "安全暂停：请到设置 → 安全指纹核对后处理（不会自动清 pin/信任）"
+            }
             Self::HostBusy => "持闸/单操作位被占用",
             Self::Backoff => "退避中",
             Self::MinStartInterval => "距上次自动启动不足 5s",

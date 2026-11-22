@@ -83,8 +83,14 @@ fn init_then_status_reports_uninitialized_vault_and_reinit_is_rejected() {
     );
     let printed = stdout(&output);
     assert!(printed.contains("state=uninitialized"), "{printed}");
-    assert!(printed.contains("devices=0"), "{printed}");
-    assert!(printed.contains("schema_version=9"), "{printed}");
+    assert!(printed.contains("vaults=0"), "{printed}");
+    assert!(
+        printed.contains(&format!(
+            "schema_version={}",
+            menghunote_relay::db::schema::SCHEMA_VERSION
+        )),
+        "{printed}"
+    );
     assert!(printed.contains("instance_id="), "{printed}");
     assert!(!printed.contains("setup_secret"), "status 不得回显 secret");
 

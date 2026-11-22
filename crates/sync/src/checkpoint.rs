@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashSet};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use crate::asset_sync;
 use crate::cbor;
 use crate::device::DeviceSigningKey;
 use crate::error::SyncError;
@@ -34,8 +35,9 @@ use crate::relay::{
 };
 use crate::slot::KeySlotV1;
 use crate::upload::{
-    fetch_object, fetch_verified_asset, upload_object_with_reservation, AssetExpectation,
-    UploadedObject, VerifiedAssetFacts,
+    encrypt_asset_parts, fetch_object, fetch_verified_asset, submit_prepared_object,
+    upload_object_with_reservation, AssetExpectation, EncryptedObjectParts, UploadedObject,
+    VerifiedAssetFacts,
 };
 use crate::{DeviceId, ObjectId, VaultId};
 use menghunote_storage::{
@@ -1723,6 +1725,108 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         Ok(report)
     }
 
+    /// 上传/复用一个 ASSET 对象（checkpoint 路径）。
+    ///
+    /// relay 的 reservation 规则是"同一对象的全部分片必须来自同一预算来源"，所以：
+    /// - relay 上**没有**该对象 → 用自己的维护 reservation 上传全部缺失分片；
+    /// - relay 上**已有完整对象**（普通同步/上一份 checkpoint/轮换传过）→ 只按确定性
+    ///   密文逐片校验 + 提交（幂等），不再上传、不碰 reservation；
+    /// - relay 上**部分分片** → 先按自己的 reservation 补齐（同一 lease 的重试）；若
+    ///   返回 `ID_CONFLICT`（对象已由普通预算/别的 reservation 建立），再按普通预算
+    ///   补齐——分片内容确定性相同，relay 对同字节幂等，不会混拼两份密文。
+    fn sync_asset_object(
+        &mut self,
+        object_id: &ObjectId,
+        message_id: [u8; 16],
+        encrypted: &EncryptedObjectParts,
+        reservation: &[u8; 16],
+    ) -> Result<UploadedObject, SyncError> {
+        // 先按维护预算直接上传（PUT 对同字节幂等，重复片不重复计费）：
+        // - 全新对象 / 同一 lease 的中断续传：一次成功，不做任何 GET（validate 的
+        //   "refs 资产只读回一次"依赖 prepare 不预先探测）；
+        // - 对象已由普通预算/上一份 checkpoint 建立：relay 报 ID_CONFLICT，再走复用探测。
+        let mut saw_conflict = false;
+        for (part_no, envelope, _) in &encrypted.parts {
+            match self.client.put_part_with_reservation(
+                object_id,
+                *part_no,
+                envelope,
+                Some(reservation),
+            ) {
+                Ok(()) => {}
+                Err(error) if asset_sync::is_id_conflict(&error) => {
+                    saw_conflict = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !saw_conflict {
+            self.submit_asset_object(object_id, message_id, encrypted)?;
+            return Ok(uploaded_object_from_parts(object_id, encrypted));
+        }
+
+        // 复用已有对象：逐片按确定性密文校验，只提交（幂等），缺失片按对象既有
+        // 预算来源补齐（普通预算对象才允许普通 PUT；维护预算对象在别人的
+        // reservation 下无法续传，直接失败）。
+        let Some(first) = asset_sync::read_part(self.client, object_id, 0)? else {
+            return Err(SyncError::LocalCorrupt(
+                "checkpoint 资产对象 ID_CONFLICT 但第 0 片不存在",
+            ));
+        };
+        // 确定性加密：同 object_id 的分片字节必须一致；不一致 fail-closed。
+        if first != encrypted.parts[0].1 {
+            return Err(SyncError::Object(
+                "checkpoint 资产对象已有密文与本地确定性密文不一致",
+            ));
+        }
+        let mut missing = Vec::new();
+        for (part_no, envelope, _) in encrypted.parts.iter().skip(1) {
+            match asset_sync::read_part(self.client, object_id, *part_no)? {
+                Some(stored) => {
+                    if stored != *envelope {
+                        return Err(SyncError::Object(
+                            "checkpoint 资产对象已有分片与本地确定性密文不一致",
+                        ));
+                    }
+                }
+                None => missing.push((*part_no, envelope)),
+            }
+        }
+        if !missing.is_empty() {
+            // 普通预算对象（普通同步中断留下的）才允许无 reservation 续传；若对象
+            // 属于其它维护 reservation，这里会再次 ID_CONFLICT 并 fail-closed。
+            for (part_no, envelope) in &missing {
+                self.client.put_part(object_id, *part_no, envelope)?;
+            }
+        }
+        self.submit_asset_object(object_id, message_id, encrypted)?;
+        Ok(uploaded_object_from_parts(object_id, encrypted))
+    }
+
+    /// 提交一个 checkpoint ASSET 对象（`ObjectCommit` 全字段确定性派生）。
+    fn submit_asset_object(
+        &mut self,
+        object_id: &ObjectId,
+        message_id: [u8; 16],
+        encrypted: &EncryptedObjectParts,
+    ) -> Result<(), SyncError> {
+        submit_prepared_object(
+            self.client,
+            self.vault_id,
+            &self.signing_key,
+            ObjectType::Asset,
+            *object_id,
+            message_id,
+            0,
+            self.root.key_epoch,
+            0,
+            encrypted.part_count,
+            encrypted.total_plain_len,
+            &encrypted.object_digest,
+        )
+    }
+
     /// prepare：只固定 S（lease）并导出/上传对象与 refs。
     ///
     /// ADR §32：**不 publish、不签最终 CheckpointCommit**；返回值不可作为可驱动 GC
@@ -1831,11 +1935,39 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
 
         let mut asset_refs = Vec::with_capacity(asset_metas.len());
         for meta in &asset_metas {
-            // ASSET object_id = HMAC(K_asset_id, real_sha256)，同资产再上传必须复用同一份
-            // 密文（relay 对同 object_id 的不同字节返回 ID_CONFLICT）。
+            // 同一 writer 生命周期内同资产只上传/复用一次。
             if let Some(cached) = self.uploaded_assets.get(&meta.real_sha256).cloned() {
                 if cached.byte_len == meta.byte_len && cached.media_type == meta.media_type {
                     asset_refs.push(cached);
+                    continue;
+                }
+            }
+            let total_plain_len = asset_sync::asset_plain_len(meta.byte_len, &meta.media_type)?;
+            let part_count = u32::try_from(part_count_for(total_plain_len, ObjectType::Asset))
+                .map_err(|_| SyncError::LocalCorrupt("资产分片数超出 u32"))?;
+            let object_id = asset_object_id(
+                &self.root,
+                &meta.real_sha256,
+                meta.byte_len,
+                &meta.media_type,
+            )?;
+            // 普通同步 / 上一份 checkpoint / 轮换若已上传并提交过同一确定性对象，直接
+            // 复用 durable 标记：不再重传分片，也不再申请一份新的 reservation 预算。
+            // （ASSET 的 object_id/nonce/message_id 都由根与完整明文头确定性派生，
+            // 同一 object_id 只可能对应逐字节相同的密文。）
+            if let Some(fact) = asset_sync::read_uploaded(self.vault, &object_id)? {
+                if fact.key_epoch == self.root.key_epoch
+                    && fact.part_count == part_count
+                    && fact.total_plain_len == total_plain_len
+                {
+                    let entry = AssetRef {
+                        real_sha256: meta.real_sha256,
+                        byte_len: meta.byte_len,
+                        media_type: meta.media_type.clone(),
+                        object: fact.uploaded_object(),
+                    };
+                    self.uploaded_assets.insert(meta.real_sha256, entry.clone());
+                    asset_refs.push(entry);
                     continue;
                 }
             }
@@ -1845,35 +1977,33 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
                 return Err(SyncError::Object("资产字节与元数据不一致"));
             }
             let plaintext = asset_plaintext(&real, meta.byte_len, &meta.media_type, &data)?;
-            let object_id = asset_object_id(&self.root, &real, meta.byte_len, &meta.media_type)?;
+            let encrypted = encrypt_asset_parts(&self.root, self.vault_id, object_id, &plaintext)?;
+            if encrypted.total_plain_len != total_plain_len || encrypted.part_count != part_count {
+                return Err(SyncError::LocalCorrupt("资产确定性分片事实与元数据不一致"));
+            }
             // ASSET 重传必须字节一致（ADR §19/§31）：object_id 已提交完整明文头，
             // nonce 与 message_id 都确定性派生。
             let message_id = crate::upload::asset_message_id(&self.root, &object_id)?;
-            let object = upload_object_with_reservation(
-                self.client,
-                self.vault_id,
-                self.device_id,
-                &self.signing_key,
-                &self.root,
-                ObjectType::Asset,
-                object_id,
-                message_id,
-                0,
-                0,
-                &plaintext,
-                &[],
-                None,
-                &lease.reservation_id,
+            let object =
+                self.sync_asset_object(&object_id, message_id, &encrypted, &lease.reservation_id)?;
+            asset_sync::mark_uploaded(
+                self.vault,
+                &asset_sync::AssetUploadedFact {
+                    object_id,
+                    part_count: object.part_count,
+                    total_plain_len: object.total_plain_len,
+                    object_digest: object.object_digest,
+                    key_epoch: self.root.key_epoch,
+                },
             )?;
-            asset_refs.push(AssetRef {
+            let entry = AssetRef {
                 real_sha256: real,
                 byte_len: meta.byte_len,
                 media_type: meta.media_type.clone(),
                 object,
-            });
-            if let Some(entry) = asset_refs.last().cloned() {
-                self.uploaded_assets.insert(real, entry);
-            }
+            };
+            self.uploaded_assets.insert(real, entry.clone());
+            asset_refs.push(entry);
         }
         let mut asset_object_ids: Vec<ObjectId> = asset_refs
             .iter()
@@ -3765,6 +3895,19 @@ pub(crate) fn asset_plaintext(
     out.extend_from_slice(media_type.as_bytes());
     out.extend_from_slice(data);
     Ok(out)
+}
+
+/// 由确定性加密结果构造 manifest/refs 使用的公开事实。
+fn uploaded_object_from_parts(
+    object_id: &ObjectId,
+    encrypted: &EncryptedObjectParts,
+) -> UploadedObject {
+    UploadedObject {
+        object_id: *object_id,
+        part_count: encrypted.part_count,
+        total_plain_len: encrypted.total_plain_len,
+        object_digest: encrypted.object_digest,
+    }
 }
 
 pub(crate) fn verify_asset_plaintext(bytes: &[u8], asset: &AssetRef) -> Result<(), SyncError> {

@@ -5,8 +5,9 @@ mod support;
 use support::*;
 
 use menghunote_storage::{
-    asset_bytes, asset_meta, insert_asset, link_asset_ref, list_asset_refs, list_assets,
-    set_asset_orphan_since, unlink_asset_ref, AssetRef,
+    asset_bytes, asset_meta, count_unreferenced_assets, insert_asset, link_asset_ref,
+    list_asset_refs, list_assets, list_referenced_assets, set_asset_orphan_since, unlink_asset_ref,
+    AssetRef, Value,
 };
 
 #[test]
@@ -81,6 +82,46 @@ fn refs_can_be_linked_updated_listed_and_unlinked() {
     let refs = list_asset_refs(&vault, "note-1").unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].start_byte, 20);
+}
+
+#[test]
+fn referenced_assets_exclude_orphans_placeholders_and_duplicates() {
+    let (_dir, vault) = fresh_vault();
+    seed_note(&vault, "note-1", "doc-1");
+    let referenced = [0xD1u8; 32];
+    let orphan = [0xD2u8; 32];
+    let placeholder = [0xD3u8; 32];
+    insert_asset(&vault, &referenced, 3, Some("text/plain"), b"abc").unwrap();
+    insert_asset(&vault, &orphan, 3, Some("text/plain"), b"xyz").unwrap();
+    // 只有元数据的占位（data IS NULL）：即便被引用也不应进入上传集合。
+    vault
+        .exec(
+            "INSERT INTO assets(asset_hash,byte_len,media_type,data) VALUES(?1,3,'text/plain',NULL)",
+            &[Value::Blob(placeholder.to_vec())],
+        )
+        .unwrap();
+    // 同一资产被多个位置引用只出现一次。
+    link_asset_ref(&vault, "note-1", &referenced, 0, 1).unwrap();
+    link_asset_ref(&vault, "note-1", &referenced, 10, 1).unwrap();
+    link_asset_ref(&vault, "note-1", &placeholder, 20, 1).unwrap();
+
+    let listed = list_referenced_assets(&vault).unwrap();
+    assert_eq!(listed.len(), 1, "只应有 1 个有明文的被引用资产");
+    assert_eq!(listed[0].asset_hash, referenced);
+    assert!(listed[0].has_data);
+    assert_eq!(listed[0].byte_len, Some(3));
+    assert_eq!(listed[0].media_type.as_deref(), Some("text/plain"));
+    assert_eq!(
+        count_unreferenced_assets(&vault).unwrap(),
+        1,
+        "有一条无引用孤儿（占位不算）"
+    );
+
+    // 解链后资产变为孤儿：从未引用集合消失、进入孤儿计数。
+    unlink_asset_ref(&vault, "note-1", &referenced, 0).unwrap();
+    unlink_asset_ref(&vault, "note-1", &referenced, 10).unwrap();
+    assert!(list_referenced_assets(&vault).unwrap().is_empty());
+    assert_eq!(count_unreferenced_assets(&vault).unwrap(), 2);
 }
 
 #[test]

@@ -39,6 +39,7 @@ use menghunote_storage::{
     insert_asset, load_body_doc, load_head, sync_cursor_state, BodyDoc, SyncIntent, UpdateRecord,
     Vault,
 };
+use menghunote_sync::api_version::RelayApiVersion;
 use menghunote_sync::checkpoint::{CheckpointWriter, EmptyAssets, StorageAssets};
 use menghunote_sync::device::{verify_signature, DeviceSigningKey};
 use menghunote_sync::engine::{
@@ -330,6 +331,7 @@ pub fn run_with(
         StdTcpTransport::new_local_dev(relay)?,
         HttpRelayConfig {
             base_url: relay.to_owned(),
+            api_version: RelayApiVersion::V1,
             vault_id,
             device_id,
             manager_pub,
@@ -440,6 +442,7 @@ pub fn run_with(
         StdTcpTransport::new_local_dev(relay)?,
         HttpRelayConfig {
             base_url: relay.to_owned(),
+            api_version: RelayApiVersion::V1,
             vault_id,
             device_id,
             manager_pub,

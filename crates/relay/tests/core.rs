@@ -4,12 +4,14 @@ mod support;
 
 use support::*;
 
+use menghunote_sync_proto as proto;
 use relay::auth::{self, Realm};
 use relay::checkpoints;
 use relay::cursor::{self, CursorKey};
 use relay::db::schema;
 use relay::envelope::ObjectType;
 use relay::error::{Error, ErrorCode};
+use relay::ids::sha256_parts;
 use relay::ids::{b64url_decode, b64url_encode, sha256};
 use relay::log;
 use relay::objects;
@@ -59,7 +61,7 @@ fn ddl_is_strict_and_pragmas_are_pinned() {
         assert_eq!(*strict, 1, "表 {name} 必须是 STRICT");
     }
     for required in [
-        "vault",
+        "vaults",
         "objects",
         "object_parts",
         "log",
@@ -91,7 +93,7 @@ fn ddl_is_strict_and_pragmas_are_pinned() {
         .db
         .read(|conn| schema::meta_text(conn, schema::META_SCHEMA_VERSION))
         .expect("meta");
-    assert_eq!(version.as_deref(), Some("9"));
+    assert_eq!(version, Some(relay::db::schema::SCHEMA_VERSION.to_string()));
 }
 
 #[test]
@@ -110,30 +112,43 @@ fn single_vault_constraint_holds() {
         certificate: certificate_bytes(&[9u8; 16], &[8u8; 16], &[1u8; 32], &[2u8; 32], 1),
         certificate_signature: b"s".to_vec(),
     };
+    // v1 创建路径用请求里的 vault_id 作为显式 scope（见 api::create_vault）。
     let err = fx
         .db
-        .write_blocking(move |conn| {
+        .inner()
+        .write_blocking(relay::VaultScope::new([9u8; 16]), move |conn| {
             relay::vault::initialize(conn, clock.as_ref(), &cfg, hook.as_ref(), &init)
         })
         .expect_err("second init must fail");
     assert_eq!(code(&err), Some(ErrorCode::AlreadyInitialized));
 
-    // 即使绕过校验直接写第二行也必须被 schema 挡住（singleton PK）。
+    // schema 10 允许第二行 vault（多租户基础，S2b 的 v2 创建票据会用到）；
+    // v1 的"单 vault"约束改由 `initialize` 的显式门禁承担（上面已断言）。
     let raw = fx.db.write_blocking(|conn| {
         conn.execute(
-            "INSERT INTO vault(singleton, vault_id, instance_id, log_id, log_incarnation,
-                               cursor_key, state, active_epoch, next_epoch, manager_rev,
-                               control_rev, auth_rev, head_seq, gc_floor, normal_limit,
-                               maintenance_limit, created_at)
-             VALUES (2, X'01010101010101010101010101010101', X'00000000000000000000000000000000',
+            "INSERT INTO vaults(vault_id, instance_id, log_id, log_incarnation,
+                                cursor_key, state, active_epoch, next_epoch, manager_rev,
+                                control_rev, auth_rev, head_seq, gc_floor, normal_limit,
+                                maintenance_limit, legacy_default, created_at)
+             VALUES (X'09090909090909090909090909090909', X'00000000000000000000000000000000',
                      X'00000000000000000000000000000000', X'00000000000000000000000000000000',
                      X'0000000000000000000000000000000000000000000000000000000000000000',
-                     'active', 1, 2, 1, 1, 1, 0, 0, 1024, 2048, 0)",
+                     'active', 1, 2, 1, 1, 1, 0, 0, 1024, 2048, 0, 0)",
             [],
         )?;
         Ok(())
     });
-    assert!(raw.is_err(), "第二个 vault 行必须被拒绝");
+    assert!(
+        raw.is_ok(),
+        "schema 10 允许多 vault 行（v1 门禁在 initialize）: {raw:?}"
+    );
+    let count: i64 = fx
+        .db
+        .read_instance(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM vaults", [], |row| row.get(0))?)
+        })
+        .expect("count");
+    assert_eq!(count, 2);
 }
 
 // ---------------------------------------------------------------- 鉴权
@@ -400,7 +415,10 @@ fn cursor_expires_below_gc_floor_and_holes_are_invariant_errors() {
     // 模拟 GC 推进 floor 到 2（真实路径见 gc 测试）。
     fx.db
         .write_blocking(|conn| {
-            conn.execute("UPDATE vault SET gc_floor = 2 WHERE singleton = 1", [])?;
+            conn.execute(
+                "UPDATE vaults SET gc_floor = 2 WHERE vault_id = ?1",
+                [conn.scope().as_slice()],
+            )?;
             Ok(())
         })
         .expect("bump floor");
@@ -417,7 +435,10 @@ fn cursor_expires_below_gc_floor_and_holes_are_invariant_errors() {
     // 先把 floor 复位，否则 after=0 会先命中 CURSOR_EXPIRED。
     fx.db
         .write_blocking(|conn| {
-            conn.execute("UPDATE vault SET gc_floor = 0 WHERE singleton = 1", [])?;
+            conn.execute(
+                "UPDATE vaults SET gc_floor = 0 WHERE vault_id = ?1",
+                [conn.scope().as_slice()],
+            )?;
             conn.execute("DELETE FROM log WHERE relay_seq = 2", [])?;
             Ok(())
         })
@@ -610,5 +631,34 @@ fn control_chain_genesis_hash_uses_zero_prev_hash() {
     assert_eq!(
         second.1.as_slice(),
         relay::ids::sha256_parts(&[hash1.as_slice(), b"next-record"]).as_slice()
+    );
+}
+
+// ---------------------------------------------------------------- 控制链 rev1 摘要
+
+/// **跨 crate 的公式一致性**：`vault::init` 里 rev1 控制记录的 `record_hash` 是
+/// `SHA256(零32 || 设备证书 CDE)`；sync crate 的 `genesis::rev1_record_hash` 用**同一
+/// 公式**在本地复算它（ADR 0013 §3：Create 内先复算再验证 relay 链）。
+///
+/// 这里用与 `crates/sync/src/genesis.rs` 单测**完全相同**的固定证书向量与期望摘要，
+/// 两边任何一侧改了公式/证书编码，这个测试就会失败（不依赖 sync crate 的依赖方向）。
+#[test]
+fn genesis_rev1_record_hash_matches_the_client_known_vector() {
+    let cert = proto::DeviceCertV1 {
+        vault_id: [0x11; 16],
+        device_id: [0x22; 16],
+        sign_ed25519_pub: [0x33; 32],
+        hpke_x25519_pub: [0x44; 32],
+        cert_serial: 7,
+        issued_manager_rev: 1,
+        rights: proto::Rights(proto::Rights::ALL),
+    };
+    let cert_bytes = cert.encode().expect("cert cde");
+    let zero = [0u8; 32];
+    let hash = sha256_parts(&[zero.as_slice(), cert_bytes.as_slice()]);
+    assert_eq!(
+        relay::ids::hex_lower(&hash),
+        "c0cfd56ee351ad4cb96d9070734f63d04e8e27539cbf3dd551b9f4981eaec8e4",
+        "relay 的 rev1 record_hash 与客户端已知向量不一致"
     );
 }

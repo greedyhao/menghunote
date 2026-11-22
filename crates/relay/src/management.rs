@@ -30,11 +30,12 @@
 //! 幂等 scope 按端点区分（`management/begin` 等）：管理签名本身绑定 path，跨端点复用同一
 //! request_id 不构成重放，也不应被误判为 409。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::auth::{self, ManagementProof};
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{sha256, Hash32, Id16};
+use crate::scope::ScopeConn;
 use crate::sig::SignatureHook;
 use crate::time::Clock;
 use crate::wire;
@@ -303,16 +304,19 @@ pub enum ManagedOutcome {
 
 /// 读幂等记录：`(request_hash, response_bytes)`。
 pub fn lookup(
-    conn: &Connection,
+    conn: &ScopeConn,
     scope: &str,
     request_id: &Id16,
 ) -> Result<Option<(Hash32, Vec<u8>)>> {
-    let mut stmt =
-        conn.prepare("SELECT request_hash, response FROM dedup WHERE scope = ?1 AND id = ?2")?;
+    let mut stmt = conn.prepare(
+        "SELECT request_hash, response FROM dedup
+         WHERE scope = ?1 AND id = ?2 AND vault_id = ?3",
+    )?;
     let row = stmt
-        .query_row((scope, request_id.as_slice()), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
+        .query_row(
+            (scope, request_id.as_slice(), conn.scope().as_slice()),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
         .optional()?;
     match row {
         None => Ok(None),
@@ -328,14 +332,19 @@ pub fn lookup(
 /// 按 request_id 跨全部管理 scope 找幂等结果（`GET rotations/current?request_id=`）。
 ///
 /// 返回 `(scope, response_bytes)`；同一次请求只会落在端点的 scope 下，多命中时取最新。
-pub fn lookup_any(conn: &Connection, request_id: &Id16) -> Result<Option<(String, Vec<u8>)>> {
+pub fn lookup_any(conn: &ScopeConn, request_id: &Id16) -> Result<Option<(String, Vec<u8>)>> {
     let mut stmt = conn.prepare(
         "SELECT scope, response FROM dedup
-         WHERE id = ?1 AND scope LIKE ?2 ORDER BY created_at DESC LIMIT 1",
+         WHERE id = ?1 AND scope LIKE ?2 AND vault_id = ?3
+         ORDER BY created_at DESC LIMIT 1",
     )?;
     let row = stmt
         .query_row(
-            (request_id.as_slice(), format!("{DEDUP_PREFIX}/%")),
+            (
+                request_id.as_slice(),
+                format!("{DEDUP_PREFIX}/%"),
+                conn.scope().as_slice(),
+            ),
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
@@ -349,7 +358,7 @@ pub fn lookup_any(conn: &Connection, request_id: &Id16) -> Result<Option<(String
 /// - 幂等查询先于 CAS，因为成功执行本身会推进 `control_rev`，重放必须仍能找回结果；
 /// - 缓存写入与业务写入在同一个 `BEGIN IMMEDIATE` 事务里（handler 的 `Db::write`）。
 pub fn run(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     call: &ManagementCall<'_>,
@@ -384,9 +393,10 @@ pub fn run(
     let fields = execute()?;
     let encoded = wire::encode(fields.clone())?;
     conn.execute(
-        "INSERT INTO dedup(scope, id, request_hash, accepted_seq, response, created_at)
-         VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+        "INSERT INTO dedup(vault_id, scope, id, request_hash, accepted_seq, response, created_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
         (
+            conn.scope().as_slice(),
             call.scope,
             call.request_id.as_slice(),
             request_hash.as_slice(),

@@ -8,7 +8,7 @@
 //!   要继续只能新分配更高 epoch 重做。
 //! - staged grants 在 activate 前对普通成员不可读（查询只认 `active_epoch`）。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::auth::{self, AuthContext, ManagementProof};
 use crate::checkpoints;
@@ -19,6 +19,7 @@ use crate::control::{
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{sha256, Hash32, Id16};
 use crate::objects;
+use crate::scope::ScopeConn;
 use crate::sig::{
     require, EpochGrantInput, Expectation, SignDomain, SignatureCheck, SignatureHook,
 };
@@ -246,16 +247,16 @@ pub struct ActivateOutcome {
 }
 
 /// 读 rotation 行。
-pub fn get(conn: &Connection, rotation_id: &Id16) -> Result<RotationRow> {
+pub fn get(conn: &ScopeConn, rotation_id: &Id16) -> Result<RotationRow> {
     let mut stmt = conn.prepare(
         "SELECT rotation_id, from_epoch, to_epoch, freeze_seq, member_set_hash, asset_set_digest,
                 revoked_count, state, created_at, updated_at,
                 primary_checkpoint, fallback_checkpoint, activation_commit, activated_at,
                 activated_control_rev
-         FROM rotations WHERE rotation_id = ?1",
+         FROM rotations WHERE rotation_id = ?1 AND vault_id = ?",
     )?;
     let row = stmt
-        .query_row([rotation_id.as_slice()], |row| {
+        .query_row((rotation_id.as_slice(), conn.scope().as_slice()), |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
@@ -345,12 +346,13 @@ pub fn get(conn: &Connection, rotation_id: &Id16) -> Result<RotationRow> {
 }
 
 /// 最新一条 rotation。
-pub fn latest(conn: &Connection) -> Result<Option<RotationRow>> {
+pub fn latest(conn: &ScopeConn) -> Result<Option<RotationRow>> {
     let mut stmt = conn.prepare(
-        "SELECT rotation_id FROM rotations ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        "SELECT rotation_id FROM rotations WHERE vault_id = ?1
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
     )?;
     let row = stmt
-        .query_row([], |row| row.get::<_, Vec<u8>>(0))
+        .query_row([conn.scope().as_slice()], |row| row.get::<_, Vec<u8>>(0))
         .optional()?;
     match row {
         None => Ok(None),
@@ -365,12 +367,16 @@ pub fn latest(conn: &Connection) -> Result<Option<RotationRow>> {
 }
 
 /// 候选 epoch 对应的 rotation id（轮换维护 reservation 以它为 resource_id）。
-pub fn rotation_id_for_epoch(conn: &Connection, epoch: u64) -> Result<Option<Id16>> {
+pub fn rotation_id_for_epoch(conn: &ScopeConn, epoch: u64) -> Result<Option<Id16>> {
     let value: Option<Vec<u8>> = conn
         .query_row(
             "SELECT rotation_id FROM rotations
-             WHERE to_epoch = ?1 AND state IN ('frozen','staging') LIMIT 1",
-            [i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?],
+             WHERE to_epoch = ?1 AND state IN ('frozen','staging') AND vault_id = ?
+             LIMIT 1",
+            (
+                i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
+                conn.scope().as_slice(),
+            ),
             |row| row.get(0),
         )
         .optional()?;
@@ -386,12 +392,16 @@ pub fn rotation_id_for_epoch(conn: &Connection, epoch: u64) -> Result<Option<Id1
 }
 
 /// 候选 epoch 的冻结水位（checkpoint 创建时校验 `head_seq >= freeze_seq`）。
-pub fn freeze_seq_for_epoch(conn: &Connection, epoch: u64) -> Result<Option<u64>> {
+pub fn freeze_seq_for_epoch(conn: &ScopeConn, epoch: u64) -> Result<Option<u64>> {
     let value: Option<i64> = conn
         .query_row(
             "SELECT freeze_seq FROM rotations
-             WHERE to_epoch = ?1 AND state IN ('frozen','staging') LIMIT 1",
-            [i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?],
+             WHERE to_epoch = ?1 AND state IN ('frozen','staging') AND vault_id = ?
+             LIMIT 1",
+            (
+                i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
+                conn.scope().as_slice(),
+            ),
             |row| row.get(0),
         )
         .optional()?;
@@ -407,12 +417,16 @@ pub fn freeze_seq_for_epoch(conn: &Connection, epoch: u64) -> Result<Option<u64>
 ///
 /// 只覆盖 staged/最新 grant 的签名头，不含密文；与 activate 的 `ActivationCommitV1`
 /// 和 rotation view 使用同一口径（客户端可复算）。
-pub fn grants_digest(conn: &Connection, epoch: u64) -> Result<(u64, Hash32)> {
+pub fn grants_digest(conn: &ScopeConn, epoch: u64) -> Result<(u64, Hash32)> {
     let mut stmt = conn.prepare(
-        "SELECT device_id, signed_header FROM device_grants WHERE epoch = ?1 ORDER BY device_id ASC",
+        "SELECT device_id, signed_header FROM device_grants
+         WHERE epoch = ?1 AND vault_id = ? ORDER BY device_id ASC",
     )?;
     let rows = stmt.query_map(
-        [i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?],
+        (
+            i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
         |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
     )?;
     let mut buf = Vec::new();
@@ -429,7 +443,7 @@ pub fn grants_digest(conn: &Connection, epoch: u64) -> Result<(u64, Hash32)> {
 /// 追加一条 typed `SignedControlRecord`（控制链永久保留，不在密文 GC 范围内）。
 #[allow(clippy::too_many_arguments)]
 fn append_control_record(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     kind: ControlKind,
     request_id: Id16,
@@ -456,12 +470,12 @@ fn append_control_record(
 
 /// 成员证书集合摘要：按 device_id 升序 `SHA256(concat(device_id || certificate ||
 /// certificate_signature?))`。activate 必须锁定它（证书集合不能在 activate 时被掉包）。
-pub fn member_cert_digest(conn: &Connection) -> Result<Hash32> {
+pub fn member_cert_digest(conn: &ScopeConn) -> Result<Hash32> {
     let mut stmt = conn.prepare(
         "SELECT device_id, certificate, certificate_signature FROM devices
-         WHERE status = 'active' ORDER BY device_id ASC",
+         WHERE status = 'active' AND vault_id = ?1 ORDER BY device_id ASC",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([conn.scope().as_slice()], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, Vec<u8>>(1)?,
@@ -481,13 +495,16 @@ pub fn member_cert_digest(conn: &Connection) -> Result<Hash32> {
 }
 
 /// 候选 epoch 的槽集合摘要：按 slot_id 升序 `SHA256(concat(slot_id || SHA256(descriptor)))`。
-pub fn slot_set_digest(conn: &Connection, epoch: u64) -> Result<Hash32> {
+pub fn slot_set_digest(conn: &ScopeConn, epoch: u64) -> Result<Hash32> {
     let mut stmt = conn.prepare(
         "SELECT slot_id, descriptor FROM key_slots
-         WHERE epoch = ?1 AND state = 'staging' ORDER BY slot_id ASC",
+         WHERE epoch = ?1 AND state = 'staging' AND vault_id = ? ORDER BY slot_id ASC",
     )?;
     let rows = stmt.query_map(
-        [i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?],
+        (
+            i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
         |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
     )?;
     let mut buf = Vec::new();
@@ -500,7 +517,7 @@ pub fn slot_set_digest(conn: &Connection, epoch: u64) -> Result<Hash32> {
 }
 
 /// 视图（含 staged grants 摘要）。
-pub fn view(conn: &Connection, rotation_id: &Id16) -> Result<RotationView> {
+pub fn view(conn: &ScopeConn, rotation_id: &Id16) -> Result<RotationView> {
     let rotation = get(conn, rotation_id)?;
     let (grants_count, grants_digest) = grants_digest(conn, rotation.to_epoch)?;
     let published = checkpoints::published_for_epoch(conn, rotation.to_epoch)?;
@@ -575,7 +592,7 @@ impl ActivationCommit {
 
 /// 开始轮换（**一个事务内完成吊销/冻结/候选 epoch/控制记录**）。
 pub fn begin(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -629,10 +646,12 @@ pub fn begin(
         vault::mark_epoch_revoked_once(conn, vault.active_epoch)?;
     }
     conn.execute(
-        "INSERT INTO rotations(rotation_id, from_epoch, to_epoch, freeze_seq, member_set_hash,
-                               asset_set_digest, revoked_count, state, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'frozen', ?7, ?7)",
+        "INSERT INTO rotations(vault_id, rotation_id, from_epoch, to_epoch, freeze_seq,
+                               member_set_hash, asset_set_digest, revoked_count, state,
+                               created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 'frozen', ?8, ?8)",
         (
+            conn.scope().as_slice(),
             rotation_id.as_slice(),
             i64::try_from(vault.active_epoch).map_err(|_| Error::Invariant("epoch"))?,
             i64::try_from(to_epoch).map_err(|_| Error::Invariant("epoch"))?,
@@ -660,7 +679,7 @@ pub fn begin(
 
 /// staged 一份 HPKE grant（activate 前不可被普通成员读取）。
 pub fn stage_grant(
-    conn: &Connection,
+    conn: &ScopeConn,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
     rotation_id: &Id16,
@@ -692,8 +711,8 @@ pub fn stage_grant(
         vault::manager_pubkey(conn)?.ok_or_else(|| Error::api(ErrorCode::ManagementRequired))?;
     // 收件人 X25519 公钥只认 relay 的 devices 行，不信任客户端传入。
     let hpke_pk: Vec<u8> = conn.query_row(
-        "SELECT hpke_pk FROM devices WHERE device_id = ?1",
-        [recipient.as_slice()],
+        "SELECT hpke_pk FROM devices WHERE device_id = ?1 AND vault_id = ?",
+        (recipient.as_slice(), conn.scope().as_slice()),
         |row| row.get(0),
     )?;
     let recipient_x25519_pub: [u8; 32] = hpke_pk
@@ -725,10 +744,11 @@ pub fn stage_grant(
     let existing: Option<StoredGrant> = conn
         .query_row(
             "SELECT hpke_ciphertext, signed_header, signature, grant_id FROM device_grants
-             WHERE epoch = ?1 AND device_id = ?2",
+             WHERE epoch = ?1 AND device_id = ?2 AND vault_id = ?",
             (
                 i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?,
                 recipient.as_slice(),
+                conn.scope().as_slice(),
             ),
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -745,13 +765,16 @@ pub fn stage_grant(
         Some(_) => return Err(Error::api(ErrorCode::CasConflict)),
         None => {
             conn.execute(
-                "INSERT INTO device_grants(epoch, device_id, manager_rev, hpke_enc, hpke_ciphertext,
-                                           signed_header, signature, grant_id, activation_ref)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO device_grants(vault_id, epoch, device_id, manager_rev, hpke_enc,
+                                           hpke_ciphertext, signed_header, signature, grant_id,
+                                           activation_ref)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 (
+                    conn.scope().as_slice(),
                     i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?,
                     recipient.as_slice(),
-                    i64::try_from(input.manager_rev).map_err(|_| Error::Invariant("manager_rev"))?,
+                    i64::try_from(input.manager_rev)
+                        .map_err(|_| Error::Invariant("manager_rev"))?,
                     input.hpke_enc.as_slice(),
                     input.hpke_ciphertext,
                     input.signed_header,
@@ -767,7 +790,7 @@ pub fn stage_grant(
     view(conn, rotation_id)
 }
 
-fn maybe_advance_to_staging(conn: &Connection, rotation: &RotationRow, now: i64) -> Result<()> {
+fn maybe_advance_to_staging(conn: &ScopeConn, rotation: &RotationRow, now: i64) -> Result<()> {
     if rotation.state != RotationState::Frozen {
         return Ok(());
     }
@@ -777,28 +800,38 @@ fn maybe_advance_to_staging(conn: &Connection, rotation: &RotationRow, now: i64)
     }
     let missing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM devices d
-         WHERE d.status = 'active'
+         WHERE d.status = 'active' AND d.vault_id = ?2
            AND NOT EXISTS (SELECT 1 FROM device_grants g
-                           WHERE g.epoch = ?1 AND g.device_id = d.device_id)",
-        [i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?],
+                           WHERE g.epoch = ?1 AND g.device_id = d.device_id
+                             AND g.vault_id = d.vault_id)",
+        (
+            i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
         |row| row.get(0),
     )?;
     if missing == 0 {
         conn.execute(
             "UPDATE rotations SET state = 'staging', updated_at = ?1
-             WHERE rotation_id = ?2 AND state = 'frozen'",
-            (now, rotation.rotation_id.as_slice()),
+             WHERE rotation_id = ?2 AND state = 'frozen' AND vault_id = ?",
+            (
+                now,
+                rotation.rotation_id.as_slice(),
+                conn.scope().as_slice(),
+            ),
         )?;
     }
     Ok(())
 }
 
 /// 成员集合摘要：排序后的 active device_id 的 SHA256。
-pub fn member_set_hash(conn: &Connection) -> Result<Hash32> {
-    let mut stmt = conn
-        .prepare("SELECT device_id FROM devices WHERE status = 'active' ORDER BY device_id ASC")?;
+pub fn member_set_hash(conn: &ScopeConn) -> Result<Hash32> {
+    let mut stmt = conn.prepare(
+        "SELECT device_id FROM devices
+         WHERE status = 'active' AND vault_id = ?1 ORDER BY device_id ASC",
+    )?;
     let ids: Vec<Vec<u8>> = stmt
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+        .query_map([conn.scope().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut buf = Vec::with_capacity(ids.len() * 16);
     for id in ids {
@@ -809,7 +842,7 @@ pub fn member_set_hash(conn: &Connection) -> Result<Hash32> {
 
 /// 原子激活：发布新槽、切 active_epoch、解冻新 epoch、控制链 + 事件。
 pub fn activate(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -863,10 +896,14 @@ pub fn activate(
     // 全成员 grant（管理签名控制链里的成员集合，不信任裸 relay 公钥列表）。
     let missing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM devices d
-         WHERE d.status = 'active'
+         WHERE d.status = 'active' AND d.vault_id = ?2
            AND NOT EXISTS (SELECT 1 FROM device_grants g
-                           WHERE g.epoch = ?1 AND g.device_id = d.device_id)",
-        [i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?],
+                           WHERE g.epoch = ?1 AND g.device_id = d.device_id
+                             AND g.vault_id = d.vault_id)",
+        (
+            i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
         |row| row.get(0),
     )?;
     if missing != 0 {
@@ -982,10 +1019,11 @@ pub fn activate(
     )?;
 
     conn.execute(
-        "INSERT INTO manager_keys(rev, pubkey, transition, old_rev, old_signature,
+        "INSERT INTO manager_keys(vault_id, rev, pubkey, transition, old_rev, old_signature,
                                   new_signature, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
+            conn.scope().as_slice(),
             i64::try_from(transition.new_rev).map_err(|_| Error::Invariant("manager rev"))?,
             transition.new_pubkey.as_slice(),
             new_manager.transition.as_slice(),
@@ -996,19 +1034,26 @@ pub fn activate(
         ),
     )?;
     conn.execute(
-        "UPDATE vault SET manager_rev = ?1 WHERE singleton = 1",
-        [i64::try_from(transition.new_rev).map_err(|_| Error::Invariant("manager rev"))?],
+        "UPDATE vaults SET manager_rev = ?1 WHERE vault_id = ?",
+        (
+            i64::try_from(transition.new_rev).map_err(|_| Error::Invariant("manager rev"))?,
+            conn.scope().as_slice(),
+        ),
     )?;
 
     // key slot：旧 active 进入 retiring（14 天），候选 epoch 的 staging 槽上线。
     conn.execute(
-        "UPDATE key_slots SET state = 'retiring', retire_at = ?1 WHERE state = 'active'",
-        [now + secs::OLD_SLOT_RETENTION],
+        "UPDATE key_slots SET state = 'retiring', retire_at = ?1
+         WHERE state = 'active' AND vault_id = ?",
+        (now + secs::OLD_SLOT_RETENTION, conn.scope().as_slice()),
     )?;
     conn.execute(
         "UPDATE key_slots SET state = 'active', slot_set_rev = slot_set_rev + 1
-         WHERE state = 'staging' AND epoch = ?1",
-        [i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?],
+         WHERE state = 'staging' AND epoch = ?1 AND vault_id = ?",
+        (
+            i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
     )?;
 
     // epoch 切换（同一事务：旧 retired、新 active）。
@@ -1019,12 +1064,20 @@ pub fn activate(
     let member_set_hash = member_set_hash(conn)?;
     conn.execute(
         "UPDATE rotations SET state = 'activated', member_set_hash = ?1, updated_at = ?2
-         WHERE rotation_id = ?3",
-        (member_set_hash.as_slice(), now, rotation_id.as_slice()),
+         WHERE rotation_id = ?3 AND vault_id = ?",
+        (
+            member_set_hash.as_slice(),
+            now,
+            rotation_id.as_slice(),
+            conn.scope().as_slice(),
+        ),
     )?;
     conn.execute(
-        "UPDATE vault SET active_epoch = ?1, state = 'active' WHERE singleton = 1",
-        [i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?],
+        "UPDATE vaults SET active_epoch = ?1, state = 'active' WHERE vault_id = ?",
+        (
+            i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
     )?;
     // 激活后立即让全部旧 token 失效：客户端必须重新认证并重新取 grant。
     let auth_rev = vault::bump_auth_rev(conn)?;
@@ -1093,7 +1146,7 @@ pub fn activate(
         "UPDATE rotations SET primary_checkpoint = ?1, fallback_checkpoint = ?2,
                              activation_commit = ?3, activated_at = ?4,
                              activated_control_rev = ?5
-         WHERE rotation_id = ?6",
+         WHERE rotation_id = ?6 AND vault_id = ?",
         (
             pair.primary.checkpoint_id.as_slice(),
             pair.fallback.checkpoint_id.as_slice(),
@@ -1101,6 +1154,7 @@ pub fn activate(
             now,
             i64::try_from(control_rev).map_err(|_| Error::Invariant("control rev"))?,
             rotation_id.as_slice(),
+            conn.scope().as_slice(),
         ),
     )?;
     // control 事件不进数据日志：它属于已签控制链（`control_commits`），
@@ -1109,8 +1163,9 @@ pub fn activate(
     // 轮换 reservation 完成（剩余维护额度归还；已写数据保留）。
     conn.execute(
         "UPDATE maintenance_reservations SET state = 'complete'
-         WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'",
-        [rotation_id.as_slice()],
+         WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'
+           AND vault_id = ?",
+        (rotation_id.as_slice(), conn.scope().as_slice()),
     )?;
     // 评审 0002 P1-E：激活后按真实 parts 对账——新 pair（原维护 reservation 写入）升为
     // normal，旧 epoch 宽限副本/退役中槽降为 maintenance；否则下一轮维护预算会被已 live
@@ -1129,7 +1184,7 @@ pub fn activate(
 
 /// 废弃候选 epoch：删 staged grants、标 aborted；**吊销过的旧 epoch 不解冻**。
 pub fn abort(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -1160,20 +1215,25 @@ pub fn abort(
     let now = clock.now_secs();
     // 废弃候选 epoch 与它的全部 staged grants（根已可能泄露 → 永不复用该 epoch）。
     conn.execute(
-        "DELETE FROM device_grants WHERE epoch = ?1",
-        [i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?],
+        "DELETE FROM device_grants WHERE epoch = ?1 AND vault_id = ?",
+        (
+            i64::try_from(rotation.to_epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
     )?;
     // §24.1：候选 checkpoint 一并作废（永不 bootstrap/参与 GC，object/cid 不复用）。
     checkpoints::abort_candidates(conn, rotation.to_epoch)?;
     vault::set_epoch_state(conn, rotation.to_epoch, vault::EpochState::Aborted)?;
     conn.execute(
-        "UPDATE rotations SET state = 'aborted', updated_at = ?1 WHERE rotation_id = ?2",
-        (now, rotation_id.as_slice()),
+        "UPDATE rotations SET state = 'aborted', updated_at = ?1
+         WHERE rotation_id = ?2 AND vault_id = ?",
+        (now, rotation_id.as_slice(), conn.scope().as_slice()),
     )?;
     conn.execute(
         "UPDATE maintenance_reservations SET state = 'expired'
-         WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'",
-        [rotation_id.as_slice()],
+         WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'
+           AND vault_id = ?",
+        (rotation_id.as_slice(), conn.scope().as_slice()),
     )?;
     // 关键：吊销过设备的轮换失败后**不能**回旧 epoch 继续写（§10）；只有未吊销才能解冻。
     // §23.1：只看目标旧 epoch 的持久事实，不看"本次 rotation 的 revoked_count"；
@@ -1232,27 +1292,36 @@ pub struct RevokeMoreOutcome {
 /// 标 aborted、写新 rotation 行（沿用 from_epoch/freeze_seq，state=frozen），旧轮换
 /// reservation 归还。返回新 rotation 行；vault 保持 `rotating`（旧写不因失败解冻）。
 fn discard_candidate_and_allocate(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     rotation: &RotationRow,
 ) -> Result<(Id16, u64)> {
     let to_epoch = rotation.to_epoch;
     let to_epoch_i64 = i64::try_from(to_epoch).map_err(|_| Error::Invariant("epoch"))?;
-    conn.execute("DELETE FROM device_grants WHERE epoch = ?1", [to_epoch_i64])?;
+    conn.execute(
+        "DELETE FROM device_grants WHERE epoch = ?1 AND vault_id = ?",
+        (to_epoch_i64, conn.scope().as_slice()),
+    )?;
     checkpoints::abort_candidates(conn, to_epoch)?;
     vault::set_epoch_state(conn, to_epoch, vault::EpochState::Aborted)?;
     conn.execute(
         "UPDATE rotations SET state = 'aborted', updated_at = ?1
-         WHERE rotation_id = ?2 AND state IN ('frozen','staging')",
-        (now, rotation.rotation_id.as_slice()),
+         WHERE rotation_id = ?2 AND state IN ('frozen','staging') AND vault_id = ?",
+        (
+            now,
+            rotation.rotation_id.as_slice(),
+            conn.scope().as_slice(),
+        ),
     )?;
     let new_to_epoch = vault::allocate_epoch(conn, now)?;
     let new_rotation_id = crate::ids::random_id16()?;
     conn.execute(
-        "INSERT INTO rotations(rotation_id, from_epoch, to_epoch, freeze_seq, member_set_hash,
-                               asset_set_digest, revoked_count, state, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, 'frozen', ?6, ?6)",
+        "INSERT INTO rotations(vault_id, rotation_id, from_epoch, to_epoch, freeze_seq,
+                               member_set_hash, asset_set_digest, revoked_count, state,
+                               created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, 'frozen', ?7, ?7)",
         (
+            conn.scope().as_slice(),
             new_rotation_id.as_slice(),
             i64::try_from(rotation.from_epoch).map_err(|_| Error::Invariant("from_epoch"))?,
             i64::try_from(new_to_epoch).map_err(|_| Error::Invariant("to_epoch"))?,
@@ -1266,15 +1335,16 @@ fn discard_candidate_and_allocate(
     )?;
     conn.execute(
         "UPDATE maintenance_reservations SET state = 'expired'
-         WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'",
-        [rotation.rotation_id.as_slice()],
+         WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'
+           AND vault_id = ?",
+        (rotation.rotation_id.as_slice(), conn.scope().as_slice()),
     )?;
     Ok((new_rotation_id, new_to_epoch))
 }
 
 /// `POST rotations/{r}/restart`：原子重启候选 epoch（更高 epoch、fresh 候选根），保持冻结。
 pub fn restart(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -1334,7 +1404,7 @@ pub fn restart(
 /// `POST rotations/{r}/revoke-more`：轮换期间追加吊销，保持冻结；若候选 grant/材料已为
 /// 被吊销设备生成，则按 §8 步 8 **原子废弃候选 + 分配更高 epoch**。
 pub fn revoke_more(
-    conn: &Connection,
+    conn: &ScopeConn,
     clock: &dyn Clock,
     hook: &dyn SignatureHook,
     actor: &AuthContext,
@@ -1383,26 +1453,30 @@ pub fn revoke_more(
     }
     conn.execute(
         "UPDATE rotations SET revoked_count = revoked_count + ?1, updated_at = ?2
-         WHERE rotation_id = ?3",
+         WHERE rotation_id = ?3 AND vault_id = ?",
         (
             i64::try_from(revoked).map_err(|_| Error::Invariant("revoked_count"))?,
             now,
             rotation_id.as_slice(),
+            conn.scope().as_slice(),
         ),
     )?;
     let mut candidate_grant = 0i64;
     for device_id in revoke {
         candidate_grant += conn.query_row(
-            "SELECT COUNT(*) FROM device_grants WHERE epoch = ?1 AND device_id = ?2",
-            (to_epoch, device_id.as_slice()),
+            "SELECT COUNT(*) FROM device_grants
+             WHERE epoch = ?1 AND device_id = ?2 AND vault_id = ?",
+            (to_epoch, device_id.as_slice(), conn.scope().as_slice()),
             |row| row.get::<_, i64>(0),
         )?;
     }
     let candidate_material: i64 = conn.query_row(
         "SELECT
-           (SELECT COUNT(*) FROM checkpoints WHERE epoch = ?1 AND state IN ('staging','candidate'))
-         + (SELECT COUNT(*) FROM key_slots WHERE epoch = ?1 AND state = 'staging')",
-        [to_epoch],
+           (SELECT COUNT(*) FROM checkpoints
+             WHERE epoch = ?1 AND state IN ('staging','candidate') AND vault_id = ?2)
+         + (SELECT COUNT(*) FROM key_slots
+             WHERE epoch = ?1 AND state = 'staging' AND vault_id = ?2)",
+        (to_epoch, conn.scope().as_slice()),
         |row| row.get(0),
     )?;
     let must_restart = revoked > 0 && (candidate_grant > 0 || candidate_material > 0);
@@ -1617,18 +1691,19 @@ pub struct GrantRow {
 }
 
 /// 读设备在活动 epoch 的 grant；staged（候选 epoch）的 grant 不可见（§8 步 5）。
-pub fn latest_grant(conn: &Connection, device_id: &Id16) -> Result<Option<GrantRow>> {
+pub fn latest_grant(conn: &ScopeConn, device_id: &Id16) -> Result<Option<GrantRow>> {
     let vault = vault::load(conn)?;
     let mut stmt = conn.prepare(
         "SELECT epoch, device_id, manager_rev, hpke_enc, hpke_ciphertext, signed_header, signature,
                 grant_id, activation_ref
-         FROM device_grants WHERE epoch = ?1 AND device_id = ?2",
+         FROM device_grants WHERE epoch = ?1 AND device_id = ?2 AND vault_id = ?",
     )?;
     let row = stmt
         .query_row(
             (
                 i64::try_from(vault.active_epoch).map_err(|_| Error::Invariant("epoch"))?,
                 device_id.as_slice(),
+                conn.scope().as_slice(),
             ),
             |row| {
                 Ok((
@@ -1695,14 +1770,17 @@ pub fn latest_grant(conn: &Connection, device_id: &Id16) -> Result<Option<GrantR
 }
 
 /// 某 epoch 的全部 grant（management 才可读的 staged 列表用）。
-pub fn list_grants(conn: &Connection, epoch: u64) -> Result<Vec<GrantRow>> {
+pub fn list_grants(conn: &ScopeConn, epoch: u64) -> Result<Vec<GrantRow>> {
     let mut stmt = conn.prepare(
         "SELECT epoch, device_id, manager_rev, hpke_enc, hpke_ciphertext, signed_header, signature,
                 grant_id, activation_ref
-         FROM device_grants WHERE epoch = ?1 ORDER BY device_id ASC",
+         FROM device_grants WHERE epoch = ?1 AND vault_id = ? ORDER BY device_id ASC",
     )?;
     let rows = stmt.query_map(
-        [i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?],
+        (
+            i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -1782,26 +1860,31 @@ pub fn grant_package_digest(grant: &GrantRow) -> Hash32 {
 }
 
 /// 诊断：grant 数量（不做健康/顺序判断）。
-pub fn grant_count(conn: &Connection, epoch: u64) -> Result<u64> {
+pub fn grant_count(conn: &ScopeConn, epoch: u64) -> Result<u64> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM device_grants WHERE epoch = ?1",
-        [i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?],
+        "SELECT COUNT(*) FROM device_grants WHERE epoch = ?1 AND vault_id = ?",
+        (
+            i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
+            conn.scope().as_slice(),
+        ),
         |row| row.get(0),
     )?;
     u64::try_from(count).map_err(|_| Error::Invariant("grant count"))
 }
 
 /// 陈旧槽清理：`retire_at <= now` 的 retiring 槽删除（只删槽，不删数据；ADR §8 步 7）。
-pub fn purge_retired_slots(conn: &Connection, now: i64) -> Result<u64> {
+pub fn purge_retired_slots(conn: &ScopeConn, now: i64) -> Result<u64> {
     let changed = conn.execute(
-        "DELETE FROM key_slots WHERE state = 'retiring' AND retire_at IS NOT NULL AND retire_at <= ?1",
-        [now],
+        "DELETE FROM key_slots
+         WHERE state = 'retiring' AND retire_at IS NOT NULL AND retire_at <= ?1
+           AND vault_id = ?",
+        (now, conn.scope().as_slice()),
     )?;
     Ok(changed as u64)
 }
 
 /// 成员集合的诊断摘要（轮换视图里 `member_set_hash` 的来源）。
-pub fn member_digest(conn: &Connection) -> Result<Hash32> {
+pub fn member_digest(conn: &ScopeConn) -> Result<Hash32> {
     member_set_hash(conn)
 }
 

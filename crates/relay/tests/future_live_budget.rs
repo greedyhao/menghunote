@@ -160,13 +160,13 @@ fn observe(fx: &Fixture) -> Observed {
                 )?,
                 gc_plans: conn.query_row("SELECT COUNT(*) FROM gc_plans", [], |row| row.get(0))?,
                 normal_bytes: conn.query_row(
-                    "SELECT normal_bytes FROM usage WHERE singleton = 1",
-                    [],
+                    "SELECT normal_bytes FROM usage WHERE vault_id = ?1",
+                    [conn.scope().as_slice()],
                     |row| row.get(0),
                 )?,
                 maintenance_bytes: conn.query_row(
-                    "SELECT maintenance_bytes FROM usage WHERE singleton = 1",
-                    [],
+                    "SELECT maintenance_bytes FROM usage WHERE vault_id = ?1",
+                    [conn.scope().as_slice()],
                     |row| row.get(0),
                 )?,
             })

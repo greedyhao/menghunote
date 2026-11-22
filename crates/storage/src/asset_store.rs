@@ -19,6 +19,16 @@ pub struct AssetRef {
     pub body_seq: u64,
 }
 
+/// 资产明文的 SHA-256（内容寻址的哈希来源）。
+///
+/// 只做纯计算：`sha2` 已经是本 crate 的依赖（基线快照/同步桥都在用），因此调用方
+/// （如 app 的附件插入）**不需要**为了算一个哈希而新增依赖。
+#[must_use]
+pub fn asset_content_hash(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).into()
+}
+
 /// 插入一份资产明文；同 hash 完全一致时幂等。
 ///
 /// - 空 `data` 拒绝（资产明文必须非空）；
@@ -160,6 +170,58 @@ pub fn list_asset_refs(vault: &Vault, note_id: &str) -> Result<Vec<AssetRef>, St
         .collect()
 }
 
+/// 列出**被正文引用**的资产元数据（`asset_refs` 去重），不加载 `data`。
+///
+/// 同步的增量上传只应该覆盖"当前正文引用得到"的资产：`assets` 里可能还留着历史孤儿
+/// （引用已删除但按"不删除本地资产"约束保留）。`data IS NULL` 的占位（只有元数据、
+/// 没有明文的导入占位）也排除，避免上传空资产。
+///
+/// 返回顺序按 `asset_hash` 升序（稳定顺序，便于报告/测试）。
+pub fn list_referenced_assets(vault: &Vault) -> Result<Vec<AssetMeta>, StorageError> {
+    let rows = vault.query(
+        "SELECT a.asset_hash, a.byte_len, a.media_type, a.data IS NOT NULL, a.orphan_since \
+         FROM assets a \
+         WHERE a.data IS NOT NULL \
+           AND EXISTS(SELECT 1 FROM asset_refs r WHERE r.asset_hash=a.asset_hash) \
+         ORDER BY a.asset_hash ASC",
+        &[],
+    )?;
+    rows.iter()
+        .map(|row| {
+            Ok(AssetMeta {
+                asset_hash: hash_of(row, 0)?,
+                byte_len: optional_i64(row, 1, "assets.byte_len")?,
+                media_type: optional_text(row, 2, "assets.media_type")?,
+                has_data: true,
+                orphan_since: optional_i64(row, 4, "assets.orphan_since")?,
+            })
+        })
+        .collect()
+}
+
+/// 统计"有明文但没有任何正文引用"的资产数（同步报告里的孤儿策略口径）。
+///
+/// 只做计数，不加载元数据/字节：自动同步每轮都要报告该值，不能为孤儿做全量读。
+pub fn count_unreferenced_assets(vault: &Vault) -> Result<u64, StorageError> {
+    let rows = vault.query(
+        "SELECT COUNT(*) FROM assets a \
+         WHERE a.data IS NOT NULL \
+           AND NOT EXISTS(SELECT 1 FROM asset_refs r WHERE r.asset_hash=a.asset_hash)",
+        &[],
+    )?;
+    let value = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|value| match value {
+            Value::Integer(value) => u64::try_from(*value).ok(),
+            _ => None,
+        })
+        .ok_or_else(|| StorageError::Corrupt {
+            context: "count_unreferenced_assets 计数非法".to_owned(),
+        })?;
+    Ok(value)
+}
+
 /// 标记/清除资产的 GC 孤儿时间；返回是否找到该资产。
 pub fn set_asset_orphan_since(
     vault: &Vault,
@@ -197,6 +259,20 @@ fn optional_i64(row: &crate::Row, index: usize, field: &str) -> Result<Option<i6
     match row.get(index) {
         Some(Value::Null) | None => Ok(None),
         Some(Value::Integer(value)) => Ok(Some(*value)),
+        other => Err(StorageError::Corrupt {
+            context: format!("{field} 类型异常：{other:?}"),
+        }),
+    }
+}
+
+fn optional_text(
+    row: &crate::Row,
+    index: usize,
+    field: &str,
+) -> Result<Option<String>, StorageError> {
+    match row.get(index) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
         other => Err(StorageError::Corrupt {
             context: format!("{field} 类型异常：{other:?}"),
         }),

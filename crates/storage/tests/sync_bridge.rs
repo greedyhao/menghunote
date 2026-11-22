@@ -6,10 +6,10 @@ use support::*;
 
 use menghunote_storage::{
     allocate_local_seq_for_import, append_updates_with_sync_intents, enqueue_sync_intent,
-    load_head, mark_acked, mark_integrated, mark_sent, outbox_parts, outbox_row,
-    pending_encryption, pending_send, set_sync_log_id, store_encrypted_parts, store_inbox_verified,
-    sync_cursor_state, take_inbox_ready, update_referenced_by_outbox, SyncEncryptedPart,
-    SyncInboxState, SyncIntent, SyncOutboxState, UpdateRecord, Value, Vault,
+    load_head, mark_acked, mark_integrated, mark_sent, mark_skipped_event_received, outbox_parts,
+    outbox_row, pending_encryption, pending_send, set_sync_log_id, store_encrypted_parts,
+    store_inbox_verified, sync_cursor_state, take_inbox_ready, update_referenced_by_outbox,
+    SyncEncryptedPart, SyncInboxState, SyncIntent, SyncOutboxState, UpdateRecord, Value, Vault,
 };
 
 fn failed_parts(_message_id: &str, bytes: &[u8]) -> Vec<SyncEncryptedPart> {
@@ -250,6 +250,32 @@ fn outbox_parts_and_ack_survive_reopen() {
     let vault = open_vault(&vault_path(&dir));
     assert!(outbox_row(&vault, "msg-1").expect("row").is_none());
     assert!(outbox_parts(&vault, "msg-1", 1).expect("parts").is_empty());
+}
+
+#[test]
+fn skipped_event_advances_received_and_integrated_prefix() {
+    let (_dir, vault) = fresh_vault();
+    let log_id = [9; 16];
+    set_sync_log_id(&vault, &log_id).expect("log id");
+
+    // seq1 是 ASSET（不写 inbox），seq2 是 UPDATE。
+    mark_skipped_event_received(&vault, &log_id, 1).expect("skip seq1");
+    store_inbox_verified(&vault, &log_id, 2, &[2; 32], 1, b"two").expect("seq2");
+    let cursor = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor.received_seq, 2, "ASSET 也必须计入连续接收前缀");
+    let ready = take_inbox_ready(&vault, 10).expect("ready");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].relay_seq, 2);
+
+    // 集成 seq2 后，integrated 前缀同样要越过 ASSET（否则 ack 水位永远卡在 0）。
+    mark_integrated(&vault, &log_id, 2).expect("integrate seq2");
+    let cursor = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor.integrated_seq, 2);
+    assert!(sync_cursor_state(&vault).expect("cursor").log_id.is_some());
+
+    // 标记幂等：重复登记同一非 inbox 事件不改变水位/不报错。
+    mark_skipped_event_received(&vault, &log_id, 1).expect("幂等");
+    assert_eq!(sync_cursor_state(&vault).expect("cursor").received_seq, 2);
 }
 
 #[test]

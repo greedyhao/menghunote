@@ -103,6 +103,7 @@ async fn app_shell_typing_flushes_intents_with_identity_peer_and_epoch(cx: &mut 
 
     let vault = dev.vault.clone();
     let config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     };
@@ -227,6 +228,7 @@ async fn structure_writes_produce_structure_intents(cx: &mut TestAppContext) {
 
     let vault = dev.vault.clone();
     let config = DevSyncConfig {
+        relay_mode: menghunote_app::onboarding::RelayMode::LocalDev,
         vault: vault_path.clone(),
         service: ServiceConfig::new("http://127.0.0.1:18080"),
     };

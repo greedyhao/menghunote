@@ -4,7 +4,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::db::DbConfig;
-use crate::ids::Hash32;
+use crate::ids::{Hash32, Id16};
+use crate::ratelimit::{
+    RateLimitSpec, DEFAULT_V2_AUTH_LIMIT, DEFAULT_V2_CREATE_LIMIT, DEFAULT_V2_DATA_LIMIT,
+};
 
 /// 明文监听门禁（评审 0002「生产阻断」）。
 ///
@@ -35,7 +38,7 @@ pub fn ensure_plaintext_listen_allowed(
     ))
 }
 
-/// relay 进程配置（单实例单 vault；配额/密钥由部署时配置，ADR 0006 §7）。
+/// relay 进程配置（单进程、同库多 vault；配额/密钥由部署时配置，ADR 0006 §7）。
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     /// 数据库参数（路径 + 预算）。
@@ -56,6 +59,19 @@ pub struct RelayConfig {
     pub cursor_key: Option<Hash32>,
     /// SNAPSHOT 对象明文上限（部署配置；默认 64MiB）。
     pub max_snapshot_bytes: u64,
+    /// v1 旧 API 显式绑定的 legacy 默认 vault（ADR 0014 §A）。
+    ///
+    /// 缺省时从库里 `vaults.legacy_default = 1` 解析（迁移把旧单 vault 标成它）；
+    /// 两者都没有就是 404，**绝不**按 token subject 或"第一个 vault"猜租户。
+    pub legacy_vault_id: Option<Id16>,
+    /// v2 `POST /v2/vaults`（创建票据消费）入口限流；`None` = 关闭（ADR 0014 §A）。
+    pub v2_create_limit: Option<RateLimitSpec>,
+    /// v2 `/v2/vaults/{id}/auth/{challenges,tokens}` 入口限流；`None` = 关闭。
+    pub v2_auth_limit: Option<RateLimitSpec>,
+    /// v2 租户**业务**路由（数据面/控制面）入口限流；`None` = 关闭。
+    ///
+    /// v1 旧路由永不受此限流影响（ADR 0014 §A：v1 行为不变）。
+    pub v2_data_limit: Option<RateLimitSpec>,
 }
 
 impl RelayConfig {
@@ -70,6 +86,10 @@ impl RelayConfig {
             setup_secret_hash: None,
             cursor_key: None,
             max_snapshot_bytes: menghunote_sync_proto::limits::MAX_SNAPSHOT_CDE_BYTES as u64,
+            legacy_vault_id: None,
+            v2_create_limit: Some(DEFAULT_V2_CREATE_LIMIT),
+            v2_auth_limit: Some(DEFAULT_V2_AUTH_LIMIT),
+            v2_data_limit: Some(DEFAULT_V2_DATA_LIMIT),
         }
     }
 
@@ -95,6 +115,37 @@ impl RelayConfig {
     /// 固定游标 HMAC key（部署级配置；缺省随机生成）。
     pub fn with_cursor_key(mut self, key: Hash32) -> Self {
         self.cursor_key = Some(key);
+        self
+    }
+
+    /// 显式指定 v1 legacy 默认 vault（运维在配置文件里覆盖 DB 标记）。
+    pub fn with_legacy_vault_id(mut self, vault_id: Id16) -> Self {
+        self.legacy_vault_id = Some(vault_id);
+        self
+    }
+
+    /// 覆盖 v2 入口限流（`None` = 关闭；测试用低阈值证明 429，不影响 v1）。
+    pub fn with_v2_rate_limits(
+        mut self,
+        create: Option<RateLimitSpec>,
+        auth: Option<RateLimitSpec>,
+    ) -> Self {
+        self.v2_create_limit = create;
+        self.v2_auth_limit = auth;
+        self
+    }
+
+    /// 覆盖 v2 **业务**路由入口限流（`None` = 关闭；只影响 v2，v1 从不受影响）。
+    pub fn with_v2_data_limit(mut self, data: Option<RateLimitSpec>) -> Self {
+        self.v2_data_limit = data;
+        self
+    }
+
+    /// 关闭 v2 入口限流（测试/受控部署专用；create/auth/data 三面全关）。
+    pub fn without_v2_rate_limits(mut self) -> Self {
+        self.v2_create_limit = None;
+        self.v2_auth_limit = None;
+        self.v2_data_limit = None;
         self
     }
 

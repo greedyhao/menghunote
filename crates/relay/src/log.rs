@@ -3,11 +3,12 @@
 //! `relay_seq` **只表示送达顺序**：它在一个 writer 事务内单调分配，`>= gc_floor` 的前缀不能有洞。
 //! 任何 log 事件都必须在对象 `complete` 的同一事务里产生（§13.1：片没齐禁止进 log）。
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::cursor::{self, Cursor, CursorKey};
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{be64, Hash32};
+use crate::scope::ScopeConn;
 use crate::vault::Vault;
 
 /// log 事件类型。
@@ -70,7 +71,7 @@ pub struct LogPage {
 
 /// 追加一条日志并分配 `relay_seq`（**同一写事务内**调用）。
 pub fn append(
-    conn: &Connection,
+    conn: &ScopeConn,
     now: i64,
     kind: LogKind,
     object_id: Option<&Hash32>,
@@ -79,8 +80,8 @@ pub fn append(
     signature: Option<&[u8]>,
 ) -> Result<u64> {
     let head: i64 = conn.query_row(
-        "SELECT head_seq FROM vault WHERE singleton = 1",
-        [],
+        "SELECT head_seq FROM vaults WHERE vault_id = ?1",
+        [conn.scope().as_slice()],
         |row| row.get(0),
     )?;
     let next = u64::try_from(head)
@@ -89,9 +90,11 @@ pub fn append(
         .ok_or(Error::Invariant("relay_seq overflow"))?;
     let next_i64 = i64::try_from(next).map_err(|_| Error::Invariant("relay_seq overflow"))?;
     conn.execute(
-        "INSERT INTO log(relay_seq, kind, object_id, epoch, event, signature, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO log(vault_id, relay_seq, kind, object_id, epoch, event, signature,
+                         created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
+            conn.scope().as_slice(),
             next_i64,
             kind.as_str(),
             object_id.map(|id| id.as_slice()),
@@ -102,18 +105,21 @@ pub fn append(
         ),
     )?;
     conn.execute(
-        "UPDATE vault SET head_seq = ?1 WHERE singleton = 1",
-        [next_i64],
+        "UPDATE vaults SET head_seq = ?1 WHERE vault_id = ?",
+        (next_i64, conn.scope().as_slice()),
     )?;
     Ok(next)
 }
 
 /// 该 `relay_seq` 是否已存在（诊断/幂等测试）。
-pub fn contains(conn: &Connection, relay_seq: u64) -> Result<bool> {
+pub fn contains(conn: &ScopeConn, relay_seq: u64) -> Result<bool> {
     let value: Option<i64> = conn
         .query_row(
-            "SELECT relay_seq FROM log WHERE relay_seq = ?1",
-            [i64::try_from(relay_seq).map_err(|_| Error::Invariant("relay_seq"))?],
+            "SELECT relay_seq FROM log WHERE relay_seq = ?1 AND vault_id = ?",
+            (
+                i64::try_from(relay_seq).map_err(|_| Error::Invariant("relay_seq"))?,
+                conn.scope().as_slice(),
+            ),
             |row| row.get(0),
         )
         .optional()?;
@@ -121,17 +127,22 @@ pub fn contains(conn: &Connection, relay_seq: u64) -> Result<bool> {
 }
 
 /// 日志行数（测试/诊断）。
-pub fn count(conn: &Connection) -> Result<u64> {
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM log", [], |row| row.get(0))?;
+pub fn count(conn: &ScopeConn) -> Result<u64> {
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM log WHERE vault_id = ?1",
+        [conn.scope().as_slice()],
+        |row| row.get(0),
+    )?;
     u64::try_from(total).map_err(|_| Error::Invariant("log count"))
 }
 
 /// 某对象在 log 中的 `relay_seq`（GC 需要"无根引用且已被 GC 前缀覆盖"的判定）。
-pub fn seq_of_object(conn: &Connection, object_id: &Hash32) -> Result<Option<u64>> {
+pub fn seq_of_object(conn: &ScopeConn, object_id: &Hash32) -> Result<Option<u64>> {
     let value: Option<i64> = conn
         .query_row(
-            "SELECT relay_seq FROM log WHERE object_id = ?1 ORDER BY relay_seq LIMIT 1",
-            [object_id.as_slice()],
+            "SELECT relay_seq FROM log
+             WHERE object_id = ?1 AND vault_id = ? ORDER BY relay_seq LIMIT 1",
+            (object_id.as_slice(), conn.scope().as_slice()),
             |row| row.get(0),
         )
         .optional()?;
@@ -145,7 +156,7 @@ pub fn seq_of_object(conn: &Connection, object_id: &Hash32) -> Result<Option<u64
 
 /// 读一页日志：`after` 排他、升序、无洞；游标过期/回退分别 410/409。
 pub fn page(
-    conn: &Connection,
+    conn: &ScopeConn,
     vault: &Vault,
     after: &Cursor,
     limit: u32,
@@ -172,12 +183,13 @@ pub fn page(
 
     let mut stmt = conn.prepare(
         "SELECT relay_seq, kind, object_id, epoch, event, signature
-         FROM log WHERE relay_seq > ?1 ORDER BY relay_seq ASC LIMIT ?2",
+         FROM log WHERE relay_seq > ?1 AND vault_id = ?3 ORDER BY relay_seq ASC LIMIT ?2",
     )?;
     let rows = stmt.query_map(
         (
             i64::try_from(after.last_seq).map_err(|_| Error::Invariant("cursor seq"))?,
             i64::from(limit),
+            conn.scope().as_slice(),
         ),
         |row| {
             Ok((
@@ -231,20 +243,23 @@ pub fn page(
 }
 
 /// 删除 `relay_seq <= floor` 的日志前缀（GC 内部使用；调用方负责 gc_floor 的推进）。
-pub fn delete_prefix(conn: &Connection, floor: u64) -> Result<u64> {
+pub fn delete_prefix(conn: &ScopeConn, floor: u64) -> Result<u64> {
     let changed = conn.execute(
-        "DELETE FROM log WHERE relay_seq <= ?1",
-        [i64::try_from(floor).map_err(|_| Error::Invariant("gc floor"))?],
+        "DELETE FROM log WHERE relay_seq <= ?1 AND vault_id = ?",
+        (
+            i64::try_from(floor).map_err(|_| Error::Invariant("gc floor"))?,
+            conn.scope().as_slice(),
+        ),
     )?;
     Ok(changed as u64)
 }
 
 /// GC 后对象是否还被日志引用（用于判断"无根引用的 update 对象"）。
-pub fn object_logged(conn: &Connection, object_id: &Hash32) -> Result<bool> {
+pub fn object_logged(conn: &ScopeConn, object_id: &Hash32) -> Result<bool> {
     let value: Option<i64> = conn
         .query_row(
-            "SELECT relay_seq FROM log WHERE object_id = ?1 LIMIT 1",
-            [object_id.as_slice()],
+            "SELECT relay_seq FROM log WHERE object_id = ?1 AND vault_id = ? LIMIT 1",
+            (object_id.as_slice(), conn.scope().as_slice()),
             |row| row.get(0),
         )
         .optional()?;
@@ -263,9 +278,10 @@ pub fn encode_seq(seq: u64) -> [u8; 8] {
 }
 
 /// 诊断：全部事件的 `(seq, kind)`。
-pub fn timeline(conn: &Connection) -> Result<Vec<(u64, LogKind)>> {
-    let mut stmt = conn.prepare("SELECT relay_seq, kind FROM log ORDER BY relay_seq")?;
-    let rows = stmt.query_map([], |row| {
+pub fn timeline(conn: &ScopeConn) -> Result<Vec<(u64, LogKind)>> {
+    let mut stmt =
+        conn.prepare("SELECT relay_seq, kind FROM log WHERE vault_id = ?1 ORDER BY relay_seq")?;
+    let rows = stmt.query_map([conn.scope().as_slice()], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
     let mut out = Vec::new();

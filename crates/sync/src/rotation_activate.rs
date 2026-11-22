@@ -17,6 +17,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::api_version::RelayApi;
 use crate::device::{DeviceHpkeKey, DeviceSigningKey, ManagementKey};
 use crate::error::SyncError;
 use crate::hpke::open_epoch_grant;
@@ -81,7 +82,7 @@ pub struct ActivatedOutcome {
 #[allow(clippy::too_many_arguments)]
 pub fn activate_http<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: VaultId,
     instance_id: &[u8; 16],
     manager: &ManagementKey,
@@ -97,17 +98,20 @@ pub fn activate_http<T: HttpTransport>(
         input.request_id,
         input.expected_control_rev,
         &body,
+        api.version(),
     )?;
-    let (token, _) = management_token(transport, base, vault_id, manager, now)?;
+    let (token, _) = management_token(transport, api, vault_id, manager, now)?;
     let signed_value = crate::cbor::CdeValue::Map(vec![
         (0, crate::cbor::bytes(signed.body.clone())),
         (1, crate::cbor::bytes(signed.signature.to_vec())),
     ]);
-    let path = format!(
-        "{base}/v1/vaults/{}/rotations/{}/activate",
-        crate::base64url::encode(&vault_id),
-        crate::base64url::encode(&input.rotation_id)
-    );
+    let path = api.url(&api.vault_path(
+        &vault_id,
+        &format!(
+            "/rotations/{}/activate",
+            crate::base64url::encode(&input.rotation_id)
+        ),
+    ));
     let response = send(
         transport,
         "POST",
@@ -125,7 +129,7 @@ pub fn activate_http<T: HttpTransport>(
             parse_activated_outcome(&fields)
         }
         Err(error @ SyncError::Transport(_)) => {
-            let view = query_current_rotation(transport, base, vault_id, manager, now)?;
+            let view = query_current_rotation(transport, api, vault_id, manager, now)?;
             if view.state == "activated" {
                 Ok(ActivatedOutcome {
                     epoch: view.to_epoch,
@@ -158,19 +162,16 @@ fn parse_activated_outcome(fields: &crate::cbor::Fields) -> Result<ActivatedOutc
 
 fn query_current_rotation<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: VaultId,
     manager: &ManagementKey,
     now: u64,
 ) -> Result<RotationView, SyncError> {
-    let (token, _) = management_token(transport, base, vault_id, manager, now)?;
+    let (token, _) = management_token(transport, api, vault_id, manager, now)?;
     let response = send(
         transport,
         "GET",
-        format!(
-            "{base}/v1/vaults/{}/rotations/current",
-            crate::base64url::encode(&vault_id)
-        ),
+        api.url(&api.vault_path(&vault_id, "/rotations/current")),
         Some(&token),
         Vec::new(),
     )?;
@@ -221,7 +222,7 @@ fn cbor_opt_uint(fields: &crate::cbor::Fields, key: u64) -> Option<u64> {
 #[allow(clippy::too_many_arguments)]
 pub fn verify_latest_grant_root<T: HttpTransport>(
     transport: &mut T,
-    base: &str,
+    api: &RelayApi,
     vault_id: VaultId,
     device_id: DeviceId,
     signing_key: &DeviceSigningKey,
@@ -229,14 +230,11 @@ pub fn verify_latest_grant_root<T: HttpTransport>(
     expected_root: &RootSecretV1,
     now: u64,
 ) -> Result<(), SyncError> {
-    let token = device_token(transport, base, vault_id, device_id, signing_key, now)?;
+    let token = device_token(transport, api, vault_id, device_id, signing_key, now)?;
     let response = send(
         transport,
         "GET",
-        format!(
-            "{base}/v1/vaults/{}/devices/self/grants/latest",
-            crate::base64url::encode(&vault_id)
-        ),
+        api.url(&api.vault_path(&vault_id, "/devices/self/grants/latest")),
         Some(&token),
         Vec::new(),
     )?;

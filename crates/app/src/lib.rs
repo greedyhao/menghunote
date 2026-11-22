@@ -15,12 +15,20 @@
 #![deny(unsafe_code)]
 
 pub mod dev_vault;
+// 附件插入（任务：开发版附件插入）：只在 `--features dev-sync` 下编译，默认构建里
+// 这个模块不存在（它的 UI 入口也只挂在 dev-sync 面板同一道门禁下）。
+#[cfg(feature = "dev-sync")]
+pub mod attachment;
 // dev-only 同步面板（ADR 0009）：只在 `--features dev-sync` 下编译，
 // 默认构建里这个模块不存在、也不引入 `menghunote-sync` 依赖树。
 #[cfg(feature = "dev-sync")]
 pub mod dev_sync;
 pub mod editor;
 pub mod export;
+// relay 模式/URL 的构建期能力闸（ADR 0013 §1）：`sync` feature 下存在；
+// 只有 `dev-sync` 构建才把 `local_dev` 视为可接受模式。
+#[cfg(feature = "sync")]
+pub mod sync_gate;
 // 同步初始化/配置的 UI 向导与设置（ADR 0011，S1–S4）：同样只在 `dev-sync` feature 下编译。
 #[cfg(feature = "dev-sync")]
 pub mod onboarding;

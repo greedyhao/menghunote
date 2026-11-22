@@ -31,6 +31,7 @@ use menghunote_storage::{
     append_updates_with_sync_intents, list_tree, load_body_doc, local_sync_intent, BodyDoc,
     HeadState, StructureWriter, SyncContext, UpdateRecord, Vault,
 };
+use menghunote_sync::api_version::RelayApiVersion;
 use menghunote_sync::dev_local::{CreatedVault, DevLocal, JoinedVault};
 use menghunote_sync::device::{DeviceHpkeKey, DeviceSigningKey, ManagementKey};
 use menghunote_sync::device_management::{revoke_device, RevokeContext, RevokeOutcome};
@@ -181,6 +182,7 @@ fn device_client(
     let transport = StdTcpTransport::new_local_dev(relay_url).expect("构造本地传输失败");
     let config = HttpRelayConfig {
         base_url: relay_url.to_owned(),
+        api_version: RelayApiVersion::V1,
         vault_id: identity.vault_id,
         device_id: identity.device_id,
         manager_pub: Some(identity.pinned_manager),

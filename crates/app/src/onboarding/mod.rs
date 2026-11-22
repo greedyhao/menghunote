@@ -22,7 +22,7 @@
 //! | --- | --- | --- |
 //! | [`layout`] | 公开目录/配置：XDG/LOCALAPPDATA 解析、`dev-sync.json` 原子读写 | `serde`/`serde_json` + std |
 //! | [`lock`] | 每实例目录的进程级独占锁（锁文件 + `create_new`，MVP） | std |
-//! | [`create`] | Create 后台线程：genesis → 身份落盘 → channel 交回 | `menghunote-sync` + `DevIdentityStore` |
+//! | [`create`] | Create 后台线程：genesis → 身份落盘 → channel 交回（`local_dev` / `remote_tls`） | `menghunote-sync` + `DevIdentityStore` |
 //! | [`join`] | Join 后台线程：恢复码自批/bootstrap → 身份落盘 → channel 交回（含失败分类） | 同上 |
 //! | [`input`] | 自绘输入控件（`EntityInputHandler`；秘密字段遮罩 + 允许粘贴） | GPUI + `sidebar_rename` |
 //! | [`settings`] | 设置面板状态 + relay 编辑校验（与运行时门禁同一套策略） | `gate`/`service` + `layout` + `input` |
@@ -47,12 +47,18 @@
 //! - 打开已有实例是**同步**的（锁 + 身份解封 + 打开库）：本地 IO 很快，但大库迁移会
 //!   短暂阻塞窗口；真正的后台 Opening 留给产品化。
 //! - 实例目录锁是"锁文件 + `create_new`"的 MVP（见 [`lock`] 的局限说明）。
-//! - `DevLocal::create/join` 自建 transport，`ServiceConfig` 的超时/预算不会传进去
-//!   （ADR 0011 已记录：逻辑超时 ≠ 停止，终态前禁止重试）。
+//! - `local_dev` 的 `DevLocal::create/join` 自建 transport，`ServiceConfig` 的超时/预算
+//!   不会传进去（ADR 0011 已记录：逻辑超时 ≠ 停止，终态前禁止重试）；`remote_tls`
+//!   （S3b）用 `RelayContext::remote_tls` + production TLS，初始化的传输预算同样是
+//!   历史默认（30s/30s）。
+//! - `remote_tls` 初始化**未**在真实鉴权 relay / Windows 真机上验证（ADR 0013 S3b）；
+//!   本地 TLS harness 通过显式注入自签根（只加信任根，不关闭证书校验）。
 
 pub mod app_root;
 pub mod create;
+pub mod fingerprint;
 pub mod input;
+pub mod invite;
 pub mod join;
 pub mod layout;
 pub mod lock;
@@ -62,11 +68,20 @@ pub use app_root::{AppRoot, AppRootOptions, RootStateLabel, DEFAULT_OPERATION_BU
 pub use create::{
     CreateEvent, CreateJob, CreateOutcome, CreateRequest, CreateStage, CREATE_PUMP_INTERVAL,
 };
+pub use fingerprint::{
+    load as load_pin_fingerprint, BootstrapFingerprint, FingerprintState, PinFingerprint,
+    FINGERPRINT_NOTICE, NOT_TRUSTED,
+};
 pub use input::{FormInput, FormInputEvent};
+pub use invite::{
+    InviteCheckRequest, InviteEvent, InviteFailureKind, InviteJob, InviteOutcome,
+    InvitePendingFacts, InviteRedeemRequest, InviteStage, INVITE_EMPTY_HINT,
+};
 pub use join::{JoinEvent, JoinFailureKind, JoinJob, JoinOutcome, JoinRequest, JoinStage};
 pub use layout::{
     generate_instance_id, validate_instance_id, DevSyncProfile, InstanceEntry, ProfileError,
-    ProfileLayout, ProfileStore, PROFILE_VERSION, VAULT_FILE_NAME,
+    ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, PROFILE_VERSION, PROFILE_VERSION_V1,
+    VAULT_FILE_NAME,
 };
 pub use lock::{InstanceLock, LockError, LOCK_FILE_NAME};
 

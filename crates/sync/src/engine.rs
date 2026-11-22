@@ -19,6 +19,7 @@
 //! **不推进游标的失败**：任何事件校验/解密/签名失败直接返回错误，`pull` 不写游标；
 //! 回滚/log_id 变化/epoch 不匹配返回 [`SyncError::Paused`]，调用方必须停止自动同步。
 
+use crate::asset_sync;
 use crate::device::{verify_signature, DeviceSigningKey};
 use crate::error::SyncError;
 use crate::keys::{derive_object_key, RootSecretV1};
@@ -33,8 +34,9 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use loro::VersionVector;
 use menghunote_storage::{
-    append_updates, count_inbox_ready, load_body_doc, load_head, mark_acked, mark_integrated,
-    mark_sent, outbox_parts, outbox_rows, pending_encryption, repack_required,
+    append_updates, asset_bytes, count_inbox_ready, count_unreferenced_assets,
+    list_referenced_assets, load_body_doc, load_head, mark_acked, mark_integrated, mark_sent,
+    mark_skipped_event_received, outbox_parts, outbox_rows, pending_encryption, repack_required,
     set_confirmed_highwater, set_sync_log_id, store_encrypted_parts, store_inbox_verified,
     sync_cursor_state, take_inbox_ready, SyncContext, SyncEncryptedPart, SyncInboxRow,
     SyncOutboxState, UpdateRecord, Vault, STRUCTURE_DOC_ID,
@@ -141,6 +143,60 @@ pub struct PushReport {
     pub acked: usize,
     /// relay 逐项失败（保留 outbox 待重试）。
     pub failed: usize,
+}
+
+/// 增量资产上传报告（普通同步的"正文之后"阶段）。
+///
+/// 语义与顺序：
+/// - 只处理 **`asset_refs` 引用得到**的本地资产（有明文）；历史孤儿跳过并计入
+///   [`AssetSyncReport::orphans_skipped`]，不把整库历史资产重新上传。
+/// - 已有 durable "已上传" 标记的资产直接跳过（不读字节、不发请求）。
+/// - relay 上对象已完整（例如 checkpoint/轮换/另一台设备传过）时按确定性密文逐片
+///   校验后只做提交/落标记，不重传分片；分片缺失时只补缺失片（已 durable 的片不重传）。
+/// - 对象被其它 reservation 持有时整条资产**延后**（`deferred`），不阻塞正文/结构同步，
+///   下一轮再试；网络/单资产损坏计入 `failed`，同样不阻塞本轮。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssetSyncReport {
+    /// 被正文引用、有明文的资产数（本轮扫描口径）。
+    pub referenced: usize,
+    /// 本轮成功上传并完成对象提交的资产数（含补齐缺失分片）。
+    pub uploaded: usize,
+    /// 本轮真正 PUT 的分片数（已存在/已 durable 的片不计）。
+    pub parts_uploaded: usize,
+    /// 本轮 PUT 的明文字节数。
+    pub bytes_uploaded: u64,
+    /// 命中本地 durable 标记、直接跳过的资产数。
+    pub already_uploaded: usize,
+    /// relay 上对象已完整（checkpoint/轮换/其他设备传过），本轮只校验+提交/落标记的数量。
+    pub reused_existing: usize,
+    /// 被其它 reservation 持有、需下一轮再试的资产数。
+    pub deferred: usize,
+    /// 单资产失败数（网络/校验失败；不阻塞正文同步，下一轮重试）。
+    pub failed: usize,
+    /// 元数据不可用或空数据而跳过的资产数（不上传空资产）。
+    pub skipped_invalid: usize,
+    /// 有明文但没有任何正文引用的孤儿数（**不上传**；GC 不在本任务范围）。
+    pub orphans_skipped: u64,
+}
+
+/// 单条资产的增量上传结果（内部用）。
+enum AssetUploadOutcome {
+    /// 命中 durable 标记，跳过。
+    AlreadyUploaded,
+    /// 本轮上传（含补齐缺失分片）并完成提交。
+    Uploaded {
+        parts_uploaded: usize,
+        bytes_uploaded: u64,
+    },
+    /// relay 上对象已完整，只校验/提交/落标记。
+    ReusedExisting {
+        parts_uploaded: usize,
+        bytes_uploaded: u64,
+    },
+    /// 被其它 reservation 持有，下一轮再试。
+    Deferred,
+    /// 元数据/明文不可用，跳空资产。
+    SkippedInvalid,
 }
 
 /// 拉取报告。
@@ -253,6 +309,8 @@ pub struct SyncReport {
     pub encrypted: usize,
     /// 推送结果。
     pub push: PushReport,
+    /// 增量资产上传结果（正文推送之后）。
+    pub assets: AssetSyncReport,
     /// 拉取结果。
     pub pull: PullReport,
     /// 集成结果。
@@ -957,6 +1015,215 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         Ok(report)
     }
 
+    /// 阶段 2b：**增量上传被正文引用的本地资产**（正文推送之后、拉取之前）。
+    ///
+    /// 顺序是刻意的（ADR 0012 的两阶段路径也复用本方法）：
+    /// - 正文/结构更新先 `push`，资产后置；单条资产失败只计入
+    ///   [`AssetSyncReport::failed`]，**不阻塞**本轮正文交付；
+    /// - 资产在 `pull` 之前完成，远端设备下一次 pull 就能同时拿到正文与 ASSET 事件；
+    /// - 已有 durable 标记的资产不读字节、不发请求；relay 上已完整的对象只校验+提交，
+    ///   被其它 reservation 持有的对象延后（`deferred`），下一轮重试。
+    ///
+    /// 只处理 `asset_refs` 引用得到的资产：历史孤儿不重传（`orphans_skipped` 如实上报）。
+    pub fn upload_pending_assets(&mut self) -> Result<AssetSyncReport, SyncError> {
+        if self.rotation_frozen {
+            return Err(SyncError::Paused(PauseReason::RotationFrozen));
+        }
+        let mut report = AssetSyncReport {
+            orphans_skipped: count_unreferenced_assets(self.vault)?,
+            ..AssetSyncReport::default()
+        };
+        let assets = list_referenced_assets(self.vault)?;
+        report.referenced = assets.len();
+        for meta in assets {
+            let (Some(byte_len), Some(media_type)) = (meta.byte_len, meta.media_type.as_deref())
+            else {
+                report.skipped_invalid += 1;
+                continue;
+            };
+            if byte_len <= 0 {
+                // 空资产/无长度元数据不上传（storage 的 insert_asset 已拒绝空明文，
+                // 这里兜底历史占位/损坏行）。
+                report.skipped_invalid += 1;
+                continue;
+            }
+            let Ok(byte_len) = u64::try_from(byte_len) else {
+                report.skipped_invalid += 1;
+                continue;
+            };
+            match self.upload_one_asset(&meta.asset_hash, byte_len, media_type) {
+                Ok(AssetUploadOutcome::AlreadyUploaded) => report.already_uploaded += 1,
+                Ok(AssetUploadOutcome::ReusedExisting {
+                    parts_uploaded,
+                    bytes_uploaded,
+                }) => {
+                    report.reused_existing += 1;
+                    report.parts_uploaded += parts_uploaded;
+                    report.bytes_uploaded += bytes_uploaded;
+                }
+                Ok(AssetUploadOutcome::Uploaded {
+                    parts_uploaded,
+                    bytes_uploaded,
+                }) => {
+                    report.uploaded += 1;
+                    report.parts_uploaded += parts_uploaded;
+                    report.bytes_uploaded += bytes_uploaded;
+                }
+                Ok(AssetUploadOutcome::Deferred) => report.deferred += 1,
+                Ok(AssetUploadOutcome::SkippedInvalid) => report.skipped_invalid += 1,
+                // 单资产失败不阻塞正文：但全局暂停（epoch/轮换）与本地库读写失败
+                // 必须上抛，否则会把"整库不可用"伪装成一次成功的同步。
+                Err(error) if matches!(error, SyncError::Paused(_) | SyncError::Storage(_)) => {
+                    return Err(error)
+                }
+                Err(_) => report.failed += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    /// 单条资产：标记 → 探测 relay → 只补缺失分片 → 提交 → durable 标记。
+    fn upload_one_asset(
+        &mut self,
+        hash: &[u8; 32],
+        byte_len: u64,
+        media_type: &str,
+    ) -> Result<AssetUploadOutcome, SyncError> {
+        asset_sync::ensure_vault(&self.root, self.vault_id)?;
+        let object = asset_sync::local_asset_object(&self.root, hash, byte_len, media_type)?;
+        let total = asset_sync::asset_plain_len(byte_len, media_type)?;
+        let part_count = u32::try_from(part_count_for(total, ObjectType::Asset))
+            .map_err(|_| SyncError::LocalCorrupt("资产分片数超出 u32"))?;
+        if let Some(fact) = asset_sync::read_uploaded(self.vault, &object.object_id)? {
+            if fact.key_epoch == object.key_epoch
+                && fact.part_count == part_count
+                && fact.total_plain_len == total
+            {
+                return Ok(AssetUploadOutcome::AlreadyUploaded);
+            }
+        }
+        let Some(data) = asset_bytes(self.vault, hash)? else {
+            return Ok(AssetUploadOutcome::SkippedInvalid);
+        };
+        if data.is_empty() {
+            return Ok(AssetUploadOutcome::SkippedInvalid);
+        }
+        if data.len() as u64 != byte_len {
+            return Err(SyncError::LocalCorrupt("资产字节长度与元数据不一致"));
+        }
+        let real: [u8; 32] = Sha256::digest(&data).into();
+        if real != *hash {
+            return Err(SyncError::LocalCorrupt("资产字节哈希与元数据不一致"));
+        }
+        let plaintext = crate::checkpoint::asset_plaintext(hash, byte_len, media_type, &data)?;
+        let encrypted = crate::upload::encrypt_asset_parts(
+            &self.root,
+            self.vault_id,
+            object.object_id,
+            &plaintext,
+        )?;
+        if encrypted.part_count != part_count || encrypted.total_plain_len != total {
+            return Err(SyncError::LocalCorrupt("资产确定性分片事实与元数据不一致"));
+        }
+
+        let mut parts_uploaded = 0usize;
+        let mut bytes_uploaded = 0u64;
+        let reused_complete = match asset_sync::read_part(self.client, &object.object_id, 0)? {
+            None => {
+                // relay 上完全没有该对象：普通预算完整上传。
+                for (part_no, envelope, _) in &encrypted.parts {
+                    self.client
+                        .put_part(&object.object_id, *part_no, envelope)?;
+                    parts_uploaded += 1;
+                    bytes_uploaded += expected_part_plain_len(
+                        ObjectType::Asset,
+                        encrypted.total_plain_len,
+                        *part_no,
+                    )? as u64;
+                }
+                false
+            }
+            Some(existing) => {
+                // 确定性加密下，同一 object_id 的分片字节必须一致；不一致只能是
+                // 本地根/代码版本变化或 relay 被篡改，必须 fail-closed（本轮不计成功）。
+                if existing != encrypted.parts[0].1 {
+                    return Err(SyncError::Object("资产对象已有密文与本地确定性密文不一致"));
+                }
+                let mut missing = Vec::new();
+                for (part_no, envelope, _) in encrypted.parts.iter().skip(1) {
+                    match asset_sync::read_part(self.client, &object.object_id, *part_no)? {
+                        Some(stored) => {
+                            if stored != *envelope {
+                                return Err(SyncError::Object(
+                                    "资产对象已有分片与本地确定性密文不一致",
+                                ));
+                            }
+                        }
+                        None => missing.push((*part_no, envelope)),
+                    }
+                }
+                if missing.is_empty() {
+                    // checkpoint/轮换/其他设备已完整上传：只做提交（幂等）并落标记。
+                    true
+                } else {
+                    // 上次普通上传中断：只补缺失片，已 durable 的片不重传。
+                    for (part_no, envelope) in missing {
+                        match self.client.put_part(&object.object_id, part_no, envelope) {
+                            Ok(()) => {
+                                parts_uploaded += 1;
+                                bytes_uploaded += expected_part_plain_len(
+                                    ObjectType::Asset,
+                                    encrypted.total_plain_len,
+                                    part_no,
+                                )? as u64;
+                            }
+                            // 对象已被 checkpoint 的维护 reservation 持有：普通预算
+                            // 不能续传，也不能改用别人的 reservation；延后到下一轮。
+                            Err(error) if asset_sync::is_id_conflict(&error) => {
+                                return Ok(AssetUploadOutcome::Deferred)
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    false
+                }
+            }
+        };
+
+        crate::upload::submit_prepared_object(
+            self.client,
+            self.vault_id,
+            &self.identity.signing_key,
+            ObjectType::Asset,
+            object.object_id,
+            object.message_id,
+            0,
+            self.root.key_epoch,
+            0,
+            encrypted.part_count,
+            encrypted.total_plain_len,
+            &encrypted.object_digest,
+        )?;
+        let fact = asset_sync::uploaded_fact_from_object(
+            &object,
+            encrypted.part_count,
+            encrypted.total_plain_len,
+            encrypted.object_digest,
+        );
+        asset_sync::mark_uploaded(self.vault, &fact)?;
+        if reused_complete {
+            Ok(AssetUploadOutcome::ReusedExisting {
+                parts_uploaded,
+                bytes_uploaded,
+            })
+        } else {
+            Ok(AssetUploadOutcome::Uploaded {
+                parts_uploaded,
+                bytes_uploaded,
+            })
+        }
+    }
+
     /// 阶段 3：拉取一页日志并验收。
     pub fn pull(&mut self) -> Result<PullReport, SyncError> {
         let state = self.client.state()?;
@@ -995,6 +1262,12 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         };
         for event in &page.events {
             if event.relay_seq <= local.received_seq {
+                // ASSET 已推进 received 前缀后仍要核对 durable skipped 记录：relay 把
+                // 同一 seq 重写成另一条资产时必须 Paused(RelayHistoryRewritten)，不能
+                // 因为"水位已覆盖"就静默跳过（记录本身还绑定完整 commit 字节）。
+                if event.kind == RelayLogKind::Asset {
+                    self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                }
                 report.skipped += 1;
                 continue;
             }
@@ -1014,6 +1287,9 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
                 // 游标不前进。
                 RelayLogKind::Asset => {
                     self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                    // ASSET 不写 inbox，但必须在 durable 消费后推进 received 连续前缀，
+                    // 否则同一页里"ASSET 在前、UPDATE 在后"会让后续 UPDATE 永远不 ready。
+                    mark_skipped_event_received(self.vault, &state.log_id, event.relay_seq)?;
                     report.skipped += 1;
                 }
                 // checkpoint/control 由 bootstrap/checkpoint 任务处理；静默跳过会
@@ -1320,6 +1596,8 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
     ) -> Result<SyncReport, SyncError> {
         let encrypted = self.encrypt_pending(self.config.send_batch)?;
         let push = self.push()?;
+        // 正文优先：正文 push 之后才上传资产；单资产失败不阻塞后续 pull/integrate。
+        let assets = self.upload_pending_assets()?;
         let pull = self.pull()?;
         guard()?;
         let integrate = self.integrate(self.config.integrate_limit)?;
@@ -1327,6 +1605,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         Ok(SyncReport {
             encrypted,
             push,
+            assets,
             pull,
             integrate,
             ack,
@@ -1546,12 +1825,16 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
     /// 验证口径与 checkpoint writer 完全一致：统一走
     /// [`crate::upload::fetch_verified_asset`]（分片上限/分配保护/固定切片/每片
     /// header 上下文/AEAD/摘要/明文头/OID 重算），这里只把事件里的完整声明传进去。
+    ///
+    /// 返回值额外带上**已验证的资产数据字节**：pull 消费 ASSET 事件时要把它们落进
+    /// 本地内容寻址表（否则"另一台设备同步后取不到资产字节"——ASSET 事件是更新日志
+    /// 里唯一携带资产数据的载体）。
     fn download_verified_asset(
         &mut self,
         object_id: &ObjectId,
         commit: &ObjectCommit,
-    ) -> Result<crate::upload::VerifiedAssetFacts, SyncError> {
-        crate::upload::fetch_verified_asset(
+    ) -> Result<(crate::upload::VerifiedAssetFacts, Vec<u8>), SyncError> {
+        crate::upload::fetch_verified_asset_data(
             &mut *self.client,
             &self.root,
             self.vault_id,
@@ -1570,15 +1853,36 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         )
     }
 
+    /// 把已验证的资产明文写进本地内容寻址表（`assets`）。
+    ///
+    /// 幂等语义由 storage 保证：同 hash + 同字节 → `Ok(())`；同 hash 不同字节
+    /// （本地已损坏或哈希碰撞）→ `Corrupt`，这里 fail-closed（不写记录、不推游标）。
+    fn store_verified_asset(
+        &self,
+        verified: &crate::upload::VerifiedAssetFacts,
+        data: &[u8],
+    ) -> Result<(), SyncError> {
+        menghunote_storage::insert_asset(
+            self.vault,
+            &verified.real_sha256,
+            verified.byte_len,
+            Some(&verified.media_type),
+            data,
+        )?;
+        Ok(())
+    }
+
     /// 持久写入一条 skipped-asset 记录；同一 seq 重放必须幂等，内容冲突 fail-closed。
     ///
     /// 冲突分两类：HMAC/结构/认证失败是 `LocalCorrupt`（本地记录被篡改或旧修订）；
     /// HMAC 校验通过但同一 seq 的身份/资产事实不同，是 relay 重写已消费历史，
     /// 返回 `Paused(RelayHistoryRewritten)`，**不覆盖**已有记录、不推进游标。
     ///
-    /// **先做来源认证**（[`Self::download_verified_asset`]）：只有真实下载并验证通过的
-    /// ASSET 才允许落记录，记录里的资产事实全部来自本机验证结果。结构校验/下载/验证
-    /// 任一失败都不写记录，调用方（pull）因此不会推进游标。
+    /// **先做来源认证，再落资产字节**（[`Self::download_verified_asset`]）：只有真实下载
+    /// 并验证通过的 ASSET 才允许落记录，记录里的资产事实全部来自本机验证结果。验证通过后
+    /// 把明文写进本地内容寻址表（[`Self::store_verified_asset`]，幂等），这样**已存在的
+    /// 设备**同步后也能用 `asset_bytes` 取到资产；结构校验/下载/验证/落库任一失败都不写
+    /// 记录，调用方（pull）因此不会推进游标。
     ///
     /// 结构校验（不验签，因为 ASSET 信封的 producer 被规范化为 0，事件里拿不到
     /// 生产者公钥）：事件必须是可解码的 `ObjectCommit`，类型 ASSET、object_id /
@@ -1618,7 +1922,22 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         }
         // 评审 0003 P0-B 残余：HMAC 只能证明本机记录过 relay 的声明；写记录之前必须
         // 真正取回并验证资产。失败直接 `?`，不写记录、不写 inbox、不推游标。
-        let verified = self.download_verified_asset(&object_id, &commit)?;
+        let (verified, data) = self.download_verified_asset(&object_id, &commit)?;
+        // 资产字节落本地（内容寻址、幂等）：只有这一步成功，别的设备同步后
+        // `asset_bytes` 才真的取得到；记录只表示"本机消费了这条 ASSET"。
+        self.store_verified_asset(&verified, &data)?;
+        // 本机刚完成"下载 + 全部分片校验 + 落盘"，relay 上该对象必然完整：直接落
+        // durable 已上传标记，避免下一轮普通同步再为这个对象发探测/重传请求。
+        asset_sync::mark_uploaded(
+            self.vault,
+            &asset_sync::AssetUploadedFact {
+                object_id,
+                part_count: commit.part_count,
+                total_plain_len: commit.total_len,
+                object_digest: commit.object_digest,
+                key_epoch: commit.key_epoch,
+            },
+        )?;
         let record = SkippedAssetRecord {
             log_id: *log_id,
             relay_seq: event.relay_seq,

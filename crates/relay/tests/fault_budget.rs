@@ -211,8 +211,9 @@ fn quota_exhaustion_is_reject_only_and_resumable() {
     fx.db
         .write_blocking(|conn| {
             conn.execute(
-                "UPDATE vault SET normal_limit = 1200, maintenance_limit = 1200 WHERE singleton = 1",
-                [],
+                "UPDATE vaults SET normal_limit = 1200, maintenance_limit = 1200
+                 WHERE vault_id = ?1",
+                [conn.scope().as_slice()],
             )?;
             Ok(())
         })
