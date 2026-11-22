@@ -77,6 +77,17 @@ fn expect_bounds(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Bo
     bounds
 }
 
+/// Welcome →「新建本地仓库」→ 确认默认目录（进入本地 Main）。
+#[cfg(not(feature = "dev-sync"))]
+fn open_default_local_vault(cx: &mut VisualTestContext) {
+    let card = expect_bounds(cx, "welcome-new-local");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.run_until_parked();
+    let confirm = expect_bounds(cx, "welcome-new-local-confirm");
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    cx.run_until_parked();
+}
+
 fn state_of(root: &Entity<AppRoot>, cx: &mut VisualTestContext) -> RootStateLabel {
     root.update(cx, |root, _| root.state_label())
 }
@@ -161,9 +172,7 @@ async fn local_open_is_remembered_and_resumes_without_resetting_vault(cx: &mut T
         !startup_path.exists(),
         "进入 Welcome 本身不得写启动偏好（只有打开成功才写）"
     );
-    let local = expect_bounds(cx, "app-root-local");
-    cx.simulate_click(local.center(), Modifiers::default());
-    cx.run_until_parked();
+    open_default_local_vault(cx);
 
     assert_eq!(state_of(&root, cx), RootStateLabel::Main);
     assert!(root.update(cx, |root, _| root.is_local_mode()));
@@ -227,9 +236,7 @@ async fn deleted_local_vault_returns_to_welcome_with_explicit_notice(cx: &mut Te
     let options = product_options(layout.clone());
     let (root, cx) = open_root(cx, options.clone());
     cx.run_until_parked();
-    let local = expect_bounds(cx, "app-root-local");
-    cx.simulate_click(local.center(), Modifiers::default());
-    cx.run_until_parked();
+    open_default_local_vault(cx);
     assert_eq!(state_of(&root, cx), RootStateLabel::Main);
 
     // 模拟用户删除本地库（连目录一起删）：偏好文件仍在数据根下。
@@ -279,9 +286,7 @@ async fn setting_active_instance_from_local_mode_switches_startup_preference(
     let options = product_options(layout.clone());
     let (root, cx) = open_root(cx, options.clone());
     cx.run_until_parked();
-    let local = expect_bounds(cx, "app-root-local");
-    cx.simulate_click(local.center(), Modifiers::default());
-    cx.run_until_parked();
+    open_default_local_vault(cx);
     assert!(root.update(cx, |root, _| root.is_local_mode()));
     assert_eq!(read_json(&layout.startup_path())["mode"], "local");
 
@@ -292,6 +297,7 @@ async fn setting_active_instance_from_local_mode_switches_startup_preference(
     let mut profile = DevSyncProfile::default();
     profile.upsert_active(InstanceEntry {
         instance_id: "inst-fake".to_owned(),
+        display_name: None,
         relay_mode: RelayMode::RemoteTls,
         api_version: RelayApiVersion::V1,
         relay_url: "https://relay.example".to_owned(),
@@ -301,14 +307,25 @@ async fn setting_active_instance_from_local_mode_switches_startup_preference(
     });
     store.save(&profile).expect("写测试公开配置失败");
 
-    // 真实点击「设为默认」（设置页从磁盘重读配置后可见该实例）。
-    open_settings(&root, cx);
-    let instances = expect_bounds(cx, "settings-nav-instances");
-    cx.simulate_click(instances.center(), Modifiers::default());
+    // 真实点击「管理仓库 → 设为默认」（管理仓库从磁盘重读配置后可见该实例；
+    // 设置页不再有「实例」分类，这是唯一入口）。
+    let switcher = expect_bounds(cx, "app-root-vault-switcher");
+    cx.simulate_click(switcher.center(), Modifiers::default());
     cx.run_until_parked();
-    let set_active = expect_bounds(cx, "settings-instance-0-active");
+    let manage = expect_bounds(cx, "app-root-vault-manage");
+    cx.simulate_click(manage.center(), Modifiers::default());
+    cx.run_until_parked();
+    expect_bounds(cx, "app-root-vault-manager");
+    let set_active = expect_bounds(cx, "vault-manager-default-0");
     cx.simulate_click(set_active.center(), Modifiers::default());
     cx.run_until_parked();
+    let notice = root
+        .update(cx, |root, _| root.vault_manager_notice().map(str::to_owned))
+        .expect("设为默认必须有提示");
+    assert!(
+        notice.contains("重启") && notice.contains("生效"),
+        "设为默认必须标注「重启后生效」：{notice}"
+    );
     assert_eq!(
         read_json(&layout.startup_path())["mode"],
         "sync",

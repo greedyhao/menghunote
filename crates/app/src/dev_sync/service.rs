@@ -60,6 +60,7 @@ use std::time::{Duration, Instant};
 use menghunote_storage::{load_head, Vault, STRUCTURE_DOC_ID};
 use menghunote_sync::api_version::RelayApiVersion;
 use menghunote_sync::dev_local::{ApplyOutcome, DevLocal};
+use menghunote_sync::engine::{IntegrateReport, PullReport};
 use menghunote_sync::error::SyncError;
 use menghunote_sync::http_relay::Clock as _;
 use menghunote_sync::http_transport::StdTcpTransport;
@@ -82,6 +83,18 @@ use super::state::{
 
 /// 默认操作 deadline：开发演示下 Argon2/首次 bootstrap 可能很慢，但也不能无限挂。
 pub const DEFAULT_OPERATION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Phase 0 只读同步指标后缀（面板/日志可见：字节 + 两阶段耗时）。
+///
+/// 口径见 `menghunote_sync::engine::PullReport`：`update_bytes` 是 UPDATE **明文**负载，
+/// `asset_bytes` 是真实下载/落库的资产明文字节；不含路径/密钥/正文。只用于展示，
+/// 不参与任何同步决策。
+fn metrics_suffix(pull: &PullReport, integrate: &IntegrateReport) -> String {
+    format!(
+        "（UPDATE {} B / ASSET {} B / 拉取 {} ms / 整合 {} ms）",
+        pull.update_bytes, pull.asset_bytes, pull.elapsed_ms, integrate.elapsed_ms
+    )
+}
 
 /// worker 的配置（门禁产出、面板显示、测试注入）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -937,20 +950,25 @@ impl DevLocalRunner {
                 format!("同步失败：{error}")
             })?;
         eprintln!(
-            "[dev-sync] sync_once 完成：encrypted={} pushed={} pulled={} integrated={} deferred={}",
+            "[dev-sync] sync_once 完成：encrypted={} pushed={} pulled={} integrated={} deferred={} update_bytes={} asset_bytes={} pull_ms={} integrate_ms={}",
             report.encrypted,
             report.push.acked,
             report.pull.stored,
             report.integrate.integrated,
-            report.integrate.deferred
+            report.integrate.deferred,
+            report.pull.update_bytes,
+            report.pull.asset_bytes,
+            report.pull.elapsed_ms,
+            report.integrate.elapsed_ms
         );
 
         let summary = format!(
-            "推送 {} / 拉取 {} / 整合 {} / 延后 {}",
+            "推送 {} / 拉取 {} / 整合 {} / 延后 {}{}",
             report.push.acked,
             report.pull.stored,
             report.integrate.integrated,
-            report.integrate.deferred
+            report.integrate.deferred,
+            metrics_suffix(&report.pull, &report.integrate)
         );
         events(Event::Progress {
             op_id: OpId::UNASSIGNED,
@@ -1025,20 +1043,25 @@ impl DevLocalRunner {
                 format!("同步失败：{error}")
             })?;
         eprintln!(
-            "[dev-sync] 无会话 sync_once 完成：encrypted={} pushed={} pulled={} integrated={} deferred={}",
+            "[dev-sync] 无会话 sync_once 完成：encrypted={} pushed={} pulled={} integrated={} deferred={} update_bytes={} asset_bytes={} pull_ms={} integrate_ms={}",
             report.encrypted,
             report.push.acked,
             report.pull.stored,
             report.integrate.integrated,
-            report.integrate.deferred
+            report.integrate.deferred,
+            report.pull.update_bytes,
+            report.pull.asset_bytes,
+            report.pull.elapsed_ms,
+            report.integrate.elapsed_ms
         );
 
         let summary = format!(
-            "推送 {} / 拉取 {} / 整合 {} / 延后 {}",
+            "推送 {} / 拉取 {} / 整合 {} / 延后 {}{}",
             report.push.acked,
             report.pull.stored,
             report.integrate.integrated,
-            report.integrate.deferred
+            report.integrate.deferred,
+            metrics_suffix(&report.pull, &report.integrate)
         );
         events(Event::Progress {
             op_id: OpId::UNASSIGNED,
@@ -1531,8 +1554,12 @@ impl DevLocalRunner {
                 .map_err(|error| format!("生成授权代际失败：{error}"))?,
         );
         let prepare_summary = format!(
-            "推送 {} / 拉取 {}（已落盘待应用 {ready}，等待持闸授权）",
-            prepare.push.acked, prepare.pull.stored
+            "推送 {} / 拉取 {}（UPDATE {} B / ASSET {} B / 拉取 {} ms；已落盘待应用 {ready}，等待持闸授权）",
+            prepare.push.acked,
+            prepare.pull.stored,
+            prepare.pull.update_bytes,
+            prepare.pull.asset_bytes,
+            prepare.pull.elapsed_ms
         );
         events(Event::Progress {
             op_id,
@@ -1659,14 +1686,15 @@ impl DevLocalRunner {
             finish
         };
         let summary = format!(
-            "推送 {} / 拉取 {} / 整合 {} / 延后 {} / tail {} / ACK received={} integrated={}{projection_note}",
+            "推送 {} / 拉取 {} / 整合 {} / 延后 {} / tail {} / ACK received={} integrated={}{projection_note}{}",
             prepare.push.acked,
             prepare.pull.stored,
             integrated.integrate.integrated,
             integrated.integrate.deferred,
             finish.push.acked,
             finish.ack.received_seq,
-            finish.ack.integrated_seq
+            finish.ack.integrated_seq,
+            metrics_suffix(&prepare.pull, &integrated.integrate)
         );
         Ok(OpOutcome::new(summary).with_heads(integrated.changed_heads))
     }

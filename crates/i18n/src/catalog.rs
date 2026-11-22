@@ -25,7 +25,7 @@ pub const ZH_CN: &[(&str, &str)] = &[
     ("settings.about.title", "关于"),
     (
         "settings.about.version",
-        "menghunote {version}（GPUI Kit 0.9.1；SQLite 单库为持久化真源）",
+        "menghunote {version}（GPUI Kit 0.10.0；SQLite 单库为持久化真源）",
     ),
     ("settings.nav.about", "关于"),
     ("settings.nav.appearance", "外观"),
@@ -35,6 +35,7 @@ pub const ZH_CN: &[(&str, &str)] = &[
     ("settings.nav.plugins", "插件"),
     ("settings.nav.relay", "Relay"),
     ("settings.nav.security", "安全"),
+    ("settings.nav.shortcuts", "快捷键"),
     ("settings.nav.sync", "同步"),
     ("settings.nav.templates", "模板"),
     ("settings.nav.title", "设置"),
@@ -53,6 +54,36 @@ pub const ZH_CN: &[(&str, &str)] = &[
     ("settings.language.system", "跟随系统"),
     ("settings.language.title", "语言"),
     ("settings.language.zh", "中文"),
+    // ---- settings.shortcuts（快捷键设置）----
+    (
+        "settings.shortcuts.capture",
+        "请按下新的快捷键…（Esc 取消；需要 Ctrl/Cmd 或 Alt，或 F1–F24）",
+    ),
+    (
+        "settings.shortcuts.capture_failed",
+        "快捷键已生效，但保存失败：{reason}",
+    ),
+    (
+        "settings.shortcuts.capture_invalid",
+        "这个组合不能用作快捷键：需要 Ctrl/Cmd 或 Alt，或 F1–F24（Esc 取消录制）",
+    ),
+    ("settings.shortcuts.command.format_bold", "加粗"),
+    ("settings.shortcuts.command.format_italic", "斜体"),
+    ("settings.shortcuts.command.new_note", "新建笔记"),
+    ("settings.shortcuts.command.open_settings", "打开设置"),
+    ("settings.shortcuts.command.rename_note", "重命名笔记"),
+    ("settings.shortcuts.command.search", "搜索"),
+    ("settings.shortcuts.command.toggle_graph", "打开图谱"),
+    ("settings.shortcuts.conflicts", "冲突 {count} 组"),
+    ("settings.shortcuts.conflict_badge", "冲突"),
+    (
+        "settings.shortcuts.hint",
+        "本机偏好；不同步、不写正文；修改后立即生效。冲突只提醒，仍然可以保存。",
+    ),
+    ("settings.shortcuts.modify", "修改"),
+    ("settings.shortcuts.no_conflicts", "无冲突"),
+    ("settings.shortcuts.reset", "恢复默认"),
+    ("settings.shortcuts.title", "快捷键"),
     // ---- settings（同步区/按钮/错误提示）----
     ("settings.active_now", "当前默认"),
     ("settings.close", "关闭"),
@@ -118,24 +149,20 @@ pub const ZH_CN: &[(&str, &str)] = &[
         "公开信息（可复制；不要分享 setup secret、恢复码或主密钥）",
     ),
     (
+        "settings.relay.auto_mode",
+        "relay 模式：按地址自动识别（https:// → remote_tls；http:// loopback → local_dev，仅 dev-sync 构建）；不再手动选择模式。",
+    ),
+    (
         "settings.relay.local_hint",
         "local_dev：只允许 http://localhost / 127.0.0.1 / [::1]；空值/非 loopback/https/带 userinfo/带路径一律内联报错且不写配置。",
     ),
     (
         "settings.relay.remote_hint",
-        "remote_tls：只允许 https + canonical origin（DNS/IP；拒绝 userinfo/query/fragment/非根路径）；必须勾选上面的确认。",
+        "remote_tls：只允许 https + canonical origin（DNS/IP；拒绝 userinfo/query/fragment/非根路径）；按 relay 配置连接，不额外确认。",
     ),
     (
         "settings.relay.title",
         "relay 模式与地址（只对 active 实例；保存后重启生效）",
-    ),
-    (
-        "settings.remote_consent",
-        "我确认要连接远程服务器（HTTPS）；确认端点 ≠ 授权接受服务器任意 hash",
-    ),
-    (
-        "settings.remote_tls_consent_required",
-        "切换到 remote_tls 需要显式勾选「我确认要连接远程服务器（HTTPS）」；确认不会清 pin、也不会自动信任新服务器",
     ),
     ("settings.save", "保存 relay 设置（重启后生效）"),
     ("settings.set_active", "设为默认"),
@@ -328,6 +355,12 @@ pub const ZH_CN: &[(&str, &str)] = &[
         "在本机打开一个独立笔记库：不联网、不创建同步实例、不参与同步；空库由你自己新建笔记。",
     ),
     ("local.welcome_title", "没有同步需求？"),
+    // ---- vault.*（用户自定义仓库名称：Welcome 表单 / 管理仓库重命名）----
+    ("vault.name.label", "仓库名称"),
+    ("vault.name.placeholder", "留空则使用目录名"),
+    ("vault.rename", "重命名"),
+    ("vault.rename.cancel", "取消"),
+    ("vault.rename.save", "保存"),
 ];
 
 /// 英文 catalog。
@@ -341,7 +374,7 @@ pub const EN: &[(&str, &str)] = &[
     ("settings.about.title", "About"),
     (
         "settings.about.version",
-        "menghunote {version} (GPUI Kit 0.9.1; single SQLite database is the source of truth)",
+        "menghunote {version} (GPUI Kit 0.10.0; single SQLite database is the source of truth)",
     ),
     ("settings.nav.about", "About"),
     ("settings.nav.appearance", "Appearance"),
@@ -351,6 +384,7 @@ pub const EN: &[(&str, &str)] = &[
     ("settings.nav.plugins", "Plugins"),
     ("settings.nav.relay", "Relay"),
     ("settings.nav.security", "Security"),
+    ("settings.nav.shortcuts", "Shortcuts"),
     ("settings.nav.sync", "Sync"),
     ("settings.nav.templates", "Templates"),
     ("settings.nav.title", "Settings"),
@@ -381,6 +415,36 @@ pub const EN: &[(&str, &str)] = &[
     ("settings.language.system", "Follow system"),
     ("settings.language.title", "Language"),
     ("settings.language.zh", "Chinese"),
+    // ---- settings.shortcuts ----
+    (
+        "settings.shortcuts.capture",
+        "Press the new shortcut… (Esc cancels; Ctrl/Cmd or Alt, or F1–F24)",
+    ),
+    (
+        "settings.shortcuts.capture_failed",
+        "The shortcut is active but saving failed: {reason}",
+    ),
+    (
+        "settings.shortcuts.capture_invalid",
+        "This combination cannot be used: Ctrl/Cmd or Alt is required, or a function key F1–F24 (Esc cancels recording)",
+    ),
+    ("settings.shortcuts.command.format_bold", "Bold"),
+    ("settings.shortcuts.command.format_italic", "Italic"),
+    ("settings.shortcuts.command.new_note", "New note"),
+    ("settings.shortcuts.command.open_settings", "Open settings"),
+    ("settings.shortcuts.command.rename_note", "Rename note"),
+    ("settings.shortcuts.command.search", "Search"),
+    ("settings.shortcuts.command.toggle_graph", "Toggle graph"),
+    ("settings.shortcuts.conflicts", "{count} conflict group(s)"),
+    ("settings.shortcuts.conflict_badge", "Conflict"),
+    (
+        "settings.shortcuts.hint",
+        "Local preference; not synced and not written to notes; applies immediately. Conflicts are warnings only and can still be saved.",
+    ),
+    ("settings.shortcuts.modify", "Change"),
+    ("settings.shortcuts.no_conflicts", "No conflicts"),
+    ("settings.shortcuts.reset", "Reset"),
+    ("settings.shortcuts.title", "Shortcuts"),
     // ---- settings（同步区/按钮/错误提示）----
     ("settings.active_now", "Active"),
     ("settings.close", "Close"),
@@ -446,24 +510,20 @@ pub const EN: &[(&str, &str)] = &[
         "Public information (copyable; never share setup secrets, recovery codes or the master key)",
     ),
     (
+        "settings.relay.auto_mode",
+        "Relay mode: inferred from the address (https:// -> remote_tls; http:// loopback -> local_dev, dev-sync builds only); no manual mode selection.",
+    ),
+    (
         "settings.relay.local_hint",
         "local_dev: only http://localhost / 127.0.0.1 / [::1]; empty, non-loopback, https, userinfo or path values fail inline and never modify the config.",
     ),
     (
         "settings.relay.remote_hint",
-        "remote_tls: only https + canonical origin (DNS/IP; userinfo/query/fragment/non-root paths rejected); the consent above is required.",
+        "remote_tls: only https + canonical origin (DNS/IP; userinfo/query/fragment/non-root paths rejected); connects from the relay config without extra confirmation.",
     ),
     (
         "settings.relay.title",
         "Relay mode and address (active instance only; takes effect after restart)",
-    ),
-    (
-        "settings.remote_consent",
-        "I confirm connecting to a remote server (HTTPS); confirming the endpoint does not accept any server hash",
-    ),
-    (
-        "settings.remote_tls_consent_required",
-        "Switching to remote_tls requires the explicit \"remote server (HTTPS)\" consent; it never clears the pin and never auto-trusts a new server",
     ),
     (
         "settings.save",
@@ -692,6 +752,12 @@ pub const EN: &[(&str, &str)] = &[
         "Open a standalone notebook vault on this machine: no network, no sync instance, no syncing; the empty vault is yours to fill.",
     ),
     ("local.welcome_title", "Don't need sync?"),
+    // ---- vault.* (user-defined vault names: Welcome form / vault manager rename) ----
+    ("vault.name.label", "Vault name"),
+    ("vault.name.placeholder", "Leave blank to use the folder name"),
+    ("vault.rename", "Rename"),
+    ("vault.rename.cancel", "Cancel"),
+    ("vault.rename.save", "Save"),
 ];
 
 #[must_use]
@@ -808,11 +874,11 @@ mod tests {
                     let after = &rest[start + 1..];
                     // `{{...}}` 是**字面量**（模板/日记占位符语法，直接展示给用户），
                     // 不是 `{name}` 插值：整段跳过，不参与 ALLOWED 校验。
-                    if after.starts_with('{') {
-                        let close = after[1..].find("}}").unwrap_or_else(|| {
+                    if let Some(stripped) = after.strip_prefix('{') {
+                        let close = stripped.find("}}").unwrap_or_else(|| {
                             panic!("{locale:?} 的 {key} 字面量花括号未闭合：{text}")
                         });
-                        rest = &after[1 + close + 2..];
+                        rest = &stripped[close + 2..];
                         continue;
                     }
                     let end = after

@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 //! menghunote 桌面端入口（ADR 0003 §7 切片 5a；ADR 0011 起带同步向导入口）。
 //!
 //! 启动有三条互不混淆的路径（顺序 = 优先级）：
@@ -40,6 +45,9 @@ fn main() -> Result<()> {
     // 应用语言（ADR 0020 P1）：读本机 `language.json`（只含 locale 选择）。缺失/损坏
     // 回退「跟随系统」（`LC_ALL`/`LANG`，未知语言回退中文）；不阻塞启动、不同步。
     menghunote_app::language_settings::init_from_disk();
+    // 快捷键（设置页「快捷键」分类）：读本机 `shortcuts.json`（数据根下）。缺失/损坏/
+    // 未知命令/非法组合回退默认值，**不阻塞启动**；改绑后立即生效。
+    menghunote_app::shortcuts::init_from_disk();
     // 先读 DPI 感知：清单没生效时这里会打一条明确警告（不 panic），
     // 后面 `scale_factor` / 显示器尺寸的数值就是它的下游表现。
     platform::log_startup_dpi_report();

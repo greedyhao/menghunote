@@ -771,6 +771,122 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   无 DPI 重新渲染；真实 Windows 像素/DPI 待验。详见
   [`docs/notes/excalidraw-embed.md`](docs/notes/excalidraw-embed.md)。
 
+- **vault 新建 / 切换 / 路径选择（2026-11-20）**：
+  默认 vault 不再写 `%LOCALAPPDATA%`：Create/Join 实例目录默认
+  `%USERPROFILE%\Documents\menghunote\instances\<id>`（Linux/macOS
+  `$HOME/Documents/menghunote/instances/<id>`；Documents 不存在则
+  `$HOME/menghunote/instances/<id>`），本地库默认同根 `local/vault.sqlite3`；
+  两个表单加「浏览…」（`cx.prompt_for_paths`，目录选择），仍要求绝对路径 +
+  不存在/空目录（`validate_instance_directory` 不变）；`sync.json` 与旧 `vault_path`
+  原样保留、不迁移。
+  设置 →「实例」每行新增「打开」：`AppShell::close_all`（有界排空/flush）→ 释放旧
+  `InstanceLock` → 关设置 → 打开目标实例（成功写 active + `startup.json` mode=sync；
+  失败进既有 Error 页；目标就是当前实例 = no-op）；新增「返回欢迎页」
+  「新建同步 vault…」「加入同步 vault…」，均先关旧 Main 再回 Welcome / 进 Create /
+  Join 表单，**不热切当前 worker**。
+  Welcome 本地入口可编辑库文件路径（`app-root-local-path` + 浏览）；文件不存在时按钮明确
+  「新建本地 vault」（`open_local_vault_at` 建空库、不播种 demo），成功后把实际路径写进
+  `startup.json` 的可选 `local_vault_path`（旧 `{version,mode}` 仍可读；旧格式 + 旧数据根
+  `local/vault.sqlite3` 仍存在时继续打开旧库，不"丢库"）。
+  selector：`settings-instance-<i>-open` / `settings-back-welcome` /
+  `settings-new-sync-vault` / `settings-join-sync-vault` / `app-root-dir-browse` /
+  `app-root-join-dir-browse` / `app-root-local-path` / `app-root-local-browse`。
+  实现：`onboarding/{app_root,layout}.rs`；新增 `headless_vault_switch` 9（产品默认）/
+  7（dev-sync；本地 2 用例仅产品构建）；layout 单测 +5。
+  测试：app 默认 **652** / `--features dev-sync` **799** / `--no-default-features` **501**；
+  `--lib onboarding` 计数见各分类；fmt/clippy（dev-sync all-targets `-D warnings`）干净。
+  已知限制：headless 不弹真实系统对话框（浏览按钮真机未验）；切换是同步关+开，大库首帧
+  可能短暂停顿；`close_all` 只请求停止同步 worker（不 join，与关窗一致）；不迁移旧
+  LOCALAPPDATA 下的 vault。详见
+  [`docs/notes/vault-management.md`](docs/notes/vault-management.md)。
+
+- **同步 UI 修复与 Windows release 控制台（2026-11-20）**：
+  - remote_tls 不再要求「我确认要连接远程服务器（HTTPS）」勾选：Create/Join/设置全部
+    去掉 `remote_consent` 字段、selector 与提交校验；仍由权威 parser 强制 HTTPS
+    canonical origin 与独立 pin 校验。
+  - DEV 勾选/`DEV 状态`提示/「同意开发同步」错误只存在于 `dev-sync` 构建；产品
+    Create/Join 不渲染、不要求，产品不再出现 DEV ONLY 文案。
+  - 邀请 PENDING 等待页每 **5s** 自动调用 `check_invite`（`busy` 防重叠；失败保留页面），
+    手动「检查状态」保留；事件泵在等待页保持存活，离开后自清 `pump_started`。
+  - 底栏 `sync-status` 在 AppRoot 托管的 Main 里发
+    `AppShellEvent::OpenSyncSettings`，由 AppRoot 打开设置并选中 `SettingsSection::Sync`；
+    不再打开 AppShell 旧组合设置页（同步下方不再混入外观/语言/模板）。direct AppShell
+    测试仍保留旧 `settings_host_managed = false` 路径。
+  - `main.rs` 加 `#![cfg_attr(all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows")]`：Windows release 不再弹终端窗口；debug 构建保留
+    控制台日志。
+  新增/重写测试：`onboarding_invite` 自动检查、`sync_ui_product` 产品无 DEV 勾选、
+  `headless_vault_switch` 状态栏打开 AppRoot 同步设置、`dev_sync_ui` host-managed 事件。
+  **relay 模式不再手选**（2026-11-20 追加）：设置/Join 去掉 `settings-mode-*` /
+  `app-root-join-mode-*` 单选，`infer_relay_mode` 按地址自动识别（https → remote_tls，
+  http → local_dev 仅 dev-sync），保存/提交仍走同一权威 parser；设置→实例的长文案
+  拆成三行短说明并改为垂直 `settings-instances` 容器，去掉带连续空格的漂浮排版。
+  测试：app 默认 **652** / `--features dev-sync` **799** / no-default **501**；fmt/clippy 干净。
+  已知限制：TLS/Windows 真机仍未验；direct AppShell 旧设置页仅测试兼容。
+
+- **vault 切换器 / 标题输入 / 编辑器交互 / 快捷键 / 画布入口（2026-11-20）**：
+  - 左下角 `app-root-vault-switcher`：当前 vault 名 + `▾`，菜单列实例（当前 ✓）、
+    `管理仓库…`；管理仓库覆盖层 `app-root-vault-manager` 提供打开/设为默认/新建同步/
+    加入同步/返回欢迎页。设置里的「实例」分类已移除；切换仍是 close_all → 释放锁 →
+    开目标，不重启。
+  - 笔记顶部标题：`Ctrl/Cmd+V` 粘贴（单行过滤）、点击按位置落 caret、新建普通笔记
+    自动进入标题编辑并全选默认名；点正文仍还给正文焦点。
+  - 编辑器：Shift+单击扩选；单击改为 mouse-up 落 caret（避免按下就闪语法/蓝选）；
+    `Ctrl+B` / `Ctrl+I` 包裹/取消/折叠插入成对标记，一次 `EditRequest`/撤销组。
+  - 设置 →「快捷键」：7 个命令可改绑、冲突红标/汇总、单行恢复默认、立即生效；
+    `shortcuts.json` 原子写；命令默认值与接线见 `docs/notes/shortcuts.md`。
+  - 画布从侧栏顶部动作行移到最左 ribbon（`ribbon-canvas`），图标用
+    Excalidraw `logoMark.svg`；`sidebar-new-drawing` selector 保留在 ribbon 按钮上。
+  - IME 回归：`headless_ime_preedit` 用 F8 真实走 `update_preedit` → `paint_preedit`，
+    断言 `preedit_paint_count > 0`；paint 增加 selection 起点兜底，防止组合串静默不画。
+  - relay 部署与“默认只发 app、relay 改动需显式提醒”记入
+    [`docs/adr/0026-relay-deployment-and-client-releases.md`](docs/adr/0026-relay-deployment-and-client-releases.md)。
+  - 标题编辑保持 **28px BOLD / 48px 行高**（编辑态不再上移）、统一 `cursor_text()` 文本光标、
+    双击按词选（`word_range_at`，CJK+ASCII 连续词、空白/标点/emoji 只选自身）；About 文案
+    改为 **`GPUI Kit 0.10.0`**（中英 catalog 同步）。
+  - 侧栏拖放落点改为目标行**最近的祖先文件夹**（文件夹行 = 自身、子笔记/子文件夹行 = 父文件夹、
+    根级笔记行 = 根）：文件夹展开后的整个目录范围都能拖入，嵌套时落到最近一层文件夹；
+    自指/后代仍拒绝，一次合法移动只写一次结构。
+  - 正文 IME preedit 的 caret 改画在**组合串末尾**（不再同时画在起点）；正文 caret 约 **530 ms**
+    闪烁（复用 50 ms pump 推进，输入/点击/聚焦重置，组合期间常亮）。
+  - 标题 / 重命名输入框 caret 同样约 **530 ms** 闪烁（独立 timer；输入/点击/移动重置，
+    `caret_blink_visible` 供 headless 断言）。
+  - Main 左下角改为**一行**动作（`app-root-bottom-actions`）：vault 切换器占剩余宽度 +
+    紧凑「设置」按钮，两按钮同一底边/行高；`app-root-settings` / `app-root-vault-switcher`
+    selector 不变，窄窗口宽度夹紧。
+  测试：app 默认 **734** / `--features dev-sync` **885** / no-default **569**；fmt/clippy 干净。
+  后续同批追加：
+  - Welcome 重做 Obsidian 式仓库选择页：`welcome-vault-list` 左栏列同步实例+本地库并直接打开；
+    右栏 `welcome-new-local` / `welcome-open-local` / `welcome-sync-remote`；同步远程只用一条
+    `mn-pair://create|join` 链接自动识别，不再手填 relay/vault/恢复码。管理仓库只保留一个统一入口。
+  - 新建文件夹立即进入行内重命名；点其它行/正文/空白确认。侧栏笔记/文件夹可用原生
+    `on_drag`/`on_drop` 拖入文件夹或根级，一次 `write_structure("移动节点")`，拒绝自指/后代。
+  - 标题栏支持鼠标拖动正/反向选字；正文 caret 只在正文聚焦时绘制，避免标题+正文双光标。
+  - 编辑器补 `Ctrl+←/→` 按词移动、`Ctrl+Shift+←/→` 按词扩选、`Ctrl+L` 选当前行、
+    `Ctrl+Home/End` 文件首尾、`Ctrl+Shift+Home/End` 扩到首尾、`Esc` 折叠选区。
+  - IME 根因：`shape_line` 空 runs 零字形；`text_runs_for_line` 空 spans 生成覆盖全文的
+    Plain run，`headless_ime_preedit` 回归。详见
+    [`docs/notes/welcome-vault-picker.md`](docs/notes/welcome-vault-picker.md)、
+    [`docs/notes/editor-selection-and-keys.md`](docs/notes/editor-selection-and-keys.md)。
+  - **仓库自定义命名**：`InstanceEntry.display_name: Option<String>`（serde default，配置仍 v2，
+    旧配置缺字段回退目录名）；Welcome 同步表单 `welcome-sync-name`，管理仓库
+    `vault-manager-rename-<i>` 行内改名，空白=清除回退；不改目录/`vault_path`/身份。
+  - **回收站**：ribbon `ribbon-trash` + `trash-panel` 列表/恢复；复用
+    `StructureWriter::restore_note`，回原父级、不自动打开；彻底删除因多设备语义未定**未做**。
+    详见 [`docs/notes/trash.md`](docs/notes/trash.md)。
+  - **代码块语法高亮**：`pulldown-cmark` 暴露 `CodeBlockSpan`，`syntect`（纯 Rust）
+    输出 token 颜色；只经 `glyph::shape_row_code` 改颜色，不改布局/编辑/选区；
+    10 个主题 token、块级 + display 两级缓存、超 256 KiB 降级无色。不引入 TextView/
+    tree-sitter/C 依赖；详见 [`docs/notes/code-highlight.md`](docs/notes/code-highlight.md)。
+  - **IME 组合串擦底纸**：绘制 preedit 前按实际 shaping 宽度用正文底色擦掉下方文字，
+    修复“光标后还有文字时组合串重叠”；headless 断言 `preedit_mask_width_last_frame`。
+  - **标题/单元格复制**：`Ctrl+C`/`Cmd+C` 复制选区、`Ctrl+X`/`Cmd+X` 剪切并删除选区
+    （`text_shortcuts::copy_shortcut/cut_shortcut`）；搜索框/向导仍保持不支持剪贴板。
+  - **同步快速追赶计划**：先做 checkpoint 快速追赶（复用已有 `/bootstrap` + `baseline_apply`），
+    不按“r1…r7 只留 id”改 relay；完整方案/决策点见
+    [`docs/notes/sync-fast-catchup-plan.md`](docs/notes/sync-fast-catchup-plan.md)。
+  已知限制：UI/拖拽/IME/标题/快捷键录制尚未 Windows 真机验收；TLS 已由用户验证但未做安全审计。
+
 - **UI 重构：设置分类导航 / 最左侧图标栏 / 侧栏排序（2026-11-18，Obsidian 风格）**：
   **设置页（产品 AppRoot）** 从一张长卡片拆成「左侧分类导航 + 右侧只渲染当前分类」：
   `appearance`（默认）/ `language` / `templates` / `daily_notes` / `sync` / `instances` /

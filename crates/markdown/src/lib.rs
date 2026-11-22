@@ -29,6 +29,9 @@
 //!   数据行、每格源码区间与对齐方式；ADR 0019 S3a）；
 //! - [`FencedMermaidBlock`]：fenced `mermaid` 代码块的源码元数据（整块/内容跨度、
 //!   起止行、info、是否可投影成 Object；ADR 0019 M2）；
+//! - [`CodeBlockSpan`]：**任意**代码块（fenced / indented）的源码元数据（整块/
+//!   内容/开围栏跨度、info、起止行、是否 fenced）；app 的只读语法高亮按它取内容
+//!   与语言，`code_spans` 的既有语义不变；
 //! - [`DrawingSpan`]：整行独占的内嵌画布笔记 `![[目标.excalidraw]]`（目标/别名
 //!   源码区间、行号；ADR 0025 后续切片）；
 //! - [`LineInfo`]：逐源码行语义（引用前缀、列表归属、是否在围栏/表格里），
@@ -516,6 +519,51 @@ impl FencedMermaidBlock {
     }
 }
 
+/// 一个代码块（fenced / indented）的**读取用**源码元数据。
+///
+/// 只记录“源码里这一段是代码块、语言是什么、内容在哪”，**不产生任何新文本**，
+/// 也不改变 [`ParsedMarkdown::code_spans`] 的既有语义。`menghunote-app` 的只读语法
+/// 高亮用它：
+///
+/// - [`Self::content`] 切片作为高亮输入（围栏行不算代码内容）；
+/// - [`Self::info`] 取语言（app 只取第一个词，如 `rust,no_run` → `rust`）；
+/// - [`Self::span`] 用于判定“这一行/这一段在代码块里”，从而只对代码行着色。
+///
+/// # 边界
+///
+/// - [`Self::span`]：整块源码区间（首行行首 .. 末行行尾，**含**换行），与
+///   [`ParsedMarkdown::code_spans`] 中的对应区间逐字节一致；
+/// - [`Self::content`]：
+///   - fenced：开围栏行行尾 .. 闭围栏行行首（与 [`FencedMermaidBlock::content`]
+///     同一口径；围栏行本身不是代码内容），空块是空区间；
+///   - indented：整块区间（缩进代码没有围栏行；保留行首缩进，交给高亮器处理）；
+///   - 无法定位闭合围栏的 fenced 块（未闭合/异常围栏）退化为“开围栏行之后到
+///     块尾”，且 `opening` 为空区间 —— 宁可少着色，也不把围栏行当代码；
+/// - [`Self::opening`]：fenced 的开围栏标记（跳过行首缩进，到行内容终点；含 info），
+///   indented 为空区间（`span.start`）；
+/// - [`Self::info`]：`pulldown-cmark` 给出的 info string（去掉首尾空白；indented 为空串）；
+/// - [`Self::first_line`] / [`Self::last_line`]：首/末源码行号（0 起；fenced 含围栏行）。
+///
+/// **mermaid 块也记录**（本类型不筛语言）：app 可以按 info 跳过 mermaid；它同时
+/// 仍出现在 [`ParsedMarkdown::mermaid_blocks`] 里，两个字段互不影响。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBlockSpan {
+    /// 整块源码区间（含围栏行与换行），与 `code_spans` 一致。
+    pub span: Span,
+    /// 代码内容区间（不含围栏行；见类型文档的口径）。
+    pub content: Span,
+    /// 开围栏标记区间（indented 为空区间）。
+    pub opening: Span,
+    /// info string（已去首尾空白；indented 为空串）。
+    pub info: String,
+    /// 首行源码行号（0 起）。
+    pub first_line: usize,
+    /// 末行源码行号（0 起，含）。
+    pub last_line: usize,
+    /// 是否 fenced（`false` = 缩进代码块）。
+    pub fenced: bool,
+}
+
 /// 一行源码的语义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineInfo {
@@ -633,6 +681,11 @@ pub struct ParsedMarkdown {
     /// 内部行内构造一律不投影。引用前缀里的围栏不产生本类型（见
     /// [`FencedMermaidBlock`] 的说明）。
     pub mermaid_blocks: Vec<FencedMermaidBlock>,
+    /// 全部代码块（fenced / indented；按 `span` 起点排序）。
+    ///
+    /// 与 [`Self::mermaid_blocks`] 不同，这里**不筛语言**：mermaid 块也在。给 app
+    /// 的只读语法高亮提供语言与内容区间；不改变 [`Self::code_spans`] 的语义。
+    pub code_blocks: Vec<CodeBlockSpan>,
     /// 可投影构造（块级 + 行内；按 span/kind 稳定排序）。
     pub constructs: Vec<Construct>,
     /// 代码块区间（围栏/缩进；editor 用它抑制旧 scanner 在代码内部的构造）。
@@ -787,6 +840,8 @@ struct Builder<'a> {
     tables: Vec<TableBlock>,
     /// 解析出的 fenced `mermaid` 块（`block` 在 finish 阶段按行语义计算）。
     mermaid_blocks: Vec<FencedMermaidBlock>,
+    /// 解析出的全部代码块（性质见 [`CodeBlockSpan`]；mermaid 也在内）。
+    code_blocks: Vec<CodeBlockSpan>,
     html_stack: Vec<Span>,
     constructs: Vec<Construct>,
     headings: Vec<(Span, u8)>,
@@ -820,6 +875,7 @@ impl<'a> Builder<'a> {
             table_cell_start: None,
             tables: Vec::new(),
             mermaid_blocks: Vec::new(),
+            code_blocks: Vec::new(),
             html_stack: Vec::new(),
             constructs: Vec::new(),
             headings: Vec::new(),
@@ -1403,10 +1459,33 @@ impl<'a> Builder<'a> {
         } else {
             self.indented_spans.push(full);
         }
-        if !frame.fenced {
-            return;
-        }
-        let Some(construct) = self.fenced_construct(first, last) else {
+        // 只读高亮的块元数据：fenced 的围栏识别与 `Construct` 同源（内容不含围栏行），
+        // indented 没有围栏行，内容就是整块。识别不出来的 fenced（未闭合/引用前缀）
+        // 退化为“开围栏行之后到块尾”，宁可少高亮也不把围栏行当代码。
+        let construct = if frame.fenced {
+            self.fenced_construct(first, last)
+        } else {
+            None
+        };
+        let content = match (&construct, frame.fenced) {
+            (Some(construct), true) => construct.content,
+            (None, true) => Span::new(self.lines[first].end.min(full.end), full.end),
+            (_, false) => full,
+        };
+        self.code_blocks.push(CodeBlockSpan {
+            span: full,
+            content,
+            opening: construct
+                .as_ref()
+                .map_or(Span::empty(self.lines[first].start), |construct| {
+                    construct.markers[0]
+                }),
+            info: frame.info.trim().to_owned(),
+            first_line: first,
+            last_line: last,
+            fenced: frame.fenced,
+        });
+        let Some(construct) = construct else {
             return;
         };
         if is_mermaid_info(&frame.info) {
@@ -1613,6 +1692,7 @@ impl<'a> Builder<'a> {
             mut tables,
             table_spans,
             mut mermaid_blocks,
+            mut code_blocks,
             html_spans,
             rule_lines,
             uncertain_inline,
@@ -1724,6 +1804,8 @@ impl<'a> Builder<'a> {
         });
         code_spans.sort_by_key(|span| (span.start, span.end));
         code_spans.dedup();
+        code_blocks.sort_by_key(|block| (block.span.start, block.span.end));
+        code_blocks.dedup();
         unsupported_spans.sort_by_key(|span| (span.start, span.end));
         unsupported_spans.dedup();
         images.sort_by_key(|image| (image.span.start, image.span.end));
@@ -1794,6 +1876,7 @@ impl<'a> Builder<'a> {
             links,
             wiki_links,
             mermaid_blocks,
+            code_blocks,
             constructs: all,
             code_spans,
             unsupported_spans,
@@ -2622,6 +2705,136 @@ mod drawing_tests {
                 .iter()
                 .any(|construct| matches!(construct.kind, super::ConstructKind::Image)),
             "画布嵌入不能产生 Image 构造：{parsed:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod code_block_tests {
+    use super::{parse, Span};
+
+    fn slice(source: &str, span: Span) -> &str {
+        &source[span.start..span.end]
+    }
+
+    #[test]
+    fn fenced_rust_records_info_content_and_lines() {
+        let source = "```rust\nfn main() {}\n```\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.code_blocks.len(), 1, "一个 fenced 块：{parsed:?}");
+        let block = &parsed.code_blocks[0];
+        assert!(block.fenced);
+        assert_eq!(block.info, "rust");
+        assert_eq!(slice(source, block.content), "fn main() {}\n");
+        assert_eq!(slice(source, block.opening), "```rust");
+        assert_eq!(slice(source, block.span), source);
+        assert_eq!(block.first_line, 0);
+        assert_eq!(block.last_line, 2);
+        // `code_spans` 的既有语义不变：与块元数据同源同区间。
+        assert_eq!(parsed.code_spans, vec![block.span]);
+        assert!(source.is_char_boundary(block.content.start));
+        assert!(source.is_char_boundary(block.content.end));
+    }
+
+    #[test]
+    fn fence_info_keeps_raw_words_and_attributes() {
+        let source = "```rust,no_run\nlet x = 1;\n```\n";
+        let block = &parse(source).code_blocks[0];
+        assert_eq!(
+            block.info, "rust,no_run",
+            "info 原样保留，切片语言由 app 负责"
+        );
+        let source = "~~~{rust}\nlet x = 1;\n~~~\n";
+        let block = &parse(source).code_blocks[0];
+        assert_eq!(block.info, "{rust}");
+        assert_eq!(slice(source, block.opening), "~~~{rust}");
+    }
+
+    #[test]
+    fn fenced_without_info_has_empty_info() {
+        let source = "```\ncode\n```\n";
+        let block = &parse(source).code_blocks[0];
+        assert_eq!(block.info, "");
+        assert_eq!(slice(source, block.content), "code\n");
+    }
+
+    #[test]
+    fn empty_fenced_block_has_empty_content() {
+        let source = "```rust\n```\n";
+        let block = &parse(source).code_blocks[0];
+        assert_eq!(block.info, "rust");
+        assert_eq!(slice(source, block.content), "");
+        assert_eq!(block.first_line, 0);
+        assert_eq!(block.last_line, 1);
+    }
+
+    #[test]
+    fn indented_block_is_recorded_without_info() {
+        let source = "前言\n\n    let x = 1;\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.code_blocks.len(), 1, "缩进代码块：{parsed:?}");
+        let block = &parsed.code_blocks[0];
+        assert!(!block.fenced);
+        assert_eq!(block.info, "");
+        assert_eq!(slice(source, block.content), "    let x = 1;\n");
+        assert_eq!(block.span, block.content);
+        assert!(block.opening.is_empty());
+        assert_eq!(block.first_line, 2);
+        assert_eq!(block.last_line, 2);
+    }
+
+    #[test]
+    fn mermaid_blocks_are_recorded_but_keep_their_object_metadata() {
+        let source = "```mermaid\ngraph TD;\n```\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.code_blocks.len(), 1);
+        assert_eq!(parsed.code_blocks[0].info, "mermaid");
+        assert_eq!(slice(source, parsed.code_blocks[0].content), "graph TD;\n");
+        assert_eq!(parsed.mermaid_blocks.len(), 1, "既有 mermaid 元数据不变");
+        assert!(
+            parsed.mermaid_blocks[0].block,
+            "整块 mermaid 仍投影成 Object"
+        );
+    }
+
+    #[test]
+    fn blocks_are_sorted_by_span_and_match_code_spans() {
+        let source = "```rust\na\n```\n\n文本\n\n```python\nb\n```\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.code_blocks.len(), 2);
+        assert_eq!(parsed.code_blocks[0].info, "rust");
+        assert_eq!(parsed.code_blocks[1].info, "python");
+        assert!(
+            parsed.code_blocks[0].span.start < parsed.code_blocks[1].span.start,
+            "按 span 起点排序"
+        );
+        let mut expected: Vec<Span> = parsed.code_blocks.iter().map(|block| block.span).collect();
+        expected.sort_by_key(|span| (span.start, span.end));
+        assert_eq!(expected, parsed.code_spans, "code_spans 与块元数据一一对应");
+
+        // 嵌套在列表里的围栏也是代码块（缩进不改变块识别）。
+        let source = "- 列表\n\n  ```js\n  let a = 1;\n  ```\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.code_blocks.len(), 1, "列表内围栏：{parsed:?}");
+        assert_eq!(parsed.code_blocks[0].info, "js");
+    }
+
+    #[test]
+    fn code_blocks_inside_quote_are_recorded_best_effort() {
+        // 引用前缀里的围栏沿用 `fenced_construct` 的既有边界（不跳过 `>`）：
+        // 没有 construct 时内容退化为开围栏行之后，不 panic、不把围栏行当内容。
+        let source = "> ```rust\n> let x = 1;\n> ```\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.code_blocks.len(), 1, "引用内代码块：{parsed:?}");
+        let block = &parsed.code_blocks[0];
+        assert_eq!(block.info, "rust");
+        assert_eq!(block.span, parsed.code_spans[0]);
+        assert!(block.opening.is_empty(), "无法识别开围栏时为空区间");
+        // 引用前缀让围栏识别失败，内容从开围栏**行尾**开始；闭围栏行可能落在里面
+        // （宁可少高亮，不能把开围栏行当代码）。
+        assert!(
+            !slice(source, block.content).contains("```rust"),
+            "开围栏行不能算代码内容"
         );
     }
 }

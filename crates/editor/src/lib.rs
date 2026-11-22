@@ -92,8 +92,9 @@ pub use model::block::{BlockKind, BlockRun};
 // ADR 0019 S1：列表/行语义由 menghunote-markdown 定义，editor 原样再导出（同一类型，
 // 不是副本）；app 用它们算 gutter / hanging indent，不自己重扫 Markdown。
 pub use menghunote_markdown::{
-    LineInfo as MarkdownLineInfo, LineKind as MarkdownLineKind, ListBlock as MarkdownListBlock,
-    ListItem as MarkdownListItem, ListLineInfo as MarkdownListLineInfo, Span as MarkdownSpan,
+    CodeBlockSpan as MarkdownCodeBlock, LineInfo as MarkdownLineInfo, LineKind as MarkdownLineKind,
+    ListBlock as MarkdownListBlock, ListItem as MarkdownListItem,
+    ListLineInfo as MarkdownListLineInfo, Span as MarkdownSpan,
     TableAlignment as MarkdownTableAlignment, TableCellInline, TableCellLink, TableCellSpan,
     TableCellStyle,
 };

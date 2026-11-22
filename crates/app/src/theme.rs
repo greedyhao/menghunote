@@ -215,6 +215,26 @@ pub struct Theme {
     pub editor_text: Rgba,
     /// 行内/围栏代码底色。
     pub code_bg: Rgba,
+    /// 代码块语法高亮：关键字。
+    pub syntax_keyword: Rgba,
+    /// 代码块语法高亮：字符串。
+    pub syntax_string: Rgba,
+    /// 代码块语法高亮：注释。
+    pub syntax_comment: Rgba,
+    /// 代码块语法高亮：数值。
+    pub syntax_number: Rgba,
+    /// 代码块语法高亮：类型名。
+    pub syntax_type: Rgba,
+    /// 代码块语法高亮：函数名。
+    pub syntax_function: Rgba,
+    /// 代码块语法高亮：变量名。
+    pub syntax_variable: Rgba,
+    /// 代码块语法高亮：运算符。
+    pub syntax_operator: Rgba,
+    /// 代码块语法高亮：标点/分隔符。
+    pub syntax_punctuation: Rgba,
+    /// 代码块语法高亮：属性/注解/键名。
+    pub syntax_attribute: Rgba,
     /// 引用块左侧竖条。
     pub quote_border: Rgba,
     /// 引用块正文。
@@ -400,6 +420,16 @@ theme_token_names!(
     editor_bg,
     editor_text,
     code_bg,
+    syntax_keyword,
+    syntax_string,
+    syntax_comment,
+    syntax_number,
+    syntax_type,
+    syntax_function,
+    syntax_variable,
+    syntax_operator,
+    syntax_punctuation,
+    syntax_attribute,
     quote_border,
     quote_text,
     link,
@@ -502,6 +532,16 @@ pub fn light_theme() -> &'static Theme {
         editor_bg: rgb(0xffffff),
         editor_text: rgb(0x1f2328),
         code_bg: rgb(0xeff1f3),
+        syntax_keyword: rgb(0xcf222e),
+        syntax_string: rgb(0x0a3069),
+        syntax_comment: rgb(0x6e7781),
+        syntax_number: rgb(0x0550ae),
+        syntax_type: rgb(0x953800),
+        syntax_function: rgb(0x8250df),
+        syntax_variable: rgb(0x24292f),
+        syntax_operator: rgb(0x24292f),
+        syntax_punctuation: rgb(0x57606a),
+        syntax_attribute: rgb(0x116329),
         quote_border: rgb(0xc4c9d0),
         quote_text: rgb(0x57606a),
         link: rgb(0x0969da),
@@ -600,6 +640,16 @@ pub fn dark_theme() -> &'static Theme {
         editor_bg: rgb(0x0d1117),
         editor_text: rgb(0xe6edf3),
         code_bg: rgb(0x161b22),
+        syntax_keyword: rgb(0xff7b72),
+        syntax_string: rgb(0xa5d6ff),
+        syntax_comment: rgb(0x8b949e),
+        syntax_number: rgb(0x79c0ff),
+        syntax_type: rgb(0xffa657),
+        syntax_function: rgb(0xd2a8ff),
+        syntax_variable: rgb(0xc9d1d9),
+        syntax_operator: rgb(0xff7b72),
+        syntax_punctuation: rgb(0x8b949e),
+        syntax_attribute: rgb(0x7ee787),
         quote_border: rgb(0x6e7681),
         quote_text: rgb(0x8b949e),
         link: rgb(0x58a6ff),

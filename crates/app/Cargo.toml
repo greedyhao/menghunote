@@ -78,6 +78,20 @@ merman = { version = "=0.10.0", default-features = false, features = [
     "all-diagrams",
     "complete-svg",
 ] }
+# 代码块只读语法高亮底座（纯 Rust）：`pulldown-cmark`（crates/markdown）负责认块
+# 和 info，这里只做 token 着色。显式关掉默认 feature，避免拉 onig/C（vendor 的
+# onig 会引入 C 编译，Windows 上还要撞本仓的 build script 限制）：
+# - `parsing`：`ParseState` / `ScopeStack`（我们不用 `HighlightLines` 的 HTML 输出）；
+# - `default-syntaxes`：内置 Sublime 语法 dump（纯 Rust，无文件 IO、无 yaml 解析）；
+# - `regex-fancy`：fancy-regex 后端（纯 Rust）。
+# 不启用 `default-themes` / `html` / `plist-load` / `yaml-load`：颜色由本仓
+# 主题 token 决定，不读 `.tmTheme`，也不需要 HTML 渲染（`parsing` 所需的
+# dump-load 是它的传递依赖，只有 bincode/flate2，无 C）。
+syntect = { version = "5.3.0", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "regex-fancy",
+] }
 
 [dev-dependencies]
 # 原生 headless UI 测试（`#[gpui::test]` + `TestAppContext`）。

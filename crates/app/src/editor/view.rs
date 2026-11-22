@@ -71,12 +71,14 @@ use menghunote_storage::MaterializeOutcome;
 
 use crate::drawing::drawing_asset_key;
 use crate::note_properties::NotePropertiesPanel;
+use crate::shortcuts::{self, CommandId};
 use crate::sidebar_rename::{RenameEvent, RenameInput};
 
 use super::clipboard::{
     choose_paste, AssetRefSummary, ImportPayload, ImportReport, ImportSource, ImportedSummary,
     PasteAction, SharedImportWriter, MARKDOWN_METADATA_PREFIX,
 };
+use super::code_highlight::{self, CodeHighlightClass};
 use super::element::EditorElement;
 use super::geometry::{
     ObjectPaint, ObjectPaintContent, ObjectPaintState, TableCellLinkPaint, TableCellPaint,
@@ -92,6 +94,11 @@ use super::theme;
 
 /// 会话驱动 pump 间隔：只做内存操作，50 ms 足够跟上 250 ms 的 flush 窗口。
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
+/// 正文 caret 闪烁的半周期（可见 / 隐藏各约 530 ms）。
+///
+/// 相位由现有的 50 ms `pump` 推进（不单独给光标起 timer）；任何输入 / 选区或
+/// caret 移动 / 鼠标点击 / 聚焦失焦都会把相位重置回"可见"。
+const CARET_BLINK_HALF_INTERVAL: Duration = Duration::from_millis(530);
 /// 关闭窗口时的有界排空上限（ADR 0002 §9：`close` 必须有界）。
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 图片放大遮罩的缩放上下限（有界，滚轮再猛也不越界）。
@@ -487,10 +494,10 @@ pub struct TaskCheckbox {
     pub display: (usize, usize),
 }
 
-/// 这个按键是不是"打开搜索"的快捷键（**纯函数**，便于单测）。
+/// **默认**「打开搜索」组合的纯函数（兼容/单测用；运行时以 [`crate::shortcuts`] 为准）。
 ///
 /// 规则：`Ctrl` + `K` 或 `Ctrl` + `F`，且**不带** Alt / Shift / Cmd。
-/// 显式排除 Shift 是为了不和"Ctrl+Shift+F"这类全局搜索/格式化快捷键撞车。
+/// 用户在设置页改绑后，编辑器的实际匹配走中心快捷键表，不再调用本函数。
 #[must_use]
 pub fn is_search_shortcut(keystroke: &gpui::Keystroke) -> bool {
     let modifiers = keystroke.modifiers;
@@ -499,6 +506,54 @@ pub fn is_search_shortcut(keystroke: &gpui::Keystroke) -> bool {
         && !modifiers.shift
         && !modifiers.platform
         && matches!(keystroke.key.as_str(), "k" | "f")
+}
+
+/// **默认** `Ctrl+B` / `Ctrl+I` 对应的行内定界符（兼容/单测用；运行时以
+/// [`crate::shortcuts`] 为准）。
+///
+/// 规则：`Ctrl` + `b` / `i`（**不区分大小写**：Caps Lock 下平台可能给 `B`/`I`），
+/// 且**不带** Alt / Shift / Cmd / Fn。与 [`is_search_shortcut`] 同一套修饰键策略：
+/// Ctrl+Shift+B、Ctrl+Alt+I、Cmd+B 都不触发（避免与平台/宿主快捷键撞车）。
+#[must_use]
+pub fn is_inline_format_shortcut(keystroke: &gpui::Keystroke) -> Option<&'static str> {
+    let modifiers = keystroke.modifiers;
+    if !modifiers.control
+        || modifiers.alt
+        || modifiers.shift
+        || modifiers.platform
+        || modifiers.function
+    {
+        return None;
+    }
+    if keystroke.key.eq_ignore_ascii_case("b") {
+        Some("**")
+    } else if keystroke.key.eq_ignore_ascii_case("i") {
+        Some("*")
+    } else {
+        None
+    }
+}
+
+/// 左键按下后、真正开始拖拽前允许的像素抖动。
+///
+/// 单击不应该在 mouse-down 上就落 caret（那会立刻显现隐藏的 Markdown 标记并画出
+/// 蓝色选区）；只有指针离开按下点超过这个阈值才算拖拽，才实时扩选。
+const CLICK_DRAG_THRESHOLD: f32 = 3.0;
+
+/// 左键按下正文文本后的**待定点击**（`None` = 没有待定手势）。
+///
+/// 新的点击语义：mouse-down 只记录落点与锚点（不动选区、不显现隐藏语法），
+/// mouse-up 若没拖动才真正落 caret；拖动则走原有的实时扩选。
+#[derive(Debug, Clone, Copy)]
+struct PendingPointerClick {
+    /// 按下时的指针位置（窗口坐标）：判断是否越过 [`CLICK_DRAG_THRESHOLD`]。
+    press: Point<Pixels>,
+    /// 按下命中的 display 字节（落点时再换算成 source scalar）。
+    display_byte: usize,
+    /// 按下命中的偏置（与拖选共用"半格"规则）。
+    bias: Bias,
+    /// `Some(anchor)` = Shift+单击：mouse-up 时从该锚点扩选（不重新落 caret）。
+    anchor: Option<UnicodeScalar>,
 }
 
 impl gpui::EventEmitter<EditorEvent> for EditorView {}
@@ -534,6 +589,114 @@ struct ImageZoom {
     scale: f32,
 }
 
+/// 一帧可直接使用的代码块高亮快照（**display** 字节坐标）。
+///
+/// 只读：`blocks` 用于判定“这一行/这段在代码块里”，`spans` 用于 shaping 着色。
+/// 颜色不在快照里（shaping 时从当前主题取），所以同一份快照深浅色都正确。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CodeHighlightDisplay {
+    /// 代码块的 display 整块区间（有序；围栏隐藏时就是内容区间）。
+    blocks: Vec<Range<usize>>,
+    /// 语法 span（display 坐标，有序、不重叠；未命中的文本不在里面）。
+    spans: Vec<(Range<usize>, CodeHighlightClass)>,
+}
+
+impl CodeHighlightDisplay {
+    /// 已着色的 span 数（headless 断言用）。
+    #[must_use]
+    pub fn span_count(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// 语法 span（display 坐标）。
+    #[must_use]
+    pub fn spans(&self) -> &[(Range<usize>, CodeHighlightClass)] {
+        &self.spans
+    }
+
+    /// 代码块的 display 区间。
+    #[must_use]
+    pub fn code_block_ranges(&self) -> &[Range<usize>] {
+        &self.blocks
+    }
+
+    /// 这段 display 区间是否落在某个代码块内（空区间按起点判定）。
+    #[must_use]
+    pub fn is_code_range(&self, display: &Range<usize>) -> bool {
+        self.blocks
+            .iter()
+            .any(|block| block.start <= display.start && display.start < block.end)
+    }
+
+    /// 裁出本视觉行的语法 span，返回**相对行首**的区间。
+    ///
+    /// 行是 display 坐标里的半开区间；span 与本行无交集时返回空 vec。
+    #[must_use]
+    pub fn spans_for_line(&self, line: &Range<usize>) -> Vec<(Range<usize>, CodeHighlightClass)> {
+        if line.is_empty() {
+            return Vec::new();
+        }
+        let first = self
+            .spans
+            .partition_point(|(range, _)| range.end <= line.start);
+        let mut out = Vec::new();
+        for (range, class) in &self.spans[first..] {
+            if range.start >= line.end {
+                break;
+            }
+            let start = range.start.max(line.start);
+            let end = range.end.min(line.end);
+            if start < end {
+                out.push((start - line.start..end - line.start, *class));
+            }
+        }
+        out
+    }
+}
+
+/// 代码块只读语法高亮的缓存（**不每帧跑 syntect**）。
+///
+/// 分两级：
+///
+/// - **块级**：按（语言, 内容哈希）缓存 syntect 产物（source 坐标）。source 变化
+///   或主题变化时重建；内容/语言没变的块直接复用（编辑其它行不重跑语法解析）。
+/// - **display 级**：把 source span 映射成 display 坐标。`source_to_display` 会随
+///   caret 进入/离开围栏而变（标记隐藏/显现），因此键是 `(selection, theme_id)`；
+///   这一级只做区间换算，不跑 syntect（很便宜，但只在变化时重算）。
+struct CodeHighlightCache {
+    /// 上一次的整篇 source 哈希（`u64::MAX` = 还没算过）。
+    source_hash: u64,
+    /// 上一次 display 映射用的 `(selection, theme_id)`。
+    mapped: Option<(Selection, crate::theme::ThemeId)>,
+    /// 逐块 syntect 产物（与 `controller.code_blocks()` 顺序一致）。
+    blocks: Vec<CodeBlockHighlight>,
+    /// 当前 display 快照。
+    display: Rc<CodeHighlightDisplay>,
+}
+
+impl Default for CodeHighlightCache {
+    fn default() -> Self {
+        Self {
+            source_hash: u64::MAX,
+            mapped: None,
+            blocks: Vec::new(),
+            display: Rc::new(CodeHighlightDisplay::default()),
+        }
+    }
+}
+
+/// 一个代码块的 syntect 缓存（source 坐标）。
+struct CodeBlockHighlight {
+    /// 语言 token（info 第一词，小写；空 = 未知/不认）。
+    language: String,
+    /// 缓存键：语言 + 内容字节的哈希。
+    content_hash: u64,
+    /// 整块 source 区间（display 行判定用）。
+    block: Range<usize>,
+    /// source 坐标语法 span（绝对偏移，有序）。
+    spans: Vec<(Range<usize>, CodeHighlightClass)>,
+}
+
 pub struct EditorView {
     controller: EditorController,
     driver: SessionDriver,
@@ -547,6 +710,32 @@ pub struct EditorView {
     preferred_x: Option<Pixels>,
     /// 拖拽锚点（按下时的 scalar）；`None` = 当前没有拖拽。
     drag_anchor: Option<UnicodeScalar>,
+    /// 左键按在正文文本上的待定点击：mouse-down 只记锚点，mouse-up 没拖动才落 caret。
+    pending_pointer: Option<PendingPointerClick>,
+    /// IME preedit 真正进入绘制路径的次数（headless 回归用；不参与业务判断）。
+    pub(crate) preedit_paint_count: u64,
+    /// 上一帧是否真的画了正文 caret（未聚焦 / 闪烁隐藏相位 / 标题编辑时必须为 false）。
+    pub(crate) caret_painted_last_frame: bool,
+    /// 上一帧是否在 IME 组合串**末尾**画了 caret（有 preedit 且正文聚焦时才为 true）。
+    ///
+    /// 与 `caret_painted_last_frame` 配合锁回归：有 preedit 时组合串末尾的那条是
+    /// 本帧唯一 caret，起点不能再画一条；取消组合后两者都必须回到"无额外 caret"。
+    pub(crate) preedit_caret_painted_last_frame: bool,
+    /// 上一帧组合串末尾 caret 的窗口 x 坐标；没画（无 preedit/未聚焦/定位失败）时为 `None`。
+    pub(crate) preedit_caret_x_last_frame: Option<Pixels>,
+    /// 上一帧为组合串擦除底纸的宽度；`None` = 本帧没有绘制 preedit。
+    ///
+    /// 组合串不进布局，只画在 caret 处；不擦掉下面的正文就会与后续文字重叠
+    /// （真机反馈“输入时后面还有文字会重叠”）。该字段只供 headless 回归。
+    pub(crate) preedit_mask_width_last_frame: Option<Pixels>,
+    /// 正文 caret 当前是否可见（~530 ms 交替；未聚焦 / IME 组合中保持常亮）。
+    ///
+    /// 绘制只读它；相位由 `pump` 推进，任何输入/移动/点击/聚焦重置为 `true`。
+    pub(crate) caret_blink_visible: bool,
+    /// 自上次重置以来经过的 pump 拍数（每拍 = [`PUMP_INTERVAL`]；用来算闪烁相位）。
+    caret_blink_ticks: u64,
+    /// 上一帧绘制观察到的正文聚焦状态：变化时（聚焦/失焦）重置闪烁。
+    caret_blink_focused_last_frame: bool,
     /// 是否已经做过首帧聚焦（避免每帧重复 `window.focus`）。
     focused_once: bool,
     /// 关闭排空结果（留痕用，只在 stderr 打一行）。
@@ -618,6 +807,8 @@ pub struct EditorView {
     swallow_mouse_up: bool,
     /// 放大预览的图片（点击图片/放大按钮后显示；`None` = 关闭）。
     zoomed_image: Option<ImageZoom>,
+    /// 代码块只读语法高亮的缓存（source/theme 变化才重跑 syntect）。
+    code_highlight: CodeHighlightCache,
     /// 已被驱动受理的**本地**编辑代数（ADR 0012 S3 自动同步的触发源）。
     ///
     /// 只在 `EditOutcome::Applied` 上自增：远端 adopt 不经过 `submit_request`，
@@ -645,6 +836,15 @@ impl EditorView {
             properties: None,
             preferred_x: None,
             drag_anchor: None,
+            pending_pointer: None,
+            preedit_paint_count: 0,
+            caret_painted_last_frame: false,
+            preedit_caret_painted_last_frame: false,
+            preedit_caret_x_last_frame: None,
+            preedit_mask_width_last_frame: None,
+            caret_blink_visible: true,
+            caret_blink_ticks: 0,
+            caret_blink_focused_last_frame: false,
             focused_once: false,
             close_report: None,
             composition: Composition::default(),
@@ -675,6 +875,7 @@ impl EditorView {
             link_notice: None,
             swallow_mouse_up: false,
             zoomed_image: None,
+            code_highlight: CodeHighlightCache::default(),
             #[cfg(feature = "sync-ui")]
             local_edit_seq: 0,
         };
@@ -764,7 +965,70 @@ impl EditorView {
         if pending_reconcile {
             self.reconcile_asset_refs_now();
         }
+        // caret 闪烁：复用同一条 50 ms pump 推进相位（绝不为光标单独起 timer）。
+        // 只有可见性真的翻转才置 changed，避免每拍都重绘。
+        if self.update_caret_blink() {
+            changed = true;
+        }
         changed
+    }
+
+    /// 推进 caret 闪烁相位；返回可见性是否翻转（只有翻转才需要重绘）。
+    ///
+    /// 口径：
+    /// - 未聚焦 / 正文没有焦点：常亮（不推进相位，避免无意义的重绘）；
+    /// - IME 组合串存在：常亮（组合时晃 caret 更难受），下划线照常绘制；
+    /// - 其余：每 [`CARET_BLINK_HALF_INTERVAL`] 在可见/隐藏之间交替。
+    fn update_caret_blink(&mut self) -> bool {
+        if !self.caret_blink_focused_last_frame || self.preedit_text().is_some() {
+            self.caret_blink_ticks = 0;
+            if self.caret_blink_visible {
+                return false;
+            }
+            self.caret_blink_visible = true;
+            return true;
+        }
+        self.caret_blink_ticks = self.caret_blink_ticks.saturating_add(1);
+        // 用"拍数 × pump 间隔"算相位：测试推进模拟时钟即可驱动，不依赖真实时间。
+        let tick_ms = PUMP_INTERVAL.as_millis() as u64;
+        let half_ms = CARET_BLINK_HALF_INTERVAL.as_millis() as u64;
+        let elapsed_ms = self.caret_blink_ticks.saturating_mul(tick_ms);
+        let visible = elapsed_ms % (half_ms * 2) < half_ms;
+        if visible == self.caret_blink_visible {
+            return false;
+        }
+        self.caret_blink_visible = visible;
+        true
+    }
+
+    /// 绘制帧观察正文焦点：聚焦/失焦都让 caret 立刻可见并重新计时。
+    ///
+    /// 为什么在 `paint` 里观察而不是注册焦点监听：`EditorView::new` 拿不到
+    /// `&mut Window`，而每帧重注册监听会泄漏订阅；`paint` 本来每帧都要读焦点。
+    pub(crate) fn note_caret_focus(&mut self, focused: bool) {
+        if self.caret_blink_focused_last_frame == focused {
+            return;
+        }
+        self.caret_blink_focused_last_frame = focused;
+        self.reset_caret_blink();
+    }
+
+    /// 任何输入 / 选区或 caret 移动 / 鼠标点击 / 聚焦失焦后：caret 立刻可见并重新计时。
+    pub(crate) fn reset_caret_blink(&mut self) {
+        self.caret_blink_visible = true;
+        self.caret_blink_ticks = 0;
+    }
+
+    /// 同 [`Self::reset_caret_blink`]，但在"从隐藏回到可见"时补一次重绘。
+    ///
+    /// 键盘/文本输入路径用这个：即使这次按键不改变正文（例如移到文档边界的
+    /// 方向键），隐藏中的 caret 也必须马上出现。
+    fn reset_caret_blink_and_repaint(&mut self, cx: &mut Context<Self>) {
+        let was_hidden = !self.caret_blink_visible;
+        self.reset_caret_blink();
+        if was_hidden {
+            cx.notify();
+        }
     }
 
     // ---- 外部提交闸门（ADR 0009 切片 3b）----
@@ -2026,6 +2290,20 @@ impl EditorView {
     #[must_use]
     pub fn is_editing_table_cell(&self) -> bool {
         self.cell_edit.is_some()
+    }
+
+    /// 全局快捷键（新建笔记/图谱/设置）是否应被**编辑器内部**的临时状态挡住。
+    ///
+    /// 宿主在根上做 `Ctrl+N` / `Ctrl+G` 等拦截时必须先问这里：链接确认框、
+    /// 右键菜单、表格单元格编辑、图片放大遮罩、IME 组合态下都不能把按键当成
+    /// "全局命令"（否则会绕过模态浮层，或在打字时创建笔记）。
+    #[must_use]
+    pub fn global_shortcuts_blocked(&self) -> bool {
+        self.link_confirm.is_some()
+            || self.context_menu.is_some()
+            || self.is_editing_table_cell()
+            || self.zoomed_image.is_some()
+            || self.is_composing()
     }
 
     /// 正在编辑的单元格 `(表格对象行, row, column)`（row 0 = 表头）。
@@ -4358,6 +4636,167 @@ impl EditorView {
         runs
     }
 
+    // ---- 代码块只读语法高亮（source/theme 变化才重跑 syntect） ----
+
+    /// 当前 display 坐标下的代码块高亮快照（必要时重建缓存）。
+    ///
+    /// `Rc` 每帧只克隆指针；syntect **只在 source 变化时**重跑，display 映射只在
+    /// selection/主题变化时重算。绘制与 headless 断言共用这一份。
+    pub fn code_highlight_display(&mut self) -> Rc<CodeHighlightDisplay> {
+        self.refresh_code_highlight();
+        Rc::clone(&self.code_highlight.display)
+    }
+
+    /// 已着色的代码 token 数（headless 回归用；未知语言/纯文本块为 0）。
+    pub fn code_highlight_span_count(&mut self) -> usize {
+        self.code_highlight_display().span_count()
+    }
+
+    /// 当前 display 坐标的语法 span（headless 断言用，克隆一份）。
+    pub fn syntax_runs_display(&mut self) -> Vec<(Range<usize>, CodeHighlightClass)> {
+        self.code_highlight_display().spans().to_vec()
+    }
+
+    /// 当前 display 坐标的代码块区间（headless 断言用）。
+    pub fn code_block_display_ranges(&mut self) -> Vec<Range<usize>> {
+        self.code_highlight_display().code_block_ranges().to_vec()
+    }
+
+    /// 已识别（有语法定义）的块语言列表（诊断/headless 用；与块顺序一致）。
+    pub fn code_highlight_languages(&mut self) -> Vec<String> {
+        self.refresh_code_highlight();
+        self.code_highlight
+            .blocks
+            .iter()
+            .map(|block| block.language.clone())
+            .collect()
+    }
+
+    /// 按需刷新两级缓存。
+    ///
+    /// **不** `notify`（只影响绘制，不影响实体语义状态），因此不会形成重绘环。
+    fn refresh_code_highlight(&mut self) {
+        if self.controller.code_blocks().is_empty() {
+            // 没有代码块：连 source 都不克隆（普通笔记零开销）。
+            if !self.code_highlight.blocks.is_empty() || self.code_highlight.source_hash != u64::MAX
+            {
+                self.code_highlight = CodeHighlightCache::default();
+            }
+            return;
+        }
+        let source = self.controller.source_text();
+        let source_hash = hash64(source.as_bytes());
+        if source_hash != self.code_highlight.source_hash {
+            self.rebuild_code_highlight_blocks(&source);
+            self.code_highlight.source_hash = source_hash;
+            self.code_highlight.mapped = None;
+        }
+        let key = (self.controller.selection(), crate::theme::theme_id());
+        if self.code_highlight.mapped != Some(key) {
+            self.remap_code_highlight();
+            self.code_highlight.mapped = Some(key);
+        }
+    }
+
+    /// 重建块级 syntect 缓存；内容/语言/块区间都没变的块直接复用（不重跑语法）。
+    fn rebuild_code_highlight_blocks(&mut self, source: &str) {
+        // 先取元数据（只读借 `controller`），再改缓存字段，避免同时借用 self。
+        let metas: Vec<(Range<usize>, Range<usize>, String)> = self
+            .controller
+            .code_blocks()
+            .iter()
+            .map(|block| {
+                (
+                    block.span.start..block.span.end,
+                    block.content.start..block.content.end,
+                    code_highlight::language_from_info(&block.info),
+                )
+            })
+            .collect();
+        let mut previous: Vec<Option<CodeBlockHighlight>> =
+            std::mem::take(&mut self.code_highlight.blocks)
+                .into_iter()
+                .map(Some)
+                .collect();
+        let mut blocks = Vec::with_capacity(metas.len());
+        for (index, (block, content_range, language)) in metas.into_iter().enumerate() {
+            let content_text = source.get(content_range.clone()).unwrap_or("");
+            // 语言 + 内容共同决定 syntect 结果；块区间也进键（块移动时绝对 source
+            // 偏移会变，必须重算，不能复用旧 span）。
+            let content_hash = hash64(language.as_bytes()).wrapping_mul(0x9e37_79b9)
+                ^ hash64(content_text.as_bytes());
+            if let Some(previous) = previous.get_mut(index).and_then(Option::take) {
+                if previous.content_hash == content_hash && previous.block == block {
+                    blocks.push(previous);
+                    continue;
+                }
+            }
+            // mermaid 投影成 Object（光标进入时才回落到源码），不参与语法高亮。
+            let spans = if language.is_empty() || language == "mermaid" {
+                Vec::new()
+            } else {
+                code_highlight::highlight(&language, content_text)
+                    .into_iter()
+                    .map(|span| {
+                        (
+                            content_range.start + span.range.start
+                                ..content_range.start + span.range.end,
+                            span.class,
+                        )
+                    })
+                    .collect()
+            };
+            blocks.push(CodeBlockHighlight {
+                language,
+                content_hash,
+                block,
+                spans,
+            });
+        }
+        self.code_highlight.blocks = blocks;
+    }
+
+    /// source 坐标 → display 坐标（围栏隐藏/显现会改变 display 偏移，故 selection
+    /// 变化也要重映射；这一步**不跑 syntect**）。
+    fn remap_code_highlight(&mut self) {
+        let mut display = CodeHighlightDisplay::default();
+        for block in &self.code_highlight.blocks {
+            let (Some(start), Some(end)) = (
+                self.controller
+                    .source_to_display(SourceByte::new(block.block.start)),
+                self.controller
+                    .source_to_display(SourceByte::new(block.block.end)),
+            ) else {
+                continue;
+            };
+            let (start, end) = (start.get(), end.get());
+            if start < end {
+                display.blocks.push(start..end);
+            }
+            for (range, class) in &block.spans {
+                let (Some(span_start), Some(span_end)) = (
+                    self.controller
+                        .source_to_display(SourceByte::new(range.start)),
+                    self.controller
+                        .source_to_display(SourceByte::new(range.end)),
+                ) else {
+                    continue;
+                };
+                let (span_start, span_end) = (span_start.get(), span_end.get());
+                if span_start >= span_end {
+                    continue;
+                }
+                match display.spans.last_mut() {
+                    Some((last, last_class)) if *last_class == *class && last.end == span_start => {
+                        last.end = span_end;
+                    }
+                    _ => display.spans.push((span_start..span_end, *class)),
+                }
+            }
+        }
+        self.code_highlight.display = Rc::new(display);
+    }
+
     /// 命中一条 wiki 链接：返回 `(target, heading)`（源码切片，不含括号/alias）。
     ///
     /// `byte` 是源码字节；点击落在 display 文本上时由几何映射回来，因此 alias
@@ -4577,6 +5016,48 @@ impl EditorView {
         core::mem::take(&mut self.dump_selection)
     }
 
+    /// headless 回归：preedit 真正进入绘制路径的次数。
+    ///
+    /// 只用于证明“有组合串时 `paint_preedit` 没有在入口提前 return”；不参与业务。
+    #[must_use]
+    pub fn preedit_paint_count(&self) -> u64 {
+        self.preedit_paint_count
+    }
+
+    /// headless 回归：上一帧正文是否画了 caret。
+    ///
+    /// 未聚焦（标题输入框/表格单元格浮层）或闪烁处于隐藏相位时必须为 false。
+    #[must_use]
+    pub fn caret_painted_last_frame(&self) -> bool {
+        self.caret_painted_last_frame
+    }
+
+    /// headless 回归：上一帧是否在 IME 组合串末尾画了 caret（有 preedit 且正文聚焦）。
+    #[must_use]
+    pub fn preedit_caret_painted_last_frame(&self) -> bool {
+        self.preedit_caret_painted_last_frame
+    }
+
+    /// headless 回归：上一帧组合串末尾 caret 的窗口 x 坐标；没画时为 `None`。
+    #[must_use]
+    pub fn preedit_caret_x_last_frame(&self) -> Option<Pixels> {
+        self.preedit_caret_x_last_frame
+    }
+
+    /// headless 回归：上一帧 preedit 擦除底纸的宽度；没有 preedit 时为 None。
+    #[must_use]
+    pub fn preedit_mask_width_last_frame(&self) -> Option<Pixels> {
+        self.preedit_mask_width_last_frame
+    }
+
+    /// headless 回归：正文 caret 当前是否处于闪烁的"可见"相位。
+    ///
+    /// 只在绘制中生效（隐藏时 `paint_caret` 整条不画）；未聚焦 / IME 组合中恒为 `true`。
+    #[must_use]
+    pub fn caret_blink_visible(&self) -> bool {
+        self.caret_blink_visible
+    }
+
     /// 当前 preedit（组合文本）；没有组合返回 `None`。
     ///
     /// 它**只**用于绘制 overlay 与状态栏文案，永远不会被写进 source。
@@ -4721,37 +5202,25 @@ impl EditorView {
 
     // ---- 鼠标 ----
 
-    /// 左键按下：命中 → 落光标，并开始一次可能的拖拽。
+    /// 左键按下正文文本：**只记录待定点击**（不落 caret、不动选区）。
+    ///
+    /// 为什么不在 mouse-down 上落 caret：落 caret 会立刻改变选区 → 投影显现隐藏的
+    /// Markdown 标记（`###`/`**`）并画出蓝色选区，单击看起来"闪一下语法"。
+    /// 现在 mouse-down 只记锚点，真正落 caret 在 [`Self::finish_pointer_click`]
+    /// （mouse-up 且没有拖动时）；拖动仍由 [`Self::extend_selection_to_biased`] 实时扩选。
     pub fn begin_pointer_selection(
         &mut self,
         display_byte: usize,
         bias: Bias,
+        position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.pending_enter_text_input = false;
+        self.pending_pointer = None;
         // 点击块外：正在编辑对象源码时先退出（ADR 0019：Esc / 点击块外 / Ctrl+Enter）。
-        //
-        // 判定按**源码行**而不是 display 行：表格在 display 上只占一行，但源码是
-        // 多行，点击表格源码里的任意一行都算“块内”，不能把源码模式踢掉。
-        if let Some(editing) = self.controller.object_source_edit_line() {
-            let range = self
-                .controller
-                .object_at_line(editing)
-                .map(|object| object.line()..=object.end_line());
-            let clicked_line = self.source_line_of_display_byte(display_byte);
-            let inside = match (range, clicked_line) {
-                (Some(range), Some(line)) => range.contains(&line),
-                _ => false,
-            };
-            if !inside {
-                self.exit_object_source_edit(cx);
-                // 退出后 display 变短，旧几何给出的字节需要夹回新 display 长度。
-                let display_byte = display_byte.min(self.controller.display_len().get());
-                let display_byte = self.snap_display_byte(display_byte);
-                self.place_caret_from_display(display_byte, bias, window, cx);
-                return;
-            }
+        if self.exit_object_source_edit_if_outside(display_byte, bias, window, cx) {
+            return;
         }
         // 入参是**布局（display）字节**：先在 display 空间吸附 grapheme，
         // 再经投影回到 source scalar（隐藏标记后 display 比 source 短）。
@@ -4766,15 +5235,100 @@ impl EditorView {
         };
         if crate::shell::trace_mouse_enabled() {
             eprintln!(
-                "[menghunote] 命中 display_byte={display_byte} → bias={bias:?} → source_byte={byte} → scalar #{}",
+                "[menghunote] 命中 display_byte={display_byte} → bias={bias:?} → source_byte={byte} → scalar #{}（待定，mouse-up 才落 caret）",
                 scalar.get()
             );
         }
+        // 拖拽仍用按下点当锚点；单击不提交选区，等 mouse-up。
         self.drag_anchor = Some(scalar);
         self.preferred_x = None;
+        self.pending_pointer = Some(PendingPointerClick {
+            press: position,
+            display_byte,
+            bias,
+            anchor: None,
+        });
         window.focus(&self.focus_handle, cx);
-        self.request_selection_dump();
-        self.commit_selection(Selection::caret(scalar), cx);
+    }
+
+    /// Shift+单击正文文本：保留**原选区 anchor**，mouse-up（未拖动）时把 head 扩到点击处。
+    ///
+    /// 必须由元素层在链接/对象分支**之前**调用：Shift+单击文本是扩选，不能打开
+    /// wiki/外链。落在对象/表格单元格上的按压不走这里（按对象自己的行为处理）。
+    pub fn begin_shift_pointer_selection(
+        &mut self,
+        display_byte: usize,
+        bias: Bias,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_enter_text_input = false;
+        self.pending_pointer = None;
+        if self.exit_object_source_edit_if_outside(display_byte, bias, window, cx) {
+            return;
+        }
+        let display_byte = self.snap_display_byte(display_byte);
+        if self
+            .scalar_at_display_byte_biased(display_byte, bias)
+            .is_none()
+        {
+            return;
+        }
+        if crate::shell::trace_mouse_enabled() {
+            eprintln!(
+                "[menghunote] Shift+单击 display_byte={display_byte} bias={bias:?}（待定，mouse-up 扩选）"
+            );
+        }
+        // 锚点规则：当前没有拖拽锚点时用**当前选区的 anchor**（单击后 `end_drag`
+        // 已经清空了 drag_anchor，这正是旧实现 Shift+单击扩不了选的原因）。
+        let anchor = self
+            .drag_anchor
+            .unwrap_or_else(|| self.controller.selection().anchor());
+        self.drag_anchor = Some(anchor);
+        self.preferred_x = None;
+        self.pending_pointer = Some(PendingPointerClick {
+            press: position,
+            display_byte,
+            bias,
+            anchor: Some(anchor),
+        });
+        window.focus(&self.focus_handle, cx);
+    }
+
+    /// 点击是否落在正在编辑源码的对象块**外**：是 → 退出源码模式并落 caret（返回
+    /// `true` 表示这次按压已经按“退出源码”处理完）。
+    ///
+    /// 判定按**源码行**而不是 display 行：表格在 display 上只占一行，但源码是
+    /// 多行，点击表格源码里的任意一行都算“块内”，不能把源码模式踢掉。
+    fn exit_object_source_edit_if_outside(
+        &mut self,
+        display_byte: usize,
+        bias: Bias,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(editing) = self.controller.object_source_edit_line() else {
+            return false;
+        };
+        let range = self
+            .controller
+            .object_at_line(editing)
+            .map(|object| object.line()..=object.end_line());
+        let clicked_line = self.source_line_of_display_byte(display_byte);
+        let inside = match (range, clicked_line) {
+            (Some(range), Some(line)) => range.contains(&line),
+            _ => false,
+        };
+        if inside {
+            return false;
+        }
+        self.exit_object_source_edit(cx);
+        // 退出后 display 变短，旧几何给出的字节需要夹回新 display 长度。
+        let display_byte = display_byte.min(self.controller.display_len().get());
+        let display_byte = self.snap_display_byte(display_byte);
+        self.place_caret_from_display(display_byte, bias, window, cx);
+        true
     }
 
     /// 把 display 字节落成 caret（带偏置；点击路径的公共尾巴）。
@@ -4796,7 +5350,42 @@ impl EditorView {
         self.drag_anchor = Some(scalar);
         self.preferred_x = None;
         window.focus(&self.focus_handle, cx);
+        self.request_selection_dump();
         self.commit_selection(Selection::caret(scalar), cx);
+    }
+
+    /// 左键按下后的移动：只有越过点击阈值才算拖拽。
+    ///
+    /// 返回 `false` = 仍在“点击抖动”范围内（不扩选、不改选区，等 mouse-up 落 caret）；
+    /// 返回 `true` = 已经成为拖拽（或本来就没有待定点击），调用方继续走实时扩选。
+    pub fn note_pointer_moved(&mut self, position: Point<Pixels>) -> bool {
+        let Some(pending) = self.pending_pointer else {
+            return true;
+        };
+        let dx = position.x.as_f32() - pending.press.x.as_f32();
+        let dy = position.y.as_f32() - pending.press.y.as_f32();
+        if dx * dx + dy * dy < CLICK_DRAG_THRESHOLD * CLICK_DRAG_THRESHOLD {
+            return false;
+        }
+        // 越过阈值：这是一次拖拽，mouse-up 不再落 caret。
+        self.pending_pointer = None;
+        true
+    }
+
+    /// 左键抬起（没有拖动）：落 caret；Shift+单击则从按下时固定的锚点扩选。
+    ///
+    /// 由元素层的 mouse-up 在 [`Self::end_drag`] **之前**调用：扩选锚点已经固定在
+    /// [`PendingPointerClick::anchor`] 里，不依赖随后会被清空的 `drag_anchor`。
+    pub fn finish_pointer_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_pointer.take() else {
+            return;
+        };
+        match pending.anchor {
+            Some(anchor) => {
+                self.extend_selection_from_anchor(anchor, pending.display_byte, pending.bias, cx)
+            }
+            None => self.place_caret_from_display(pending.display_byte, pending.bias, window, cx),
+        }
     }
 
     /// 拖拽移动：anchor 保持，head 跟着鼠标。
@@ -4814,6 +5403,17 @@ impl EditorView {
         let Some(anchor) = self.drag_anchor else {
             return;
         };
+        self.extend_selection_from_anchor(anchor, display_byte, bias, cx);
+    }
+
+    /// 从**显式锚点**把 head 扩到 `display_byte`（Shift+单击 / 拖拽共用）。
+    fn extend_selection_from_anchor(
+        &mut self,
+        anchor: UnicodeScalar,
+        display_byte: usize,
+        bias: Bias,
+        cx: &mut Context<Self>,
+    ) {
         let display_byte = self.snap_display_byte(display_byte);
         let Some(head) = self.scalar_at_display_byte_biased(display_byte, bias) else {
             return;
@@ -4823,9 +5423,10 @@ impl EditorView {
         self.commit_selection(Selection::new(anchor, head), cx);
     }
 
-    /// 左键抬起：结束拖拽。
+    /// 左键抬起：结束拖拽（同时丢弃任何遗留的待定点击）。
     pub fn end_drag(&mut self) {
         self.drag_anchor = None;
+        self.pending_pointer = None;
     }
 
     /// 滚动（像素，正 = 向下滚）：滚轮与后续自动滚动都走这里。
@@ -4840,11 +5441,19 @@ impl EditorView {
 
     // ---- 键盘 ----
 
-    /// 方向键 / 翻页 / 行首行尾。
+    /// 方向键 / 翻页 / 行首行尾，以及 Ctrl 组合（撤销/剪贴板/按词移动/整行选择）。
     ///
-    /// 只处理**无修饰键**与 `Shift`（扩选）；带 Ctrl / Alt 的组合留给后续切片
-    /// （按词移动、命令面板等）。
+    /// 无修饰键与 `Shift`（扩选）走下方移动分支；`Ctrl` 组合统一在上面的 Ctrl 分支里
+    /// 处理（`Ctrl+←/→` 按词移动、`Ctrl+Shift+←/→` 按词扩选、`Ctrl+L` 选整行、
+    /// `Ctrl+Home/End` 到文件首尾）；`Alt` / 平台键仍不处理。
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 任何按键都是"用户在操作"：caret 立刻回到可见并重新计时（与是否改变正文无关）。
+        self.reset_caret_blink_and_repaint(cx);
+        // 单击还没抬起就来了键盘输入（极少见）：先把待定点击落成 caret，
+        // 否则这次按键会作用在“旧光标”上，抬起时又跳一次。
+        if self.pending_pointer.is_some() {
+            self.finish_pointer_click(window, cx);
+        }
         if event.keystroke.key.as_str() != "enter" {
             // 平台没有补发 Enter 文本输入时，标记不能留到下一次普通输入。
             self.pending_enter_text_input = false;
@@ -4870,7 +5479,8 @@ impl EditorView {
 
         // 正文右键菜单（ADR 0019 S3b4）：Esc 关闭；其它按键先关菜单再继续处理
         // （不吞用户输入，也不让菜单停在过期位置）。
-        if self.context_menu.is_some() {
+        let context_menu_was_open = self.context_menu.is_some();
+        if context_menu_was_open {
             self.close_context_menu(cx);
             if event.keystroke.key.as_str() == "escape" {
                 window.prevent_default();
@@ -4891,8 +5501,32 @@ impl EditorView {
             );
         }
 
-        // Ctrl+K / Ctrl+F：请宿主打开搜索浮层（编辑器不管浮层，只发事件）。
-        if is_search_shortcut(&event.keystroke) {
+        // 行内粗体 / 斜体（Markdown `**` / `*`）：**由中心快捷键表决定**（默认
+        // Ctrl+B / Ctrl+I；用户可在设置页改绑）。
+        //
+        // 放在搜索快捷键与普通文本处理**之前**；一次按键只产生一个 `EditRequest`
+        // （一个撤销组）。组合态 / 持闸 / 单元格编辑 / 链接确认框 / 右键菜单打开时
+        // 不执行（右键菜单打开时这一次按键只负责关菜单）。
+        let inline_delimiter = if shortcuts::matches(CommandId::FormatBold, &event.keystroke) {
+            Some("**")
+        } else if shortcuts::matches(CommandId::FormatItalic, &event.keystroke) {
+            Some("*")
+        } else {
+            None
+        };
+        if let Some(delimiter) = inline_delimiter {
+            window.prevent_default();
+            if context_menu_was_open {
+                eprintln!("[menghunote] 右键菜单打开中：本次格式化快捷键只关菜单，不格式化");
+                return;
+            }
+            self.toggle_inline_format(delimiter, cx);
+            return;
+        }
+
+        // 搜索（默认 Ctrl+K / Ctrl+F 是同一个命令的两个默认别名）：请宿主打开
+        // 搜索浮层（编辑器不管浮层，只发事件）。
+        if shortcuts::matches(CommandId::Search, &event.keystroke) {
             cx.emit(EditorEvent::SearchRequested);
             window.prevent_default();
             return;
@@ -4913,13 +5547,9 @@ impl EditorView {
             return;
         }
 
-        // F2：有图片对象可编辑 → 该块源码模式；否则请宿主重命名侧栏项。
-        // 单元格编辑不再需要 F2（单击表格单元格即进入原地编辑）。
-        if !modifiers.control
-            && !modifiers.alt
-            && !modifiers.platform
-            && event.keystroke.key.as_str() == "f2"
-        {
+        // 重命名（默认 F2）：有图片对象可编辑 → 该块源码模式；否则请宿主重命名
+        // 侧栏项。单元格编辑不再需要 F2（单击表格单元格即进入原地编辑）。
+        if shortcuts::matches(CommandId::RenameNote, &event.keystroke) {
             if self.toolbar_target_line().is_some() {
                 self.enter_selected_object_source_edit(cx);
             } else {
@@ -4927,6 +5557,29 @@ impl EditorView {
             }
             window.prevent_default();
             return;
+        }
+
+        // Esc：**有选区先折叠**到 head（只改选区，不删文本、不产生请求）。
+        // 这是最普通的一层：无选区时才继续落到下面的对象源码 / 表格选中等既有分支，
+        // 因此那些 Esc 行为不受影响（它们本来也只在折叠 caret 下生效）。
+        if event.keystroke.key.as_str() == "escape"
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+        {
+            let selection = self.controller.selection();
+            if !selection.is_empty() {
+                eprintln!(
+                    "[menghunote] Esc：折叠选区到 head（{}..{} → #{}），不删除文本",
+                    selection.start().get(),
+                    selection.end().get(),
+                    selection.head().get()
+                );
+                self.preferred_x = None;
+                window.prevent_default();
+                self.commit_selection(Selection::caret(selection.head()), cx);
+                return;
+            }
         }
 
         // Esc：正在编辑图片源码时先退出源码模式（对象内部没有文本 caret）。
@@ -5036,6 +5689,15 @@ impl EditorView {
                     window.prevent_default();
                     self.paste_from_clipboard(true, cx);
                 }
+                // Ctrl+←/→：按 **display** 文本的单词边界移动（隐藏的 Markdown
+                // 标记不参与切分）；带 Shift 时保持 anchor 按词扩选。
+                ("left", shift) => self.move_word(GraphemeStep::Backward, shift, cx),
+                ("right", shift) => self.move_word(GraphemeStep::Forward, shift, cx),
+                // Ctrl+L：选中 caret 所在的**源码行**（含行尾换行，若有）。
+                ("l", false) => self.select_source_line(cx),
+                // Ctrl+Home/End：文件开头 / 结尾；带 Shift 时保持 anchor 扩选。
+                ("home", shift) => self.move_to_document_edge(false, shift, cx),
+                ("end", shift) => self.move_to_document_edge(true, shift, cx),
                 // Ctrl+Enter：退出图片源码模式（与 Esc 等价）。
                 ("enter", _) if self.controller.is_editing_object_source() => {
                     self.exit_object_source_edit(cx);
@@ -5205,6 +5867,120 @@ impl EditorView {
         self.commit_selection(next, cx);
     }
 
+    /// Ctrl+←/→：按 **display** 文本上的单词边界移动；`extend` 时保持 anchor 扩选。
+    ///
+    /// 为什么在 display 上算：Markdown 标记（`**`、`` ` ``、`# `）在当前投影里是隐藏的，
+    /// 直接扫 source 会把它们当成标点/词字符，`Ctrl+←` 就会停在标记中间。这里先取
+    /// display 上的词边界，再映射回 source scalar；映射失败保持原 caret。
+    ///
+    /// 守卫：IME 组合中方向键归 IME（不取消组合、不移动）；表格单元格编辑期间正文
+    /// 不接受按键（与其它 Ctrl 快捷键一致，见 [`Self::is_editing_table_cell`]）。
+    fn move_word(&mut self, step: GraphemeStep, extend: bool, cx: &mut Context<Self>) {
+        if self.is_composing() {
+            eprintln!("[menghunote] IME 组合中：方向键归 IME，Ctrl+←/→ 不处理");
+            return;
+        }
+        if self.is_editing_table_cell() {
+            return;
+        }
+        let anchor = self.controller.selection().anchor();
+        let display = self.display_text();
+        let Some(caret) = self.display_caret() else {
+            return;
+        };
+        let target = match step {
+            GraphemeStep::Backward => word_boundary_left(&display, caret),
+            GraphemeStep::Forward => word_boundary_right(&display, caret),
+        };
+        if target == caret {
+            // 已在文档边界 / 没有可跳的词：保持原 caret（与 move_grapheme 同口径不跳 0）。
+            return;
+        }
+        let Some(scalar) = self.scalar_at_display_byte(target) else {
+            eprintln!("[menghunote] 按词移动：display {target} 映射不到 source，保持原 caret");
+            return;
+        };
+        if crate::shell::trace_mouse_enabled() {
+            eprintln!(
+                "[menghunote] 按词移动：display {caret} → {target} → scalar #{}",
+                scalar.get()
+            );
+        }
+        let next = if extend {
+            Selection::new(anchor, scalar)
+        } else {
+            Selection::caret(scalar)
+        };
+        self.preferred_x = None;
+        self.ensure_caret_visible(scalar);
+        self.log_caret(next);
+        self.commit_selection(next, cx);
+    }
+
+    /// Ctrl+L：选中 caret 所在的**源码行**（行首到行尾；有换行时包含行尾换行）。
+    ///
+    /// 选源码行而不是视觉行：软折行后 Ctrl+L 仍选整段源码行，`Ctrl+C` 一次复制整行；
+    /// 行尾换行一起选入（VS Code / Windows 习惯），最后一行没有换行就选到文件末尾。
+    /// 空行（行首 == 行尾）会得到折叠 caret，不产生空选区。
+    fn select_source_line(&mut self, cx: &mut Context<Self>) {
+        if self.is_editing_table_cell() {
+            return;
+        }
+        let Some(caret) = self.source_byte_of_scalar(self.controller.selection().head()) else {
+            return;
+        };
+        let source = self.controller.source_text();
+        let caret = caret.min(source.len());
+        let start_byte = source[..caret].rfind('\n').map_or(0, |index| index + 1);
+        let end_byte = source[caret..]
+            .find('\n')
+            .map_or(source.len(), |index| caret + index + 1);
+        let (Some(start), Some(end)) = (
+            scalar_of_byte(&source, start_byte),
+            scalar_of_byte(&source, end_byte),
+        ) else {
+            return;
+        };
+        eprintln!(
+            "[menghunote] Ctrl+L：选中源码行 {start_byte}..{end_byte}（scalar {}..{}）",
+            start.get(),
+            end.get()
+        );
+        self.preferred_x = None;
+        self.commit_selection(Selection::new(start, end), cx);
+    }
+
+    /// Ctrl+Home / Ctrl+End：移动到文件开头 / 结尾；`extend` 时保持 anchor 扩选。
+    ///
+    /// 目标位置从 **display** 边界换算：`display 0` 在 frontmatter 会被零宽省略段
+    /// 收敛到**正文起点**（与打开笔记时的初始 caret 一致），不会把 caret 放进隐藏的
+    /// `---` 里；`display.len()` 映射到 source 末尾（含最后一行没有换行的情况）。
+    fn move_to_document_edge(&mut self, to_end: bool, extend: bool, cx: &mut Context<Self>) {
+        if self.is_editing_table_cell() {
+            return;
+        }
+        let anchor = self.controller.selection().anchor();
+        let display = self.display_text();
+        let target_byte = if to_end { display.len() } else { 0 };
+        let Some(target) = self.scalar_at_display_byte(target_byte) else {
+            return;
+        };
+        if crate::shell::trace_mouse_enabled() {
+            eprintln!(
+                "[menghunote] Ctrl+{}：display {target_byte} → scalar #{}",
+                if to_end { "End" } else { "Home" },
+                target.get()
+            );
+        }
+        let next = if extend {
+            Selection::new(anchor, target)
+        } else {
+            Selection::caret(target)
+        };
+        self.preferred_x = None;
+        self.commit_selection(next, cx);
+    }
+
     // ---- 文本输入 / IME 组合（切片 6b）----
 
     /// 组合更新：**只改 overlay**（preedit 不进 source、不产生 `EditRequest`）。
@@ -5214,6 +5990,8 @@ impl EditorView {
         selected: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
+        // IME 组合期间 caret 常亮：每次 preedit 更新都重置相位（不闪）。
+        self.reset_caret_blink_and_repaint(cx);
         self.pending_enter_text_input = false;
         if self.frozen_by_external_commit() {
             // Held：连接收组合会走到 `driver.begin_composition()`（3a 会拒绝进入组合），
@@ -5238,6 +6016,8 @@ impl EditorView {
 
     /// 取消组合：丢弃 overlay，**不发请求**；返回的延后远端仍然要合并。
     pub(crate) fn cancel_composition(&mut self, cx: &mut Context<Self>) {
+        // 取消组合也是输入活动：caret 回到可见并重新计时。
+        self.reset_caret_blink_and_repaint(cx);
         let dropped = self.controller.preedit_text().map(str::to_owned);
         self.controller.clear_preedit();
         if let Some(preedit) = dropped.as_deref() {
@@ -5249,6 +6029,8 @@ impl EditorView {
 
     /// 组合提交：`text` 是平台给的最终文本，**只产生一个 `EditRequest`**。
     pub(crate) fn commit_composition(&mut self, text: &str, cx: &mut Context<Self>) {
+        // 上屏是输入活动：caret 回到可见并重新计时。
+        self.reset_caret_blink_and_repaint(cx);
         self.pending_enter_text_input = false;
         if !self.is_editing_table_cell() {
             self.selected_object_line = None;
@@ -5332,6 +6114,8 @@ impl EditorView {
     }
 
     fn insert_text_inner(&mut self, text: &str, allow_backtick: bool, cx: &mut Context<Self>) {
+        // 文本输入（打字/粘贴/菜单插入）都算活动：caret 立刻可见并重新计时。
+        self.reset_caret_blink_and_repaint(cx);
         // 兜底：单元格浮层编辑期间文本属于输入框。正常路径焦点在输入框、不会走到这里；
         // 万一平台把文本送给了正文，也不能把它插进表格/正文（那会写坏结构）。
         if self.is_editing_table_cell() {
@@ -5379,6 +6163,63 @@ impl EditorView {
             Err(error) => eprintln!("[menghunote] 插入文本失败：{error}"),
         }
         cx.notify();
+    }
+
+    /// `Ctrl+B` / `Ctrl+I`：行内粗体 / 斜体。
+    ///
+    /// - 有选区 → 用 `**` / `*` 包裹；选区文本本身已带同一层包裹 → 去掉；
+    /// - 折叠 caret → 插入成对标记（`****` / `**`）并把 caret 放中间；
+    /// - **一次按键只有一个 `EditRequest`**（一个撤销组）：模型方法
+    ///   [`EditorController::toggle_inline_delimiters`] 内部仍走
+    ///   `compose_edits` / `compose_replace_selection`，这里只做上下文闸门 + 提交；
+    /// - IME 组合 / 外部提交持闸 / 表格单元格编辑 / 链接确认框 / 右键菜单打开时
+    ///   **不执行**（也不落普通文本）。
+    fn toggle_inline_format(&mut self, delimiter: &str, cx: &mut Context<Self>) {
+        if self.frozen_by_external_commit() {
+            eprintln!("[menghunote] 同步持闸中：忽略 Ctrl+B/I 格式化（不产生请求）");
+            cx.notify();
+            return;
+        }
+        if self.is_composing() {
+            eprintln!("[menghunote] IME 组合中：忽略 Ctrl+B/I 格式化（不产生请求）");
+            cx.notify();
+            return;
+        }
+        if self.is_editing_table_cell()
+            || self.link_confirm.is_some()
+            || self.context_menu.is_some()
+        {
+            eprintln!("[menghunote] 浮层/单元格编辑中：忽略 Ctrl+B/I 格式化（不产生请求）");
+            cx.notify();
+            return;
+        }
+        match self.controller.toggle_inline_delimiters(delimiter) {
+            Ok(Some(request)) => {
+                // 格式化后的 caret/选区已由控制器设好；清掉对象/单元格的临时选中态。
+                self.selected_object_line = None;
+                self.selected_table_cell = None;
+                self.table_axis_selection = None;
+                self.pending_enter_text_input = false;
+                let after = self.controller.selection();
+                eprintln!(
+                    "[menghunote] Ctrl+{}：command_id={} 选区 {}..{}（一次快捷键 = 一个 EditRequest）",
+                    if delimiter == "**" { "B" } else { "I" },
+                    request.command_id,
+                    after.start().get(),
+                    after.end().get()
+                );
+                self.submit_request(Some(request));
+                self.preferred_x = None;
+                self.ensure_caret_visible(after.head());
+                self.log_caret(after);
+                cx.notify();
+            }
+            Ok(None) => {
+                eprintln!("[menghunote] Ctrl+B/I：本次没有可格式化的选区（no-op）");
+                cx.notify();
+            }
+            Err(error) => eprintln!("[menghunote] Ctrl+B/I 格式化失败：{error}"),
+        }
     }
 
     /// 反引号自动补全：返回 `true` 表示这次输入已被处理（不再走普通替换）。
@@ -6230,7 +7071,11 @@ impl EditorView {
     }
 
     /// 源码字节 → 窗口坐标（行内 x + 行顶 y）；屏外行按需 shaping。
-    pub(crate) fn point_for_source_byte(
+    ///
+    /// IME 候选窗定位与点击命中共用同一份几何；headless 测试用它把“第 N 个字符”
+    /// 换成可点击的窗口坐标（与真实鼠标命中完全同源）。
+    #[must_use]
+    pub fn point_for_source_byte(
         &self,
         byte: usize,
         window: &Window,
@@ -6318,6 +7163,8 @@ impl EditorView {
 
     /// 提交选区：控制器校验通过后滚动到光标可见并重绘。
     fn commit_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        // caret/选区移动（键盘、点击、拖选、程序化）都让闪烁重新计时。
+        self.reset_caret_blink();
         // 选区一变，图片对象的“点选态”就结束（工具条/描边随之消失）。
         self.selected_object_line = None;
         // 单元格选中态同理：正文 caret 动了就不再是“选着某一格”（Enter/F2 的入口
@@ -7856,12 +8703,117 @@ pub(crate) fn sanitize_single_line(text: &str) -> String {
         .collect()
 }
 
+/// 缓存键用的快速内容哈希（**不是**密码学哈希；只要求同输入稳定、不同输入大概率不同）。
+///
+/// 用 8 字节分块 + rotate/multiply 混合，避免每帧对整个文档做 SipHash 的开销；
+/// 只用于“内容是否变化”的缓存判定，碰撞最坏结果是复用旧颜色（下帧 source 长度/
+/// 内容再变就会修正），不会影响正文/投影/编辑。
+fn hash64(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut hash = 0x9e37_79b9_7f4a_7c15_u64 ^ bytes.len() as u64;
+    for chunk in bytes.chunks(8) {
+        if let Ok(word) = <[u8; 8]>::try_from(chunk) {
+            hash = (hash.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+        } else {
+            for &byte in chunk {
+                hash = (hash.rotate_left(5) ^ u64::from(byte)).wrapping_mul(K);
+            }
+        }
+    }
+    hash
+}
+
 /// 把字节位置退到最近的 `char` 边界（兜底路径，避免落在多字节字符中间）。
 fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
     while byte > 0 && !text.is_char_boundary(byte) {
         byte -= 1;
     }
     byte
+}
+
+/// `Ctrl+←/→` 用的字符类别（不引 ICU：中文/字母/数字都算词字符）。
+///
+/// 中文连续字按“一个词”处理（`char::is_alphanumeric` 对 Han 为真），与需求
+/// “中文连续字按一个词/连续非空白”一致；不做 ICU 分词。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WordCharClass {
+    /// 词字符：字母 / 数字 / `_` / CJK（`is_alphanumeric`）。
+    Word,
+    /// 空白：空格 / Tab / 换行（`char::is_whitespace`）。
+    Space,
+    /// 其它可见字符（标点/符号/emoji）：连续同类算一组。
+    Punct,
+}
+
+fn word_char_class(ch: char) -> WordCharClass {
+    if ch.is_whitespace() {
+        WordCharClass::Space
+    } else if ch.is_alphanumeric() || ch == '_' {
+        WordCharClass::Word
+    } else {
+        WordCharClass::Punct
+    }
+}
+
+/// grapheme 的类别（按首字符判定；组合标记跟随基字符）。
+fn grapheme_class(text: &str) -> Option<WordCharClass> {
+    text.chars().next().map(word_char_class)
+}
+
+/// caret 向左的单词边界（display 文本的 UTF-8 字节偏移）。
+///
+/// 语义（Windows / VS Code 直觉：**落到前一个词的开头**）：
+/// 1. 从 caret 向左跳过非词字符（空白 / 标点 / emoji 等分隔符）；
+/// 2. 再跳过连续词字符 run，最后停在词首（没有更早的词时停在 0）。
+///
+/// 「词字符」= `char::is_alphanumeric()` 或 `_`；中文连续字因此算一个词
+/// （不做 ICU 分词）。caret 不在 grapheme 边界时按所在 grapheme 处理。
+#[must_use]
+pub(crate) fn word_boundary_left(text: &str, caret: usize) -> usize {
+    let boundaries = menghunote_editor::units::grapheme_boundaries(text);
+    // 指向 caret 右侧第一个 grapheme 边界（caret 正常时就是它自己）。
+    let mut index = boundaries.partition_point(|&byte| byte < caret.min(text.len()));
+    let class_of = |index: usize| grapheme_class(&text[boundaries[index - 1]..boundaries[index]]);
+    // 1) 跳过 caret 左边的分隔符（空白/标点都是非词字符）。
+    while index > 0 && class_of(index) != Some(WordCharClass::Word) {
+        index -= 1;
+    }
+    // 2) 跳过词字符 run，停在词首。
+    while index > 0 && class_of(index) == Some(WordCharClass::Word) {
+        index -= 1;
+    }
+    boundaries[index]
+}
+
+/// caret 向右的单词边界（display 文本的 UTF-8 字节偏移）。
+///
+/// 语义（**落到下一个词的开头**；没有下一个词时落到最后一段的末尾/文件尾）：
+/// 1. 若当前是词字符，先跳过整个词 run；
+/// 2. 再跳过随后的分隔符（空白 / 标点 / emoji）；
+/// 3. 停在下一个词首或 `text.len()`。
+///
+/// 文件末尾返回 `text.len()`；不越界、不切进 grapheme 中间。
+#[must_use]
+pub(crate) fn word_boundary_right(text: &str, caret: usize) -> usize {
+    let boundaries = menghunote_editor::units::grapheme_boundaries(text);
+    // 最后一项恒为 text.len()，它的下标就是“文档尾”的位置。
+    let last = boundaries.len() - 1;
+    let mut index = boundaries.partition_point(|&byte| byte < caret.min(text.len()));
+    if index >= last {
+        return text.len();
+    }
+    let class_at = |index: usize| grapheme_class(&text[boundaries[index]..boundaries[index + 1]]);
+    // 1) 词内：先越过整个词。
+    if class_at(index) == Some(WordCharClass::Word) {
+        while index < last && class_at(index) == Some(WordCharClass::Word) {
+            index += 1;
+        }
+    }
+    // 2) 越过词后的分隔符，停到下一个词首（或文档尾）。
+    while index < last && class_at(index) != Some(WordCharClass::Word) {
+        index += 1;
+    }
+    boundaries[index]
 }
 
 /// 列表续行是否应该占用列表缩进。
@@ -7896,6 +8848,70 @@ mod search_shortcut_tests {
         assert!(!is_search_shortcut(&keystroke("ctrl-shift-k")));
         assert!(!is_search_shortcut(&keystroke("ctrl-alt-f")));
         assert!(!is_search_shortcut(&keystroke("ctrl-j")));
+    }
+}
+
+#[cfg(test)]
+mod inline_format_shortcut_tests {
+    use super::is_inline_format_shortcut;
+    use gpui::{Keystroke, Modifiers};
+
+    fn keystroke(text: &'static str) -> Keystroke {
+        Keystroke::parse(text).expect("按键解析失败")
+    }
+
+    #[test]
+    fn ctrl_b_and_ctrl_i_map_to_bold_and_italic_delimiters() {
+        assert_eq!(is_inline_format_shortcut(&keystroke("ctrl-b")), Some("**"));
+        assert_eq!(is_inline_format_shortcut(&keystroke("ctrl-i")), Some("*"));
+    }
+
+    #[test]
+    fn key_matching_is_case_insensitive_but_shift_is_rejected() {
+        // Caps Lock 下平台可能报大写 key（不带 shift）→ 仍应触发。
+        let caps = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            key: "B".to_owned(),
+            key_char: None,
+        };
+        assert_eq!(is_inline_format_shortcut(&caps), Some("**"));
+        // Ctrl+Shift+B 是另一个快捷键（与搜索/格式化都不撞车）→ 不触发。
+        assert_eq!(is_inline_format_shortcut(&keystroke("ctrl-shift-b")), None);
+    }
+
+    #[test]
+    fn alt_cmd_fn_and_bare_keys_do_not_format() {
+        for text in [
+            "b",
+            "i",
+            "alt-b",
+            "alt-i",
+            "cmd-b",
+            "cmd-i",
+            "ctrl-alt-b",
+            "ctrl-alt-i",
+            "ctrl-j",
+        ] {
+            assert_eq!(
+                is_inline_format_shortcut(&keystroke(text)),
+                None,
+                "{text} 不得触发 Ctrl+B/I"
+            );
+        }
+        // Fn 修饰（Windows 上部分键盘会带）同样不触发。
+        let function = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                function: true,
+                ..Modifiers::default()
+            },
+            key: "i".to_owned(),
+            key_char: None,
+        };
+        assert_eq!(is_inline_format_shortcut(&function), None);
     }
 }
 
@@ -8021,5 +9037,88 @@ mod tests {
         let empty = SourceRange::new(SourceByte::new(0), SourceByte::new(0), source.len())
             .expect("空区间合法");
         assert_eq!(table_cell_display_text(source, empty), "");
+    }
+}
+
+#[cfg(test)]
+mod word_boundary_tests {
+    use super::{word_boundary_left, word_boundary_right};
+
+    /// ASCII：`Ctrl+←` 到前一个词开头，`Ctrl+→` 到下一个词开头（跳过词后空白）。
+    #[test]
+    fn ascii_words_move_between_word_starts() {
+        let text = "hello world foo";
+        assert_eq!(word_boundary_left(text, 15), 12);
+        assert_eq!(word_boundary_left(text, 12), 6);
+        assert_eq!(word_boundary_left(text, 6), 0);
+        assert_eq!(word_boundary_left(text, 0), 0, "文件开头不越界");
+        // 词内任意位置都回到当前词开头。
+        assert_eq!(word_boundary_left(text, 9), 6);
+        // 右移：从词首跳到下一个词首；从词尾先吃掉空白。
+        assert_eq!(word_boundary_right(text, 0), 6);
+        assert_eq!(word_boundary_right(text, 6), 12);
+        assert_eq!(word_boundary_right(text, 12), 15, "最后一个词之后是文件尾");
+        assert_eq!(word_boundary_right(text, 5), 6, "词尾的空白只跳空白");
+        assert_eq!(word_boundary_right(text, 15), 15, "文件尾不越界");
+    }
+
+    /// 标点/括号是分隔符：左移落到词首，右移落到下一个词首，不会停在括号里。
+    #[test]
+    fn punctuation_is_skipped_not_landed_on() {
+        let text = "foo(bar) baz";
+        assert_eq!(word_boundary_right(text, 0), 4, "越过 `(` 落到 bar 开头");
+        assert_eq!(word_boundary_right(text, 3), 4, "从 `(` 上右移同样越过标点");
+        assert_eq!(word_boundary_right(text, 8), 9, "空格后是 baz 开头");
+        assert_eq!(
+            word_boundary_left(text, 4),
+            0,
+            "从 bar 开头左移越过 `(` 到 foo 开头"
+        );
+        assert_eq!(word_boundary_left(text, 8), 4, "从 `)` 左移回到 bar 开头");
+        assert_eq!(word_boundary_left(text, 11), 9, "baz 词内回到 baz 开头");
+    }
+
+    /// CJK：连续汉字按一个“词”（不做 ICU 分词）；空白分隔才切组。
+    #[test]
+    fn cjk_continuous_run_is_one_word() {
+        let text = "你好世界 再见";
+        // 每字 3 字节：你好世界 = 12，空格 1，再见 = 6。
+        assert_eq!(word_boundary_left(text, 19), 13);
+        assert_eq!(word_boundary_left(text, 13), 0, "连续汉字整体一组");
+        assert_eq!(word_boundary_right(text, 0), 13);
+        assert_eq!(word_boundary_right(text, 13), 19);
+    }
+
+    /// 空串 / 组合字符 / emoji：不 panic，不切进 grapheme 中间。
+    #[test]
+    fn boundaries_are_safe_at_edges_and_graphemes() {
+        assert_eq!(word_boundary_left("", 0), 0);
+        assert_eq!(word_boundary_right("", 0), 0);
+        let text = "e\u{301}x";
+        assert_eq!(word_boundary_left(text, 4), 0);
+        assert_eq!(word_boundary_right(text, 0), 4);
+        // emoji 不是词字符：会被当作分隔符跳过，落点是相邻词首。
+        let emoji = "a😀b";
+        assert_eq!(word_boundary_right(emoji, 0), 5, "越过 emoji 落到 b 开头");
+        assert_eq!(
+            word_boundary_left(emoji, emoji.len()),
+            5,
+            "从末尾回到 b 开头"
+        );
+        assert_eq!(
+            word_boundary_left(emoji, 5),
+            0,
+            "再左移跳过 emoji 回到 a 开头"
+        );
+    }
+
+    /// 换行算分隔符：越行按词移动不会停在新行缩进里。
+    #[test]
+    fn newlines_are_separators() {
+        let text = "alpha\n  beta\n";
+        assert_eq!(word_boundary_right(text, 0), 8, "跳过 alpha 与换行缩进");
+        assert_eq!(word_boundary_right(text, 8), 13, "beta 之后是文件尾");
+        assert_eq!(word_boundary_left(text, 13), 8);
+        assert_eq!(word_boundary_left(text, 8), 0);
     }
 }

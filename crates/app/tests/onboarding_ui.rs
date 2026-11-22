@@ -36,9 +36,9 @@ use std::time::Duration;
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use menghunote_app::dev_sync::DevIdentityStore;
 use menghunote_app::onboarding::{
-    AppRoot, AppRootOptions, DevSyncProfile, FormCreateMode, InstanceEntry, InstanceLock,
-    ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, RootStateLabel,
-    DEFAULT_OPERATION_BUDGET, LOCK_FILE_NAME,
+    AppRoot, AppRootOptions, DevSyncProfile, InstanceEntry, InstanceLock, ProfileLayout,
+    ProfileStore, RelayApiVersion, RelayMode, RootStateLabel, DEFAULT_OPERATION_BUDGET,
+    LOCK_FILE_NAME, VAULT_FILE_NAME,
 };
 use menghunote_app::ui_text;
 use menghunote_dev_relay::DevRelay;
@@ -172,19 +172,28 @@ async fn onboarding_welcome_is_shown_without_any_config(cx: &mut TestAppContext)
     for selector in [
         "app-root",
         "app-root-welcome",
-        "app-root-create",
-        "app-root-join",
-        "app-root-instances",
+        "welcome-vault-list",
+        "welcome-new-local",
+        "welcome-open-local",
+        "welcome-sync-remote",
     ] {
         expect_bounds(cx, selector);
     }
-    // 没有 active 实例：Main 与备份页都不存在；for_test 关闭了「继续本地」入口。
+    // 没有 active 实例：Main 与备份页都不存在；没有本地库时左栏没有本地行。
     assert!(cx.debug_bounds("app-root-main").is_none());
     assert!(cx.debug_bounds("app-root-backup").is_none());
-    assert!(
-        cx.debug_bounds("app-root-local").is_none(),
-        "for_test 明确关闭本地 dev vault 入口"
-    );
+    for old in [
+        "app-root-create",
+        "app-root-join",
+        "app-root-local",
+        "app-root-instances",
+    ] {
+        assert!(
+            cx.debug_bounds(old).is_none(),
+            "旧 Welcome 入口必须移除：{old}"
+        );
+    }
+    assert!(cx.debug_bounds("welcome-vault-local").is_none());
     // 没有配置时不该凭空创建库/身份/配置。
     assert!(
         !layout.config_path.exists(),
@@ -205,7 +214,13 @@ async fn dev_build_shows_dev_banner_and_local_entry(cx: &mut TestAppContext) {
 
     assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
     expect_bounds(cx, "app-root-dev-banner");
-    expect_bounds(cx, "app-root-local");
+    expect_bounds(cx, "welcome-new-local");
+    expect_bounds(cx, "welcome-open-local");
+    expect_bounds(cx, "welcome-sync-remote");
+    assert!(
+        cx.debug_bounds("app-root-local").is_none(),
+        "旧「继续本地」按钮入口必须移除（本地仓库改为左列表 + 右栏操作卡）"
+    );
     // A 组第二切片：dev-sync 构建保留旧「继续本地（DEV ONLY）」文案（同一 selector，
     // 产品构建是「仅本地使用」）。
     assert_eq!(
@@ -220,44 +235,65 @@ async fn dev_build_shows_dev_banner_and_local_entry(cx: &mut TestAppContext) {
     );
 }
 
-/// 回归：Create 表单可以用 Tab 从创建链接切到实例目录，也可以鼠标点击聚焦。
+/// 回归：Welcome 的「同步远程仓库」卡片可以用 Tab 从链接切到实例目录，也可以鼠标点击聚焦。
 ///
 /// 之前 `FormInput` 只有 `track_focus`、没有 `tab_stop(true)`，并且向导字段
-/// `click_to_focus=false`：键盘 Tab 与鼠标点击都进不了输入框，用户无法创建。
-/// ADR 0018 S4b 后 Create 只剩创建链接 + 实例目录两个输入框。
+/// `click_to_focus=false`：键盘 Tab 与鼠标点击都进不了输入框。新的统一表单一屏内
+/// 只有链接 + 实例目录（+ dev 的同意勾选），不再有 relay/vault_id/恢复码多字段。
 #[gpui::test]
-async fn create_form_tab_and_click_can_focus_link_and_dir(cx: &mut TestAppContext) {
-    let (_dir, layout) = temp_layout("create-focus");
+async fn welcome_sync_form_tab_and_click_can_focus_link_and_dir(cx: &mut TestAppContext) {
+    let (_dir, layout) = temp_layout("sync-form-focus");
     let options = AppRootOptions::for_test(
         layout.clone(),
         "http://127.0.0.1:18080",
-        "inst-create-focus",
+        "inst-sync-form-focus",
     );
     let (root, cx) = open_root(cx, options);
     cx.run_until_parked();
-    let create = expect_bounds(cx, "app-root-create");
-    cx.simulate_click(create.center(), Modifiers::default());
+    let card = expect_bounds(cx, "welcome-sync-remote");
+    cx.simulate_click(card.center(), Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(state_of(&root, cx), RootStateLabel::CreateForm);
     assert_eq!(
-        root.update(cx, |root, _| root.form_create_mode()),
-        Some(FormCreateMode::Link),
-        "ADR 0018 S4b：Create 只有粘贴创建链接一种方式"
+        state_of(&root, cx),
+        RootStateLabel::Welcome,
+        "展开同步卡不得整页跳到旧 CreateForm"
     );
+    for selector in [
+        "welcome-sync-link",
+        "welcome-sync-dir",
+        "welcome-sync-dir-browse",
+        "welcome-sync-confirm",
+        "welcome-sync-consent",
+    ] {
+        expect_bounds(cx, selector);
+    }
+    // 统一表单不再有旧的手动字段（欢迎页也没有旧入口）。
+    for absent in [
+        "app-root-join-relay-input",
+        "app-root-vault-id-input",
+        "app-root-recovery-input",
+        "app-root-invite-input",
+        "app-root-create-link-input",
+    ] {
+        assert!(
+            cx.debug_bounds(absent).is_none(),
+            "统一远程表单不得出现手动字段/旧入口：{absent}"
+        );
+    }
     let initial_dir = root
-        .update(cx, |root, cx| root.form_dir_text(cx))
-        .expect("表单必须有实例目录");
+        .update(cx, |root, cx| root.welcome_sync_dir_text(cx))
+        .expect("同步表单必须有实例目录");
 
-    // 进入表单时宿主聚焦创建链接；输入进链接（目录不变）。
+    // 展开后宿主聚焦链接；输入进链接（目录不变）。
     cx.simulate_input("mn-pair://create-draft");
     cx.run_until_parked();
     assert_eq!(
-        root.update(cx, |root, cx| root.form_create_link_is_empty(cx)),
+        root.update(cx, |root, cx| root.welcome_sync_link_is_empty(cx)),
         Some(false),
-        "初始焦点必须在创建链接输入框"
+        "初始焦点必须在同步链接输入框"
     );
     assert_eq!(
-        root.update(cx, |root, cx| root.form_dir_text(cx)),
+        root.update(cx, |root, cx| root.welcome_sync_dir_text(cx)),
         Some(initial_dir.clone()),
         "输入链接时不得写进实例目录"
     );
@@ -268,44 +304,77 @@ async fn create_form_tab_and_click_can_focus_link_and_dir(cx: &mut TestAppContex
     cx.simulate_input("-tab");
     cx.run_until_parked();
     let dir_after_tab = root
-        .update(cx, |root, cx| root.form_dir_text(cx))
-        .expect("表单必须有实例目录");
+        .update(cx, |root, cx| root.welcome_sync_dir_text(cx))
+        .expect("同步表单必须有实例目录");
     assert!(
         dir_after_tab.ends_with("-tab"),
         "Tab 后输入必须进入实例目录：{dir_after_tab}"
     );
 
     // 鼠标点击链接 → 输入进链接；再点实例目录 → 输入进目录。
-    let link_bounds = expect_bounds(cx, "app-root-create-link-input");
+    let link_bounds = expect_bounds(cx, "welcome-sync-link");
     cx.simulate_click(link_bounds.center(), Modifiers::default());
     cx.run_until_parked();
     cx.simulate_input("-link-click");
     cx.run_until_parked();
     assert_eq!(
-        root.update(cx, |root, cx| root.form_create_link_is_empty(cx)),
+        root.update(cx, |root, cx| root.welcome_sync_link_is_empty(cx)),
         Some(false),
         "点击链接后输入必须进入链接（且仍有内容）"
     );
     let dir_after_click_link = root
-        .update(cx, |root, cx| root.form_dir_text(cx))
-        .expect("表单必须有实例目录");
+        .update(cx, |root, cx| root.welcome_sync_dir_text(cx))
+        .expect("同步表单必须有实例目录");
     assert_eq!(
         dir_after_click_link, dir_after_tab,
         "点击链接后输入不得写进实例目录"
     );
 
-    let dir_bounds = expect_bounds(cx, "app-root-dir-input");
+    let dir_bounds = expect_bounds(cx, "welcome-sync-dir");
     cx.simulate_click(dir_bounds.center(), Modifiers::default());
     cx.run_until_parked();
     cx.simulate_input("-dir-click");
     cx.run_until_parked();
     let dir_after_click_dir = root
-        .update(cx, |root, cx| root.form_dir_text(cx))
-        .expect("表单必须有实例目录");
+        .update(cx, |root, cx| root.welcome_sync_dir_text(cx))
+        .expect("同步表单必须有实例目录");
     assert!(
         dir_after_click_dir.ends_with("-dir-click"),
         "点击实例目录后输入必须进入目录：{dir_after_click_dir}"
     );
+}
+
+/// 统一远程表单：不认识/坏形式的链接必须内联报错，**不联网、不建文件**。
+#[gpui::test]
+async fn welcome_sync_rejects_unknown_links_inline_without_creating_files(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let (_dir, layout) = temp_layout("welcome-bad-link");
+    let target_dir = layout.instances_dir.join("inst-bad-link");
+    let options =
+        AppRootOptions::for_test(layout.clone(), "http://127.0.0.1:18080", "inst-bad-link");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+
+    let card = expect_bounds(cx, "welcome-sync-remote");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.run_until_parked();
+    root.update(cx, |root, cx| {
+        root.welcome_set_sync_link("https://example.com/not-a-pair-link", cx);
+        root.welcome_set_sync_dir(&target_dir.display().to_string(), cx);
+        root.welcome_set_sync_consent(true, cx);
+        root.welcome_confirm_sync(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Welcome,
+        "无法识别的链接必须留在 Welcome（不进入 Working）"
+    );
+    let error = root
+        .update(cx, |root, _| root.welcome_error().map(str::to_owned))
+        .expect("必须内联报错");
+    assert!(error.contains("无法识别"), "错误必须点明链接形式：{error}");
+    assert!(!target_dir.exists(), "链接解析失败不得创建目录/库");
 }
 
 /// 验收 2：真实 Create 全链路 + 关窗拦截 + 备份确认 + 重启自动进 Main。
@@ -326,85 +395,66 @@ async fn create_flow_backs_up_code_then_opens_empty_main_and_restarts(cx: &mut T
     cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
 
-    // ---- 真实点击「创建新的同步实例」→ 表单 ----
-    let create = expect_bounds(cx, "app-root-create");
-    cx.simulate_click(create.center(), Modifiers::default());
+    // ---- 真实点击「同步远程仓库」→ 同一张卡展开统一表单（不整页跳走）----
+    let card = expect_bounds(cx, "welcome-sync-remote");
+    cx.simulate_click(card.center(), Modifiers::default());
     cx.run_until_parked();
     assert_eq!(
         state_of(&root, cx),
-        RootStateLabel::CreateForm,
-        "点击「创建」必须真实进入表单"
-    );
-    let create_form = expect_bounds(cx, "app-root-create-form");
-    assert!(
-        create_form.size.height.as_f32() > 0.0,
-        "表单必须有实际布局：{create_form:?}"
-    );
-    // ADR 0018 S4b：Create 只有创建链接 + 实例目录。
-    assert_eq!(
-        root.update(cx, |root, _| root.form_create_mode()),
-        Some(FormCreateMode::Link),
-        "默认（也是唯一）创建方式必须是粘贴创建链接"
+        RootStateLabel::Welcome,
+        "展开同步卡必须仍在 Welcome（旧的 CreateForm 入口已移除）"
     );
     for selector in [
-        "app-root-create-link-input",
-        "app-root-create-link-apply",
-        "app-root-dir-input",
-        "app-root-consent",
-        "app-root-submit",
-        "app-root-back",
+        "welcome-sync-link",
+        "welcome-sync-dir",
+        "welcome-sync-dir-browse",
+        "welcome-sync-confirm",
+        "welcome-sync-consent",
     ] {
         expect_bounds(cx, selector);
     }
+    // 统一表单不再显示任何手动 relay / vault_id / 恢复码 / 邀请链接字段。
     for selector in [
-        "app-root-relay-input",
-        "app-root-secret-input",
-        "app-root-admin-secret",
-        "app-root-admin-notice",
-        "app-root-create-mode-admin",
-        "app-root-create-mode-legacy",
+        "app-root-create-form",
+        "app-root-join-form",
+        "app-root-create-link-input",
+        "app-root-join-relay-input",
+        "app-root-vault-id-input",
+        "app-root-recovery-input",
+        "app-root-invite-input",
     ] {
         assert!(
             cx.debug_bounds(selector).is_none(),
-            "ADR 0018 S4b：Create 不得再显示 {selector}"
+            "统一远程表单不得显示旧入口/手动字段：{selector}"
         );
     }
 
-    // ---- 应用一张真实创建链接（v2 一次性票据）；公开事实必须展示 ----
+    // ---- 粘贴一张真实创建链接（v2 一次性票据）----
     let vault_id = [0x5Bu8; 16];
     let link = create_link_for(&relay, vault_id, 900);
-    apply_create_link(&root, cx, &link);
-    expect_bounds(cx, "app-root-create-link-warning");
-    expect_bounds(cx, "app-root-create-link-facts");
-    assert_eq!(
-        root.update(cx, |root, _| root
-            .form_create_link_vault_id()
-            .map(str::to_owned)),
-        Some(menghunote_sync::ids::hex_of(&vault_id)),
-        "应用链接后必须记录绑定的 vault id"
-    );
-
-    // ---- 未勾选同意：提交被拒（留在表单 + 明确原因），不触发任何网络 ----
     let instance_dir = layout
         .instance_dir(instance_id)
         .expect("合法实例 id")
         .display()
         .to_string();
     root.update(cx, |root, cx| {
-        root.form_set_dir(&instance_dir, cx);
-        root.submit_create(cx);
+        root.welcome_set_sync_link(&link, cx);
+        root.welcome_set_sync_dir(&instance_dir, cx);
     });
+
+    // ---- 未勾选同意：提交被拒（留在 Welcome + 内联错误），不触发任何网络 ----
+    root.update(cx, |root, cx| root.welcome_confirm_sync(cx));
     cx.run_until_parked();
-    assert_eq!(state_of(&root, cx), RootStateLabel::CreateForm);
+    assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
     assert!(
-        cx.debug_bounds("app-root-form-error").is_some(),
-        "未勾选同意必须在表单里给出错误，而不是悄悄开始创建"
+        cx.debug_bounds("welcome-error").is_some(),
+        "未勾选同意必须在卡片里给出内联错误，而不是悄悄开始创建"
     );
 
     // ---- 勾选同意 → 提交 → Working（后台线程；UI 不阻塞） ----
     root.update(cx, |root, cx| {
-        root.form_set_consent(true, cx);
-        root.submit_create(cx);
+        root.welcome_set_sync_consent(true, cx);
+        root.welcome_confirm_sync(cx);
     });
     cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::Working);
@@ -729,6 +779,7 @@ fn write_profile(layout: &ProfileLayout, created: &CreatedInstance, active: &str
     let mut profile = DevSyncProfile::default();
     profile.upsert_active(InstanceEntry {
         instance_id: created.instance_id.clone(),
+        display_name: None,
         relay_mode: RelayMode::LocalDev,
         api_version: RelayApiVersion::V1,
         relay_url: created.relay_url.clone(),
@@ -1015,18 +1066,18 @@ async fn join_flow_opens_creator_note_writes_config_and_restarts(cx: &mut TestAp
     cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
 
-    // ---- 真实点击「加入已有同步实例」→ JoinForm ----
-    let join = expect_bounds(cx, "app-root-join");
-    cx.simulate_click(join.center(), Modifiers::default());
+    // ---- 旧 JoinForm 仍保留为内部/恢复码路径（欢迎页已不再暴露手动表单）----
+    root.update(cx, |root, cx| root.enter_join_form(cx));
     cx.run_until_parked();
     assert_eq!(
         state_of(&root, cx),
         RootStateLabel::JoinForm,
-        "点击「加入」必须真实进入 Join 表单（不再是「即将支持」）"
+        "旧 JoinForm 必须仍可进入（内部/测试路径，供恢复码加入使用）"
     );
     for selector in [
         "app-root-join-form",
         "app-root-join-relay-input",
+        "app-root-join-relay-hint",
         "app-root-vault-id-input",
         "app-root-recovery-input",
         "app-root-join-dir-input",
@@ -1034,6 +1085,17 @@ async fn join_flow_opens_creator_note_writes_config_and_restarts(cx: &mut TestAp
         "app-root-join-back",
     ] {
         expect_bounds(cx, selector);
+    }
+    // 模式按 relay 地址自动推断：Join 不再渲染任何模式单选项。
+    for absent in [
+        "app-root-join-mode-local_dev",
+        "app-root-join-mode-remote_tls",
+        "app-root-join-mode",
+    ] {
+        assert!(
+            cx.debug_bounds(absent).is_none(),
+            "Join 表单不得再有模式单选控件：{absent}"
+        );
     }
 
     let target_dir = layout
@@ -1743,6 +1805,7 @@ fn write_profile_multi(layout: &ProfileLayout, created: &[&CreatedInstance], act
     for item in created {
         profile.upsert_active(InstanceEntry {
             instance_id: item.instance_id.clone(),
+            display_name: None,
             relay_mode: RelayMode::LocalDev,
             api_version: RelayApiVersion::V1,
             relay_url: item.relay_url.clone(),
@@ -1815,9 +1878,37 @@ async fn settings_lists_public_instance_without_secret_fields(cx: &mut TestAppCo
     ] {
         expect_bounds(cx, selector);
     }
-    open_settings_nav(cx, "instances");
-    expect_bounds(cx, "settings-instance-0");
-    expect_bounds(cx, "settings-instance-0-active");
+    // 「实例」分类已移除（用户反馈没存在感）：active 实例的**公开**信息挪到
+    // 「同步」分类底部（只读、可复制；不含任何秘密）。
+    open_settings_nav(cx, "sync");
+    let section = expect_bounds(cx, "settings-section-sync");
+    expect_bounds(cx, "settings-toggle-sync");
+    let info = expect_bounds(cx, "settings-public-info");
+    expect_bounds(cx, "settings-api-version");
+    for selector in [
+        "settings-copy-vault-id",
+        "settings-copy-device-id",
+        "settings-copy-path",
+    ] {
+        expect_bounds(cx, selector);
+    }
+    // 公开信息必须与内容区左对齐、不超出内容宽度、放在同步面板下方。
+    let section_left = section.origin.x.as_f32();
+    let section_right = section_left + section.size.width.as_f32();
+    assert!(
+        (info.origin.x.as_f32() - section_left).abs() <= 1.0,
+        "公开信息必须与内容区左对齐：info={info:?} section={section:?}"
+    );
+    assert!(
+        info.origin.x.as_f32() + info.size.width.as_f32() <= section_right + 1.0,
+        "公开信息不得超出内容区：info={info:?} section={section:?}"
+    );
+    let sync_content = expect_bounds(cx, "settings-toggle-sync");
+    assert!(
+        info.origin.y.as_f32()
+            >= sync_content.origin.y.as_f32() + sync_content.size.height.as_f32() - 0.5,
+        "公开信息必须在同步面板下方：info={info:?} sync={sync_content:?}"
+    );
     expect_bounds(cx, "app-root-main");
     // 设置里不存在秘密输入控件（setup secret/恢复码/root/manager seed）。
     for absent in [
@@ -1904,12 +1995,13 @@ async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestApp
     cx.run_until_parked();
 
     // 左侧导航固定、8 个固定分类 + 分界线 + 已启用的插件分类；默认选中「外观」。
+    // 「实例」分类已移除（创建 vault 改由 Main 左下角的「管理仓库」承担）。
     expect_bounds(cx, "settings-nav");
     for section in [
         "appearance",
         "language",
+        "shortcuts",
         "sync",
-        "instances",
         "relay",
         "security",
         "plugins",
@@ -1928,8 +2020,8 @@ async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestApp
     for selector in [
         "settings-nav-appearance",
         "settings-nav-language",
+        "settings-nav-shortcuts",
         "settings-nav-sync",
-        "settings-nav-instances",
         "settings-nav-relay",
         "settings-nav-security",
         "settings-nav-plugins",
@@ -2036,19 +2128,33 @@ async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestApp
         "同步面板必须位于 settings-toggle-sync 内容容器内：panel={sync_panel:?} container={sync_content:?}"
     );
 
-    // 「实例」分类：列表 + 公开信息。
-    open_settings_nav(cx, "instances");
-    expect_bounds(cx, "settings-section-instances");
-    expect_bounds(cx, "settings-instance-0");
-    expect_bounds(cx, "settings-instance-0-active");
+    // 「实例」分类已移除：左栏没有该项，也不会渲染对应的内容区。
+    assert!(
+        cx.debug_bounds("settings-nav-instances").is_none(),
+        "设置左栏不得再有「实例」分类"
+    );
+    assert!(
+        cx.debug_bounds("settings-section-instances").is_none(),
+        "设置内容区不得再渲染「实例」分类"
+    );
+    // 公开信息（API 面）随「同步」分类渲染。
     expect_bounds(cx, "settings-api-version");
 
-    // 「Relay」分类：输入框 + 模式选择。
+    // 「Relay」分类：输入框 + 只读的自动模式说明（不再有模式单选）。
     open_settings_nav(cx, "relay");
     expect_bounds(cx, "settings-section-relay");
     expect_bounds(cx, "settings-relay");
-    expect_bounds(cx, "settings-mode-local_dev");
-    expect_bounds(cx, "settings-mode-remote_tls");
+    expect_bounds(cx, "settings-relay-mode-hint");
+    for absent in [
+        "settings-mode-local_dev",
+        "settings-mode-remote_tls",
+        "settings-mode",
+    ] {
+        assert!(
+            cx.debug_bounds(absent).is_none(),
+            "Relay 分类不得再有模式选择控件：{absent}"
+        );
+    }
 
     // 「安全」分类：指纹 + 错误类别。
     open_settings_nav(cx, "security");
@@ -2208,7 +2314,8 @@ async fn settings_rejects_invalid_relay_without_writing(cx: &mut TestAppContext)
 
     let cases = [
         ("", "不能为空"),
-        ("https://127.0.0.1:18080", "http://"),
+        // 其它 scheme 按 remote_tls 推断，由权威 parser 报"只接受 https"。
+        ("ftp://relay.example", "https"),
         ("http://relay.example:18080", "loopback"),
         ("http://192.168.1.9:18080", "loopback"),
         ("http://0.0.0.0:18080", "loopback"),
@@ -2284,13 +2391,26 @@ async fn settings_switches_active_and_restarts_into_it(cx: &mut TestAppContext) 
             .as_deref(),
         Some("inst-active-a")
     );
-    // 真实点击第二行（active 优先排序后 A 在前、B 在后）的「设为默认」。
-    open_settings_nav(cx, "instances");
-    let set_active = expect_bounds(cx, "settings-instance-1-active");
+    // 关闭设置：「设为默认」已从设置页挪到 Main 左下角「管理仓库」。
+    let close = expect_bounds(cx, "settings-close");
+    cx.simulate_click(close.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(!root.update(cx, |root, _| root.settings_is_open()));
+
+    // 左下角切换菜单 →「管理仓库…」→ 第二行（active 优先排序后 A 在前、B 在后）
+    // 的「设为默认」。
+    let switcher = expect_bounds(cx, "app-root-vault-switcher");
+    cx.simulate_click(switcher.center(), Modifiers::default());
+    cx.run_until_parked();
+    let manage = expect_bounds(cx, "app-root-vault-manage");
+    cx.simulate_click(manage.center(), Modifiers::default());
+    cx.run_until_parked();
+    expect_bounds(cx, "app-root-vault-manager");
+    let set_active = expect_bounds(cx, "vault-manager-default-1");
     cx.simulate_click(set_active.center(), Modifiers::default());
     cx.run_until_parked();
     let notice = root
-        .update(cx, |root, _| root.settings_notice().map(str::to_owned))
+        .update(cx, |root, _| root.vault_manager_notice().map(str::to_owned))
         .expect("切换 active 必须有提示");
     assert!(
         notice.contains("重启") && notice.contains("生效"),
@@ -2320,10 +2440,22 @@ async fn settings_switches_active_and_restarts_into_it(cx: &mut TestAppContext) 
             .map(|shell| shell.entity_id())),
         Some(shell_id)
     );
+    // 管理仓库只写 active/startup，不改当前会话；重新打开设置时按磁盘 active 重读。
+    let manager_close = expect_bounds(cx, "vault-manager-close");
+    cx.simulate_click(manager_close.center(), Modifiers::default());
+    cx.run_until_parked();
+    open_settings(&root, cx);
+    assert_eq!(
+        root.update(cx, |root, _| root
+            .settings_active_entry()
+            .map(|entry| entry.instance_id)),
+        Some("inst-active-b".to_owned()),
+        "重新打开设置必须按磁盘 active 显示 B"
+    );
     assert_eq!(
         root.update(cx, |root, cx| root.settings_relay(cx)),
         Some(created_b.relay_url.clone()),
-        "切换 active 后 relay 输入框必须跟到新 active（避免写错实例）"
+        "设置 relay 输入框必须跟到新 active（避免写错实例）"
     );
 
     // 重启 → 打开新 active B。
@@ -2597,10 +2729,10 @@ fn corrupt_pending(vault_path: &Path) {
         .expect("写坏 pending");
 }
 
-/// remote 模式：必须显式确认才能保存；保存后提示重启；配置写 ProfileV2；重启后按新
-/// 模式打开（不降级 local_dev）。
+/// remote 模式：**不再要求**"确认连接 HTTPS"勾选（用户反馈：按 relay 配置连接即可），
+/// 保存后提示重启；配置写 ProfileV2；重启后按新模式打开（不降级 local_dev）。
 #[gpui::test]
-async fn settings_remote_mode_requires_consent_saves_and_restarts(cx: &mut TestAppContext) {
+async fn settings_remote_mode_saves_without_consent_and_restarts(cx: &mut TestAppContext) {
     ensure_test_user_key();
     let relay = DevRelay::start().expect("起进程内 dev relay 失败");
     let (_dir, layout) = temp_layout("settings-remote");
@@ -2613,37 +2745,16 @@ async fn settings_remote_mode_requires_consent_saves_and_restarts(cx: &mut TestA
     assert_eq!(state_of(&root, cx), RootStateLabel::Main);
     open_settings(&root, cx);
 
-    // 没勾选「远程服务器/HTTPS」→ 拒绝保存，配置原样。
+    // 直接输入合法 HTTPS origin → 自动推断 remote_tls 并保存成功（没有额外确认框）。
     root.update(cx, |root, cx| {
-        root.settings_set_mode(menghunote_app::onboarding::RelayMode::RemoteTls, cx);
         root.settings_set_relay("https://relay.example", cx);
-        root.settings_save(cx);
-    });
-    cx.run_until_parked();
-    let error = root
-        .update(cx, |root, _| root.settings_error().map(str::to_owned))
-        .expect("缺确认必须内联报错");
-    assert!(error.contains("远程服务器"), "{error}");
-    let profile = layout.store().load().expect("读配置").expect("配置存在");
-    assert_eq!(
-        profile
-            .find("inst-settings-remote")
-            .expect("实例条目")
-            .relay_mode,
-        RelayMode::LocalDev,
-        "缺确认不得写 remote_tls"
-    );
-
-    // 勾选后保存：模式/URL 都写入，提示重启生效。
-    root.update(cx, |root, cx| {
-        root.settings_set_remote_consent(true, cx);
         root.settings_save(cx);
     });
     cx.run_until_parked();
     assert!(
         root.update(cx, |root, _| root.settings_error().map(str::to_owned))
             .is_none(),
-        "确认后必须能保存"
+        "合法 remote_tls 不需要额外确认即可保存"
     );
     let notice = root
         .update(cx, |root, _| root.settings_notice().map(str::to_owned))
@@ -2681,9 +2792,10 @@ async fn settings_remote_mode_requires_consent_saves_and_restarts(cx: &mut TestA
     );
 }
 
-/// 模式与 URL 必须匹配（唯一权威 parser）；非法值不写配置、不回显 userinfo。
+/// 模式不再手选：https → remote_tls，http loopback → local_dev（dev-sync）；
+/// 非法 URL 由权威 parser 拒绝，不写配置、不回显 userinfo。
 #[gpui::test]
-async fn settings_rejects_mode_mismatched_or_noncanonical_relays(cx: &mut TestAppContext) {
+async fn settings_infers_mode_from_relay_text_and_rejects_invalid_urls(cx: &mut TestAppContext) {
     ensure_test_user_key();
     let relay = DevRelay::start().expect("起进程内 dev relay 失败");
     let (_dir, layout) = temp_layout("settings-mode-url");
@@ -2694,35 +2806,49 @@ async fn settings_rejects_mode_mismatched_or_noncanonical_relays(cx: &mut TestAp
     cx.run_until_parked();
     open_settings(&root, cx);
 
-    // local_dev + https → 拒绝。
+    // https → 自动推断 remote_tls（不再需要先切换模式）。
     root.update(cx, |root, cx| {
         root.settings_set_relay("https://relay.example", cx);
         root.settings_save(cx);
     });
     cx.run_until_parked();
-    let error = root
-        .update(cx, |root, _| root.settings_error().map(str::to_owned))
-        .expect("local_dev + https 必须拒绝");
-    assert!(error.contains("http"), "{error}");
+    assert!(
+        root.update(cx, |root, _| root.settings_error().map(str::to_owned))
+            .is_none(),
+        "https 输入必须自动按 remote_tls 保存：{:?}",
+        root.update(cx, |root, _| root.settings_error().map(str::to_owned))
+    );
+    let profile = layout.store().load().expect("读配置").expect("配置存在");
+    let entry = profile.find("inst-mode-url").expect("实例条目");
+    assert_eq!(entry.relay_mode, RelayMode::RemoteTls);
+    assert_eq!(entry.relay_url, "https://relay.example");
 
-    // remote_tls + http → 拒绝。
+    // http loopback → 自动推断 local_dev（dev-sync 构建允许）。
+    let loopback = free_loopback_url();
     root.update(cx, |root, cx| {
-        root.settings_set_mode(menghunote_app::onboarding::RelayMode::RemoteTls, cx);
-        root.settings_set_remote_consent(true, cx);
-        root.settings_set_relay("http://relay.example", cx);
+        root.settings_set_relay(&loopback, cx);
         root.settings_save(cx);
     });
     cx.run_until_parked();
-    let error = root
-        .update(cx, |root, _| root.settings_error().map(str::to_owned))
-        .expect("remote_tls + http 必须拒绝");
-    assert!(error.contains("https"), "{error}");
+    assert!(
+        root.update(cx, |root, _| root.settings_error().map(str::to_owned))
+            .is_none(),
+        "http loopback 必须自动按 local_dev 保存：{:?}",
+        root.update(cx, |root, _| root.settings_error().map(str::to_owned))
+    );
+    let profile = layout.store().load().expect("读配置").expect("配置存在");
+    let entry = profile.find("inst-mode-url").expect("实例条目");
+    assert_eq!(entry.relay_mode, RelayMode::LocalDev);
+    assert_eq!(entry.relay_url, loopback);
+    let after_good = std::fs::read(&layout.config_path).expect("配置必须存在");
 
-    // remote_tls + userinfo/path 也拒绝，且不回显口令。
+    // 非法 URL：按输入 scheme 推断后仍由权威 parser 拒绝，配置不被写坏、不回显 userinfo。
     for (bad, needle) in [
         ("https://user:pass@relay.example", "userinfo"),
         ("https://relay.example/api", "canonical origin"),
         ("https://relay.example?x=1", "query"),
+        ("ftp://relay.example", "https"),
+        ("http://relay.example:18080", "loopback"),
     ] {
         root.update(cx, |root, cx| {
             root.settings_set_relay(bad, cx);
@@ -2731,16 +2857,15 @@ async fn settings_rejects_mode_mismatched_or_noncanonical_relays(cx: &mut TestAp
         cx.run_until_parked();
         let error = root
             .update(cx, |root, _| root.settings_error().map(str::to_owned))
-            .expect("非法 remote URL 必须拒绝");
+            .unwrap_or_else(|| panic!("非法 relay {bad:?} 必须拒绝"));
         assert!(error.contains(needle), "{bad} → {error}");
         assert!(!error.contains("pass"), "不得回显 userinfo：{error}");
+        assert_eq!(
+            std::fs::read(&layout.config_path).expect("配置必须仍可读"),
+            after_good,
+            "非法 relay {bad:?} 不得写配置"
+        );
     }
-
-    // 配置始终没有被写坏。
-    let profile = layout.store().load().expect("读配置").expect("配置存在");
-    let entry = profile.find("inst-mode-url").expect("实例条目");
-    assert_eq!(entry.relay_mode, RelayMode::LocalDev);
-    assert_eq!(entry.relay_url, created.relay_url);
 }
 
 /// 有 pin：设置页显示公开指纹、可复制完整公开值、无秘密/无重置按钮。
@@ -2766,8 +2891,18 @@ async fn settings_fingerprint_shows_and_copies_only_public_values(cx: &mut TestA
         expect_bounds(cx, selector);
     }
     open_settings_nav(cx, "relay");
-    for selector in ["settings-mode-local_dev", "settings-mode-remote_tls"] {
+    for selector in ["settings-relay", "settings-relay-mode-hint"] {
         expect_bounds(cx, selector);
+    }
+    for absent in [
+        "settings-mode-local_dev",
+        "settings-mode-remote_tls",
+        "settings-mode",
+    ] {
+        assert!(
+            cx.debug_bounds(absent).is_none(),
+            "Relay 分类不得再提供模式选择：{absent}"
+        );
     }
     // 只读：没有任何重置 pin / 强制信任 / 接受无效证书的按钮。
     for absent in [
@@ -3009,7 +3144,6 @@ fn submit_remote_create(root: &Entity<AppRoot>, cx: &mut VisualTestContext, link
         root.enter_create_link_form(cx);
         root.form_set_create_link(&link, cx);
         root.form_apply_create_link(cx);
-        root.form_set_remote_consent(true, cx);
         root.form_set_dir(&dir, cx);
         root.form_set_consent(true, cx);
         root.submit_create(cx);
@@ -3032,8 +3166,7 @@ fn submit_remote_join(
     let dir = dir.to_owned();
     root.update(cx, |root, cx| {
         root.enter_join_form(cx);
-        root.join_form_set_mode(RelayMode::RemoteTls, cx);
-        root.join_form_set_remote_consent(true, cx);
+        // 没有模式单选项：https 地址在 submit_join 里自动推断为 remote_tls。
         root.join_form_set_relay(&relay_url, cx);
         root.join_form_set_vault_id(&vault_id, cx);
         root.join_form_set_recovery_code(&recovery_code, cx);
@@ -3080,9 +3213,10 @@ fn seed_remote_pending(
     }
 }
 
-/// remote 模式：必须显式确认（缺确认不建目录/不联网）；确认后表单可用并显示 DEV 状态。
+/// dev-sync 构建：remote_tls 不再要求「确认连接 HTTPS」；DEV 状态标注与「同意开发同步」
+/// 仍保留（缺同意不建目录/不联网）。产品构建的等价断言见 `sync_ui_product.rs`。
 #[gpui::test]
-async fn remote_mode_requires_consent_and_shows_dev_status_notice(cx: &mut TestAppContext) {
+async fn dev_build_remote_mode_keeps_dev_notice_and_dev_consent_only(cx: &mut TestAppContext) {
     ensure_test_user_key();
     let relay = DevRelay::start_tls().expect("起进程内 TLS relay 失败");
     let (_dir, layout) = temp_layout("remote-consent");
@@ -3100,31 +3234,50 @@ async fn remote_mode_requires_consent_and_shows_dev_status_notice(cx: &mut TestA
         root.form_set_create_link(&link, cx);
         root.form_apply_create_link(cx);
         root.form_set_dir(&dir, cx);
-        root.form_set_consent(true, cx);
-        root.submit_create(cx);
     });
     cx.run_until_parked();
-    // 缺「我确认要连接远程服务器」→ 表单内拒绝，不进入后台、不建目录。
+    // dev-sync 构建保留 DEV 状态标注；但**不再**有"确认连接 HTTPS"勾选（用户反馈）。
+    expect_bounds(cx, "app-root-remote-dev-notice");
+    expect_bounds(cx, "app-root-consent");
+    assert!(
+        cx.debug_bounds("app-root-remote-consent").is_none(),
+        "remote_tls 不再要求「确认连接 HTTPS」勾选"
+    );
+
+    // 缺「同意开发同步」→ 只有 DEV 构建才拒绝（产品构建没有这个勾选/校验）。
+    root.update(cx, |root, cx| root.submit_create(cx));
+    cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::CreateForm);
     let error = root
         .update(cx, |root, _| root.form_error().map(str::to_owned))
-        .expect("缺远程确认必须给表单错误");
-    assert!(error.contains("远程服务器"), "{error}");
+        .expect("缺 DEV 同意必须给表单错误");
+    assert!(error.contains("同意开发同步"), "{error}");
     assert!(
         !layout
             .instance_dir("inst-remote-consent")
             .expect("目录")
             .exists(),
-        "缺确认不得建实例目录/库"
+        "缺同意不得建实例目录/库"
     );
-    assert!(!layout.config_path.exists(), "缺确认不得写配置");
+    assert!(!layout.config_path.exists(), "缺同意不得写配置");
 
-    // 远程模式的 DEV 状态标注（未在真实 relay/Windows 验证）必须可见。
+    // 勾选 DEV 同意后提交：进后台并真实到达备份页（这里不需要远程 HTTPS 确认）。
     root.update(cx, |root, cx| {
-        root.form_set_remote_consent(true, cx);
+        root.form_set_consent(true, cx);
+        root.submit_create(cx);
     });
     cx.run_until_parked();
-    expect_bounds(cx, "app-root-remote-dev-notice");
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Working,
+        "DEV 同意后必须直接进入后台（没有远程确认拦截）"
+    );
+    let finished = root.update(cx, |root, cx| {
+        root.wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)
+    });
+    cx.run_until_parked();
+    assert!(finished, "remote Create 必须在预算内到达终态");
+    assert_eq!(state_of(&root, cx), RootStateLabel::BackupRequired);
 }
 
 /// remote Create 真实 TLS 全链路：genesis → 强 pin → 备份页 → Main → ProfileV2（remote_tls）
@@ -3477,6 +3630,7 @@ async fn startup_remote_pending_prepared_is_aborted_without_network(cx: &mut Tes
     let mut profile = DevSyncProfile::default();
     profile.upsert_active(InstanceEntry {
         instance_id: "inst-remote-pending".to_owned(),
+        display_name: None,
         relay_mode: RelayMode::RemoteTls,
         api_version: RelayApiVersion::V1,
         relay_url: relay.base_url().to_owned(),
@@ -3656,4 +3810,128 @@ async fn startup_without_pending_does_not_contact_the_relay(cx: &mut TestAppCont
         "无 pending 时启动对账必须纯 no-op（不联网）"
     );
     assert!(root.update(cx, |root, _| root.has_main_shell()));
+}
+
+// ---------------------------------------------------------------------------
+// 5) 统一表单「仓库名称」：Create 成功写 display_name，三处显示同步，不改路径
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn welcome_sync_create_writes_display_name_and_shows_it(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("create-display-name");
+    let instance_id = "inst-create-name";
+    let options = AppRootOptions {
+        layout: layout.clone(),
+        default_relay: relay.base_url().to_owned(),
+        instance_id: Some(instance_id.to_owned()),
+        allow_local_vault: false,
+        operation_budget: DEFAULT_OPERATION_BUDGET,
+    };
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
+
+    // 展开统一同步卡：链接 / 实例目录 / 可选的「仓库名称」。
+    let card = expect_bounds(cx, "welcome-sync-remote");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.run_until_parked();
+    expect_bounds(cx, "welcome-sync-link");
+    expect_bounds(cx, "welcome-sync-dir");
+    expect_bounds(cx, "welcome-sync-name");
+    assert_eq!(
+        root.update(cx, |root, cx| root.welcome_sync_name_text(cx)),
+        Some(String::new()),
+        "名称默认留空（= 使用目录名）"
+    );
+
+    // 填名称（含首尾空白/中文/emoji）→ 真实 Create → 备份 → Main。
+    let vault_id = [0x6Cu8; 16];
+    let link = create_link_for(&relay, vault_id, 900);
+    let instance_dir = layout.instance_dir(instance_id).expect("合法实例 id");
+    let instance_dir_text = instance_dir.display().to_string();
+    root.update(cx, |root, cx| {
+        root.welcome_set_sync_link(&link, cx);
+        root.welcome_set_sync_dir(&instance_dir_text, cx);
+        root.welcome_set_sync_name("  研究 库🚀  ", cx);
+        root.welcome_set_sync_consent(true, cx);
+    });
+    assert_eq!(
+        root.update(cx, |root, cx| root.welcome_sync_name_text(cx)),
+        Some("研究 库🚀".to_owned())
+    );
+    root.update(cx, |root, cx| root.welcome_confirm_sync(cx));
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Working);
+    assert!(
+        root.update(cx, |root, cx| root
+            .wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)),
+        "Create 必须在预算内收敛"
+    );
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::BackupRequired);
+    root.update(cx, |root, cx| {
+        root.set_backup_confirmed(true, cx);
+        root.confirm_backup(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+
+    // 公开配置：display_name = trim 后的名字；目录/路径/vault_id 是真实事实。
+    let profile = layout.store().load().expect("读配置").expect("配置存在");
+    let entry = profile.find(instance_id).expect("实例已登记");
+    assert_eq!(
+        entry.display_name.as_deref(),
+        Some("研究 库🚀"),
+        "Create 成功时必须写 display_name（trim）"
+    );
+    assert_eq!(
+        PathBuf::from(&entry.vault_path),
+        instance_dir.join(VAULT_FILE_NAME),
+        "名称只影响显示：目标路径仍是用户选的实例目录"
+    );
+    assert_eq!(profile.active_instance.as_deref(), Some(instance_id));
+
+    // 三处显示同名字：左下角按钮 / 切换菜单当前行 / 管理仓库行。
+    assert_eq!(
+        root.update(cx, |root, cx| root.current_vault_name(cx)),
+        "研究 库🚀",
+        "左下角必须显示自定义名"
+    );
+    let switcher = expect_bounds(cx, "app-root-vault-switcher");
+    cx.simulate_click(switcher.center(), Modifiers::default());
+    cx.run_until_parked();
+    let rows = root.update(cx, |root, cx| root.vault_menu_rows(cx));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "✓ 研究 库🚀", "菜单当前行必须同名");
+    let manage = expect_bounds(cx, "app-root-vault-manage");
+    cx.simulate_click(manage.center(), Modifiers::default());
+    cx.run_until_parked();
+    let manager = root.update(cx, |root, _| root.vault_manager_rows());
+    assert_eq!(manager.len(), 1);
+    assert_eq!(manager[0].name, "研究 库🚀", "管理仓库必须显示自定义名");
+    assert_eq!(manager[0].path, entry.vault_path, "管理仓库仍显示真实路径");
+
+    // 留空 = None：行内重命名清空后再保存，显示回退目录名。
+    let rename = expect_bounds(cx, "vault-manager-rename-0");
+    cx.simulate_click(rename.center(), Modifiers::default());
+    cx.run_until_parked();
+    root.update(cx, |root, cx| root.vault_rename_set_text("", cx));
+    let save = expect_bounds(cx, "vault-manager-rename-save");
+    cx.simulate_click(save.center(), Modifiers::default());
+    cx.run_until_parked();
+    let cleared = layout.store().load().expect("读配置").expect("配置存在");
+    assert_eq!(
+        cleared
+            .find(instance_id)
+            .and_then(|e| e.display_name.clone()),
+        None,
+        "留空保存 = 清除自定义名（落盘为 null/缺省）"
+    );
+    assert_eq!(
+        root.update(cx, |root, cx| root.current_vault_name(cx)),
+        instance_id,
+        "清除后左下角回退目录名"
+    );
 }

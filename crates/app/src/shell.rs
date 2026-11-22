@@ -58,8 +58,18 @@ use crate::graph::{
 };
 use crate::note_history::{NoteHistoryEvent, NoteHistoryPanel};
 use crate::search_input::{SearchInput, SearchInputEvent};
+use crate::shortcuts::{self, CommandId};
 use crate::sidebar_rename::{RenameEvent, RenameInput};
 use crate::templates::{self, TemplatePicker, TemplatePickerEvent, TemplatePickerPurpose};
+
+// 回收站覆盖层（P0：查看 + 恢复已删除笔记）。
+//
+// 用 `#[path]` 指到 `src/trash.rs`：文件仍按「一个视图一个模块」放在 `src/` 顶层，
+// 但模块路径挂在 `shell::trash` 下（`lib.rs` 的公开模块清单不需要为本切片改动）。
+#[path = "trash.rs"]
+pub mod trash;
+
+use self::trash::{TrashEvent, TrashPanel};
 
 /// 新建笔记的默认标题（与现有标题重名时自动加序号）。
 const DEFAULT_NOTE_TITLE: &str = "未命名笔记";
@@ -180,6 +190,10 @@ mod icons {
     pub const GRAPH: &[u8] = include_bytes!("../assets/icons/network.svg");
     /// 搜索（lucide `search`）。
     pub const SEARCH: &[u8] = include_bytes!("../assets/icons/search.svg");
+    /// 回收站（lucide `trash-2`）。
+    pub const TRASH: &[u8] = include_bytes!("../assets/icons/trash.svg");
+    /// 画布（Excalidraw logo mark，与嵌入预览/画布笔记同一视觉来源）。
+    pub const EXCALIDRAW: &[u8] = include_bytes!("../../excalidraw/assets/icons/logoMark.svg");
     /// 排序（lucide `arrow-up-down`）。
     pub const SORT: &[u8] = include_bytes!("../assets/icons/arrow-up-down.svg");
 }
@@ -547,6 +561,44 @@ struct OpenNote {
     _events: gpui::Subscription,
 }
 
+/// 侧栏拖拽载荷（行 → 拖拽 ghost / drop 目标）。
+///
+/// 只带**结构节点 ID**与展示用的标题：drop 时重新按 ID 查树，树在这期间变了
+/// （同步/删除）也能给出明确提示，不会拿旧快照写入。文件夹拖拽天然包含整棵子树
+/// （storage 的 `move_node` 只改父指针）。
+#[derive(Clone)]
+struct SidebarDrag {
+    /// 结构节点 ID（笔记/目录共用）。
+    node_id: String,
+    /// 行标题（ghost 卡片显示用）。
+    title: String,
+    /// 是否目录（ghost 显示文件夹标记；drop 时以**当前结构树**里的种类为准）。
+    is_folder: bool,
+}
+
+impl Render for SidebarDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let label = if self.is_folder {
+            format!("▾ {}", self.title)
+        } else {
+            self.title.clone()
+        };
+        div()
+            // 测试元数据（只读断言用）：拖拽 ghost 画出来 = 拖拽真的启动了。
+            .debug_selector(|| "sidebar-drag-ghost".to_string())
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme::sidebar_border())
+            .bg(theme::menu_bg())
+            .text_size(px(12.0))
+            .text_color(theme::text_color())
+            .shadow_sm()
+            .child(SharedString::from(label))
+    }
+}
+
 /// 图谱覆盖层的运行态（`None` = 没打开）。
 ///
 /// **坐标只存在内存里**（`model` 里的布局 + `view` 的平移缩放），不写库、不进同步；
@@ -662,10 +714,22 @@ pub struct AppShell {
     editing: Option<Editing>,
     /// 下一帧需要把焦点给新的输入框（订阅回调里没有 `&mut Window`）。
     pending_focus_rename: bool,
+    /// 新建笔记后需要把焦点送到大标题输入框（延后到 `EditorView` 首帧聚焦之后）。
+    pending_focus_title: bool,
     /// 菜单打开的时刻（写日志、以及"同一次手势不关菜单"的守卫用）。
     menu_opened_at: Option<std::time::Instant>,
     /// 最近一次点中菜单动作的时刻（吞掉紧跟着的 mouse-up 落到下层行）。
     menu_action_at: Option<std::time::Instant>,
+    /// 本次左键按下是否允许随后的行/空白点击执行动作。
+    ///
+    /// 行动作在 **mouse-up** 上执行（为了不把拖拽起手当成点击）；而 AppShell 自己的
+    /// 模态覆盖层（右键菜单/排序菜单/搜索/图谱/历史/模板）多半在 **mouse-down** 上
+    /// 关闭。同一次手势的 mouse-up 会落到被覆盖层挡住的侧栏行上——按下瞬间记下
+    /// "有没有覆盖层"，mouse-up 时把这次点击吞掉，避免"关个菜单却打开了笔记"。
+    ///
+    /// 限制：AppRoot 的覆盖层（如设置页）在 AppShell 之外，这里看不见；那些覆盖层
+    /// 需要在遮罩上加 `occlude()` 才能阻断命中链（与改动前行为一致，未在本切片扩展）。
+    row_click_armed: bool,
     /// 本次打开是否已经画过一帧（诊断"状态已设置但没画出来"）。
     menu_painted: std::cell::Cell<bool>,
     /// 视图创建时刻：日志里的相对时间戳。
@@ -684,6 +748,10 @@ pub struct AppShell {
     history_panel: Option<Entity<NoteHistoryPanel>>,
     /// 历史面板的事件订阅（关闭时 drop = 取消订阅）。
     history_panel_events: Option<gpui::Subscription>,
+    /// 回收站覆盖层（P0：查看 + 恢复；`None` = 关闭）。
+    trash_panel: Option<Entity<TrashPanel>>,
+    /// 回收站的事件订阅（关闭时 drop = 取消订阅）。
+    trash_panel_events: Option<gpui::Subscription>,
     /// 自动捕获的基线：`(note_id, 上次捕获/打开时的源文)`。
     ///
     /// 只在 active 源文与它不同时写版本（与 storage 的 `body_hash` 去重双保险）；
@@ -709,6 +777,21 @@ pub struct AppShell {
     /// 同步设置页是否打开（默认关闭；面板只在设置页里渲染）。
     #[cfg(feature = "sync-ui")]
     settings_open: bool,
+    /// 设置入口是否由宿主（`AppRoot`）接管（默认 `false`，行为不变）。
+    ///
+    /// `false`（直接构造 `AppShell` 的 headless 测试 / 旧入口）：底栏 `sync-status`
+    /// 打开 `AppShell` 自己的组合设置页（同步 + 外观/语言/模板）。
+    /// `true`（生产 `AppRoot` 创建的 Main）：点击只发
+    /// [`AppShellEvent::OpenSyncSettings`]，由宿主打开 `AppRoot` 设置页并选中「同步」
+    /// 分类——不再打开这张旧组合设置页，避免"同步下面混入其它设置"。
+    #[cfg(feature = "sync-ui")]
+    settings_host_managed: bool,
+    /// 是否允许 `AppShell` 根视图直接处理全局快捷键（新建笔记/图谱）。
+    ///
+    /// 默认 `true`（直接构造 `AppShell` 的入口，包括 `--no-default-features` 构建）；
+    /// `AppRoot` 宿主 Main 里设为 `false`：由宿主统一拦截并加自己的守卫
+    /// （设置/管理仓库/切换菜单打开时不得新建笔记），避免两层各处理一半。
+    global_shortcut_direct: bool,
     /// 设置页焦点（Esc 关闭用）。
     #[cfg(feature = "sync-ui")]
     settings_focus: FocusHandle,
@@ -795,6 +878,22 @@ pub struct AppShell {
     #[cfg(feature = "sync-ui")]
     pending_focus_daily_template: bool,
 }
+
+/// `AppShell` 发给宿主（`AppRoot`）的事件。
+///
+/// 只有底栏 `sync-status` 需要路由：生产 `AppRoot` 统一用 [`AppShellEvent::OpenSyncSettings`]
+/// 打开自己的设置页（左侧分类导航，只有「同步」分类内容）；直接构造的 `AppShell`
+/// （headless 测试/旧入口）没有宿主订阅，点击仍然打开 `AppShell` 自己的设置页，
+/// 行为与既有测试语义一致。
+#[cfg(feature = "sync-ui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppShellEvent {
+    /// 请求宿主打开设置页并选中「同步」分类。
+    OpenSyncSettings,
+}
+
+#[cfg(feature = "sync-ui")]
+impl gpui::EventEmitter<AppShellEvent> for AppShell {}
 
 /// 右键行弹出的上下文菜单。
 #[derive(Debug, Clone, PartialEq)]
@@ -1081,6 +1180,112 @@ impl AppShell {
         self.history_panel.clone()
     }
 
+    // ---- 回收站覆盖层（P0：查看 + 恢复）----
+
+    /// 打开回收站覆盖层（ribbon `ribbon-trash` / 兼容别名 `sidebar-trash`）。
+    ///
+    /// 打开时由面板一次性读取 `trashed_notes` + `tree` 投影（只读、小查询）；恢复本身
+    /// 仍走 [`Self::write_structure`]（同步冻结/提交失败与其它结构写入同一条路径）。
+    /// 面板覆盖在编辑器上，不卸载编辑器、不动正文/选区。
+    fn open_trash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.trash_panel.is_some() {
+            return;
+        }
+        let vault = self.vault.clone();
+        let panel = cx.new(|cx| TrashPanel::new(vault, cx));
+        let events = cx.subscribe(
+            &panel,
+            |shell, _panel, event: &TrashEvent, cx| match event {
+                TrashEvent::Closed => shell.close_trash(cx),
+                TrashEvent::RestoreRequested { node_id, title } => {
+                    shell.restore_trashed_note(node_id.clone(), title.clone(), cx);
+                }
+            },
+        );
+        panel.update(cx, |panel, cx| panel.focus(window, cx));
+        // 打开全屏覆盖层 = 新手势上下文：清掉右键菜单动作的 150ms 余波守卫，
+        // 否则在覆盖层里恢复后立刻点侧栏行会被当成"菜单 mouse-up 余波"吞掉。
+        self.menu_action_at = None;
+        eprintln!("[menghunote] 打开回收站覆盖层");
+        self.trash_panel = Some(panel);
+        self.trash_panel_events = Some(events);
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 关闭回收站覆盖层；下一帧把焦点还给编辑器（事件回调里拿不到 `&mut Window`）。
+    fn close_trash(&mut self, cx: &mut Context<Self>) {
+        if self.trash_panel.take().is_none() {
+            return;
+        }
+        self.trash_panel_events = None;
+        self.pending_focus_editor = !self.active_is_drawing();
+        cx.notify();
+    }
+
+    /// 恢复一行：ack 删除事件 → `refresh_tree` → 选中该节点 → 关闭覆盖层。
+    ///
+    /// - **不自动打开正文**：恢复后只选中侧栏节点；
+    /// - 不移动节点：`restore_note` 只确认删除事件，原父级自动保留；
+    /// - 失败时把 `write_structure` 的提示写回面板 inline 错误，**保留列表**。
+    fn restore_trashed_note(&mut self, node_id: String, title: String, cx: &mut Context<Self>) {
+        // 与 `write_structure` 同一条同步门禁：先给出针对「恢复」的明确提示，
+        // 不绕过冻结去写结构。
+        #[cfg(feature = "sync-ui")]
+        if self.dev_sync_sync.is_some() {
+            eprintln!("[menghunote] 恢复被拒绝：dev-sync 同步进行中（结构写入已冻结）");
+            self.notice = Some(trash::RESTORE_SYNC_FROZEN_NOTICE.to_owned());
+            self.set_trash_error(trash::RESTORE_SYNC_FROZEN_NOTICE, cx);
+            return;
+        }
+        let restored = self.write_structure("恢复笔记", |writer| {
+            let confirmed = writer.doc().restore_note(&node_id, now_millis())?;
+            eprintln!("[menghunote] 恢复删除事件 {confirmed} 条 node={node_id}");
+            Ok(node_id.clone())
+        });
+        let Some(node_id) = restored else {
+            // `write_structure` 已把具体失败写进 notice；面板再显示同一句 inline 错误。
+            let message = self
+                .notice
+                .clone()
+                .unwrap_or_else(|| trash::RESTORE_FAILED_NOTICE.to_owned());
+            self.set_trash_error(message, cx);
+            return;
+        };
+        self.refresh_tree();
+        if self.tree.iter().any(|entry| entry.node_id == node_id) {
+            self.selected_node_id = Some(node_id.clone());
+            self.close_trash(cx);
+            self.notice = Some(trash::RESTORED_NOTICE.to_owned());
+            eprintln!("[menghunote] 已从回收站恢复「{title}」（node={node_id}）");
+            cx.notify();
+        } else {
+            eprintln!("[menghunote] 恢复后侧栏里找不到 node={node_id}（「{title}」）");
+            self.notice = Some(trash::RESTORE_LIST_FAILED_NOTICE.to_owned());
+            self.set_trash_error(trash::RESTORE_LIST_FAILED_NOTICE, cx);
+        }
+    }
+
+    /// 把错误写到回收站面板（面板不在时只保留侧栏 notice）。
+    fn set_trash_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let message = message.into();
+        if let Some(panel) = self.trash_panel.clone() {
+            panel.update(cx, |panel, cx| panel.set_error(message, cx));
+        }
+    }
+
+    /// 回收站覆盖层是否打开（headless 断言用）。
+    #[must_use]
+    pub fn trash_open(&self) -> bool {
+        self.trash_panel.is_some()
+    }
+
+    /// 回收站覆盖层实体（headless 测试读行/错误用）。
+    #[must_use]
+    pub fn trash_entity(&self) -> Option<Entity<TrashPanel>> {
+        self.trash_panel.clone()
+    }
+
     // ---- 图谱覆盖层（G1/G2）：打开/关闭/交互 ----
 
     /// 打开图谱覆盖层（侧栏底部「图谱」）。
@@ -1154,6 +1359,22 @@ impl AppShell {
                 cx.notify();
             }
         }
+    }
+
+    /// 全局快捷键「打开图谱」（设置页可改绑；默认 `Ctrl+G`）。
+    ///
+    /// 与侧栏「图谱」入口同一条路径；图谱打开后由覆盖层自己的搜索框/`Esc` 接管
+    /// 键盘，不在这里做"再按一次关闭"（全局快捷键在覆盖层打开时被守卫挡住）。
+    pub fn shortcut_open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_graph(window, cx);
+    }
+
+    /// 全局快捷键「新建笔记」（设置页可改绑；默认 `Ctrl+N`）。
+    ///
+    /// 完全复用侧栏「＋ 笔记」的 [`Self::create_note`]（根级；新笔记直接打开并进入
+    /// 大标题编辑），不新增第二条结构写入路径。
+    pub fn shortcut_create_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_note(None, window, cx);
     }
 
     /// 关闭图谱覆盖层，并把焦点还给当前编辑器。
@@ -1586,6 +1807,12 @@ impl AppShell {
         self.active.as_ref().map(|active| active.note_id.as_str())
     }
 
+    /// 侧栏当前**选中**的节点 ID（与「已打开」是两件事；headless 断言恢复后选中用）。
+    #[must_use]
+    pub fn selected_node(&self) -> Option<&str> {
+        self.selected_node_id.as_deref()
+    }
+
     /// 侧栏当前展示顺序的标题（先序 DFS；headless 断言"文件夹优先 + 排序键"用）。
     ///
     /// 只读投影，不触发任何 IO；`tree-row-<i>` 的下标就是这里的下标。
@@ -1699,8 +1926,10 @@ impl AppShell {
             graph: None,
             graph_focus: cx.focus_handle(),
             pending_focus_rename: false,
+            pending_focus_title: false,
             menu_opened_at: None,
             menu_action_at: None,
+            row_click_armed: true,
             menu_painted: std::cell::Cell::new(false),
             epoch: std::time::Instant::now(),
             menu_focus: cx.focus_handle(),
@@ -1709,6 +1938,8 @@ impl AppShell {
             appearance_subscription: None,
             history_panel: None,
             history_panel_events: None,
+            trash_panel: None,
+            trash_panel_events: None,
             history_last_source: None,
             history_timer_started: false,
             #[cfg(feature = "sync-ui")]
@@ -1719,6 +1950,9 @@ impl AppShell {
             management_open: false,
             #[cfg(feature = "sync-ui")]
             settings_open: false,
+            #[cfg(feature = "sync-ui")]
+            settings_host_managed: false,
+            global_shortcut_direct: true,
             #[cfg(feature = "sync-ui")]
             settings_focus: cx.focus_handle(),
             #[cfg(feature = "sync-ui")]
@@ -2057,7 +2291,10 @@ impl AppShell {
     }
 
     /// 侧栏「新建笔记」：走结构写入路径 → commit → 刷新 → 直接打开新笔记。
-    fn create_note(&mut self, parent: Option<String>, cx: &mut Context<Self>) {
+    ///
+    /// 新建成功后**直接进入大标题编辑并聚焦**（默认名预选，键入即整体替换），
+    /// 方便用户马上改名；打开已有笔记不会走这条路径，正文点击也不会被抢焦点。
+    fn create_note(&mut self, parent: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let title = unique_title(DEFAULT_NOTE_TITLE, &self.tree);
         // `parent = None` → 根级；`Some(目录)` → 右键菜单指定的目录内。
         let Some(seed) = self.write_structure("新建笔记", |writer| {
@@ -2085,17 +2322,31 @@ impl AppShell {
         // 刷新保留 collapsed（refresh_tree 不改它）；选中新节点并把新笔记打开。
         self.refresh_tree();
         self.selected_node_id = Some(seed.clone());
+        let mut opened = false;
         if let Some(index) = self.tree.iter().position(|entry| entry.node_id == seed) {
-            self.open_entry(index, cx);
+            opened = self.open_entry_with_history(index, true, cx);
         } else {
             eprintln!("[menghunote] 新建的笔记没有出现在结构树里（投影滞后？）");
             self.notice = Some("新建成功，但列表里暂时看不到（稍后刷新）".to_owned());
+        }
+        if opened {
+            self.begin_title_edit_selected(window, cx);
         }
         cx.notify();
     }
 
     /// 侧栏「新建文件夹」：同样走结构写入，只刷新列表，不切换文档。
+    ///
+    /// 新建成功后**立即进入行内重命名**（复用 [`Self::begin_rename`] / `Editing`）：
+    /// 用户可直接键入新名字，点其它行/正文/侧栏空白则按"确认命名"提交。
+    /// 事件回调路径都不带 `&mut Window`，所以焦点交给现有的
+    /// [`Self::pending_focus_rename`] 机制，在下一帧补上（输入框默认全选）。
     fn create_folder(&mut self, parent: Option<String>, cx: &mut Context<Self>) {
+        // 编辑中再点「新建文件夹」= 点外部：先确认当前标题；标题为空则中止，
+        // 不把两个编辑态叠在一起。
+        if self.editing.is_some() && !self.commit_editing_from_outside(cx) {
+            return;
+        }
         let title = unique_title(DEFAULT_FOLDER_TITLE, &self.tree);
         let Some(node_id) = self.write_structure("新建文件夹", |writer| {
             let node_id = writer.doc().create_folder(&title, now_millis())?;
@@ -2112,10 +2363,20 @@ impl AppShell {
         if let Some(parent) = &parent {
             self.collapsed.remove(parent);
         }
-        eprintln!("[menghunote] 新建目录「{title}」（node={node_id}）");
+        eprintln!("[menghunote] 新建目录「{title}」（node={node_id}），立即进入重命名");
         self.refresh_tree();
-        self.selected_node_id = Some(node_id);
+        self.selected_node_id = Some(node_id.clone());
         self.notice = None;
+        // 从刚刷新过的树里取标题（与落库值一致，不依赖局部变量）。
+        let title = self
+            .tree
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .map_or(title, |entry| entry.title.clone());
+        // 事件回调里没有 `&mut Window`：用与 F2 / 菜单重命名相同的"下一帧聚焦"路径。
+        // 双层 `defer` 保证不会被同一帧里正文/行点击的聚焦抢走（见 `render`）。
+        self.pending_focus_rename = true;
+        self.begin_rename(node_id, title, cx);
         cx.notify();
     }
 
@@ -2222,18 +2483,19 @@ impl AppShell {
     /// 让位 = 实体保留（场景与撤销栈不丢）、只是不渲染：Excalidraw 编辑器每帧会
     /// 自抢焦点，继续渲染会抢走设置页输入框/搜索框的焦点。关闭模态后自动回来。
     fn drawing_yields_to_modal(&self) -> bool {
-        if self.search.is_some()
+        let base = self.search.is_some()
             || self.graph.is_some()
             || self.template_picker.is_some()
             || self.history_panel.is_some()
-        {
-            return true;
-        }
+            || self.trash_panel.is_some();
         #[cfg(feature = "sync-ui")]
-        if self.settings_open || self.daily_template_picker.is_some() {
-            return true;
+        {
+            base || self.settings_open || self.daily_template_picker.is_some()
         }
-        false
+        #[cfg(not(feature = "sync-ui"))]
+        {
+            base
+        }
     }
 
     /// 画布覆盖层（内容区最上层；`None` = 关闭或让位给其它模态）。
@@ -2888,8 +3150,10 @@ impl AppShell {
                 self.open_note_history(note_id, entry.title, window, cx);
             }
             MenuAction::NewNote => {
-                self.create_note(Some(node_id), cx);
+                // 先关菜单（会把焦点还给旧编辑器），再新建并进入标题编辑；
+                // 反过来的话 close_menu 会把刚拿到标题输入框的焦点抢回正文。
                 self.close_menu("菜单项-新建笔记", window, cx);
+                self.create_note(Some(node_id), window, cx);
             }
             MenuAction::NewFolder => {
                 self.create_folder(Some(node_id), cx);
@@ -3226,6 +3490,136 @@ impl AppShell {
         }
         self.commit_rename(title, cx);
         true
+    }
+
+    /// 侧栏行被拖到**任意一行**上（drop 入口）：落点是该行**最近的祖先文件夹**。
+    ///
+    /// - 文件夹行 → 自身；
+    /// - 子笔记/子文件夹行 → 其父文件夹（也就是展开后整个目录范围都可作为拖入区）；
+    /// - 根级笔记行 → 根级（`None`；把子级节点拖到这里 = 移回根）。
+    ///
+    /// 自指/后代/目标失效等校验统一由 [`Self::move_node_to_parent`] 负责，
+    /// 保证拖放与 headless 测试走同一条路径、一次合法移动只写一次结构。
+    fn on_sidebar_row_drop(
+        &mut self,
+        drag: &SidebarDrag,
+        target_parent: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_node_to_parent(drag.node_id.clone(), target_parent, cx);
+    }
+
+    /// 侧栏空白/根容器 drop：移动到根级。
+    fn on_sidebar_root_drop(&mut self, drag: &SidebarDrag, cx: &mut Context<Self>) {
+        self.move_node_to_parent(drag.node_id.clone(), None, cx);
+    }
+
+    /// 把节点移动到 `parent`（`None` = 根级）。**拖放与 headless 测试共用这一条路径**。
+    ///
+    /// 规则（对应交互约定）：
+    /// - 目标必须是**目录**；笔记行 / 不存在的节点 → 不移动、`notice` 说明原因；
+    /// - 不能落到自己或自己的后代（含隔代）上；
+    /// - 父节点没变 = 正常结束，**不写库**（避免一次拖放产生无意义的结构提交）；
+    /// - 合法移动 = 恰好一次 [`Self::write_structure`]（"移动节点"）+ `refresh_tree`；
+    ///   提交失败时树保持原样（不丢节点），提示由 `write_structure` 写入。
+    ///
+    /// 文件夹移动只改父指针，子树随父节点整体移动。
+    pub fn move_node_to_parent(
+        &mut self,
+        node_id: String,
+        parent: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .tree
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .cloned()
+        else {
+            self.notice = Some("要移动的节点已不在列表里".to_owned());
+            cx.notify();
+            return;
+        };
+        if let Some(parent_id) = &parent {
+            let Some(target) = self
+                .tree
+                .iter()
+                .find(|entry| entry.node_id == *parent_id)
+                .cloned()
+            else {
+                self.notice = Some("目标文件夹已不存在".to_owned());
+                cx.notify();
+                return;
+            };
+            if !target.is_folder() {
+                self.notice = Some(format!(
+                    "「{}」不是文件夹，不能作为拖放目标（可拖到文件夹或侧栏空白处）",
+                    target.title
+                ));
+                cx.notify();
+                return;
+            }
+            if target.node_id == entry.node_id {
+                self.notice = Some("不能把节点拖到它自己上面".to_owned());
+                cx.notify();
+                return;
+            }
+            if self.is_descendant_of(&target.node_id, &entry.node_id) {
+                self.notice = Some(format!("不能把「{}」移进它自己的子文件夹", entry.title));
+                cx.notify();
+                return;
+            }
+        }
+        if entry.parent_id == parent {
+            self.notice = Some(format!("「{}」已经在该位置", entry.title));
+            cx.notify();
+            return;
+        }
+        let moved_title = entry.title.clone();
+        let done = self
+            .write_structure("移动节点", |writer| {
+                writer
+                    .doc()
+                    .move_node(&node_id, parent.as_deref(), now_millis())?;
+                Ok(node_id.clone())
+            })
+            .is_some();
+        if !done {
+            // 结构写入失败：树没有刷新，节点仍在原位；提示已由 `write_structure` 写入。
+            cx.notify();
+            return;
+        }
+        // 目标目录若折叠，展开它，否则"移动成功但看不见"。
+        if let Some(parent_id) = &parent {
+            self.collapsed.remove(parent_id);
+        }
+        self.refresh_tree();
+        self.selected_node_id = Some(node_id.clone());
+        self.notice = None;
+        eprintln!(
+            "[menghunote] 移动节点「{moved_title}」（node={node_id}）→ {}",
+            parent.as_deref().unwrap_or("根级")
+        );
+        cx.notify();
+    }
+
+    /// `candidate` 是否是 `ancestor` 的后代（含自身；父链断掉/超过 64 层按否处理）。
+    fn is_descendant_of(&self, candidate: &str, ancestor: &str) -> bool {
+        let mut cursor = Some(candidate.to_owned());
+        for _ in 0..64 {
+            let Some(node_id) = cursor else {
+                return false;
+            };
+            if node_id == ancestor {
+                return true;
+            }
+            cursor = self
+                .tree
+                .iter()
+                .find(|entry| entry.node_id == node_id)
+                .and_then(|entry| entry.parent_id.clone());
+        }
+        false
     }
 
     /// 放弃重命名（不写库）。
@@ -3633,10 +4027,35 @@ impl AppShell {
         });
     }
 
+    /// 当前是否有 AppShell 自己的覆盖层（这些覆盖层可能在 mouse-down 上就关闭，
+    /// 让同一次手势的 mouse-up 落到下层行上）。
+    ///
+    /// 只列**会遮住侧栏**、且可能在 mouse-down 上关闭的覆盖层；漏掉一项的后果是
+    /// "关覆盖层时顺手点开了笔记"，所以新增覆盖层时记得加进来。
+    ///
+    /// `settings_open` / 画布覆盖层故意**不**算：点侧栏行就是正常切换（与既有
+    /// headless 路径一致，且设置页/画布本来就不该阻止换笔记）。
+    fn overlay_blocks_row_click(&self) -> bool {
+        let open = self.menu.is_some()
+            || self.sort_menu
+            || self.search.is_some()
+            || self.graph.is_some()
+            || self.history_panel.is_some()
+            || self.trash_panel.is_some()
+            || self.template_picker.is_some();
+        #[cfg(feature = "sync-ui")]
+        let open = open || self.daily_template_picker.is_some();
+        open
+    }
+
     /// 点击侧栏第 `index` 行。
     ///
     /// 目录不打开文档；当前笔记重复点击直接忽略。
     fn on_row_click(&mut self, index: usize, cx: &mut Context<Self>) {
+        // 这次 mouse-up 属于"关闭覆盖层"的同一次手势 → 吞掉（见 `row_click_armed`）。
+        if !std::mem::take(&mut self.row_click_armed) {
+            return;
+        }
         // 菜单项的 mouse-up 余波：不要让下层行把刚进入的重命名立刻提交掉。
         if self
             .menu_action_at
@@ -3966,9 +4385,39 @@ impl AppShell {
     }
 
     /// 点顶部标题进入大标题输入框（标题语义复用侧栏的 IME 输入框）。
-    fn begin_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// `click` 是 `MouseDownEvent.position`（窗口坐标）：传给输入框做"点哪放哪"
+    /// 的首次光标定位（**不预选**），不再像侧栏 F2 那样整段全选。
+    fn begin_title_edit(
+        &mut self,
+        click: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_title_edit(Some(click), false, window, cx);
+    }
+
+    /// 新建笔记后直接进入改名：预选默认标题，用户一次输入就能整体替换。
+    ///
+    /// 与点击进入的区别只有初始选区；焦点同样交给标题输入框，正文不抢焦点。
+    fn begin_title_edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_title_edit(None, true, window, cx);
+    }
+
+    /// 打开大标题编辑（两种入口共用：点击 / 新建笔记后自动改名）。
+    fn start_title_edit(
+        &mut self,
+        click: Option<Point<Pixels>>,
+        select_all: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.title_edit.is_some() {
-            return;
+            if !select_all {
+                return;
+            }
+            // 新建笔记后重新绑定标题：旧输入框属于上一篇笔记，直接丢弃。
+            self.title_edit = None;
         }
         if self.editing.is_some() && !self.commit_editing_from_outside(cx) {
             return;
@@ -3976,7 +4425,13 @@ impl AppShell {
         let Some(title) = self.active_note_title() else {
             return;
         };
-        let input = cx.new(|cx| RenameInput::new_note_title(&title, cx));
+        let input = cx.new(|cx| {
+            if select_all {
+                RenameInput::new_note_title_selected(&title, cx)
+            } else {
+                RenameInput::new_note_title(&title, click, cx)
+            }
+        });
         cx.subscribe(
             &input,
             |shell, _input, event: &RenameEvent, cx| match event {
@@ -3987,6 +4442,7 @@ impl AppShell {
                 }
                 RenameEvent::Cancel => {
                     shell.title_edit = None;
+                    shell.pending_focus_editor = true;
                     cx.notify();
                 }
                 RenameEvent::Advance { .. } | RenameEvent::Changed => {}
@@ -3994,6 +4450,11 @@ impl AppShell {
         )
         .detach();
         input.update(cx, |input, cx| input.focus(window, cx));
+        if select_all {
+            // 新建笔记时 `EditorView` 首帧会 `cx.focus_self` 把焦点抢回正文；
+            // 在下一帧的 render 里再补一次（见 `pending_focus_title`）。
+            self.pending_focus_title = true;
+        }
         self.title_edit = Some(input);
         cx.notify();
     }
@@ -4015,6 +4476,8 @@ impl AppShell {
 
     fn commit_title_rename(&mut self, title: String, cx: &mut Context<Self>) {
         self.title_edit = None;
+        // 标题编辑结束后键盘输入要回到正文（尤其"新建笔记 → 改标题 → Enter"）。
+        self.pending_focus_editor = true;
         let Some(node_id) = self.active.as_ref().map(|active| active.node_id.clone()) else {
             cx.notify();
             return;
@@ -4077,6 +4540,15 @@ impl AppShell {
         self.editing.is_some()
     }
 
+    /// 侧栏行内重命名的输入框（`None` = 不在编辑；测试/诊断用）。
+    ///
+    /// 与 [`Self::title_edit_input`] 同口径：测试据此断言输入框存在、初始选区、
+    /// 以及键盘焦点是否真的在输入框上（不引入第二套"编辑态"状态）。
+    #[must_use]
+    pub fn rename_input(&self) -> Option<Entity<RenameInput>> {
+        self.editing.as_ref().map(|editing| editing.input.clone())
+    }
+
     /// 侧栏提示文本（测试/诊断用；`None` = 没有提示）。
     #[must_use]
     pub fn notice_text(&self) -> Option<&str> {
@@ -4090,6 +4562,12 @@ impl AppShell {
     #[must_use]
     pub fn active_editor_view(&self) -> Option<Entity<EditorView>> {
         self.active.as_ref().map(|active| active.view.clone())
+    }
+
+    /// 笔记顶部大标题的输入框（`None` = 不在编辑；headless 测试/诊断用）。
+    #[must_use]
+    pub fn title_edit_input(&self) -> Option<Entity<RenameInput>> {
+        self.title_edit.clone()
     }
 
     pub fn close_all(&mut self, cx: &mut Context<Self>) {
@@ -4138,6 +4616,51 @@ impl AppShell {
         self.settings_open = true;
         self.settings_focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// 交给宿主（`AppRoot`）接管设置入口（生产 Main 用；默认 `false`）。
+    ///
+    /// `true` 时底栏 `sync-status` 不再打开 `AppShell` 自己的组合设置页，只发出
+    /// [`AppShellEvent::OpenSyncSettings`]，由宿主打开 `AppRoot` 设置页的「同步」分类。
+    #[cfg(feature = "sync-ui")]
+    pub fn set_settings_host_managed(&mut self, managed: bool) {
+        self.settings_host_managed = managed;
+    }
+
+    /// 是否允许本视图根上直接处理全局快捷键（新建笔记/图谱）。
+    ///
+    /// `AppRoot` 宿主 Main 设为 `false`，由宿主在更外层统一拦截；直接构造
+    /// `AppShell`（dev vault / headless 测试 / `--no-default-features`）保持 `true`。
+    pub fn set_global_shortcut_direct(&mut self, direct: bool) {
+        self.global_shortcut_direct = direct;
+    }
+
+    /// 根级全局快捷键（新建笔记/图谱）是否应被本视图的临时状态挡住。
+    ///
+    /// 覆盖：搜索浮层、图谱、右键菜单、排序菜单、模板选择器、历史时间线、画布、
+    /// 侧栏行内重命名、大标题编辑、`AppShell` 自己的设置页，以及编辑器内部的
+    /// 模态/组合态（链接确认、表格单元格编辑、图片放大、IME）。
+    #[must_use]
+    pub fn shortcuts_blocked(&self, cx: &gpui::App) -> bool {
+        #[cfg(feature = "sync-ui")]
+        let settings_open = self.settings_open;
+        #[cfg(not(feature = "sync-ui"))]
+        let settings_open = false;
+        self.search.is_some()
+            || self.graph.is_some()
+            || self.menu.is_some()
+            || self.sort_menu
+            || self.template_picker.is_some()
+            || self.history_panel.is_some()
+            || self.trash_panel.is_some()
+            || self.drawing.is_some()
+            || self.editing.is_some()
+            || self.title_edit.is_some()
+            || settings_open
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.view.read(cx).global_shortcuts_blocked())
     }
 
     /// 设置页里的「模板」「日记」区（第一方插件）：首次打开设置页时懒创建。
@@ -4370,13 +4893,13 @@ impl AppShell {
 
     /// 最左侧图标栏（Obsidian ribbon 风格）：窄条、纯图标、hover 高亮。
     ///
-    /// 只放**快捷操作**：今日日记 / 从模板新建 / 图谱 / 搜索。
+    /// 只放**快捷操作**：今日日记 / 从模板新建 / 画布 / 图谱 / 回收站 / 搜索。
     /// **设置不在 ribbon 里**：它仍然是侧栏底部的「⚙ 设置」（`AppRoot` 的
     /// `app-root-settings` / `AppShell` 状态栏同步入口），避免两套设置入口。
     ///
     /// 旧文本按钮的 selector（`sidebar-daily-note` / `sidebar-new-from-template` /
-    /// `sidebar-graph`）作为**兼容别名**挂在外层包装上：既有 headless 测试点的是
-    /// 同一个动作、同一个位置，视觉上只有 ribbon 一个按钮。
+    /// `sidebar-graph` / `sidebar-trash`）作为**兼容别名**挂在外层包装上：既有 headless
+    /// 测试点的是同一个动作、同一个位置，视觉上只有 ribbon 一个按钮。
     fn render_ribbon(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // 第一方插件开关：关闭时隐藏对应图标（设置页仍可开启；不写正文/不同步）。
         let templates_enabled = templates::preferences().enabled;
@@ -4417,6 +4940,14 @@ impl AppShell {
                 },
             ));
         }
+        ribbon = ribbon.child(ribbon_button(
+            Some("sidebar-new-drawing"),
+            "ribbon-canvas",
+            icons::EXCALIDRAW,
+            crate::ui_text::sidebar_new_drawing(),
+            cx,
+            |shell, _window, cx| shell.create_drawing(cx),
+        ));
         ribbon
             .child(ribbon_button(
                 Some("sidebar-graph"),
@@ -4425,6 +4956,14 @@ impl AppShell {
                 crate::ui_text::sidebar_ribbon_graph(),
                 cx,
                 |shell, window, cx| shell.open_graph(window, cx),
+            ))
+            .child(ribbon_button(
+                Some("sidebar-trash"),
+                "ribbon-trash",
+                icons::TRASH,
+                trash::PANEL_TITLE.to_owned(),
+                cx,
+                |shell, window, cx| shell.open_trash(window, cx),
             ))
             .child(ribbon_button(
                 None,
@@ -4455,6 +4994,18 @@ impl AppShell {
                     .as_deref()
                     .is_some_and(|node_id| node_id == entry.node_id);
                 let is_folder = entry.is_folder();
+                // 行级闭包必须是 `'static`：先克隆，别让 `entry` 的借用逃出本帧。
+                let row_node_id = entry.node_id.clone();
+                let row_title = entry.title.clone();
+                // 拖放落点 = 该行最近的祖先文件夹：文件夹行是自身，子笔记/子文件夹行
+                // 是父文件夹（文件夹展开后的整个目录范围都能拖入）；根级笔记行是根。
+                let row_drop_parent = if is_folder {
+                    Some(row_node_id.clone())
+                } else {
+                    entry.parent_id.clone()
+                };
+                // drop 监听要 `'static`，单独留一份给闭包；原值留给 `drag_over` 判断。
+                let row_drop_parent_for_drop = row_drop_parent.clone();
                 let editing_input = self
                     .editing
                     .as_ref()
@@ -4528,12 +5079,41 @@ impl AppShell {
                             )
                         },
                     )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                    // 左键 = 行动作（打开/折叠/确认外部编辑）。
+                    //
+                    // 用 `on_click`（mouse-up）而不是 `on_mouse_down`：GPUI 原生拖拽在
+                    // 按下后移动超过阈值才启动，且启动时会清掉这次点击的 pending
+                    // mouse-down——因此从行上拖起**不会**顺带触发打开/折叠。
+                    // （早先用 `on_mouse_down` 时会先折叠目录再开始拖拽，用户看到的是
+                    // "刚拖一下目录就收起来了"。）
+                    .on_click(
+                        cx.listener(move |shell, _event: &gpui::ClickEvent, _window, cx| {
                             shell.on_row_click(index, cx);
                         }),
                     )
+                    // 行可拖起（笔记与文件夹都行）：载荷只带节点 ID/标题。
+                    .on_drag(
+                        SidebarDrag {
+                            node_id: row_node_id.clone(),
+                            title: row_title,
+                            is_folder,
+                        },
+                        |drag, _, _, cx| cx.new(|_| drag.clone()),
+                    )
+                    // 行本身也是 drop 目标：落点是该行最近的祖先文件夹（见
+                    // `row_drop_parent`）。这样文件夹展开后的任意子行都能拖入该文件夹，
+                    // 嵌套时自然落到最近一层文件夹；根级笔记行等价于拖到根级。
+                    // 空白/根级由树容器底部的专用空白区处理（见 `render_sidebar`）。
+                    .on_drop(cx.listener(move |shell, drag: &SidebarDrag, _window, cx| {
+                        shell.on_sidebar_row_drop(drag, row_drop_parent_for_drop.clone(), cx);
+                    }))
+                    // 有文件夹落点的行在拖拽悬停时高亮，明确"这里能放"；
+                    // 根级笔记行只是"落回根级"，不高亮成目录目标。
+                    .when(row_drop_parent.is_some(), |this| {
+                        this.drag_over::<SidebarDrag>(|style, _drag, _window, _cx| {
+                            style.bg(theme::sidebar_selected_bg())
+                        })
+                    })
                     // 右键：只对目录弹菜单，且**不**触发左键的打开/折叠。
                     //
                     // 为什么用 `on_mouse_down` 而不是 `on_mouse_up`：gpui 的
@@ -4638,8 +5218,8 @@ impl AppShell {
                             .child(SharedString::from(crate::ui_text::sidebar_new_note()))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
-                                    shell.create_note(None, cx);
+                                cx.listener(|shell, _event: &gpui::MouseDownEvent, window, cx| {
+                                    shell.create_note(None, window, cx);
                                 }),
                             ),
                     )
@@ -4659,26 +5239,6 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
                                     shell.create_folder(None, cx);
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("sidebar-new-drawing")
-                            // 测试元数据（只读断言用）：新建画布笔记（`.excalidraw`）。
-                            .debug_selector(|| "sidebar-new-drawing".to_string())
-                            .flex_1()
-                            .h(px(22.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(12.0))
-                            .text_color(theme::status_bar_text())
-                            .child(SharedString::from(crate::ui_text::sidebar_new_drawing()))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
-                                    shell.create_drawing(cx);
                                 }),
                             ),
                     )
@@ -4713,7 +5273,47 @@ impl AppShell {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-                    .children(rows),
+                    .children(rows)
+                    // 列表下方的空白区（drop 到根级 + 点外部确认重命名）。
+                    // 不用"整个树容器"做 drop：父元素的 drop 监听会先于子行触发，
+                    // 把"拖到文件夹行"抢成"移到根级"。专用空白区与行不重叠。
+                    .child(
+                        div()
+                            .id("sidebar-tree-blank")
+                            .debug_selector(|| "sidebar-tree-blank".to_string())
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h(px(24.0))
+                            .w_full()
+                            .on_click(cx.listener(
+                                |shell, _event: &gpui::ClickEvent, _window, cx| {
+                                    // 点空白 = 点外部 → 确认行内重命名（不写库的情况见
+                                    // `commit_rename_node` 的同名短路）。
+                                    // 与行点击同一条守卫：这次 mouse-up 若是"关闭覆盖层"
+                                    // 的同一次手势，不当作点空白（不提交编辑）。
+                                    if !std::mem::take(&mut shell.row_click_armed) {
+                                        return;
+                                    }
+                                    // 菜单项的 mouse-up 余波同理（菜单在 mouse-down 上
+                                    // 执行，菜单消失后 mouse-up 会落到空白区）。
+                                    if shell.menu_action_at.is_some_and(|at| {
+                                        at.elapsed() < std::time::Duration::from_millis(150)
+                                    }) {
+                                        return;
+                                    }
+                                    if shell.editing.is_some() {
+                                        shell.commit_editing_from_outside(cx);
+                                    }
+                                },
+                            ))
+                            .on_drop(cx.listener(|shell, drag: &SidebarDrag, _window, cx| {
+                                shell.on_sidebar_root_drop(drag, cx);
+                            }))
+                            .drag_over::<SidebarDrag>(|style, _drag, _window, _cx| {
+                                style.bg(theme::sidebar_selected_bg())
+                            }),
+                    ),
             )
             // 提示放在按钮**上方**：按钮位置固定，二次确认时不会"跑掉"，
             // 也不会把「图谱」入口往上顶（真机反馈：未解析链接提示出现后，
@@ -5740,7 +6340,13 @@ impl AppShell {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|shell, _event: &gpui::MouseDownEvent, window, cx| {
-                                shell.open_settings(window, cx);
+                                if shell.settings_host_managed {
+                                    // 生产 Main：宿主（AppRoot）统一打开设置页的「同步」分类，
+                                    // 不再打开 AppShell 的组合设置页（避免同步与外观/语言/模板混排）。
+                                    cx.emit(AppShellEvent::OpenSyncSettings);
+                                } else {
+                                    shell.open_settings(window, cx);
+                                }
                             }),
                         ),
                 )
@@ -6044,12 +6650,12 @@ impl AppShell {
                 .text_size(px(28.0))
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme::text_color())
-                .cursor_pointer()
+                .cursor_text()
                 .child(SharedString::from(title))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
-                        shell.begin_title_edit(window, cx);
+                    cx.listener(|shell, event: &MouseDownEvent, window, cx| {
+                        shell.begin_title_edit(event.position, window, cx);
                         cx.stop_propagation();
                     }),
                 )
@@ -9527,6 +10133,30 @@ impl Render for AppShell {
                 });
             }
         }
+        // 新建笔记后 Enter 标题编辑的焦点要压过 `EditorView` 首帧的 `focus_self`。
+        // 延时两帧的理由与上面相同：本帧队列里 `EditorView` 的聚焦在这之后执行，
+        // 第二层 defer 会排到它后面，最终焦点停在标题输入框。
+        if self.pending_focus_title {
+            self.pending_focus_title = false;
+            if let Some(input) = self.title_edit.clone() {
+                let shell = cx.entity().downgrade();
+                window.defer(cx, move |window, cx| {
+                    let input = input.clone();
+                    let shell = shell.clone();
+                    window.defer(cx, move |window, cx| {
+                        let Some(shell) = shell.upgrade() else {
+                            return;
+                        };
+                        // 这两帧内用户可能已经 Enter/Esc/点正文结束编辑：焦点不能
+                        // 塞回一个已经不在元素树里的旧输入框。
+                        if shell.read(cx).title_edit.as_ref() != Some(&input) {
+                            return;
+                        }
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    });
+                });
+            }
+        }
         // 窗口失焦 → 关菜单（只订阅一次，避免每帧重复注册）。
         if !self.activation_observed {
             self.activation_observed = true;
@@ -9626,6 +10256,8 @@ impl Render for AppShell {
         let graph = self.render_graph(window, cx);
         // 历史时间线覆盖层（ADR 0024）：同样只盖一层，不卸载编辑器。
         let history = self.history_panel.clone();
+        // 回收站覆盖层（P0）：同样只盖一层；与其它覆盖层互斥（各自有快捷键/点击守卫）。
+        let trash_panel = self.trash_panel.clone();
         // 侧栏排序菜单：根层绝对定位（侧栏是 `overflow_y_scroll`，放里面会被裁掉）。
         let sort_menu = self.render_sort_menu(cx);
         #[cfg(feature = "sync-ui")]
@@ -9645,6 +10277,11 @@ impl Render for AppShell {
             // (c) 命中行但行上的 up 没触发。日志一直开着（不藏进 debug 构建）。
             .capture_any_mouse_down(cx.listener(
                 |shell, event: &gpui::MouseDownEvent, window, _cx| {
+                    // 左键按下时记下覆盖层状态：mouse-up 的行/空白点击据此决定是否
+                    // 执行（覆盖层在 mouse-down 上关闭时，同一次手势会落到下层行上）。
+                    if event.button == MouseButton::Left {
+                        shell.row_click_armed = !shell.overlay_blocks_row_click();
+                    }
                     trace_mouse!(
                         "[menghunote] mouse down button={:?} at=({:.1},{:.1}) active={} t=+{:.1}ms",
                         event.button,
@@ -9667,6 +10304,25 @@ impl Render for AppShell {
                     );
                 }),
             )
+            // 全局快捷键（默认 Ctrl+N / Ctrl+G；设置页可改绑）。放在根上：
+            // 编辑器/侧栏/输入框先拿到按键，没消费的再冒泡到这里；显式守卫
+            // 保证设置/搜索/图谱/弹层/标题编辑/表格编辑/IME 时不会误触。
+            .on_key_down(
+                cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
+                    if !shell.global_shortcut_direct || shell.shortcuts_blocked(cx) {
+                        return;
+                    }
+                    if shortcuts::matches(CommandId::NewNote, &event.keystroke) {
+                        window.prevent_default();
+                        shell.shortcut_create_note(window, cx);
+                        cx.stop_propagation();
+                    } else if shortcuts::matches(CommandId::ToggleGraph, &event.keystroke) {
+                        window.prevent_default();
+                        shell.shortcut_open_graph(window, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .child(content)
             .child(status_bar)
             .when_some(sort_menu, |this, menu| this.child(menu))
@@ -9680,9 +10336,11 @@ impl Render for AppShell {
         let root = root.when_some(daily_template_picker, |this, picker| this.child(picker));
         // 模板选择器在设置页之上、图谱之下（二者不会同时打开）。
         let root = root.when_some(template_picker, |this, picker| this.child(picker));
-        // 图谱覆盖层；历史时间线在最上层（两者不会同时打开：打开历史时菜单已关闭）。
+        // 图谱/历史/回收站覆盖层：后画的在上；三者互斥（各自打开时快捷键已被
+        // `shortcuts_blocked` 挡住，鼠标也被遮罩拦住）。
         root.when_some(graph, |this, graph| this.child(graph))
             .when_some(history, |this, panel| this.child(panel))
+            .when_some(trash_panel, |this, panel| this.child(panel))
     }
 }
 

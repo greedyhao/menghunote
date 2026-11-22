@@ -17,7 +17,7 @@ use std::path::Path;
 
 use gpui::{
     div, AppContext as _, Entity, InteractiveElement as _, Modifiers, ParentElement as _, Render,
-    Styled as _, TestAppContext,
+    Styled as _, Subscription, TestAppContext,
 };
 use menghunote_app::dev_sync::gate::DevSyncConfig;
 use menghunote_app::dev_sync::service::ServiceConfig;
@@ -274,5 +274,87 @@ async fn sync_panel_is_hidden_until_settings_opened(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("dev-sync-panel").is_some(),
         "点齿轮后同步面板才进入布局"
+    );
+}
+
+/// 宿主接管（生产 `AppRoot`）：底栏 `sync-status` 只发 `OpenSyncSettings` 事件，
+/// 不打开 `AppShell` 自己的组合设置页（`settings-panel` 不得出现）。
+#[gpui::test]
+async fn host_managed_status_click_emits_event_without_opening_shell_settings(
+    cx: &mut TestAppContext,
+) {
+    struct ManagedHost {
+        shell: Entity<AppShell>,
+        sync_events: usize,
+        _sub: Option<Subscription>,
+    }
+
+    impl Render for ManagedHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            div()
+                .size_full()
+                .debug_selector(|| "managed-host".to_string())
+                .child(self.shell.clone())
+        }
+    }
+
+    let (_dir, dev) = open_temp_dev_vault();
+    let vault = dev.vault.clone();
+    let config = dev_sync_config();
+    let (host, cx) = cx.add_window_view(move |_, cx| {
+        let shell = cx.new(|cx| {
+            AppShell::new_with_dev_sync(
+                vault,
+                "dev-sync-ui-managed".to_owned(),
+                config,
+                menghunote_storage::SyncContext::new(dev_vault::DEV_PEER_ID, 1),
+                cx,
+            )
+        });
+        shell.update(cx, |shell, _| shell.set_settings_host_managed(true));
+        let mut host = ManagedHost {
+            shell,
+            sync_events: 0,
+            _sub: None,
+        };
+        let sub = cx.subscribe(
+            &host.shell,
+            |host: &mut ManagedHost,
+             _shell,
+             event: &menghunote_app::shell::AppShellEvent,
+             cx: &mut gpui::Context<ManagedHost>| match *event {
+                menghunote_app::shell::AppShellEvent::OpenSyncSettings => {
+                    host.sync_events += 1;
+                    cx.notify();
+                }
+            },
+        );
+        host._sub = Some(sub);
+        host
+    });
+    cx.run_until_parked();
+
+    let status = cx
+        .debug_bounds("sync-status")
+        .expect("底栏必须有 sync-status");
+    cx.simulate_click(status.center(), Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| host.read(app).sync_events),
+        1,
+        "点击底栏必须发出一次 OpenSyncSettings 事件"
+    );
+    assert!(
+        cx.debug_bounds("settings-panel").is_none(),
+        "宿主接管时不得打开 AppShell 旧组合设置页"
+    );
+    assert!(
+        cx.debug_bounds("dev-sync-panel").is_none(),
+        "宿主接管时同步面板只能由 AppRoot 设置页渲染"
     );
 }

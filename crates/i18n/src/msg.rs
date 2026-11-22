@@ -14,6 +14,7 @@
 //! | `templates.*` | 模板插件（第一方）：侧栏/菜单/选择器/设置页固定文案 |
 //! | `daily_notes.*` | 日记插件（第一方）：侧栏/设置页/提示固定文案 |
 //! | `local.*` | 「仅本地使用（不同步）」入口：Welcome 文案、主界面提示、错误页 |
+//! | `vault.*` | 用户自定义仓库名称：Welcome 表单字段、管理仓库「重命名」 |
 //! | `plugin.<plugin_id>.*` | **后置**：第三方插件命名空间（插件 API 冻结后再定） |
 //!
 //! [`ALL`] 由宏一并生成，供 catalog 一致性测试断言"常量集合 == 两个语言的
@@ -40,6 +41,7 @@ define_messages! {
         NAV_TITLE = "settings.nav.title";
         NAV_APPEARANCE = "settings.nav.appearance";
         NAV_LANGUAGE = "settings.nav.language";
+        NAV_SHORTCUTS = "settings.nav.shortcuts";
         NAV_TEMPLATES = "settings.nav.templates";
         NAV_DAILY_NOTES = "settings.nav.daily_notes";
         NAV_SYNC = "settings.nav.sync";
@@ -76,6 +78,24 @@ define_messages! {
         LANGUAGE_CURRENT = "settings.language.current";
         LANGUAGE_CURRENT_SYSTEM = "settings.language.current_system";
 
+        SHORTCUTS_TITLE = "settings.shortcuts.title";
+        SHORTCUTS_HINT = "settings.shortcuts.hint";
+        SHORTCUTS_NO_CONFLICTS = "settings.shortcuts.no_conflicts";
+        SHORTCUTS_CONFLICTS = "settings.shortcuts.conflicts";
+        SHORTCUTS_CONFLICT_BADGE = "settings.shortcuts.conflict_badge";
+        SHORTCUTS_MODIFY = "settings.shortcuts.modify";
+        SHORTCUTS_RESET = "settings.shortcuts.reset";
+        SHORTCUTS_CAPTURE = "settings.shortcuts.capture";
+        SHORTCUTS_CAPTURE_INVALID = "settings.shortcuts.capture_invalid";
+        SHORTCUTS_CAPTURE_FAILED = "settings.shortcuts.capture_failed";
+        SHORTCUT_SEARCH = "settings.shortcuts.command.search";
+        SHORTCUT_RENAME_NOTE = "settings.shortcuts.command.rename_note";
+        SHORTCUT_FORMAT_BOLD = "settings.shortcuts.command.format_bold";
+        SHORTCUT_FORMAT_ITALIC = "settings.shortcuts.command.format_italic";
+        SHORTCUT_NEW_NOTE = "settings.shortcuts.command.new_note";
+        SHORTCUT_TOGGLE_GRAPH = "settings.shortcuts.command.toggle_graph";
+        SHORTCUT_OPEN_SETTINGS = "settings.shortcuts.command.open_settings";
+
         SYNC_TITLE = "settings.sync.title";
         SYNC_PANEL_TITLE = "settings.sync.panel_title";
         SYNC_DEV_BANNER = "settings.sync.dev_banner";
@@ -91,10 +111,9 @@ define_messages! {
         NO_INSTANCES_HINT = "settings.no_instances_hint";
         INSTANCES_TITLE = "settings.instances.title";
         RELAY_TITLE = "settings.relay.title";
+        RELAY_AUTO_MODE = "settings.relay.auto_mode";
         RELAY_LOCAL_HINT = "settings.relay.local_hint";
         RELAY_REMOTE_HINT = "settings.relay.remote_hint";
-        REMOTE_CONSENT = "settings.remote_consent";
-        REMOTE_TLS_CONSENT_REQUIRED = "settings.remote_tls_consent_required";
         SET_ACTIVE = "settings.set_active";
         ACTIVE_NOW = "settings.active_now";
         INSTANCE = "settings.instance";
@@ -245,6 +264,14 @@ define_messages! {
         DEV_HINT = "local.dev_hint";
         DEV_OPEN_FAILED_TITLE = "local.dev_open_failed_title";
     }
+
+    vault {
+        NAME_LABEL = "vault.name.label";
+        NAME_PLACEHOLDER = "vault.name.placeholder";
+        RENAME = "vault.rename";
+        RENAME_SAVE = "vault.rename.save";
+        RENAME_CANCEL = "vault.rename.cancel";
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +296,7 @@ mod tests {
                     "templates.",
                     "daily_notes.",
                     "local.",
+                    "vault.",
                     "plugin."
                 ]
                 .iter()

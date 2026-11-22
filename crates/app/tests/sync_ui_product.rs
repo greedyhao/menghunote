@@ -4,8 +4,8 @@
 //! `cargo test -p menghunote-app` 的产品路径覆盖（dev-sync 专属测试仍由各自
 //! `#![cfg(feature = "dev-sync")]` 文件保留，不会静默变成 0 覆盖）：
 //!
-//! 1. 默认构建能构造并渲染 `AppRoot`，停在 Welcome（onboarding 入口确实存在，
-//!    「仅本地使用（不同步）」入口 `app-root-local` 在 Welcome 上）；
+//! 1. 默认构建能构造并渲染 `AppRoot`，停在 Welcome（Obsidian 式仓库选择页：
+//!    左栏 `welcome-vault-list`，右栏新建/打开/同步三张卡）；
 //! 2. `local_dev` 在 UI 层被明确拒绝（create 链接应用阶段，不联网、不消费票据）；
 //!    同一表单接受 `remote_tls` 链接，说明产品路径本身可用；
 //! 3. 没有挂同步面板的 `AppShell`（`AppShell::new`）仍能渲染状态栏，设置入口是 no-op，
@@ -14,7 +14,7 @@
 //! A 组第二切片追加（P2 产品路径的可用性补全）：
 //!
 //! 4. P2 数据目录/迁移/DEV 标注（见 `product_startup_*`）；
-//! 5. **仅本地使用**：点击 `app-root-local` → Main（无同步面板/同步状态），
+//! 5. **仅本地使用**：Welcome →「新建本地仓库」→ Main（无同步面板/同步状态），
 //!    数据根下 `local/vault.sqlite3` 被创建；不写 `sync.json`、不建 `instances/`、
 //!    不写身份文件；空库**不播种 demo**；本机 `startup.json` 记 `mode=local`，
 //!    重启后**直接回到本地 Main**（库内容不重置）；
@@ -32,8 +32,12 @@ use gpui::{
     Styled as _, TestAppContext, VisualTestContext,
 };
 use menghunote_app::dev_vault;
+use menghunote_app::onboarding::app_root::SettingsSection;
+use menghunote_app::onboarding::layout::save_startup_preferences;
 use menghunote_app::onboarding::{
-    AppRoot, AppRootOptions, ProfileLayout, RelayMode, RootStateLabel,
+    AppRoot, AppRootOptions, DevSyncProfile, InstanceEntry, ProfileLayout, ProfileStore,
+    RelayApiVersion, RelayMode, RootStateLabel, StartupMode, StartupPreferences,
+    DEFAULT_OPERATION_BUDGET,
 };
 use menghunote_app::shell::AppShell;
 use menghunote_app::ui_text;
@@ -149,6 +153,75 @@ fn create_link(mode: RelayMode, relay: &str) -> String {
     .url
 }
 
+/// 产品构建：设置页把 http loopback 推断为 local_dev 后，保存必须被能力闸拒绝，
+/// 配置原样保留（不写坏 public config）。启动偏好走本地（库缺失）让根视图停在
+/// Welcome 并加载实例列表，从而能打开设置页。
+#[gpui::test]
+async fn product_settings_rejects_inferred_local_dev(cx: &mut TestAppContext) {
+    let (_dir, layout) = temp_layout("settings-local-dev");
+    let entry = InstanceEntry {
+        instance_id: "inst-product-settings".to_owned(),
+        display_name: None,
+        relay_mode: RelayMode::RemoteTls,
+        api_version: RelayApiVersion::V1,
+        relay_url: "https://relay.example".to_owned(),
+        vault_path: layout
+            .vault_path("inst-product-settings")
+            .expect("合法实例 id")
+            .to_string_lossy()
+            .into_owned(),
+        vault_id: "00112233445566778899aabbccddeeff".to_owned(),
+        device_id: "ffeeddccbbaa99887766554433221100".to_owned(),
+    };
+    let mut profile = DevSyncProfile::default();
+    profile.upsert_active(entry);
+    let store: ProfileStore = layout.store();
+    store.save(&profile).expect("写测试配置失败");
+    let before = std::fs::read(&layout.config_path).expect("配置必须存在");
+    // 本地库路径故意不存在：boot 回到 Welcome（加载 profile，不自动打开实例）。
+    save_startup_preferences(
+        &layout.startup_path(),
+        &StartupPreferences::with_local_vault_path(
+            StartupMode::Local,
+            layout.default_local_vault_path(),
+        ),
+    )
+    .expect("写启动偏好失败");
+
+    let options = product_options(layout.clone());
+    let (root, cx) = cx.add_window_view(move |_window, cx| AppRoot::new(options, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        root.update(cx, |root, _| root.state_label()),
+        RootStateLabel::Welcome,
+        "本地库缺失时必须回到 Welcome（配置仍加载）"
+    );
+    root.update(cx, |root, cx| {
+        root.open_settings(cx);
+        root.settings_select_section(SettingsSection::Relay, cx);
+    });
+    cx.run_until_parked();
+    expect_bounds(cx, "settings-relay");
+
+    root.update(cx, |root, cx| {
+        root.settings_set_relay("http://127.0.0.1:18080", cx);
+        root.settings_save(cx);
+    });
+    cx.run_until_parked();
+    let error = root
+        .update(cx, |root, _| root.settings_error().map(str::to_owned))
+        .expect("产品构建保存 http loopback 必须内联报错");
+    assert!(
+        error.contains("不开放 relay 模式") && error.contains("local_dev"),
+        "产品构建必须拒绝推断出的 local_dev：{error}"
+    );
+    assert_eq!(
+        std::fs::read(&layout.config_path).expect("配置必须仍可读"),
+        before,
+        "被拒绝的保存不得写配置"
+    );
+}
+
 /// 1) 产品构建默认入口存在：`AppRoot` 渲染 Welcome，没有 dev-sync 专属设置面板。
 #[gpui::test]
 async fn product_root_starts_at_welcome(cx: &mut TestAppContext) {
@@ -172,9 +245,20 @@ async fn product_root_starts_at_welcome(cx: &mut TestAppContext) {
         cx.debug_bounds("app-root-dev-banner").is_none(),
         "产品构建不得出现 DEV 警示条"
     );
+    for selector in [
+        "welcome-vault-list",
+        "welcome-new-local",
+        "welcome-open-local",
+        "welcome-sync-remote",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "产品 Welcome 必须有 Obsidian 式仓库选择入口：{selector}"
+        );
+    }
     assert!(
-        cx.debug_bounds("app-root-local").is_some(),
-        "产品构建必须有「仅本地使用（不同步）」入口"
+        cx.debug_bounds("app-root-local").is_none(),
+        "旧的单按钮「仅本地使用」入口已移除"
     );
     assert_eq!(
         AppRoot::local_entry_label(),
@@ -383,8 +467,9 @@ async fn product_startup_uses_new_layout_migrates_legacy_and_shows_local_entry(
         "产品构建不得出现 DEV 警示条"
     );
     assert!(
-        cx.debug_bounds("app-root-local").is_some(),
-        "产品构建 Welcome 必须有「仅本地使用」入口"
+        cx.debug_bounds("welcome-new-local").is_some()
+            && cx.debug_bounds("welcome-open-local").is_some(),
+        "产品构建 Welcome 必须有本地仓库新建/打开入口"
     );
     assert_eq!(
         std::fs::read(&legacy_config).expect("旧配置必须仍在"),
@@ -561,16 +646,19 @@ async fn product_local_entry_opens_empty_local_vault_without_sync(cx: &mut TestA
         !vault_path.exists(),
         "进入 Welcome 本身不得创建本地库（只有点入口才打开）"
     );
-    let local = expect_bounds(cx, "app-root-local");
-
-    // 真实点击入口（不是直接调方法）：验证 Welcome 的动作接线。
-    cx.simulate_click(local.center(), Modifiers::default());
+    // 真实点击入口（不是直接调方法）：展开「新建本地仓库」并确认默认目录。
+    let new_local = expect_bounds(cx, "welcome-new-local");
+    cx.simulate_click(new_local.center(), Modifiers::default());
+    cx.run_until_parked();
+    expect_bounds(cx, "welcome-new-local-dir");
+    let confirm = expect_bounds(cx, "welcome-new-local-confirm");
+    cx.simulate_click(confirm.center(), Modifiers::default());
     cx.run_until_parked();
 
     assert_eq!(
         root.update(cx, |root, _| root.state_label()),
         RootStateLabel::Main,
-        "点击「仅本地使用」必须进入 Main"
+        "「新建本地仓库」必须进入 Main"
     );
     assert!(root.update(cx, |root, _| root.has_main_shell()));
     assert!(
@@ -693,7 +781,8 @@ async fn product_local_open_failure_lands_on_error_page(cx: &mut TestAppContext)
         root
     });
     cx.run_until_parked();
-    let local = expect_bounds(cx, "app-root-local");
+    // 默认本地库已存在（坏字节）→ 左栏出现本地行；点击直接打开（不要求先设为默认）。
+    let local = expect_bounds(cx, "welcome-vault-local");
     cx.simulate_click(local.center(), Modifiers::default());
     cx.run_until_parked();
 
@@ -717,4 +806,132 @@ async fn product_local_open_failure_lands_on_error_page(cx: &mut TestAppContext)
         broken_before,
         "打不开时不得覆盖/重建本地库"
     );
+}
+
+/// 9) 产品构建（无 `dev-sync`）：Create/Join 表单**不出现** DEV 勾选与 DEV 状态提示，
+///    提交也不要求 `consent`（用户截图回归：产品构建仍在 Create 表单显示 DEV 文案）。
+#[gpui::test]
+async fn product_forms_have_no_dev_consent_and_create_submits_without_it(cx: &mut TestAppContext) {
+    let (_dir, layout) = temp_layout("no-dev-consent");
+    let instance_id = "inst-product-no-dev";
+    let options = product_options(layout.clone());
+    let (root, cx) = cx.add_window_view(move |_window, cx| AppRoot::new(options, cx));
+    cx.run_until_parked();
+
+    // Welcome 的**统一同步表单**（唯一面向用户的远程入口）：产品构建没有 DEV 勾选，
+    // 也没有旧的手动 relay/vault_id/恢复码字段。
+    let card = expect_bounds(cx, "welcome-sync-remote");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.run_until_parked();
+    for selector in [
+        "welcome-sync-link",
+        "welcome-sync-dir",
+        "welcome-sync-dir-browse",
+        "welcome-sync-confirm",
+    ] {
+        expect_bounds(cx, selector);
+    }
+    for selector in [
+        "welcome-sync-consent",
+        "app-root-consent",
+        "app-root-remote-dev-notice",
+        "app-root-join-relay-input",
+        "app-root-vault-id-input",
+        "app-root-recovery-input",
+        "app-root-invite-input",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "产品构建的统一同步表单不得出现 {selector}"
+        );
+    }
+    root.update(cx, |root, cx| root.back_to_welcome(cx));
+    cx.run_until_parked();
+
+    // Join：产品构建同样不能出现 DEV 状态标注/远程确认勾选/模式单选。
+    root.update(cx, |root, cx| root.enter_join_form(cx));
+    cx.run_until_parked();
+    expect_bounds(cx, "app-root-join-relay-hint");
+    for selector in [
+        "app-root-remote-dev-notice",
+        "app-root-join-remote-consent",
+        "app-root-join-mode-local_dev",
+        "app-root-join-mode-remote_tls",
+        "app-root-join-mode",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "产品构建 Join 表单不得出现 {selector}"
+        );
+    }
+    // 模式按地址自动推断：http loopback 被判为 local_dev，产品构建提交必须明确拒绝。
+    root.update(cx, |root, cx| {
+        root.join_form_set_relay("http://127.0.0.1:18080", cx);
+        root.submit_join(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        root.update(cx, |root, _| root.state_label()),
+        RootStateLabel::JoinForm,
+        "产品构建的 local_dev 必须在 UI 校验阶段拒绝，不进入后台"
+    );
+    let error = root
+        .update(cx, |root, _| root.join_form_error().map(str::to_owned))
+        .expect("产品构建 Join 提交 http loopback 必须内联报错");
+    assert!(
+        error.contains("不开放 relay 模式") && error.contains("local_dev"),
+        "产品构建必须拒绝推断出的 local_dev：{error}"
+    );
+
+    // Create：应用 remote_tls 链接后也不得出现任何 DEV 文案/勾选。
+    let link = create_link(RelayMode::RemoteTls, "https://127.0.0.1:1");
+    root.update(cx, |root, cx| {
+        root.enter_create_link_form(cx);
+        root.form_set_create_link(&link, cx);
+        root.form_apply_create_link(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        root.update(cx, |root, _| root.form_has_create_link()),
+        "产品构建必须能应用 remote_tls 创建链接"
+    );
+    for selector in [
+        "app-root-consent",
+        "app-root-remote-consent",
+        "app-root-remote-dev-notice",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "产品构建 Create 表单不得出现 {selector}（DEV 只属于 dev-sync 构建）"
+        );
+    }
+
+    // 提交不要求 consent：直接进入后台（这里用必然连接失败的 127.0.0.1:1 收尾，
+    // 只证明没有被"同意开发同步 / 确认 HTTPS"挡住）。
+    let dir = layout
+        .instance_dir(instance_id)
+        .expect("合法实例 id")
+        .display()
+        .to_string();
+    root.update(cx, |root, cx| {
+        root.form_set_dir(&dir, cx);
+        root.submit_create(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        root.update(cx, |root, _| root.form_error().is_none()),
+        "产品构建提交不得出现 consent 类表单错误：{:?}",
+        root.update(cx, |root, _| root.form_error().map(str::to_owned))
+    );
+    assert_eq!(
+        root.update(cx, |root, _| root.state_label()),
+        RootStateLabel::Working,
+        "产品构建提交 Create 必须直接进入后台（无 DEV 勾选/HTTPS 确认）"
+    );
+    assert!(
+        root.update(cx, |root, cx| root
+            .wait_for_create_terminal(cx, DEFAULT_OPERATION_BUDGET)),
+        "Create 必须在预算内到达终态（连接被拒也应快速失败）"
+    );
+    cx.run_until_parked();
 }

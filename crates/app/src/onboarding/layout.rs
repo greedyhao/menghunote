@@ -10,16 +10,24 @@
 //! - 恢复码只在 Create 成功后的备份页内存里存在（`onboarding::create` 的 `Zeroizing`），
 //!   从 `serialize` 的字段集合里根本不存在——这不是"记得别写"，而是类型上写不进去。
 //!
-//! ## 默认位置（ADR 0011；P2 改成产品目录）
+//! ## 默认位置
 //!
-//! | 平台 | 数据 | 配置 |
+//! **vault（库/实例目录）默认放在用户可见的文档目录**，不再默认写
+//! `%LOCALAPPDATA%`；用户可以在 Create/Join 表单里改，选择会写进公开配置的
+//! `vault_path`（旧配置里的路径原样保留、不迁移）。
+//!
+//! | 平台 | vault 默认根 | 公开配置 |
 //! | --- | --- | --- |
-//! | Windows | `%LOCALAPPDATA%\menghunote\instances\<id>\` | `%LOCALAPPDATA%\menghunote\sync.json` |
-//! | Linux | `$XDG_DATA_HOME/menghunote/instances/<id>/` | `$XDG_CONFIG_HOME/menghunote/sync.json` |
+//! | Windows | `%USERPROFILE%\Documents\menghunote\`（Documents 不存在则 `%USERPROFILE%\menghunote\`） | `%LOCALAPPDATA%\menghunote\sync.json` |
+//! | Linux/macOS | `$HOME/Documents/menghunote/`（Documents 不存在则 `$HOME/menghunote/`） | `$XDG_CONFIG_HOME/menghunote/sync.json` |
 //!
-//! 环境变量缺失时分别回退 `~/.local/share` 与 `~/.config`；**HOME 也没有就报错**，
-//! 绝不回退 cwd/tmp（真实使用把库留在临时目录是数据丢失）。测试用
-//! [`ProfileLayout::new`] 显式注入 `target/tmp` 下的路径。
+//! - 实例目录默认 `<vault 根>/instances/<id>/`，本地库默认
+//!   `<vault 根>/local/vault.sqlite3`；
+//! - 配置 `sync.json` 仍然很小、只含公开定位信息，留在平台配置目录（LOCALAPPDATA）；
+//! - 环境变量缺失时配置目录分别回退 `~/.local/share` 与 `~/.config`；**HOME 也没有
+//!   就报错**，绝不回退 cwd/tmp（真实使用把库留在临时目录是数据丢失）。
+//! - 测试用 [`ProfileLayout::new`] 显式注入 `target/tmp` 下的路径：显式布局**不读
+//!   平台环境**，默认 vault 根就是数据根（既有测试/第三方注入语义不变）。
 //!
 //! 实例目录内的文件名本轮**不改名**：库仍是 `vault.sqlite3`、身份仍是
 //! `dev-identity.bin`（动它们就会碰用户数据/身份，另行规划）。
@@ -42,11 +50,25 @@
 //! ```json
 //! { "version": 2, "active_instance": "inst-...",
 //!   "instances": [{ "instance_id": "...", "relay_mode": "local_dev", "relay_url": "...",
-//!                   "vault_path": "...", "vault_id": "...", "device_id": "..." }] }
+//!                   "vault_path": "...", "vault_id": "...", "device_id": "...",
+//!                   "display_name": "我的笔记库" }] }
 //! ```
 //!
 //! v1（没有 `relay_mode`）只在 [`ProfileStore::load`] 里**显式迁移**为 `local_dev`
 //! 并写回 v2；未知版本/模式一律明确报错（ADR 0013 §1）。
+//!
+//! ## 用户自定义仓库名称（`display_name`）
+//!
+//! `display_name` 是**可选显示名**（[`InstanceEntry::display_name`]），只影响界面文案：
+//!
+//! - **不是**路径，也**不参与**实例目录/vault 文件名/身份文件的任何计算——改名不移动、
+//!   不复制、不重建库（`vault_path`/`vault_id`/`device_id` 原样保留）；
+//! - 字段带 `#[serde(default)]`：v2 旧配置（没有该字段）照常可读，读成 `None`；
+//!   配置 `version` **仍是 2**（只增可选字段，旧版本程序忽略未知字段也能读）；
+//! - 校验（[`normalize_display_name`]）：trim 后 1–64 个字符、禁止控制字符；
+//!   空白/空串一律归一为 `None`（显示层回退目录名）；中文/空格/emoji 都允许；
+//! - 显示顺序（[`InstanceEntry::effective_name`]）：自定义名 → 库文件所在目录名 →
+//!   [`super::settings::short_public_id`]（**不是**显示 `inst-...` 全串）。
 //!
 //! ## 原子写
 //!
@@ -100,6 +122,13 @@ pub const STARTUP_PREFERENCES_VERSION: u32 = 1;
 /// 缺失/损坏/未知 key 一律回退「外观」。
 pub const SETTINGS_UI_FILE_NAME: &str = "settings-ui.json";
 
+/// 快捷键偏好文件名（数据根下；本机 UI 偏好）。
+///
+/// 与 [`crate::shortcuts`] 的 `SHORTCUTS_FILE_NAME` 同一份约定；这里显式保留
+/// 路径方法，保证测试注入的显式布局把偏好写进临时数据根而不是用户目录。
+/// 不进 vault、不参与同步、不同步。
+pub const SHORTCUTS_FILE_NAME: &str = "shortcuts.json";
+
 /// 默认实例目录（`instances/`）。
 const INSTANCES_DIR_NAME: &str = "instances";
 
@@ -133,6 +162,16 @@ pub enum ProfileError {
         instance_id: String,
         /// 原因（已脱敏；不含 userinfo/凭据）。
         detail: String,
+    },
+    /// 用户自定义仓库名称非法（trim 后 1–64 字符、不含控制字符）。
+    InvalidDisplayName {
+        /// 原因（只描述规则，不回显整段非法输入）。
+        detail: String,
+    },
+    /// 配置里没有这个实例（显式操作只针对已登记实例，**不自动新增**）。
+    UnknownInstance {
+        /// 找不到的实例 id。
+        instance_id: String,
     },
     /// IO 失败（读写配置/建目录）。
     Io {
@@ -176,6 +215,13 @@ impl std::fmt::Display for ProfileError {
                 f,
                 "实例 {instance_id} 的 relay 配置无效：{detail}；不自动改写配置，请人工修正"
             ),
+            Self::InvalidDisplayName { detail } => {
+                write!(f, "仓库名称无效：{detail}")
+            }
+            Self::UnknownInstance { instance_id } => write!(
+                f,
+                "同步配置里没有该实例：{instance_id}；这是索引操作，不自动新增条目"
+            ),
             Self::Io { path, source } => {
                 write!(f, "同步配置 IO 失败：{}（{source}）", path.display())
             }
@@ -198,6 +244,15 @@ pub struct ProfileLayout {
     /// `None`（测试/兼容注入的显式路径**不触发**任何迁移）。它只用于一次性迁移判定，
     /// 不是当前配置。
     pub legacy_config_path: Option<PathBuf>,
+    /// 用户可见的默认 vault 根（Create/Join/本地入口的**初始值**）。
+    ///
+    /// - [`Self::discover`]：`<Documents>/menghunote`（Documents 不存在则
+    ///   `<HOME>/menghunote`）；
+    /// - [`Self::new`]：`None`——显式注入布局没有平台环境可读，默认根退化为
+    ///   [`Self::data_root`]（测试/第三方注入语义，既有路径不变）。
+    ///
+    /// 它只是**默认值**：真正写入配置的是用户在表单里确认的绝对路径。
+    default_vault_root: Option<PathBuf>,
 }
 
 impl ProfileLayout {
@@ -210,6 +265,7 @@ impl ProfileLayout {
             config_path: config_path.into(),
             instances_dir: instances_dir.into(),
             legacy_config_path: None,
+            default_vault_root: None,
         }
     }
 
@@ -226,6 +282,9 @@ impl ProfileLayout {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
         };
+        // 用户可见的默认 vault 根（与配置目录分开：配置仍留平台目录）。
+        // `env` 是 `Fn` 闭包（Copy）：按值传一份，下面的 cfg 分支仍能继续用同一份。
+        let default_vault_root = user_default_vault_root(env);
         #[cfg(windows)]
         {
             let local = env("LOCALAPPDATA")
@@ -248,6 +307,7 @@ impl ProfileLayout {
                     root.join(LEGACY_APP_DIR_NAME)
                         .join(LEGACY_PROFILE_FILE_NAME),
                 ),
+                default_vault_root,
             })
         }
         #[cfg(not(windows))]
@@ -266,6 +326,7 @@ impl ProfileLayout {
                         .join(LEGACY_APP_DIR_NAME)
                         .join(LEGACY_PROFILE_FILE_NAME),
                 ),
+                default_vault_root,
             })
         }
     }
@@ -322,6 +383,44 @@ impl ProfileLayout {
         Ok(self.instance_dir(instance_id)?.join(VAULT_FILE_NAME))
     }
 
+    /// 用户可见的默认 vault 根（**只是默认值**；用户可在表单里改）。
+    ///
+    /// - 平台默认布局（[`Self::discover`]）：`<Documents>/menghunote`，Documents
+    ///   不存在时退回 `<HOME>/menghunote`（Windows 用 `USERPROFILE`）；
+    /// - 显式布局（[`Self::new`]）：数据根（既有注入语义，不读平台环境）。
+    ///
+    /// 它**不**等于配置目录：`sync.json` 仍留平台配置目录（Windows LOCALAPPDATA）。
+    #[must_use]
+    pub fn default_vault_root(&self) -> PathBuf {
+        self.default_vault_root
+            .clone()
+            .unwrap_or_else(|| self.data_root())
+    }
+
+    /// Create/Join 表单的默认实例目录：`<默认 vault 根>/instances/<id>`。
+    ///
+    /// 与 [`Self::instance_dir`] 的区别：后者恒为配置布局的 `instances/`（旧默认，
+    /// 可能落在 LOCALAPPDATA）；这里返回**用户可见目录**下的位置，作为表单初始值。
+    /// 两者都只是默认值，提交时以用户输入为准（写进 `vault_path`）。
+    pub fn default_instance_dir(&self, instance_id: &str) -> Result<PathBuf, ProfileError> {
+        validate_instance_id(instance_id)?;
+        Ok(self
+            .default_vault_root()
+            .join(INSTANCES_DIR_NAME)
+            .join(instance_id))
+    }
+
+    /// 「仅本地使用」入口的默认库文件：`<默认 vault 根>/local/vault.sqlite3`。
+    ///
+    /// **不建目录、不写配置**；显式布局下与 [`Self::local_vault_path`] 相同（既有
+    /// 测试/注入语义），平台默认布局下是用户文档目录（不再默认 LOCALAPPDATA）。
+    #[must_use]
+    pub fn default_local_vault_path(&self) -> PathBuf {
+        self.default_vault_root()
+            .join(LOCAL_DIR_NAME)
+            .join(VAULT_FILE_NAME)
+    }
+
     /// **数据根**：`instances/` 的上一级（产品目录 `.../menghunote`）。
     ///
     /// 本地（不同步）库与 `instances/` 同级，所以只依赖布局解析结果；显式
@@ -369,6 +468,15 @@ impl ProfileLayout {
         self.data_root().join(SETTINGS_UI_FILE_NAME)
     }
 
+    /// 快捷键偏好路径：`<数据根>/shortcuts.json`。
+    ///
+    /// 本机 UI 偏好（与 [`crate::shortcuts`] 共用文件格式）；不进 vault、
+    /// 不参与同步。测试/显式布局必须走这里，不能落到平台用户目录。
+    #[must_use]
+    pub fn shortcuts_path(&self) -> PathBuf {
+        self.data_root().join(SHORTCUTS_FILE_NAME)
+    }
+
     /// 配置存储句柄。
     #[must_use]
     pub fn store(&self) -> ProfileStore {
@@ -376,6 +484,37 @@ impl ProfileLayout {
             path: self.config_path.clone(),
         }
     }
+}
+
+/// 用户可见的默认 vault 根：`<Documents>/menghunote`，Documents 不存在则
+/// `<HOME>/menghunote`。
+///
+/// - Windows 优先 `USERPROFILE`（需求明确要求 `%USERPROFILE%\Documents\...`；
+///   不跟随 OneDrive 重定向，避免把库写进用户没预期的位置）；
+/// - 其它平台用 `HOME`；
+/// - 两者都没有 → `None`（调用方回退数据根，保证应用仍可用）。
+///
+/// 只做路径解析 + `Documents` 是否存在这一项本机事实判断，不建目录。
+#[must_use]
+pub fn user_default_vault_root(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    user_default_vault_root_for(env, cfg!(windows))
+}
+
+/// [`user_default_vault_root`] 的平台可注入版本（测试在 Linux 上也能覆盖 Windows 分支）。
+#[must_use]
+pub fn user_default_vault_root_for(
+    env: impl Fn(&str) -> Option<String>,
+    windows: bool,
+) -> Option<PathBuf> {
+    let var = if windows { "USERPROFILE" } else { "HOME" };
+    let home = env(var)?;
+    let home = PathBuf::from(home.trim());
+    if home.as_os_str().is_empty() {
+        return None;
+    }
+    let documents = home.join("Documents");
+    let base = if documents.is_dir() { documents } else { home };
+    Some(base.join(APP_DIR_NAME))
 }
 
 /// 上次成功打开的入口（本机启动偏好；不同步、不含秘密/正文）。
@@ -402,24 +541,20 @@ impl StartupMode {
 
     /// 从 JSON 文本解析；缺失/不可读/损坏/未知 `mode`/未知版本一律 `None`。
     ///
+    /// 只取 `mode`，忽略扩展字段（例如 [`StartupPreferences::local_vault_path`]），
+    /// 这样旧客户端/旧测试读新文件仍成立。
+    ///
     /// `version` 字段**可缺省**（`{"mode":"local"}` 也接受，字段最小化）；一旦给出
     /// 就必须是 [`STARTUP_PREFERENCES_VERSION`]，避免未来格式被旧程序误读。
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(text).ok()?;
-        if let Some(version) = value.get("version") {
-            if version.as_u64() != Some(u64::from(STARTUP_PREFERENCES_VERSION)) {
-                return None;
-            }
-        }
-        match value.get("mode")?.as_str()? {
-            "local" => Some(Self::Local),
-            "sync" => Some(Self::Sync),
-            _ => None,
-        }
+        StartupPreferences::parse(text).map(|preferences| preferences.mode)
     }
 
     /// 序列化为稳定 JSON（写入前先落临时文件再 rename）。
+    ///
+    /// 这是**旧格式**（只有 `version` + `mode`）；新代码写
+    /// [`StartupPreferences::to_json`]（可选带 `local_vault_path`）。
     #[must_use]
     pub fn to_json(self) -> String {
         format!(
@@ -429,16 +564,122 @@ impl StartupMode {
     }
 }
 
-/// 读取本机启动偏好；文件不存在/不可读/损坏 → `None`（不报错、不阻塞启动）。
-#[must_use]
-pub fn load_startup_mode(path: &Path) -> Option<StartupMode> {
-    let text = fs::read_to_string(path).ok()?;
-    StartupMode::parse(&text)
+/// 本机启动偏好（`startup.json`）：上次打开的入口 + 上次本地库路径。
+///
+/// 向后兼容：旧文件只有 `{"version":1,"mode":"local"}`（没有 `local_vault_path`），
+/// [`Self::parse`] 仍能读，路径为 `None`（启动引导再按旧数据根/新用户目录回退）。
+///
+/// 只记"上次成功打开的入口"，**不同步、不含正文/秘密**；`version` 保持 1（新增字段
+/// 是可选扩展，旧解析器忽略即可）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupPreferences {
+    /// 上次成功打开的入口。
+    pub mode: StartupMode,
+    /// 上次本地（不同步）库的绝对路径；`None` = 旧格式/没有本地路径。
+    pub local_vault_path: Option<PathBuf>,
 }
 
-/// 原子写入本机启动偏好：同目录临时文件 → rename；失败时旧文件原样保留。
+impl StartupPreferences {
+    /// 只有入口、没有本地路径（同步入口/旧格式）。
+    #[must_use]
+    pub fn new(mode: StartupMode) -> Self {
+        Self {
+            mode,
+            local_vault_path: None,
+        }
+    }
+
+    /// 带上次本地库路径（本地入口成功后写）。
+    #[must_use]
+    pub fn with_local_vault_path(mode: StartupMode, path: impl Into<PathBuf>) -> Self {
+        Self {
+            mode,
+            local_vault_path: Some(path.into()),
+        }
+    }
+
+    /// 从 JSON 文本解析；缺失/不可读/损坏/未知 `mode`/未知版本一律 `None`。
+    ///
+    /// `local_vault_path` 缺失、空串或不是字符串 → `None`（忽略该扩展，不丢 `mode`）。
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        if let Some(version) = value.get("version") {
+            if version.as_u64() != Some(u64::from(STARTUP_PREFERENCES_VERSION)) {
+                return None;
+            }
+        }
+        let mode = match value.get("mode")?.as_str()? {
+            "local" => StartupMode::Local,
+            "sync" => StartupMode::Sync,
+            _ => return None,
+        };
+        let local_vault_path = value
+            .get("local_vault_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        Some(Self {
+            mode,
+            local_vault_path,
+        })
+    }
+
+    /// 序列化为稳定 JSON（写入前先落临时文件再 rename）。
+    ///
+    /// 没有本地路径时不写该字段：保持与旧格式逐字节兼容（旧程序/测试仍按
+    /// `{version,mode}` 读）。
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut value = serde_json::json!({
+            "version": STARTUP_PREFERENCES_VERSION,
+            "mode": self.mode.as_str(),
+        });
+        if let Some(path) = &self.local_vault_path {
+            value["local_vault_path"] =
+                serde_json::Value::String(path.to_string_lossy().into_owned());
+        }
+        let mut text = serde_json::to_string_pretty(&value).unwrap_or_default();
+        text.push('\n');
+        text
+    }
+}
+
+/// 读取本机启动偏好；文件不存在/不可读/损坏 → `None`（不报错、不阻塞启动）。
+#[must_use]
+pub fn load_startup_preferences(path: &Path) -> Option<StartupPreferences> {
+    let text = fs::read_to_string(path).ok()?;
+    StartupPreferences::parse(&text)
+}
+
+/// 兼容旧调用点：只读入口（忽略本地路径）。
+#[must_use]
+pub fn load_startup_mode(path: &Path) -> Option<StartupMode> {
+    load_startup_preferences(path).map(|preferences| preferences.mode)
+}
+
+/// 原子写入本机启动偏好（新格式；可选带本地库路径）。
+pub fn save_startup_preferences(
+    path: &Path,
+    preferences: &StartupPreferences,
+) -> std::io::Result<()> {
+    write_json_file_atomically(path, &preferences.to_json())
+}
+
+/// 原子写入本机启动偏好（旧 API）：**保留**原文件里已记录的本地库路径。
+///
+/// 打开同步实例时只换 `mode`，不应该忘掉用户上次选的本地库位置。
 pub fn save_startup_mode(path: &Path, mode: StartupMode) -> std::io::Result<()> {
-    write_json_file_atomically(path, &mode.to_json())
+    let local_vault_path =
+        load_startup_preferences(path).and_then(|preferences| preferences.local_vault_path);
+    save_startup_preferences(
+        path,
+        &StartupPreferences {
+            mode,
+            local_vault_path,
+        },
+    )
 }
 
 /// 原子写一个小 JSON 偏好文件（同目录临时文件 → `rename`）。
@@ -494,11 +735,55 @@ pub fn generate_instance_id() -> String {
     format!("inst-{nanos:x}-{:x}-{seq:x}", std::process::id())
 }
 
+/// 用户自定义仓库名称的字符上限（Unicode scalar；不按字节计）。
+pub const DISPLAY_NAME_MAX_CHARS: usize = 64;
+
+/// 归一化/校验用户输入的仓库名称。
+///
+/// - 前后空白先 trim；trim 后为空 → `Ok(None)`（"没有自定义名"，显示层回退目录名）；
+/// - 1–[`DISPLAY_NAME_MAX_CHARS`] 个字符（中文/空格/emoji 都合法，与文件名无关）；
+/// - 拒绝控制字符（`char::is_control`：C0/C1/DEL），避免把换行/制表符画进按钮；
+/// - 其它一律保留原文（trim 后的样子），异常返回 [`ProfileError::InvalidDisplayName`]。
+///
+/// 只在**写配置/改名入口**做归一化；显示层用 [`InstanceEntry::effective_name`]。
+pub fn normalize_display_name(raw: &str) -> Result<Option<String>, ProfileError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let len = trimmed.chars().count();
+    if len > DISPLAY_NAME_MAX_CHARS {
+        return Err(ProfileError::InvalidDisplayName {
+            detail: format!(
+                "最多 {DISPLAY_NAME_MAX_CHARS} 个字符（当前 {len} 个）；名称只用于显示，\
+                 不会改动目录/库路径"
+            ),
+        });
+    }
+    if let Some(bad) = trimmed.chars().find(|c| c.is_control()) {
+        return Err(ProfileError::InvalidDisplayName {
+            detail: format!(
+                "不能包含控制字符（发现 U+{:04X}）；名称只用于显示，\
+                 不会改动目录/库路径",
+                u32::from(bad)
+            ),
+        });
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
 /// 一个已保存实例（**只公开信息**）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceEntry {
     /// 本机实例 id（与服务器 `vault_id` 分离）。
     pub instance_id: String,
+    /// 用户自定义显示名（可选；**只影响界面文案**）。
+    ///
+    /// 旧 v2 配置没有该字段 → `#[serde(default)]` 读成 `None`；写入前由
+    /// [`normalize_display_name`] 归一化（trim/1–64 字符/无控制字符，空白 = `None`）。
+    /// **不参与**目录/库路径/身份的任何计算。
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// relay 接入模式（ADR 0013 §1）：`local_dev` / `remote_tls`。
     ///
     /// 未知模式在反序列化时就被拒绝（serde 错误进 [`ProfileError::Corrupt`]），
@@ -549,6 +834,36 @@ impl InstanceEntry {
             .map_or(file.clone(), |parent| {
                 format!("{}/{}", parent.to_string_lossy(), file)
             })
+    }
+
+    /// 库文件所在目录名（`…/instances/inst-a/vault.sqlite3` → `inst-a`）。
+    ///
+    /// 只取目录名（不显示库文件名/完整路径）；路径异常时 `None`。
+    #[must_use]
+    pub fn directory_name(&self) -> Option<String> {
+        Path::new(&self.vault_path)
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().trim().to_owned())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// 界面显示名（**优先自定义名**）：`display_name` → 目录名 → `short_public_id(instance_id)`。
+    ///
+    /// 左下角切换按钮、切换菜单当前行、管理仓库、Welcome 左栏都走这里，保证"同一份
+    /// 名字"；`short_label()` 仍然专供状态栏（目录/库文件名，语义不同）。
+    #[must_use]
+    pub fn effective_name(&self) -> String {
+        if let Some(name) = self
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_owned();
+        }
+        self.directory_name()
+            .unwrap_or_else(|| super::settings::short_public_id(&self.instance_id))
     }
 }
 
@@ -610,6 +925,36 @@ impl DevSyncProfile {
             Some(existing) => *existing = entry,
             None => self.instances.push(entry),
         }
+    }
+
+    /// 改一个已保存实例的**显示名**（`None`/空白 = 清除自定义名，回退目录名）。
+    ///
+    /// 只动 `display_name`：**不碰** `active_instance` / `vault_path` / `vault_id` /
+    /// `device_id`，也**不移动/重建**实例目录、不碰 worker/实例锁。名称先过
+    /// [`normalize_display_name`]（trim、1–64 字符、无控制字符）。
+    ///
+    /// 本方法只改内存；调用方用 [`ProfileStore::save`] 原子写盘（失败时磁盘原样保留）。
+    /// 实例不存在是错误（[`ProfileError::UnknownInstance`]），不自动新增条目。
+    pub fn rename_instance(
+        &mut self,
+        instance_id: &str,
+        name: Option<&str>,
+    ) -> Result<(), ProfileError> {
+        let normalized = match name {
+            Some(raw) => normalize_display_name(raw)?,
+            None => None,
+        };
+        let Some(entry) = self
+            .instances
+            .iter_mut()
+            .find(|entry| entry.instance_id == instance_id)
+        else {
+            return Err(ProfileError::UnknownInstance {
+                instance_id: instance_id.to_owned(),
+            });
+        };
+        entry.display_name = normalized;
+        Ok(())
     }
 
     /// Welcome 列表顺序：active 在前，其余保持登记顺序。
@@ -743,9 +1088,16 @@ impl ProfileStore {
         let mut profile = profile.clone();
         profile.version = PROFILE_VERSION;
         // 写前校验 + canonical 化：配置里只存权威 parser 认可的模式/地址，
-        // 手改的非法值在写回前就失败（不把坏值落盘）。
+        // 手改的非法值在写回前就失败（不把坏值落盘）。显示名同样归一化
+        // （trim；空白 = None；超长/控制字符拒绝）。
         for entry in &mut profile.instances {
             validate_instance_id(&entry.instance_id)?;
+            entry.display_name = entry
+                .display_name
+                .as_deref()
+                .map(normalize_display_name)
+                .transpose()?
+                .flatten();
             let origin = parse_for_build(&entry.relay_url, entry.relay_mode).map_err(|error| {
                 ProfileError::InvalidRelay {
                     instance_id: entry.instance_id.clone(),
@@ -856,6 +1208,7 @@ fn migrate_v1(legacy: DevSyncProfileV1) -> Result<DevSyncProfile, ProfileError> 
         })?;
         profile.instances.push(InstanceEntry {
             instance_id: entry.instance_id,
+            display_name: None,
             relay_mode: RelayMode::LocalDev,
             api_version: RelayApiVersion::V1,
             relay_url: origin.as_str(),
@@ -868,11 +1221,25 @@ fn migrate_v1(legacy: DevSyncProfileV1) -> Result<DevSyncProfile, ProfileError> 
     Ok(profile)
 }
 
-/// v2 配置校验：index、实例 id、模式/URL 与 canonical 形态。
+/// v2 配置校验：index、实例 id、模式/URL 与 canonical 形态、显示名归一化形态。
 fn validate_profile(profile: &DevSyncProfile) -> Result<(), ProfileError> {
     let _ = profile.active()?;
     for entry in &profile.instances {
         validate_instance_id(&entry.instance_id)?;
+        // 磁盘上的名字必须已经是归一化形态（save 会 trim；手改出的空白/超长/
+        // 控制字符不静默改写，直接报错让用户修正）。
+        if let Some(stored) = entry.display_name.as_deref() {
+            let normalized = normalize_display_name(stored)?;
+            if normalized.as_deref() != Some(stored) {
+                return Err(ProfileError::InvalidDisplayName {
+                    detail: format!(
+                        "实例 {} 的 display_name 不是归一化形态（应为 {:?}；\
+                         首尾空白/纯空白请手工修正）",
+                        entry.instance_id, normalized
+                    ),
+                });
+            }
+        }
         let origin = parse_for_build(&entry.relay_url, entry.relay_mode).map_err(|error| {
             ProfileError::InvalidRelay {
                 instance_id: entry.instance_id.clone(),
@@ -1015,10 +1382,17 @@ mod tests {
         #[cfg(windows)]
         {
             let local = root.join("localappdata");
-            std::fs::create_dir_all(&local).expect("创建临时 LOCALAPPDATA 失败");
+            let home = root.join("home");
+            for dir in [&local, &home] {
+                std::fs::create_dir_all(dir).expect("创建临时平台目录失败");
+            }
             env.insert(
                 "LOCALAPPDATA".to_owned(),
                 local.to_string_lossy().into_owned(),
+            );
+            env.insert(
+                "USERPROFILE".to_owned(),
+                home.to_string_lossy().into_owned(),
             );
         }
         ProfileLayout::discover(move |key| env.get(key).cloned()).expect("临时默认布局解析失败")
@@ -1516,6 +1890,7 @@ mod tests {
         let mut profile = DevSyncProfile::default();
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-a".to_owned(),
+            display_name: None,
             relay_mode: RelayMode::RemoteTls,
             api_version: RelayApiVersion::V1,
             relay_url: "https://relay.example".to_owned(),
@@ -1545,6 +1920,7 @@ mod tests {
         // 再写一次（覆盖）后旧内容不应残留。
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-b".to_owned(),
+            display_name: None,
             relay_mode: RelayMode::RemoteTls,
             api_version: RelayApiVersion::V1,
             relay_url: "https://relay.example".to_owned(),
@@ -1782,6 +2158,7 @@ mod tests {
         let mut profile = DevSyncProfile::default();
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-bad".to_owned(),
+            display_name: None,
             relay_mode: RelayMode::LocalDev,
             api_version: RelayApiVersion::V1,
             // local_dev 只允许 http + loopback 白名单。
@@ -1831,6 +2208,7 @@ mod tests {
         let mut profile = loaded;
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-v2".to_owned(),
+            display_name: None,
             relay_mode: RelayMode::RemoteTls,
             api_version: RelayApiVersion::V2,
             relay_url: "https://relay.example".to_owned(),
@@ -1947,6 +2325,533 @@ mod tests {
             layout.startup_path().parent(),
             Some(layout.data_root().as_path()),
             "启动偏好必须与本地库/实例目录同一数据根"
+        );
+    }
+
+    /// 默认 vault 根：Documents 存在 → `<home>/Documents/menghunote`；不存在 →
+    /// `<home>/menghunote`。Windows 分支优先 `USERPROFILE`（不读 `HOME`）。
+    #[test]
+    fn user_default_vault_root_prefers_documents_and_falls_back_to_home() {
+        let root = temp_dir("user-root");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("建 home 失败");
+        let home_text = home.to_string_lossy().into_owned();
+
+        // 没有 Documents：回退 <home>/menghunote（仍是用户目录，不是 LOCALAPPDATA）。
+        let unix = user_default_vault_root_for(env_of(&[("HOME", &home_text)]), false)
+            .expect("HOME 可解析");
+        assert_eq!(unix, home.join(APP_DIR_NAME));
+
+        // 有 Documents：优先 Documents/menghunote。
+        let documents = home.join("Documents");
+        std::fs::create_dir_all(&documents).expect("建 Documents 失败");
+        let unix = user_default_vault_root_for(env_of(&[("HOME", &home_text)]), false)
+            .expect("HOME 可解析");
+        assert_eq!(unix, documents.join(APP_DIR_NAME));
+
+        // Windows：只认 USERPROFILE，HOME 里即使有 Documents 也不影响。
+        let windows_home = root.join("windows-home");
+        std::fs::create_dir_all(windows_home.join("Documents")).expect("建 Windows Documents 失败");
+        let windows_text = windows_home.to_string_lossy().into_owned();
+        let win = user_default_vault_root_for(
+            env_of(&[
+                ("USERPROFILE", &windows_text),
+                ("HOME", "/definitely-wrong"),
+            ]),
+            true,
+        )
+        .expect("USERPROFILE 可解析");
+        assert_eq!(win, windows_home.join("Documents").join(APP_DIR_NAME));
+
+        // 变量缺失 → None（调用方回退数据根，不 panic）。
+        assert_eq!(user_default_vault_root_for(env_of(&[]), true), None);
+        assert_eq!(user_default_vault_root_for(env_of(&[]), false), None);
+    }
+
+    /// 显式布局不读平台环境：默认 vault 根 = 数据根（既有测试/注入语义）。
+    #[test]
+    fn explicit_layout_keeps_data_root_defaults_and_never_reads_localappdata() {
+        let root = temp_dir("explicit-defaults");
+        let layout = ProfileLayout::new(
+            root.join("config/sync.json"),
+            root.join("data").join("instances"),
+        );
+        let data_root = root.join("data");
+        assert_eq!(layout.default_vault_root(), data_root);
+        assert_eq!(
+            layout.default_instance_dir("inst-x").expect("合法 id"),
+            data_root.join("instances").join("inst-x")
+        );
+        assert_eq!(
+            layout.default_instance_dir("inst-x").expect("合法 id"),
+            layout.instance_dir("inst-x").expect("合法 id"),
+            "显式布局下默认实例目录与实例目录必须一致（不破坏既有测试）"
+        );
+        assert_eq!(
+            layout.default_local_vault_path(),
+            layout.local_vault_path(),
+            "显式布局下本地库默认位置保持数据根（既有测试契约）"
+        );
+        assert!(
+            !layout
+                .default_local_vault_path()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("localappdata"),
+            "默认本地库路径不得落在 LOCALAPPDATA"
+        );
+        assert!(
+            layout.default_instance_dir("..").is_err(),
+            "默认实例目录仍必须校验 id（防路径穿越）"
+        );
+    }
+
+    /// 平台默认布局：vault 默认根在用户文档目录（不是 LOCALAPPDATA）。
+    #[cfg(not(windows))]
+    #[test]
+    fn discovered_layout_uses_user_documents_instead_of_localappdata() {
+        let root = temp_dir("discover-user-docs");
+        let home = root.join("home");
+        let documents = home.join("Documents");
+        std::fs::create_dir_all(&documents).expect("建 Documents 失败");
+        let layout = discover_in(&root);
+
+        assert_eq!(
+            layout.default_vault_root(),
+            documents.join(APP_DIR_NAME),
+            "Discover 的默认 vault 根必须在用户 Documents 下"
+        );
+        assert_eq!(
+            layout.default_instance_dir("inst-new").expect("合法 id"),
+            documents
+                .join(APP_DIR_NAME)
+                .join("instances")
+                .join("inst-new")
+        );
+        assert_eq!(
+            layout.default_local_vault_path(),
+            documents
+                .join(APP_DIR_NAME)
+                .join("local")
+                .join(VAULT_FILE_NAME)
+        );
+        for path in [
+            layout.default_instance_dir("inst-new").expect("合法 id"),
+            layout.default_local_vault_path(),
+        ] {
+            let text = path.to_string_lossy().to_lowercase();
+            assert!(
+                !text.contains("localappdata"),
+                "不得默认写 LOCALAPPDATA：{text}"
+            );
+            assert!(!text.contains("appdata"), "不得默认写 AppData：{text}");
+        }
+        // 配置仍留平台配置目录（小、公开），只有 vault 数据移动到用户目录。
+        #[cfg(not(windows))]
+        assert_eq!(
+            layout.config_path,
+            root.join("config")
+                .join(APP_DIR_NAME)
+                .join(PROFILE_FILE_NAME)
+        );
+        // 旧数据根 local/ 路径仍由 `local_vault_path()` 提供（兼容旧用户）。
+        assert_eq!(
+            layout.local_vault_path(),
+            root.join("data")
+                .join(APP_DIR_NAME)
+                .join(LOCAL_DIR_NAME)
+                .join(VAULT_FILE_NAME)
+        );
+    }
+
+    /// `startup.json`：新格式带 `local_vault_path` 可往返；旧格式（只有
+    /// `{version,mode}`）仍可读，local 路径为 `None`；`save_startup_mode` 不丢已记路径。
+    #[test]
+    fn startup_preferences_round_trip_and_legacy_format_is_readable() {
+        let dir = temp_dir("startup-preferences");
+        let path = dir.join(STARTUP_FILE_NAME);
+        let local_path = dir.join("Documents/menghunote/local/vault.sqlite3");
+
+        save_startup_preferences(
+            &path,
+            &StartupPreferences::with_local_vault_path(StartupMode::Local, local_path.clone()),
+        )
+        .expect("写新格式失败");
+        let loaded = load_startup_preferences(&path).expect("新格式必须可读");
+        assert_eq!(loaded.mode, StartupMode::Local);
+        assert_eq!(loaded.local_vault_path, Some(local_path.clone()));
+        // 旧 API 仍只读 mode。
+        assert_eq!(load_startup_mode(&path), Some(StartupMode::Local));
+
+        // 打开同步实例：只换 mode，保留上次本地路径。
+        save_startup_mode(&path, StartupMode::Sync).expect("写 sync 失败");
+        let loaded = load_startup_preferences(&path).expect("同步格式必须可读");
+        assert_eq!(loaded.mode, StartupMode::Sync);
+        assert_eq!(
+            loaded.local_vault_path,
+            Some(local_path),
+            "切到同步入口不得忘记上次本地库路径"
+        );
+
+        // 旧格式（没有 local_vault_path）：仍能读，路径为 None。
+        std::fs::write(&path, b"{\n  \"version\": 1,\n  \"mode\": \"local\"\n}\n")
+            .expect("写旧格式失败");
+        let legacy = load_startup_preferences(&path).expect("旧格式必须可读");
+        assert_eq!(legacy.mode, StartupMode::Local);
+        assert_eq!(legacy.local_vault_path, None);
+        assert_eq!(
+            StartupMode::parse("{\"mode\":\"local\"}"),
+            Some(StartupMode::Local)
+        );
+
+        // 空串路径视为没有记录（不把空路径写进配置/启动逻辑）。
+        std::fs::write(
+            &path,
+            b"{\"version\":1,\"mode\":\"local\",\"local_vault_path\":\"\"}",
+        )
+        .expect("写空路径失败");
+        assert_eq!(
+            load_startup_preferences(&path)
+                .expect("必须可读")
+                .local_vault_path,
+            None
+        );
+
+        // 损坏/未知版本仍回退 None。
+        for corrupt in [
+            "{ broken",
+            "{\"version\":99,\"mode\":\"local\"}",
+            "{\"mode\":\"welcome\"}",
+        ] {
+            std::fs::write(&path, corrupt).expect("写坏偏好失败");
+            assert_eq!(load_startup_preferences(&path), None, "{corrupt:?}");
+        }
+    }
+
+    // ---- 用户自定义仓库名称（display_name，只影响显示）----
+
+    fn entry(instance_id: &str, vault_dir: &str) -> InstanceEntry {
+        InstanceEntry {
+            instance_id: instance_id.to_owned(),
+            display_name: None,
+            relay_mode: RelayMode::RemoteTls,
+            api_version: RelayApiVersion::V1,
+            relay_url: "https://relay.example".to_owned(),
+            vault_path: format!("{vault_dir}/vault.sqlite3"),
+            vault_id: "00112233445566778899aabbccddeeff".to_owned(),
+            device_id: "ffeeddccbbaa99887766554433221100".to_owned(),
+        }
+    }
+
+    /// 旧 v2 配置（没有 `display_name`）照常可读；`version` 仍是 2（不升版本）。
+    #[test]
+    fn v2_profile_without_display_name_is_readable_and_keeps_version_two() {
+        let dir = temp_dir("display-name-legacy");
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
+        std::fs::write(
+            layout.config_path.clone(),
+            br#"{
+              "version": 2,
+              "active_instance": "inst-old",
+              "instances": [{
+                "instance_id": "inst-old",
+                "relay_mode": "remote_tls",
+                "api_version": 2,
+                "relay_url": "https://relay.example",
+                "vault_path": "/data/instances/inst-old/vault.sqlite3",
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+              }]
+            }"#,
+        )
+        .expect("写旧 v2 配置失败");
+
+        let loaded = layout
+            .store()
+            .load()
+            .expect("旧 v2 必须可读")
+            .expect("存在");
+        assert_eq!(loaded.version, PROFILE_VERSION);
+        assert_eq!(loaded.version, 2, "只增可选字段，配置版本仍为 2");
+        let entry = loaded.active().expect("active 合法").expect("有 active");
+        assert_eq!(entry.display_name, None, "缺省字段必须是 None");
+        assert_eq!(entry.effective_name(), "inst-old", "显示层回退目录名");
+        assert_eq!(loaded.instances.len(), 1);
+    }
+
+    /// 写入/读回：名字落盘为 `display_name`，且**不碰**路径/身份/active/vault 目录。
+    #[test]
+    fn display_name_round_trips_without_touching_vault_identity_or_active() {
+        let dir = temp_dir("display-name-roundtrip");
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
+        let store = layout.store();
+        let mut profile = DevSyncProfile::default();
+        profile.upsert_active(entry("inst-a", "/data/instances/inst-a"));
+        store.save(&profile).expect("写配置失败");
+
+        let before = store.load().expect("读回").expect("存在");
+        let mut edited = before.clone();
+        edited
+            .rename_instance("inst-a", Some("  研究库 / Research  "))
+            .expect("改名");
+        store.save(&edited).expect("写改名后的配置失败");
+
+        let loaded = store.load().expect("读回").expect("存在");
+        let a = loaded.find("inst-a").expect("条目仍在");
+        assert_eq!(
+            a.display_name.as_deref(),
+            Some("研究库 / Research"),
+            "保存前必须 trim（中文/空格/下划线都保留）"
+        );
+        assert_eq!(a.effective_name(), "研究库 / Research");
+        assert_eq!(
+            (
+                a.vault_path.as_str(),
+                a.vault_id.as_str(),
+                a.device_id.as_str()
+            ),
+            (
+                "/data/instances/inst-a/vault.sqlite3",
+                "00112233445566778899aabbccddeeff",
+                "ffeeddccbbaa99887766554433221100"
+            ),
+            "改名只动 display_name：路径/身份原样保留"
+        );
+        assert_eq!(loaded.active_instance.as_deref(), Some("inst-a"));
+        assert_eq!(loaded.version, 2);
+        // 原库目录没有任何写入（测试里本来就只有配置文件）。
+        assert!(store.path().is_file());
+        let raw = std::fs::read_to_string(store.path()).expect("读配置文本");
+        assert!(
+            raw.contains("\"display_name\": \"研究库 / Research\""),
+            "配置里必须有 display_name：{raw}"
+        );
+    }
+
+    /// 校验：trim/空白 → None；超长与超过 64 字符拒绝；控制字符拒绝；中文/emoji 合法。
+    #[test]
+    fn display_name_normalization_bounds_and_control_chars() {
+        assert_eq!(normalize_display_name("").expect("空合法"), None);
+        assert_eq!(normalize_display_name("   ").expect("纯空白合法"), None);
+        assert_eq!(normalize_display_name("\t\n ").expect("纯空白合法"), None);
+        assert_eq!(
+            normalize_display_name("  我的库  ").expect("trim 合法"),
+            Some("我的库".to_owned())
+        );
+        // 中文 + 空格 + emoji + 下划线都允许（与文件名无关，只做显示）。
+        assert_eq!(
+            normalize_display_name("工作 笔记 🚀_v2").expect("中文/emoji 合法"),
+            Some("工作 笔记 🚀_v2".to_owned())
+        );
+        // 边界：64 个字符可以，65 个拒绝。
+        let exactly = "库".repeat(DISPLAY_NAME_MAX_CHARS);
+        assert_eq!(
+            normalize_display_name(&exactly)
+                .expect("64 字符合法")
+                .map(|name| name.chars().count()),
+            Some(DISPLAY_NAME_MAX_CHARS)
+        );
+        let too_long = "库".repeat(DISPLAY_NAME_MAX_CHARS + 1);
+        let error = normalize_display_name(&too_long).expect_err("超长必须拒绝");
+        assert!(
+            matches!(error, ProfileError::InvalidDisplayName { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("64"), "{error}");
+        // 控制字符（换行/制表/ESC）拒绝，不允许把换行画进按钮。
+        for bad in ["a\nb", "a\tb", "\u{7f}", "a\u{1b}b"] {
+            assert!(
+                matches!(
+                    normalize_display_name(bad),
+                    Err(ProfileError::InvalidDisplayName { .. })
+                ),
+                "{bad:?} 必须被拒绝"
+            );
+        }
+    }
+
+    /// 改名 API：只改目标实例；`None`/空白清除；未知实例报错；不自动新增条目。
+    #[test]
+    fn rename_instance_only_touches_the_target_entry() {
+        let mut profile = DevSyncProfile::default();
+        profile.upsert_active(entry("inst-a", "/data/instances/inst-a"));
+        profile
+            .instances
+            .push(entry("inst-b", "/data/instances/inst-b"));
+        let before_b = profile.find("inst-b").cloned().expect("有 B");
+
+        profile
+            .rename_instance("inst-a", Some("甲库"))
+            .expect("改名成功");
+        assert_eq!(
+            profile.find("inst-a").and_then(|e| e.display_name.clone()),
+            Some("甲库".to_owned())
+        );
+        assert_eq!(
+            profile.find("inst-b").cloned(),
+            Some(before_b.clone()),
+            "不得改动其它实例"
+        );
+        assert_eq!(profile.active_instance.as_deref(), Some("inst-a"));
+        assert_eq!(profile.instances.len(), 2);
+
+        // 空白 = 清除自定义名（回退目录名）。
+        profile
+            .rename_instance("inst-a", Some("   "))
+            .expect("空白合法");
+        assert_eq!(
+            profile.find("inst-a").and_then(|e| e.display_name.clone()),
+            None
+        );
+        assert_eq!(
+            profile.find("inst-a").map(InstanceEntry::effective_name),
+            Some("inst-a".to_owned())
+        );
+        profile.rename_instance("inst-a", None).expect("None 合法");
+        assert_eq!(
+            profile.find("inst-a").and_then(|e| e.display_name.clone()),
+            None
+        );
+
+        // 非法名字不改动任何东西。
+        assert!(matches!(
+            profile.rename_instance("inst-a", Some("a\nb")),
+            Err(ProfileError::InvalidDisplayName { .. })
+        ));
+        assert_eq!(
+            profile.find("inst-a").and_then(|e| e.display_name.clone()),
+            None,
+            "非法输入不得落进内存配置"
+        );
+
+        // 未知实例：明确报错，不新增条目。
+        let error = profile
+            .rename_instance("inst-missing", Some("x"))
+            .expect_err("未知实例必须报错");
+        assert!(
+            matches!(
+                error,
+                ProfileError::UnknownInstance { ref instance_id } if instance_id == "inst-missing"
+            ),
+            "{error}"
+        );
+        assert_eq!(profile.instances.len(), 2, "不得自动新增条目");
+    }
+
+    /// 手改出的非法 display_name 在读取时明确报错（不静默改写配置）。
+    #[test]
+    fn stored_display_name_must_be_normalized() {
+        let dir = temp_dir("display-name-invalid-stored");
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
+        for (bad, label) in [("  前后空白  ", "首尾空白"), ("换\n行", "控制字符")] {
+            let json = format!(
+                r#"{{
+                  "version": 2,
+                  "active_instance": "inst-a",
+                  "instances": [{{
+                    "instance_id": "inst-a",
+                    "display_name": "{bad}",
+                    "relay_mode": "remote_tls",
+                    "relay_url": "https://relay.example",
+                    "vault_path": "/data/instances/inst-a/vault.sqlite3",
+                    "vault_id": "00112233445566778899aabbccddeeff",
+                    "device_id": "ffeeddccbbaa99887766554433221100"
+                  }}]
+                }}"#
+            );
+            std::fs::write(layout.config_path.clone(), json).expect("写配置失败");
+            let error = layout
+                .store()
+                .load()
+                .expect_err(&format!("{label} 必须被拒绝"));
+            assert!(
+                matches!(
+                    error,
+                    ProfileError::InvalidDisplayName { .. } | ProfileError::Corrupt { .. }
+                ),
+                "{label}: {error}"
+            );
+        }
+        // 合法名字仍可读。
+        std::fs::write(
+            layout.config_path.clone(),
+            r#"{
+              "version": 2,
+              "active_instance": "inst-a",
+              "instances": [{
+                "instance_id": "inst-a",
+                "display_name": "OK 库",
+                "relay_mode": "remote_tls",
+                "relay_url": "https://relay.example",
+                "vault_path": "/data/instances/inst-a/vault.sqlite3",
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+              }]
+            }"#,
+        )
+        .expect("写合法配置失败");
+        let loaded = layout.store().load().expect("合法名字可读").expect("存在");
+        assert_eq!(
+            loaded
+                .find("inst-a")
+                .and_then(|e| e.display_name.as_deref()),
+            Some("OK 库")
+        );
+    }
+
+    /// `save` 对内存里未归一化的名字也做归一化（trim/空白 → None），不把坏值落盘。
+    #[test]
+    fn save_normalizes_in_memory_display_name() {
+        let dir = temp_dir("display-name-save-normalize");
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
+        let store = layout.store();
+        let mut profile = DevSyncProfile::default();
+        let mut a = entry("inst-a", "/data/instances/inst-a");
+        a.display_name = Some("  甲库  ".to_owned());
+        profile.upsert_active(a);
+        store.save(&profile).expect("写配置失败");
+        let loaded = store.load().expect("读回").expect("存在");
+        assert_eq!(
+            loaded
+                .find("inst-a")
+                .and_then(|e| e.display_name.as_deref()),
+            Some("甲库")
+        );
+
+        // 纯空白写盘 = None（不出现空字符串的自定义名）。
+        let mut profile = loaded;
+        profile.instances[0].display_name = Some("   ".to_owned());
+        store.save(&profile).expect("写配置失败");
+        let raw = std::fs::read_to_string(store.path()).expect("读配置文本");
+        assert!(
+            raw.contains("\"display_name\": null"),
+            "空白名字必须落成 null：{raw}"
+        );
+        assert_eq!(
+            store
+                .load()
+                .expect("读回")
+                .expect("存在")
+                .find("inst-a")
+                .and_then(|e| e.display_name.clone()),
+            None
+        );
+
+        // 超长/控制字符在写前就失败（旧文件原样保留）。
+        let before = std::fs::read(store.path()).expect("读旧文件");
+        let mut profile = DevSyncProfile::default();
+        let mut a = entry("inst-a", "/data/instances/inst-a");
+        a.display_name = Some("x".repeat(DISPLAY_NAME_MAX_CHARS + 1));
+        profile.upsert_active(a);
+        let error = store.save(&profile).expect_err("超长必须拒绝");
+        assert!(
+            matches!(error, ProfileError::InvalidDisplayName { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(store.path()).expect("读旧文件"),
+            before,
+            "写失败不得动旧配置"
         );
     }
 }

@@ -231,6 +231,8 @@ impl InviteOutcome {
     pub fn public_facts(&self, instance_id: &str) -> super::layout::InstanceEntry {
         super::layout::InstanceEntry {
             instance_id: instance_id.to_owned(),
+            // 自定义显示名由 UI 层在拿到公开事实后写入（worker 不知道用户输入）。
+            display_name: None,
             relay_mode: self.relay_mode,
             api_version: self.api_version,
             relay_url: self.relay_url.clone(),

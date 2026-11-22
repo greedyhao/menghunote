@@ -9,12 +9,16 @@
 //! ```text
 //! 启动（feature on、无显式 CLI 模式）
 //!   ├─ 已有有效公开配置 + 身份 → 自动打开实例 → Main（不必先闪 Welcome）
-//!   └─ 没有 → Welcome
-//!        ├─ 创建新的同步实例 → CreateForm → Working → BackupRequired → Main
-//!        ├─ 加入已有同步实例 → JoinForm  → Working → Main（成功即写配置，无备份页）
-//!        ├─ 打开已保存实例 → Main
-//!        └─ 仅本地使用（不同步）→ Main（无同步面板；产品 = 数据根下 local/vault.sqlite3，
-//!           dev-sync = 旧「继续本地」默认 dev vault）
+//!   └─ 没有 → Welcome（Obsidian 式：左栏仓库列表，右栏新建/打开/同步三张卡）
+//!        ├─ 同步远程仓库（一条 mn-pair://create / mn-pair://join 链接，自动识别）
+//!        │    ├─ 创建票据 → Working → BackupRequired → Main
+//!        │    └─ 邀请链接 → Working → InvitePending → Main（批准后）
+//!        ├─ 打开左栏已保存实例 / 本地仓库 → Main
+//!        ├─ 新建本地仓库（空库，不播种）→ Main
+//!        └─ 打开已有本地仓库 → Main（缺失明确报错，不新建）
+//!
+//! 旧的 CreateForm/JoinForm 状态机仍保留（Create 链接 / 恢复码内部与测试路径），
+//! 但欢迎页与管理仓库只暴露上图的统一入口。
 //! ```
 //!
 //! ## 各文件职责（互不越界）
@@ -70,6 +74,7 @@ pub mod settings;
 
 pub use app_root::{
     AppRoot, AppRootOptions, FormCreateMode, RootStateLabel, DEFAULT_OPERATION_BUDGET,
+    INVITE_AUTO_CHECK_INTERVAL,
 };
 pub use create::{
     CreateEvent, CreateJob, CreateOutcome, CreateRequest, CreateStage, CREATE_PUMP_INTERVAL,
@@ -89,8 +94,8 @@ pub use invite_copy::{
 pub use join::{JoinEvent, JoinFailureKind, JoinJob, JoinOutcome, JoinRequest, JoinStage};
 pub use layout::{
     generate_instance_id, validate_instance_id, DevSyncProfile, InstanceEntry, ProfileError,
-    ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, LOCAL_DIR_NAME, PROFILE_VERSION,
-    PROFILE_VERSION_V1, VAULT_FILE_NAME,
+    ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, StartupMode, StartupPreferences,
+    LOCAL_DIR_NAME, PROFILE_VERSION, PROFILE_VERSION_V1, VAULT_FILE_NAME,
 };
 pub use lock::{InstanceLock, LockError, LOCK_FILE_NAME};
 

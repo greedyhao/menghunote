@@ -1245,6 +1245,7 @@ async fn app_root_settings_exposes_management_section(cx: &mut TestAppContext) {
     let mut profile = DevSyncProfile::default();
     profile.upsert_active(InstanceEntry {
         instance_id: instance_id.to_owned(),
+        display_name: None,
         relay_mode: RelayMode::LocalDev,
         api_version: RelayApiVersion::V1,
         relay_url: relay.base_url().to_owned(),

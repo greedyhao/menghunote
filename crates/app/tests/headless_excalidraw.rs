@@ -802,6 +802,8 @@ async fn note_header_shows_path_and_renames_the_file(cx: &mut TestAppContext) {
         cx.debug_bounds("note-title-edit").is_some(),
         "点标题进入编辑"
     );
+    // 大标题现在**不预选**（点击落点决定光标），覆盖式改名先显式全选。
+    cx.simulate_keystrokes("ctrl-a");
     cx.simulate_input("新标题");
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();

@@ -357,8 +357,8 @@ async fn picker_lists_all_notes_and_writes_back_atomically(cx: &mut TestAppConte
     }
 
     let (root, cx) = open_root(cx, layout.clone());
-    // 真实点击「仅本地使用」进入 Main（不是直接调方法）。
-    let local = bounds_of(cx, "app-root-local");
+    // 真实点击左栏「本地仓库」进入 Main（不是直接调方法）。
+    let local = bounds_of(cx, "welcome-vault-local");
     cx.simulate_click(local.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(root.update(cx, |root, _| root.has_main_shell()));

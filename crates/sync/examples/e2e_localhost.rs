@@ -656,6 +656,10 @@ fn print_round(label: &str, report: &menghunote_sync::engine::SyncReport) {
         stored,
         skipped,
         next_cursor,
+        update_bytes,
+        asset_bytes,
+        elapsed_ms,
+        ..
     } = pull;
     let IntegrateReport {
         integrated,
@@ -667,7 +671,7 @@ fn print_round(label: &str, report: &menghunote_sync::engine::SyncReport) {
         integrated_seq,
     } = report.ack;
     println!(
-        "[e2e] {label}: encrypted={} uploaded={} acked={} failed={} pull.events={} stored={} skipped={} next_cursor={} integrated={} deferred={} ack.received={} ack.integrated={}",
+        "[e2e] {label}: encrypted={} uploaded={} acked={} failed={} pull.events={} stored={} skipped={} next_cursor={} integrated={} deferred={} ack.received={} ack.integrated={} pull.update_bytes={} pull.asset_bytes={} pull.elapsed_ms={} integrate.elapsed_ms={}",
         report.encrypted,
         uploaded,
         acked,
@@ -679,6 +683,10 @@ fn print_round(label: &str, report: &menghunote_sync::engine::SyncReport) {
         integrated,
         deferred,
         received_seq,
-        integrated_seq
+        integrated_seq,
+        update_bytes,
+        asset_bytes,
+        elapsed_ms,
+        report.integrate.elapsed_ms
     );
 }

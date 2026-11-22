@@ -325,6 +325,12 @@ pub fn settings_relay_title() -> String {
     t(msg::settings::RELAY_TITLE)
 }
 
+/// relay 模式的只读自动识别说明（设置页顶部；不再有可点选项）。
+#[must_use]
+pub fn settings_relay_auto_mode() -> String {
+    t(msg::settings::RELAY_AUTO_MODE)
+}
+
 /// `local_dev` 模式的约束提示。
 #[must_use]
 pub fn settings_relay_local_hint() -> String {
@@ -335,18 +341,6 @@ pub fn settings_relay_local_hint() -> String {
 #[must_use]
 pub fn settings_relay_remote_hint() -> String {
     t(msg::settings::RELAY_REMOTE_HINT)
-}
-
-/// 远程服务器/HTTPS 的显式确认文案。
-#[must_use]
-pub fn settings_remote_consent() -> String {
-    t(msg::settings::REMOTE_CONSENT)
-}
-
-/// 切到 remote_tls 但没有勾选确认时的内联错误。
-#[must_use]
-pub fn settings_remote_tls_consent_required() -> String {
-    t(msg::settings::REMOTE_TLS_CONSENT_REQUIRED)
 }
 
 /// 开发警示条（`DEV ONLY · 开发同步…`）：**只在 `dev-sync` 构建渲染**
@@ -825,6 +819,40 @@ pub fn local_dir_label() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// 用户自定义仓库名称（Welcome 统一同步表单 + 管理仓库「重命名」）
+// ---------------------------------------------------------------------------
+
+/// Welcome 同步表单 / 管理仓库重命名的字段标签「仓库名称」。
+#[must_use]
+pub fn vault_name_label() -> String {
+    t(msg::vault::NAME_LABEL)
+}
+
+/// 「仓库名称」输入框占位：留空则使用目录名。
+#[must_use]
+pub fn vault_name_placeholder() -> String {
+    t(msg::vault::NAME_PLACEHOLDER)
+}
+
+/// 管理仓库每行的「重命名」按钮/标题。
+#[must_use]
+pub fn vault_rename() -> String {
+    t(msg::vault::RENAME)
+}
+
+/// 重命名行内输入的「保存」。
+#[must_use]
+pub fn vault_rename_save() -> String {
+    t(msg::vault::RENAME_SAVE)
+}
+
+/// 重命名行内输入的「取消」（Esc 等价）。
+#[must_use]
+pub fn vault_rename_cancel() -> String {
+    t(msg::vault::RENAME_CANCEL)
+}
+
+// ---------------------------------------------------------------------------
 // 设置页左侧分类导航 / 关于（AppRoot 产品设置）
 // ---------------------------------------------------------------------------
 
@@ -844,6 +872,12 @@ pub fn settings_nav_appearance() -> String {
 #[must_use]
 pub fn settings_nav_language() -> String {
     t(msg::settings::NAV_LANGUAGE)
+}
+
+/// 导航项「快捷键」。
+#[must_use]
+pub fn settings_nav_shortcuts() -> String {
+    t(msg::settings::NAV_SHORTCUTS)
 }
 
 /// 导航项「模板」。
@@ -1218,6 +1252,29 @@ mod tests {
             settings_save(),
             "Save relay settings (takes effect after restart)"
         );
+    }
+
+    /// 用户自定义仓库名称：中文默认 + 英文 key 都有（Welcome 表单/管理仓库共用）。
+    #[test]
+    fn vault_name_labels_follow_the_global_locale() {
+        let guard = lock_for_test();
+
+        guard.reset(Locale::ZhCn);
+        assert_eq!(vault_name_label(), "仓库名称");
+        assert_eq!(vault_name_placeholder(), "留空则使用目录名");
+        assert_eq!(vault_rename(), "重命名");
+        assert_eq!(vault_rename_save(), "保存");
+        assert_eq!(vault_rename_cancel(), "取消");
+
+        guard.reset(Locale::En);
+        assert_eq!(vault_name_label(), "Vault name");
+        assert_eq!(
+            vault_name_placeholder(),
+            "Leave blank to use the folder name"
+        );
+        assert_eq!(vault_rename(), "Rename");
+        assert_eq!(vault_rename_save(), "Save");
+        assert_eq!(vault_rename_cancel(), "Cancel");
     }
 
     #[test]

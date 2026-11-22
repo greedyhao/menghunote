@@ -18,6 +18,8 @@
 
 use gpui::{Font, Rgba};
 
+use super::code_highlight::CodeHighlightClass;
+
 /// 等宽字体族（Windows 自带 Consolas；缺失时由 GPUI 的平台回退链接管）。
 pub const FONT_FAMILY: &str = "Consolas";
 /// 正文字号（像素）。
@@ -410,4 +412,44 @@ theme_token_fns! {
     overlay_scrim => overlay_scrim,
     /// 设置页浅遮罩。
     overlay_scrim_soft => overlay_scrim_soft,
+    /// 代码块语法高亮：关键字。
+    syntax_keyword => syntax_keyword,
+    /// 代码块语法高亮：字符串。
+    syntax_string => syntax_string,
+    /// 代码块语法高亮：注释。
+    syntax_comment => syntax_comment,
+    /// 代码块语法高亮：数值。
+    syntax_number => syntax_number,
+    /// 代码块语法高亮：类型名。
+    syntax_type => syntax_type,
+    /// 代码块语法高亮：函数名。
+    syntax_function => syntax_function,
+    /// 代码块语法高亮：变量名。
+    syntax_variable => syntax_variable,
+    /// 代码块语法高亮：运算符。
+    syntax_operator => syntax_operator,
+    /// 代码块语法高亮：标点/分隔符。
+    syntax_punctuation => syntax_punctuation,
+    /// 代码块语法高亮：属性/注解/键名。
+    syntax_attribute => syntax_attribute,
+}
+
+/// 语法类别 → 当前主题的颜色（绘制层只调这一个入口）。
+///
+/// `CodeHighlightClass` 与主题 token 一一对应；新增类别时这里编译期报错，
+/// 不会出现“有类别但没颜色”的静默退化。
+#[must_use]
+pub fn syntax_color(class: CodeHighlightClass) -> Rgba {
+    match class {
+        CodeHighlightClass::Keyword => syntax_keyword(),
+        CodeHighlightClass::String => syntax_string(),
+        CodeHighlightClass::Comment => syntax_comment(),
+        CodeHighlightClass::Number => syntax_number(),
+        CodeHighlightClass::Type => syntax_type(),
+        CodeHighlightClass::Function => syntax_function(),
+        CodeHighlightClass::Variable => syntax_variable(),
+        CodeHighlightClass::Operator => syntax_operator(),
+        CodeHighlightClass::Punctuation => syntax_punctuation(),
+        CodeHighlightClass::Attribute => syntax_attribute(),
+    }
 }

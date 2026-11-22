@@ -349,6 +349,15 @@ impl EditorController {
         self.markdown.list_items()
     }
 
+    /// 全部代码块元数据（fenced / indented；按 `span` 起点排序）。
+    ///
+    /// 只读：app 的代码块语法高亮按 `info` 取语言、按 `content` 切片着色；
+    /// 围栏行不算代码内容。**只在 source 变化时**重建（随 Markdown 语义扫描）。
+    #[must_use]
+    pub fn code_blocks(&self) -> &[menghunote_markdown::CodeBlockSpan] {
+        self.markdown.code_blocks()
+    }
+
     /// 第 `index` 个列表项隐藏态下显示的 marker（bullet / 右对齐编号）。
     #[must_use]
     pub fn list_marker_text(&self, index: usize) -> Option<String> {
@@ -1668,6 +1677,132 @@ impl EditorController {
             replacement: replacement.to_owned(),
         };
         self.submit_or_draft(vec![edit])
+    }
+
+    /// `Ctrl+B` / `Ctrl+I`：用一对行内定界符包裹选区，或去掉已有的包裹。
+    ///
+    /// 语义（写死，测试钉住）：
+    ///
+    /// - **非空选区**：`**选区**`（`delimiter = "**"`）或 `*选区*`（`delimiter = "*"`）；
+    ///   若选区文本本身以该定界符开头且结尾，或选区**两侧紧邻**同一对定界符
+    ///   （例如上次包裹后保留了内层选区），则**去掉**一层包裹（`**a**` → `a`）；
+    /// - **折叠光标**：插入成对标记（`****` / `**`），caret 落在中间，方便直接输入；
+    /// - **一次调用只有一个 `EditRequest`**（一个撤销组）：包裹是两条插入、取消是
+    ///   一条替换（或两条只删标记的删除），都走 [`Self::compose_edits`]；折叠插入走
+    ///   [`Self::compose_replace_selection`]（不复制第二套编辑/撤销路径）；
+    /// - 格式化后的选区/光标在本方法内设好：包裹保留**内层**选区（方向保持）、
+    ///   取消保留去掉标记后的文本选区、折叠插入 caret 居中。
+    ///
+    /// 模型层不判断上下文（代码块/表格/链接）：那些由 app 在调用前过滤；这里只把
+    /// 选区两端原样包起来，不删除任何已有内容（v1）。
+    ///
+    /// `delimiter` 只接受非空 ASCII（目前只有 `*` / `**`）；空串 / 非 ASCII 返回
+    /// `Ok(None)`（不产生请求、不动选区）。
+    pub fn toggle_inline_delimiters(
+        &mut self,
+        delimiter: &str,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        if delimiter.is_empty() || !delimiter.is_ascii() {
+            return Ok(None);
+        }
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let selection = self.selection;
+        // ASCII 定界符：字节数 = scalar 数。
+        let unit = delimiter.chars().count();
+        if selection.is_empty() {
+            let caret = selection.head().get();
+            let pair = format!("{delimiter}{delimiter}");
+            let Some(request) = self.compose_replace_selection(&pair)? else {
+                return Ok(None);
+            };
+            // `compose` 会把 caret 放到插入文本之后；这里放回两个标记中间。
+            self.set_selection(Selection::caret(UnicodeScalar::new(caret + unit)))?;
+            return Ok(Some(request));
+        }
+        let source = self.mirror.to_string();
+        let start = selection.start().to_source_byte(&source)?.get();
+        let end = selection.end().to_source_byte(&source)?.get();
+        let text = &source[start..end];
+        let wrapped_inside = text.len() >= delimiter.len() * 2
+            && text.starts_with(delimiter)
+            && text.ends_with(delimiter);
+        if wrapped_inside {
+            let inner = &text[delimiter.len()..text.len() - delimiter.len()];
+            let request = self.compose_edits(vec![ScalarEdit {
+                start: selection.start(),
+                end: selection.end(),
+                replacement: inner.to_owned(),
+            }])?;
+            // 取消包裹：保留去掉标记后的文本选区（方向与原来一致）。
+            let inner_len = units::scalar_len(inner);
+            let start = selection.start().get();
+            let (anchor, head) = if selection.anchor() <= selection.head() {
+                (start, start + inner_len)
+            } else {
+                (start + inner_len, start)
+            };
+            self.set_selection(Selection::new(
+                UnicodeScalar::new(anchor),
+                UnicodeScalar::new(head),
+            ))?;
+            return Ok(Some(request));
+        }
+        // 选区**外侧**紧邻同一对定界符：上次 Ctrl+B 包裹后选区被保留在**内层**，
+        // 再按一次也要能去掉包裹（否则二次按键会变成双重包裹）。
+        let wrapped_outside = start >= delimiter.len() && source[..start].ends_with(delimiter);
+        if wrapped_outside
+            && source
+                .get(end..)
+                .is_some_and(|rest| rest.starts_with(delimiter))
+        {
+            let start_scalar = selection.start();
+            let end_scalar = selection.end();
+            let before = UnicodeScalar::new(start_scalar.get() - unit);
+            let after = UnicodeScalar::new(end_scalar.get() + unit);
+            // 只删两侧标记，不重写内层文本（两条删除都在同一个请求里）。
+            let request = self.compose_edits(vec![
+                ScalarEdit {
+                    start: before,
+                    end: start_scalar,
+                    replacement: String::new(),
+                },
+                ScalarEdit {
+                    start: end_scalar,
+                    end: after,
+                    replacement: String::new(),
+                },
+            ])?;
+            let start = before.get();
+            let end = end_scalar.get() - unit;
+            let (anchor, head) = if selection.anchor() <= selection.head() {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            self.set_selection(Selection::new(
+                UnicodeScalar::new(anchor),
+                UnicodeScalar::new(head),
+            ))?;
+            return Ok(Some(request));
+        }
+        let request = self.compose_edits(vec![
+            ScalarEdit {
+                start: selection.start(),
+                end: selection.start(),
+                replacement: delimiter.to_owned(),
+            },
+            ScalarEdit {
+                start: selection.end(),
+                end: selection.end(),
+                replacement: delimiter.to_owned(),
+            },
+        ])?;
+        // 包裹后保留**内层**选区（两端各右移一个定界符长度，方向保持）。
+        let anchor = UnicodeScalar::new(selection.anchor().get() + unit);
+        let head = UnicodeScalar::new(selection.head().get() + unit);
+        self.set_selection(Selection::new(anchor, head))?;
+        Ok(Some(request))
     }
 
     /// 提交一组编辑：校验（排序 / 不重叠 / 不越界）→ 乐观写入镜像 → 生成请求。

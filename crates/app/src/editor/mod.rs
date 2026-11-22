@@ -5,6 +5,7 @@
 //! | [`layout`] | 软折行 + 视觉行几何（纯逻辑，可单测） |
 //! | [`geometry`] | 一帧的绘制几何：视觉行 → 字形 x 偏移（命中只读这里） |
 //! | [`glyph`] | 行 shaping 的唯一入口（绘制与键盘导航共用） |
+//! | [`code_highlight`] | 代码块只读语法高亮（syntect scope → 应用语义类别） |
 //! | [`shared`] | 视图 ↔ 元素共享的非观察状态（折行缓存 / 上一帧几何） |
 //! | [`input`] | `EntityInputHandler`：IME / 文本输入（虚拟输入文档 + 一次提交） |
 //! | [`clipboard`] | 粘贴/拖放的剪贴板分流（纯逻辑）+ 资产导入能力面（S2b） |
@@ -21,6 +22,7 @@
 //! 不隐藏标记、不做 IME、不改写文本。
 
 pub mod clipboard;
+pub mod code_highlight;
 pub mod display_edit;
 pub mod element;
 pub mod geometry;

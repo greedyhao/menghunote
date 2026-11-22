@@ -11,10 +11,12 @@ mod support;
 use support::*;
 
 use menghunote_storage::{
-    load_body_doc, load_head, outbox_parts, outbox_row, sync_cursor_state, StorageError,
-    SyncOutboxState, Vault, META_SYNC_LOG_ID,
+    load_body_doc, load_head, outbox_parts, outbox_row, sync_cursor_state, take_inbox_ready,
+    StorageError, SyncOutboxState, Vault, META_SYNC_LOG_ID,
 };
-use menghunote_sync::engine::{EngineIdentity, IntegrateConfig, SyncEngine, RELAY_CURSOR_META};
+use menghunote_sync::engine::{
+    EngineConfig, EngineIdentity, IntegrateConfig, SyncEngine, RELAY_CURSOR_META,
+};
 use menghunote_sync::relay::{PauseReason, RelayLogKind};
 use menghunote_sync::SyncError;
 use menghunote_sync_proto::{
@@ -34,6 +36,21 @@ fn engine<'a>(
         peer_id: device.identity.peer_id,
     };
     SyncEngine::new(vault, relay, identity, device.root.clone())
+}
+
+/// 指定 `EngineConfig` 的引擎（Phase 0 批量开关/页大小实验用）。
+fn engine_with_config<'a>(
+    vault: &'a Vault,
+    relay: &'a mut FakeRelay,
+    device: &Device,
+    config: EngineConfig,
+) -> SyncEngine<'a, FakeRelay> {
+    let identity = EngineIdentity {
+        device_id: device.identity.device_id,
+        signing_key: device.identity.signing_key.clone(),
+        peer_id: device.identity.peer_id,
+    };
+    SyncEngine::with_config(vault, relay, identity, device.root.clone(), config)
 }
 
 fn cursor(vault: &Vault) -> Option<String> {
@@ -1431,4 +1448,188 @@ fn pull_pauses_on_lagging_asset_event_epoch_before_download() {
         skipped_asset_rows(&vault).is_empty(),
         "不得写 skipped-asset 记录"
     );
+}
+
+// ============================================================ Phase 0：指标 + 批量 inbox
+// 只加**只读**度量与默认关闭的实验开关；不改变追赶策略、不动 relay/wire/schema。
+
+/// 指定 `EngineConfig` 跑一轮 pull + integrate（Phase 0 批量开关对照用）。
+fn pull_integrate_with_config(
+    vault: &Vault,
+    relay: &mut FakeRelay,
+    device: &Device,
+    inbox_batch: bool,
+) -> (
+    menghunote_sync::engine::PullReport,
+    menghunote_sync::engine::IntegrateReport,
+) {
+    let config = EngineConfig {
+        inbox_batch,
+        ..EngineConfig::default()
+    };
+    let mut sync = engine_with_config(vault, relay, device, config);
+    let pull = sync.pull().expect("拉取");
+    let integrate = sync.integrate(16).expect("集成");
+    (pull, integrate)
+}
+
+/// 两个 UPDATE + 一个真实 ASSET：指标口径固定、非零、且与 durable 事实一致。
+///
+/// - `update_bytes` = 成功验收的 `UpdateV1` **明文负载**之和（= inbox 里的
+///   `verified_payload` 长度之和），不含信封头/AEAD tag；
+/// - `asset_bytes` = 真实下载并验证通过的资产明文字节；
+/// - `elapsed_ms` 是毫秒截断（只断言合理上界，不断言快慢）。
+#[test]
+fn pull_and_integrate_reports_phase0_metrics() {
+    ensure_test_identity_wrap();
+    let (_a_dir, vault_a) = fresh_vault();
+    let (_b_dir, vault_b) = fresh_vault();
+    let device_a = Device::new(0x75);
+    let device_b = Device::new(0x76);
+    let mut relay = FakeRelay::new(&[&device_a, &device_b]);
+
+    let doc_a = seed_doc(&vault_a, "doc-1", device_a.identity.peer_id);
+    doc_a.insert_scalars(0, "alpha").expect("A 正文1");
+    commit_with_intent(&vault_a, &doc_a, &uuid_like(0x7501), [0x75; 32], EPOCH);
+    doc_a.insert_scalars(5, "-beta").expect("A 正文2");
+    commit_with_intent(&vault_a, &doc_a, &uuid_like(0x7502), [0x76; 32], EPOCH);
+    assert_eq!(publish_from(&mut relay, &vault_a, &device_a), 2);
+    let (_asset, asset_seq) = publish_device_asset(&mut relay, &device_a, ASSET_DATA, "image/png");
+    assert_eq!(asset_seq, 3);
+
+    seed_doc(&vault_b, "doc-1", device_b.identity.peer_id);
+    seed_cursor(&vault_b);
+
+    let pull = {
+        let mut sync = engine(&vault_b, &mut relay, &device_b);
+        sync.pull().expect("拉取")
+    };
+    // 指标必须在 integrate 之前对账（integrate 会把 inbox 行标成 integrated，
+    // `take_inbox_ready` 只返回仍 verified 的行）。
+    let inbox_rows = take_inbox_ready(&vault_b, 16).expect("读 inbox");
+    let integrate = {
+        let mut sync = engine(&vault_b, &mut relay, &device_b);
+        sync.integrate(16).expect("集成")
+    };
+
+    assert_eq!(pull.events, 3, "两条 UPDATE + 一条 ASSET");
+    assert_eq!(pull.stored, 2);
+    assert_eq!(pull.skipped, 1, "ASSET 走 skipped 计数不进 inbox");
+    assert_eq!(pull.pages, 1);
+    assert!(!pull.inbox_batch, "默认配置必须逐条写 inbox");
+    assert_eq!(pull.next_cursor, "c3");
+    assert!(pull.update_bytes > 0, "成功验收的 update 明文负载必须 > 0");
+    assert_eq!(pull.asset_bytes, ASSET_DATA.len() as u64);
+    assert!(pull.elapsed_ms < 60_000, "耗时必须是合理的毫秒数");
+
+    // update_bytes 与 durable inbox 的明文负载逐字节对齐。
+    assert_eq!(inbox_rows.len(), 2);
+    let expected_update_bytes: u64 = inbox_rows
+        .iter()
+        .map(|row| {
+            u64::try_from(row.verified_payload.as_deref().unwrap_or_default().len())
+                .expect("payload 长度在 u64 内")
+        })
+        .sum();
+    assert!(expected_update_bytes > 0);
+    assert_eq!(pull.update_bytes, expected_update_bytes);
+
+    assert_eq!(integrate.integrated, 2);
+    assert_eq!(integrate.deferred, 0);
+    assert_eq!(integrate.body_integrated, 2);
+    assert_eq!(integrate.structure_integrated, 0);
+    assert!(!integrate.projected, "没有结构文档就不会投影");
+    assert!(integrate.elapsed_ms < 60_000);
+
+    // 空页：零事件/零字节，但仍然算一次页请求；integrate 空转也有耗时。
+    let (empty, again) = {
+        let mut sync = engine(&vault_b, &mut relay, &device_b);
+        let empty = sync.pull().expect("空页拉取");
+        let again = sync.integrate(16).expect("再集成");
+        (empty, again)
+    };
+    assert_eq!(empty.events, 0);
+    assert_eq!(empty.stored, 0);
+    assert_eq!(empty.skipped, 0);
+    assert_eq!(empty.update_bytes, 0);
+    assert_eq!(empty.asset_bytes, 0);
+    assert_eq!(empty.pages, 1);
+    assert!(empty.elapsed_ms < 60_000);
+    assert_eq!(again.integrated, 0);
+    assert!(again.elapsed_ms < 60_000);
+}
+
+/// Phase 0 批量开关：打开后**结果**必须与逐条路径一致，只是 `inbox_batch` 标为 true。
+///
+/// 对照两条独立的 B vault（同一份 relay 日志、各自 cursor/log_id），断言事件数/字节/
+/// 游标/received 水位/integrate 结论与最终正文全部相同。
+#[test]
+fn pull_inbox_batch_flag_matches_per_event_results() {
+    ensure_test_identity_wrap();
+    let (_a_dir, vault_a) = fresh_vault();
+    let device_a = Device::new(0x77);
+    let device_b1 = Device::new(0x78);
+    let device_b2 = Device::new(0x79);
+    let mut relay = FakeRelay::new(&[&device_a, &device_b1, &device_b2]);
+
+    // A：跨两个文档的两条 update + 一个真实 ASSET（覆盖批量行与 skipped 事件混排）。
+    let doc_a1 = seed_doc(&vault_a, "doc-1", device_a.identity.peer_id);
+    let doc_a2 = seed_doc(&vault_a, "doc-2", device_a.identity.peer_id);
+    doc_a1.insert_scalars(0, "one").expect("doc1");
+    commit_with_intent(&vault_a, &doc_a1, &uuid_like(0x7701), [0x77; 32], EPOCH);
+    doc_a2.insert_scalars(0, "two").expect("doc2");
+    commit_with_intent(&vault_a, &doc_a2, &uuid_like(0x7702), [0x78; 32], EPOCH);
+    assert_eq!(publish_from(&mut relay, &vault_a, &device_a), 2);
+    publish_device_asset(&mut relay, &device_a, ASSET_DATA, "image/png");
+
+    let (_d1, vault_b1) = fresh_vault();
+    let (_d2, vault_b2) = fresh_vault();
+    for (vault, device) in [(&vault_b1, &device_b1), (&vault_b2, &device_b2)] {
+        seed_doc(vault, "doc-1", device.identity.peer_id);
+        seed_doc(vault, "doc-2", device.identity.peer_id);
+        seed_cursor(vault);
+    }
+
+    let (row_pull, row_integrate) =
+        pull_integrate_with_config(&vault_b1, &mut relay, &device_b1, false);
+    let (batch_pull, batch_integrate) =
+        pull_integrate_with_config(&vault_b2, &mut relay, &device_b2, true);
+
+    assert!(!row_pull.inbox_batch, "逐条路径必须报 false");
+    assert!(batch_pull.inbox_batch, "批量路径必须报 true");
+    assert_eq!(batch_pull.events, row_pull.events);
+    assert_eq!(batch_pull.stored, row_pull.stored);
+    assert_eq!(batch_pull.skipped, row_pull.skipped);
+    assert_eq!(batch_pull.update_bytes, row_pull.update_bytes);
+    assert_eq!(batch_pull.asset_bytes, row_pull.asset_bytes);
+    assert_eq!(batch_pull.pages, row_pull.pages);
+    assert_eq!(batch_pull.next_cursor, row_pull.next_cursor);
+    assert_eq!(cursor(&vault_b1), cursor(&vault_b2));
+    assert_eq!(received(&vault_b1), received(&vault_b2));
+
+    assert_eq!(batch_integrate.integrated, row_integrate.integrated);
+    assert_eq!(batch_integrate.deferred, row_integrate.deferred);
+    assert_eq!(
+        batch_integrate.body_integrated,
+        row_integrate.body_integrated
+    );
+    assert_eq!(
+        batch_integrate.structure_integrated,
+        row_integrate.structure_integrated
+    );
+
+    for doc_id in ["doc-1", "doc-2"] {
+        let (body_row, head_row) =
+            load_body_doc(&vault_b1, doc_id, device_b1.identity.peer_id, None).expect("B1 正文");
+        let (body_batch, head_batch) =
+            load_body_doc(&vault_b2, doc_id, device_b2.identity.peer_id, None).expect("B2 正文");
+        assert_eq!(body_row.text(), body_batch.text(), "{doc_id} 正文必须等价");
+        assert_eq!(
+            head_row.head_seq, head_batch.head_seq,
+            "{doc_id} head 必须一致"
+        );
+    }
+    let (body, _) =
+        load_body_doc(&vault_b2, "doc-1", device_b2.identity.peer_id, None).expect("B2");
+    assert!(body.text().contains("one"), "批量路径必须真的集成了正文");
 }

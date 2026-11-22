@@ -28,9 +28,20 @@ license = "MIT"
 [profile.dev]
 # GPUI 依赖树很深，开发构建保持默认优化级别会明显偏慢
 opt-level = 1
+# 只保留行号级调试信息（完整 DWARF 是磁盘杀手）。
+# 2026-11-20 实测：单个 app 测试二进制 1.65G 里 1.56G 是 `.debug_*`，真实代码+数据仅 65M；
+# 一次 app 全目标测试会产出 22 个这种文件，`target/` 合计 71G，把 197G 的盘占到 100%。
+# `line-tables-only` 仍让 backtrace 显示「文件:行号」，只是没有变量/类型信息。
+# 需要完整调试信息时临时覆盖：`CARGO_PROFILE_DEV_DEBUG=2 cargo build -p menghunote-app`。
+# 注意：`test` 内置 profile 继承 `dev`，因此本行同时作用于 `cargo test` 的产物。
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
+# 依赖不保留调试信息：上游（gpui / wgpu / merman / loro / tantivy …）的 DWARF 会被
+# 复制进每一个测试二进制，是体积主因；日常几乎不会步进调试依赖内部。
+# 需要时把本行改回 `debug = 2`（或对单个包显式开 debug）。
+debug = false
 
 # libsqlite3-sys 用 `bundled` 特性把整份 sqlite3.c 交给 cc/cl 编译。
 # 本机（受限进程上下文里由 cargo 启动 cl.exe）生成 C 调试记录会失败：

@@ -8,11 +8,29 @@
 //!                      \-> Error（保留表单）        （保存配置失败 -> Error，可重试保存）
 //! 已有有效配置 -> Main（启动直接进入，不闪 Welcome）
 //! 本机 startup.json = local 且本地库存在 -> Main（重启直接回到本地库，不读 sync.json）
-//! Welcome -> Main（本地（不同步）库：产品 = 数据根下 local/vault.sqlite3，
+//! Welcome -> Main（本地（不同步）库：产品 = 用户选择的库文件，默认
+//!               <用户目录>/Documents/menghunote/local/vault.sqlite3（不播种 demo）；
 //!               dev-sync = 默认 dev vault；都没有同步面板）
 //! 任意 -> Error（配置损坏 / 身份缺失 / 库不匹配 / 实例目录被占用 / 本地库打不开）
-//! Welcome/Main -> 设置（覆盖层，不销毁 Main 的 AppShell）-> 关闭回原状态
+//! Welcome/Main -> 设置（覆盖层；Main 的 AppShell 不销毁）-> 关闭回原状态
 //! ```
+//!
+//! **不重启切换 vault（显式用户动作，绝不热切 worker）**：
+//!
+//! ```text
+//! Main -> 左下角 vault 切换菜单 → 点另一个已保存实例
+//!         = AppShell::close_all（有界排空/flush）→ 释放旧 InstanceLock → 关菜单
+//!           → 打开目标实例（成功写 active + startup=sync；失败进既有 Error 页）
+//!         当前实例 = no-op（不重建、不重新加载）
+//! Main -> 左下角菜单 →「管理仓库…」→ 管理仓库覆盖层
+//!         实例行「打开」= 同上关旧开新；「设为默认」只写 active/startup（不热切换）
+//!         「返回欢迎页」 = close_all + 释放锁 → Welcome（实例列表仍在）
+//!         「新建同步 vault…」 = close_all + 释放锁 → Create 表单
+//!         「加入同步 vault…」 = close_all + 释放锁 → Join 表单
+//! ```
+//!
+//! **创建 vault 的唯一入口是「管理仓库」**：设置页不再有「实例」分类
+//! （旧 `settings-ui.json` 的 `instances` 记忆回退「外观」，不崩、不空白）。
 //!
 //! **打开成功后写本机启动偏好**（`startup.json`：`local`/`sync`）：只记入口、不同步、
 //! 不含正文；下次启动按它直接恢复。偏好缺失/损坏/本地库不存在 → Welcome（不报错页）。
@@ -37,38 +55,58 @@
 //! | selector | 元素 |
 //! | --- | --- |
 //! | `app-root` | 根视图（铺满窗口） |
-//! | `app-root-welcome` / `app-root-create` / `app-root-join` / `app-root-local` | Welcome 页与三个入口（`app-root-local` = 本地（不同步）入口，两种构建都出现；产品文案「仅本地使用」，dev-sync 文案「继续本地（DEV ONLY）」） |
+//! | `app-root-welcome` / `welcome-vault-list` | Obsidian 式仓库选择页 / 左栏滚动列表 |
+//! | `welcome-vault-<i>` | 左栏第 i 个**已保存同步实例**（active 优先；点击直接打开，不经过管理页） |
+//! | `welcome-vault-local` | 左栏「本地仓库」行（`startup.json` 最近本地路径 / 默认路径存在时才出现；点击直接打开） |
+//! | `welcome-new-local` / `welcome-new-local-dir` / `welcome-new-local-browse` / `welcome-new-local-confirm` | 右栏「新建本地仓库」卡与展开表单 |
+//! | `welcome-open-local` / `welcome-open-local-path` / `welcome-open-local-browse` / `welcome-open-local-confirm` | 右栏「打开本地仓库」卡与展开表单 |
+//! | `welcome-sync-remote` / `welcome-sync-link` / `welcome-sync-dir` / `welcome-sync-dir-browse` / `welcome-sync-confirm` | 右栏「同步远程仓库」卡（**只收一条链接**，自动识别 create/join） |
+//! | `welcome-sync-name` | 统一的「仓库名称」可选输入（只影响左下角/菜单/管理仓库的显示，不改目标路径；留空 = 目录名） |
+//! | `welcome-sync-consent` | `dev-sync` 构建的「同意开发同步」勾选（产品构建不渲染/不要求） |
+//! | `welcome-error` | Welcome 内联错误（链接解析/目录/后端兑换失败；已脱敏） |
 //! | `app-root-dev-banner` | 各页顶部的开发警示条（**只有 `dev-sync` 构建**存在；产品构建不挂节点） |
-//! | `app-root-instances` / `app-root-instance-<i>` | 已保存实例列表与第 i 行（active 优先） |
-//! | `app-root-create-form` / `app-root-dir-input` | Create 表单（只有创建链接 + 实例目录）与目录字段 |
+//! | `app-root-create-form` / `app-root-dir-input` | **旧** Create 表单（内部/测试保留；欢迎页不再暴露）与目录字段 |
+//! | `app-root-dir-browse` / `app-root-join-dir-browse` | Create/Join 的实例目录「浏览…」（系统目录选择器） |
 //! | `app-root-create-link-input` / `app-root-create-link-apply` / `app-root-create-link-clear` | Create 表单的创建链接字段 /「应用」/「移除链接」 |
 //! | `app-root-create-link-warning` / `app-root-create-link-facts` | 一次性票据警告 / 预填的 relay+vault_id+API 面 |
-//! | `app-root-join-form` / `app-root-join-relay-input` / `app-root-vault-id-input` / `app-root-recovery-input` / `app-root-join-dir-input` | Join 表单与四个字段 |
-//! | `app-root-remote-consent` / `app-root-remote-dev-notice` | HTTPS 创建链接的远程确认 / DEV 状态标注 |
-//! | `app-root-consent` / `app-root-submit` / `app-root-back` / `app-root-form-error` | Create 表单的同意框/提交/返回/错误行 |
+//! | `app-root-join-form` / `app-root-join-relay-input` / `app-root-vault-id-input` / `app-root-recovery-input` / `app-root-join-dir-input` | **旧** Join 表单（恢复码内部/测试路径；欢迎页与管理仓库都不再暴露手动字段） |
+//! | `app-root-remote-dev-notice` | HTTPS 初始化未真机验证的 DEV 状态标注（**只有 `dev-sync` 构建**渲染） |
+//! | `app-root-consent` / `app-root-submit` / `app-root-back` / `app-root-form-error` | Create 表单的「同意开发同步」勾选（**只有 `dev-sync` 构建**渲染）/提交/返回/错误行 |
 //! | `app-root-join-submit` / `app-root-join-back` / `app-root-join-error` | Join 表单的提交/返回/错误行 |
 //! | `app-root-working` / `app-root-progress` / `app-root-cancel` | Working 页（Create/Join 共用） |
 //! | `app-root-backup` / `app-root-vault-id` / `app-root-recovery-code` / `app-root-copy-code` / `app-root-backup-confirm` / `app-root-continue` | 备份页 |
 //! | `app-root-copy-invite` / `app-root-invite-ttl` / `app-root-invite-error` | 备份页「复制邀请链接」（v2、15 分钟；token 只在剪贴板）/ 剩余有效期 / 脱敏失败 |
 //! | `app-root-main` | Main（`AppShell` 子视图宿主） |
 //! | `app-root-local-mode` | Main 顶部的「本地模式：不同步」提示条（**只有本地库入口**出现） |
-//! | `app-root-settings` | 打开设置（Welcome 页与 Main 左侧栏底部入口） |
+//! | `app-root-settings` | 打开设置（Welcome 页与 Main 左下角动作行右端的紧凑按钮，宽 64px） |
+//! | `app-root-bottom-actions` | Main 左下角的底部动作行容器（切换器 + 设置**同一行**，同一底边/行高） |
 //! | `dev-sync-settings` | 设置覆盖层根（打开时存在；Main 仍在其下保留） |
 //! | `settings-nav` / `settings-nav-<section>` | 设置页左侧分类导航 / 单个分类项 |
 //! | `settings-nav-divider` | 固定分类与插件分类之间的 1px 分界线（整行不可点） |
 //! | `settings-section-<section>` | 右侧内容区（**只渲染当前分类**；`settings-content` 是滚动容器） |
 //! | `settings-plugin-<id>` / `-toggle` / `-state` | 「插件」分类里的第一方插件行 / 开关 / 状态（模板 `templates`、日记 `daily_notes`） |
 //! | `settings-toggle-sync` | 「同步」分类的同步面板**内容容器**（进入分类即渲染；没有展开/收起） |
-//! | `settings-instance-<i>` / `settings-instance-<i>-active` | 公开实例行 /「设为默认」控件（active 优先） |
-//! | `settings-relay` / `settings-save` / `settings-cancel` | relay 输入框 / 保存 / 关闭（仅在「Relay」分类） |
+//! | `app-root-vault-switcher` | Main 左下角动作行里的 vault 切换按钮（当前库短名 + `▾`，占满设置按钮之外的宽度） |
+//! | `app-root-vault-menu` / `app-root-vault-menu-backdrop` | 切换菜单 / 打开时铺满窗口的透明遮罩（点空白关菜单） |
+//! | `app-root-vault-menu-current` | 当前 vault 行（带 `✓`；点击 = no-op 并收起菜单） |
+//! | `app-root-vault-menu-instance-<i>` | 第 i 个**其它**已保存实例（名字 + 简短 API/mode；点击 = 直接切换） |
+//! | `app-root-vault-menu-divider` / `app-root-vault-manage` | 菜单分隔线 /「管理仓库…」（打开管理仓库覆盖层） |
+//! | `app-root-vault-manager` | 「管理仓库」覆盖层面板（标题「管理仓库」+ 关闭 `vault-manager-close`） |
+//! | `app-root-vault-manager-backdrop` | 管理仓库的遮罩（点空白关闭；滚轮不穿透） |
+//! | `vault-manager-instance-<i>` / `vault-manager-open-<i>` / `vault-manager-default-<i>` / `vault-manager-name` | 实例行 /「打开」（关旧开新）/「设为默认」/ 行内显示名（自定义名优先） |
+//! | `vault-manager-rename-<i>` / `vault-manager-rename-row` / `vault-manager-rename-input` / `vault-manager-rename-save` / `vault-manager-rename-cancel` / `vault-manager-rename-error` | 「重命名」（行内输入；保存才写 `sync.json`，Esc/取消不改；只改显示名，不移动目录） |
+//! | `vault-manager-sync-remote` / `vault-manager-back-welcome` | 同步远程仓库（**唯一入口**，回到 Welcome 展开同一个统一表单）/ 返回欢迎页 |
+//! | `vault-manager-notice` | 管理仓库的内联提示（设为默认结果/失败原因） |
+//! | `settings-relay` / `settings-relay-mode-hint` / `settings-save` / `settings-cancel` | relay 输入框 / 只读「按地址自动识别」说明 / 保存 / 关闭（仅在「Relay」分类） |
+//! | `app-root-join-relay-hint` | Join 表单 relay 的只读模式/约束说明（自动识别，不再有单选项） |
 //! | `settings-about-version` / `settings-about-build` | 关于：版本 / 构建特性（只读） |
-//! | `settings-mode-local_dev` / `settings-mode-remote_tls` / `settings-remote-consent` | relay 模式选择 / 远程确认 |
 //! | `settings-fingerprint` / `settings-fingerprint-headline` / `settings-copy-fingerprint` | 安全指纹只读区 / 标题 / 复制公开值 |
 //! | `settings-security-category` | 当前安全暂停类别（无则「无安全暂停」） |
 //! | `settings-close` | 非 relay 分类的关闭按钮（即时设置已保存） |
 //! | `settings-error` / `settings-notice` | relay 分类的内联错误 / 提示（含「重启后生效」） |
+//! | `settings-public-info` | 「同步」分类底部的 active 实例**公开**信息（vault_id/device_id/路径） |
 //! | `settings-copy-vault-id` / `settings-copy-device-id` / `settings-copy-path` | 公开值复制按钮 |
-//! | `settings-api-version` | active 实例的 API 面（v1 setup secret / v2 票据） |
+//! | `settings-api-version` | active 实例的 API 面（v1 setup secret / v2 票据；在「同步」分类） |
 //! | `app-root-error` / `app-root-error-message` / `app-root-retry` / `app-root-back-welcome` | Error 页 |
 //! | `app-root-notice` | 底部提示行 |
 //!
@@ -80,8 +118,8 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, ClipboardItem, Context, Entity, IntoElement, MouseButton, Render, SharedString,
-    Window,
+    div, px, App, ClipboardItem, Context, Entity, FocusHandle, IntoElement, MouseButton,
+    PathPromptOptions, Render, SharedString, Window,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -95,6 +133,7 @@ use crate::dev_sync::{DevIdentityStore, DevSyncConfig};
 use crate::dev_vault;
 use crate::editor::theme;
 use crate::shell::{AppShell, RIBBON_WIDTH};
+use crate::shortcuts::{CommandId, KeyCombo};
 
 use super::create::{CreateEvent, CreateJob, CreateOutcome, CreateRequest, CREATE_PUMP_INTERVAL};
 use super::fingerprint::{FingerprintState, FINGERPRINT_NOTICE};
@@ -106,19 +145,25 @@ use super::invite::{
 use super::invite_copy::{CopyInviteEvent, CopyInviteJob, CopyInviteRequest, CopyInviteStage};
 use super::join::{JoinEvent, JoinJob, JoinOutcome, JoinRequest};
 use super::layout::{
-    generate_instance_id, load_startup_mode, save_startup_mode, write_json_file_atomically,
-    DevSyncProfile, InstanceEntry, ProfileError, ProfileLayout, ProfileStore, RelayApiVersion,
-    RelayMode, StartupMode, VAULT_FILE_NAME,
+    generate_instance_id, load_startup_preferences, normalize_display_name,
+    save_startup_preferences, write_json_file_atomically, DevSyncProfile, InstanceEntry,
+    ProfileError, ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, StartupMode,
+    StartupPreferences, VAULT_FILE_NAME,
 };
 use super::lock::{InstanceLock, LOCK_FILE_NAME};
 use super::sanitize_error;
 use super::settings::{
-    local_option_available, remote_option_available, short_public_id, validate_relay_edit,
-    SettingsState,
+    infer_relay_mode, local_option_available, short_public_id, validate_relay_edit, SettingsState,
 };
 
 /// 操作预算（ADR 0011：沿用 120s；逻辑超时 ≠ 停止）。
 pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(120);
+
+/// 邀请 PENDING 等待页自动检查批准状态的间隔（用户反馈：不点按钮也要自动更新）。
+///
+/// 生产按真实单调时钟节流；headless 测试用
+/// `cx.executor().advance_clock(INVITE_AUTO_CHECK_INTERVAL)` 推进虚拟时钟，不 sleep。
+pub const INVITE_AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `AppRoot` 的构造参数（测试注入目录/relay/instance id）。
 #[derive(Debug, Clone)]
@@ -130,14 +175,14 @@ pub struct AppRootOptions {
     pub default_relay: String,
     /// 测试注入固定实例 id；`None` = 每次进入表单自动生成。
     pub instance_id: Option<String>,
-    /// 是否提供**本地（不同步）**入口（Welcome 的 `app-root-local`）：
+    /// 是否允许**启动引导**按 `startup.json` 自动恢复本机本地库。
     ///
-    /// - 产品 `sync-ui` 构建 =「仅本地使用（不同步）」→ 打开数据根下
-    ///   `local/vault.sqlite3`（空库、不播种、不联网、不写同步配置/身份）；
-    /// - `dev-sync` 构建 = 旧「继续本地（DEV ONLY）」→ 默认 dev vault（含演示树）。
+    /// - 产品 `sync-ui` 构建 = `true`：上次打开的本地库存在时直接回 Main；
+    /// - `dev-sync` 构建 = `true`：旧「继续本地」恢复默认 dev vault（含演示树）；
+    /// - [`Self::for_test`] 默认 `false`：既有测试不必显式关掉恢复逻辑。
     ///
-    /// [`Self::for_test`] 默认**关闭**；需要测本地路径时显式置 `true`（两种构建都会
-    /// 出现同一 selector，文案按构建区分）。
+    /// Welcome 的「新建/打开本地仓库」卡与左栏本地行**不再依赖**该开关（用户可用
+    /// 的仓库选择页始终完整）；它只影响启动自动恢复。
     pub allow_local_vault: bool,
     /// 操作预算（Create 的等待上限；测试可缩短）。
     pub operation_budget: Duration,
@@ -169,8 +214,8 @@ impl AppRootOptions {
 
     /// 测试用：显式目录 + relay + 固定实例 id。
     ///
-    /// **默认关闭本地（不同步）入口**（既有测试的 Welcome 契约不变）；要测本地库
-    /// 路径的测试把它显式置 `true`。
+    /// **默认关闭启动时的本地库自动恢复**（既有测试不必先清 `startup.json`）；
+    /// Welcome 的本地仓库卡仍会渲染，要测启动恢复把它显式置 `true`。
     #[must_use]
     pub fn for_test(layout: ProfileLayout, relay: impl Into<String>, instance_id: &str) -> Self {
         Self {
@@ -275,23 +320,24 @@ impl FormCreateMode {
     }
 }
 
-/// Create 表单状态（创建链接 + 实例目录 + 同意勾选）。
+/// Create 表单状态（创建链接 + 实例目录 + DEV 同意勾选）。
 ///
 /// ADR 0018 S4b：表单**只**有创建链接与实例目录；relay 地址/模式都由链接决定，
-/// 不再有管理员凭证或 v1 setup secret 字段。
+/// 不再有管理员凭证或 v1 setup secret 字段。`consent` 只在 `dev-sync` 构建渲染/校验
+/// （产品构建没有 DEV 勾选，提交直接继续）。
 struct FormState {
     instance_id: String,
     /// 创建方式（只剩 [`FormCreateMode::Link`]）。
     mode_kind: FormCreateMode,
     /// 链接 scheme 决定的 relay 模式（应用链接后设置；默认 `local_dev`）。
     mode: RelayMode,
-    /// `remote_tls` 的显式确认（"远程服务器/HTTPS"；ADR 0013 §1）。
-    remote_consent: bool,
     /// 创建链接输入（**秘密**：含一次性票据；遮罩 + 禁复制 + 允许粘贴）。
     link: Entity<FormInput>,
     /// 已应用的创建链接（票据只在内存；提交时移动到 worker，不落盘）。
     link_state: Option<CreateLinkState>,
     dir: Entity<FormInput>,
+    /// 「同意开发同步」勾选（**只有 `dev-sync` 构建渲染并校验**；产品构建恒为 `false`
+    /// 且不检查）。
     consent: bool,
     error: Option<String>,
     /// Enter 提交的订阅（随表单一起 drop）。
@@ -320,10 +366,7 @@ struct CreateLinkState {
 /// Join 表单状态（四个输入框；**不实现 `Debug`**：恢复码就在子实体里）。
 struct JoinFormState {
     instance_id: String,
-    /// 本次加入要写的 relay 模式（默认 `local_dev`；`remote_tls` 初始化留 S3b）。
-    mode: RelayMode,
-    /// `remote_tls` 的显式确认（"远程服务器/HTTPS"；ADR 0013 §1）。
-    remote_consent: bool,
+    /// relay 输入（模式在提交时按 scheme 推断；不再有手动选择的 `mode` 字段）。
     relay: Entity<FormInput>,
     vault_id: Entity<FormInput>,
     /// 恢复码（秘密；遮罩 + 禁复制）。
@@ -334,6 +377,58 @@ struct JoinFormState {
     invite: Entity<FormInput>,
     dir: Entity<FormInput>,
     error: Option<String>,
+    _subs: Vec<gpui::Subscription>,
+}
+
+/// Welcome 右栏三张操作卡（Obsidian 式仓库选择页）。
+///
+/// 点卡片 = 展开/收起该行的小表单，不整页跳走；真正的后台任务仍在确认后进入
+/// `Working`（Create）或 `InvitePending`（邀请加入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WelcomeAction {
+    /// 新建本地仓库（选择目录 → 创建空 `vault.sqlite3`）。
+    NewLocal,
+    /// 打开本地仓库（选择已有 `vault.sqlite3`；缺失不创建）。
+    OpenLocal,
+    /// 同步远程仓库（只粘贴一条 `mn-pair://create` / `mn-pair://join` 链接）。
+    SyncRemote,
+}
+
+impl WelcomeAction {
+    /// 测试/诊断用的稳定字面值。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewLocal => "new-local",
+            Self::OpenLocal => "open-local",
+            Self::SyncRemote => "sync-remote",
+        }
+    }
+}
+
+/// Welcome 页的输入控件与展开状态（Obsidian 式左列表 + 右操作卡）。
+///
+/// 这些控件只在 Welcome 使用；进入 Main 后仍保留（返回欢迎页时不丢用户刚输入的
+/// 链接/路径），但不会写盘、不会联网。
+struct WelcomeForms {
+    expanded: Option<WelcomeAction>,
+    /// 「新建本地仓库」的目录（创建 `<dir>/vault.sqlite3`）。
+    new_local_dir: Entity<FormInput>,
+    /// 「打开本地仓库」的文件路径（也接受目录，提交时自动补 `vault.sqlite3`）。
+    open_local_path: Entity<FormInput>,
+    /// 同步远程仓库：一条链接（创建票据或邀请链接；自动识别）。
+    sync_link: Entity<FormInput>,
+    /// 同步远程仓库：实例目录（Create/Join 都需要）。
+    sync_dir: Entity<FormInput>,
+    /// 同步远程仓库：可选的「仓库名称」（只影响显示；留空 = 回退目录名）。
+    sync_name: Entity<FormInput>,
+    /// `dev-sync` 构建的「同意开发同步」勾选；产品构建不渲染/不校验。
+    sync_consent: bool,
+    /// 本次同步表单使用的实例 id（Create 写配置、Join 等待页都用它）。
+    sync_instance_id: String,
+    /// Welcome 内联错误（`welcome-error`；解析失败/目录不合法都走这里）。
+    error: Option<String>,
+    /// Enter 提交的订阅（随 Welcome 控件一起 drop）。
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -419,6 +514,11 @@ struct PendingJoin {
 struct InvitePendingState {
     /// 本次加入的实例 id（写公开配置用）。
     instance_id: String,
+    /// 统一同步表单填的「仓库名称」（bootstrap 完成写配置时使用；只影响显示）。
+    ///
+    /// `None` = 留空或**重启后 resume**（durable pending 里没有名字）：写配置时回退目录名，
+    /// 之后仍可在「管理仓库 → 重命名」补名字。
+    display_name: Option<String>,
     /// 公开事实（relay/vault/设备/指纹；不含 token）。
     facts: InvitePendingFacts,
     /// 实例目录锁（检查时移交 worker；失败后被 drop 则重新获取）。
@@ -437,6 +537,20 @@ enum LocalResume {
     Missing,
     /// 本地库存在但打开失败（Error 页已由打开路径设置）。
     Failed,
+}
+
+/// 管理仓库里正在**重命名**的实例（行内输入；保存才写 `sync.json`）。
+///
+/// 打开重命名不写盘、不动目录/实例锁；Esc/取消只丢弃输入（磁盘原样保留）。
+struct VaultRenameState {
+    /// 目标实例 id（只改这一条）。
+    instance_id: String,
+    /// 行内输入控件（自绘 IME；selector `vault-manager-rename-input`）。
+    input: Entity<FormInput>,
+    /// 行内错误（校验失败/写盘失败；成功后整块消失）。
+    error: Option<String>,
+    /// 首帧是否已经主动聚焦（否则点击「重命名」后要再点一次输入框）。
+    focused_once: bool,
 }
 
 /// 常驻根视图。
@@ -458,6 +572,14 @@ pub struct AppRoot {
     invite_copy_job: Option<CopyInviteJob>,
     /// 邀请 PENDING 等待页状态（`None` = 不在等待页）。
     invite: Option<InvitePendingState>,
+    /// PENDING 等待页下一次自动检查批准状态的时刻（单调时钟）。
+    ///
+    /// 用 `cx.background_executor().now()`（生产 = 真实单调时钟；headless = 测试
+    /// 调度器的虚拟时钟，`cx.executor().advance_clock(...)` 可推进），因此自动检查
+    /// 在测试里是确定性的、不需要 sleep。`None` = 不在等待页/刚离开。
+    invite_auto_check_due: Option<Instant>,
+    /// 已经自动发出的批准检查次数（**不含**手动点「检查状态」；测试/诊断用）。
+    invite_auto_checks: u32,
     /// bootstrap 已完成、但公开配置写失败：只重试保存（不重新联网/不重新 bootstrap）。
     pending_invite: Option<(Box<InviteOutcome>, String)>,
     /// 设置页「模板」区（第一方插件；首次打开设置页时懒创建）。
@@ -480,11 +602,66 @@ pub struct AppRoot {
     settings_management_open: bool,
     /// 设置页当前分类（本机 `settings-ui.json` 记忆；缺失/损坏/未知 key 回退「外观」）。
     settings_section: SettingsSection,
+    /// 设置页「快捷键」分类：正在录制新绑定的命令（`None` = 未录制）。
+    ///
+    /// 录制期间根视图用 **capture 相**监听按键：先于编辑器/输入框拿到事件并
+    /// `stop_propagation`，保证「录制时绝不让按键同时触发原命令/正文输入」。
+    shortcut_capture: Option<CommandId>,
+    /// 录制态提示（非法组合/写盘失败；每次进入录制或成功改绑时清空）。
+    shortcut_capture_notice: Option<String>,
+    /// 设置覆盖层焦点（录制态抢焦点；`Esc`/键盘分发需要一个焦点节点）。
+    settings_focus: FocusHandle,
+    /// 根视图焦点：Welcome/Create/Join 没有输入框时也要能收到全局快捷键
+    /// （`Ctrl+,` 打开设置）；Main 不抢，避免干扰编辑器首帧聚焦。
+    root_focus: FocusHandle,
+    /// Main 左下角的 **vault 切换菜单**是否展开（Obsidian 式；不是设置页）。
+    vault_menu_open: bool,
+    /// **管理仓库**覆盖层是否展开（Main 里新建/加入/返回欢迎页的唯一入口）。
+    vault_manager_open: bool,
+    /// 切换菜单的焦点句柄（接 `Esc`；关闭后把焦点还给编辑器）。
+    vault_menu_focus: FocusHandle,
+    /// 管理仓库覆盖层的焦点句柄（同上）。
+    vault_manager_focus: FocusHandle,
+    /// 菜单首帧是否已经主动抢过焦点（否则 `Esc` 收不到；每次打开复位）。
+    vault_menu_focused_once: bool,
+    /// 管理仓库首帧是否已经主动抢过焦点（同上）。
+    vault_manager_focused_once: bool,
+    /// 管理仓库的内联提示（「设为默认」结果/失败原因；每次打开复位）。
+    vault_manager_notice: Option<String>,
     /// 关闭设置后要把焦点还给 Main 的编辑器（下一帧渲染时消费）。
     pending_focus_restore: bool,
     main: Option<Entity<AppShell>>,
+    /// Main 的 `AppShell` 事件订阅（底栏「同步」→ 打开 AppRoot 设置页的「同步」分类）。
+    ///
+    /// 随 Main 生命周期：替换/关闭 `AppShell` 时 drop 旧订阅（不再往已卸载的 shell 发事件）。
+    main_shell_events: Option<gpui::Subscription>,
     lock: Option<InstanceLock>,
     instance: Option<InstanceEntry>,
+    /// 本机最近一次**成功打开**的本地（不同步）库路径（来自 `startup.json` 或本次打开）。
+    ///
+    /// Welcome 左栏的「本地仓库」行与「打开本地仓库」表单默认值都读它；
+    /// `None` 时回退 [`ProfileLayout::default_local_vault_path`]。
+    local_recent_path: Option<PathBuf>,
+    /// 启动引导读到的上次入口（`startup.json`；Welcome 的 active 标记用）。
+    ///
+    /// 缓存而不是每帧读盘：Welcome 会在 hover/滚动时重绘，不能把本机偏好文件
+    /// 变成每帧 IO。
+    startup_mode: Option<StartupMode>,
+    /// Welcome 左列表/右操作卡的控件与展开状态（首次渲染前创建）。
+    welcome: Option<WelcomeForms>,
+    /// 本次统一远程表单启动的 Create 实例 id（`apply_create_event` 在 `form` 为空时用）。
+    pending_create_instance: Option<String>,
+    /// 本次统一远程表单启动的邀请加入实例 id（`InviteEvent::Pending` 用）。
+    pending_invite_instance: Option<String>,
+    /// 本次统一远程表单填写的「仓库名称」（Create 完成时写入公开配置）。
+    ///
+    /// 只来自 Welcome 统一表单；旧 CreateForm/JoinForm 路径恒为 `None`
+    /// （不会把上一次表单的名字串到内部/测试入口上）。
+    pending_create_display_name: Option<String>,
+    /// 本次邀请加入填写的「仓库名称」（PENDING 页保留，bootstrap 完成时写入配置）。
+    pending_invite_display_name: Option<String>,
+    /// 管理仓库行内重命名状态（`None` = 没有在改名；不写盘）。
+    vault_rename: Option<VaultRenameState>,
     /// Main 是否来自**本地（不同步）**库入口（产品 `local/vault.sqlite3` 或
     /// dev-sync 默认 dev vault）。只影响 Main 顶部提示条与只读投影；同步实例 Main
     /// 恒为 `false`。
@@ -512,6 +689,13 @@ impl AppRoot {
         // 本机 UI 偏好（侧栏排序）在产品根视图初始化一次；`AppShell` 只读缓存值，
         // 这样 headless 测试不会因为本机残留 `sidebar.json` 而改变默认顺序。
         crate::shell::init_sidebar_sort_from_disk();
+        // 快捷键按**本布局的数据根**重新加载：显式布局（测试/便携）不会读到用户
+        // 目录；缺失/损坏回退默认值，不阻塞启动。文件在数据根下，不进 vault。
+        // `MENGHUNOTE_SHORTCUTS_PATH` 显式覆盖优先（测试/便携），与 `init_from_disk` 一致。
+        let shortcuts_path = std::env::var_os(crate::shortcuts::SHORTCUTS_PATH_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| options.layout.shortcuts_path());
+        crate::shortcuts::init_from_path(shortcuts_path);
         let store = options.layout.store();
         let mut root = Self {
             options,
@@ -528,6 +712,8 @@ impl AppRoot {
             invite_job: None,
             invite_copy_job: None,
             invite: None,
+            invite_auto_check_due: None,
+            invite_auto_checks: 0,
             pending_invite: None,
             templates_settings: None,
             daily_notes_settings: None,
@@ -539,10 +725,30 @@ impl AppRoot {
             settings: None,
             settings_management_open: false,
             settings_section: SettingsSection::default(),
+            shortcut_capture: None,
+            shortcut_capture_notice: None,
+            settings_focus: cx.focus_handle(),
+            root_focus: cx.focus_handle(),
+            vault_menu_open: false,
+            vault_manager_open: false,
+            vault_menu_focus: cx.focus_handle(),
+            vault_manager_focus: cx.focus_handle(),
+            vault_menu_focused_once: false,
+            vault_manager_focused_once: false,
+            vault_manager_notice: None,
             pending_focus_restore: false,
             main: None,
+            main_shell_events: None,
             lock: None,
             instance: None,
+            local_recent_path: None,
+            startup_mode: None,
+            welcome: None,
+            pending_create_instance: None,
+            pending_invite_instance: None,
+            pending_create_display_name: None,
+            pending_invite_display_name: None,
+            vault_rename: None,
             local_mode: false,
             retry_entry: None,
             error: None,
@@ -554,6 +760,9 @@ impl AppRoot {
             test_baseline_unreachable: false,
         };
         root.boot(cx);
+        // Welcome 的控件在首帧前就建好：启动引导已经把 `startup.json` 的本地路径
+        // 读进 `local_recent_path`，表单默认值因此与恢复逻辑一致。
+        root.ensure_welcome_forms(cx);
         root
     }
 
@@ -578,18 +787,28 @@ impl AppRoot {
         //    - 本地库不存在 → 回 Welcome + 明确提示（**不凭空创建库**）；实例列表
         //      容错读取，不把同步配置的问题升级成错误页；
         //    - 偏好缺失/损坏/`sync` → 沿用下面的 active 实例自动打开逻辑。
-        if self.options.allow_local_vault
-            && load_startup_mode(&self.options.layout.startup_path()) == Some(StartupMode::Local)
-        {
-            match self.resume_local_vault(cx) {
-                LocalResume::Opened | LocalResume::Failed => return,
-                LocalResume::Missing => {
-                    let path = self.local_vault_path();
-                    self.notice = Some(crate::ui_text::local_resume_missing(
-                        &path.display().to_string(),
-                    ));
-                    self.load_profile_for_welcome();
-                    return;
+        if self.options.allow_local_vault {
+            if let Some(preferences) = load_startup_preferences(&self.options.layout.startup_path())
+            {
+                self.startup_mode = Some(preferences.mode);
+                if preferences.mode == StartupMode::Local {
+                    // 旧格式没有 `local_vault_path`：优先打开旧数据根下仍存在的
+                    // `local/vault.sqlite3`（老用户看起来不丢库），否则用新的用户目录默认。
+                    let path = self.resumed_local_vault_path(&preferences);
+                    self.local_recent_path = Some(path.clone());
+                    match self.resume_local_vault(&path, cx) {
+                        LocalResume::Opened | LocalResume::Failed => return,
+                        LocalResume::Missing => {
+                            self.notice = Some(crate::ui_text::local_resume_missing(
+                                &path.display().to_string(),
+                            ));
+                            self.load_profile_for_welcome();
+                            return;
+                        }
+                    }
+                } else if let Some(path) = &preferences.local_vault_path {
+                    // 上次打开的是同步实例，但本地路径仍记得：Welcome 继续显示它。
+                    self.local_recent_path = Some(path.clone());
                 }
             }
         }
@@ -679,19 +898,52 @@ impl AppRoot {
         }
     }
 
+    /// 启动时按本机偏好解析要恢复的本地库路径（**只解析，不创建**）。
+    ///
+    /// 优先级：
+    /// 1. 新格式记下的 `local_vault_path`（用户上次选的绝对路径）；
+    /// 2. 旧格式（没有该字段）/dev-sync：旧数据根下仍存在的 `local/vault.sqlite3`
+    ///    ——老用户升级后看起来不会"丢库"；
+    /// 3. 新默认：`<用户目录>/Documents/menghunote/local/vault.sqlite3`
+    ///    （Documents 不存在则 HOME 下；显式注入布局仍是数据根）。
+    fn resumed_local_vault_path(&self, preferences: &StartupPreferences) -> PathBuf {
+        if let Some(path) = &preferences.local_vault_path {
+            return path.clone();
+        }
+        if cfg!(feature = "dev-sync") {
+            return dev_vault::dev_vault_path();
+        }
+        let legacy = self.options.layout.local_vault_path();
+        if legacy.is_file() {
+            legacy
+        } else {
+            self.options.layout.default_local_vault_path()
+        }
+    }
+
     /// 按本机启动偏好恢复上次的本地库；**只检查路径，不凭空创建库**。
     ///
     /// - 文件不存在 → [`LocalResume::Missing`]（调用方回 Welcome + 明确提示）；
     /// - 打开失败 → [`LocalResume::Failed`]（打开路径已按既有语义设置 Error 页）；
     /// - 成功 → [`LocalResume::Opened`]（Main 已就绪，且已写回 `local` 偏好）。
-    fn resume_local_vault(&mut self, cx: &mut Context<Self>) -> LocalResume {
-        if !self.local_vault_path().is_file() {
+    fn resume_local_vault(&mut self, path: &Path, cx: &mut Context<Self>) -> LocalResume {
+        if !path.is_file() {
             return LocalResume::Missing;
         }
         if cfg!(feature = "dev-sync") {
-            self.open_local_dev_vault(cx);
+            // 旧 dev 偏好没有 `local_vault_path`：继续打开默认 dev vault（含演示树）。
+            // 新 Welcome「新建/打开本地仓库」会写实际路径；有路径时必须复用同一个库，
+            // 不能把用户选的本地库换成 dev vault。
+            let has_recorded_path = load_startup_preferences(&self.options.layout.startup_path())
+                .and_then(|preferences| preferences.local_vault_path)
+                .is_some();
+            if has_recorded_path {
+                self.open_local_only_vault_at(path.to_path_buf(), cx);
+            } else {
+                self.open_local_dev_vault(cx);
+            }
         } else {
-            self.open_local_only_vault(cx);
+            self.open_local_only_vault_at(path.to_path_buf(), cx);
         }
         if self.state == State::Main {
             LocalResume::Opened
@@ -700,27 +952,260 @@ impl AppRoot {
         }
     }
 
-    /// 本构建「本地」入口对应的库路径（只解析，不创建目录/文件）。
+    /// Welcome 控件（首次渲染/首次动作前创建；幂等）。
     ///
-    /// 产品 `sync-ui` = `<数据根>/local/vault.sqlite3`；`dev-sync` 构建的「继续本地
-    /// （DEV ONLY）」= 默认 dev vault（与手动点入口完全同一条路径）。
-    fn local_vault_path(&self) -> PathBuf {
-        if cfg!(feature = "dev-sync") {
-            dev_vault::dev_vault_path()
+    /// 默认值全部来自公开路径解析：
+    /// - 「新建本地仓库」= `default_local_vault_path()` 的父目录（用户文档目录下）；
+    /// - 「打开本地仓库」= 本机 `startup.json` 里最近的本地路径，缺失则默认路径；
+    /// - 「同步远程仓库」= `default_instance_dir()`（用户文档目录下，可修改）。
+    fn ensure_welcome_forms(&mut self, cx: &mut Context<Self>) {
+        if self.welcome.is_some() {
+            return;
+        }
+        let default_local = self.options.layout.default_local_vault_path();
+        let new_dir = default_local
+            .parent()
+            .map_or_else(|| default_local.clone(), Path::to_path_buf);
+        let open_path = self.welcome_open_default_path();
+        let instance_id = self
+            .options
+            .instance_id
+            .clone()
+            .unwrap_or_else(generate_instance_id);
+        let sync_dir = self
+            .options
+            .layout
+            .default_instance_dir(&instance_id)
+            .unwrap_or_else(|_| {
+                self.options
+                    .layout
+                    .default_vault_root()
+                    .join("instances")
+                    .join(&instance_id)
+            });
+        let new_dir_text = new_dir.display().to_string();
+        let open_path_text = open_path.display().to_string();
+        let sync_dir_text = sync_dir.display().to_string();
+        let new_local_dir = cx.new(|cx| {
+            let mut input = FormInput::new(new_dir_text.clone(), false, cx)
+                .selector("welcome-new-local-dir")
+                .click_to_focus();
+            input.set_text(&new_dir_text);
+            input
+        });
+        let open_local_path = cx.new(|cx| {
+            let mut input = FormInput::new(open_path_text.clone(), false, cx)
+                .selector("welcome-open-local-path")
+                .click_to_focus();
+            input.set_text(&open_path_text);
+            input
+        });
+        let sync_link = cx.new(|cx| {
+            FormInput::new("粘贴 mn-pair://create 或 mn-pair://join 链接", true, cx)
+                .selector("welcome-sync-link")
+                .click_to_focus()
+        });
+        let sync_dir_input = cx.new(|cx| {
+            let mut input = FormInput::new(sync_dir_text.clone(), false, cx)
+                .selector("welcome-sync-dir")
+                .click_to_focus();
+            input.set_text(&sync_dir_text);
+            input
+        });
+        // 可选「仓库名称」：空 = 回退目录名；只影响显示（不改目标路径）。
+        let sync_name_input = cx.new(|cx| {
+            FormInput::new(crate::ui_text::vault_name_placeholder(), false, cx)
+                .selector("welcome-sync-name")
+                .click_to_focus()
+        });
+        let mut subs = Vec::new();
+        subs.push(cx.subscribe(
+            &new_local_dir,
+            |root, _input, event: &FormInputEvent, cx| {
+                if matches!(event, FormInputEvent::Submit) {
+                    root.welcome_confirm_new_local(cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe(
+            &open_local_path,
+            |root, _input, event: &FormInputEvent, cx| {
+                if matches!(event, FormInputEvent::Submit) {
+                    root.welcome_confirm_open_local(cx);
+                }
+            },
+        ));
+        subs.push(
+            cx.subscribe(&sync_link, |root, _input, event: &FormInputEvent, cx| {
+                if matches!(event, FormInputEvent::Submit) {
+                    root.welcome_confirm_sync(cx);
+                }
+            }),
+        );
+        subs.push(cx.subscribe(
+            &sync_dir_input,
+            |root, _input, event: &FormInputEvent, cx| {
+                if matches!(event, FormInputEvent::Submit) {
+                    root.welcome_confirm_sync(cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe(
+            &sync_name_input,
+            |root, _input, event: &FormInputEvent, cx| {
+                if matches!(event, FormInputEvent::Submit) {
+                    root.welcome_confirm_sync(cx);
+                }
+            },
+        ));
+        self.welcome = Some(WelcomeForms {
+            expanded: None,
+            new_local_dir,
+            open_local_path,
+            sync_link,
+            sync_dir: sync_dir_input,
+            sync_name: sync_name_input,
+            sync_consent: false,
+            sync_instance_id: instance_id,
+            error: None,
+            _subs: subs,
+        });
+    }
+
+    /// 「打开本地仓库」表单的默认路径：本机最近打开的本地库，否则用户目录默认。
+    fn welcome_open_default_path(&self) -> PathBuf {
+        self.local_recent_path
+            .clone()
+            .unwrap_or_else(|| self.options.layout.default_local_vault_path())
+    }
+
+    /// Welcome 左栏「本地仓库」行：只返回**真实存在**的本地库。
+    ///
+    /// 优先级：`startup.json` 最近路径 → `default_local_vault_path()`；两处都不存在时
+    /// 不显示该行（右栏仍可新建）。
+    #[must_use]
+    pub fn welcome_local_row_path(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.local_recent_path {
+            if path.is_file() {
+                return Some(path.clone());
+            }
+        }
+        let default = self.options.layout.default_local_vault_path();
+        default.is_file().then_some(default)
+    }
+
+    /// 「打开本地仓库」输入框里的当前路径文本（Welcome 未创建时回退最近路径）。
+    #[must_use]
+    pub fn local_path_text(&self, cx: &App) -> Option<String> {
+        if let Some(welcome) = &self.welcome {
+            return Some(welcome.open_local_path.read(cx).text().trim().to_owned());
+        }
+        self.local_recent_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+    }
+
+    /// 测试/预填：设置「打开本地仓库」的路径。
+    pub fn local_set_path(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        let Some(welcome) = &self.welcome else {
+            return;
+        };
+        let text = text.to_owned();
+        welcome.open_local_path.update(cx, |input, cx| {
+            input.set_text(&text);
+            cx.notify();
+        });
+    }
+
+    /// 「浏览…」：系统文件/目录选择器 → 填进「打开本地仓库」路径。
+    ///
+    /// 选择器只填文本，不打开、不创建；真正校验在
+    /// [`Self::welcome_confirm_open_local`]（缺失明确报错、绝不新建）。
+    pub fn local_browse_vault_path(&mut self, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if self.welcome.is_none() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: false,
+            prompt: Some(SharedString::from("选择已有 vault.sqlite3（或目录）")),
+        });
+        cx.spawn(async move |root, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.first() {
+                    let text = path.display().to_string();
+                    let _ = root.update(cx, |root, cx| root.local_set_path(&text, cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 把「打开本地仓库」输入框同步成实际要打开的路径（打开成功后调用；不写盘）。
+    fn set_local_path_text(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.local_recent_path = Some(path.to_path_buf());
+        if let Some(welcome) = &self.welcome {
+            let text = path.display().to_string();
+            welcome.open_local_path.update(cx, |input, cx| {
+                input.set_text(&text);
+                cx.notify();
+            });
+        }
+    }
+
+    /// 把用户选的「目录或文件」解析成真正的 `vault.sqlite3` 路径。
+    ///
+    /// - 已存在的目录 / 没有扩展名的输入 → 自动补 `vault.sqlite3`；
+    /// - 以 `.sqlite3`（或其它扩展名）结尾 / 已存在的文件 → 原样使用。
+    fn resolve_local_vault_selection(path: PathBuf) -> PathBuf {
+        if path.is_dir() {
+            return path.join(VAULT_FILE_NAME);
+        }
+        if path.is_file() {
+            return path;
+        }
+        let looks_like_file = path
+            .extension()
+            .is_some_and(|extension| extension == "sqlite3");
+        if looks_like_file {
+            path
         } else {
-            self.options.layout.local_vault_path()
+            path.join(VAULT_FILE_NAME)
         }
     }
 
     /// 记住上次成功打开的入口（本机 `startup.json`；失败只记日志，不影响本次打开）。
-    fn remember_startup_mode(&self, mode: StartupMode) {
+    ///
+    /// 打开同步实例时**保留**上次本地库路径（换入口不忘位置）；打开本地库时写入
+    /// 本次实际路径，供下次启动直接恢复。
+    fn remember_startup_preferences(
+        &mut self,
+        mode: StartupMode,
+        local_vault_path: Option<PathBuf>,
+    ) {
+        self.startup_mode = Some(mode);
         let path = self.options.layout.startup_path();
-        if let Err(error) = save_startup_mode(&path, mode) {
+        let local_vault_path = local_vault_path.or_else(|| {
+            load_startup_preferences(&path).and_then(|preferences| preferences.local_vault_path)
+        });
+        let preferences = StartupPreferences {
+            mode,
+            local_vault_path,
+        };
+        if let Err(error) = save_startup_preferences(&path, &preferences) {
             eprintln!(
                 "[menghunote] 保存启动偏好失败：{}（{error}）",
                 path.display()
             );
         }
+    }
+
+    /// 只记入口（同步实例；保留已记的本地路径）。
+    fn remember_startup_mode(&mut self, mode: StartupMode) {
+        self.remember_startup_preferences(mode, None);
     }
 
     /// 尝试打开一个已保存实例；失败进 Error（保留公开字段，不重建）。
@@ -850,7 +1335,7 @@ impl AppRoot {
         let shell = cx.new(move |cx| {
             AppShell::new_with_dev_sync_with_autosync(vault, label, config, sync, cx)
         });
-        self.main = Some(shell);
+        self.set_main_shell(shell, cx);
         self.lock = Some(lock);
         self.instance = Some(entry.clone());
         self.local_mode = false;
@@ -894,6 +1379,7 @@ impl AppRoot {
             retry,
         });
         self.state = State::Error;
+        self.main_shell_events = None;
         self.main = None;
     }
 
@@ -1077,11 +1563,16 @@ impl AppRoot {
         if self.settings.is_some() || !matches!(self.state, State::Welcome | State::Main) {
             return;
         }
+        // 重新打开设置页不残留录制态/提示。
+        self.shortcut_capture = None;
+        self.shortcut_capture_notice = None;
         // 重新打开设置页不残留上一次的选择器（只在设置页内可用）。
         self.daily_template_picker = None;
         self.daily_template_picker_events = None;
         self.pending_daily_template_picker = false;
         self.pending_focus_daily_template = false;
+        // 设置页/左下角切换菜单/管理仓库三选一：打开设置时收起另外两个覆盖层。
+        self.clear_vault_overlays();
         let mut error = None;
         let profile = match self.store.load() {
             Ok(Some(profile)) => profile,
@@ -1138,9 +1629,8 @@ impl AppRoot {
         });
         // ADR 0013 §4：模式/指纹/错误类别都是**公开信息**；指纹只在"设置里的 active
         // 就是当前打开的实例"时读取（否则显示未打开，避免拿错库的 pin）。
-        let mode = active
-            .as_ref()
-            .map_or(RelayMode::LocalDev, |entry| entry.relay_mode);
+        // 模式不再有面板状态：保存时按输入框文本推断（https → remote_tls，
+        // http → local_dev），UI 只展示只读说明。
         let fingerprint = active
             .as_ref()
             .map(|entry| self.settings_fingerprint(entry, cx));
@@ -1161,8 +1651,6 @@ impl AppRoot {
         self.clamp_settings_section();
         self.settings = Some(SettingsState {
             active,
-            mode,
-            remote_consent: false,
             relay,
             fingerprint,
             security,
@@ -1174,12 +1662,51 @@ impl AppRoot {
         cx.notify();
     }
 
+    /// 底栏「同步」点击（`AppShell` 事件）的宿主路由：打开 AppRoot 设置页并选中
+    /// [`SettingsSection::Sync`]。
+    ///
+    /// 生产 Main 唯一走这里：不再打开 `AppShell` 的旧组合设置页，因此「同步」分类
+    /// 左侧是分类导航、右侧只有同步面板内容，下方不会混入外观/语言/模板。
+    pub fn open_sync_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            self.open_settings(cx);
+        }
+        self.settings_select_section(SettingsSection::Sync, cx);
+    }
+
+    /// 挂上 Main 的 `AppShell`，并把设置入口交给宿主（AppRoot）统一路由。
+    ///
+    /// - `set_settings_host_managed(true)`：底栏 `sync-status` 只发
+    ///   [`crate::shell::AppShellEvent::OpenSyncSettings`]，不再打开组合设置页；
+    /// - 订阅随 `main_shell_events` 保存：替换/关闭 Main 时 drop（旧订阅自动取消）。
+    fn set_main_shell(&mut self, shell: Entity<AppShell>, cx: &mut Context<Self>) {
+        shell.update(cx, |shell, _cx| {
+            shell.set_settings_host_managed(true);
+            // 全局快捷键（新建笔记/图谱）由 AppRoot 统一拦截：它能看见设置/管理
+            // 仓库/切换菜单这些宿主覆盖层，避免 AppShell 根上再处理一遍造成误触。
+            shell.set_global_shortcut_direct(false);
+        });
+        let subscription = cx.subscribe(
+            &shell,
+            |root, _shell, event: &crate::shell::AppShellEvent, cx| match *event {
+                crate::shell::AppShellEvent::OpenSyncSettings => root.open_sync_settings(cx),
+            },
+        );
+        self.main_shell_events = Some(subscription);
+        self.main = Some(shell);
+        // 进入 Main 时把焦点交给 `AppShell` 的活动编辑器：Welcome 的输入框/按钮
+        // 可能仍拿着焦点，否则 Ctrl+, / Ctrl+N 等宿主快捷键收不到（下一帧消费）。
+        self.pending_focus_restore = true;
+    }
+
     /// 关闭设置面板：**不写配置**；Main 的 `AppShell`/文档状态原样保留。
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
         if self.settings.take().is_none() {
             return;
         }
         self.settings_management_open = false;
+        // 关闭设置 = 退出录制态（未确认的按键不落任何绑定）。
+        self.shortcut_cancel_capture(cx);
         // 设置关闭 = 选择器随之卸载，不残留到下一次打开。
         self.daily_template_picker = None;
         self.daily_template_picker_events = None;
@@ -1327,6 +1854,8 @@ impl AppRoot {
             section
         };
         if self.settings_section != section {
+            // 切换分类 = 离开快捷键页：录制态必须取消（不能把按键录到看不见的行上）。
+            self.shortcut_cancel_capture(cx);
             self.settings_section = section;
             // 本机 `settings-ui.json`（只存分类短名；失败只记日志，本会话仍然生效）。
             save_settings_section(&self.options.layout.settings_ui_path(), section);
@@ -1479,7 +2008,7 @@ impl AppRoot {
         }
     }
 
-    /// 设置面板里的实例列表（active 优先；公开条目）。
+    /// 公开配置里的已保存实例（active 优先；设置页/管理仓库/测试共用的只读投影）。
     #[must_use]
     pub fn settings_entries(&self) -> Vec<InstanceEntry> {
         self.entries()
@@ -1512,19 +2041,18 @@ impl AppRoot {
     /// 「保存」：只改 **active 实例**的 relay，并原子写公开配置。
     ///
     /// - 没有 active 实例 → 内联错误（先在列表里点「设为默认」）；
-    /// - relay 非法 → 内联错误，**不写配置**；
+    /// - 模式按输入地址推断（https → remote_tls，http → local_dev），再交给权威
+    ///   parser 做模式/URL 校验；非法 → 内联错误，**不写配置**；
     /// - 写失败 → 内联错误 + 可重试；不改库/身份、不重建实例、不跑 Create/Join；
     /// - 成功 → 提示「重启后生效」；当前 `AppShell`/worker **不热切换**。
     pub fn settings_save(&mut self, cx: &mut Context<Self>) {
-        let (active, raw_relay, mode, remote_consent) = {
+        let (active, raw_relay) = {
             let Some(settings) = self.settings.as_ref() else {
                 return;
             };
             (
                 settings.active.clone(),
                 settings.relay.read(cx).text().trim().to_owned(),
-                settings.mode,
-                settings.remote_consent,
             )
         };
         let Some(active) = active else {
@@ -1532,13 +2060,11 @@ impl AppRoot {
             cx.notify();
             return;
         };
-        // ADR 0013 §1：remote_tls 必须显式确认"远程服务器/HTTPS"（确认端点 ≠ 授权接受
-        // 服务器任意 hash；pin 仍独立校验）。
-        if mode == RelayMode::RemoteTls && !remote_consent {
-            self.set_settings_error(crate::ui_text::settings_remote_tls_consent_required());
-            cx.notify();
-            return;
-        }
+        // relay 模式不再由用户选择：从地址推断（不复制 URL 校验，最终仍走权威 parser）。
+        let mode = infer_relay_mode(&raw_relay);
+        // remote_tls 不需要额外"确认连接 HTTPS"勾选：模式 + canonical HTTPS origin
+        // 只由权威 parser 校验（ADR 0013 §1 的旧显式确认已按用户反馈移除；确认端点
+        // 仍不等于授权接受服务器任意 hash，pin 依旧独立校验）。
         let relay = match validate_relay_edit(&raw_relay, mode) {
             Ok(relay) => relay,
             Err(message) => {
@@ -1599,67 +2125,625 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// 「设为默认」：只改公开配置的 `active_instance`，原子写；**不热切换**当前 Main。
-    ///
-    /// 同时把本机启动入口记为 `sync`：这句「重启后生效」意味着下次启动应回到该
-    /// 实例，而不是上次的本地库（`startup.json` 只记入口，不含正文）。
-    pub fn settings_set_active(&mut self, instance_id: &str, cx: &mut Context<Self>) {
-        if self.settings.is_none() {
+    // ---- Main 左下角：vault 切换（Obsidian 式） + 管理仓库覆盖层 ----
+
+    /// 左下角切换菜单：打开（只在 Main 可用；不是设置页）。
+    pub fn open_vault_menu(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::Main || self.vault_menu_open {
             return;
         }
+        // 菜单与管理仓库互斥；打开菜单不碰主界面。
+        self.vault_manager_open = false;
+        self.vault_manager_focused_once = false;
+        self.vault_manager_notice = None;
+        self.vault_menu_open = true;
+        self.vault_menu_focused_once = false;
+        cx.notify();
+    }
+
+    /// 关闭左下角切换菜单；Main 里把焦点还给编辑器（不重建 `AppShell`）。
+    pub fn close_vault_menu(&mut self, cx: &mut Context<Self>) {
+        if !self.vault_menu_open {
+            return;
+        }
+        self.vault_menu_open = false;
+        self.vault_menu_focused_once = false;
+        if self.state == State::Main && !self.vault_manager_open {
+            self.pending_focus_restore = true;
+        }
+        cx.notify();
+    }
+
+    /// 左下角 vault 按钮：菜单 开 ↔ 关。
+    pub fn toggle_vault_menu(&mut self, cx: &mut Context<Self>) {
+        if self.vault_menu_open {
+            self.close_vault_menu(cx);
+        } else {
+            self.open_vault_menu(cx);
+        }
+    }
+
+    /// 切换菜单是否展开（测试/诊断；不是设置页）。
+    #[must_use]
+    pub fn vault_menu_is_open(&self) -> bool {
+        self.vault_menu_open
+    }
+
+    /// 打开「管理仓库」覆盖层（Main 里新建/加入/返回欢迎页的唯一入口）。
+    ///
+    /// 打开时重读一次公开配置（与设置页一致：显示磁盘当前内容，外部手改也能看到）。
+    pub fn open_vault_manager(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::Main {
+            return;
+        }
+        // 菜单 → 管理仓库：不还焦点给编辑器（下一帧焦点进管理仓库）。
+        self.vault_menu_open = false;
+        self.vault_menu_focused_once = false;
+        self.vault_manager_notice = None;
+        // 重新打开 = 从磁盘当前内容开始：不保留上一次未保存的重命名输入。
+        self.vault_rename = None;
+        match self.store.load() {
+            Ok(Some(profile)) => self.profile = Some(profile),
+            // 没有配置文件时保留内存里的列表（不把刚打开实例的公开信息清掉）。
+            Ok(None) => {}
+            Err(error) => {
+                self.vault_manager_notice = Some(format!(
+                    "配置读取失败：{error}；先按内存里的列表显示，不自动重建、不改写配置"
+                ));
+            }
+        }
+        self.vault_manager_open = true;
+        self.vault_manager_focused_once = false;
+        cx.notify();
+    }
+
+    /// 关闭「管理仓库」；Main 里把焦点还给编辑器。
+    pub fn close_vault_manager(&mut self, cx: &mut Context<Self>) {
+        if !self.vault_manager_open {
+            return;
+        }
+        self.vault_manager_open = false;
+        self.vault_manager_focused_once = false;
+        self.vault_manager_notice = None;
+        self.vault_rename = None;
+        if self.state == State::Main {
+            self.pending_focus_restore = true;
+        }
+        cx.notify();
+    }
+
+    /// 「管理仓库」是否展开（测试/诊断）。
+    #[must_use]
+    pub fn vault_manager_is_open(&self) -> bool {
+        self.vault_manager_open
+    }
+
+    /// 管理仓库的内联提示（「设为默认」结果/失败原因；重新打开时清空）。
+    #[must_use]
+    pub fn vault_manager_notice(&self) -> Option<&str> {
+        self.vault_manager_notice.as_deref()
+    }
+
+    /// 管理仓库的行投影（**渲染与测试共用**：名字/路径/角色只有一份）。
+    #[must_use]
+    pub fn vault_manager_rows(&self) -> Vec<VaultManagerRow> {
+        let active_id = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.active_instance.clone());
+        let opened_id = self
+            .instance
+            .as_ref()
+            .map(|entry| entry.instance_id.clone());
+        self.entries()
+            .into_iter()
+            .map(|entry| VaultManagerRow {
+                name: entry.effective_name(),
+                meta: format!(
+                    "API {} · {} · vault_id {}",
+                    entry.api_version.as_str(),
+                    entry.relay_mode.as_str(),
+                    short_public_id(&entry.vault_id)
+                ),
+                instance_id: entry.instance_id.clone(),
+                path: entry.vault_path.clone(),
+                is_active: active_id.as_deref() == Some(entry.instance_id.as_str()),
+                opened: opened_id.as_deref() == Some(entry.instance_id.as_str()),
+            })
+            .collect()
+    }
+
+    /// 是否正在管理仓库里行内重命名（`None` = 不在改名；不写盘）。
+    #[must_use]
+    pub fn vault_rename_is_open(&self) -> bool {
+        self.vault_rename.is_some()
+    }
+
+    /// 正在改名的实例 id（测试/诊断）。
+    #[must_use]
+    pub fn vault_rename_instance_id(&self) -> Option<&str> {
+        self.vault_rename
+            .as_ref()
+            .map(|rename| rename.instance_id.as_str())
+    }
+
+    /// 行内重命名输入框的当前文本（trim 后原文）。
+    #[must_use]
+    pub fn vault_rename_text(&self, cx: &App) -> Option<String> {
+        self.vault_rename
+            .as_ref()
+            .map(|rename| rename.input.read(cx).text().trim().to_owned())
+    }
+
+    /// 行内重命名输入框的错误（校验失败/写盘失败；没有则 `None`）。
+    #[must_use]
+    pub fn vault_rename_error(&self) -> Option<&str> {
+        self.vault_rename
+            .as_ref()
+            .and_then(|rename| rename.error.as_deref())
+    }
+
+    /// 测试/预填：改行内重命名输入框的文本（不写盘）。
+    pub fn vault_rename_set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(rename) = &self.vault_rename {
+            let text = text.to_owned();
+            rename.input.update(cx, |input, cx| {
+                input.set_text(&text);
+                cx.notify();
+            });
+            cx.notify();
+        }
+    }
+
+    /// 开始重命名一个已保存实例：打开**行内**输入（预填当前自定义名，空 = 目录名）。
+    ///
+    /// 只准备输入：不写 `sync.json`、不移动目录、不碰实例锁/worker。
+    pub fn begin_vault_rename(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        if !self.vault_manager_open {
+            return;
+        }
+        let Some(entry) = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.find(instance_id))
+            .cloned()
+        else {
+            self.vault_manager_notice = Some(format!("实例不存在：{instance_id}；配置没有被改动"));
+            cx.notify();
+            return;
+        };
+        let initial = entry.display_name.clone().unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = FormInput::new(crate::ui_text::vault_name_placeholder(), false, cx)
+                .selector("vault-manager-rename-input")
+                .click_to_focus();
+            input.set_text(&initial);
+            input
+        });
+        self.vault_manager_notice = None;
+        self.vault_rename = Some(VaultRenameState {
+            instance_id: instance_id.to_owned(),
+            input,
+            error: None,
+            focused_once: false,
+        });
+        cx.notify();
+    }
+
+    /// 取消重命名（Esc/「取消」）：只丢弃输入，磁盘/内存配置都不变。
+    pub fn cancel_vault_rename(&mut self, cx: &mut Context<Self>) {
+        if self.vault_rename.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 保存重命名：校验 → 只改 `display_name` → `sync.json` 原子写 → 刷新三处显示。
+    ///
+    /// 成功条件（全部满足才关闭行内输入）：
+    /// 1. 名称通过 [`normalize_display_name`]（trim/1–64 字符/无控制字符；空白 = 清除）；
+    /// 2. 实例仍在公开配置里（不自动新增条目）；
+    /// 3. `sync.json` 写成功（失败时磁盘原样保留，输入与错误留在行内）。
+    ///
+    /// **不移动目录、不改 `active_instance`/`vault_path`/`vault_id`、不碰实例锁**。
+    pub fn save_vault_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.vault_rename.as_ref() else {
+            return;
+        };
+        let instance_id = rename.instance_id.clone();
+        let raw = rename.input.read(cx).text().trim().to_owned();
+        let normalized = match normalize_display_name(&raw) {
+            Ok(name) => name,
+            Err(error) => {
+                self.set_vault_rename_error(error.to_string(), cx);
+                return;
+            }
+        };
         let mut profile = self.profile.clone().unwrap_or_default();
-        let Some(entry) = profile.find(instance_id).cloned() else {
-            self.set_settings_error(format!(
-                "实例不存在：{instance_id}；配置没有被改动，请重读设置"
+        if let Err(error) = profile.rename_instance(&instance_id, normalized.as_deref()) {
+            self.set_vault_rename_error(error.to_string(), cx);
+            return;
+        }
+        if let Err(error) = self.store.save(&profile) {
+            self.set_vault_rename_error(
+                format!(
+                    "配置保存失败：{error}；名称没有被改动（磁盘原样保留），\
+                     可修正后重试（不会动实例目录/库/实例锁）"
+                ),
+                cx,
+            );
+            return;
+        }
+        self.profile = Some(profile);
+        // 当前打开的实例也要立刻换名字（左下角按钮/菜单当前行/管理仓库同步刷新）。
+        if let Some(current) = &mut self.instance {
+            if current.instance_id == instance_id {
+                current.display_name = normalized.clone();
+            }
+        }
+        self.vault_rename = None;
+        let display = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.find(&instance_id))
+            .map(InstanceEntry::effective_name)
+            .unwrap_or_else(|| instance_id.clone());
+        self.vault_manager_notice = Some(match &normalized {
+            Some(_) => format!(
+                "已保存仓库名称「{display}」到 sync.json：只改显示，\
+                 目录/库路径/实例锁/同步 worker 都没有变化。"
+            ),
+            None => format!(
+                "已清除自定义名称：显示回退为目录名「{display}」（只改显示，目录/路径没有变化）。"
+            ),
+        });
+        cx.notify();
+    }
+
+    /// 行内重命名的错误（保留输入，可修正后重试）。
+    fn set_vault_rename_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(rename) = &mut self.vault_rename {
+            rename.error = Some(message);
+        }
+        cx.notify();
+    }
+
+    /// 当前 vault 的显示名（左下角按钮文案）：**自定义名优先**，其次库文件父目录名
+    /// （不显示 `vault.sqlite3`/完整路径）；本地库用本地路径的目录名，没有则「本地库」。
+    ///
+    /// 与切换菜单当前行、管理仓库行共用 [`InstanceEntry::effective_name`]：三处同一个名字。
+    #[must_use]
+    pub fn current_vault_name(&self, _cx: &App) -> String {
+        if let Some(entry) = self.instance.as_ref() {
+            // 自定义名优先，其次目录名，最后短 id（与菜单/管理仓库同一份名字）。
+            return entry.effective_name();
+        }
+        if self.local_mode {
+            let path = self
+                .local_recent_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            return vault_directory_name(Path::new(&path)).unwrap_or_else(|| "本地库".to_owned());
+        }
+        "本库".to_owned()
+    }
+
+    /// 左下角切换菜单的行模型（当前 vault 带 `✓`；其它按已保存顺序，active 优先）。
+    ///
+    /// 渲染与测试共用这一份投影：菜单文案不会出现"测试断言的和画出来的不一致"。
+    #[must_use]
+    pub fn vault_menu_rows(&self, cx: &App) -> Vec<VaultMenuRow> {
+        let current_id = self
+            .instance
+            .as_ref()
+            .filter(|_| !self.local_mode)
+            .map(|entry| entry.instance_id.clone());
+        // 当前行与左下角按钮用同一个短名字（目录名），避免两处显示不一致。
+        let current_name = self.current_vault_name(cx);
+        self.entries()
+            .into_iter()
+            .map(|entry| {
+                let current = current_id.as_deref() == Some(entry.instance_id.as_str());
+                // 与左下角按钮/管理仓库同一套显示名（自定义名 → 目录名 → 短 id）。
+                let name = entry.effective_name();
+                VaultMenuRow {
+                    instance_id: entry.instance_id.clone(),
+                    label: if current {
+                        format!("✓ {current_name}")
+                    } else {
+                        name
+                    },
+                    meta: if current {
+                        "当前 vault".to_owned()
+                    } else {
+                        format!(
+                            "API {} · {}",
+                            entry.api_version.as_str(),
+                            entry.relay_mode.as_str()
+                        )
+                    },
+                    current,
+                }
+            })
+            .collect()
+    }
+
+    /// 切到另一个已保存实例：**关旧开新**，不重启应用、不热切 worker。
+    ///
+    /// 顺序（数据安全优先）：
+    /// 1. 目标就是当前打开的实例 → **no-op**（只收菜单/管理器），不重建 `AppShell`；
+    /// 2. 先 `AppShell::close_all`（有界排空/flush）→ drop 旧 `AppShell`；
+    /// 3. 释放旧 `InstanceLock`（Drop 删除锁文件）；
+    /// 4. 打开目标实例（成功写 active/`startup.json` = sync；失败进既有 Error 页，
+    ///    **绝不**把两个 `AppShell`/worker 同时留着）。
+    ///
+    /// 这是**显式用户动作**：切换 = 关旧开新；锁逻辑只有这一份。
+    pub fn switch_to_instance(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        if self.state != State::Main {
+            return;
+        }
+        let Some(entry) = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.find(instance_id))
+            .cloned()
+        else {
+            self.vault_manager_notice = Some(format!(
+                "实例不存在：{instance_id}；配置没有被改动，请重新打开管理仓库"
             ));
             cx.notify();
             return;
         };
-        if profile.active_instance.as_deref() == Some(instance_id) {
-            if let Some(settings) = &mut self.settings {
-                settings.error = None;
-                settings.notice = Some(format!(
-                    "「{}」已经是默认实例：重启后仍会打开它（当前界面不变）。",
+        // 目标就是当前实例：no-op（不 flush/不重新加载），只收起菜单/管理器。
+        if !self.local_mode
+            && self
+                .instance
+                .as_ref()
+                .is_some_and(|current| current.instance_id == instance_id)
+        {
+            let from_manager = self.vault_manager_open;
+            self.vault_menu_open = false;
+            self.vault_menu_focused_once = false;
+            if from_manager {
+                self.vault_manager_notice = Some(format!(
+                    "「{}」已经是当前打开的 vault：不重建、不重新加载。",
+                    entry.instance_id
+                ));
+            } else {
+                self.pending_focus_restore = self.main.is_some();
+                self.notice = Some(format!(
+                    "「{}」已经是当前打开的 vault：不重建、不重新加载（当前库保持不变）。",
                     entry.instance_id
                 ));
             }
-            // 已经是默认也要兑现「重启后打开它」：本地模式里点这一行同样切到同步入口。
-            self.remember_startup_mode(StartupMode::Sync);
             cx.notify();
             return;
         }
-        profile.active_instance = Some(instance_id.to_owned());
-        if let Err(error) = self.store.save(&profile) {
-            self.set_settings_error(format!(
-                "配置保存失败：{error}；active 没有被改动，可修正后重试（不会动实例目录）"
-            ));
-            cx.notify();
+        // 关旧开新：菜单/管理器先收起，再 flush 旧 Main + 释放锁。
+        self.clear_vault_overlays();
+        self.close_main(cx);
+        self.state = State::Opening;
+        self.error = None;
+        self.pending_focus_restore = false;
+        self.close_settings(cx);
+        self.open_entry_after_close(entry, cx);
+        cx.notify();
+    }
+
+    /// 管理仓库 →「设为默认」：只改公开配置 `active_instance` + 本机启动入口，
+    /// **不热切换**当前 Main（当前库/worker 不变）。
+    pub fn vault_manager_set_active(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        if !self.vault_manager_open {
             return;
         }
-        self.profile = Some(profile);
-        let fingerprint = self.settings_fingerprint(&entry, cx);
-        if let Some(settings) = &mut self.settings {
-            settings.active = Some(entry.clone());
-            settings.mode = entry.relay_mode;
-            settings.remote_consent = false;
-            settings.fingerprint = Some(fingerprint);
-            settings.error = None;
-            settings.notice = Some(format!(
-                "已将「{}」设为默认：重启后生效；当前主界面保持不变，\
-                 不热切换 Vault/worker。",
-                entry.instance_id
-            ));
-            // 新 active 的 relay 才是可编辑对象：输入框跟着切过去，避免把 A 的
-            // relay 误写到 B。
-            let relay_url = entry.relay_url.clone();
-            settings.relay.update(cx, |input, cx| {
-                input.set_text(&relay_url);
+        let mut profile = self.profile.clone().unwrap_or_default();
+        let Some(entry) = profile.find(instance_id).cloned() else {
+            self.vault_manager_notice = Some(format!("实例不存在：{instance_id}；配置没有被改动"));
+            cx.notify();
+            return;
+        };
+        let already = profile.active_instance.as_deref() == Some(instance_id);
+        if !already {
+            profile.active_instance = Some(instance_id.to_owned());
+            if let Err(error) = self.store.save(&profile) {
+                self.vault_manager_notice = Some(format!(
+                    "配置保存失败：{error}；active 没有被改动，可修正后重试（不会动实例目录）"
+                ));
                 cx.notify();
-            });
+                return;
+            }
+            self.profile = Some(profile);
         }
         // 兑现「重启后生效」：下次启动走同步入口（即使当前停在本地模式）。
         self.remember_startup_mode(StartupMode::Sync);
+        self.vault_manager_notice = Some(if already {
+            format!(
+                "「{}」已经是默认实例：重启后生效（仍会打开它；当前界面不变）。\
+                 要立刻切换请点同一行的「打开」（关旧开新，不重启）。",
+                entry.instance_id
+            )
+        } else {
+            format!(
+                "已将「{}」设为默认：重启后生效；当前主界面保持不变，不热切换 Vault/worker。\
+                 要立刻切换请点同一行的「打开」（关旧开新，不重启）。",
+                entry.instance_id
+            )
+        });
         cx.notify();
+    }
+
+    /// 管理仓库 →「同步远程仓库…」：关 Main + 回 Welcome → 展开**同一个**统一表单。
+    ///
+    /// 创建与加入不再分两个入口：表单只收一条 `mn-pair://create` / `mn-pair://join`
+    /// 链接，由 [`Self::welcome_confirm_sync`] 自动识别（还有 DEV 同意勾选与实例目录）。
+    pub fn vault_manager_sync_remote(&mut self, cx: &mut Context<Self>) {
+        if !self.vault_manager_open {
+            return;
+        }
+        self.leave_main_to_welcome(cx);
+        self.ensure_welcome_forms(cx);
+        self.reset_welcome_sync_form(cx);
+        self.welcome_open_action(WelcomeAction::SyncRemote, cx);
+        self.notice = Some(
+            "同步远程仓库：粘贴 mn-pair://create（创建票据）或 mn-pair://join（邀请加入）             链接，自动识别；不再需要手填 relay/vault_id/恢复码。"
+                .to_owned(),
+        );
+        cx.notify();
+    }
+
+    /// 重置统一同步表单：新实例 id、默认目录、空链接、未勾选（不写盘/不联网）。
+    fn reset_welcome_sync_form(&mut self, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        let instance_id = self
+            .options
+            .instance_id
+            .clone()
+            .unwrap_or_else(generate_instance_id);
+        let dir_text = self
+            .options
+            .layout
+            .default_instance_dir(&instance_id)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let Some(welcome) = &mut self.welcome else {
+            return;
+        };
+        welcome.sync_instance_id = instance_id;
+        welcome.sync_consent = false;
+        welcome.error = None;
+        welcome.sync_link.update(cx, |input, cx| {
+            input.clear();
+            cx.notify();
+        });
+        welcome.sync_dir.update(cx, |input, cx| {
+            input.set_text(&dir_text);
+            cx.notify();
+        });
+        // 名称属于上一次操作：新表单从「留空则使用目录名」开始。
+        welcome.sync_name.update(cx, |input, cx| {
+            input.clear();
+            cx.notify();
+        });
+    }
+
+    /// 管理仓库 →「返回欢迎页」：关闭当前 Main（flush）并释放实例锁，回到 Welcome。
+    ///
+    /// 同步实例列表仍在（`sync.json` 不改），可以重新打开；本地模式提示清掉。
+    /// 不删除任何用户文件、不改 active、不重建实例。
+    pub fn vault_manager_back_to_welcome(&mut self, cx: &mut Context<Self>) {
+        if !self.vault_manager_open {
+            return;
+        }
+        let had_main = self.main.is_some() || self.state == State::Main;
+        self.leave_main_to_welcome(cx);
+        if let Some(welcome) = &mut self.welcome {
+            welcome.expanded = None;
+            welcome.error = None;
+        }
+        self.notice = had_main.then(|| {
+            "已返回欢迎页：当前笔记库已关闭（已 flush），实例列表仍在；可重新打开、新建或加入 vault。"
+                .to_owned()
+        });
+        cx.notify();
+    }
+
+    /// 收起左下角菜单/管理仓库（不碰焦点；`close_main`/`open_settings` 内部用）。
+    fn clear_vault_overlays(&mut self) {
+        self.vault_menu_open = false;
+        self.vault_manager_open = false;
+        self.vault_menu_focused_once = false;
+        self.vault_manager_focused_once = false;
+        self.vault_manager_notice = None;
+        self.vault_rename = None;
+    }
+
+    /// 关闭当前 Main：`AppShell::close_all`（有界排空）→ drop shell → 释放实例锁。
+    ///
+    /// 不触碰公开配置；本地模式标记一并清除。
+    fn close_main(&mut self, cx: &mut Context<Self>) {
+        // 离开 Main：左下角菜单/管理仓库一并收起（不残留到 Welcome/Error）。
+        self.clear_vault_overlays();
+        self.main_shell_events = None;
+        if let Some(shell) = self.main.take() {
+            shell.update(cx, |shell, cx| shell.close_all(cx));
+        }
+        self.lock = None;
+        self.instance = None;
+        self.local_mode = false;
+    }
+
+    /// 清掉 Welcome 同步表单里的**一次性链接**与 DEV 同意（离开入口/返回时调用）。
+    fn clear_welcome_sync_secret(&mut self, cx: &mut Context<Self>) {
+        let Some(welcome) = &mut self.welcome else {
+            return;
+        };
+        welcome.sync_consent = false;
+        welcome.error = None;
+        welcome.sync_link.update(cx, |input, cx| {
+            input.clear();
+            cx.notify();
+        });
+    }
+
+    /// 关 Main + 关设置 + 清掉所有临时页面状态，回到 Welcome（不删文件/不改配置）。
+    fn leave_main_to_welcome(&mut self, cx: &mut Context<Self>) {
+        self.close_main(cx);
+        self.close_settings(cx);
+        self.pending_focus_restore = false;
+        self.pending = None;
+        self.pending_join = None;
+        self.pending_invite = None;
+        self.form = None;
+        self.join_form = None;
+        self.invite = None;
+        self.working = None;
+        self.retry_entry = None;
+        self.error = None;
+        self.pending_create_display_name = None;
+        self.pending_invite_display_name = None;
+        self.vault_rename = None;
+        self.state = State::Welcome;
+        if let Some(welcome) = &mut self.welcome {
+            welcome.expanded = None;
+        }
+        self.clear_welcome_sync_secret(cx);
+    }
+
+    /// 打开目标实例；失败进既有 Error 页（可重试/返回欢迎页）。
+    fn open_entry_after_close(&mut self, entry: InstanceEntry, cx: &mut Context<Self>) {
+        if let Err(error) = self.open_instance(&entry, cx) {
+            let message = sanitize_error(&error, &[]);
+            self.retry_entry = Some(entry.clone());
+            let public = public_fields(&entry);
+            self.set_error("无法打开实例", message, public, RetryKind::OpenInstance);
+        }
+    }
+
+    /// 当前打开的实例（`None` = Welcome/本地模式/未成功打开）。
+    #[must_use]
+    pub fn opened_instance(&self) -> Option<&InstanceEntry> {
+        self.instance.as_ref()
+    }
+
+    /// Welcome 本地入口按钮的**动态**文案（产品）：文件已存在 =「打开本地 vault」，
+    /// 不存在 =「新建本地 vault」（点击创建空库，不播种 demo）。
+    ///
+    /// dev-sync 构建保持旧「继续本地（DEV ONLY）」文案。
+    #[must_use]
+    pub fn local_action_label(&self, cx: &App) -> String {
+        if cfg!(feature = "dev-sync") {
+            return Self::local_entry_label();
+        }
+        let path = self
+            .welcome
+            .as_ref()
+            .map(|welcome| welcome.open_local_path.read(cx).text().trim().to_owned())
+            .unwrap_or_default();
+        if !path.is_empty() && Path::new(&path).is_file() {
+            "打开本地 vault".to_owned()
+        } else {
+            "新建本地 vault".to_owned()
+        }
     }
 
     /// 复制**公开值**（`vault_id` / `device_id` / 库路径）到剪贴板并提示风险。
@@ -1713,39 +2797,6 @@ impl AppRoot {
         FingerprintState::from_result(entry.relay_mode, &entry.relay_url, result)
     }
 
-    /// 设置面板当前编辑的 relay 模式（公开配置字段的投影）。
-    #[must_use]
-    pub fn settings_mode(&self) -> Option<RelayMode> {
-        self.settings.as_ref().map(|settings| settings.mode)
-    }
-
-    /// 切换设置面板的 relay 模式（只改面板状态；保存才写配置，重启后生效）。
-    pub fn settings_set_mode(&mut self, mode: RelayMode, cx: &mut Context<Self>) {
-        if let Some(settings) = &mut self.settings {
-            settings.mode = mode;
-            settings.remote_consent = false;
-            settings.error = None;
-            settings.notice = None;
-        }
-        cx.notify();
-    }
-
-    /// 设置面板 remote_tls 的显式确认（"远程服务器/HTTPS"）。
-    #[must_use]
-    pub fn settings_remote_consent(&self) -> Option<bool> {
-        self.settings
-            .as_ref()
-            .map(|settings| settings.remote_consent)
-    }
-
-    /// 勾选/取消 remote_tls 的显式确认。
-    pub fn settings_set_remote_consent(&mut self, consent: bool, cx: &mut Context<Self>) {
-        if let Some(settings) = &mut self.settings {
-            settings.remote_consent = consent;
-        }
-        cx.notify();
-    }
-
     /// 设置面板的安全指纹（只读公开投影；`None` = 面板未打开）。
     #[must_use]
     pub fn settings_fingerprint_state(&self) -> Option<FingerprintState> {
@@ -1791,10 +2842,12 @@ impl AppRoot {
             .instance_id
             .clone()
             .unwrap_or_else(generate_instance_id);
+        // 默认放在用户可见目录（Documents/menghunote/instances/<id>），不再默认
+        // LOCALAPPDATA；用户可改，实际路径提交时写进公开配置的 `vault_path`。
         let default_dir = self
             .options
             .layout
-            .instance_dir(&instance_id)
+            .default_instance_dir(&instance_id)
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         // 创建链接含一次性票据：遮罩 + 禁复制 + 允许粘贴（与秘密字段同一控件）。
@@ -1803,10 +2856,14 @@ impl AppRoot {
                 .selector("app-root-create-link-input")
                 .click_to_focus()
         });
+        // 预填真实值（不是 placeholder）：用户不点「浏览」也能直接提交默认目录。
+        let dir_default = default_dir.clone();
         let dir = cx.new(|cx| {
-            FormInput::new(default_dir, false, cx)
+            let mut input = FormInput::new(dir_default.clone(), false, cx)
                 .selector("app-root-dir-input")
-                .click_to_focus()
+                .click_to_focus();
+            input.set_text(&dir_default);
+            input
         });
         // 链接输入框按 Enter = 应用链接；其它字段按 Enter = 提交表单。
         let mut subs = Vec::new();
@@ -1827,7 +2884,6 @@ impl AppRoot {
             mode_kind: FormCreateMode::Link,
             // 尚未应用链接：按本构建可用的默认模式展示，应用链接后由 scheme 覆盖。
             mode: default_form_mode(),
-            remote_consent: false,
             link,
             link_state: None,
             dir,
@@ -1868,6 +2924,32 @@ impl AppRoot {
                 cx.notify();
             });
         }
+    }
+
+    /// 「浏览…」：系统目录选择器 → 选中目录写进 Create 表单的实例目录。
+    ///
+    /// 只填文本、不提交；方向/存在性校验仍在 [`Self::submit_create`] 的
+    /// `validate_instance_directory`（绝对路径 + 不存在/空目录），选择器不构成授权。
+    /// headless 环境拿不到真实对话框，测试直接调 [`Self::form_set_dir`]。
+    pub fn form_browse_dir(&mut self, cx: &mut Context<Self>) {
+        if self.form.is_none() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(SharedString::from("选择同步实例目录")),
+        });
+        cx.spawn(async move |root, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.first() {
+                    let text = path.display().to_string();
+                    let _ = root.update(cx, |root, cx| root.form_set_dir(&text, cx));
+                }
+            }
+        })
+        .detach();
     }
 
     /// 测试/预填：设置创建链接输入框文本（秘密；只在控件里存在）。
@@ -1966,10 +3048,9 @@ impl AppRoot {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        // 应用链接 = 唯一创建方式；模式由链接 scheme 决定。
+        // 应用链接 = 唯一创建方式；模式由链接 scheme 决定（HTTPS 只由权威 parser 校验，
+        // 不需要额外的"确认连接 HTTPS"勾选）。
         form.mode = mode;
-        // 远端必须在票据模式下重新确认（换链接 = 换端点，不能沿用旧确认）。
-        form.remote_consent = false;
         form.link_state = Some(CreateLinkState {
             mode,
             relay: relay.clone(),
@@ -2000,7 +3081,6 @@ impl AppRoot {
             return;
         }
         form.mode = default_form_mode();
-        form.remote_consent = false;
         form.error = None;
         self.notice = Some(
             "已移除创建链接：粘贴新的 mn-pair://create 链接后可重新创建（旧票据已从界面丢弃，             未提交时不会被消费）"
@@ -2036,12 +3116,6 @@ impl AppRoot {
         self.form.as_ref().map(|form| form.mode)
     }
 
-    /// Create 表单是否已勾选 remote_tls 的显式确认。
-    #[must_use]
-    pub fn form_remote_consent(&self) -> Option<bool> {
-        self.form.as_ref().map(|form| form.remote_consent)
-    }
-
     /// **测试专用**：给 remote_tls 的 Create/Join worker 注入显式信任根（DER）。
     ///
     /// 只用于本地 TLS harness（`menghunote-dev-relay::start_tls` 的自签 CA）；生产不调用。
@@ -2059,14 +3133,6 @@ impl AppRoot {
         self.test_baseline_unreachable = unreachable;
     }
 
-    /// 设置 Create 表单的 remote_tls 确认勾选。
-    pub fn form_set_remote_consent(&mut self, consent: bool, cx: &mut Context<Self>) {
-        if let Some(form) = &mut self.form {
-            form.remote_consent = consent;
-        }
-        cx.notify();
-    }
-
     /// 进入 Join 表单（默认 relay / 自动实例目录 / 空 vault_id / 遮罩恢复码）。
     ///
     /// 与 Create 共用目录默认值与实例锁；`vault_id` 是**公开标识**（不遮罩），
@@ -2077,10 +3143,11 @@ impl AppRoot {
             .instance_id
             .clone()
             .unwrap_or_else(generate_instance_id);
+        // 与 Create 同一默认根（用户可见目录，可改；不再默认 LOCALAPPDATA）。
         let default_dir = self
             .options
             .layout
-            .instance_dir(&instance_id)
+            .default_instance_dir(&instance_id)
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         let default_relay = self.options.default_relay.clone();
@@ -2105,10 +3172,14 @@ impl AppRoot {
                 .selector("app-root-invite-input")
                 .click_to_focus()
         });
+        // 预填真实值（不是 placeholder）：与 Create 同一默认根，可直接提交或再浏览。
+        let dir_default = default_dir.clone();
         let dir = cx.new(|cx| {
-            FormInput::new(default_dir, false, cx)
+            let mut input = FormInput::new(dir_default.clone(), false, cx)
                 .selector("app-root-join-dir-input")
-                .click_to_focus()
+                .click_to_focus();
+            input.set_text(&dir_default);
+            input
         });
         // 在任意字段按 Enter 都提交（与按钮同一条路径）。
         let mut subs = Vec::new();
@@ -2128,8 +3199,6 @@ impl AppRoot {
         }
         self.join_form = Some(JoinFormState {
             instance_id,
-            mode: default_form_mode(),
-            remote_consent: false,
             relay,
             vault_id,
             recovery_code,
@@ -2202,33 +3271,28 @@ impl AppRoot {
         }
     }
 
-    /// Join 表单当前选择的 relay 模式。
-    #[must_use]
-    pub fn join_form_mode(&self) -> Option<RelayMode> {
-        self.join_form.as_ref().map(|form| form.mode)
-    }
-
-    /// 设置 Join 表单的 relay 模式（不写配置、不联网）。
-    pub fn join_form_set_mode(&mut self, mode: RelayMode, cx: &mut Context<Self>) {
-        if let Some(form) = &mut self.join_form {
-            form.mode = mode;
-            form.error = None;
+    /// 「浏览…」：系统目录选择器 → 选中目录写进 Join 表单的实例目录。
+    ///
+    /// 与 Create 同一套校验（绝对路径 + 不存在/空目录），选择器不构成授权。
+    pub fn join_form_browse_dir(&mut self, cx: &mut Context<Self>) {
+        if self.join_form.is_none() {
+            return;
         }
-        cx.notify();
-    }
-
-    /// Join 表单是否已勾选 remote_tls 的显式确认。
-    #[must_use]
-    pub fn join_form_remote_consent(&self) -> Option<bool> {
-        self.join_form.as_ref().map(|form| form.remote_consent)
-    }
-
-    /// 设置 Join 表单的 remote_tls 确认勾选。
-    pub fn join_form_set_remote_consent(&mut self, consent: bool, cx: &mut Context<Self>) {
-        if let Some(form) = &mut self.join_form {
-            form.remote_consent = consent;
-        }
-        cx.notify();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(SharedString::from("选择同步实例目录")),
+        });
+        cx.spawn(async move |root, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.first() {
+                    let text = path.display().to_string();
+                    let _ = root.update(cx, |root, cx| root.join_form_set_dir(&text, cx));
+                }
+            }
+        })
+        .detach();
     }
 
     /// 点击实例列表里的一个已保存实例。
@@ -2261,56 +3325,509 @@ impl AppRoot {
         }
     }
 
-    /// 「本地（不同步）」：打开本地库并进入 Main（**无同步面板/状态**）。
-    ///
-    /// 两种构建共用 selector 与状态机，行为按编译期特性区分：
-    ///
-    /// - **产品 `sync-ui`**：`ProfileLayout::local_vault_path()`（数据根下
-    ///   `local/vault.sqlite3`）；空库**不播种 demo**、不联网、不建实例、
-    ///   不写 `sync.json`/身份文件；顶部显示「本地模式：不同步」。
-    /// - **`dev-sync`**：保留旧「继续本地」行为 —— 默认 dev vault（含演示树），
-    ///   提示里明确 DEV ONLY（现有测试/开发路径不变）。
-    ///
-    /// 打开**成功**后写本机 `startup.json`（`mode = local`，不同步、不含正文），
-    /// 下次启动直接回到同一本地库；打开失败不写偏好。
-    ///
-    /// 打不开时进 GUI Error 页（[`Self::set_error`]），不静默退出。
-    pub fn open_local_vault(&mut self, cx: &mut Context<Self>) {
-        if !self.options.allow_local_vault {
-            self.notice = Some("本地入口在本进程被禁用（测试注入）".to_owned());
-            cx.notify();
+    // ---- Welcome 左列表 / 右操作卡（Obsidian 式仓库选择页） ----
+
+    /// 展开/收起右栏某张操作卡（不整页跳走；当前展开项再点一次 = 收起）。
+    pub fn welcome_toggle_action(&mut self, action: WelcomeAction, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        let Some(welcome) = &mut self.welcome else {
             return;
-        }
-        if cfg!(feature = "dev-sync") {
-            self.open_local_dev_vault(cx);
+        };
+        welcome.expanded = if welcome.expanded == Some(action) {
+            None
         } else {
-            self.open_local_only_vault(cx);
+            Some(action)
+        };
+        welcome.error = None;
+        self.pending_focus = true;
+        cx.notify();
+    }
+
+    /// 打开指定操作卡（测试/管理仓库入口使用；幂等）。
+    pub fn welcome_open_action(&mut self, action: WelcomeAction, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        let Some(welcome) = &mut self.welcome else {
+            return;
+        };
+        welcome.expanded = Some(action);
+        welcome.error = None;
+        self.pending_focus = true;
+        cx.notify();
+    }
+
+    /// 当前展开的操作卡（测试/诊断）。
+    #[must_use]
+    pub fn welcome_expanded(&self) -> Option<WelcomeAction> {
+        self.welcome.as_ref().and_then(|welcome| welcome.expanded)
+    }
+
+    /// Welcome 内联错误（`welcome-error`；已脱敏）。
+    #[must_use]
+    pub fn welcome_error(&self) -> Option<&str> {
+        self.welcome
+            .as_ref()
+            .and_then(|welcome| welcome.error.as_deref())
+    }
+
+    fn set_welcome_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if let Some(welcome) = &mut self.welcome {
+            welcome.error = Some(message.into());
         }
         cx.notify();
     }
 
-    /// 产品构建的「仅本地使用」：数据根下 `local/vault.sqlite3`，空库不播种。
+    /// 「新建本地仓库」的目录文本（测试/预填）。
+    #[must_use]
+    pub fn welcome_new_local_dir_text(&self, cx: &App) -> Option<String> {
+        self.welcome
+            .as_ref()
+            .map(|welcome| welcome.new_local_dir.read(cx).text().trim().to_owned())
+    }
+
+    /// 测试/预填：「新建本地仓库」目录。
+    pub fn welcome_set_new_local_dir(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if let Some(welcome) = &self.welcome {
+            let text = text.to_owned();
+            welcome.new_local_dir.update(cx, |input, cx| {
+                input.set_text(&text);
+                cx.notify();
+            });
+        }
+    }
+
+    /// 「打开本地仓库」输入框文本（测试/预填）。
+    #[must_use]
+    pub fn welcome_open_local_path_text(&self, cx: &App) -> Option<String> {
+        self.welcome
+            .as_ref()
+            .map(|welcome| welcome.open_local_path.read(cx).text().trim().to_owned())
+    }
+
+    /// 测试/预填：「打开本地仓库」路径。
+    pub fn welcome_set_open_local_path(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.local_set_path(text, cx);
+    }
+
+    /// 同步表单的链接输入框（**秘密**：只报告是否为空/测试预填，不打印正文）。
+    #[must_use]
+    pub fn welcome_sync_link_is_empty(&self, cx: &App) -> Option<bool> {
+        self.welcome
+            .as_ref()
+            .map(|welcome| welcome.sync_link.read(cx).text().is_empty())
+    }
+
+    /// 测试/预填：同步远程仓库的链接（截图/日志不得输出正文）。
+    pub fn welcome_set_sync_link(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if let Some(welcome) = &self.welcome {
+            let text = text.to_owned();
+            welcome.sync_link.update(cx, |input, cx| {
+                input.set_text(&text);
+                cx.notify();
+            });
+        }
+    }
+
+    /// 同步远程仓库的实例目录文本（测试/预填）。
+    #[must_use]
+    pub fn welcome_sync_dir_text(&self, cx: &App) -> Option<String> {
+        self.welcome
+            .as_ref()
+            .map(|welcome| welcome.sync_dir.read(cx).text().trim().to_owned())
+    }
+
+    /// 测试/预填：同步远程仓库的实例目录。
+    pub fn welcome_set_sync_dir(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if let Some(welcome) = &self.welcome {
+            let text = text.to_owned();
+            welcome.sync_dir.update(cx, |input, cx| {
+                input.set_text(&text);
+                cx.notify();
+            });
+        }
+    }
+
+    /// 统一同步表单里的「仓库名称」输入（trim 后的原文；空 = 留空）。
+    #[must_use]
+    pub fn welcome_sync_name_text(&self, cx: &App) -> Option<String> {
+        self.welcome
+            .as_ref()
+            .map(|welcome| welcome.sync_name.read(cx).text().trim().to_owned())
+    }
+
+    /// 测试/预填：统一同步表单的「仓库名称」（只影响显示，不写盘）。
+    pub fn welcome_set_sync_name(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if let Some(welcome) = &self.welcome {
+            let text = text.to_owned();
+            welcome.sync_name.update(cx, |input, cx| {
+                input.set_text(&text);
+                cx.notify();
+            });
+        }
+    }
+
+    /// `dev-sync` 的「同意开发同步」当前是否勾选（产品构建恒为 false）。
+    #[must_use]
+    pub fn welcome_sync_consent(&self) -> bool {
+        self.welcome
+            .as_ref()
+            .is_some_and(|welcome| welcome.sync_consent)
+    }
+
+    /// 勾选/取消「同意开发同步」（**只有 `dev-sync` 构建渲染/校验**）。
+    pub fn welcome_set_sync_consent(&mut self, consent: bool, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if let Some(welcome) = &mut self.welcome {
+            welcome.sync_consent = consent;
+        }
+        cx.notify();
+    }
+
+    /// 「新建本地仓库」→ 选择目录 → 创建空 `vault.sqlite3`（**不播种 demo**）。
+    ///
+    /// 目录内已有库时明确提示改用「打开本地仓库」，绝不覆盖；成功后写
+    /// `startup.json`（`mode=local` + 实际路径）并进入 Main。
+    pub fn welcome_confirm_new_local(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::Welcome {
+            return;
+        }
+        self.ensure_welcome_forms(cx);
+        let text = self
+            .welcome
+            .as_ref()
+            .map(|welcome| welcome.new_local_dir.read(cx).text().trim().to_owned())
+            .unwrap_or_default();
+        if text.is_empty() {
+            self.set_welcome_error("请填写要创建仓库的目录（绝对路径）", cx);
+            return;
+        }
+        let dir = PathBuf::from(&text);
+        if !dir.is_absolute() {
+            self.set_welcome_error(
+                "本地仓库目录必须是绝对路径（例如 /home/you/... 或 C:\\...）",
+                cx,
+            );
+            return;
+        }
+        let path = if dir.file_name().is_some_and(|name| name == VAULT_FILE_NAME)
+            || dir
+                .extension()
+                .is_some_and(|extension| extension == "sqlite3")
+            || dir.is_file()
+        {
+            dir
+        } else {
+            dir.join(VAULT_FILE_NAME)
+        };
+        if path.exists() {
+            self.set_welcome_error(
+                format!(
+                    "该位置已有库文件 {}：请改用「打开本地仓库」（新建不会覆盖已有库）",
+                    path.display()
+                ),
+                cx,
+            );
+            return;
+        }
+        if let Some(welcome) = &mut self.welcome {
+            welcome.error = None;
+        }
+        self.open_local_only_vault_at(path, cx);
+        cx.notify();
+    }
+
+    /// 「打开本地仓库」→ 打开已有 `vault.sqlite3`；**缺失/损坏明确报错，不新建**。
+    pub fn welcome_confirm_open_local(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::Welcome {
+            return;
+        }
+        self.ensure_welcome_forms(cx);
+        let text = self
+            .welcome
+            .as_ref()
+            .map(|welcome| welcome.open_local_path.read(cx).text().trim().to_owned())
+            .unwrap_or_default();
+        if text.is_empty() {
+            self.set_welcome_error("请选择已有 vault.sqlite3（或包含它的目录）", cx);
+            return;
+        }
+        let selected = PathBuf::from(&text);
+        if !selected.is_absolute() {
+            self.set_welcome_error(
+                "本地仓库路径必须是绝对路径（例如 /home/you/... 或 C:\\...）",
+                cx,
+            );
+            return;
+        }
+        let path = Self::resolve_local_vault_selection(selected);
+        if !path.is_file() {
+            self.set_welcome_error(
+                format!(
+                    "本地库不存在：{}（打开不会新建；需要新库请用「新建本地仓库」）",
+                    path.display()
+                ),
+                cx,
+            );
+            return;
+        }
+        if let Some(welcome) = &mut self.welcome {
+            welcome.error = None;
+        }
+        self.open_local_only_vault_at(path, cx);
+        cx.notify();
+    }
+
+    /// 「浏览…」：新建本地仓库的目录选择器（只填文本，不创建）。
+    pub fn welcome_browse_new_local(&mut self, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if self.welcome.is_none() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(SharedString::from("选择新建仓库的目录")),
+        });
+        cx.spawn(async move |root, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.first() {
+                    let text = path.display().to_string();
+                    let _ = root.update(cx, |root, cx| root.welcome_set_new_local_dir(&text, cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 「浏览…」：打开本地仓库的文件/目录选择器（只填文本，不打开）。
+    pub fn welcome_browse_open_local(&mut self, cx: &mut Context<Self>) {
+        self.local_browse_vault_path(cx);
+    }
+
+    /// 「浏览…」：同步远程仓库的实例目录选择器（只填文本，不建目录）。
+    pub fn welcome_browse_sync_dir(&mut self, cx: &mut Context<Self>) {
+        self.ensure_welcome_forms(cx);
+        if self.welcome.is_none() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(SharedString::from("选择同步实例目录")),
+        });
+        cx.spawn(async move |root, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.first() {
+                    let text = path.display().to_string();
+                    let _ = root.update(cx, |root, cx| root.welcome_set_sync_dir(&text, cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 统一「同步远程仓库」入口：**只收一条链接**，自动识别创建票据 / 邀请链接。
+    ///
+    /// 严格解析：不认识的 scheme/host、坏票据、坏目录都**不联网、不建文件**，
+    /// 错误内联到 `welcome-error`。识别成功后才走既有 Create / Invite worker。
+    pub fn welcome_confirm_sync(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::Welcome {
+            return;
+        }
+        self.ensure_welcome_forms(cx);
+        let (link, dir, name, consent, instance_id) = {
+            let Some(welcome) = &self.welcome else {
+                return;
+            };
+            (
+                welcome.sync_link.read(cx).text().trim().to_owned(),
+                welcome.sync_dir.read(cx).text().trim().to_owned(),
+                welcome.sync_name.read(cx).text().trim().to_owned(),
+                welcome.sync_consent,
+                welcome.sync_instance_id.clone(),
+            )
+        };
+        if link.is_empty() {
+            self.set_welcome_error(
+                "请粘贴一条链接：mn-pair://create（创建票据）或 mn-pair://join（邀请加入）",
+                cx,
+            );
+            return;
+        }
+        let lower = link.to_ascii_lowercase();
+        let is_create = lower.starts_with("mn-pair://create");
+        let is_join = lower.starts_with("mn-pair://join");
+        if !is_create && !is_join {
+            self.set_welcome_error(
+                "无法识别的链接：只接受 mn-pair://create 或 mn-pair://join（没有联网，也没有创建文件）",
+                cx,
+            );
+            return;
+        }
+        // 产品构建没有 DEV 勾选；dev-sync 构建必须先明确同意。
+        #[cfg(feature = "dev-sync")]
+        if !consent {
+            self.set_welcome_error(
+                "请先勾选「同意开发同步」：这是 localhost 开发验证，不是生产跨设备安全同步",
+                cx,
+            );
+            return;
+        }
+        #[cfg(not(feature = "dev-sync"))]
+        let _ = consent;
+        if dir.is_empty() {
+            self.set_welcome_error("请填写实例目录（绝对路径；默认在用户文档目录）", cx);
+            return;
+        }
+        // 「仓库名称」可选：trim 后 1–64 字符、无控制字符；空白 = 回退目录名。
+        // **只影响显示**，不参与目录/路径计算。
+        let display_name = match normalize_display_name(&name) {
+            Ok(name) => name,
+            Err(error) => {
+                self.set_welcome_error(
+                    format!("{error}（名称只用于显示；没有改动目录，也没有创建任何文件）"),
+                    cx,
+                );
+                return;
+            }
+        };
+        if is_create {
+            let parsed = match CreateLink::parse(&link) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.set_welcome_error(
+                        format!("创建链接无效：{error}（没有联网，也没有创建任何文件）"),
+                        cx,
+                    );
+                    return;
+                }
+            };
+            if !crate::sync_gate::mode_allowed(parsed.mode) {
+                self.set_welcome_error(
+                    format!(
+                        "本次构建不开放 relay 模式 {}：产品构建只允许 remote_tls（local_dev 需要 dev-sync 构建）",
+                        parsed.mode.as_str()
+                    ),
+                    cx,
+                );
+                return;
+            }
+            let dir_path = PathBuf::from(&dir);
+            if let Err(message) = validate_instance_directory(&dir_path) {
+                self.set_welcome_error(message, cx);
+                return;
+            }
+            let CreateLink {
+                mode,
+                relay,
+                vault_id,
+                ticket,
+                pin,
+                url,
+            } = parsed;
+            drop(url);
+            let state = CreateLinkState {
+                mode,
+                relay,
+                vault_id,
+                vault_id_hex: menghunote_sync::ids::hex_of(&vault_id),
+                ticket,
+                pin,
+            };
+            match self.begin_ticket_create(state, dir_path, instance_id, display_name, cx) {
+                Ok(()) => {
+                    if let Some(welcome) = &mut self.welcome {
+                        welcome.error = None;
+                        welcome.sync_link.update(cx, |input, cx| {
+                            input.clear();
+                            cx.notify();
+                        });
+                    }
+                    cx.notify();
+                }
+                Err(message) => self.set_welcome_error(message, cx),
+            }
+        } else {
+            let target = match menghunote_sync::invite_link::InviteLinkTarget::parse(&link) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.set_welcome_error(
+                        format!("邀请链接无效：{error}（没有联网，也没有创建任何文件）"),
+                        cx,
+                    );
+                    return;
+                }
+            };
+            if !crate::sync_gate::mode_allowed(target.mode()) {
+                self.set_welcome_error(
+                    format!(
+                        "本次构建不开放 relay 模式 {}：产品构建只允许 remote_tls（local_dev 需要 dev-sync 构建）",
+                        target.mode().as_str()
+                    ),
+                    cx,
+                );
+                return;
+            }
+            let dir_path = PathBuf::from(&dir);
+            let vault_path = dir_path.join(VAULT_FILE_NAME);
+            if let Err(message) = validate_invite_directory(&target, &vault_path, &dir_path) {
+                self.set_welcome_error(message, cx);
+                return;
+            }
+            match self.begin_invite_redeem(target, vault_path, Some(instance_id), display_name, cx)
+            {
+                Ok(()) => {
+                    if let Some(welcome) = &mut self.welcome {
+                        welcome.error = None;
+                        welcome.sync_link.update(cx, |input, cx| {
+                            input.clear();
+                            cx.notify();
+                        });
+                    }
+                    cx.notify();
+                }
+                Err(message) => self.set_welcome_error(message, cx),
+            }
+        }
+    }
+
+    /// 「本地（不同步）」：打开当前选择的已有本地库（旧公开入口；也供测试调用）。
+    ///
+    /// Welcome 的新入口是 [`Self::welcome_confirm_open_local`]（只打开已有库）；
+    /// 这里保持旧 API 存在，但同样不新建缺失的库。
+    pub fn open_local_vault(&mut self, cx: &mut Context<Self>) {
+        self.welcome_confirm_open_local(cx);
+    }
+
+    /// 产品构建的「仅本地使用」：用户选择的库文件，空库不播种。
     ///
     /// 数据安全：
     /// - 不写 `sync.json`（不登记实例）、不建 instance 目录、不写身份文件；
-    /// - 已有库直接复用（`Vault::open`，不重置内容）；
+    /// - 已有库直接复用（`Vault::open`，不重置内容）；不存在则创建空库；
     /// - 不取实例目录锁（不影响同步实例的锁；本地库与 instances 目录分离）。
-    fn open_local_only_vault(&mut self, cx: &mut Context<Self>) {
-        let path = self.options.layout.local_vault_path();
+    /// - 成功后把**实际路径**写进 `startup.json`，下次启动恢复同一路径。
+    fn open_local_only_vault_at(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match dev_vault::open_local_vault_at(&path) {
             Ok(dev) => {
                 let label = dev.path.display().to_string();
                 let vault = dev.vault.clone();
                 let shell = cx.new(|cx| AppShell::new(vault, label, cx));
-                self.main = Some(shell);
+                self.set_main_shell(shell, cx);
                 self.instance = None;
                 self.lock = None;
                 self.local_mode = true;
                 self.state = State::Main;
                 self.error = None;
                 self.notice = Some(crate::ui_text::local_mode_notice());
+                self.set_local_path_text(&path, cx);
                 // 本机启动偏好：下次启动直接回到这个本地库（不写 sync.json/身份/正文）。
-                self.remember_startup_mode(StartupMode::Local);
+                self.remember_startup_preferences(StartupMode::Local, Some(path));
             }
             Err(error) => {
                 let message = sanitize_error(&error, &[]);
@@ -2336,7 +3853,7 @@ impl AppRoot {
                 let label = dev.path.display().to_string();
                 let vault = dev.vault.clone();
                 let shell = cx.new(|cx| AppShell::new(vault, label, cx));
-                self.main = Some(shell);
+                self.set_main_shell(shell, cx);
                 self.instance = None;
                 self.lock = None;
                 self.local_mode = true;
@@ -2346,7 +3863,9 @@ impl AppRoot {
                     "本地模式：默认 dev vault（DEV ONLY，无同步面板）；同步实例请用左侧创建。"
                         .to_owned(),
                 );
-                // dev 构建的「继续本地」同样记本机启动偏好（下次启动回到同一 dev vault）。
+                // dev 构建的「继续本地」同样记本机启动偏好（下次启动回到同一 dev vault），
+                // 并让 Welcome 的「打开本地仓库」显示实际路径。
+                self.set_local_path_text(&dev.path, cx);
                 self.remember_startup_mode(StartupMode::Local);
             }
             Err(error) => {
@@ -2388,7 +3907,8 @@ impl AppRoot {
     /// 票据模式提交（ADR 0014 S3b / ADR 0018 S4b：App 唯一创建路径）。
     ///
     /// 校验顺序（全部在 UI 线程；任何失败都不联网、不建文件）：链接已应用 →
-    /// `remote_tls` 确认 → 实例目录 → 显式同意 → 目录锁。
+    /// 实例目录 → DEV 显式同意（**只有 `dev-sync` 构建**）→ 目录锁。
+    /// HTTPS 只由链接 scheme + 权威 parser 决定，不再有"确认连接 HTTPS"勾选。
     /// 通过后票据**只**移动到 worker（不写配置/日志）；失败后需重新粘贴同一链接
     /// （票据未被 relay 消费时可重试）。
     fn submit_ticket_create(&mut self, cx: &mut Context<Self>) {
@@ -2398,9 +3918,8 @@ impl AppRoot {
         let Some(mode) = form.link_state.as_ref().map(|link| link.mode) else {
             return;
         };
-        let remote_consent = form.remote_consent;
-        let consent = form.consent;
         let dir = form.dir.read(cx).text().trim().to_owned();
+        let instance_id = form.instance_id.clone();
         if let Some(form) = &mut self.form {
             form.error = None;
         }
@@ -2423,45 +3942,50 @@ impl AppRoot {
             );
             return;
         }
-        // 1) remote_tls 必须显式确认（链接只预填端点，不构成授权）。
-        if mode == RelayMode::RemoteTls && !remote_consent {
-            fail(
-                self,
-                "请先勾选「我确认要连接远程服务器（HTTPS）」：remote_tls 不是默认模式，确认端点 ≠ 授权接受服务器任意 hash"
-                    .to_owned(),
-                cx,
-            );
-            return;
-        }
         // 1) 实例目录：绝对路径 + 尚不存在或空目录（绝不覆盖已有库/身份）。
         let dir_path = PathBuf::from(&dir);
         if let Err(message) = validate_instance_directory(&dir_path) {
             fail(self, message, cx);
             return;
         }
-        // 2) 显式同意开发同步。
-        if !consent {
-            fail(
-                self,
-                "请先勾选「同意开发同步」：这是 localhost 开发验证，不是生产跨设备安全同步"
-                    .to_owned(),
-                cx,
-            );
-            return;
-        }
-        let vault_path = dir_path.join(VAULT_FILE_NAME);
-        // 3) 目录锁 → 票据离开 UI 内存（移动到 worker）。
-        let lock = match InstanceLock::acquire(&dir_path) {
-            Ok(lock) => lock,
-            Err(error) => {
-                fail(self, error.to_string(), cx);
+        // 2) 「同意开发同步」只在 dev-sync 构建要求/渲染（产品构建没有这个 DEV 勾选，
+        //    提交直接继续；产品安全说明仍由 TLS/pin 与恢复码承担）。
+        #[cfg(feature = "dev-sync")]
+        {
+            let consent = self.form.as_ref().is_some_and(|form| form.consent);
+            if !consent {
+                fail(
+                    self,
+                    "请先勾选「同意开发同步」：这是 localhost 开发验证，不是生产跨设备安全同步"
+                        .to_owned(),
+                    cx,
+                );
                 return;
             }
-        };
+        }
         let Some(link) = self.form.as_mut().and_then(|form| form.link_state.take()) else {
-            drop(lock);
             return;
         };
+        match self.begin_ticket_create(link, dir_path, instance_id, None, cx) {
+            Ok(()) => cx.notify(),
+            Err(message) => fail(self, message, cx),
+        }
+    }
+
+    /// 启动 Create worker（统一远程表单与旧 Create 表单共用）。
+    ///
+    /// 目录锁、票据移动、Working 状态都在这里；失败时票据随 `CreateLinkState` drop
+    /// （未被 relay 消费，可重新粘贴同一链接），不写配置/日志。
+    fn begin_ticket_create(
+        &mut self,
+        link: CreateLinkState,
+        dir_path: PathBuf,
+        instance_id: String,
+        display_name: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let vault_path = dir_path.join(VAULT_FILE_NAME);
+        let lock = InstanceLock::acquire(&dir_path).map_err(|error| error.to_string())?;
         let CreateLinkState {
             mode,
             relay,
@@ -2481,20 +4005,15 @@ impl AppRoot {
             test_extra_roots: self.test_relay_roots.clone(),
             test_baseline_unreachable: self.test_baseline_unreachable,
         };
-        let job = match CreateJob::start(request) {
-            Ok(job) => job,
-            Err(error) => {
-                fail(
-                    self,
-                    format!(
-                        "无法启动后台创建线程：{error}；票据已从界面移除（不持久化），\
-                         请重新粘贴创建链接"
-                    ),
-                    cx,
-                );
-                return;
-            }
-        };
+        let job = CreateJob::start(request).map_err(|error| {
+            format!(
+                "无法启动后台创建线程：{error}；票据已从界面移除（不持久化），\
+                 请重新粘贴创建链接"
+            )
+        })?;
+        self.pending_create_instance = Some(instance_id);
+        // 名字只来自 Welcome 统一表单；Create 成功时写进公开配置（不改路径）。
+        self.pending_create_display_name = display_name;
         self.job = Some(job);
         self.working = Some(WorkingState {
             kind: WorkingKind::Create,
@@ -2508,7 +4027,7 @@ impl AppRoot {
             "正在用一次性票据创建 vault（vault_id {vault_id_hex}，v2 面；票据不写配置/日志）…"
         ));
         self.spawn_job_pump(cx);
-        cx.notify();
+        Ok(())
     }
 
     /// 提交 Join 表单（按钮与 Enter 的同一入口）。
@@ -2525,8 +4044,6 @@ impl AppRoot {
             return;
         };
         let relay = form.relay.read(cx).text().trim().to_owned();
-        let mode = form.mode;
-        let remote_consent = form.remote_consent;
         let vault_id_text = form.vault_id.read(cx).text().trim().to_owned();
         // 恢复码是秘密：只在这个局部缓冲里存在，交给 worker 后立刻丢弃/清空输入框。
         let recovery_code = Zeroizing::new(form.recovery_code.read(cx).text().trim().to_owned());
@@ -2547,17 +4064,10 @@ impl AppRoot {
             self.submit_invite(invite_text.as_str(), &dir, cx);
             return;
         }
-        // 0b) remote_tls 必须显式确认"远程服务器/HTTPS"（ADR 0013 §1）。
-        if mode == RelayMode::RemoteTls && !remote_consent {
-            fail(
-                self,
-                "请先勾选「我确认要连接远程服务器（HTTPS）」：remote_tls 不是默认模式，确认端点 ≠ 授权接受服务器任意 hash"
-                    .to_owned(),
-                cx,
-            );
-            return;
-        }
-        // 1) relay 必须是本模式允许的 canonical origin（同一套权威 parser）。
+        // 0b) 模式按 relay 地址推断（https → remote_tls，http → local_dev），再交给
+        //     同一套权威 parser：remote_tls 只接受 HTTPS，不需要额外的"确认连接
+        //     HTTPS"勾选；产品构建的 local_dev 会在这里被能力闸明确拒绝。
+        let mode = infer_relay_mode(&relay);
         if let Err(error) = validate_relay_edit(&relay, mode) {
             fail(self, error, cx);
             return;
@@ -2671,57 +4181,52 @@ impl AppRoot {
         }
         let dir_path = PathBuf::from(dir);
         let vault_path = dir_path.join(VAULT_FILE_NAME);
-        // 目录校验：普通情况必须"不存在或空目录"；**唯一例外**是本邀请自己的 PENDING
-        // 续跑（重启/丢回应后重贴同一链接，不重复兑换、不覆盖别的库）。
-        let mut resumable = false;
-        if let Err(message) = validate_instance_directory(&dir_path) {
-            resumable = vault_path.exists()
-                && menghunote_storage::Vault::open(&vault_path)
-                    .ok()
-                    .and_then(|vault| {
-                        menghunote_sync::invite_link::InviteJoin::load(&vault)
-                            .ok()
-                            .flatten()
-                    })
-                    .is_some_and(|pending| {
-                        pending.vault_id == target.vault_id()
-                            && pending.invite_id == target.invite_id()
-                            && pending.relay == target.relay()
-                            && pending.pin == target.pin()
-                    });
-            if !resumable {
-                fail(self, message, cx);
-                return;
-            }
+        if let Err(message) = validate_invite_directory(&target, &vault_path, &dir_path) {
+            fail(self, message, cx);
+            return;
         }
-        let _ = resumable;
-        let lock = match InstanceLock::acquire(&dir_path) {
-            Ok(lock) => lock,
-            Err(error) => {
-                fail(self, error.to_string(), cx);
-                return;
+        match self.begin_invite_redeem(target, vault_path, None, None, cx) {
+            Ok(()) => {
+                // 链接（含 token）已交给 worker：立刻清空输入框，不在 UI 里继续持有。
+                if let Some(form) = &mut self.join_form {
+                    form.invite.update(cx, |input, cx| {
+                        input.clear();
+                        cx.notify();
+                    });
+                }
+                cx.notify();
             }
-        };
+            Err(message) => fail(self, message, cx),
+        }
+    }
+
+    /// 启动邀请兑换 worker（统一远程表单与旧 Join 表单共用）。
+    ///
+    /// 目录校验由调用方完成（旧 Join 表单与新欢迎页的入口一致）；这里只取锁、
+    /// 把 token 移交给 worker，并进入 Working。失败不写库/不写配置。
+    fn begin_invite_redeem(
+        &mut self,
+        target: menghunote_sync::invite_link::InviteLinkTarget,
+        vault_path: PathBuf,
+        instance_id: Option<String>,
+        display_name: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let instance_dir = vault_path
+            .parent()
+            .map_or_else(|| vault_path.clone(), std::path::Path::to_path_buf);
+        let lock = InstanceLock::acquire(&instance_dir).map_err(|error| error.to_string())?;
         let request = InviteRedeemRequest {
             target,
             vault_path,
             lock,
             test_extra_roots: self.test_relay_roots.clone(),
         };
-        let job = match InviteJob::start_redeem(request) {
-            Ok(job) => job,
-            Err(error) => {
-                fail(self, format!("无法启动后台邀请线程：{error}"), cx);
-                return;
-            }
-        };
-        // 链接（含 token）已交给 worker：立刻清空输入框，不在 UI 里继续持有。
-        if let Some(form) = &mut self.join_form {
-            form.invite.update(cx, |input, cx| {
-                input.clear();
-                cx.notify();
-            });
-        }
+        let job = InviteJob::start_redeem(request)
+            .map_err(|error| format!("无法启动后台邀请线程：{error}"))?;
+        self.pending_invite_instance = instance_id;
+        // 名字在 PENDING 等待页保留，bootstrap 完成写配置时才落盘（只影响显示）。
+        self.pending_invite_display_name = display_name;
         self.invite_job = Some(job);
         self.working = Some(WorkingState {
             kind: WorkingKind::Invite,
@@ -2734,7 +4239,7 @@ impl AppRoot {
         self.state = State::Working;
         self.notice = None;
         self.spawn_job_pump(cx);
-        cx.notify();
+        Ok(())
     }
 
     /// 「检查状态」：查创建者是否已批准；批准后 bootstrap 并进 Main。
@@ -2783,6 +4288,10 @@ impl AppRoot {
                     invite.busy = true;
                     invite.message = Some("正在检查批准状态…".to_owned());
                 }
+                // 手动检查同样重置自动检查的节拍：下一次自动 CHECK 在 ~5s 后，
+                // 不会紧跟着手动点击再发一次（busy 期间也不会重叠）。
+                self.invite_auto_check_due =
+                    Some(cx.background_executor().now() + INVITE_AUTO_CHECK_INTERVAL);
                 self.spawn_job_pump(cx);
             }
             Err(error) => {
@@ -2798,7 +4307,10 @@ impl AppRoot {
     pub fn back_from_invite(&mut self, cx: &mut Context<Self>) {
         self.invite_job = None;
         self.invite = None;
+        self.invite_auto_check_due = None;
         self.state = State::Welcome;
+        self.ensure_welcome_forms(cx);
+        self.welcome_open_action(WelcomeAction::SyncRemote, cx);
         self.notice = Some(
             "已离开等待页：PENDING 已 durable 保存；再次粘贴同一邀请链接可继续（不会重复兑换）"
                 .to_owned(),
@@ -2806,7 +4318,12 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// 后台 Create/Join 的事件泵（40ms；非阻塞 `try_next`）。
+    /// 后台 Create/Join/邀请的事件泵（40ms；非阻塞 `try_next`）。
+    ///
+    /// **等待页保持存活**：进入 `State::InvitePending` 后即使没有在途 job 也继续泵，
+    /// 这样 [`Self::poll_invite_auto_check`] 才能每 ~5s 自动发一次 CHECK；离开等待页
+    /// （Main/JoinForm/Welcome）后的下一拍发现没有活可干就清 `pump_started` 并退出，
+    /// 后续操作仍能重新拉起泵。
     fn spawn_job_pump(&mut self, cx: &mut Context<Self>) {
         if self.pump_started {
             return;
@@ -2817,10 +4334,18 @@ impl AppRoot {
             timers.timer(CREATE_PUMP_INTERVAL).await;
             let alive = this.update(cx, |root, cx| {
                 root.poll_working(cx);
-                root.job.is_some()
+                root.poll_invite_auto_check(cx);
+                let keep = root.job.is_some()
                     || root.join_job.is_some()
                     || root.invite_job.is_some()
                     || root.invite_copy_job.is_some()
+                    || root.state == State::InvitePending;
+                if !keep {
+                    // 泵决定退出时由它自己清标志：否则"离开等待页→立刻重新粘贴邀请"
+                    // 会看到 `pump_started == true` 而不启动新泵，页面就再也不更新了。
+                    root.pump_started = false;
+                }
+                keep
             });
             match alive {
                 Ok(true) => {}
@@ -2829,6 +4354,38 @@ impl AppRoot {
             }
         })
         .detach();
+    }
+
+    /// PENDING 等待页的自动批准检查（每 [`INVITE_AUTO_CHECK_INTERVAL`] 一次）。
+    ///
+    /// - 只在 `State::InvitePending` 时工作；离开页面清掉下一次到点时刻；
+    /// - 到点而 `busy`/已有检查在途 → **不重复发**，只把节拍推到下一个间隔；
+    /// - 检查失败由 [`Self::apply_invite_event`] 保留等待页，下一拍自动重试；
+    /// - 时间源使用 `cx.background_executor().now()`：生产是真实单调时钟，
+    ///   headless 是测试调度器的虚拟时钟（`advance_clock` 可推进，不 sleep）。
+    fn poll_invite_auto_check(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::InvitePending {
+            self.invite_auto_check_due = None;
+            return;
+        }
+        let now = cx.background_executor().now();
+        let Some(due) = self.invite_auto_check_due else {
+            // 防御：等待页状态存在但没登记节拍（例如未来新入口）→ 从现在起算一个间隔。
+            self.invite_auto_check_due = Some(now + INVITE_AUTO_CHECK_INTERVAL);
+            return;
+        };
+        if now < due {
+            return;
+        }
+        // 先推进节拍再尝试派发：busy 时本轮跳过，下一间隔再试（不会每 40ms 空转）。
+        self.invite_auto_check_due = Some(now + INVITE_AUTO_CHECK_INTERVAL);
+        let busy =
+            self.invite.as_ref().is_some_and(|invite| invite.busy) || self.invite_job.is_some();
+        if busy {
+            return;
+        }
+        self.invite_auto_checks = self.invite_auto_checks.saturating_add(1);
+        self.check_invite(cx);
     }
 
     /// 排空 channel 里当前可用的事件，并按操作预算给一次**逻辑超时提示**。
@@ -2974,10 +4531,13 @@ impl AppRoot {
                     .take()
                     .is_some_and(|working| working.cancel_requested);
                 let instance_id = self
-                    .form
-                    .as_ref()
-                    .map_or_else(String::new, |form| form.instance_id.clone());
-                let entry = outcome.public_facts(&instance_id);
+                    .pending_create_instance
+                    .take()
+                    .or_else(|| self.form.as_ref().map(|form| form.instance_id.clone()))
+                    .unwrap_or_default();
+                let mut entry = outcome.public_facts(&instance_id);
+                // 统一表单填的「仓库名称」在这里落进公开事实（只影响显示）。
+                entry.display_name = self.pending_create_display_name.take();
                 self.pending = Some(PendingCreate {
                     outcome,
                     entry,
@@ -3004,16 +4564,28 @@ impl AppRoot {
                     .working
                     .take()
                     .is_some_and(|working| working.cancel_requested);
+                self.pending_create_instance = None;
+                self.pending_create_display_name = None;
                 if cancelled {
                     self.state = State::Welcome;
+                    self.ensure_welcome_forms(cx);
+                    self.welcome_open_action(WelcomeAction::SyncRemote, cx);
                     self.notice = Some(format!("已取消；Create 未完成：{message}"));
-                } else {
+                } else if self.form.is_some() {
+                    // 旧 Create 表单（内部/测试路径）保留既有「回到表单重试」语义。
                     let mut public = self.form_public_fields(cx);
                     let (title, message) = security_error_text("创建失败", security, message);
                     if let Some(category) = security {
                         public.push(("安全类别".to_owned(), category.label().to_owned()));
                     }
                     self.set_error(&title, message, public, RetryKind::CreateForm);
+                } else {
+                    // 统一远程表单：错误内联回 Welcome（不构造不存在的 CreateForm）。
+                    let (_, text) = security_error_text("创建失败", security, message);
+                    self.state = State::Welcome;
+                    self.ensure_welcome_forms(cx);
+                    self.welcome_open_action(WelcomeAction::SyncRemote, cx);
+                    self.set_welcome_error(text, cx);
                 }
             }
         }
@@ -3033,26 +4605,34 @@ impl AppRoot {
             }
             InviteEvent::Pending { facts, lock } => {
                 self.invite_job = None;
-                self.pump_started = false;
+                // 不在这里停泵：等待页要靠同一个泵每 ~5s 自动检查批准状态
+                // （泵在 `State::InvitePending` 时保持存活，离开页面后自己退出）。
                 self.working = None;
-                let instance_id = self.invite.as_ref().map_or_else(
-                    || {
-                        self.options
-                            .instance_id
-                            .clone()
-                            .unwrap_or_else(generate_instance_id)
-                    },
-                    |invite| invite.instance_id.clone(),
-                );
+                let instance_id = self
+                    .pending_invite_instance
+                    .take()
+                    .or_else(|| {
+                        self.invite
+                            .as_ref()
+                            .map(|invite| invite.instance_id.clone())
+                    })
+                    .or_else(|| self.options.instance_id.clone())
+                    .unwrap_or_else(generate_instance_id);
                 let resumed = facts.resumed;
+                let display_name = self.pending_invite_display_name.take();
                 self.invite = Some(InvitePendingState {
                     instance_id,
+                    display_name,
                     facts: *facts,
                     lock: Some(lock),
                     busy: false,
                     message: None,
                 });
                 self.state = State::InvitePending;
+                // 第一拍自动检查在进入等待页 ~5s 后（不是立刻），之后每 5s 一次。
+                self.invite_auto_check_due =
+                    Some(cx.background_executor().now() + INVITE_AUTO_CHECK_INTERVAL);
+                self.invite_auto_checks = 0;
                 self.error = None;
                 self.notice = Some(if resumed {
                     "已从 durable pending 恢复（没有重复兑换）：仍然等待创建者批准".to_owned()
@@ -3062,7 +4642,6 @@ impl AppRoot {
             }
             InviteEvent::Waiting { lock } => {
                 self.invite_job = None;
-                self.pump_started = false;
                 if let Some(invite) = &mut self.invite {
                     invite.lock = Some(lock);
                     invite.busy = false;
@@ -3075,16 +4654,14 @@ impl AppRoot {
             }
             InviteEvent::Finished(outcome) => {
                 self.invite_job = None;
-                self.pump_started = false;
-                let instance_id = self.invite.as_ref().map_or_else(
-                    || {
-                        self.options
-                            .instance_id
-                            .clone()
-                            .unwrap_or_else(generate_instance_id)
-                    },
-                    |invite| invite.instance_id.clone(),
-                );
+                let instance_id = self
+                    .invite
+                    .as_ref()
+                    .map(|invite| invite.instance_id.clone())
+                    .or_else(|| self.pending_invite_instance.take())
+                    .or_else(|| self.options.instance_id.clone())
+                    .unwrap_or_else(generate_instance_id);
+                self.pending_invite_instance = None;
                 self.commit_invite(outcome, instance_id, cx);
             }
             InviteEvent::Failed {
@@ -3093,7 +4670,6 @@ impl AppRoot {
                 security,
             } => {
                 self.invite_job = None;
-                self.pump_started = false;
                 let checking = self.state == State::InvitePending;
                 let text = match security {
                     Some(category) => format!(
@@ -3110,15 +4686,28 @@ impl AppRoot {
                         invite.message = Some(text.clone());
                     }
                     self.notice = Some(format!("检查失败（未重新兑换）：{}", kind.hint()));
-                } else {
-                    // 兑换失败：回 Join 表单（公开字段保留；秘密需重输）。
+                } else if self.join_form.is_some() {
+                    // 旧 Join 表单：公开字段保留；秘密需重输。
                     self.working = None;
                     self.invite = None;
+                    self.pending_invite_instance = None;
+                    self.pending_invite_display_name = None;
                     self.state = State::JoinForm;
                     if let Some(form) = &mut self.join_form {
                         form.error = Some(text);
                     }
                     self.pending_focus = true;
+                } else {
+                    // 统一远程表单：回 Welcome，在对应卡片内联显示错误。
+                    self.working = None;
+                    self.invite = None;
+                    self.pending_invite_instance = None;
+                    self.pending_invite_display_name = None;
+                    self.state = State::Welcome;
+                    self.ensure_welcome_forms(cx);
+                    self.welcome_open_action(WelcomeAction::SyncRemote, cx);
+                    self.notice = Some(format!("邀请加入失败：{}", kind.hint()));
+                    self.set_welcome_error(text, cx);
                 }
             }
         }
@@ -3132,7 +4721,12 @@ impl AppRoot {
         instance_id: String,
         cx: &mut Context<Self>,
     ) {
-        let entry = outcome.public_facts(&instance_id);
+        let mut entry = outcome.public_facts(&instance_id);
+        // 统一表单填的「仓库名称」：bootstrap 成功后才写进公开配置（只影响显示）。
+        entry.display_name = self
+            .invite
+            .as_ref()
+            .and_then(|invite| invite.display_name.clone());
         let mut profile = self.profile.clone().unwrap_or_default();
         profile.upsert_active(entry.clone());
         if let Err(error) = self.store.save(&profile) {
@@ -3218,7 +4812,7 @@ impl AppRoot {
         let shell = cx.new(move |cx| {
             AppShell::new_with_dev_sync_with_autosync(vault, label, config, sync, cx)
         });
-        self.main = Some(shell);
+        self.set_main_shell(shell, cx);
         self.lock = Some(lock);
         self.instance = Some(entry);
         self.local_mode = false;
@@ -3277,6 +4871,12 @@ impl AppRoot {
     #[must_use]
     pub fn invite_busy(&self) -> bool {
         self.invite.as_ref().is_some_and(|invite| invite.busy)
+    }
+
+    /// 等待页**自动**发出的批准检查次数（不含手动点「检查状态」；测试/诊断用）。
+    #[must_use]
+    pub const fn invite_auto_check_count(&self) -> u32 {
+        self.invite_auto_checks
     }
 
     /// 等待页的公开事实（测试断言用；不含 token）。
@@ -3416,7 +5016,7 @@ impl AppRoot {
         let shell = cx.new(move |cx| {
             AppShell::new_with_dev_sync_with_autosync(vault, label, config, sync, cx)
         });
-        self.main = Some(shell);
+        self.set_main_shell(shell, cx);
         self.lock = Some(lock);
         self.instance = Some(entry);
         self.local_mode = false;
@@ -3734,7 +5334,7 @@ impl AppRoot {
         let shell = cx.new(move |cx| {
             AppShell::new_with_dev_sync_with_autosync(vault, label, config, sync, cx)
         });
-        self.main = Some(shell);
+        self.set_main_shell(shell, cx);
         self.lock = Some(lock);
         self.instance = Some(entry);
         self.local_mode = false;
@@ -3793,6 +5393,7 @@ impl AppRoot {
         let (retry, message) = (error.retry, error.message.clone());
         match retry {
             RetryKind::ReloadConfig => {
+                self.main_shell_events = None;
                 self.main = None;
                 self.lock = None;
                 self.instance = None;
@@ -3832,17 +5433,26 @@ impl AppRoot {
     }
 
     /// 返回 Welcome（不删任何用户文件；丢弃本次未确认的恢复码）。
+    ///
+    /// 若当前有 Main，先走 [`Self::close_main`]（`close_all` 有界排空 + 释放实例锁），
+    /// 不留后台 `AppShell`/worker。
     pub fn back_to_welcome(&mut self, cx: &mut Context<Self>) {
-        self.main = None;
-        self.lock = None;
-        self.instance = None;
+        self.close_main(cx);
         self.pending = None;
         self.pending_join = None;
+        self.pending_invite = None;
         self.form = None;
         self.join_form = None;
+        self.invite = None;
+        self.working = None;
+        self.retry_entry = None;
         self.error = None;
         self.notice = None;
         self.state = State::Welcome;
+        if let Some(welcome) = &mut self.welcome {
+            welcome.expanded = None;
+        }
+        self.clear_welcome_sync_secret(cx);
         cx.notify();
     }
 
@@ -3863,16 +5473,13 @@ impl AppRoot {
                 false
             }
             State::Main => {
-                if let Some(shell) = self.main.take() {
-                    shell.update(cx, |shell, cx| shell.close_all(cx));
-                }
-                self.lock = None;
+                self.close_main(cx);
                 self.pending = None;
                 self.pending_join = None;
-                self.instance = None;
                 true
             }
             _ => {
+                self.main_shell_events = None;
                 self.main = None;
                 self.lock = None;
                 self.pending = None;
@@ -3969,6 +5576,35 @@ fn validate_instance_directory(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 邀请加入的目录校验：普通情况必须"不存在或空目录"；**唯一例外**是本邀请
+/// 自己的 PENDING 续跑（重启/丢回应后重贴同一链接，不重复兑换、不覆盖别的库）。
+fn validate_invite_directory(
+    target: &menghunote_sync::invite_link::InviteLinkTarget,
+    vault_path: &Path,
+    dir_path: &Path,
+) -> Result<(), String> {
+    if let Err(message) = validate_instance_directory(dir_path) {
+        let resumable = vault_path.exists()
+            && menghunote_storage::Vault::open(vault_path)
+                .ok()
+                .and_then(|vault| {
+                    menghunote_sync::invite_link::InviteJoin::load(&vault)
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|pending| {
+                    pending.vault_id == target.vault_id()
+                        && pending.invite_id == target.invite_id()
+                        && pending.relay == target.relay()
+                        && pending.pin == target.pin()
+                });
+        if !resumable {
+            return Err(message);
+        }
+    }
+    Ok(())
+}
+
 /// 解析 Join 表单里的 `vault_id`（32 位十六进制，大小写皆可）。
 ///
 /// 错误**只报长度/格式**，绝不回显输入：用户可能把恢复码误贴进这个框，回显就等于泄露。
@@ -3990,15 +5626,35 @@ impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // ADR 0021 P2：系统外观（浅色/深色）变化 → 全局主题 + 重绘；只订阅一次。
         self.observe_appearance_once(window, cx);
+        // Welcome/Create/Join 没有输入框时没有焦点节点，按键事件不会分发到根上
+        // （`Ctrl+,` 就打不开设置）。只在非 Main 且当前没有焦点时补一个根焦点；
+        // Main 由编辑器/输入框自己聚焦，不能在这里抢。
+        if !matches!(self.state, State::Main) && window.focused(cx).is_none() {
+            let focus = self.root_focus.clone();
+            window.defer(cx, move |window, cx| {
+                window.focus(&focus, cx);
+            });
+        }
         if self.pending_focus {
             self.pending_focus = false;
-            // Join 失败后最该重输的是恢复码；Create 聚焦创建链接（唯一入口）。
+            // Join 失败后最该重输的是恢复码；Create 聚焦创建链接（唯一入口）；
+            // Welcome 展开哪张卡就聚焦那张卡的主输入框。
             let target = match self.state {
                 State::JoinForm => self
                     .join_form
                     .as_ref()
                     .map(|form| form.recovery_code.clone()),
                 State::CreateForm => self.form.as_ref().map(|form| form.link.clone()),
+                State::Welcome => {
+                    self.welcome
+                        .as_ref()
+                        .and_then(|welcome| match welcome.expanded {
+                            Some(WelcomeAction::NewLocal) => Some(welcome.new_local_dir.clone()),
+                            Some(WelcomeAction::OpenLocal) => Some(welcome.open_local_path.clone()),
+                            Some(WelcomeAction::SyncRemote) => Some(welcome.sync_link.clone()),
+                            None => None,
+                        })
+                }
                 _ => None,
             };
             if let Some(target) = target {
@@ -4022,9 +5678,17 @@ impl Render for AppRoot {
         // 关闭设置后把焦点还给 Main 的当前编辑器（同一帧不重建 `AppShell`）。
         if self.pending_focus_restore {
             self.pending_focus_restore = false;
+            let root_focus = self.root_focus.clone();
             if let Some(shell) = self.main.clone() {
+                // 空库没有活动编辑器（刚新建的本地库）：焦点退回根视图，
+                // 否则欢迎页输入框的旧焦点会让 Ctrl+, / Ctrl+N 收不到。
+                let has_editor = shell.read(cx).active_editor_view().is_some();
                 window.defer(cx, move |window, cx| {
-                    shell.update(cx, |shell, cx| shell.focus_active_editor(window, cx));
+                    if has_editor {
+                        shell.update(cx, |shell, cx| shell.focus_active_editor(window, cx));
+                    } else {
+                        window.focus(&root_focus, cx);
+                    }
                 });
             }
         }
@@ -4060,23 +5724,74 @@ impl Render for AppRoot {
                 .into_any_element(),
             State::Main => {
                 let shell = self.main.clone();
-                // 唯一的「设置」入口：左侧栏底部（与笔记动作行分开，避免右下角两个设置）。
-                // 覆盖在 `AppShell` 侧栏底部；点在按钮上不会漏给编辑器。
-                let settings_entry = div()
+                // 左下角菜单/管理仓库打开后的**首帧**抢焦点（`Esc` 才能收到）。
+                self.focus_vault_overlay_once(window, cx);
+                // 左下角**一行**动作：vault 切换器（左，占满剩余宽度）+ 紧凑「设置」。
+                // 两按钮同一底边/同一行高，设置按钮不撑满剩余宽度（`flex_shrink_0` + 定宽）。
+                let vault_name = self.current_vault_name(cx);
+                let bottom_actions_w = bottom_actions_width(window.bounds().size.width.as_f32());
+                let vault_switcher = div()
+                    .id("app-root-vault-switcher")
+                    .debug_selector(|| "app-root-vault-switcher".to_string())
+                    // 占满设置按钮之外的剩余宽度：长名字只在自身内部省略。
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .bg(theme::menu_bg())
+                    .text_size(px(12.0))
+                    .text_color(theme::text_color())
+                    .cursor_pointer()
+                    .whitespace_nowrap()
+                    // 长名字省略：不让目录名把 ▾ 挤出侧栏。
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(SharedString::from(vault_name)),
+                    )
+                    .child(div().flex_shrink_0().child("▾"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|root, _event: &gpui::MouseDownEvent, _window, cx| {
+                            root.toggle_vault_menu(cx);
+                            cx.stop_propagation();
+                        }),
+                    );
+                // 唯一的「设置」入口：仍是左侧栏底部，但和切换器**同一行**，且缩短成
+                // 紧凑按钮（56–64px），不再单独占一行。覆盖在 `AppShell` 侧栏底部；
+                // 点在按钮上不会漏给编辑器。
+                let settings_entry = compact_action_button(
+                    "app-root-settings",
+                    crate::ui_text::sidebar_settings(),
+                    SETTINGS_ENTRY_WIDTH,
+                    cx,
+                    |root, cx| root.open_settings(cx),
+                );
+                let bottom_actions = div()
+                    .debug_selector(|| "app-root-bottom-actions".to_string())
                     .absolute()
-                    // 跳过最左侧图标栏（ribbon）：设置入口仍然在侧栏底部，
-                    // 但不能压在 ribbon 按钮上（`RIBBON_WIDTH` 是唯一口径）。
+                    // 跳过最左侧图标栏（ribbon）：这一行仍然在侧栏底部，
+                    // 但整体不压在 ribbon 按钮上（`RIBBON_WIDTH` 是唯一口径）。
                     .left(px(8.0 + RIBBON_WIDTH))
-                    .bottom(px(30.0))
-                    .w(px(196.0))
-                    .child(action_button(
-                        "app-root-settings",
-                        crate::ui_text::sidebar_settings(),
-                        false,
-                        false,
-                        cx,
-                        |root, cx| root.open_settings(cx),
-                    ));
+                    .bottom(px(SETTINGS_ENTRY_BOTTOM))
+                    // 窄窗口时夹住，不把设置按钮挤出窗口右边界。
+                    .w(px(bottom_actions_w))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(BOTTOM_ACTIONS_GAP))
+                    .child(vault_switcher)
+                    .child(settings_entry);
                 let shell_body = div()
                     .size_full()
                     .when_some(shell, |this, shell| this.child(shell));
@@ -4111,11 +5826,39 @@ impl Render for AppRoot {
                 } else {
                     main = main.child(shell_body);
                 }
-                main.child(settings_entry).into_any_element()
+                // 菜单打开时铺一层透明遮罩：点空白关菜单，且这次点击不漏给编辑器；
+                // 遮罩在切换器/设置按钮**下面**（后面再加），按钮仍可点（再点 = 收起）。
+                if self.vault_menu_open {
+                    main = main.child(
+                        div()
+                            .debug_selector(|| "app-root-vault-menu-backdrop".to_string())
+                            .absolute()
+                            .inset_0()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|root, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    root.close_vault_menu(cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_scroll(cx.listener(
+                                |_root, _event: &gpui::ScrollEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                },
+                            )),
+                    );
+                }
+                main = main.child(bottom_actions);
+                if self.vault_menu_open {
+                    main = main.child(self.render_vault_menu(window, cx));
+                }
+                main.into_any_element()
             }
             State::Error => self.render_error(cx).into_any_element(),
         };
         let settings = self.render_settings(window, cx);
+        // 「管理仓库」覆盖层（Main 里新建/加入/返回欢迎页的唯一入口；与设置互斥）。
+        let vault_manager = self.render_vault_manager(window, cx);
         // 日记模板选择器：覆盖层，挂在设置页**之上**（设置页关闭时会被清理）。
         let daily_template_picker = self.daily_template_picker.clone();
         div()
@@ -4126,7 +5869,64 @@ impl Render for AppRoot {
             .flex_col()
             .bg(theme::window_bg())
             .font_family(theme::FONT_FAMILY)
+            .track_focus(&self.root_focus)
+            // 快捷键录制：**capture 相**在根上先于编辑器/输入框拿到按键，吞掉并
+            // stop_propagation —— 录制时绝不能让按键同时触发原命令或落进正文。
+            .capture_key_down(cx.listener(|root, event: &gpui::KeyDownEvent, window, cx| {
+                if root.handle_shortcut_capture_key(event, cx) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            // 全局命令（默认 Ctrl+, 打开设置 / Ctrl+N 新建笔记 / Ctrl+G 图谱）。
+            // Main 的 `AppShell` 已被设为 `global_shortcut_direct = false`，由这里
+            // 统一拦截并检查宿主覆盖层；Welcome 只响应「打开设置」。
+            .on_key_down(cx.listener(|root, event: &gpui::KeyDownEvent, window, cx| {
+                if crate::shortcuts::matches(CommandId::OpenSettings, &event.keystroke) {
+                    window.prevent_default();
+                    if root.settings.is_none()
+                        && root.shortcut_capture.is_none()
+                        && matches!(root.state, State::Welcome | State::Main)
+                        && root.daily_template_picker.is_none()
+                        && !root.vault_menu_open
+                        && !root.vault_manager_open
+                    {
+                        root.open_settings(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                // 设置/录制态/非 Main：新笔记与图谱不得穿透（它们由宿主统一处理）。
+                if root.settings.is_some() || root.shortcut_capture.is_some() {
+                    return;
+                }
+                if !matches!(root.state, State::Main) {
+                    return;
+                }
+                if root.vault_menu_open
+                    || root.vault_manager_open
+                    || root.daily_template_picker.is_some()
+                {
+                    return;
+                }
+                let Some(shell) = root.main.clone() else {
+                    return;
+                };
+                if shell.read(cx).shortcuts_blocked(cx) {
+                    return;
+                }
+                if crate::shortcuts::matches(CommandId::NewNote, &event.keystroke) {
+                    window.prevent_default();
+                    shell.update(cx, |shell, cx| shell.shortcut_create_note(window, cx));
+                    cx.stop_propagation();
+                } else if crate::shortcuts::matches(CommandId::ToggleGraph, &event.keystroke) {
+                    window.prevent_default();
+                    shell.update(cx, |shell, cx| shell.shortcut_open_graph(window, cx));
+                    cx.stop_propagation();
+                }
+            }))
             .child(body)
+            .when_some(vault_manager, |this, manager| this.child(manager))
             .when_some(settings, |this, settings| this.child(settings))
             .when_some(daily_template_picker, |this, picker| this.child(picker))
     }
@@ -4201,6 +6001,33 @@ fn banner_text() -> Option<gpui::Div> {
 /// 产品构建：没有开发警示条。
 #[cfg(not(feature = "dev-sync"))]
 fn banner_text() -> Option<gpui::Div> {
+    None
+}
+
+/// Join 表单的 DEV 状态标注（**只有 `dev-sync` 构建**渲染）。
+///
+/// 模式不再手选（按地址自动推断），因此这里不再按模式分支：dev-sync 构建里
+/// local_dev / remote_tls 两条初始化路径都未在真实 relay / Windows 上验证。
+/// 产品构建返回 `None`（调用方用 `when_some`，不挂节点、也不把 DEV 文案编进产品二进制）。
+#[cfg(feature = "dev-sync")]
+fn join_dev_notice() -> Option<gpui::Div> {
+    Some(
+        div()
+            .debug_selector(|| "app-root-remote-dev-notice".to_string())
+            .w_full()
+            .text_size(px(11.0))
+            .text_color(theme::caret_color())
+            .child(SharedString::from(
+                "DEV 状态：relay 初始化已接线（local_dev / remote_tls；production TLS + \
+                 受限初始化，未在真实 relay / Windows 上验证）。不会忽略证书，\
+                 也不提供私有 CA 导入（请自行安装系统根）。",
+            )),
+    )
+}
+
+/// 产品构建：Join 表单不出现任何 DEV 文案。
+#[cfg(not(feature = "dev-sync"))]
+fn join_dev_notice() -> Option<gpui::Div> {
     None
 }
 
@@ -4338,6 +6165,16 @@ fn plugin_switch_row(
         .into_any_element()
 }
 
+/// 库文件路径 → **父目录名**（左下角切换按钮/菜单里的短名字）。
+///
+/// 只取目录名：不显示 `vault.sqlite3`、也不显示完整路径（长路径会把侧栏挤坏）。
+fn vault_directory_name(path: &Path) -> Option<String> {
+    path.parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
 fn label_text(text: impl Into<SharedString>) -> gpui::Div {
     div()
         .text_size(px(12.0))
@@ -4394,6 +6231,106 @@ where
     element
 }
 
+/// 底部动作行里的**紧凑**按钮（定宽 + `flex_shrink_0` + 文案不换行/省略）。
+///
+/// 复用 [`action_button`] 的样式与点击语义（selector 完全不变），只额外收紧宽度：
+/// `action_button` 有几十处调用方，宽度是**局部**需求，不能全局改。
+fn compact_action_button<F>(
+    selector: impl Into<SharedString> + 'static,
+    label: impl Into<SharedString>,
+    width: f32,
+    cx: &mut Context<AppRoot>,
+    on_click: F,
+) -> gpui::Stateful<gpui::Div>
+where
+    F: Fn(&mut AppRoot, &mut Context<AppRoot>) + 'static,
+{
+    action_button(selector, label, false, false, cx, on_click)
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .w(px(width))
+        // 比通用按钮更紧的内边距：定宽下也要能放下「⚙ 设置」（英文超长时省略）。
+        .px(px(6.0))
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .text_ellipsis()
+}
+
+/// Welcome 右栏的一张操作卡（点整行展开/收起，不整页跳走）。
+fn welcome_action_card(
+    selector: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    expanded: bool,
+    action: WelcomeAction,
+    cx: &mut Context<AppRoot>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(selector)
+        .debug_selector(move || selector.to_string())
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p(px(14.0))
+        .rounded_md()
+        .border_1()
+        .border_color(if expanded {
+            theme::link_color()
+        } else {
+            theme::sidebar_border()
+        })
+        .bg(if expanded {
+            theme::sidebar_selected_bg()
+        } else {
+            theme::menu_bg()
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(14.0))
+                        .text_color(theme::text_color())
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.0))
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(if expanded { "▾" } else { "▸" })),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .text_size(px(11.0))
+                .text_color(theme::status_bar_text())
+                .child(SharedString::from(hint)),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
+                root.welcome_toggle_action(action, cx);
+                cx.stop_propagation();
+            }),
+        )
+}
+
 /// 一行复选框（同意 / 已备份）。
 fn checkbox_row(
     selector: &'static str,
@@ -4442,82 +6379,15 @@ fn checkbox_row(
         )
 }
 
-/// 表单的默认 relay 模式：产品 `sync-ui` 构建没有 `local_dev`，直接选 `remote_tls`。
+/// Create 表单在**尚未应用创建链接**时的默认 relay 模式：产品 `sync-ui` 构建没有
+/// `local_dev`，显示 `remote_tls`；应用链接后由链接 scheme 覆盖。Join 不再使用它
+/// （Join 提交时按 relay 地址推断）。
 fn default_form_mode() -> RelayMode {
     if local_option_available() {
         RelayMode::LocalDev
     } else {
         RelayMode::RemoteTls
     }
-}
-
-/// relay 模式选择行（Create/Join/设置共用；ADR 0013 §1）。
-///
-/// 选择只改**面板/表单状态**：Create/Join 的 remote 提交会被 S3b 边界明确拒绝；
-/// 设置保存才写 ProfileV2，且重启后生效。`remote_option_available()` 为 false 时
-/// remote 按钮视觉禁用（默认构建没有本 UI；保留单一判定点）。
-fn mode_selector(
-    prefix: &'static str,
-    current: RelayMode,
-    cx: &mut Context<AppRoot>,
-    on_select: impl Fn(&mut AppRoot, RelayMode, &mut Context<AppRoot>) + 'static + Clone,
-) -> gpui::Div {
-    let mut row = div()
-        .w_full()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(theme::status_bar_text())
-                .child(SharedString::from("relay 模式：")),
-        );
-    let remote_available = remote_option_available();
-    let local_available = local_option_available();
-    for mode in [RelayMode::LocalDev, RelayMode::RemoteTls] {
-        let label = match mode {
-            RelayMode::LocalDev => "local_dev（本机开发 / 明文 loopback）",
-            RelayMode::RemoteTls => "remote_tls（远程服务器 / HTTPS）",
-        };
-        let chosen = current == mode;
-        let disabled = match mode {
-            RelayMode::LocalDev => !local_available,
-            RelayMode::RemoteTls => !remote_available,
-        };
-        let selector = format!("{prefix}-{}", mode.as_str());
-        let handler = on_select.clone();
-        row = row.child(action_button(
-            selector,
-            if chosen {
-                format!("● {label}")
-            } else {
-                format!("○ {label}")
-            },
-            chosen,
-            disabled,
-            cx,
-            move |root, cx| {
-                if disabled {
-                    return;
-                }
-                handler(root, mode, cx);
-            },
-        ));
-    }
-    row.child(
-        div()
-            .text_size(px(10.0))
-            .text_color(theme::status_bar_text())
-            .child(SharedString::from(if !local_available {
-                "本次构建不开放 local_dev（产品构建只允许 remote_tls）"
-            } else if remote_available {
-                "远端模式必须显式确认「远程服务器/HTTPS」；pin/指纹仍独立校验"
-            } else {
-                "本次构建不开放 remote_tls（只在含 sync 能力的构建里可见）"
-            })),
-    )
 }
 
 /// 设置页左侧分类（Obsidian「选项」式导航；**只在本次会话记住**，不持久化）。
@@ -4532,11 +6402,11 @@ pub enum SettingsSection {
     Appearance,
     /// 语言 / Language。
     Language,
-    /// 同步（同步面板：进入分类即渲染，没有展开/收起）。
+    /// 快捷键（查看/修改命令绑定；冲突红标 + 顶部汇总；本机 `shortcuts.json`）。
+    Shortcuts,
+    /// 同步（同步面板：进入分类即渲染，没有展开/收起；底部有 active 实例的公开信息）。
     Sync,
-    /// 实例（公开实例列表 + 公开信息复制）。
-    Instances,
-    /// Relay（模式 + 地址 + 远程确认）。
+    /// Relay（地址 + 只读的自动模式说明；模式按 scheme 推断）。
     Relay,
     /// 安全（指纹 + V2 实验入口）。
     Security,
@@ -4555,8 +6425,8 @@ impl SettingsSection {
     pub const FIXED: [SettingsSection; 8] = [
         SettingsSection::Appearance,
         SettingsSection::Language,
+        SettingsSection::Shortcuts,
         SettingsSection::Sync,
-        SettingsSection::Instances,
         SettingsSection::Relay,
         SettingsSection::Security,
         SettingsSection::Plugins,
@@ -4571,8 +6441,8 @@ impl SettingsSection {
     pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Appearance,
         SettingsSection::Language,
+        SettingsSection::Shortcuts,
         SettingsSection::Sync,
-        SettingsSection::Instances,
         SettingsSection::Relay,
         SettingsSection::Security,
         SettingsSection::Plugins,
@@ -4587,8 +6457,8 @@ impl SettingsSection {
         match self {
             SettingsSection::Appearance => "appearance",
             SettingsSection::Language => "language",
+            SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::Sync => "sync",
-            SettingsSection::Instances => "instances",
             SettingsSection::Relay => "relay",
             SettingsSection::Security => "security",
             SettingsSection::Plugins => "plugins",
@@ -4641,8 +6511,8 @@ impl SettingsSection {
         match self {
             SettingsSection::Appearance => crate::ui_text::settings_nav_appearance(),
             SettingsSection::Language => crate::ui_text::settings_nav_language(),
+            SettingsSection::Shortcuts => crate::ui_text::settings_nav_shortcuts(),
             SettingsSection::Sync => crate::ui_text::settings_nav_sync(),
-            SettingsSection::Instances => crate::ui_text::settings_nav_instances(),
             SettingsSection::Relay => crate::ui_text::settings_nav_relay(),
             SettingsSection::Security => crate::ui_text::settings_nav_security(),
             SettingsSection::Plugins => crate::ui_text::settings_nav_plugins(),
@@ -4714,7 +6584,590 @@ fn build_features() -> String {
     }
 }
 
+/// Main 左下角：底部动作行（切换器 + 设置）的底边距窗口底部（避开 `AppShell` 24px 状态栏）。
+const SETTINGS_ENTRY_BOTTOM: f32 = 30.0;
+/// 动作行内两个按钮之间的水平间隙。
+const BOTTOM_ACTIONS_GAP: f32 = 6.0;
+/// 「设置」紧凑按钮宽度（56–64px；不再撑满剩余宽度，也不再单独占一行）。
+const SETTINGS_ENTRY_WIDTH: f32 = 64.0;
+/// 动作行的行高（按钮 py5 + 12px 文案 + 1px 边框 ≈ 31.5；向上取整用于菜单底边）。
+const BOTTOM_ACTIONS_ROW_HEIGHT: f32 = 32.0;
+/// vault 切换菜单的底边：在动作行**上方** 4px 处向上展开（不盖住按钮）。
+const VAULT_MENU_BOTTOM: f32 = SETTINGS_ENTRY_BOTTOM + BOTTOM_ACTIONS_ROW_HEIGHT + 4.0;
+/// 左下角动作行宽度（跳过 ribbon 后的侧栏宽度；窄窗口会被 [`bottom_actions_width`] 夹小）。
+const VAULT_SIDEBAR_ACTION_WIDTH: f32 = 196.0;
+/// 动作行宽度的下限：再窄就放弃夹取（和旧实现一样允许溢出，不把按钮压成 0 宽）。
+const BOTTOM_ACTIONS_MIN_WIDTH: f32 = 140.0;
+
+/// 底部动作行的实际宽度：默认 196（侧栏宽度），窄窗口时夹进窗口（右侧留 8px）。
+fn bottom_actions_width(window_width: f32) -> f32 {
+    (window_width - (8.0 + RIBBON_WIDTH) - 8.0)
+        .clamp(BOTTOM_ACTIONS_MIN_WIDTH, VAULT_SIDEBAR_ACTION_WIDTH)
+}
+
+/// 「管理仓库」一行（**渲染与测试共用**的投影：名字/路径/角色只有一份）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultManagerRow {
+    /// 实例 id（「打开」/「设为默认」/「重命名」的目标）。
+    pub instance_id: String,
+    /// 显示名：自定义名 → 库目录名 → 短 id（**不再只显示 `inst-...`**）。
+    pub name: String,
+    /// 次要信息：`API v2 · remote_tls · vault_id xxxxxxxx…`。
+    pub meta: String,
+    /// 库文件完整路径（渲染时省略；测试断言"路径仍在"）。
+    pub path: String,
+    /// 是否是公开配置里的 active（默认实例；行边框高亮）。
+    pub is_active: bool,
+    /// 是否是当前真正打开的实例（「打开」= no-op）。
+    pub opened: bool,
+}
+
+/// 左下角切换菜单的一行（**渲染与测试共用**的投影：文案/✓/次要信息只有一份）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultMenuRow {
+    /// 该行对应的实例 id（当前 vault 行也带上：点击 = no-op）。
+    pub instance_id: String,
+    /// 显示文案：当前 vault 行带 `✓ ` 前缀，其它行是短名字（目录名）。
+    pub label: String,
+    /// 次要信息：当前行「当前 vault」，其它行 `API v2 · remote_tls`。
+    pub meta: String,
+    /// 是否当前打开的 vault（渲染为高亮 + `✓`；点击 = no-op）。
+    pub current: bool,
+}
+
+/// 左下角切换菜单/管理仓库里的一行（名字省略 + 可选次要信息）。
+///
+/// 行本身可点（菜单 = 直接切换；管理仓库由按钮承载动作，行只高亮当前项），
+/// 长名字/长路径一律 `overflow_hidden + text_ellipsis`：不把菜单撑出窗口。
+fn vault_list_row(
+    selector: String,
+    label: String,
+    meta: Option<String>,
+    accent: bool,
+    on_click: impl Fn(&mut AppRoot, &mut Context<AppRoot>) + 'static,
+    cx: &mut Context<AppRoot>,
+) -> gpui::Stateful<gpui::Div> {
+    let mut row = div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector)
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+        .child(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(12.0))
+                .text_color(if accent {
+                    theme::link_color()
+                } else {
+                    theme::text_color()
+                })
+                .child(SharedString::from(label)),
+        );
+    if let Some(meta) = meta {
+        row = row.child(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(10.0))
+                .text_color(theme::status_bar_text())
+                .child(SharedString::from(meta)),
+        );
+    }
+    row.on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
+            on_click(root, cx);
+            cx.stop_propagation();
+        }),
+    )
+}
+
 impl AppRoot {
+    /// 左下角菜单/管理仓库打开后的**首帧**抢焦点：否则 `Esc` 由编辑器收，覆盖层收不到。
+    ///
+    /// 只在打开后的第一帧做一次（`*_focused_once`），关闭时复位；不重复抢焦点。
+    fn focus_vault_overlay_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_menu_open && !self.vault_menu_focused_once {
+            self.vault_menu_focused_once = true;
+            let focus = self.vault_menu_focus.clone();
+            window.defer(cx, move |window, cx| {
+                window.focus(&focus, cx);
+            });
+        }
+        if self.vault_manager_open && !self.vault_manager_focused_once {
+            self.vault_manager_focused_once = true;
+            let focus = self.vault_manager_focus.clone();
+            window.defer(cx, move |window, cx| {
+                window.focus(&focus, cx);
+            });
+        }
+    }
+
+    /// Main 左下角的 vault 切换菜单（Obsidian 式下拉；在按钮上方向上展开、限高可滚）。
+    ///
+    /// 当前 vault 行带 `✓`（点击 = no-op 并收起菜单）；其它已保存实例逐行（名字 +
+    /// 简短 API/mode），点击 = 直接切换（关旧开新，不经过设置页）；底部「管理仓库…」。
+    fn render_vault_menu(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let window_size = window.bounds().size;
+        let left = 8.0 + RIBBON_WIDTH;
+        // 不超出窗口：宽度/高度按当前窗口夹住；实例很多时菜单内部滚动。
+        let menu_w = (window_size.width.as_f32() - left - 8.0).clamp(160.0, 248.0);
+        let menu_max_h =
+            (window_size.height.as_f32() - VAULT_MENU_BOTTOM - 12.0).clamp(120.0, 420.0);
+        let rows = self.vault_menu_rows(cx);
+        let mut items = div().w_full().flex().flex_col().gap_1();
+        for (index, row) in rows.iter().enumerate() {
+            // 当前行固定 selector（唯一）；其它行用**已保存顺序**下标（active 优先）。
+            let selector = if row.current {
+                "app-root-vault-menu-current".to_owned()
+            } else {
+                format!("app-root-vault-menu-instance-{index}")
+            };
+            let select_id = row.instance_id.clone();
+            items = items.child(vault_list_row(
+                selector,
+                row.label.clone(),
+                Some(row.meta.clone()),
+                row.current,
+                move |root, cx| root.switch_to_instance(&select_id, cx),
+                cx,
+            ));
+        }
+        if rows.is_empty() {
+            items = items.child(hint_text("还没有已保存的同步 vault。").w_full());
+        }
+        let menu = div()
+            .id("app-root-vault-menu")
+            .debug_selector(|| "app-root-vault-menu".to_string())
+            .absolute()
+            .left(px(left))
+            .bottom(px(VAULT_MENU_BOTTOM))
+            .w(px(menu_w))
+            .max_h(px(menu_max_h))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .bg(theme::menu_bg())
+            .border_1()
+            .border_color(theme::sidebar_border())
+            .rounded_md()
+            .shadow_lg()
+            .track_focus(&self.vault_menu_focus)
+            .on_key_down(
+                cx.listener(|root, event: &gpui::KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        root.close_vault_menu(cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            // 菜单内部的点击不能冒泡到遮罩（否则先关菜单再点空）。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_root, _event: &gpui::MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(items)
+            .child(
+                div()
+                    .debug_selector(|| "app-root-vault-menu-divider".to_string())
+                    .w_full()
+                    .h(px(1.0))
+                    .my_1()
+                    .flex_shrink_0()
+                    .bg(theme::sidebar_border()),
+            )
+            .child(action_button(
+                "app-root-vault-manage",
+                "管理仓库…",
+                false,
+                false,
+                cx,
+                |root, cx| root.open_vault_manager(cx),
+            ));
+        menu.into_any_element()
+    }
+
+    /// 「管理仓库」覆盖层：实例列表（打开/设为默认）+ 新建/加入/返回欢迎页。
+    ///
+    /// 这是 Main 里创建 vault 的**唯一入口**（设置页不再有「实例」分类）。
+    /// 每个实例一行：名字/API/mode/vault_id/路径（省略）+「打开」+「设为默认」。
+    fn render_vault_manager(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        // 只在 Main 里渲染：离开 Main（关窗/返回欢迎页/进 Error）时管理仓库必须消失。
+        if !self.vault_manager_open || self.state != State::Main {
+            return None;
+        }
+        // 重命名行内输入：打开后的**首帧**抢焦点（否则要先点一下输入框才能打字）。
+        if let Some(rename) = &mut self.vault_rename {
+            if !rename.focused_once {
+                rename.focused_once = true;
+                let input = rename.input.clone();
+                window.defer(cx, move |window, cx| {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                });
+            }
+        }
+        let rows = self.vault_manager_rows();
+        let rename_target = self
+            .vault_rename
+            .as_ref()
+            .map(|rename| rename.instance_id.clone());
+        let rename_input = self
+            .vault_rename
+            .as_ref()
+            .map(|rename| rename.input.clone());
+        let rename_error = self
+            .vault_rename
+            .as_ref()
+            .and_then(|rename| rename.error.clone());
+        let notice = self.vault_manager_notice.clone();
+        let window_size = window.bounds().size;
+        let panel_w = (window_size.width.as_f32() - 40.0).clamp(320.0, 680.0);
+        let panel_h = (window_size.height.as_f32() - 112.0).clamp(240.0, 720.0);
+
+        let mut list = div()
+            .id("vault-manager-list")
+            .debug_selector(|| "vault-manager-list".to_string())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1();
+        if rows.is_empty() {
+            list = list.child(
+                hint_text("还没有已保存的 vault；可以点「同步远程仓库…」粘贴创建/邀请链接。")
+                    .w_full(),
+            );
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let row_selector = format!("vault-manager-instance-{index}");
+            let open_selector = format!("vault-manager-open-{index}");
+            let default_selector = format!("vault-manager-default-{index}");
+            let rename_selector = format!("vault-manager-rename-{index}");
+            let open_id = row.instance_id.clone();
+            let default_id = row.instance_id.clone();
+            let rename_id = row.instance_id.clone();
+            let renaming = rename_target.as_deref() == Some(row.instance_id.as_str());
+            let mut actions = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                // 「打开」= 关旧开新（不重启）；当前实例 = no-op。
+                .child(action_button(
+                    open_selector,
+                    if row.opened { "已打开" } else { "打开" },
+                    row.opened,
+                    false,
+                    cx,
+                    move |root, cx| root.switch_to_instance(&open_id, cx),
+                ))
+                // 「设为默认」只写公开配置 + 本机启动入口，不热切换。
+                .child(action_button(
+                    default_selector,
+                    if row.is_active {
+                        "当前默认"
+                    } else {
+                        "设为默认"
+                    },
+                    false,
+                    row.is_active,
+                    cx,
+                    move |root, cx| root.vault_manager_set_active(&default_id, cx),
+                ))
+                // 「重命名」= 行内输入（只改显示名，不移动目录/不碰实例锁）。
+                .child(action_button(
+                    rename_selector,
+                    crate::ui_text::vault_rename(),
+                    false,
+                    renaming,
+                    cx,
+                    move |root, cx| root.begin_vault_rename(&rename_id, cx),
+                ));
+            if renaming {
+                if let Some(input) = rename_input.clone() {
+                    let rename_row = div()
+                        .debug_selector(|| "vault-manager-rename-row".to_string())
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .px_2()
+                                .py_1()
+                                .bg(theme::window_bg())
+                                .border_1()
+                                .border_color(theme::input_border())
+                                .rounded_sm()
+                                .child(input),
+                        )
+                        .child(action_button(
+                            "vault-manager-rename-save",
+                            crate::ui_text::vault_rename_save(),
+                            true,
+                            false,
+                            cx,
+                            |root, cx| root.save_vault_rename(cx),
+                        ))
+                        .child(action_button(
+                            "vault-manager-rename-cancel",
+                            crate::ui_text::vault_rename_cancel(),
+                            false,
+                            false,
+                            cx,
+                            |root, cx| root.cancel_vault_rename(cx),
+                        ));
+                    actions = actions.child(rename_row);
+                    actions = actions.child(
+                        div()
+                            .debug_selector(|| "vault-manager-rename-hint".to_string())
+                            .w_full()
+                            .text_size(px(10.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(crate::ui_text::vault_name_placeholder())),
+                    );
+                    if let Some(error) = rename_error.clone() {
+                        actions = actions.child(
+                            div()
+                                .debug_selector(|| "vault-manager-rename-error".to_string())
+                                .w_full()
+                                .text_size(px(11.0))
+                                .text_color(theme::danger_text())
+                                .child(SharedString::from(error)),
+                        );
+                    }
+                }
+            }
+            list = list.child(
+                div()
+                    .id(SharedString::from(row_selector.clone()))
+                    .debug_selector(move || row_selector)
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(if row.is_active {
+                        theme::link_color()
+                    } else {
+                        theme::sidebar_border()
+                    })
+                    .bg(theme::sidebar_bg())
+                    // 名字：自定义名优先（回退目录名/短 id），不再只显示 `inst-...`。
+                    .child(
+                        div()
+                            .debug_selector(|| "vault-manager-name".to_string())
+                            .w_full()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(12.0))
+                            .text_color(if row.is_active {
+                                theme::link_color()
+                            } else {
+                                theme::text_color()
+                            })
+                            .child(SharedString::from(if row.is_active {
+                                format!("✓ {}", row.name)
+                            } else {
+                                row.name.clone()
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(11.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(row.meta.clone())),
+                    )
+                    .child(
+                        // 长路径省略：不把下面的按钮挤乱（内容区仍可滚动）。
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(row.path.clone())),
+                    )
+                    .child(actions),
+            );
+        }
+
+        let panel = div()
+            .id("app-root-vault-manager")
+            .debug_selector(|| "app-root-vault-manager".to_string())
+            .w(px(panel_w))
+            .h(px(panel_h))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p(px(14.0))
+            .bg(theme::menu_bg())
+            .border_1()
+            .border_color(theme::sidebar_border())
+            .rounded_md()
+            .shadow_lg()
+            .track_focus(&self.vault_manager_focus)
+            .on_key_down(
+                cx.listener(|root, event: &gpui::KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        // 重命名进行中：Esc 只取消行内输入（不关管理仓库、不改配置）。
+                        if root.vault_rename_is_open() {
+                            root.cancel_vault_rename(cx);
+                        } else {
+                            root.close_vault_manager(cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_root, _event: &gpui::MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(title_text("管理仓库"))
+                    .child(div().flex_1())
+                    .child(action_button(
+                        "vault-manager-close",
+                        crate::ui_text::settings_close(),
+                        false,
+                        false,
+                        cx,
+                        |root, cx| root.close_vault_manager(cx),
+                    )),
+            )
+            .child(
+                hint_text(
+                    "切换 = 先 flush 关闭当前库并释放实例锁，再打开目标 vault；\
+                     不重启应用、不热切换 worker。「重命名」只改显示名（sync.json），\
+                     不移动目录、不改库路径、不碰实例锁。",
+                )
+                .w_full(),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "vault-manager-actions".to_string())
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(action_button(
+                        "vault-manager-sync-remote",
+                        "同步远程仓库…",
+                        true,
+                        false,
+                        cx,
+                        |root, cx| root.vault_manager_sync_remote(cx),
+                    ))
+                    .child(action_button(
+                        "vault-manager-back-welcome",
+                        "返回欢迎页",
+                        false,
+                        false,
+                        cx,
+                        |root, cx| root.vault_manager_back_to_welcome(cx),
+                    )),
+            )
+            .child(
+                div()
+                    .id("vault-manager-content")
+                    .debug_selector(|| "vault-manager-content".to_string())
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(list)
+                    .when_some(notice, |this, notice| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "vault-manager-notice".to_string())
+                                .w_full()
+                                .text_size(px(11.0))
+                                .text_color(theme::caret_color())
+                                .child(SharedString::from(notice)),
+                        )
+                    }),
+            );
+
+        Some(
+            div()
+                .debug_selector(|| "app-root-vault-manager-backdrop".to_string())
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_start()
+                .justify_center()
+                .pt(px(56.0))
+                .bg(theme::overlay_scrim())
+                // 覆盖层拦住滚轮（不把滚动漏给下面的编辑器）。
+                .on_scroll(
+                    cx.listener(|_root, _event: &gpui::ScrollEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
+                // 点空白 = 关闭管理仓库（未保存的重命名一并丢弃，磁盘不变）。
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|root, _event: &gpui::MouseDownEvent, _window, cx| {
+                        root.close_vault_manager(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
     /// 设置面板（overlay）：左侧分类导航 + 右侧**只渲染当前分类**的内容区。
     ///
     /// 只投影公开配置；不持有 setup secret/恢复码/root/manager seed（类型上也没有）。
@@ -4723,21 +7176,10 @@ impl AppRoot {
     /// 布局：标题 + 两栏（左侧固定导航 / 右侧独立滚动内容）+ 底部固定（错误/提示/保存/关闭）。
     /// 覆盖层仍然限高、拦截滚轮（不穿透到底下的编辑器）。
     fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let (
-            active_entry,
-            mode,
-            remote_consent,
-            stored_fingerprint,
-            stored_security,
-            error,
-            notice,
-            relay,
-        ) = {
+        let (active_entry, stored_fingerprint, stored_security, error, notice, relay) = {
             let settings = self.settings.as_ref()?;
             (
                 settings.active.clone(),
-                settings.mode,
-                settings.remote_consent,
                 settings.fingerprint.clone(),
                 settings.security,
                 settings.error.clone(),
@@ -4767,101 +7209,13 @@ impl AppRoot {
             .as_ref()
             .and_then(|shell| shell.read(cx).dev_sync_security_category())
             .or(stored_security);
-        let entries = self.entries();
-        let active_id = self
-            .profile
-            .as_ref()
-            .and_then(|profile| profile.active_instance.clone());
-
-        let mut list = div().w_full().flex().flex_col().gap_1();
-        if entries.is_empty() {
-            list = list.child(hint_text(crate::ui_text::settings_no_instances_hint()));
-        }
-        for (index, entry) in entries.iter().enumerate() {
-            let is_active = active_id.as_deref() == Some(entry.instance_id.as_str());
-            let instance_id = entry.instance_id.clone();
-            let set_active_id = entry.instance_id.clone();
-            let row_id = entry.instance_id.clone();
-            let row_selector = format!("settings-instance-{index}");
-            let active_selector = format!("settings-instance-{index}-active");
-            let role = if is_active {
-                crate::ui_text::settings_active_now()
-            } else {
-                crate::ui_text::settings_instance()
-            };
-            let row_label =
-                crate::ui_text::settings_instance_row(&role, &short_public_id(&entry.instance_id));
-            let ids_line = format!(
-                "API {} · {} · vault_id {} · device_id {}",
-                entry.api_version.as_str(),
-                entry.relay_mode.as_str(),
-                short_public_id(&entry.vault_id),
-                short_public_id(&entry.device_id)
-            );
-            list = list.child(
-                div()
-                    .id(SharedString::from(row_id))
-                    .debug_selector(move || row_selector)
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_2()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if is_active {
-                        theme::link_color()
-                    } else {
-                        theme::sidebar_border()
-                    })
-                    .bg(theme::sidebar_bg())
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme::text_color())
-                            .child(SharedString::from(row_label)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme::status_bar_text())
-                            .child(SharedString::from(ids_line)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(theme::status_bar_text())
-                            .child(SharedString::from(entry.vault_path.clone())),
-                    )
-                    .child(action_button(
-                        active_selector,
-                        if is_active {
-                            crate::ui_text::settings_active_now()
-                        } else {
-                            crate::ui_text::settings_set_active()
-                        },
-                        false,
-                        is_active,
-                        cx,
-                        move |root, cx| root.settings_set_active(&set_active_id, cx),
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
-                            root.settings_set_active(&instance_id, cx);
-                            cx.stop_propagation();
-                        }),
-                    ),
-            );
-        }
-
         let public_section: gpui::AnyElement = match active_entry {
             Some(entry) => {
                 let vault_id = entry.vault_id.clone();
                 let device_id = entry.device_id.clone();
                 let vault_path = entry.vault_path.clone();
                 div()
+                    .debug_selector(|| "settings-public-info".to_string())
                     .w_full()
                     .flex()
                     .flex_col()
@@ -4889,11 +7243,13 @@ impl AppRoot {
                         div()
                             .flex()
                             .flex_row()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w(px(0.0))
                                     .text_size(px(11.0))
                                     .text_color(theme::text_color())
                                     .child(SharedString::from(crate::ui_text::settings_vault_id(
@@ -4918,11 +7274,13 @@ impl AppRoot {
                         div()
                             .flex()
                             .flex_row()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w(px(0.0))
                                     .text_size(px(11.0))
                                     .text_color(theme::text_color())
                                     .child(SharedString::from(crate::ui_text::settings_device_id(
@@ -4947,11 +7305,13 @@ impl AppRoot {
                         div()
                             .flex()
                             .flex_row()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w(px(0.0))
                                     .text_size(px(11.0))
                                     .text_color(theme::status_bar_text())
                                     .child(SharedString::from(
@@ -5063,6 +7423,9 @@ impl AppRoot {
             SettingsSection::Language => {
                 content = content.child(crate::language_settings::language_section());
             }
+            SettingsSection::Shortcuts => {
+                content = content.child(self.render_shortcuts_section(cx));
+            }
             SettingsSection::Templates => {
                 content = match self.templates_settings.clone() {
                     Some(panel) => content.child(div().w_full().child(panel)),
@@ -5096,6 +7459,10 @@ impl AppRoot {
                     }
                 }
                 content = content.child(sync_content);
+                // active 实例的**公开**信息（vault_id/device_id/API 面/库路径）：
+                // 「实例」分类已移除（用户反馈没有存在感），但公开信息仍要能看，
+                // 因此贴在同步内容下方（只读、可复制；不含任何秘密）。
+                content = content.child(public_section);
             }
             SettingsSection::Plugins => {
                 // Obsidian「核心插件」式总开关页：只列**有运行时开关**的第一方插件
@@ -5123,36 +7490,15 @@ impl AppRoot {
                             )),
                     );
             }
-            SettingsSection::Instances => {
-                content = content
-                    .child(section_text(crate::ui_text::settings_instances_title()))
-                    .child(list)
-                    .child(public_section);
-            }
             SettingsSection::Relay => {
                 content = content
                     .child(section_text(crate::ui_text::settings_relay_title()))
-                    .child(mode_selector(
-                        "settings-mode",
-                        mode,
-                        cx,
-                        |root, mode, cx| root.settings_set_mode(mode, cx),
-                    ))
-                    .when(mode == RelayMode::RemoteTls, |this| {
-                        this.child(checkbox_row(
-                            "settings-remote-consent",
-                            remote_consent,
-                            crate::ui_text::settings_remote_consent(),
-                            cx,
-                            |root, cx| {
-                                let next = root
-                                    .settings
-                                    .as_ref()
-                                    .is_some_and(|settings| !settings.remote_consent);
-                                root.settings_set_remote_consent(next, cx);
-                            },
-                        ))
-                    })
+                    // 模式不再提供可点选项：只读说明按地址自动识别。
+                    .child(
+                        hint_text(crate::ui_text::settings_relay_auto_mode())
+                            .debug_selector(|| "settings-relay-mode-hint".to_string())
+                            .w_full(),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -5164,10 +7510,10 @@ impl AppRoot {
                             .rounded_sm()
                             .child(relay),
                     )
-                    .child(hint_text(match mode {
-                        RelayMode::LocalDev => crate::ui_text::settings_relay_local_hint(),
-                        RelayMode::RemoteTls => crate::ui_text::settings_relay_remote_hint(),
-                    }));
+                    .child(hint_text(crate::ui_text::settings_relay_remote_hint()).w_full())
+                    .when(local_option_available(), |this| {
+                        this.child(hint_text(crate::ui_text::settings_relay_local_hint()).w_full())
+                    });
             }
             SettingsSection::Security => {
                 content =
@@ -5234,6 +7580,9 @@ impl AppRoot {
                     div()
                         .id("dev-sync-settings")
                         .debug_selector(|| "dev-sync-settings".to_string())
+                        // 快捷键录制需要一个焦点节点（点击「修改」后我们把焦点放到
+                        // 面板本身；根上的 capture 监听器先于所有子节点收按键）。
+                        .track_focus(&self.settings_focus)
                         .w(px(760.0))
                         .h(px(
                             (window.bounds().size.height.as_f32() - 112.0).clamp(240.0, 900.0)
@@ -5368,6 +7717,270 @@ impl AppRoot {
         )
     }
 
+    /// 设置页「快捷键」分类：标题 + 说明 + 顶部冲突汇总 + 每个命令一行。
+    ///
+    /// 固定 selector（headless 测试点击/断言用）：
+    /// `settings-shortcuts` / `shortcut-row-<id>` / `shortcut-value-<id>` /
+    /// `shortcut-edit-<id>` / `shortcut-reset-<id>` / `shortcut-conflict-<id>` /
+    /// `shortcut-conflicts-summary` / `shortcut-capture`。
+    ///
+    /// 冲突**只提醒、不禁止保存**：行上红标 + 顶部汇总；录制成功后立即写盘并生效。
+    fn render_shortcuts_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let snapshot = crate::shortcuts::snapshot();
+        let capture = self.shortcut_capture;
+        let notice = self.shortcut_capture_notice.clone();
+        let has_conflicts = snapshot.conflict_count() > 0;
+        let mut section = div()
+            .id("settings-shortcuts")
+            .debug_selector(|| "settings-shortcuts".to_string())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_text(crate::shortcuts::title()))
+            .child(hint_text(crate::shortcuts::hint()).w_full())
+            .child(
+                div()
+                    .debug_selector(|| "shortcut-conflicts-summary".to_string())
+                    .w_full()
+                    .text_size(px(11.0))
+                    .text_color(if has_conflicts {
+                        theme::danger_text()
+                    } else {
+                        theme::status_bar_text()
+                    })
+                    .child(SharedString::from(snapshot.summary())),
+            );
+        // 非录制态的提示（恢复默认写盘失败等）：只在有内容时挂一行，避免空白。
+        if let Some(notice) = notice.as_ref().filter(|_| capture.is_none()) {
+            section = section.child(
+                div()
+                    .debug_selector(|| "shortcut-notice".to_string())
+                    .w_full()
+                    .text_size(px(11.0))
+                    .text_color(theme::danger_text())
+                    .child(SharedString::from(notice.clone())),
+            );
+        }
+        for row in &snapshot.rows {
+            let command = row.command;
+            let id = command.as_str();
+            let row_selector = format!("shortcut-row-{id}");
+            let value_selector = format!("shortcut-value-{id}");
+            let edit_selector = format!("shortcut-edit-{id}");
+            let reset_selector = format!("shortcut-reset-{id}");
+            let conflict_selector = format!("shortcut-conflict-{id}");
+            let is_capturing = capture == Some(command);
+            let mut line = div()
+                .id(SharedString::from(row_selector.clone()))
+                .debug_selector(move || row_selector)
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .py(px(6.0))
+                .border_b_1()
+                .border_color(theme::sidebar_border())
+                .when(is_capturing, |this| this.bg(theme::sidebar_selected_bg()))
+                .child(
+                    div()
+                        .w(px(104.0))
+                        .flex_shrink_0()
+                        .text_size(px(12.0))
+                        .text_color(theme::text_color())
+                        .child(SharedString::from(command.label())),
+                );
+            if is_capturing {
+                let capture_text = notice
+                    .clone()
+                    .unwrap_or_else(crate::shortcuts::capture_prompt);
+                line = line.child(
+                    div()
+                        .id("shortcut-capture")
+                        .debug_selector(|| "shortcut-capture".to_string())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(12.0))
+                        .text_color(if notice.is_some() {
+                            theme::danger_text()
+                        } else {
+                            theme::link_color()
+                        })
+                        .child(SharedString::from(capture_text)),
+                );
+            } else {
+                line = line.child(
+                    div()
+                        .debug_selector(move || value_selector)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(12.0))
+                        .text_color(theme::text_color())
+                        .child(SharedString::from(row.value_text())),
+                );
+            }
+            if row.conflicted {
+                line = line.child(
+                    div()
+                        .debug_selector(move || conflict_selector)
+                        .flex_shrink_0()
+                        .px_1()
+                        .py(px(1.0))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme::danger_text())
+                        .text_size(px(10.0))
+                        .text_color(theme::danger_text())
+                        .child(SharedString::from(crate::shortcuts::conflict_badge())),
+                );
+            }
+            let edit_id = SharedString::from(edit_selector);
+            let edit_debug = edit_id.clone();
+            line = line.child(
+                div()
+                    .id(edit_id)
+                    .debug_selector(move || edit_debug.to_string())
+                    .flex_shrink_0()
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .bg(theme::menu_bg())
+                    .text_size(px(11.0))
+                    .text_color(theme::text_color())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(SharedString::from(crate::shortcuts::modify_label()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _event: &gpui::MouseDownEvent, window, cx| {
+                            root.shortcut_begin_capture(command, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+            let reset_id = SharedString::from(reset_selector);
+            let reset_debug = reset_id.clone();
+            line = line.child(
+                div()
+                    .id(reset_id)
+                    .debug_selector(move || reset_debug.to_string())
+                    .flex_shrink_0()
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .bg(theme::menu_bg())
+                    .text_size(px(11.0))
+                    .text_color(theme::text_color())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(SharedString::from(crate::shortcuts::reset_label()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
+                            root.shortcut_reset(command, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+            section = section.child(line);
+        }
+        section.into_any_element()
+    }
+
+    /// 点击「修改」进入录制态：下一次按键成为该命令的新绑定。
+    ///
+    /// 先把焦点交给设置面板：根视图的 **capture 相**监听器先于编辑器/输入框
+    /// 拿到按键并吞掉，保证录制时按键不会同时触发原命令或落进正文。
+    fn shortcut_begin_capture(
+        &mut self,
+        command: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.is_none() {
+            return;
+        }
+        self.shortcut_capture = Some(command);
+        self.shortcut_capture_notice = None;
+        self.settings_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// 取消录制（Esc / 关闭设置 / 切换分类）。
+    fn shortcut_cancel_capture(&mut self, cx: &mut Context<Self>) {
+        if self.shortcut_capture.take().is_none() {
+            return;
+        }
+        self.shortcut_capture_notice = None;
+        cx.notify();
+    }
+
+    /// 「恢复默认」：只恢复该命令的内置绑定并立即写盘（冲突随之消失）。
+    fn shortcut_reset(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.shortcut_capture == Some(command) {
+            self.shortcut_capture = None;
+        }
+        self.shortcut_capture_notice = match crate::shortcuts::reset_binding(command) {
+            Ok(()) => None,
+            Err(error) => Some(crate::shortcuts::capture_failed(&error.to_string())),
+        };
+        cx.notify();
+    }
+
+    /// 录制态按键处理（返回 `true` = 本次按键已被吞掉，绝不能再传给编辑器/输入框）。
+    ///
+    /// 规则与 [`KeyCombo::is_bindable`] 同源：必须有 Ctrl/Cmd 或 Alt，或功能键
+    /// F1–F24；裸字母/数字/Enter/Tab/Backspace 不接受。`Esc` 取消录制。
+    fn handle_shortcut_capture_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(command) = self.shortcut_capture else {
+            return false;
+        };
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        // 裸 Esc = 取消；带修饰键的 Esc 允许被录成快捷键（与"取消键"区分）。
+        if keystroke.key.eq_ignore_ascii_case("escape")
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+        {
+            self.shortcut_cancel_capture(cx);
+            return true;
+        }
+        let Some(combo) = KeyCombo::from_keystroke(keystroke) else {
+            self.shortcut_capture_notice = Some(crate::shortcuts::capture_invalid());
+            cx.notify();
+            return true;
+        };
+        if !combo.is_bindable() {
+            self.shortcut_capture_notice = Some(crate::shortcuts::capture_invalid());
+            cx.notify();
+            return true;
+        }
+        match crate::shortcuts::assign(command, combo) {
+            Ok(()) => {
+                self.shortcut_capture = None;
+                self.shortcut_capture_notice = None;
+            }
+            Err(error) => {
+                // 内存里已经生效（下一次按键即用新绑定），只有写盘失败要提示。
+                self.shortcut_capture = None;
+                self.shortcut_capture_notice =
+                    Some(crate::shortcuts::capture_failed(&error.to_string()));
+            }
+        }
+        cx.notify();
+        true
+    }
+
     /// 设置页的「安全指纹」只读区（ADR 0013 §4）。
     ///
     /// 只投影公开值；**没有**重置 pin / 强制信任 / 接受无效证书之类的动作。
@@ -5448,143 +8061,528 @@ impl AppRoot {
         section.into_any_element()
     }
 
-    fn render_welcome(&self, cx: &mut Context<Self>) -> gpui::Div {
+    /// Welcome（Obsidian 式仓库选择页）：左栏已保存仓库列表，右栏新建/打开/同步。
+    ///
+    /// 右栏三张卡各自展开小表单（不整页跳走）；真正的创建/加入在确认后进入
+    /// `Working`，成功仍是既有备份页 / PENDING 等待页。
+    fn render_welcome(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        self.ensure_welcome_forms(cx);
         let entries = self.entries();
-        let mut list = div().flex().flex_col().gap_1();
-        if entries.is_empty() {
-            list = list.child(hint_text("还没有保存的实例：点下面「创建新的同步实例」。"));
-        } else {
-            for (index, entry) in entries.iter().enumerate() {
-                let short_vault = entry.vault_id.chars().take(8).collect::<String>();
-                let active = self
-                    .profile
-                    .as_ref()
-                    .and_then(|profile| profile.active_instance.as_deref())
-                    == Some(entry.instance_id.as_str());
-                let instance_id = entry.instance_id.clone();
-                let label = format!(
-                    "{}{} · v{} · vault {}… · {}",
-                    entry.short_label(),
-                    if active { "（上次使用）" } else { "" },
-                    entry.api_version.as_number(),
-                    short_vault,
-                    entry.relay_url
-                );
-                list = list.child(
+        let active_id = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.active_instance.clone());
+        let local_row = self.welcome_local_row_path();
+        let has_local_row = local_row.is_some();
+        let startup_mode = self.startup_mode;
+        let (
+            expanded,
+            new_local_dir,
+            open_local_path,
+            sync_link,
+            sync_dir,
+            sync_name,
+            form_error,
+            sync_consent,
+        ) = {
+            let Some(welcome) = &self.welcome else {
+                return page_column()
+                    .debug_selector(|| "app-root-welcome".to_string())
+                    .child(title_text("Welcome 控件未就绪"))
+                    .child(hint_text("内部状态不一致：请返回欢迎页重试。"));
+            };
+            (
+                welcome.expanded,
+                welcome.new_local_dir.clone(),
+                welcome.open_local_path.clone(),
+                welcome.sync_link.clone(),
+                welcome.sync_dir.clone(),
+                welcome.sync_name.clone(),
+                welcome.error.clone(),
+                welcome.sync_consent,
+            )
+        };
+
+        // ---- 左栏：已保存的仓库（同步实例 active 优先 + 本地库）----
+        let mut list = div()
+            .debug_selector(|| "welcome-vault-list".to_string())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1();
+        for (index, entry) in entries.iter().enumerate() {
+            let is_active = active_id.as_deref() == Some(entry.instance_id.as_str());
+            let name = entry.effective_name();
+            let path = entry.vault_path.clone();
+            let instance_id = entry.instance_id.clone();
+            let selector = format!("welcome-vault-{index}");
+            let row_id = selector.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(row_id))
+                    .debug_selector(move || selector)
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_active {
+                        theme::link_color()
+                    } else {
+                        theme::sidebar_border()
+                    })
+                    .bg(if is_active {
+                        theme::sidebar_selected_bg()
+                    } else {
+                        theme::menu_bg()
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_size(px(13.0))
+                                    .text_color(if is_active {
+                                        theme::link_color()
+                                    } else {
+                                        theme::text_color()
+                                    })
+                                    .child(SharedString::from(name)),
+                            )
+                            .when(is_active, |this| {
+                                this.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.0))
+                                        .text_color(theme::status_bar_text())
+                                        .child("上次使用"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(path)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
+                            root.open_saved_instance(&instance_id, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+        if let Some(path) = local_row {
+            let is_active = startup_mode == Some(StartupMode::Local);
+            let name = vault_directory_name(&path).unwrap_or_else(|| "本地仓库".to_owned());
+            let path_text = path.display().to_string();
+            list = list.child(
+                div()
+                    .id("welcome-vault-local")
+                    .debug_selector(|| "welcome-vault-local".to_string())
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_active {
+                        theme::link_color()
+                    } else {
+                        theme::sidebar_border()
+                    })
+                    .bg(if is_active {
+                        theme::sidebar_selected_bg()
+                    } else {
+                        theme::menu_bg()
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_size(px(13.0))
+                                    .text_color(if is_active {
+                                        theme::link_color()
+                                    } else {
+                                        theme::text_color()
+                                    })
+                                    .child(SharedString::from(format!("本地仓库 · {name}"))),
+                            )
+                            .when(is_active, |this| {
+                                this.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.0))
+                                        .text_color(theme::status_bar_text())
+                                        .child("上次使用"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(path_text)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
+                            // 左栏点击 = 直接打开该库（不要求先「设为默认」、不经过管理页）。
+                            root.open_local_only_vault_at(path.clone(), cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+        if entries.is_empty() && !has_local_row {
+            list =
+                list.child(hint_text("还没有仓库：从右侧新建本地仓库，或同步远程仓库。").w_full());
+        }
+        let left = div()
+            .id("welcome-vault-scroll")
+            .w(px(280.0))
+            .flex_shrink_0()
+            .h_full()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .p(px(18.0))
+            .border_r_1()
+            .border_color(theme::sidebar_border())
+            .bg(theme::sidebar_bg())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_text("已保存的仓库"))
+            .child(list);
+
+        // ---- 右栏：大标题 + 三行操作卡 ----
+        let mut right = div()
+            .id("welcome-content-scroll")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .p(px(28.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(26.0))
+                    .text_color(theme::text_color())
+                    .child("menghunote"),
+            )
+            .child(section_text("仓库"))
+            .when_some(banner_text(), |this, banner| this.child(banner));
+
+        // 1) 新建本地仓库
+        right = right.child(welcome_action_card(
+            "welcome-new-local",
+            "新建本地仓库",
+            "选择一个目录，在其中创建空的 vault.sqlite3（不播种演示内容）",
+            expanded == Some(WelcomeAction::NewLocal),
+            WelcomeAction::NewLocal,
+            cx,
+        ));
+        if expanded == Some(WelcomeAction::NewLocal) {
+            right = right.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p(px(12.0))
+                    .rounded_md()
+                    .bg(theme::input_bg())
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .child(label_text(
+                        "目录（绝对路径；将在其中创建 vault.sqlite3；已有库请改用「打开本地仓库」）",
+                    ))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .px_2()
+                                    .py_1()
+                                    .bg(theme::window_bg())
+                                    .border_1()
+                                    .border_color(theme::input_border())
+                                    .rounded_sm()
+                                    .child(new_local_dir),
+                            )
+                            .child(action_button(
+                                "welcome-new-local-browse",
+                                "浏览…",
+                                false,
+                                false,
+                                cx,
+                                |root, cx| root.welcome_browse_new_local(cx),
+                            )),
+                    )
+                    .child(
+                        div().flex().flex_row().gap_2().child(action_button(
+                            "welcome-new-local-confirm",
+                            "创建并打开",
+                            true,
+                            false,
+                            cx,
+                            |root, cx| root.welcome_confirm_new_local(cx),
+                        )),
+                    ),
+            );
+        }
+
+        // 2) 打开本地仓库
+        right = right.child(welcome_action_card(
+            "welcome-open-local",
+            "打开本地仓库",
+            "打开已有的 vault.sqlite3；缺失时明确报错，不会新建",
+            expanded == Some(WelcomeAction::OpenLocal),
+            WelcomeAction::OpenLocal,
+            cx,
+        ));
+        if expanded == Some(WelcomeAction::OpenLocal) {
+            right = right.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p(px(12.0))
+                    .rounded_md()
+                    .bg(theme::input_bg())
+                    .border_1()
+                    .border_color(theme::input_border())
+                    .child(label_text(
+                        "库文件（vault.sqlite3；也可以选目录，提交时自动补 vault.sqlite3）",
+                    ))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .px_2()
+                                    .py_1()
+                                    .bg(theme::window_bg())
+                                    .border_1()
+                                    .border_color(theme::input_border())
+                                    .rounded_sm()
+                                    .child(open_local_path),
+                            )
+                            .child(action_button(
+                                "welcome-open-local-browse",
+                                "浏览…",
+                                false,
+                                false,
+                                cx,
+                                |root, cx| root.welcome_browse_open_local(cx),
+                            )),
+                    )
+                    .child(div().flex().flex_row().gap_2().child(action_button(
+                        "welcome-open-local-confirm",
+                        "打开",
+                        true,
+                        false,
+                        cx,
+                        |root, cx| root.welcome_confirm_open_local(cx),
+                    ))),
+            );
+        }
+
+        // 3) 同步远程仓库（只收一条链接；自动识别 create/join）
+        right = right.child(welcome_action_card(
+            "welcome-sync-remote",
+            "同步远程仓库",
+            "粘贴 mn-pair://create 或 mn-pair://join 链接；自动识别创建/加入，不用手填 relay/vault/恢复码",
+            expanded == Some(WelcomeAction::SyncRemote),
+            WelcomeAction::SyncRemote,
+            cx,
+        ));
+        if expanded == Some(WelcomeAction::SyncRemote) {
+            let mut form = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p(px(12.0))
+                .rounded_md()
+                .bg(theme::input_bg())
+                .border_1()
+                .border_color(theme::input_border())
+                .child(label_text(
+                    "链接（只粘贴一条；创建票据 mn-pair://create 或邀请链接 mn-pair://join）",
+                ))
+                .child(
                     div()
-                        .id(SharedString::from(format!("app-root-instance-{index}")))
-                        .debug_selector(move || format!("app-root-instance-{index}"))
                         .w_full()
                         .px_2()
                         .py_1()
-                        .rounded_sm()
+                        .bg(theme::window_bg())
                         .border_1()
-                        .border_color(theme::sidebar_border())
-                        .bg(theme::sidebar_bg())
-                        .cursor_pointer()
-                        .text_size(px(12.0))
-                        .text_color(theme::text_color())
-                        .child(SharedString::from(label))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
-                                root.open_saved_instance(&instance_id, cx);
-                                cx.stop_propagation();
-                            }),
-                        ),
-                );
+                        .border_color(theme::input_border())
+                        .rounded_sm()
+                        .child(sync_link),
+                )
+                .child(hint_text(
+                    "链接严格解析：不是 mn-pair://create / mn-pair://join 的形式、票据/令牌不合法时会在本页内联报错，不联网、不建文件。",
+                ))
+                .child(label_text(
+                    "实例目录（绝对路径；默认在用户文档目录，可修改/浏览；目录内固定 vault.sqlite3）",
+                ))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .px_2()
+                                .py_1()
+                                .bg(theme::window_bg())
+                                .border_1()
+                                .border_color(theme::input_border())
+                                .rounded_sm()
+                                .child(sync_dir),
+                        )
+                        .child(action_button(
+                            "welcome-sync-dir-browse",
+                            "浏览…",
+                            false,
+                            false,
+                            cx,
+                            |root, cx| root.welcome_browse_sync_dir(cx),
+                        )),
+                )
+                // 可选「仓库名称」：只影响左下角/菜单/管理仓库的显示，不改路径。
+                .child(label_text(format!(
+                    "{}（可选；只影响显示，不改变实例目录）",
+                    crate::ui_text::vault_name_label()
+                )))
+                .child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .bg(theme::window_bg())
+                        .border_1()
+                        .border_color(theme::input_border())
+                        .rounded_sm()
+                        .child(sync_name),
+                )
+                .child(hint_text(crate::ui_text::vault_name_placeholder()));
+            #[cfg(feature = "dev-sync")]
+            {
+                form = form.child(checkbox_row(
+                    "welcome-sync-consent",
+                    sync_consent,
+                    "我理解这是开发同步（DEV ONLY / localhost / 非生产），并同意继续",
+                    cx,
+                    |root, cx| {
+                        let next = !root.welcome_sync_consent();
+                        root.welcome_set_sync_consent(next, cx);
+                    },
+                ));
             }
-        }
-        let mut column = page_column()
-            .debug_selector(|| "app-root-welcome".to_string())
-            .child(title_text("menghunote · 同步实例"))
-            .when_some(banner_text(), |this, banner| this.child(banner))
-            .child(
-                content_column()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(action_button(
-                                "app-root-create",
-                                "创建新的同步实例",
-                                true,
-                                false,
-                                cx,
-                                |root, cx| root.enter_create_form(cx),
-                            ))
-                            .child(action_button(
-                                "app-root-create-link",
-                                "粘贴创建链接（v2 票据）",
-                                false,
-                                false,
-                                cx,
-                                |root, cx| root.enter_create_link_form(cx),
-                            ))
-                            .child(action_button(
-                                "app-root-join",
-                                "加入已有同步实例",
-                                false,
-                                false,
-                                cx,
-                                |root, cx| root.enter_join_form(cx),
-                            ))
-                            .child(action_button(
-                                "app-root-settings",
-                                "同步设置",
-                                false,
-                                false,
-                                cx,
-                                |root, cx| root.open_settings(cx),
-                            )),
-                    )
-                    .child(section_text("已保存的实例（active 优先）"))
-                    .child(
-                        div()
-                            .debug_selector(|| "app-root-instances".to_string())
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(list),
-                    ),
-            );
-        if self.options.allow_local_vault {
-            // 本地（不同步）：同一 selector，两种构建文案不同（产品 = 仅本地使用；
-            // dev-sync = 旧「继续本地」开发入口）。产品额外显示本地库实际路径，
-            // 让用户知道数据落在哪（不联网、不建同步实例）。
-            let mut local = content_column()
-                .child(section_text(crate::ui_text::local_welcome_title()))
-                .child(hint_text(if cfg!(feature = "dev-sync") {
-                    crate::ui_text::local_dev_hint()
-                } else {
-                    crate::ui_text::local_welcome_hint()
-                }));
-            if !cfg!(feature = "dev-sync") {
-                local = local.child(hint_text(crate::ui_text::local_path_hint(
-                    &self.options.layout.local_vault_path().display().to_string(),
-                )));
-            }
-            column = column.child(local.child(action_button(
-                "app-root-local",
-                Self::local_entry_label(),
-                false,
+            #[cfg(not(feature = "dev-sync"))]
+            let _ = sync_consent;
+            form = form.child(div().flex().flex_row().gap_2().child(action_button(
+                "welcome-sync-confirm",
+                "继续",
+                true,
                 false,
                 cx,
-                |root, cx| root.open_local_vault(cx),
+                |root, cx| root.welcome_confirm_sync(cx),
             )));
+            right = right.child(form);
         }
-        let notice = self.notice.clone();
-        column.when_some(notice, |this, notice| {
-            this.child(
+
+        if let Some(error) = form_error {
+            right = right.child(
+                div()
+                    .debug_selector(|| "welcome-error".to_string())
+                    .w_full()
+                    .text_size(px(11.0))
+                    .text_color(theme::danger_text())
+                    .child(SharedString::from(error)),
+            );
+        }
+        if let Some(notice) = self.notice.clone() {
+            right = right.child(
                 div()
                     .debug_selector(|| "app-root-notice".to_string())
+                    .w_full()
                     .text_size(px(11.0))
                     .text_color(theme::caret_color())
                     .child(SharedString::from(notice)),
-            )
-        })
+            );
+        }
+
+        div()
+            .debug_selector(|| "app-root-welcome".to_string())
+            .w_full()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_row()
+            .child(left)
+            .child(right)
     }
 
     fn render_create_form(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -5594,9 +8592,11 @@ impl AppRoot {
                 .child(title_text("没有待填写的创建表单"))
                 .child(hint_text("内部状态不一致：请返回欢迎页重试。"));
         };
+        // 「同意开发同步」只在 dev-sync 构建渲染/校验；产品构建没有这个勾选。
+        #[cfg(feature = "dev-sync")]
         let consent = form.consent;
+        #[cfg(feature = "dev-sync")]
         let mode = form.mode;
-        let remote_consent = form.remote_consent;
         let link = form.link.clone();
         let dir = form.dir.clone();
         let form_error = form.error.clone();
@@ -5670,30 +8670,21 @@ impl AppRoot {
                             "relay：{relay}   ·   vault_id：{vault_id}   ·   API 面：v2"
                         ))),
                 );
+            // DEV 状态标注只在 dev-sync 构建出现；产品构建不渲染任何 DEV 文案。
+            #[cfg(feature = "dev-sync")]
             if mode == RelayMode::RemoteTls {
-                content = content
-                    .child(
-                        div()
-                            .debug_selector(|| "app-root-remote-dev-notice".to_string())
-                            .w_full()
-                            .text_size(px(11.0))
-                            .text_color(theme::caret_color())
-                            .child(SharedString::from(
-                                "DEV 状态：remote_tls 初始化已接线（production TLS + 受限初始化，\
-                                 未在真实 relay / Windows 上验证）。不会忽略证书，也不提供私有 \
-                                 CA 导入（请自行安装系统根）。",
-                            )),
-                    )
-                    .child(checkbox_row(
-                        "app-root-remote-consent",
-                        remote_consent,
-                        "我确认要连接远程服务器（HTTPS）；确认端点 ≠ 授权接受服务器任意 hash",
-                        cx,
-                        |root, cx| {
-                            let next = root.form.as_ref().is_some_and(|form| !form.remote_consent);
-                            root.form_set_remote_consent(next, cx);
-                        },
-                    ));
+                content = content.child(
+                    div()
+                        .debug_selector(|| "app-root-remote-dev-notice".to_string())
+                        .w_full()
+                        .text_size(px(11.0))
+                        .text_color(theme::caret_color())
+                        .child(SharedString::from(
+                            "DEV 状态：remote_tls 初始化已接线（production TLS + 受限初始化，\
+                             未在真实 relay / Windows 上验证）。不会忽略证书，也不提供私有 \
+                             CA 导入（请自行安装系统根）。",
+                        )),
+                );
             }
         } else {
             content = content.child(hint_text(
@@ -5704,20 +8695,40 @@ impl AppRoot {
 
         content = content
             .child(label_text(
-                "实例目录（绝对路径；目录内固定 vault.sqlite3 / dev-identity.bin）",
+                "实例目录（绝对路径；默认在用户文档目录，可修改/浏览；目录内固定 vault.sqlite3 / dev-identity.bin）",
             ))
             .child(
                 div()
                     .w_full()
-                    .px_2()
-                    .py_1()
-                    .bg(theme::window_bg())
-                    .border_1()
-                    .border_color(theme::input_border())
-                    .rounded_sm()
-                    .child(dir),
-            )
-            .child(checkbox_row(
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .px_2()
+                            .py_1()
+                            .bg(theme::window_bg())
+                            .border_1()
+                            .border_color(theme::input_border())
+                            .rounded_sm()
+                            .child(dir),
+                    )
+                    .child(action_button(
+                        "app-root-dir-browse",
+                        "浏览…",
+                        false,
+                        false,
+                        cx,
+                        |root, cx| root.form_browse_dir(cx),
+                    )),
+            );
+        // 「同意开发同步」只在 dev-sync 构建出现；产品构建没有 DEV 勾选，提交直接继续。
+        #[cfg(feature = "dev-sync")]
+        {
+            content = content.child(checkbox_row(
                 "app-root-consent",
                 consent,
                 "我理解这是开发同步（DEV ONLY / localhost / 非生产），并同意创建",
@@ -5726,7 +8737,9 @@ impl AppRoot {
                     let next = root.form.as_ref().is_some_and(|form| !form.consent);
                     root.form_set_consent(next, cx);
                 },
-            ))
+            ));
+        }
+        content = content
             .when_some(form_error, |this, error| {
                 this.child(
                     div()
@@ -5789,51 +8802,16 @@ impl AppRoot {
         let invite = form.invite.clone();
         let dir = form.dir.clone();
         let form_error = form.error.clone();
-        let mode = form.mode;
-        let remote_consent = form.remote_consent;
-        let relay_label = match mode {
-            RelayMode::LocalDev => "relay 地址（local_dev 只允许明文 loopback）",
-            RelayMode::RemoteTls => "relay 地址（remote_tls 只接受 HTTPS canonical origin）",
-        };
+        // 模式不再手选：提交时按 relay 地址推断；这里只展示只读约束。
+        let relay_label =
+            "relay 地址（按地址自动识别：https → remote_tls；http loopback → local_dev，仅 dev-sync）";
         let column = page_column()
             .debug_selector(|| "app-root-join-form".to_string())
             .child(title_text("加入已有同步实例（Join）"))
             .when_some(banner_text(), |this, banner| this.child(banner))
             .child(
                 content_column()
-                    .child(mode_selector(
-                        "app-root-join-mode",
-                        mode,
-                        cx,
-                        |root, mode, cx| root.join_form_set_mode(mode, cx),
-                    ))
-                    .when(mode == RelayMode::RemoteTls, |this| {
-                        this.child(
-                            div()
-                                .debug_selector(|| "app-root-remote-dev-notice".to_string())
-                                .w_full()
-                                .text_size(px(11.0))
-                                .text_color(theme::caret_color())
-                                .child(SharedString::from(
-                                    "DEV 状态：remote_tls 初始化已接线（FreshRecovery / production TLS + \
-                                     受限初始化，未在真实 relay / Windows 上验证）。不会忽略证书，\
-                                     也不提供私有 CA 导入（请自行安装系统根）。",
-                                )),
-                        )
-                        .child(checkbox_row(
-                            "app-root-join-remote-consent",
-                            remote_consent,
-                            "我确认要连接远程服务器（HTTPS）；确认端点 ≠ 授权接受服务器任意 hash",
-                            cx,
-                            |root, cx| {
-                                let next = root
-                                    .join_form
-                                    .as_ref()
-                                    .is_some_and(|form| !form.remote_consent);
-                                root.join_form_set_remote_consent(next, cx);
-                            },
-                        ))
-                    })
+                    .when_some(join_dev_notice(), |this, notice| this.child(notice))
                     .child(
                         div()
                             .w_full()
@@ -5874,6 +8852,14 @@ impl AppRoot {
                             .rounded_sm()
                             .child(relay),
                     )
+                    .child(
+                        hint_text(
+                            "remote_tls 只接受 HTTPS canonical origin；local_dev 只允许明文 loopback（仅 dev-sync）。\
+                             非法地址内联报错，不联网。",
+                        )
+                        .debug_selector(|| "app-root-join-relay-hint".to_string())
+                        .w_full(),
+                    )
                     .child(label_text("vault_id（32 位十六进制；创建者实例的公开标识）"))
                     .child(
                         div()
@@ -5906,18 +8892,35 @@ impl AppRoot {
                          提交后输入框立即清空，只在后台线程内存里存在。",
                     ))
                     .child(label_text(
-                        "实例目录（绝对路径；必须尚不存在或空目录；目录内固定 vault.sqlite3 / dev-identity.bin）",
+                        "实例目录（绝对路径；默认在用户文档目录，可修改/浏览；必须尚不存在或空目录；目录内固定 vault.sqlite3 / dev-identity.bin）",
                     ))
                     .child(
                         div()
                             .w_full()
-                            .px_2()
-                            .py_1()
-                            .bg(theme::window_bg())
-                            .border_1()
-                            .border_color(theme::input_border())
-                            .rounded_sm()
-                            .child(dir),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .px_2()
+                                    .py_1()
+                                    .bg(theme::window_bg())
+                                    .border_1()
+                                    .border_color(theme::input_border())
+                                    .rounded_sm()
+                                    .child(dir),
+                            )
+                            .child(action_button(
+                                "app-root-join-dir-browse",
+                                "浏览…",
+                                false,
+                                false,
+                                cx,
+                                |root, cx| root.join_form_browse_dir(cx),
+                            )),
                     )
                     .child(hint_text(
                         "与 Create 同一套目录校验与实例锁：已有库/身份/其它文件一律拒绝，不覆盖。",
@@ -6527,7 +9530,8 @@ mod tests {
         for section in SettingsSection::ALL {
             assert_eq!(SettingsSection::parse(section.key()), Some(section));
         }
-        for unknown in ["", "nope", "Appearance", "templates ", "0"] {
+        // `instances` 是**已移除**分类的旧 key：必须明确不可达（回退「外观」）。
+        for unknown in ["", "nope", "Appearance", "templates ", "0", "instances"] {
             assert_eq!(SettingsSection::parse(unknown), None, "{unknown:?}");
         }
         // 短名唯一（导航 selector / 偏好文件都靠它）。
@@ -6571,6 +9575,8 @@ mod tests {
             "{\"version\":99,\"section\":\"language\"}",
             "{\"version\":1}",
             "{\"version\":1,\"section\":2}",
+            // 旧版本可能记住已移除的「实例」分类：回退「外观」，不崩/不空白。
+            "{\"version\":1,\"section\":\"instances\"}",
         ] {
             std::fs::write(&path, corrupt).expect("写坏文件失败");
             assert_eq!(

@@ -961,6 +961,15 @@ impl MarkdownDocument {
         &self.semantic.items
     }
 
+    /// 全部代码块元数据（fenced / indented；按 `span` 起点排序）。
+    ///
+    /// 只读：给 app 的代码块语法高亮取语言与内容区间（围栏行不含在 `content` 里）。
+    /// 与 `code_spans` 同一区间来源，不改变投影/编辑语义，也不复制源码。
+    #[must_use]
+    pub fn code_blocks(&self) -> &[semantic::CodeBlockSpan] {
+        &self.semantic.code_blocks
+    }
+
     /// 第 `index` 个列表项在**隐藏态**下要显示的 marker 文本（bullet / 右对齐编号）。
     ///
     /// 有序列表示例（最大编号 10）：`" 9. "`、`"10. "` —— 编号右对齐、宽度稳定。

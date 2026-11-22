@@ -66,6 +66,9 @@ pub mod search_overlay;
 pub mod search_service;
 pub mod shell;
 pub mod sidebar_rename;
+// 快捷键中心模型 + 本机 `shortcuts.json`（设置页「快捷键」分类）：编辑器/宿主
+// 都从这里查询当前绑定。默认构建也编进来（与同步无关）。
+pub mod shortcuts;
 pub mod text_shortcuts;
 // 应用级主题（ADR 0021 P1/P2）：语义 token 集 + 浅色/深色/跟随系统 + 本机偏好。
 // **默认构建也编进来**：编辑器/侧栏/状态栏都靠它取色，不依赖 dev-sync。

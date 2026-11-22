@@ -17,10 +17,16 @@
 //!
 //! ## 模式与 URL（ADR 0013 §1）
 //!
-//! 两者都走**唯一权威 parser**（`menghunote-sync::relay_policy::parse_relay_url`）：
-//! `local_dev` 只接受明文 loopback，`remote_tls` 只接受 HTTPS + canonical origin；
-//! userinfo/query/fragment/非根路径一律拒绝。`remote_tls` 是**显式选择**（需要用户
-//! 勾选"远程服务器/HTTPS"确认），默认仍是 `local_dev`。
+//! 模式**不再由用户手动选择**：UI 只输入 relay 地址，保存/提交时按 scheme 推断
+//! （[`infer_relay_mode`]）——`https://` → `remote_tls`，`http://` → `local_dev`，
+//! 其它情况（含空值/缺 scheme/未知 scheme）一律先按 `remote_tls` 交给权威 parser
+//! 给出明确错误，不在 UI 复制一份 URL 校验。
+//!
+//! 推断结果与地址都走**唯一权威 parser**
+//! （`menghunote-sync::relay_policy::parse_relay_url`）：`local_dev` 只接受明文
+//! loopback，`remote_tls` 只接受 HTTPS + canonical origin；userinfo/query/fragment/
+//! 非根路径一律拒绝。`remote_tls` **不再**额外要求"确认连接 HTTPS"勾选：按 relay
+//! 配置连接，端点校验由 parser 完成，pin 仍独立校验。
 //!
 //! ## 安全边界
 //!
@@ -42,10 +48,6 @@ use super::layout::{InstanceEntry, RelayMode};
 pub(crate) struct SettingsState {
     /// 打开面板/切换 active 时 active 实例的快照（`None` = 配置里没有 active）。
     pub(crate) active: Option<InstanceEntry>,
-    /// 正在编辑的 relay 模式（保存时才写回配置）。
-    pub(crate) mode: RelayMode,
-    /// 远程模式确认（ADR 0013 §1：`remote_tls` 必须显式同意"远程服务器/HTTPS"）。
-    pub(crate) remote_consent: bool,
     /// relay 输入框（`settings-relay`）。
     pub(crate) relay: Entity<FormInput>,
     /// 安全指纹（打开面板时的只读快照；`None` = 没有打开实例，无法读取）。
@@ -62,23 +64,31 @@ pub(crate) struct SettingsState {
     pub(crate) _subs: Vec<Subscription>,
 }
 
-/// 本构建是否提供 `remote_tls` 选项（ADR 0013 §1：模式能力来自编译期，不看环境变量）。
-///
-/// `onboarding` 只在 `sync-ui`（默认）下编译（它隐含 `sync`），因此当前构建恒为
-/// `true`；保留这个单一判定点，无 sync UI 的构建里选项在类型上不存在。
-#[must_use]
-pub(crate) const fn remote_option_available() -> bool {
-    cfg!(feature = "sync") && crate::sync_gate::mode_allowed(RelayMode::RemoteTls)
-}
-
-/// 本构建是否提供 `local_dev` 选项。
+/// 本构建是否提供 `local_dev` 模式。
 ///
 /// **产品 `sync-ui` 构建恒为 `false`**（只有 `dev-sync` 打开 `mode_allowed(LocalDev)`）。
-/// UI 用它在模式选择器里禁用 local_dev，并在表单默认值上直接选 remote_tls；真正的
-/// 拒绝仍在 [`crate::sync_gate::parse_for_build`]（单一权威，不在 UI 复制策略）。
+/// UI 用它在设置/Join 里决定是否提示 loopback 约束；真正的拒绝仍在
+/// [`crate::sync_gate::parse_for_build`]（单一权威，不在 UI 复制策略）。
 #[must_use]
 pub(crate) const fn local_option_available() -> bool {
     cfg!(feature = "sync") && crate::sync_gate::mode_allowed(RelayMode::LocalDev)
+}
+
+/// 从 relay 输入文本**推断**模式（UI 不再提供手动选择）。
+///
+/// 规则只做 scheme 分流，**不复制 URL 校验**：
+///
+/// - `https://…`（scheme 大小写不敏感）→ [`RelayMode::RemoteTls`]；
+/// - `http://…` → [`RelayMode::LocalDev`]（产品构建随后被
+///   [`crate::sync_gate::parse_for_build`] 的构建期能力拒绝）；
+/// - 其它 scheme / 缺 scheme / 空值 → 先按 `remote_tls`，由权威 parser 给出明确
+///   错误（"只接受 https://" / "缺少 scheme" / "不能为空"）。
+#[must_use]
+pub(crate) fn infer_relay_mode(raw: &str) -> RelayMode {
+    match raw.trim().split_once("://") {
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("http") => RelayMode::LocalDev,
+        _ => RelayMode::RemoteTls,
+    }
 }
 
 /// 校验设置面板里的 relay 编辑值；成功返回**canonical origin**。
@@ -206,7 +216,7 @@ mod tests {
     #[cfg(not(feature = "dev-sync"))]
     #[test]
     fn product_build_rejects_local_dev_mode() {
-        assert!(!local_option_available(), "产品构建不得开放 local_dev 选项");
+        assert!(!local_option_available(), "产品构建不得开放 local_dev 模式");
         for raw in [
             "http://127.0.0.1:18080",
             "http://localhost:18080",
@@ -221,15 +231,46 @@ mod tests {
         }
     }
 
+    /// 产品构建里，**从输入框推断出**的 `local_dev` 也必须被保存路径拒绝。
+    #[cfg(not(feature = "dev-sync"))]
+    #[test]
+    fn product_build_rejects_inferred_local_dev_relay() {
+        let mode = infer_relay_mode("http://127.0.0.1:18080");
+        assert_eq!(mode, RelayMode::LocalDev);
+        let error = validate_relay_edit("http://127.0.0.1:18080", mode)
+            .expect_err("产品构建保存/提交必须拒绝 http loopback");
+        assert!(
+            error.contains("不开放 relay 模式") && error.contains("local_dev"),
+            "{error}"
+        );
+    }
+
+    /// 模式只按 scheme 推断；不做 URL 校验（最终仍由权威 parser 报错）。
+    #[test]
+    fn mode_is_inferred_from_scheme_only() {
+        for (raw, expected) in [
+            ("https://relay.example", RelayMode::RemoteTls),
+            (" HTTPS://Relay.Example:8443/ ", RelayMode::RemoteTls),
+            ("http://127.0.0.1:18080", RelayMode::LocalDev),
+            (" HTTP://localhost:18080 ", RelayMode::LocalDev),
+            ("http://[::1]:18080", RelayMode::LocalDev),
+            // 其它 scheme / 缺 scheme / 空值先按 remote_tls，由 parser 给出明确错误。
+            ("ftp://relay.example", RelayMode::RemoteTls),
+            ("relay.example", RelayMode::RemoteTls),
+            ("", RelayMode::RemoteTls),
+        ] {
+            assert_eq!(infer_relay_mode(raw), expected, "{raw:?}");
+        }
+    }
+
     #[test]
     fn mode_capabilities_are_compile_time_facts() {
         // 所有含 sync 能力的构建都允许 remote_tls；local_dev 只在 dev-sync 构建允许。
-        assert!(remote_option_available());
         assert!(crate::sync_gate::mode_allowed(RelayMode::RemoteTls));
         assert_eq!(
             local_option_available(),
             crate::sync_gate::mode_allowed(RelayMode::LocalDev),
-            "UI 选项与构建期能力必须同源"
+            "UI 提示与构建期能力必须同源"
         );
         #[cfg(feature = "dev-sync")]
         assert!(local_option_available(), "dev-sync 构建开放 local_dev");

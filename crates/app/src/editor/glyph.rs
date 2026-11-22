@@ -10,6 +10,7 @@ use std::ops::Range;
 use gpui::{px, FontStyle, FontWeight, ShapedLine, SharedString, TextRun, Window};
 use menghunote_editor::StyleKind;
 
+use super::code_highlight::CodeHighlightClass;
 use super::theme;
 
 /// 用编辑器统一字体 shaping 一行文本。
@@ -163,6 +164,111 @@ pub fn text_runs_with_color(spans: &[(usize, StyleKind)], plain_color: gpui::Rgb
         .collect()
 }
 
+/// 把样式段变成 runs；空段时生成一个覆盖全文的 Plain run。
+///
+/// 这是 preedit 可见性的最小保证：GPUI 0.10 的 `shape_line` 对空 runs 不兜底，
+/// 直接传 `&[]` 会得到零字形（标题输入框自己构造了 run，所以正常）。
+fn text_runs_for_line(
+    spans: &[(usize, StyleKind)],
+    text_len: usize,
+    plain_color: gpui::Rgba,
+) -> Vec<TextRun> {
+    if spans.is_empty() && text_len > 0 {
+        text_runs_with_color(&[(text_len, StyleKind::Plain)], plain_color)
+    } else {
+        text_runs_with_color(spans, plain_color)
+    }
+}
+
+/// 用**代码块语法高亮** spans shaping 一行代码（只改颜色，不改布局/编辑）。
+///
+/// `syntax_spans` 是**相对 `text`** 的字节区间（调用方已把 display 坐标裁剪到本
+/// 视觉行）。未命中的区间用正文色（`theme::text_color()`），字体由 `mono` 决定
+/// （代码行恒为等宽）；`TextRun` 的字体/字号与普通行 shaping 完全一致，所以行宽、
+/// caret 位置、命中几何都不变。
+#[must_use]
+pub fn shape_row_code(
+    window: &Window,
+    text: &str,
+    syntax_spans: &[(Range<usize>, CodeHighlightClass)],
+    font_size: f32,
+    mono: bool,
+) -> ShapedLine {
+    let shared = SharedString::from(text);
+    let runs = if shared.is_empty() {
+        Vec::new()
+    } else {
+        code_text_runs(text, syntax_spans, mono)
+    };
+    window
+        .text_system()
+        .shape_line(shared, px(font_size), &runs, None)
+}
+
+/// 代码高亮 spans → 覆盖全文的 `TextRun`（空洞补正文色）。
+///
+/// 防御性裁剪：spans 越界、重叠、切在 UTF-8 中间都被修正或丢弃；任何情况下
+/// runs 的 `len` 之和都等于 `text.len()`，否则 GPUI 的 shaping 会丢字/错位。
+fn code_text_runs(
+    text: &str,
+    syntax_spans: &[(Range<usize>, CodeHighlightClass)],
+    mono: bool,
+) -> Vec<TextRun> {
+    let font = if mono {
+        theme::code_block_font()
+    } else {
+        theme::font()
+    };
+    let plain_color = theme::text_color().into();
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut cursor = 0usize;
+    let push = |runs: &mut Vec<TextRun>, len: usize, color: gpui::Hsla| {
+        if len == 0 {
+            return;
+        }
+        // 相邻同色合并，避免一行几十个等价 run。
+        if let Some(last) = runs.last_mut() {
+            if last.color == color {
+                last.len += len;
+                return;
+            }
+        }
+        runs.push(TextRun {
+            len,
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    };
+    for (range, class) in syntax_spans {
+        let mut start = range.start.max(cursor).min(text.len());
+        let mut end = range.end.min(text.len());
+        while start < end && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= start {
+            continue;
+        }
+        if cursor < start {
+            push(&mut runs, start - cursor, plain_color);
+        }
+        push(&mut runs, end - start, theme::syntax_color(*class).into());
+        cursor = end;
+    }
+    if cursor < text.len() {
+        push(&mut runs, text.len() - cursor, plain_color);
+    }
+    if runs.is_empty() && !text.is_empty() {
+        push(&mut runs, text.len(), plain_color);
+    }
+    runs
+}
+
 /// 用**带样式**的 runs shaping 一行文本。
 ///
 /// 绘制与命中必须共用它：粗体会让字变宽，如果命中用无样式 shaping，点击就会偏。
@@ -197,7 +303,9 @@ pub fn shape_row_styled_at_with_color(
     let runs = if shared.is_empty() {
         Vec::new()
     } else {
-        let mut runs = text_runs_with_color(spans, plain_color);
+        // **必须有覆盖全文的 run**：GPUI 0.10 的 shape_line 在 runs 为空时不会给
+        // 纯文本兜底，绘制结果是零字形。IME preedit / 占位文案都曾因此“只剩候选窗”。
+        let mut runs = text_runs_for_line(spans, text.len(), plain_color);
         if mono {
             let font = theme::code_block_font();
             for run in &mut runs {
@@ -344,5 +452,82 @@ mod tests {
         // 粗体真的改字重；代码有底色
         assert_ne!(runs[1].font.weight, runs[0].font.weight);
         assert!(runs[2].background_color.is_some());
+    }
+}
+
+#[cfg(test)]
+mod code_run_tests {
+    use super::code_text_runs;
+    use crate::editor::code_highlight::CodeHighlightClass;
+
+    #[test]
+    fn code_runs_cover_the_whole_line_and_use_token_colors() {
+        let text = "fn main() {";
+        let spans = vec![
+            (0..2, CodeHighlightClass::Keyword),
+            (3..7, CodeHighlightClass::Function),
+            (10..11, CodeHighlightClass::Punctuation),
+        ];
+        let runs = code_text_runs(text, &spans, true);
+        assert_eq!(
+            runs.iter().map(|run| run.len).sum::<usize>(),
+            text.len(),
+            "runs 必须完整覆盖一行（shaping 不允许丢字节）"
+        );
+        let plain = crate::editor::theme::text_color().into();
+        let keyword = crate::editor::theme::syntax_color(CodeHighlightClass::Keyword).into();
+        let function = crate::editor::theme::syntax_color(CodeHighlightClass::Function).into();
+        assert_eq!(runs[0].len, 2);
+        assert_eq!(runs[0].color, keyword, "关键字 run 用关键字 token 色");
+        assert_ne!(runs[0].color, plain);
+        // `main` 前面有一个空格空洞 → 正文色 run；随后才是函数色。
+        assert_eq!(runs[1].len, 1);
+        assert_eq!(runs[1].color, plain);
+        assert_eq!(runs[2].len, 4);
+        assert_eq!(runs[2].color, function);
+        assert_ne!(keyword, function);
+    }
+
+    #[test]
+    fn code_runs_clip_invalid_utf8_boundaries_instead_of_panicking() {
+        let text = "中文代码";
+        // 1 不是 char 边界（中 占 0..3）；必须吸附到 3，不能切坏字符。
+        let spans = vec![(1..6, CodeHighlightClass::String)];
+        let runs = code_text_runs(text, &spans, true);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+        assert_eq!(runs.len(), 3, "非法区间只能覆盖它真正覆盖到的完整字符");
+        assert_eq!(runs[0].len, 3, "非法起点吸附到 3（`中` 用正文色）");
+        assert_eq!(runs[1].len, 3, "`文` 用字符串色");
+        assert_eq!(runs[2].len, 6, "尾部 `代码` 仍是正文色");
+    }
+
+    #[test]
+    fn code_runs_ignore_out_of_range_and_empty_spans() {
+        let text = "abc";
+        let spans = vec![
+            (2..2, CodeHighlightClass::Keyword),
+            (9..12, CodeHighlightClass::String),
+        ];
+        let runs = code_text_runs(text, &spans, true);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, 3);
+    }
+}
+
+#[cfg(test)]
+mod default_run_tests {
+    use super::*;
+
+    #[test]
+    fn empty_spans_get_one_plain_run_covering_the_text() {
+        let text = "组合";
+        let runs = text_runs_for_line(&[], text.len(), theme::text_color());
+        assert_eq!(
+            runs.len(),
+            1,
+            "空 spans 必须兜底一个 run，否则 preedit 零字形"
+        );
+        assert_eq!(runs[0].len, text.len());
+        assert_eq!(runs[0].color, theme::text_color().into());
     }
 }

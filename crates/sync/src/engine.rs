@@ -38,8 +38,9 @@ use menghunote_storage::{
     list_referenced_assets, load_body_doc, load_head, mark_acked, mark_integrated, mark_sent,
     mark_skipped_event_received, outbox_parts, outbox_rows, pending_encryption, repack_required,
     set_confirmed_highwater, set_sync_log_id, store_encrypted_parts, store_inbox_verified,
-    sync_cursor_state, take_inbox_ready, SyncContext, SyncEncryptedPart, SyncInboxRow,
-    SyncOutboxState, UpdateRecord, Vault, STRUCTURE_DOC_ID,
+    store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, SyncContext,
+    SyncEncryptedPart, SyncInboxRow, SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow,
+    STRUCTURE_DOC_ID,
 };
 use menghunote_sync_proto::{
     cap_plain, expected_part_plain_len, object_commit_signing_input, object_digest_input,
@@ -47,6 +48,7 @@ use menghunote_sync_proto::{
     MAX_ASSET_MIME_BYTES, MAX_ASSET_RAW_BYTES,
 };
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 
 /// `meta` 键：本设备持久化的 relay 游标（bootstrap 或上一次 pull 写入）。
 pub const RELAY_CURSOR_META: &str = "sync.relay_cursor";
@@ -87,6 +89,8 @@ pub const INTEGRATE_BATCH_BYTES: usize = 1024 * 1024;
 pub const INTEGRATE_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(50);
 /// 一次 integrate 最多跑多少批（防止病态库把持闸窗口拖到不可控）。
 pub const INTEGRATE_MAX_BATCHES: usize = 32;
+/// `pull` 批量写 inbox 的单批明文上限（只防一页大 update 在内存里堆太多；不改变语义）。
+const PULL_INBOX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: u16 = 196;
 const PROTOCOL_VERSION: u16 = 1;
@@ -101,6 +105,15 @@ pub struct EngineConfig {
     pub page_limit: u32,
     /// 每次 integrate 最多处理的行数。
     pub integrate_limit: usize,
+    /// Phase 0 实验开关：`pull` 是否把一页的 verified 行用**一个事务**批量写入 inbox。
+    ///
+    /// 默认 `false` = 生产语义（每条事件一个事务；页内前面的行在后续事件失败时已经
+    /// durable）。打开后**结果等价**（重复字节幂等、冲突 fail-closed、游标只在整页
+    /// 验收成功后推进），只是 durability 粒度从"条"变成"页"：后续事件失败时本页已
+    /// 验签的行还没有落库，重试会重新下载/验签（幂等，不丢数据）。
+    ///
+    /// 本字段只用于 Phase 0 实测"批量事务能否低成本提速"，Phase 1 才决定是否默认开启。
+    pub inbox_batch: bool,
 }
 
 impl Default for EngineConfig {
@@ -109,6 +122,7 @@ impl Default for EngineConfig {
             send_batch: 256,
             page_limit: 256,
             integrate_limit: 256,
+            inbox_batch: false,
         }
     }
 }
@@ -200,6 +214,9 @@ enum AssetUploadOutcome {
 }
 
 /// 拉取报告。
+///
+/// 除事件计数外还带**只读性能指标**（Phase 0：先量清楚瓶颈，再决定要不要批量/快照）。
+/// 所有字节/耗时字段都不含路径、密钥或明文内容，可以直接打日志。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PullReport {
     /// 本页事件数。
@@ -210,6 +227,26 @@ pub struct PullReport {
     pub skipped: usize,
     /// 新游标（已持久化）。
     pub next_cursor: String,
+    /// 本次成功验收的 UPDATE **明文负载**字节合计。
+    ///
+    /// 口径：`UpdateV1` 载荷的明文长度之和（= durable 写进 `sync_inbox.verified_payload`、
+    /// 后续 integrate 要 import 的字节）。**不含**每片 196B 信封头与 16B AEAD tag，
+    /// 因此它是网络拉取字节的下界；要估算 wire 体积需再加"分片数 × 212B"。
+    pub update_bytes: u64,
+    /// 本次 pull 实际下载 + 验证 + 落本地内容寻址表的 ASSET **明文字节**合计。
+    ///
+    /// 含幂等重放时对已消费 ASSET 的重新下载/校验（那是真实发生的网络与磁盘成本）。
+    pub asset_bytes: u64,
+    /// 本次 pull 的墙钟耗时（`Duration::as_millis` 截断成 `u64`；<1ms 记 0）。
+    pub elapsed_ms: u64,
+    /// 本次 pull 请求/消费的日志页数。
+    ///
+    /// 当前实现每次调用只拉一页，成功返回的报告恒为 `1`（空页也算 1）；字段保留给
+    /// Phase 1 的多页/快照路径复用。
+    pub pages: usize,
+    /// 本页 verified 行是否用**一个事务**批量写入 inbox
+    /// （[`EngineConfig::inbox_batch`]；默认逐条写 = `false`）。
+    pub inbox_batch: bool,
 }
 
 /// 集成（Integrate）阶段的批次预算与上限（ADR 0012 S2b）。
@@ -282,6 +319,10 @@ pub struct IntegrateReport {
     pub batches: usize,
     /// 结构 head 真的前进了、并且**只做投影**重建了 body 行 / notes 视图。
     pub projected: bool,
+    /// 整个 integrate 阶段的墙钟耗时（`Duration::as_millis` 截断成 `u64`）。
+    ///
+    /// 包含结构阶段、只投影、正文轮转与 `deferred` 计数；不含网络（pull 已单独计时）。
+    pub elapsed_ms: u64,
 }
 
 /// 依赖有序集成的完整结果（`changed_heads` 供 UI 判断要不要交付/刷新）。
@@ -1225,7 +1266,12 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
     }
 
     /// 阶段 3：拉取一页日志并验收。
+    ///
+    /// 除游标/计数外还会填写 [`PullReport`] 的只读指标（事件/明文字节/资产字节/耗时/
+    /// 页数/是否批量），并在成功返回前打一行脱敏 `eprintln!`（事件、字节、耗时，不含
+    /// 路径/密钥/明文）。
     pub fn pull(&mut self) -> Result<PullReport, SyncError> {
+        let started = Instant::now();
         let state = self.client.state()?;
         if state.vault_id != self.vault_id {
             return Err(SyncError::RelayWire("state.vault_id 与本地不一致"));
@@ -1258,23 +1304,56 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         }
         let mut report = PullReport {
             events: page.events.len(),
+            pages: 1,
             ..PullReport::default()
         };
+        // Phase 0 实验：`inbox_batch` 打开时把整页 verified 行攒起来，用一个事务写入
+        // （见 `EngineConfig::inbox_batch`）。默认关，仍然逐条 `store_inbox_verified`。
+        let mut buffered: Vec<VerifiedInboxRow> = Vec::new();
+        let mut buffered_bytes = 0usize;
         for event in &page.events {
             if event.relay_seq <= local.received_seq {
                 // ASSET 已推进 received 前缀后仍要核对 durable skipped 记录：relay 把
                 // 同一 seq 重写成另一条资产时必须 Paused(RelayHistoryRewritten)，不能
                 // 因为"水位已覆盖"就静默跳过（记录本身还绑定完整 commit 字节）。
                 if event.kind == RelayLogKind::Asset {
-                    self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                    let bytes =
+                        self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                    report.asset_bytes = report.asset_bytes.saturating_add(bytes);
                 }
                 report.skipped += 1;
                 continue;
             }
             match event.kind {
                 RelayLogKind::Update => {
-                    self.ingest_update(&state.log_id, event)?;
-                    report.stored += 1;
+                    let row = self.verify_update_event(&state.log_id, event)?;
+                    // 指标口径：成功验收的 Update **明文负载**字节（见 PullReport 注释）。
+                    report.update_bytes = report.update_bytes.saturating_add(
+                        u64::try_from(row.verified_payload.len()).unwrap_or(u64::MAX),
+                    );
+                    if self.config.inbox_batch {
+                        buffered_bytes = buffered_bytes.saturating_add(row.verified_payload.len());
+                        buffered.push(row);
+                        if buffered_bytes >= PULL_INBOX_BATCH_BYTES {
+                            // 返回的"新插入行数"只用于区分幂等命中；`stored` 口径是
+                            // "成功验收并 durable"，与逐条路径一致（重放行也算已 durable）。
+                            store_inbox_verified_batch(self.vault, &buffered)?;
+                            report.stored += buffered.len();
+                            report.inbox_batch = true;
+                            buffered.clear();
+                            buffered_bytes = 0;
+                        }
+                    } else {
+                        store_inbox_verified(
+                            self.vault,
+                            &row.log_id,
+                            row.relay_seq,
+                            &row.object_id,
+                            row.epoch,
+                            &row.verified_payload,
+                        )?;
+                        report.stored += 1;
+                    }
                 }
                 // 资产事件不是文档水位事件：其密文本体已由 checkpoint refs 恢复，
                 // 新设备从 S 补齐日志时直接跳过，不阻塞后续 update。
@@ -1286,7 +1365,9 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
                 // （见 `persist_skipped_asset`）；记录写入失败时整个 pull 返回错误，
                 // 游标不前进。
                 RelayLogKind::Asset => {
-                    self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                    let bytes =
+                        self.persist_skipped_asset(&state.log_id, event, &page.next_cursor)?;
+                    report.asset_bytes = report.asset_bytes.saturating_add(bytes);
                     // ASSET 不写 inbox，但必须在 durable 消费后推进 received 连续前缀，
                     // 否则同一页里"ASSET 在前、UPDATE 在后"会让后续 UPDATE 永远不 ready。
                     mark_skipped_event_received(self.vault, &state.log_id, event.relay_seq)?;
@@ -1297,12 +1378,33 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
                 _ => return Err(SyncError::Paused(PauseReason::UnsupportedEvent)),
             }
         }
+        // 整页验收成功后才把批量行落库（默认逐条路径这里无事可做）。
+        if !buffered.is_empty() {
+            store_inbox_verified_batch(self.vault, &buffered)?;
+            report.stored += buffered.len();
+            report.inbox_batch = true;
+            buffered.clear();
+        }
         // 只有全部事件验收成功才推进游标（失败已在上面返回）。
         self.write_cursor(&page.next_cursor)?;
         report.next_cursor = page.next_cursor.clone();
         if page.query_head > local.confirmed_highwater.unwrap_or(0) {
             set_confirmed_highwater(self.vault, page.query_head)?;
         }
+        report.elapsed_ms = elapsed_millis(started);
+        // 脱敏日志：只有数量/字节/耗时，不含路径、密钥或明文（Phase 0 观测用）。
+        eprintln!(
+            "[sync] pull events={} stored={} skipped={} update_bytes={} asset_bytes={} \
+             pages={} inbox_batch={} elapsed_ms={}",
+            report.events,
+            report.stored,
+            report.skipped,
+            report.update_bytes,
+            report.asset_bytes,
+            report.pages,
+            report.inbox_batch,
+            report.elapsed_ms
+        );
         Ok(report)
     }
 
@@ -1332,6 +1434,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         &mut self,
         config: IntegrateConfig,
     ) -> Result<IntegrateOutcome, SyncError> {
+        let started = Instant::now();
         // 结构行是 vault 的长期不变量；但 engine 的单元测试会用"没有结构文档"的裸库，
         // 因此这里把它当**可选**前置：没有结构行 → 不投影（结构 update 会按未知文档
         // deferred，和旧行为一致）。
@@ -1397,6 +1500,19 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         // 剩余 verified 行：依赖未就绪或被本次批数上限留下，都不是丢失。
         let remaining = count_inbox_ready(self.vault)?;
         outcome.report.deferred = usize::try_from(remaining).unwrap_or(usize::MAX);
+        outcome.report.elapsed_ms = elapsed_millis(started);
+        // 脱敏日志：只有计数/耗时（Phase 0 观测用）。
+        eprintln!(
+            "[sync] integrate integrated={} structure={} body={} deferred={} batches={} \
+             projected={} elapsed_ms={}",
+            outcome.report.integrated,
+            outcome.report.structure_integrated,
+            outcome.report.body_integrated,
+            outcome.report.deferred,
+            outcome.report.batches,
+            outcome.report.projected,
+            outcome.report.elapsed_ms
+        );
         Ok(outcome)
     }
 
@@ -1690,7 +1806,15 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         Ok(parts)
     }
 
-    fn ingest_update(&mut self, log_id: &[u8; 16], event: &RelayLogEvent) -> Result<(), SyncError> {
+    /// 只做**验收**（验签/摘要/解密/载荷校验），不写库；返回可批量写入的 inbox 行。
+    ///
+    /// 拆出这一步是为了让 `pull` 能在 `EngineConfig::inbox_batch` 打开时把整页行用
+    /// 一个事务写入（指标/实验路径）；默认路径仍是"验收一条、立刻 durable 一条"。
+    fn verify_update_event(
+        &mut self,
+        log_id: &[u8; 16],
+        event: &RelayLogEvent,
+    ) -> Result<VerifiedInboxRow, SyncError> {
         let object_id = event
             .object_id
             .ok_or(SyncError::Object("update 事件缺少 object_id"))?;
@@ -1804,16 +1928,13 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         }
         envelopes[0].header.validate_update_payload(&update)?;
 
-        // durable 写入（依赖未齐也保存）；received 前缀在事务内推进。
-        store_inbox_verified(
-            self.vault,
-            log_id,
-            event.relay_seq,
-            &object_id,
-            event.epoch,
-            &plaintext,
-        )?;
-        Ok(())
+        Ok(VerifiedInboxRow {
+            log_id: *log_id,
+            relay_seq: event.relay_seq,
+            object_id,
+            epoch: event.epoch,
+            verified_payload: plaintext,
+        })
     }
 
     /// 从 relay 完整读回并验证一个 ASSET 对象（评审 0003 P0-B：ASSET 来源认证）。
@@ -1887,12 +2008,15 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
     /// 结构校验（不验签，因为 ASSET 信封的 producer 被规范化为 0，事件里拿不到
     /// 生产者公钥）：事件必须是可解码的 `ObjectCommit`，类型 ASSET、object_id /
     /// vault / epoch 与日志事件一致、generation=0、sender_seq=0。
+    ///
+    /// 返回值为本次**实际下载并验证通过的资产明文字节**（`PullReport::asset_bytes` 口径；
+    /// 幂等重放也会真实下载一次，因此同样计入）。
     fn persist_skipped_asset(
         &mut self,
         log_id: &[u8; 16],
         event: &RelayLogEvent,
         cursor: &str,
-    ) -> Result<(), SyncError> {
+    ) -> Result<u64, SyncError> {
         let object_id = event
             .object_id
             .ok_or(SyncError::Object("ASSET 日志事件缺少 object_id"))?;
@@ -1923,6 +2047,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         // 评审 0003 P0-B 残余：HMAC 只能证明本机记录过 relay 的声明；写记录之前必须
         // 真正取回并验证资产。失败直接 `?`，不写记录、不写 inbox、不推游标。
         let (verified, data) = self.download_verified_asset(&object_id, &commit)?;
+        let asset_bytes = verified.byte_len;
         // 资产字节落本地（内容寻址、幂等）：只有这一步成功，别的设备同步后
         // `asset_bytes` 才真的取得到；记录只表示"本机消费了这条 ASSET"。
         self.store_verified_asset(&verified, &data)?;
@@ -1964,7 +2089,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
             ],
         )?;
         if inserted == 1 {
-            return Ok(());
+            return Ok(asset_bytes);
         }
         let existing = self
             .vault
@@ -1988,7 +2113,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         {
             return Err(SyncError::Paused(PauseReason::RelayHistoryRewritten));
         }
-        Ok(())
+        Ok(asset_bytes)
     }
 
     fn read_cursor(&self) -> Result<Option<String>, SyncError> {
@@ -2005,6 +2130,11 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
         self.vault.set_meta(RELAY_CURSOR_META, cursor.as_bytes())?;
         Ok(())
     }
+}
+
+/// `Instant::elapsed` 的毫秒截断（`Duration` 转 `u64`，超出范围饱和到 `u64::MAX`）。
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// 一条待集成的 inbox 行 + 取出后缓存的 doc id / 负载大小（供公平取批复用）。

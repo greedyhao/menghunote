@@ -316,6 +316,24 @@ pub struct SyncInboxRow {
     pub verified_payload: Option<Vec<u8>>,
 }
 
+/// 批量写入的一行**已验签 / 已解密**入站事实（[`store_inbox_verified_batch`] 的输入）。
+///
+/// 字段与 [`store_inbox_verified`] 的参数一一对应；依赖是否齐仍由 sync 层判断，
+/// storage 只负责 durable 落行与推进 `received` 连续前缀。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedInboxRow {
+    /// relay 日志 incarnation（同一批必须一致）。
+    pub log_id: [u8; 16],
+    /// relay 日志序号（必须 > 0；同一批内不得重复）。
+    pub relay_seq: u64,
+    /// 密文对象名（32B）。
+    pub object_id: [u8; 32],
+    /// 加密 epoch（必须 > 0）。
+    pub epoch: u64,
+    /// 已解密并完成载荷校验的 `UpdateV1` 明文（写入 `sync_inbox.verified_payload`）。
+    pub verified_payload: Vec<u8>,
+}
+
 /// 本地同步水位（`meta` 约定）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncCursorState {
@@ -1024,6 +1042,125 @@ pub fn store_inbox_verified(
     Ok(())
 }
 
+/// 入站批量入口：**一个事务**写入多行已验签/已解密对象（Phase 0 压测用，生产 pull 默认仍
+/// 走逐条 [`store_inbox_verified`]）。
+///
+/// 语义与逐条入口**完全一致**：
+///
+/// - 已存在同 `(log_id, relay_seq)` 行、且 `object_id/epoch/verified_payload` 完全相同 →
+///   幂等跳过（不重写、不报错）；
+/// - 已存在同行但字节不同 → [`StorageError::SyncConflict`]，**整批一行都不写**（先读后写，
+///   冲突在任何写入之前暴露，不存在半写）；
+/// - 新行全部在**同一个** `exec_transaction` 里插入，每行都要求恰好影响 1 行（守卫不满足
+///   即整笔回滚）；
+/// - 事务提交后一次性推进 `received` 连续前缀（语义同逐条推进：只覆盖已消费的连续序号）。
+///
+/// 输入先按 `relay_seq` 升序**稳定排序**（不要求调用方预排序；允许序号不连续，例如一页里
+/// 混有已消费的 ASSET 序号）；同一批里出现重复 `relay_seq` 直接拒绝——一条日志不可能有
+/// 两个同序号事件，静默去重会掩盖上游错误。
+///
+/// 返回**本次新插入**的行数（幂等跳过的行不计）。
+pub fn store_inbox_verified_batch(
+    vault: &Vault,
+    rows: &[VerifiedInboxRow],
+) -> Result<usize, StorageError> {
+    let Some(first) = rows.first() else {
+        return Ok(0);
+    };
+    let log_id = first.log_id;
+    for row in rows {
+        if row.relay_seq == 0 || row.epoch == 0 {
+            return Err(StorageError::Corrupt {
+                context: "inbox relay_seq/epoch 必须 >0".to_owned(),
+            });
+        }
+        if row.log_id != log_id {
+            return Err(StorageError::Corrupt {
+                context: "批量 inbox 行必须属于同一 log_id".to_owned(),
+            });
+        }
+    }
+    let mut sorted: Vec<&VerifiedInboxRow> = rows.iter().collect();
+    sorted.sort_by_key(|row| row.relay_seq);
+    if sorted
+        .windows(2)
+        .any(|pair| pair[0].relay_seq == pair[1].relay_seq)
+    {
+        return Err(StorageError::Corrupt {
+            context: "批量 inbox 出现重复 relay_seq".to_owned(),
+        });
+    }
+    ensure_log_id(vault, &log_id)?;
+
+    // 1) 先读既有行（一次范围查询）。任何字节冲突都在写入之前返回 → 整批不写。
+    let first_seq = sorted.first().map_or(0, |row| row.relay_seq);
+    let last_seq = sorted.last().map_or(0, |row| row.relay_seq);
+    let existing_rows = vault.query(
+        "SELECT relay_seq,object_id,epoch,verified_payload FROM sync_inbox \
+         WHERE log_id=?1 AND relay_seq>=?2 AND relay_seq<=?3",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(first_seq)?),
+            Value::Integer(i64_of(last_seq)?),
+        ],
+    )?;
+    let mut existing: BTreeMap<u64, ([u8; 32], u64, Vec<u8>)> = BTreeMap::new();
+    for row in &existing_rows {
+        existing.insert(
+            u64_of(row, 0, "sync_inbox.relay_seq")?,
+            (
+                array32(row, 1, "sync_inbox.object_id")?,
+                u64_of(row, 2, "sync_inbox.epoch")?,
+                row.get(3).and_then(blob_value).unwrap_or_default(),
+            ),
+        );
+    }
+    let mut fresh: Vec<&VerifiedInboxRow> = Vec::with_capacity(sorted.len());
+    for row in &sorted {
+        match existing.get(&row.relay_seq) {
+            Some((object_id, epoch, payload)) => {
+                if *object_id != row.object_id
+                    || *epoch != row.epoch
+                    || *payload != row.verified_payload
+                {
+                    return Err(StorageError::SyncConflict {
+                        context: format!("inbox {log_id:?}/{} 字节不一致", row.relay_seq),
+                    });
+                }
+            }
+            None => fresh.push(row),
+        }
+    }
+    if fresh.is_empty() {
+        // 全部幂等命中：与逐条入口一致，仍要把前缀推进到最新（可能上次写完前缀前崩溃）。
+        advance_received_prefix(vault)?;
+        return Ok(0);
+    }
+
+    // 2) 单事务插入所有新行；每条语句由守卫要求恰好 1 行。
+    let mut statements = Vec::with_capacity(fresh.len());
+    let mut guards = Vec::with_capacity(fresh.len());
+    for (index, row) in fresh.iter().enumerate() {
+        statements.push(Statement::new(
+            "INSERT INTO sync_inbox(log_id,relay_seq,object_id,epoch,state,verified_payload) \
+             VALUES(?1,?2,?3,?4,'verified',?5)",
+            vec![
+                Value::Blob(log_id.to_vec()),
+                Value::Integer(i64_of(row.relay_seq)?),
+                Value::Blob(row.object_id.to_vec()),
+                Value::Integer(i64_of(row.epoch)?),
+                Value::Blob(row.verified_payload.clone()),
+            ],
+        ));
+        guards.push(AffectedGuard::exactly(index, 1));
+    }
+    vault.exec_transaction(&statements, &guards)?;
+
+    // 3) 事务后一次性推进连续前缀（与逐条入口同语义；失败时行已 durable，下次重算）。
+    advance_received_prefix(vault)?;
+    Ok(fresh.len())
+}
+
 /// 读当前已验证、且落在 durable 连续接收前缀内的 inbox 行。
 ///
 /// 依赖完整性由 sync 层判断（本 crate 不解析 Loro VV）；这里的 "ready"
@@ -1197,31 +1334,136 @@ fn ensure_log_id(vault: &Vault, log_id: &[u8; 16]) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// 一次前缀扫描的 inbox 窗口大小（正常一页 256 条；4096 已远超单页，只作上限保护）。
+const PREFIX_SCAN_LIMIT: usize = 4096;
+
 fn advance_received_prefix(vault: &Vault) -> Result<(), StorageError> {
+    advance_consumed_prefix(
+        vault,
+        META_SYNC_RECEIVED_SEQ,
+        "state IN('verified','integrated')",
+    )
+}
+
+/// 把连续前缀推进到最大已消费序号（**一次**写最终值）。
+///
+/// 语义与"从 `current+1` 起逐条检查、遇到第一个缺口停下"逐字等价；差别只在写盘次数：
+/// 旧实现对每个前进的序号各写一次 `meta`（每次 `write_meta` 都是独立事务，WAL +
+/// `synchronous=FULL` 下就是一次 fsync）。追赶一页 256 条时那是 256 次提交，而提交次数
+/// 正是 Phase 0 量出来的主要瓶颈。
+///
+/// 现在的做法：先用两次读（inbox 升序窗口 + 同 log 的 `skipped_received` 键范围扫描）
+/// 在内存里走到第一个缺口，再**一次**写入最终值。崩溃语义没有变差：inbox 行与 skipped
+/// 标记都先 durable；前缀少推进只会让下一次调用重算（扫描幂等），绝不会把未消费的事件
+/// 算成已消费。
+fn advance_consumed_prefix(
+    vault: &Vault,
+    meta_key: &str,
+    inbox_condition: &str,
+) -> Result<(), StorageError> {
     let Some(log_id) = read_meta(vault, META_SYNC_LOG_ID)? else {
         return Ok(());
     };
-    let mut current = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
+    let log_id = array16_bytes(log_id, "sync.log_id")?;
+    let mut current = read_meta_u64(vault, meta_key)?.unwrap_or(0);
     loop {
-        let next = current
+        // 与旧实现同口径：前缀已经是 u64::MAX 时无法再前进（保留溢出错误）。
+        current
             .checked_add(1)
             .ok_or_else(|| StorageError::Corrupt {
-                context: "received_seq 溢出".to_owned(),
+                context: format!("{meta_key} 溢出"),
             })?;
-        let rows = vault.query(
-            "SELECT state FROM sync_inbox WHERE log_id=?1 AND relay_seq=?2 \
-             AND state IN('verified','integrated')",
-            &[Value::Blob(log_id.clone()), Value::Integer(i64_of(next)?)],
-        )?;
-        let consumed_without_inbox =
-            read_meta(vault, &skipped_received_key(&log_id, next)?)?.is_some();
-        if rows.is_empty() && !consumed_without_inbox {
-            break;
+        let (seqs, truncated) = scan_consumed_after(vault, &log_id, current, inbox_condition)?;
+        let Some(&last) = seqs.last() else {
+            return Ok(());
+        };
+        // 在内存里从 current+1 走到第一个缺口（seqs 已升序去重）。
+        let mut next = current;
+        for seq in seqs {
+            if Some(seq) == next.checked_add(1) {
+                next = seq;
+            } else {
+                break;
+            }
+        }
+        if next == current {
+            return Ok(());
         }
         current = next;
-        write_meta(vault, META_SYNC_RECEIVED_SEQ, &current.to_be_bytes())?;
+        write_meta(vault, meta_key, &current.to_be_bytes())?;
+        // 窗口没被截断 → 已看到 current 之后的全部 inbox 行，缺口是真的；
+        // 被截断但停在窗口内更大序号之前 → 缺口也是真的。两种情况都不必再扫。
+        if !truncated || current < last {
+            return Ok(());
+        }
+        // 否则：窗口被 LIMIT 截断且刚好走到窗口末尾，继续下一窗口。
     }
-    Ok(())
+}
+
+/// 扫出 `current` 之后**已消费**的序号（升序去重），以及 inbox 窗口是否被截断。
+///
+/// "已消费"= inbox 行满足 `inbox_condition`（received 用 `verified|integrated`，
+/// integrated 只用 `integrated`）**或**存在 `sync.skipped_received` 标记（ASSET 这类不写
+/// inbox 的事件）。`skipped_received` 键是固定宽度的
+/// `<prefix><hex log_id>.<20 位序号>`，字典序等于序号序，因此可以用 `meta` 主键做
+/// **范围扫描**，不需要 `LIKE` 全表匹配。
+fn scan_consumed_after(
+    vault: &Vault,
+    log_id: &[u8; 16],
+    current: u64,
+    inbox_condition: &str,
+) -> Result<(Vec<u64>, bool), StorageError> {
+    let sql = format!(
+        "SELECT relay_seq FROM sync_inbox \
+         WHERE log_id=?1 AND relay_seq>?2 AND {inbox_condition} \
+         ORDER BY relay_seq LIMIT ?3"
+    );
+    let rows = vault.query(
+        &sql,
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(current)?),
+            Value::Integer(i64::try_from(PREFIX_SCAN_LIMIT).unwrap_or(i64::MAX)),
+        ],
+    )?;
+    let truncated = rows.len() == PREFIX_SCAN_LIMIT;
+    let mut seqs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        seqs.push(u64_of(row, 0, "sync_inbox.relay_seq")?);
+    }
+    let lower = skipped_received_key(log_id, current.saturating_add(1))?;
+    let upper = skipped_received_key(log_id, u64::MAX)?;
+    let keys = vault.query(
+        "SELECT key FROM meta WHERE key>=?1 AND key<=?2",
+        &[Value::Text(lower), Value::Text(upper)],
+    )?;
+    for row in &keys {
+        let key = text_of(row, 0, "meta.key")?;
+        if let Some(seq) = parse_skipped_received_seq(&key) {
+            if seq > current {
+                seqs.push(seq);
+            }
+        }
+    }
+    seqs.sort_unstable();
+    seqs.dedup();
+    Ok((seqs, truncated))
+}
+
+/// 解析 `sync.skipped_received.<hex log_id>.<20 位序号>` 的序号。
+///
+/// 格式不认识就返回 `None`：不是本函数写下的键不参与前缀推进，宁可让前缀停在这里
+/// （fail-safe），也不把来路不明的 meta 键当成"已消费"。
+fn parse_skipped_received_seq(key: &str) -> Option<u64> {
+    let rest = key.strip_prefix(META_SYNC_SKIPPED_RECEIVED_PREFIX)?;
+    let (hex, digits) = rest.split_once('.')?;
+    if hex.len() != 32 || digits.len() != 20 {
+        return None;
+    }
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// 登记一个**不写 inbox**、但已 durable 消费的事件（ASSET），并推进连续接收前缀。
@@ -1258,31 +1500,7 @@ fn skipped_received_key(log_id: &[u8], relay_seq: u64) -> Result<String, Storage
 }
 
 fn advance_integrated_prefix(vault: &Vault) -> Result<(), StorageError> {
-    let Some(log_id) = read_meta(vault, META_SYNC_LOG_ID)? else {
-        return Ok(());
-    };
-    let mut current = read_meta_u64(vault, META_SYNC_INTEGRATED_SEQ)?.unwrap_or(0);
-    loop {
-        let next = current
-            .checked_add(1)
-            .ok_or_else(|| StorageError::Corrupt {
-                context: "integrated_seq 溢出".to_owned(),
-            })?;
-        let rows = vault.query(
-            "SELECT 1 FROM sync_inbox WHERE log_id=?1 AND relay_seq=?2 AND state='integrated'",
-            &[Value::Blob(log_id.clone()), Value::Integer(i64_of(next)?)],
-        )?;
-        // 已收到的非 inbox 事件（ASSET）在被 received 前缀覆盖后同样算"已消费"，
-        // 否则 integrated 水位会永久卡在该序号之前。
-        let consumed_without_inbox =
-            read_meta(vault, &skipped_received_key(&log_id, next)?)?.is_some();
-        if rows.is_empty() && !consumed_without_inbox {
-            break;
-        }
-        current = next;
-        write_meta(vault, META_SYNC_INTEGRATED_SEQ, &current.to_be_bytes())?;
-    }
-    Ok(())
+    advance_consumed_prefix(vault, META_SYNC_INTEGRATED_SEQ, "state='integrated'")
 }
 
 fn read_meta(vault: &Vault, key: &str) -> Result<Option<Vec<u8>>, StorageError> {

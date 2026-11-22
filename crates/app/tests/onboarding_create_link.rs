@@ -104,9 +104,8 @@ fn expect_bounds(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Bo
         }
         // 设置页是「左侧分类导航 + 右侧只渲染当前分类」：按 selector 前缀切到对应分类。
         let section = match selector {
-            "settings-instance-0" | "settings-instance-1" | "settings-api-version" => {
-                Some("instances")
-            }
+            // 公开信息（API 面）已随「实例」分类移除，挪到「同步」分类底部。
+            "settings-api-version" | "settings-public-info" => Some("sync"),
             "settings-fingerprint" => Some("security"),
             "settings-relay" => Some("relay"),
             _ => None,
@@ -400,7 +399,9 @@ async fn two_ticket_vaults_on_one_relay_are_isolated_and_restart_into_main(
     let (root, cx) = open_root(cx, options_for(&layout, &relay));
     cx.run_until_parked();
     assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
-    expect_bounds(cx, "app-root-create-link");
+    // 欢迎页已改为 Obsidian 式仓库选择页：旧的「粘贴创建链接」入口换成
+    // 「同步远程仓库」卡（同一条链接、统一的 create/join 识别）。
+    expect_bounds(cx, "welcome-sync-remote");
 
     // ---- A：粘贴链接 → 票据模式（setup secret 隐藏）→ 真实创建 ----
     apply_create_link(&root, cx, &link_a);
@@ -641,9 +642,9 @@ async fn two_ticket_vaults_on_one_relay_are_isolated_and_restart_into_main(
             .collect::<Vec<_>>()
     });
     assert_eq!(listed, vec![inst_a.clone(), inst_b.clone()]);
-    expect_bounds(cx_w, "app-root-instance-0");
-    expect_bounds(cx_w, "app-root-instance-1");
-    let first = expect_bounds(cx_w, "app-root-instance-0");
+    expect_bounds(cx_w, "welcome-vault-0");
+    expect_bounds(cx_w, "welcome-vault-1");
+    let first = expect_bounds(cx_w, "welcome-vault-0");
     cx_w.simulate_click(first.center(), Modifiers::default());
     cx_w.run_until_parked();
     assert_eq!(state_of(&root_w, cx_w), RootStateLabel::Main);
@@ -657,7 +658,7 @@ async fn two_ticket_vaults_on_one_relay_are_isolated_and_restart_into_main(
         root.back_to_welcome(cx);
         assert!(root.should_close(cx));
     });
-    let second = expect_bounds(cx_w, "app-root-instance-1");
+    let second = expect_bounds(cx_w, "welcome-vault-1");
     cx_w.simulate_click(second.center(), Modifiers::default());
     cx_w.run_until_parked();
     assert_eq!(state_of(&root_w, cx_w), RootStateLabel::Main);
@@ -1151,7 +1152,6 @@ async fn settings_show_api_version_and_public_pin(cx: &mut TestAppContext) {
     expect_bounds(cx, "dev-sync-settings");
     expect_bounds(cx, "settings-api-version");
     expect_bounds(cx, "settings-fingerprint");
-    expect_bounds(cx, "settings-instance-0");
     let entry = root
         .update(cx, |root, _| root.settings_active_entry())
         .expect("设置里有 active 实例");

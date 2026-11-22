@@ -17,6 +17,8 @@ cargo build -p menghunote-relay --release --bin menghunote-relay
 
 产物：`target/release/menghunote-relay`。
 
+Windows PowerShell 下交叉编译 Linux ARM64 的步骤见[编译与部署指南](../../docs/guides/relay-build-deploy.md)。
+
 ## 两段式启动（推荐）
 
 ### 1. 初始化（一次性 setup secret + admin token）

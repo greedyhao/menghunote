@@ -169,11 +169,12 @@ async fn settings_page_shows_templates_and_daily_notes_sections(cx: &mut TestApp
     // 先断言导航齐全 + 默认选中「外观」，再逐分类点开断言旧 selector 仍然存在。
     bounds_of(cx, "dev-sync-settings");
     bounds_of(cx, "settings-nav");
+    // 「实例」分类已移除（vault 创建/管理改由 Main 左下角的「管理仓库」承担）。
     for section in [
         "appearance",
         "language",
+        "shortcuts",
         "sync",
-        "instances",
         "relay",
         "security",
         "plugins",

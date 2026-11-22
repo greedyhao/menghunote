@@ -144,32 +144,59 @@ impl EditorElement {
         }
     }
 
-    /// 画 IME 组合文本（overlay）。
+    /// 画 IME 组合文本（overlay），返回本帧是否真的画了 preedit。
     ///
     /// preedit **不在布局里**（`LayoutFrame` 只描述 source），所以这里按光标位置临时
     /// shaping 一次并画在光标右侧；组合串通常很短，超出行宽时由 content mask 裁掉。
+    ///
+    /// **caret 归属**：preedit 非空时，这一帧**唯一**的 caret 画在组合串末尾
+    /// （`x + shaped.width()`），调用方必须据此跳过 [`Self::paint_caret`]；否则组合串
+    /// 起点还会再画一条竖线（真机反馈：caret 停在 `biao'p` 开头）。
+    ///
+    /// `caret_visible` 是闪烁相位：隐藏时不画串尾 caret（preedit 文本与下划线保留）。
+    /// 组合期间 `pump` 会强制常亮，所以实际使用中组合时不会闪。
     fn paint_preedit(
         &self,
         geometry: &EditorGeometry,
         display_caret: Option<usize>,
+        focused: bool,
+        caret_visible: bool,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> bool {
         let preedit = self.view.read(cx).preedit_text().map(str::to_owned);
         let Some(preedit) = preedit else {
-            return;
+            // 没有 preedit：清掉上一帧组合串 caret/底纸的痕迹，走原来的 caret 路径。
+            self.record_preedit_caret(cx, None, None);
+            return false;
         };
         // preedit 不进 display_text，但**位置**按 display 坐标算（标记可能被隐藏）。
-        let Some(caret) = display_caret else {
-            return;
+        // 兜底：极少数帧里 source→display 的 head 映射会拿不到（例如选区正跨过
+        // 刚被投影隐藏的标记）；此时仍应把组合串画在选区起点，不能静默消失。
+        let caret = display_caret.or_else(|| {
+            self.view
+                .read(cx)
+                .selection_in_display_range()
+                .map(|range| range.start)
+        });
+        let Some(caret) = caret else {
+            self.record_preedit_caret(cx, None, None);
+            return false;
         };
         let Some((row, x)) = geometry.caret_row_x(caret) else {
-            return;
+            self.record_preedit_caret(cx, None, None);
+            return false;
         };
         let sanitized = super::view::sanitize_single_line(&preedit);
         if sanitized.is_empty() {
-            return;
+            self.record_preedit_caret(cx, None, None);
+            return false;
         }
+        self.view.update(cx, |view, _| {
+            view.preedit_paint_count += 1;
+        });
+        // 宽度按**实际绘制用的 sanitized 文本** shaping（反引号/制表符/换行都已处理），
+        // 不能拿原始 preedit 的长度或估算宽度来定 caret 位置。
         let shaped = super::glyph::shape_row_styled_at(
             window,
             &sanitized,
@@ -178,6 +205,16 @@ impl EditorElement {
             geometry.frame.lines[row].mono,
         );
         let top = geometry.row_top(row);
+        let width = shaped.width();
+        // **先擦底纸**：组合串不在布局里，只画在 caret 处；如果不清掉它下面的正文，
+        // 光标后面的已有文字会和组合串叠在一起（真机反馈的“输入时重叠”）。
+        // 只覆盖组合串实际宽度，后续文字虽然不会右移（布局没变），但不会被压字。
+        if width > px(0.0) {
+            window.paint_quad(fill(
+                Bounds::new(point(x, top), size(width, geometry.row_height(row))),
+                theme::window_bg(),
+            ));
+        }
         // 组合串用主色 + 下划线，和已提交文本区分开。
         if let Err(error) = shaped.paint(
             point(x, top),
@@ -189,7 +226,6 @@ impl EditorElement {
         ) {
             eprintln!("[menghunote] 绘制 preedit 失败：{error}");
         }
-        let width = shaped.width();
         if width > px(0.0) {
             window.paint_quad(fill(
                 Bounds::new(
@@ -199,6 +235,32 @@ impl EditorElement {
                 theme::caret_color(),
             ));
         }
+        // 组合串末尾画这一帧唯一的 caret：同一视觉行、同一行高、同一颜色。
+        // 正文未聚焦或闪烁相位隐藏时不画（与 `paint_caret` 的口径一致）。
+        let preedit_caret_x = if focused && caret_visible {
+            let caret_x = x + width;
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(caret_x, top),
+                    size(px(CARET_WIDTH), geometry.row_height(row)),
+                ),
+                theme::caret_color(),
+            ));
+            Some(caret_x)
+        } else {
+            None
+        };
+        self.record_preedit_caret(cx, preedit_caret_x, (width > px(0.0)).then_some(width));
+        true
+    }
+
+    /// 记录本帧组合串末尾 caret 的绘制结果（headless 回归用；不参与业务判断）。
+    fn record_preedit_caret(&self, cx: &mut App, x: Option<Pixels>, mask_width: Option<Pixels>) {
+        self.view.update(cx, |view, _| {
+            view.preedit_caret_painted_last_frame = x.is_some();
+            view.preedit_caret_x_last_frame = x;
+            view.preedit_mask_width_last_frame = mask_width;
+        });
     }
 
     /// 画光标竖线（最后画，保证压在文本与 preedit 之上）。
@@ -206,8 +268,12 @@ impl EditorElement {
         &self,
         geometry: &EditorGeometry,
         display_caret: Option<usize>,
+        focused: bool,
         window: &mut Window,
     ) {
+        if !focused {
+            return;
+        }
         let Some(caret) = display_caret else {
             return;
         };
@@ -551,6 +617,10 @@ impl EditorElement {
                 {
                     return;
                 }
+                // 鼠标点击是"活动"：闪烁立刻回到可见并重新计时（点击同一位置也一样）。
+                down_view
+                    .update(cx, |view, _| view.reset_caret_blink())
+                    .ok();
                 // 外部链接确认框是模态的：点击只由遮罩/按钮处理，绝不落到正文
                 // （正常情况下遮罩已经 `stop_propagation`，这里是兜底）。
                 if down_view
@@ -639,6 +709,28 @@ impl EditorElement {
                         .ok();
                     return;
                 }
+                // Shift+单击正文文本：**扩选**而不是重新落 caret，更不能打开链接。
+                //
+                // 必须在链接/对象分支**之前**处理：Shift+单击 wiki/外链是要扩选，
+                // 不是跳转。落在对象/表格单元格上的按压保持原行为（不扩选），
+                // 因此对象分支放在它之后；任务框在上面已按原行为处理。
+                if event.modifiers.shift && down_geometry.object_at(event.position).is_none() {
+                    let (byte, bias) = down_geometry
+                        .byte_at_with_bias(event.position)
+                        .unwrap_or((down_geometry.byte_at(event.position), Bias::Right));
+                    down_view
+                        .update(cx, |view, cx| {
+                            view.begin_shift_pointer_selection(
+                                byte,
+                                bias,
+                                event.position,
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                    return;
+                }
                 // 表格单元格（ADR 0019 S3b2）：单击只选中该格（不移动正文 caret）；
                 // 再次单击同一格 / 双击才进入就地编辑。点到表格的非单元格区域（内边距/
                 // 边框）仍然走 S3a 的整块选中。
@@ -696,7 +788,7 @@ impl EditorElement {
                 }
                 down_view
                     .update(cx, |view, cx| {
-                        view.begin_pointer_selection(byte, bias, window, cx)
+                        view.begin_pointer_selection(byte, bias, event.position, window, cx)
                     })
                     .ok();
             },
@@ -718,6 +810,10 @@ impl EditorElement {
                 {
                     return;
                 }
+                // 右键点击同样是活动：闪烁回到可见并重新计时。
+                right_view
+                    .update(cx, |view, _| view.reset_caret_blink())
+                    .ok();
                 // 确认框是模态的：右键也不得在它下面开菜单。
                 if right_view
                     .update(cx, |view, _| view.link_confirm_open())
@@ -768,6 +864,14 @@ impl EditorElement {
                 if !event.dragging() {
                     return;
                 }
+                // 正文文本单击：按下后只有真正拖动（越过点击阈值）才实时扩选；
+                // 阈值内的抖动保持原选区，等 mouse-up 再落 caret（不提前显现隐藏语法）。
+                if !move_view
+                    .update(cx, |view, _| view.note_pointer_moved(event.position))
+                    .unwrap_or(true)
+                {
+                    return;
+                }
                 // 拖选与点击用同一套偏置，否则跨构造拖动会跳。
                 let (byte, bias) = move_geometry
                     .byte_at_with_bias(event.position)
@@ -808,6 +912,12 @@ impl EditorElement {
                         })
                         .ok();
                 }
+                // 正文文本单击：mouse-down 只记了锚点，抬起且**没有拖动**才真正落
+                // caret（Shift+单击在这里扩选）。必须在 `end_drag` 之前（扩选锚点
+                // 还在拖拽状态里）；拖动过的手势不会留下待定点击，保持既有选区。
+                up_view
+                    .update(cx, |view, cx| view.finish_pointer_click(window, cx))
+                    .ok();
                 up_view.update(cx, |view, _cx| view.end_drag()).ok();
             },
         );
@@ -969,6 +1079,11 @@ impl Element for EditorElement {
         // 注意：样式随 caret 变化（进入/离开构造），所以**每帧**都要按当前 runs 重新
         // shaping；`WrapCache` 只缓存折行（纯文本函数），不会把样式缓存住。
         let styles = Rc::new(self.view.read(cx).style_runs_display());
+        // 代码块只读语法高亮：display 坐标快照（syntect 只在 source 变化时重跑；
+        // 这里每帧只克隆一个 `Rc`）。颜色只在 shaping 时生效，不影响折行/行高/命中。
+        let code_highlight = self
+            .view
+            .update(cx, |view, _| view.code_highlight_display());
         // 图片对象：几何矩形按 LayoutFrame 的行顶/行高算（元素局部坐标，下面再加 origin）。
         let objects_local = self.view.read(cx).object_paints(
             window,
@@ -994,14 +1109,22 @@ impl Element for EditorElement {
                         line.mono,
                     );
                 }
+                let text = &frame.text[line.bytes.clone()];
+                // 代码行（等宽且落在代码块内）：用语法 spans 着色。字体/字号与普通
+                // shaping 完全一致（只是 TextRun 颜色不同），行宽与命中几何不变；
+                // 未命中 token 的文本仍是正文色。代码块里没有语义样式（粗体/斜体）。
+                if line.mono && code_highlight.is_code_range(&line.bytes) {
+                    let syntax = code_highlight.spans_for_line(&line.bytes);
+                    return super::glyph::shape_row_code(
+                        window,
+                        text,
+                        &syntax,
+                        line.font_size,
+                        line.mono,
+                    );
+                }
                 let spans = super::glyph::line_spans(&styles, line.bytes.clone());
-                super::glyph::shape_row_styled_at(
-                    window,
-                    &frame.text[line.bytes.clone()],
-                    &spans,
-                    line.font_size,
-                    line.mono,
-                )
+                super::glyph::shape_row_styled_at(window, text, &spans, line.font_size, line.mono)
             })
             .collect();
         // 局部坐标 → 窗口坐标（元素原点；表格内部的表头/行/单元格矩形一起平移）。
@@ -1132,14 +1255,39 @@ impl Element for EditorElement {
 
         // 文字不能画到画布外面（最后一个视觉行可能只有半行高）。
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            // 顺序：选区底色 → 正文 → IME 组合串 → 光标（光标永远压在最上面）。
+            // 顺序：选区底色 → 正文 → IME 组合串（含组合串末尾的 caret）→ 光标。
+            // 有 preedit 时组合串末尾那条竖线就是本帧唯一 caret，不能再从起点画。
             self.paint_selection(&geometry, selection, display_selection, window, cx);
             self.paint_text(&geometry, window, cx);
             self.paint_thematic_breaks(bounds, &geometry, window, cx);
             self.paint_task_boxes(&geometry, window);
             self.paint_objects(bounds, &geometry, window, cx);
-            self.paint_preedit(&geometry, display_caret, window, cx);
-            self.paint_caret(&geometry, display_caret, window);
+            let body_focused = self.view.read(cx).focus_handle(cx).is_focused(window);
+            // 聚焦/失焦：闪烁立刻回到可见并重新计时（只在绘制帧观察，不额外注册监听）。
+            self.view
+                .update(cx, |view, _| view.note_caret_focus(body_focused));
+            let caret_visible = self.view.read(cx).caret_blink_visible();
+            let preedit_painted = self.paint_preedit(
+                &geometry,
+                display_caret,
+                body_focused,
+                caret_visible,
+                window,
+                cx,
+            );
+            if !preedit_painted {
+                // preedit 为空/取消/定位失败：保持原 caret 路径（起点竖线）。
+                // 闪烁隐藏时整条都不画（下划线/组合串文本不受影响）。
+                self.paint_caret(
+                    &geometry,
+                    display_caret,
+                    body_focused && caret_visible,
+                    window,
+                );
+            }
+            self.view.update(cx, |view, _| {
+                view.caret_painted_last_frame = body_focused && caret_visible;
+            });
         });
 
         self.register_handlers(bounds, geometry, window);

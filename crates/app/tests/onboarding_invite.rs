@@ -16,11 +16,12 @@
 #![cfg(feature = "dev-sync")]
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use gpui::{Entity, TestAppContext, VisualTestContext};
+use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use menghunote_app::onboarding::{
-    AppRoot, AppRootOptions, ProfileLayout, ProfileStore, RootStateLabel,
+    AppRoot, AppRootOptions, ProfileLayout, ProfileStore, RootStateLabel, CREATE_PUMP_INTERVAL,
+    INVITE_AUTO_CHECK_INTERVAL,
 };
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
@@ -458,4 +459,302 @@ async fn used_invite_link_reports_explicit_failure(cx: &mut TestAppContext) {
         "失败不得留下身份文件"
     );
     drop(dir_root);
+}
+
+// ---------------------------------------------------------------------------
+// 4) PENDING 等待页自动刷新批准状态（不需要点「检查状态」）
+// ---------------------------------------------------------------------------
+
+/// 推进测试时钟（40ms 一拍，不 sleep），直到等待页累计自动发出 `expected` 次 CHECK。
+fn advance_until_auto_checks(root: &Entity<AppRoot>, cx: &mut VisualTestContext, expected: u32) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if root.update(cx, |root, _| root.invite_auto_check_count()) >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "等待页在 {INVITE_AUTO_CHECK_INTERVAL:?} 后仍未自动发出第 {expected} 次 CHECK"
+        );
+        cx.executor().advance_clock(CREATE_PUMP_INTERVAL);
+        cx.run_until_parked();
+    }
+}
+
+/// 用户反馈：邀请等待批准时状态不会自动更新，要手动点「检查状态」。
+///
+/// 本用例全程**不点**按钮：进入 PENDING 后推进测试时钟（不 sleep），等待页的泵应在
+/// ~[`INVITE_AUTO_CHECK_INTERVAL`] 后自动发出一次 CHECK；创建端批准后自动 bootstrap
+/// 并进入 Main。
+#[gpui::test]
+async fn pending_page_auto_checks_and_enters_main_without_manual_check(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let creator = creator("auto-check");
+    let link = invite_url(&creator);
+    let (_dir_root, layout) = temp_layout("auto-check");
+    let b_dir = layout.instances_dir.join("inst-b");
+    let store = layout.store();
+
+    let (root, cx) = open_root(
+        cx,
+        AppRootOptions::for_test(layout.clone(), creator.relay.base_url(), "inst-b"),
+    );
+    root.update(cx, |root, cx| {
+        root.enter_join_form(cx);
+        root.join_form_set_dir(&b_dir.display().to_string(), cx);
+        root.join_form_set_invite(&link, cx);
+        root.submit_join(cx);
+    });
+    assert!(
+        root.update(cx, |root, cx| root.wait_for_invite_terminal(cx, DEADLINE)),
+        "邀请兑换必须在 60s 内收敛"
+    );
+    assert_eq!(state_of(&root, cx), RootStateLabel::InvitePending);
+    let facts = root
+        .update(cx, |root, _| root.invite_pending_facts().cloned())
+        .expect("PENDING 公开事实");
+    assert_eq!(
+        root.update(cx, |root, _| root.invite_auto_check_count()),
+        0,
+        "刚进入等待页不应立刻发起自动检查（间隔 ~5s）"
+    );
+
+    // 第一步：还没批准时，自动 CHECK 必须发出；结果是 Waiting，页面保留并继续轮询。
+    advance_until_auto_checks(&root, cx, 1);
+    assert!(
+        root.update(cx, |root, cx| root.wait_for_invite_terminal(cx, DEADLINE)),
+        "未批准时的自动检查也必须在 60s 内收敛（Waiting）"
+    );
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::InvitePending,
+        "未批准不得离开等待页（下次自动检查继续）"
+    );
+    let waiting = root
+        .update(cx, |root, _| root.invite_message().map(str::to_owned))
+        .expect("Waiting 必须给出状态文案");
+    assert!(
+        waiting.contains("尚未批准") || waiting.contains("未批准"),
+        "未批准文案必须明确：{waiting}"
+    );
+    assert!(
+        !root.update(cx, |root, _| root.invite_busy()),
+        "Waiting 后必须允许下一次自动检查"
+    );
+
+    // 创建端批准（不碰 B 的等待页/按钮）。
+    let target_device =
+        menghunote_sync::ids::parse_hex::<16>(&facts.device_id).expect("设备 id 必须是 32 位 hex");
+    let approved = approve_pending_device(
+        &relay_context(&creator),
+        &creator.vault,
+        &creator.identity,
+        target_device,
+        u64::try_from(creator.relay.now()).expect("now"),
+    )
+    .expect("A 批准");
+    assert!(approved.changed);
+
+    // 第二步：再推进 ~5s，自动 CHECK 看到已批准 → bootstrap 并进 Main。
+    advance_until_auto_checks(&root, cx, 2);
+
+    // 自动 CHECK 结果：bootstrap + 写配置 + 进 Main（没有手动点按钮）。
+    assert!(
+        root.update(cx, |root, cx| root.wait_for_invite_terminal(cx, DEADLINE)),
+        "自动检查必须在 60s 内收敛"
+    );
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "批准后等待页必须自动进入 Main"
+    );
+    assert!(
+        config_active(&store).is_some(),
+        "自动进入 Main 也必须写入公开配置 active"
+    );
+    drop(_dir_root);
+}
+
+// ---------------------------------------------------------------------------
+// 5) 统一「同步远程仓库」：粘贴 mn-pair://join 链接 → PENDING（不再显示手动字段）
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn welcome_remote_form_join_link_enters_pending(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let creator = creator("welcome-join");
+    let link = invite_url(&creator);
+    let (_dir_root, layout) = temp_layout("welcome-join");
+    let b_dir = layout.instances_dir.join("inst-b");
+    let vault_path = b_dir.join("vault.sqlite3");
+    let store = layout.store();
+
+    let (root, cx) = open_root(
+        cx,
+        AppRootOptions::for_test(layout.clone(), creator.relay.base_url(), "inst-b"),
+    );
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
+
+    // 展开统一同步卡：只有一个链接字段 + 实例目录（+ dev 同意），没有手动 relay/
+    // vault_id/恢复码/邀请链接多字段。
+    let Some(card) = cx.debug_bounds("welcome-sync-remote") else {
+        panic!("Welcome 必须有「同步远程仓库」卡");
+    };
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("welcome-sync-link").is_some());
+    assert!(cx.debug_bounds("welcome-sync-dir").is_some());
+    assert!(cx.debug_bounds("welcome-sync-confirm").is_some());
+    assert!(cx.debug_bounds("welcome-sync-consent").is_some());
+    for absent in [
+        "app-root-join-form",
+        "app-root-join-relay-input",
+        "app-root-vault-id-input",
+        "app-root-recovery-input",
+        "app-root-invite-input",
+    ] {
+        assert!(
+            cx.debug_bounds(absent).is_none(),
+            "统一表单不得显示手动字段：{absent}"
+        );
+    }
+
+    root.update(cx, |root, cx| {
+        root.welcome_set_sync_link(&link, cx);
+        root.welcome_set_sync_dir(&b_dir.display().to_string(), cx);
+        root.welcome_set_sync_consent(true, cx);
+        root.welcome_confirm_sync(cx);
+    });
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Working,
+        "合法 join 链接必须直接进入后台邀请兑换（不是 JoinForm）"
+    );
+    assert!(
+        root.update(cx, |root, cx| root.wait_for_invite_terminal(cx, DEADLINE)),
+        "邀请兑换必须在 60s 内收敛"
+    );
+    assert_eq!(state_of(&root, cx), RootStateLabel::InvitePending);
+    let facts = root
+        .update(cx, |root, _| root.invite_pending_facts().cloned())
+        .expect("PENDING 公开事实");
+    assert_eq!(
+        facts.vault_id,
+        menghunote_sync::ids::hex_of(&creator.vault_id)
+    );
+    assert!(
+        config_active(&store).is_none(),
+        "PENDING 期间不得写公开配置"
+    );
+    assert!(
+        !menghunote_app::dev_sync::DevIdentityStore::path_for(&vault_path).exists(),
+        "PENDING 期间不得写身份文件"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6) 统一表单「仓库名称」：邀请加入（join）成功后写入 display_name
+// ---------------------------------------------------------------------------
+
+/// 粘贴 `mn-pair://join` + 填「仓库名称」→ PENDING（不写配置）→ 创建端批准 →
+/// 检查/bootstrap → Main：`display_name` 落盘（trim），三处显示同名，目标路径不变。
+#[gpui::test]
+async fn welcome_join_link_with_display_name_writes_it_on_bootstrap(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let creator = creator("welcome-name");
+    let link = invite_url(&creator);
+    let (_dir_root, layout) = temp_layout("welcome-name");
+    let b_dir = layout.instances_dir.join("inst-b");
+    let store = layout.store();
+
+    let (root, cx) = open_root(
+        cx,
+        AppRootOptions::for_test(layout.clone(), creator.relay.base_url(), "inst-b"),
+    );
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
+
+    // 展开统一同步卡：链接 / 实例目录 / 可选的「仓库名称」。
+    let card = cx
+        .debug_bounds("welcome-sync-remote")
+        .expect("Welcome 必须有「同步远程仓库」卡");
+    cx.simulate_click(card.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("welcome-sync-link").is_some());
+    assert!(cx.debug_bounds("welcome-sync-dir").is_some());
+    assert!(
+        cx.debug_bounds("welcome-sync-name").is_some(),
+        "统一表单必须有可选的「仓库名称」字段"
+    );
+
+    root.update(cx, |root, cx| {
+        root.welcome_set_sync_link(&link, cx);
+        root.welcome_set_sync_dir(&b_dir.display().to_string(), cx);
+        root.welcome_set_sync_name("  邀请 来的库  ", cx);
+        root.welcome_set_sync_consent(true, cx);
+        root.welcome_confirm_sync(cx);
+    });
+    assert!(
+        root.update(cx, |root, cx| root.wait_for_invite_terminal(cx, DEADLINE)),
+        "邀请兑换必须在 60s 内收敛"
+    );
+    assert_eq!(state_of(&root, cx), RootStateLabel::InvitePending);
+    assert!(
+        config_active(&store).is_none(),
+        "PENDING 期间不得写公开配置（名称也不落盘）"
+    );
+
+    // 创建端批准 → B「检查状态」→ bootstrap → Main。
+    let facts = root
+        .update(cx, |root, _| root.invite_pending_facts().cloned())
+        .expect("PENDING 公开事实");
+    let target_device =
+        menghunote_sync::ids::parse_hex::<16>(&facts.device_id).expect("设备 id 必须是 32 位 hex");
+    approve_pending_device(
+        &relay_context(&creator),
+        &creator.vault,
+        &creator.identity,
+        target_device,
+        u64::try_from(creator.relay.now()).expect("now"),
+    )
+    .expect("A 批准");
+    root.update(cx, |root, cx| root.check_invite(cx));
+    assert!(
+        root.update(cx, |root, cx| root.wait_for_invite_terminal(cx, DEADLINE)),
+        "检查/bootstrap 必须在 60s 内收敛"
+    );
+    assert_eq!(
+        state_of(&root, cx),
+        RootStateLabel::Main,
+        "批准后必须进入 Main（配置写回失败会停在等待页）"
+    );
+
+    let profile = store.load().expect("读配置").expect("配置存在");
+    let entry = profile.find("inst-b").expect("B 已登记");
+    assert_eq!(
+        entry.display_name.as_deref(),
+        Some("邀请 来的库"),
+        "邀请加入成功后必须写 display_name（trim）"
+    );
+    assert_eq!(
+        std::path::PathBuf::from(&entry.vault_path),
+        b_dir.join("vault.sqlite3"),
+        "名称只影响显示：目标路径不变"
+    );
+    assert_eq!(profile.active_instance.as_deref(), Some("inst-b"));
+
+    // 左下角 + 切换菜单同一名字。
+    assert_eq!(
+        root.update(cx, |root, cx| root.current_vault_name(cx)),
+        "邀请 来的库"
+    );
+    let switcher = cx
+        .debug_bounds("app-root-vault-switcher")
+        .expect("Main 左下角必须有切换器");
+    cx.simulate_click(switcher.center(), Modifiers::default());
+    cx.run_until_parked();
+    let rows = root.update(cx, |root, cx| root.vault_menu_rows(cx));
+    assert_eq!(rows[0].label, "✓ 邀请 来的库");
+    drop(_dir_root);
 }

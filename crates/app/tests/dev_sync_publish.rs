@@ -338,10 +338,13 @@ fn service(
 /// 点正文首行焦点（真实命中链路）。
 fn focus_editor(cx: &mut VisualTestContext) {
     let pane = cx.debug_bounds("editor-pane").expect("编辑器面板 selector");
+    // 笔记顶部有固定 header（路径行 + 大标题，约 90px）：点 y+10 会落在 header 上，
+    // 既不会提交"新建笔记后自动进入的标题编辑"，也不会把焦点交给正文。
+    // 点在正文上部，走真实的「点正文 → 提交标题编辑 + 正文拿焦点」路径。
     cx.simulate_click(
         gpui::point(
             pane.origin.x + gpui::px(20.0),
-            pane.origin.y + gpui::px(10.0),
+            pane.origin.y + gpui::px(140.0),
         ),
         Modifiers::default(),
     );

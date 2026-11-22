@@ -34,7 +34,7 @@
 | `language`（固定） | `settings-nav-language` | `settings-section-language` | `settings-language` + `settings-language-*` |
 | `sync`（固定） | `settings-nav-sync` | `settings-section-sync` | `settings-toggle-sync`（**同步内容容器**，进入分类即渲染）+ 同步面板（设备/邀请/轮换） |
 | `instances`（固定） | `settings-nav-instances` | `settings-section-instances` | `settings-instance-<i>` / `-active` / `settings-api-version` / 公开值复制 |
-| `relay`（固定） | `settings-nav-relay` | `settings-section-relay` | `settings-relay` / `settings-mode-*` / `settings-remote-consent` |
+| `relay`（固定） | `settings-nav-relay` | `settings-section-relay` | `settings-relay` / `settings-mode-*`（HTTPS 由权威 parser 校验；2026-11-20 起不再有 `settings-remote-consent` 勾选） |
 | `security`（固定） | `settings-nav-security` | `settings-section-security` | `settings-fingerprint*` / `settings-security-category` / `settings-toggle-management`（V2 实验入口，`dev-sync` + 实验变量才渲染） |
 | `plugins`（固定） | `settings-nav-plugins` | `settings-section-plugins` | `settings-plugin-templates*` / `settings-plugin-daily_notes*`（第一方核心插件总开关） |
 | `about`（固定） | `settings-nav-about` | `settings-section-about` | `settings-about-version` / `settings-about-build`（只读） |
@@ -54,6 +54,9 @@
 - 功能没有挪走/删除：同步面板、实例列表、relay 编辑、安全指纹、V2 实验入口都仍可达
   （V2 管理入口放在「安全」分类下）。
 - `AppShell` 的 dev-sync 设置页（`settings-panel`）**暂不拆**，行为不变。
+  **2026-11-20 更新**：生产 `AppRoot` 创建的 Main 把设置入口交给宿主——点底栏
+  `sync-status` 只发 `AppShellEvent::OpenSyncSettings`，由 `AppRoot` 打开本页并选中
+  「同步」分类（不再打开 `settings-panel` 旧组合页；直接构造 `AppShell` 的测试仍走旧页）。
 
 实现要点（`crates/app/src/onboarding/app_root.rs`）：
 
