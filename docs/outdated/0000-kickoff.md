@@ -1,5 +1,7 @@
 # 新会话开场 Prompt
 
+> **已归档（2026-11-22 文档整理）**：本文被判定为「已作废 / 被取代 / 已完成的待办」，移入 `docs/outdated/` 保留追溯，**不作为当前状态依据**。归档说明见 [`docs/outdated/README.md`](README.md)。
+
 > 用途：在 `D:\code\menghunote` 工作区**新开一个会话**，把下面代码块里的内容整段粘贴进去。
 > 前提：已执行 Settings → Model selection → 打开「Allow agents to choose models for Subagents」并保存。
 > 更新于：2026-11-07
@@ -15,7 +17,7 @@
 
 开工前必须先读完这三个文件，它们是本仓库的行为契约，优先级高于本 prompt 之外的一切临时想法：
   1. AGENTS.md                          —— 路由规则（§2）、代码约定、依赖基线、生态分叉风险（§1）
-  2. docs/briefs/0001-storage-format.md  —— 存储格式与数据流架构（含 AI 对接 + 同步 + 自建服务器）
+  2. docs/outdated/0001-storage-format.md  —— 存储格式与数据流架构（含 AI 对接 + 同步 + 自建服务器）
   3. docs/briefs/0002-editor-core.md     —— 编辑器内核（Typora 式所见即所得）
 
 然后严格按下面的顺序执行。步骤之间有依赖，不要跳步、不要合并。

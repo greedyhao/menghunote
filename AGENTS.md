@@ -1,5 +1,8 @@
 # AGENTS.md — menghunote
 
+> **2026-11-22 历史整理**：开发主线已切到 `main`（从零重建的 30 组语义提交，首个提交日期 2026-11-22）；整理前 303 个提交完整保留在 `backup/dev-20261122`。文档里的旧 commit 锚点已清除或改指新提交，逐条映射见 [`docs/notes/history-rewrite-20261122.md`](docs/notes/history-rewrite-20261122.md)。
+
+
 本文件是 AI agent 在本仓库的行为契约。**优先级高于任何单次对话中的临时指令**。
 若某次任务的要求与本文件冲突，以本文件为准，并在回复中说明冲突点。
 
@@ -225,7 +228,7 @@ GPT 看不到仓库时，简报质量决定决策质量。**必须**包含：
   Lead review 一律看 `git diff`，不再接受"仓库无 git、无法给 diff"。
 - **UI / 交互类改动必须先真机验证再提交**：单元测试证明不了"看起来对不对"（光标形状、候选窗位置、选区像素）。
   未验证的改动用 `wip:` 前缀提交，验证通过后再补一个正式提交；**不要**把未验证的东西混进已验证节点。
-  （教训：`f4b49f6` 是先提交后验证的产物，随后被 `7d95610` 整体推翻。）
+  （教训：早期一次「先提交后验证」的产物随后被下一次提交整体推翻。）
 - **发布点用 annotated tag 标记**（首个：`v0.1-slice6` = 切片 6 真机验收通过的完整闭环）。
   需要回滚、对照或复现时 `git checkout <tag>`；tag 只打"已被真人验过"的状态，不打 WIP。
 
@@ -239,7 +242,7 @@ GPT 看不到仓库时，简报质量决定决策质量。**必须**包含：
 - 状态变更集中在少量可测的 state 类型上，UI 只做投影；便于后续加 undo/redo。
 - 平台相关代码进 `#[cfg(target_os = "...")]` 或 `platform/` 模块，业务层不得出现平台分支。
 - **异步/后台任务的测试必须等明确收敛点**（`DurableAck`、物化完成、事件收尾），**禁止**用 sleep 或"事件队列为空"当收敛判据——
-  后者会把后台异步事件当成 bug（`2b8ed22` 的教训：B 物化事件与断言窗口重叠，5% 偶发）。
+  后者会把后台异步事件当成 bug（历史教训：B 物化事件与断言窗口重叠，5% 偶发）。
 - 新依赖需在提交信息里说明理由与替代方案（重依赖须先经 GPT 评审）。
 - 注释与文档用**中文**；标识符用英文。
 
@@ -353,25 +356,26 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 
 按优先级；括号内为决策类型。
 
-1. ~~**本地存储格式 + 数据流架构**~~ —— **已决**（2026-11-08，`gpt-6.1-sol`）：见 [`docs/adr/0001-storage-format.md`](docs/adr/0001-storage-format.md)。输入为 [`docs/briefs/0003-storage-sync-consolidated.md`](docs/briefs/0003-storage-sync-consolidated.md)；原 `0001-storage-format.md` 简报已作废。
+1. ~~**本地存储格式 + 数据流架构**~~ —— **已决**（2026-11-08，`gpt-6.1-sol`）：见 [`docs/adr/0001-storage-format.md`](docs/adr/0001-storage-format.md)。输入为 [`docs/briefs/0003-storage-sync-consolidated.md`](docs/briefs/0003-storage-sync-consolidated.md)；原简报已移至 `docs/outdated/0001-storage-format.md`（已作废）。
 2. ~~**编辑器内核：Typora 式所见即所得**~~ —— **已决**（2026-11-09，`gpt-6.1-sol`）：见 [`docs/adr/0002-editor-core.md`](docs/adr/0002-editor-core.md)。选**源码投影编辑器**（A，按语义块布局）；C 只作内部 v0/alpha，**v1 必须含行内标记隐藏与进入显现**。
 3. GPUI 状态管理与异步模型在本项目的规范用法 —— *(架构)*
 4. 笔记领域模型（笔记/块/标签/双链/查询的抽象粒度） —— *(数据模型)*
 5. ~~**撤销/重做与命令栈设计**~~ —— **已决**（并入 [ADR 0002](docs/adr/0002-editor-core.md) §8）：单一正文 `UndoManager`（本 peer）、750 ms 同向合并、远端 import 不进本地 Undo 项但须被变换、v1 100 组且不跨重启。
 6. ~~同步协议的服务器职责边界（relay-only vs 存 snapshot）~~ —— **已决**（并入 ADR 0001）：持久**密文**中继 + 密文快照/manifest；relay 不解析明文、不见密钥、不做搜索。
 7. ~~**模块边界与依赖方向（crate 拆分）**~~ —— **已决**（2026-11-09，`gpt-6.1-sol`）：见 [`docs/adr/0003-module-boundaries.md`](docs/adr/0003-module-boundaries.md)。新建 `crates/text` 收口坐标/单位；会话端口放 `storage::session`；`editor → storage/text`。
-8. ~~**同步/加密 v1 的实现契约**~~ —— **已决**（2026-11-11，`gpt-6.1-sol`，max）：见 [`docs/adr/0006-sync-v1.md`](docs/adr/0006-sync-v1.md)。输入 [`docs/briefs/0004-sync-v1.md`](docs/briefs/0004-sync-v1.md)；冻结 MNE1 信封（196B header + AAD + HKDF 域）、密钥槽/DPAPI/恢复码、Ed25519 设备鉴权 + HPKE grant、relay API/DDL/游标、两 checkpoint GC、`key_epoch` 轮换；wire 不可静默变更。
+8. ~~**同步/加密 v1 的实现契约**~~ —— **已决**（2026-11-11，`gpt-6.1-sol`，max）：见 [`docs/adr/0006-sync-v1.md`](docs/adr/0006-sync-v1.md)。输入 [`docs/outdated/0004-sync-v1.md`](docs/outdated/0004-sync-v1.md)；冻结 MNE1 信封（196B header + AAD + HKDF 域）、密钥槽/DPAPI/恢复码、Ed25519 设备鉴权 + HPKE grant、relay API/DDL/游标、两 checkpoint GC、`key_epoch` 轮换；wire 不可静默变更。
 
 ---
 
 ## 8. 当前状态
 
-> **同步/加密 v1 交接入口（2026-11-13）**：见 [`docs/briefs/0007-sync-handoff.md`](docs/briefs/0007-sync-handoff.md)。
-> 三个阻断已修：ASSET 来源认证/覆盖实证 + post-activation + Linux 封装（`2c88f72`）；
-> 同一 durable E1 跨两轮 e2e 与三条 e2e 去脚本化（`61d8de4`）。
+> **同步/加密 v1 交接入口（2026-11-13）**：见 [`docs/outdated/0007-sync-handoff.md`](docs/outdated/0007-sync-handoff.md)。
+> 三个阻断已修：ASSET 来源认证/覆盖实证 + post-activation + Linux 封装（整理前历史）；
+> 同一 durable E1 跨两轮 e2e 与三条 e2e 去脚本化。
 > 本机（Linux）基线：`cargo test --workspace --exclude menghunote-app` = **1006 passed**；sync = **417 passed**。
-> **`v0.4-sync` 已由 GPT 复审 APPROVE（原锚点 `61d8de4`；整理前 `321f732`，无必修项）并打 annotated tag**；2026-11-13 前移至 `d16f6fe`（旧锚点 `v0.4-sync-backup-20261113` → `738f3f0`）；非生产，仅 localhost 开发验收。
-> **Windows 实机已由用户于 2026-11-13 在 `5538344` 包上实测通过**（产品代码与 `v0.4-sync` tag 树一致；命令/计数未逐条留档，复跑命令见 0007 §5）。
+> **`v0.4-sync` 已由 GPT 复审 APPROVE 并打 annotated tag**（无必修项；非生产，仅 localhost 开发验收）；
+> tag **未移动**，仍指向整理前历史，经 `backup/dev-20261122` 可达；旧锚点映射见 `docs/notes/history-rewrite-20261122.md`。
+> **Windows 实机已由用户于 2026-11-13 实测通过**（产品代码与 `v0.4-sync` tag 树一致；命令/计数未逐条留档，复跑命令见 0007 §5）。
 > v0.4 **只支持修复后新建的 vault/身份**，旧开发 vault 失效（旧签名 checkpoint 无法仅靠本地版本拒绝隔离）。
 > 后置：`task-123`（默认删凭证吊销 + 轮换 opt-in）、`task-124`（metadata 事件认证对账/续读）。
 > `task-121`（relay reservation 复用）**已完成**（2026-11-18）：同字节跨 reservation
@@ -393,10 +397,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > Linux 开发适配见 ADR 0008（0600 裸主钥，安全弱于 DPAPI，不宣称等价）。
 > **dev-only 同步 UI（ADR 0009）Phase 1 已完成**：真实 AppShell 内面板 + 持闸 SyncOnce +
 > 活动文档 adopt；面板「发布基线」、设备列表/「移除设备（不轮换）」已接通。
-> **UI 初始化（ADR 0011 S1–S3，2026-11-14，当前 `972a083`）**：`AppRoot` 同窗根视图；
+> **UI 初始化（ADR 0011 S1–S3，2026-11-14，当前 `4ea5ed0`）**：`AppRoot` 同窗根视图；
 > Create/Join 向导（恢复码一次性展示+备份确认、失败恢复、实例目录锁/公开配置），
 > 真实用户不再需要 CLI/env；命令行仅保留自动化/恢复兼容。
-> **自动同步（ADR 0012 S1–S3，2026-11-13，当前 `184a8dd`）**：两阶段（网络不持闸、
+> **自动同步（ADR 0012 S1–S3，2026-11-13，当前 `4ea5ed0`）**：两阶段（网络不持闸、
 > integrate/adopt 短持闸）+ 编辑 debounce 2s/周期 45s/退避 + 状态栏 + 重启待应用恢复；
 > 手动同步与发布/设备命令优先。并行测试改为显式事件收敛（连续 10 次全绿）。
 > **轮换 UI（ADR 0009 Phase 2 / 切片 6a–6b）**：设备面板「轮换密钥…」/「应用轮换」、
@@ -417,7 +421,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **多 vault（ADR 0014 S2–S3b）**：relay schema 11、22 张租户表带 `vault_id` +
 > `VaultScope`、v1→v10→v11 迁移；`/v2` 全数据面 + 一次性创建票据 + v2 租户鉴权/限流；
 > 客户端 `api_version`、`mn-pair://create` 票据创建、同 relay 多实例、v2 邀请链接 `api=2`。
-> **ManagementCapV2（ADR 0015 S4a–S4c + ADR 0016 S4d1a/b，2026-11-14，当前 `b32a5b2`）**：
+> **ManagementCapV2（ADR 0015 S4a–S4c + ADR 0016 S4d1a/b，2026-11-14，当前 `abb4cbd`）**：
 > schema 12；relay 控制提交链/CAS/dedup、Upgrade/Cap/Device/Invite/rotation/Recovery 全链路；
 > 客户端库已能回放控制链、选择 cap、realm3 鉴权、ApprovalEnvelope 双签、submit/回执/重放。
 > **S4d1c App 管理 UI + S4d2 relay 审批收件箱已实现**（见 ADR 0016 实施记录）；
@@ -449,14 +453,14 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > 回滚/文本与强制文本/IME/对账幂等/拖放/SVG/持闸）、`attachment` 单测 6、
 > `editor::clipboard` 单测 6、`replace_asset_refs` 单测 4。
 > 历史整理：整理前 97 个提交完整保留在 `backup/dev-before-cleanup-20261116`；
-> `v0.4-sync` tag 未移动；`v0.5-sync-web` 打在整理后的 12 组 tip `bcb20e8`。
-> **同步 UI 收口（2026-11-16，`71f0164` + 后续微调）**：主界面不常驻 DevSyncPanel；
+> `v0.4-sync` tag 未移动；`v0.5-sync-web` 打在整理前 12 组 tip（经 `backup/dev-20261122` 可达）。
+> **同步 UI 收口（2026-11-16，整理后归入 `72358b9` + 后续微调）**：主界面不常驻 DevSyncPanel；
 > 侧栏动作行（＋笔记/＋文件夹/导出）移到列表上方；唯一的「⚙ 设置」在侧栏底部，
 > 打开 AppRoot 设置页（relay/实例/安全指纹 + 可展开的同步面板）；底栏只保留紧凑同步状态
 > （点击仍可打开 AppShell 测试用同步设置页），不再有独立齿轮。侧栏旧状态移除；
 > `sync-status` / `settings-panel` / `settings-close` / `settings-toggle-sync` 为固定 selector。
 > worker/持闸/协议未动。
-> **同步卡死修复（2026-11-16，`969a6f7`）**：窗口激活回调把
+> **同步卡死修复（2026-11-16，整理后归入 `72358b9`）**：窗口激活回调把
 > `scheduler.on_network_recovered` 的 `Start` 决策丢弃，scheduler 留在 Running 但没人派发；
 > 手动同步永远 `单操作在途`，重启后激活再次触发。现改为退回 pending（清
 > `last_auto_start`），下一拍 tick 正常派发；另保留“无真实 op 时清理陈旧轮次”保险。
@@ -552,19 +556,24 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > （Linux headless + relay 测试），真实 V2 vault/TLS/Windows 仍待验。**
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
-- **版本管理**：当前开发分支 **`dev`**（2026-11-16 历史整理：`v0.4-sync` 后 12 个语义提交；
-  整理前 97 个提交保留在 `backup/dev-before-cleanup-20261116`）；
-  旧历史保留：**`backup/main-wip-20261110`**（首个基线）、**`backup/dev-wip-20261111`**（重命名/搜索 wip）、
-  **`backup/dev-wip-20261111b`**（S5 两次 wip 前）。
-  tag：`v0.1-slice6` = 切片 6；**`v0.2-gpui-kit`** = S2 + 引用块 + 导出 + GPUI Kit；
-  **`v0.3-search`** = S4/S5 检索（P0 物化修复、单行多行摘要、大小写/整词开关、进度条、分组折叠；真机验收）。
-  **2026-11-13 历史整理**：新 `dev` 为 12 个语义提交（tree 与整理前 tip `3c69f16`（backup）逐字节一致）；
-  旧 185 个提交完整保留在 **`backup/dev-20261113`**；`v0.4-sync` tag 未改动。详见
-  [`docs/notes/history-rewrite-20261113.md`](docs/notes/history-rewrite-20261113.md)。
-  更早一次重建（2026-11-11）遗留的哈希（如 `7d95610`/`6c0c302`）见 `backup/*-wip` 分支。
+- **版本管理**：当前主分支 **`main`**（2026-11-22 从零重建：整理前 `dev` 的 **303 个提交**
+  按主题合并为 **30 组语义提交**；首个提交日期 **2026-11-22**，是独立 root，不与旧历史共祖；
+  最终 tree 与整理前 tip `9e666d1` **逐字节一致**）。逐条映射与验证见
+  [`docs/notes/history-rewrite-20261122.md`](docs/notes/history-rewrite-20261122.md)。
+  整理前完整历史保留在 **`backup/dev-20261122`**（303 提交，tip `9e666d1`）；
+  旧 `dev` 分支保持原状，仅作历史参照，**不再作为开发主线**。
+  更早的历史整理留档：`backup/dev-before-cleanup-20261116`（97 提交）、
+  `backup/dev-20261113`（185 提交）、`backup/main-wip-20261110` / `backup/dev-wip-20261111` /
+  `backup/dev-wip-20261111b`（更早 wip 阶段）。
+  6 个 annotated tag（`v0.1-slice6` / `v0.2-gpui-kit` / `v0.3-search` / `v0.4-sync` /
+  `v0.4-sync-backup-20261113` / `v0.5-sync-web`）**均未移动**，仍指向整理前历史，
+  经 backup 分支可达；tag 只打"已被真人验过"的状态。
+  文档里的旧 commit 锚点已**清除**（历史文档）或**改指新语义提交**（当前状态）；
+  `docs/notes/history-rewrite-20261113.md` / `history-rewrite-20261116.md` /
+  `commit-attribution.md` 三份历史账本保留原哈希以便追溯。
   `target/`（20G）与本地 vault 不入库；**Lead review 一律看 `git diff`**，提交前必须三绿。
-- 已落盘：[`AGENTS.md`](AGENTS.md)、[`docs/briefs/0000-kickoff.md`](docs/briefs/0000-kickoff.md)、
-  [`0001-storage-format.md`](docs/briefs/0001-storage-format.md)（**已作废**）、
+- 已落盘：[`AGENTS.md`](AGENTS.md)、[`docs/outdated/0000-kickoff.md`](docs/outdated/0000-kickoff.md)、
+  [`0001-storage-format.md`](docs/outdated/0001-storage-format.md)（**已作废**）、
   [`0002-editor-core.md`](docs/briefs/0002-editor-core.md)（含附录 A–E 实测事实）、
   [`0003-storage-sync-consolidated.md`](docs/briefs/0003-storage-sync-consolidated.md)、
   [`docs/adr/0001-storage-format.md`](docs/adr/0001-storage-format.md)、
@@ -580,21 +589,21 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   ③ ~~切片 4（无头端到端）~~ **已完成并验收** → **S0 通过**；
       ~~切片 5a（app 单 Element，首次 GPUI）~~ **已完成并验收**（identity 渲染 / 命中 / 选区 / 滚动，截图已核）；
       ~~切片 6a（storage composition 闸门）~~、~~6b 支撑（driver undo/redo 转发）~~、~~切片 6b（IME 输入闭环，自动化部分）~~、~~切片 6c（grapheme 删除 API）~~、~~切片 6d（app 退格/Delete 接线）~~ **均已完成并验收**；
-      真机发现并修复：空行上折叠光标被误画成选区高亮（`6c0c302`）；软折行选区整体右移 14px（`4fbd5cc`，根因是 `PAD_X` 在几何与绘制两处各加一次）。
-      **I-beam 的教训（三次尝试，`7d95610` 定稿）**：① 在 paint 里采样 `mouse_position()` → 无重绘就漏判；② 自建根容器 `on_mouse_move` 状态机 → 整体失效。两者都是"没先查框架"。
+      真机发现并修复：空行上折叠光标被误画成选区高亮；软折行选区整体右移 14px（根因是 `PAD_X` 在几何与绘制两处各加一次）。
+      **I-beam 的教训（三次尝试后定稿）**：① 在 paint 里采样 `mouse_position()` → 无重绘就漏判；② 自建根容器 `on_mouse_move` 状态机 → 整体失效。两者都是"没先查框架"。
       **正确做法是 gpui 原生机制**：`prepaint` 里 `insert_hitbox`，`paint` 里 `set_cursor_style(IBeam, &hitbox)`，由框架在命中链变化时调 `reset_cursor_style` 自动切换。
       **以后遇到"悬停/交互态"这类需求，先查框架有没有一等公民 API（hitbox、hover、cursor 都属于此类），再考虑自建。**
       **IME 真机验收通过**（2026-11-10，用户确认）：微软拼音打字、候选窗跟随光标、`Esc` 取消、空格上屏、`Ctrl+Z` / `Ctrl+Shift+Z` 均正常 → **切片 6 关闭**（task-14 complete）。
       **已知缺口**：ADR 0001 §3.2 的「克隆备份必须换新 `peer_id`」尚未验证（`peer_id` 不入库，属设备身份/同步切片）。
       **多进程并发写同一库**：当前生产只有一个 Vault / 一条写连接，不会自争锁；但 `synchronous=FULL` + 慢盘下，
-      第二个 Vault 并发写可能耗尽 5s `busy_timeout`（写者饥饿，`13111a8` 诊断）。将来做备份/迁移进程并发写时，
+      第二个 Vault 并发写可能耗尽 5s `busy_timeout`（写者饥饿，早期诊断）。将来做备份/迁移进程并发写时，
       需在 Vault 写入路径加**有界** BUSY 重试，并接受"错误延迟变长、可能掩盖持续冲突"的代价。
 - **S2 源码投影编辑器已完成（2026-11-10，真机验收）**：Markdown 语义扫描 → `ProjectionMap` 真实省略 →
   `EditorController` 输出 display 文本/双向映射 → app 按投影渲染（隐藏标记、caret 进入显现、命中映射）→
   语义样式（粗体/斜体/行内代码/删除线/链接）→ 块级度量（h1–h6 字号、围栏代码等宽、逐行行高）。
   **编辑与移动都走 display 语义**：退格/Delete/方向键先取可见 grapheme，再映射成最小 source 区间——否则会删到
   隐藏的 `**` 或把 caret 落进标记中间。**允许删除"已显现的"标记**（此时它是可见文本，等同直接改源码）。
-  引用块缩进/左侧竖条已完成（`6cc6fa4`：`text_left_for_row` 收口，绘制/命中共用一套左边界）。
+  引用块缩进/左侧竖条已完成（`text_left_for_row` 收口，绘制/命中共用一套左边界）。
   已知未做：其它块级样式（列表项符号需要 Replace/Object 段）、`***`/同种定界符嵌套、跨行行内。
 - **S3 导出已完成（2026-11-10）**：整库单向导出 Markdown 到 `<vault>/export/<时间戳>/`，文件名清洗（Windows 非法字符 / 尾空格点 / 空标题 / 大小写不敏感去重）
   与目录结构镜像；导出取 `BodyDoc::text()`（源文）**不是** UI 的 display 文本；后台执行，2000 篇 1126ms，导出期间 UI 可交互。
@@ -616,7 +625,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   平台入口 `gpui::platform::application()`；`text`/`editor`/`storage` **零改动**。
   探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口；迁移后三绿 329 用例 + UI smoke 10/10 + 用户真机 IME/DPI 通过。
   迁移/探针 worktree 与临时分支已清理；**升级必须整套对齐**，见 §1 依赖基线。
-- **应用级主题（ADR 0021 P1/P2，2026-11-18，`5fc84c5`）**：
+- **应用级主题（ADR 0021 P1/P2，2026-11-18，`d41c7f3`）**：
   `crates/app/src/theme.rs` 定义 `ThemeMode { Light, Dark, System }` / `ThemeId` / 91 个语义 token；
   内置浅色**逐色等于**迁移前硬编码（零视觉回归），新增深色；全局 `ThemeState`（`RwLock`）+
   `current_theme()` / `theme_id()` / `set_mode()` / `apply_system_appearance()`；
@@ -633,7 +642,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   `headless_theme_ui`（1，dev-sync）+ theme 单测 7；fmt/clippy 干净。
   已知限制：自定义主题包（P5）后置；Mermaid SVG 内容暗色配色属 M3；真实 OS 外观切换/像素/DPI
   仍需 Windows 真机验；默认 demo 构建（无 `dev-sync`）没有设置页（仍默认跟随系统）。
-- **i18n 基础设施 + 首批迁移（ADR 0020 P1，2026-11-18，`7ef5040`）**：
+- **i18n 基础设施 + 首批迁移（ADR 0020 P1，2026-11-18，`d41c7f3`）**：
   新增纯 crate `crates/i18n`（`menghunote-i18n`，零外部依赖、不依赖 GPUI）：
   `Locale { ZhCn, En }`（`LC_ALL`→`LANG` 解析；未知/`C`/缺失回退中文，Windows 无
   `LANG` 等价默认 `zh-CN`）+ `LocaleMode { ZhCn, En, System }`；消息 id 常量
@@ -854,7 +863,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   - Main 左下角改为**一行**动作（`app-root-bottom-actions`）：vault 切换器占剩余宽度 +
     紧凑「设置」按钮，两按钮同一底边/行高；`app-root-settings` / `app-root-vault-switcher`
     selector 不变，窄窗口宽度夹紧。
-  测试：app 默认 **740** / `--features dev-sync` **891** / no-default **575**；storage **274** / sync **634**；本轮硬化见 [`docs/notes/sync-hardening-20261121.md`](docs/notes/sync-hardening-20261121.md)。
+  测试：app 默认 **740** / `--features dev-sync` **891** / no-default **575**；storage **274** / sync **634**；本轮硬化记录已于 2026-11-22 文档整理时清理（见 git 历史）。
   后续同批追加：
   - Welcome 重做 Obsidian 式仓库选择页：`welcome-vault-list` 左栏列同步实例+本地库并直接打开；
     右栏 `welcome-new-local` / `welcome-open-local` / `welcome-sync-remote`；同步远程只用一条
@@ -890,11 +899,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
     选批防饥饿、整批一次 integrated 前缀）；`baseline_apply` 单次 snapshot 解码 +
     detached oplog 合并，5/20 MiB gate 从秒级降到 35/110 ms；remote-known VV 同事务
     落 meta 修复已有库 tombstone。Release 实测 5000 单文档 integrate 147s→275ms、
-    20 篇 14.9s→0.76s。Phase 1B（checkpoint 快速追赶）**未实现**，N_min=25k /
-    16 MiB 机会性上限 / 3 s 持闸见
+    20 篇 14.9s→0.76s。Phase 1B（checkpoint 快速追赶）**已实现 MVP（2026-11-22）**，
+    N_min=25k / 16 MiB 机会性上限 / 3 s 持闸见
     [`docs/notes/sync-fast-catchup-plan.md`](docs/notes/sync-fast-catchup-plan.md) §9；
-    评审材料见 [`docs/notes/sync-review-packet-20261121.md`](docs/notes/sync-review-packet-20261121.md)；
-单文件评审版见 [`docs/notes/sync-critical-modules-review.md`](docs/notes/sync-critical-modules-review.md)。
+    当时的评审材料已于 2026-11-22 文档整理时清理（见 git 历史）。
   已知限制：UI/拖拽/IME/标题/快捷键录制尚未 Windows 真机验收；TLS 已由用户验证但未做安全审计。
 
 - **UI 重构：设置分类导航 / 最左侧图标栏 / 侧栏排序（2026-11-18，Obsidian 风格）**：

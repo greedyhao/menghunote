@@ -1,12 +1,17 @@
 # 0005 同步/加密 v1 设计与开发计划（供 GPT 评审）
 
+> **已归档（2026-11-22 文档整理）**：本文被判定为「已作废 / 被取代 / 已完成的待办」，移入 `docs/outdated/` 保留追溯，**不作为当前状态依据**。归档说明见 [`docs/outdated/README.md`](README.md)。
+
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
 
 
-> **历史留档**：本文写于 2026-11-12 历史整理前；文中哈希（如 `0b30b2e`、`2c93f6e`）只在
+> **历史留档**：本文写于 2026-11-12 历史整理前；文中哈希（如 旧基线、旧基线）只在
 > `backup/dev-20261113` 可达，见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
 
-> 状态：2026-11-12，分支 `dev`，HEAD `0b30b2e`（restart 执行链）；全仓测试在 `2c93f6e` 基线绿，之后 sync 新增 restart/repack/bugfix 在途。
+> 状态：2026-11-12，分支 `dev`，HEAD 旧基线（restart 执行链）；全仓测试在 旧基线 基线绿，之后 sync 新增 restart/repack/bugfix 在途。
 > 关联：[ADR 0006](../adr/0006-sync-v1.md)（§1–§30）、[评审 0001](../reviews/0001-rotation-security-review.md)、[ADR 0001](../adr/0001-storage-format.md)、[ADR 0003](../adr/0003-module-boundaries.md)。
 
 ## 1. 目标与非目标
@@ -132,7 +137,7 @@ ADR §23–§30 + 评审 0001 的硬约束：
 | 改口令 | e2e + 单元 |
 | relay 安全轮换收口 | relay 160 tests；schema v9 |
 | 单设备轮换 A–H + P2 重包 | `scripts/e2e_rotation_verify.ps1` 复跑通过：`activated epoch=2 / grant root verified / repacked 1 / old epoch cannot decrypt new / delayed old ACK ignored / bootstrap=2` |
-| restart 执行链 | `0b30b2e`，168 tests（两基线/排除 revoked/双签 activate/四 digest） |
+| restart 执行链 | 旧基线，168 tests（两基线/排除 revoked/双签 activate/四 digest） |
 
 ### 8.2 在途（未收口）
 1. **两个 bug 修复中**（新 subagent）：
@@ -140,7 +145,7 @@ ADR §23–§30 + 评审 0001 的硬约束：
    - `stage_grants` 的 `grant_id` 填成 device_id。
 2. **双设备 e2e 在途**（subagent）：`examples/e2e_common.rs`、`e2e_rotation_two_devices.rs`、`scripts/...ps1` 未提交。
 3. `execute_restart` 与 relay `POST /restart` 的单一入口未串。
-4. 全仓测试最后一次绿在 `2c93f6e`；`0b30b2e` 后需重跑全仓。
+4. 全仓测试最后一次绿在 旧基线；旧基线 后需重跑全仓。
 
 ### 8.3 明确未做
 - app 端同步 UI（连接/配对/恢复/轮换进度/确认）。

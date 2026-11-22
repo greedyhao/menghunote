@@ -1,5 +1,8 @@
 # ADR 0015 — ManagementCapV2：设备管理能力的 wire/控制链契约
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 状态：**已决**（2026-11-14，GPT 决策；S4a–S4c 实施）。
 > 关联：[ADR 0006](0006-sync-v1.md)（MNE1/控制链）、[ADR 0010](0010-device-access-revocation.md)、
 > [ADR 0014](0014-multi-vault-invites-management.md)（C 目标）。
@@ -182,7 +185,7 @@ S4a1 实现时暴露的歧义，在此冻结；S4a1 golden 未覆盖处补 golde
 
 ## S4b1 实施记录（2026-11-14）
 
-> 状态：**S4b1 已实现**（Linux，dev `2b606f9` + 本切片）。**未启用真实 vault**、未改客户端
+> 状态：**S4b1 已实现**（Linux，dev 旧基线 + 本切片）。**未启用真实 vault**、未改客户端
 > UI/wire 兼容层；S4b2（DeviceApprove/Revoke/RightsChange）与 S4c（rotation/activation/
 > RecoveryReset）当时仍未实现，对应 kind 一律 fail-stop（**S4b2 已由下节接上**，S4c 仍 501）。
 >
@@ -332,7 +335,7 @@ cargo test -p menghunote-app --features dev-sync # 365 passed
 
 ## S4b2 实施记录（2026-11-14）
 
-> 状态：**S4b2 已实现**（Linux，dev `53f1b15` + 本切片）。**未启用真实 vault**、未改客户端
+> 状态：**S4b2 已实现**（Linux，dev 旧基线 + 本切片）。**未启用真实 vault**、未改客户端
 > UI/wire 兼容层；rotation/activation/recovery（kind 6–10/13/14）仍 501 fail-stop，留 S4c。
 >
 > 代码：`crates/sync-proto/src/management_cap_v2.rs`（kind 4/5/16 payload + 集合字段数）、
@@ -438,7 +441,7 @@ Ed25519 + 真实 PoP、无 sleep（FakeClock + 显式收敛点）。
 
 ## S4c 实施记录（2026-11-14）
 
-> 状态：**S4c 已实现**（Linux，dev `53f1b15` + 本切片）。**未启用真实 vault**、未改客户端
+> 状态：**S4c 已实现**（Linux，dev 旧基线 + 本切片）。**未启用真实 vault**、未改客户端
 > UI/wire 兼容层；真实 TLS/Windows 系统根/DPAPI 仍未验，**不宣称生产可用**。
 >
 > 代码：`crates/sync-proto/src/management_cap_v2.rs`（kind 6–10/12/13/14 payload 与字段数）、

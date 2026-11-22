@@ -1,8 +1,11 @@
 # ADR 0009 — 同步接入 app UI（dev-only 面板 + 串行 worker）
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 状态：**已决**（2026-11-13，GPT 决策；Phase 1 实施中）。
 > 输入：`crates/app` 现状、`crates/sync` 契约（ADR 0006）、headless UI 测试基座、e2e 流水。
-> 关联：[ADR 0006](0006-sync-v1.md)、[0007 交接](../briefs/0007-sync-handoff.md)、[0008 Linux 封装](0008-linux-local-identity-wrap.md)。
+> 关联：[ADR 0006](0006-sync-v1.md)、[0007 交接](../outdated/0007-sync-handoff.md)、[0008 Linux 封装](0008-linux-local-identity-wrap.md)。
 
 ## 背景与问题
 
@@ -174,7 +177,7 @@ Phase 1 的面板/同步已能跑，但手工演示缺"操作者能拿到恢复�
 
 ## 实施记录（Phase 2 切片 6a/6b：轮换接入，2026-11-13）
 
-**6a（机制层，`3d7e7d1`）**：`DevIdentityStore::replace_protected`（只允许同 vault/device 的
+**6a（机制层，旧基线）**：`DevIdentityStore::replace_protected`（只允许同 vault/device 的
 身份替换，0600 临时文件 → fsync → rename → 父目录 fsync；失败时旧身份逐字节保留）+
 worker `Command::Rotate { recovery_code, revoke }` / `Command::ApplyEpoch`（**整段持闸**、
 派发前复核库中 head、成功后把新身份写回 `dev-identity.bin` 并重新 load、失败保留 journal

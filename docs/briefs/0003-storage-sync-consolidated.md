@@ -1,7 +1,7 @@
 # 决策简报 0003 — 存储与同步数据模型定稿（v2）
 
 > 状态：**待 GPT 决策**（`bluetrum/gpt-6.1-sol`, `reasoning_effort: "max"`）
-> 取代 [`0001-storage-format.md`](0001-storage-format.md) 成为本决策的唯一输入；0001 保留作历史。
+> 取代 [`0001-storage-format.md`](../outdated/0001-storage-format.md) 成为本决策的唯一输入；0001 保留作历史。
 > 决策落地后写 `docs/adr/0001-storage-format.md`。
 > 提交给 `subagent` 时，把「二、用户已定」至「五、输出要求」整段作为 prompt（逐字复制）。
 

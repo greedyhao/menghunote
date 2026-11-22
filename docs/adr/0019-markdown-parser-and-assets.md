@@ -1054,7 +1054,7 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 
 > 范围：**依赖 pin + 纯 SVG 渲染封装 + 资源上限/panic 兜底/SVG 形状校验 + 单测 + 文档**。
 > 明确**未做**：编辑器里的 fenced `mermaid` 识别、Object Block 投影、源码切换/工具条、
-> 缓存、暗色主题、导出、子进程隔离（那是 M2/M3；见 [`docs/notes/editor-backlog-links-mermaid.md`](../notes/editor-backlog-links-mermaid.md)）。
+> 缓存、暗色主题、导出、子进程隔离（那是 M2/M3；见 [`docs/outdated/editor-backlog-links-mermaid.md`](../outdated/editor-backlog-links-mermaid.md)）。
 > 本切片没有改任何 editor 现有文件（`view.rs`/`element.rs`/`geometry.rs`/`controller.rs`/
 > `markdown.rs`），只新增 `crates/app/src/mermaid.rs` + 模块声明 + 依赖 + 文档。
 
@@ -1498,7 +1498,7 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 
 ### 18.8 M3a 实施记录（2026-11-18，暗色主题 + CJK 字体回退）
 
-> 输入：[`docs/notes/editor-backlog-links-mermaid.md`](../notes/editor-backlog-links-mermaid.md)
+> 输入：[`docs/outdated/editor-backlog-links-mermaid.md`](../outdated/editor-backlog-links-mermaid.md)
 > §2「M3」。本切片只做**暗色 SVG 配色 + CJK 字体回退**，并保持 M1/M2 的
 > 输入/输出上限、`catch_unwind`、`ResvgSafe` 管线与失败回退语义。
 > **不做**：SVG/HTML/PDF 导出、独立子进程 + 超时隔离、WebView、跨文档共享缓存、
@@ -1577,7 +1577,7 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 
 ## 19. 外部链接增强实施记录（2026-11-17，Ctrl/Cmd+单击 / 右键菜单 / scheme 策略 / 内部链接）
 
-> 输入：[`docs/notes/editor-backlog-links-mermaid.md`](../notes/editor-backlog-links-mermaid.md) §1。
+> 输入：[`docs/outdated/editor-backlog-links-mermaid.md`](../outdated/editor-backlog-links-mermaid.md) §1。
 > 本切片只做**普通 Markdown 链接**（`[text](dest)`）；wiki 链接、图片、表格、Mermaid
 > 的既有行为不变（wiki 仍是单击打开；图片/表格/Mermaid 仍是 Object）。
 

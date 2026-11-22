@@ -1,5 +1,8 @@
 # ManagementCapV2 schema 12 与迁移（ADR 0015 S4a2）
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 状态：S4a2 已实现（`crates/relay/src/db/schema.rs`）。**未启用 V2**：本切片只落
 > **存储形状 + 迁移 + 约束**，不实现控制链验证/cap 门限/`/authz/*`/`/control/submit`
 > （S4b），不改客户端，不改 v1 wire 与行为。依据
@@ -168,7 +171,7 @@ V2 控制提交的幂等/回执：`request_hash`、`control_rev`（FK → 控制
 
 S4b 落地时只需在此 schema 上写读写路径：表/列/约束已经就位，**不需要再升 schema**。
 
-## 7. 验证（2026-11-14，Linux，dev `2b606f9` + 本切片）
+## 7. 验证（2026-11-14，Linux，dev 旧基线 + 本切片）
 
 ```bash
 export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0

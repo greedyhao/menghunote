@@ -1,5 +1,8 @@
 # 决策简报 0002 — 编辑器内核（Typora 式所见即所得）
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 状态：**待 GPT 决策**（`bluetrum/gpt-6.1-sol`, `reasoning_effort: "max"`）
 > 决策落地后请写 `docs/adr/0002-editor-core.md`
 > 提交时把「要决断的问题」至「输出要求」整段作为 prompt。
@@ -132,7 +135,7 @@ gpui-kit = { version = "=0.7.3", default-features = false, features = ["test-sup
 `gpui-unofficial 1.27.0` 的 README 原文要点：
 
 - 它是 **gpui-archipelago（"GPUI-lago"）的自动化非官方发布**，由 Zed `v1.27.0`
-  （commit `c84af5b99cbc366d675064e52b23664a015b6e35`）生成；
+  （commit 旧基线）生成；
 - 明确写着 **"unofficial, not affiliated with or maintained by Zed Industries"**；
 - 在项目自述里，`gpui-unofficial` 条目下直接写着 **"Currently needs a maintainer"**；
 - 版本号逐字取自 Zed 的 semver：**已发布版本不可替换**，修复只能等下一个 Zed release。

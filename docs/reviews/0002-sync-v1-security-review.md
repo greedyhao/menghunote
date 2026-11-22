@@ -1,13 +1,16 @@
 # 评审 0002 — 同步/加密 v1 安全架构评审（最终，gpt-6.1-sol，2026-11-12）
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
 
 
 > **历史留档**：本文写于 2026-11-13 历史整理前；文中哈希只在 `backup/dev-20261113` 可达，
 > 见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
 
-> 对象：`docs/briefs/0005-sync-status-and-plan.md`；取样 HEAD `d875ec9`（简报以 `0b30b2e` 为基线）。
-> 评审期间 `5937386`（槽 AAD/grant_id）及 ADR §31–§33 已落地；**新增 ADR 是已决方向，不等于实现已验收**；最终发布须再审最终 diff。
+> 对象：`docs/outdated/0005-sync-status-and-plan.md`；取样 HEAD 旧基线（简报以 旧基线 为基线）。
+> 评审期间 旧基线（槽 AAD/grant_id）及 ADR §31–§33 已落地；**新增 ADR 是已决方向，不等于实现已验收**；最终发布须再审最终 diff。
 > 本评审只读静态审计，未改文件、未运行 cargo，不把测试数量或 teammate 三绿当安全证明。
 
 ## 结论

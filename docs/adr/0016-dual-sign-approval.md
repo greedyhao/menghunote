@@ -1,5 +1,8 @@
 # ADR 0016 — 双签协调：ApprovalEnvelope 与收件箱
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 状态：**已决**（2026-11-14，GPT 决策；S4d1/S4d2）。
 > 关联：[ADR 0015](0015-management-cap-v2.md)（OperationV2/两签）。
 > S0 门禁：可先做离线/仿真；真实 vault 启用/发布 V2 前必须过真实 TLS/Windows。
@@ -107,7 +110,7 @@ kind1 另验。真实 TLS/Windows 两实例导入/审核/重启实测仍为 V2 �
 
 ## S4d1a 实施记录（2026-11-14）
 
-> 状态：**S4d1a 已实现**（Linux，dev `b32a5b2` + 本切片）。范围 = 客户端 V2 管理**基础**：
+> 状态：**S4d1a 已实现**（Linux，dev 旧基线 + 本切片）。范围 = 客户端 V2 管理**基础**：
 > 控制链回放、cap 缓存/选择、realm3 challenge/token 与 v2 管理请求鉴权封装。
 > **未做**：`OperationV2` 构造/签名/提交、`ApprovalEnvelopeV1`、双签 UI/收件箱（S4d1b）；
 > **未启用真实 vault**；真实 TLS/Windows 系统根/DPAPI 未验，不宣称生产可用。
@@ -230,7 +233,7 @@ cap 证据/收件箱（S4d2 schema 12→13）与 UI。**不得**绕过本文的�
 
 ## S4d1b 实施记录（2026-11-14）
 
-> 状态：**S4d1b 已实现**（Linux，dev `b32a5b2` + 本切片）。范围 = 库级手工双签通道（通道 A）：
+> 状态：**S4d1b 已实现**（Linux，dev 旧基线 + 本切片）。范围 = 库级手工双签通道（通道 A）：
 > `ApprovalEnvelopeV1`、typed `OperationV2` 构造/签名、双签状态机、`/v2/control/submit` 提交与
 > 回执对账、草稿持久化。**未做** App UI（S4d1c）、收件箱 relay 表/API（S4d2）、
 > rotation/recovery 构造；**未启用真实 vault**；真实 TLS/Windows/DPAPI 未验，不宣称生产可用。
@@ -370,7 +373,7 @@ cargo test -p menghunote-app --features dev-sync # 365 passed（基线）
 
 ## S4d1c 实施记录（2026-11-18）
 
-> 状态：**S4d1c 已实现但默认隐藏**（Linux，dev `e3830ec` + 本切片；个人用户不需要 V2，
+> 状态：**S4d1c 已实现但默认隐藏**（Linux，dev 旧基线 + 本切片；个人用户不需要 V2，
 > 只有 `MENGHUNOTE_EXPERIMENTAL_V2=1` 才在设置页显示）。范围 = App 侧**管理 UI**
 > （设置页里的「管理（V2 控制面 / 通道 A 双签）」区）：状态概览、设备/成员只读列表、
 > 审批详情/指纹、`.mn-approval` 导入导出、A 签署 / B 加签 / 满签提交 / 取消。
@@ -484,7 +487,7 @@ legacy 真实 relay/vault 的"未启用 V2"、真实 `AppRoot` 设置页入口�
 
 ## S4d2 实施记录（2026-11-18）
 
-> 状态：**S4d2 已实现**（Linux，dev `e3830ec` + 本切片）。范围 = relay 侧**审批收件箱（通道 B）**：
+> 状态：**S4d2 已实现**（Linux，dev 旧基线 + 本切片）。范围 = relay 侧**审批收件箱（通道 B）**：
 > schema 14、5 个 `/v2/vaults/{V}/approvals*` 端点、事务内授权/验签/幂等/惰性终态。
 > **未做**：客户端管理 UI（S4d1c）、真实 vault 启用 V2、真实 TLS/Windows 实机；
 > relay 仍**不持**任何管理私钥、不代签、不改控制链/门限/Operation 语义。

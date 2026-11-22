@@ -254,7 +254,7 @@ epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当�
 
 ### 9.4 Stage 1A Release 标定结论与缺陷收口（2026-11-21）
 
-`--release` 重跑后（详见 `sync-phase0-metrics.md` §8）：
+`--release` 重跑后（原度量记录已随 2026-11-22 文档整理清理，见 git 历史）：
 
 - 聚合正文把 `doc_loads` 从“每条一次”降到“每文档每页一次”：单文档 2000 条
   `2000 → 8`、5000 条 `5000 → 20`；5000 条/20 篇 `5000 → 400`。
@@ -278,9 +278,8 @@ epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当�
   默认值；最终值仍需用户确认。强制追赶不使用这两个阈值。
 - Phase 1B **尚未实现**；上述阈值确认后再编码。
 - Phase 1A 代码已落地：批量 inbox 原子化、按文档聚合 integrate、release 标定、
-  precheck/乱序/防饥饿、baseline detached merge；完整评审入口见
-  [`sync-review-packet-20261121.md`](sync-review-packet-20261121.md)，
-  文件清单见 [`sync-phase1a-review-index.md`](sync-phase1a-review-index.md)。
+  precheck/乱序/防饥饿、baseline detached merge；当时的评审入口与文件清单
+  已于 2026-11-22 文档整理时清理（见 git 历史）。
 
 ---
 
@@ -305,7 +304,7 @@ epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当�
    （最终 release 复跑 58.8 s，同量级；5→20 约 16–17×）。因此“`gate_hold` 小”
    不能当成“全链路 <3 s”，也不能据此放高 16 MiB 机会性上限。
 4. **“每页 ~2 s/篇”的折算不成立；大文档成本在 verify，不在纯 replay。** M3 实测
-   （`sync-phase0-metrics.md` §8.7.7）：1 MiB 单文档、1 条大 insert 的
+   （原 Phase 0 度量记录，已随 2026-11-22 文档整理清理）：1 MiB 单文档、1 条大 insert 的
    `load_body_doc` ≈2 ms；拆成 256 条 4 KiB update ≈6 ms。§10.3 的 45 s@20MiB
    是 **baseline_apply 的 `verify_imported`**（`local` + `baseline_merge` 两行
    update 的 attached import/merge），不是 aggregate 每页的 `load_body_doc`。

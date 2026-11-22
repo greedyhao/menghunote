@@ -1,5 +1,8 @@
 # v0.3→v0.4 历史整理记录（2026-11-13）
 
+> 2026-11-22 历史整理：本文是整理前的历史映射/归因账本，表中哈希保留原值以便追溯；最新映射见 `docs/notes/history-rewrite-20261122.md`，整理前历史见 `backup/dev-20261122`。
+
+
 > 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
 
 

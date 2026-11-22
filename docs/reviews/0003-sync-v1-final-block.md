@@ -1,12 +1,15 @@
 # 评审 0003 — 同步 v1 最终 BLOCK 与 M0 最小阻断清单（gpt-6.1-sol，2026-11-12）
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 历史文档：以下 commit 哈希属于 2026-11-16 整理前历史；映射与 backup 分支见 [history-rewrite-20261116](../notes/history-rewrite-20261116.md)。
 
 
 > **历史留档**：本文写于 2026-11-13 历史整理前；文中哈希只在 `backup/dev-20261113` 可达，
 > 见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
 
-> 对象：committed HEAD `60af841`；证据边界：只读静态审计，未改文件/未跑 cargo。
+> 对象：committed HEAD 旧基线；证据边界：只读静态审计，未改文件/未跑 cargo。
 > 结论：**BLOCK，不批准 `v0.4-sync`（含 localhost/非生产）**。不是可销毁实验版；用户已明确走完整 M0。
 > 本文件是最终报告的仓库留档；修复后须对**新的已提交 HEAD** 重新复审。
 

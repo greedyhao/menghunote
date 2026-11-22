@@ -1,6 +1,8 @@
 # 决策简报 0001 — 本地存储格式与数据流架构
 
-> 状态：**已被 [`0003-storage-sync-consolidated.md`](0003-storage-sync-consolidated.md) 取代**（2026-11-08）。
+> **已归档（2026-11-22 文档整理）**：本文被判定为「已作废 / 被取代 / 已完成的待办」，移入 `docs/outdated/` 保留追溯，**不作为当前状态依据**。归档说明见 [`docs/outdated/README.md`](README.md)。
+
+> 状态：**已被 [`0003-storage-sync-consolidated.md`](../briefs/0003-storage-sync-consolidated.md) 取代**（2026-11-08）。
 > 取代原因：用户已定「不支持外部编辑、单库为真源、服务端密文/本地明文」，且 cang-jie/tantivy/Loro
 > 的版本事实已重新核实。本文件保留作历史，不再提交决策。
 > （原状态：待 GPT 决策，`bluetrum/gpt-6.1-sol`, `reasoning_effort: "max"`）
@@ -38,7 +40,7 @@
 > **正确形态是：Markdown 纯文本为唯一真源 + 渲染层派生样式**。
 > 因此 CRDT 应使用**文本 CRDT**（`LoroText`，字符级），而非富文本 CRDT。
 > 附带好处：纯文本对 AI 切块/embedding 天然友好，对导出/迁移也最安全。
-> 编辑器侧的具体设计见 [`docs/briefs/0002-editor-core.md`](0002-editor-core.md)。
+> 编辑器侧的具体设计见 [`docs/briefs/0002-editor-core.md`](../briefs/0002-editor-core.md)。
 
 ## 已核实的技术事实（2026-11，以此为准，勿臆断版本）
 

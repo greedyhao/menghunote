@@ -1,5 +1,8 @@
 # ADR 0013 — 生产 relay 接入：模式、URL 策略与 ControlPin 持久化
 
+> 2026-11-22 历史整理：本文是整理前的历史文档，文中旧 commit 锚点已清除（原哈希不再对应新 `main`）；原始版本见 `backup/dev-20261122`，旧→新映射见 `docs/notes/history-rewrite-20261122.md`。
+
+
 > 状态：**已决**（2026-11-13，GPT 决策；S1–S3 实施）。
 > 关联：[ADR 0006](0006-sync-v1.md)（控制链/pin/§35 提交规则）、[ADR 0011](0011-sync-onboarding-ui.md)（配置）、
 > [ADR 0012](0012-autosync-two-phase-gate.md)（预算）。
@@ -112,7 +115,7 @@
 
 ## 实施记录
 
-### S1（2026-11-13，`2124d6a`）
+### S1（2026-11-13，旧基线）
 
 `RelayMode`/URL 唯一权威 parser、`PinStore`（`sync.control_pin` canonical CDE v1）、
 `VerifiedHead`/`commit_verified_head`（事务重读 + CAS）与 `open_pinned_client` 受限入口。

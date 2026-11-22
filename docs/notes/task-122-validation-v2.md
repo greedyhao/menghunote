@@ -1,7 +1,7 @@
 # task-122：验证修订 2（CheckpointCommit v2 + receipt HMAC + GC 版本门禁）
 
-> 状态：**已完成**（`dev` 工作树；未 commit）。范围按交接文档
-> [`0007-sync-handoff.md`](../briefs/0007-sync-handoff.md) §3/§4/§8 的 task-122 条目。
+> 状态：**已完成并提交**（当前 `main`；「未 commit」是 2026-11-19 记录时的状态）。范围按交接文档
+> [`0007-sync-handoff.md`](../outdated/0007-sync-handoff.md) §3/§4/§8 的 task-122 条目。
 > **不改** ADR 0006 已冻结的 MNE1 信封 / 密钥槽 / 控制链 / 鉴权语义，也不改
 > `ObjectCommit`/`ManifestV1`/`ActivationTV1` 的既有字段与签名域。
 
