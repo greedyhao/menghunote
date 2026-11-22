@@ -25,6 +25,8 @@
 //! - [`Construct`]：可投影的构造（标题/引用/列表项/围栏代码/行内构造）；
 //! - [`ListItem`] / [`ListBlock`]：列表块树（嵌套层级、有序起始号、松紧、
 //!   续行缩进、子段落、内部围栏）；
+//! - [`TableBlock`] / [`TableRow`]：GFM 表格块树（整表跨度、表头行、分隔行、
+//!   数据行、每格源码区间与对齐方式；ADR 0019 S3a）；
 //! - [`LineInfo`]：逐源码行语义（引用前缀、列表归属、是否在围栏/表格里），
 //!   供 app 做 gutter / hanging indent / 命中几何；
 //! - [`ParsedMarkdown`]：上述内容的集合，外加 `code_spans` / `unsupported_spans`
@@ -32,13 +34,14 @@
 //!
 //! # 明确不做
 //!
-//! 图片 Object、任务框点击、表格单元格交互、脚注/数学/alerts、HTML 执行、
-//! 任何源码归一化或重新序列化。这些是 ADR 0019 S2/S3 的范围。
+//! 图片 Object、任务框点击、**表格单元格就地编辑/加行加列/拖拽**、脚注/数学/alerts、
+//! HTML 执行、任何源码归一化或重新序列化。表格只提供**只读**块树与源码区间，
+//! 渲染（Object Block / 编辑源码切换）在 editor/app（ADR 0019 S3a/S3b 的范围）。
 #![forbid(unsafe_code)]
 
 use std::fmt;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 /// 源码字节区间（半开 `[start, end)`）。
 ///
@@ -330,6 +333,114 @@ pub enum LineKind {
     ThematicBreak,
 }
 
+/// GFM 表格单元格的对齐方式（来自分隔行 `:---:` / `---:` / `:---`）。
+///
+/// 与 `pulldown-cmark` 的 `Alignment` 一一对应，但**本 crate 自己的类型**：
+/// 上游枚举不进入公共 API，升级解析器时不强迫下游改签名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub enum TableAlignment {
+    /// 默认（分隔行里没有冒号）。
+    #[default]
+    None,
+    /// 左对齐（`:---`）。
+    Left,
+    /// 居中（`:---:`）。
+    Center,
+    /// 右对齐（`---:`）。
+    Right,
+}
+
+/// 一行表格（表头行或数据行）的源码语义（ADR 0019 S3a）。
+///
+/// `cells` 与 [`TableBlock::columns`] 等长：解析器给出的列数不足时用空区间补齐，
+/// 多出的列（GFM 会丢弃）不存在。cell 区间已去掉 GFM 的单层首尾空白，
+/// **不含** `|` 边界与两侧空白。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRow {
+    /// 整行内容区间（不含 `\n` / `\r\n`）。
+    pub span: Span,
+    /// 源码行号（0 起）。
+    pub line: usize,
+    /// 每列 cell 文本的源码区间（长度 = [`TableBlock::columns`]；空 cell 是空区间）。
+    pub cells: Vec<Span>,
+}
+
+impl TableRow {
+    /// 第 `column` 列的 cell 区间；越界返回 `None`（不猜列，也不 panic）。
+    #[must_use]
+    pub fn cell(&self, column: usize) -> Option<Span> {
+        self.cells.get(column).copied()
+    }
+}
+
+/// 一个 GFM 表格块（ADR 0019 S3a）。
+///
+/// 这是**只读渲染**需要的最小结构：整表源码跨度 + 表头/分隔行/数据行 + 每行
+/// 每个 cell 的源码区间 + 对齐信息。它**不产生任何新文本**，所有区间都能在
+/// 源码里逐字节切片回原文；object 投影与绘制都由下游（editor/app）决定。
+///
+/// # 与 `unsupported_spans` 的关系
+///
+/// 表格不再是“未支持块”：它有自己的块树，因此**不进入** `unsupported_spans`
+/// （否则 editor 的 Object Block 判定会与“未支持块”冲突）。但表格内部仍然是
+/// 原子块：内部行内构造不参与源码投影，见 [`ParsedMarkdown::opaque_spans`]。
+///
+/// # 边界（写死，测试钉住）
+///
+/// - [`Self::span`] 覆盖整表源码但**不含**表格最后一行之后的换行符：把它换成
+///   单行 Object 占位时，后面的换行仍留在正文里，不会与下一段粘成一行；
+/// - 行区间同样不含行尾换行；
+/// - GFM 规定表格必须由表头行 + 分隔行组成，因此 [`Self::header`] 与
+///   [`Self::delimiter`] 恒存在（解析器不给出表头的异常输入不会变成表格）；
+/// - 分隔行不产生 `TableRow` 事件（`pulldown-cmark` 只发 `TableHead` / `TableRow`），
+///   这里按“表头行的下一行”定位它，只给整行区间（对齐信息在
+///   [`Self::alignments`] 里）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableBlock {
+    /// 整表源码区间（表头行起点 .. 最后一行的内容终点；不含行尾换行）。
+    pub span: Span,
+    /// 表头行。
+    pub header: TableRow,
+    /// 分隔行整行区间（不含行尾换行）。
+    pub delimiter: Span,
+    /// 数据行（按源码顺序；可能为空）。
+    pub rows: Vec<TableRow>,
+    /// 每列对齐方式（长度 = [`Self::columns`]）。
+    pub alignments: Vec<TableAlignment>,
+    /// 列数（由分隔行决定；恒 ≥ 1）。
+    pub columns: usize,
+    /// 首行行号（0 起；= 表头行行号）。
+    pub first_line: usize,
+    /// 末行行号（0 起，含）。
+    pub last_line: usize,
+}
+
+impl TableBlock {
+    /// 数据行数（不含表头与分隔行）。
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// 第 `row` 条数据行；越界返回 `None`。
+    #[must_use]
+    pub fn row(&self, row: usize) -> Option<&TableRow> {
+        self.rows.get(row)
+    }
+
+    /// 第 `row` 条数据行第 `column` 列的 cell 区间；任一越界返回 `None`。
+    #[must_use]
+    pub fn cell(&self, row: usize, column: usize) -> Option<Span> {
+        self.rows.get(row)?.cell(column)
+    }
+
+    /// 第 `column` 列的对齐方式（越界按默认对齐，不 panic）。
+    #[must_use]
+    pub fn alignment(&self, column: usize) -> TableAlignment {
+        self.alignments.get(column).copied().unwrap_or_default()
+    }
+}
+
 /// 一行源码的语义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineInfo {
@@ -382,14 +493,39 @@ pub struct ParsedMarkdown {
     /// 每个图片同时也出现在 [`Self::constructs`] 里（`ConstructKind::Image`）；
     /// 这里额外给出目标 URL，投影层据此判断能否渲染成 Object Block。
     pub images: Vec<ImageSpan>,
+    /// GFM 表格块（ADR 0019 S3a；按 `span` 起点排序）。
+    ///
+    /// 表格是**原子块**：内部行内构造不会出现在 [`Self::constructs`] 里，
+    /// editor 把它投影成 Object Block 或（不满足整行独占时）原样显示源码。
+    pub tables: Vec<TableBlock>,
     /// 可投影构造（块级 + 行内；按 span/kind 稳定排序）。
     pub constructs: Vec<Construct>,
     /// 代码块区间（围栏/缩进；editor 用它抑制旧 scanner 在代码内部的构造）。
     pub code_spans: Vec<Span>,
-    /// 未支持块区间（表格 / HTML 块；editor 原样显示、不投影内部构造）。
+    /// 未支持块区间（HTML 块 / Setext / 无空格列表 marker 等；editor 原样显示、
+    /// 不投影内部构造）。
+    ///
+    /// **表格不在这里**（ADR 0019 S3a）：表格有 [`Self::tables`] 块树，属于已支持
+    /// 原子块；把整表再塞进来会与 Object Block 判定冲突。需要“不投影内部构造”的
+    /// 调用方请用 [`Self::opaque_spans`]。
     pub unsupported_spans: Vec<Span>,
     /// 行内构造里出现过“定位不确定”的情况（editor 应整篇退回旧 scanner 的行内投影）。
     pub uncertain_inline: bool,
+}
+
+impl ParsedMarkdown {
+    /// 不投影内部行内构造的**原子块**区间（代码块 + 表格 + 未支持块）。
+    ///
+    /// editor 用它回答“这个构造是不是在原子块内部”：在内部的构造一律按源码原样
+    /// 显示（代码/表格/HTML 里的 `**`、`![...]` 都不是可投影语法）。返回顺序按区间
+    /// 起点近似有序，调用方按需自行排序/合并，不假设互不重叠。
+    pub fn opaque_spans(&self) -> impl Iterator<Item = Span> + '_ {
+        self.code_spans
+            .iter()
+            .copied()
+            .chain(self.tables.iter().map(|table| table.span))
+            .chain(self.unsupported_spans.iter().copied())
+    }
 }
 
 /// ADR 0019 §1 规定的 Options：显式开启表格/任务列表/删除线。
@@ -460,6 +596,22 @@ struct CodeFrame {
     info: String,
 }
 
+/// 表格块构建状态。
+struct TableFrame {
+    span_start: usize,
+    alignments: Vec<TableAlignment>,
+    header: Option<TableFrameRow>,
+    rows: Vec<TableFrameRow>,
+    /// 正在收集的当前行（表头或数据行）。
+    current: Option<TableFrameRow>,
+}
+
+/// 一行表格构建中的原始区间（cell 尚未裁掉首尾空白）。
+struct TableFrameRow {
+    span: Span,
+    cells: Vec<Span>,
+}
+
 /// 行内构造的开始位置。
 struct InlineFrame {
     kind: InlineKind,
@@ -493,7 +645,11 @@ struct Builder<'a> {
     /// 解析出的普通链接元数据。
     links: Vec<LinkSpan>,
     quote_stack: Vec<Span>,
-    table_stack: Vec<Span>,
+    table_stack: Vec<TableFrame>,
+    /// 正在收集的 cell 起点（`TagEnd::TableCell` 时配对成区间）。
+    table_cell_start: Option<usize>,
+    /// 解析出的表格块（按 `span` 起点排序后写进 [`ParsedMarkdown::tables`]）。
+    tables: Vec<TableBlock>,
     html_stack: Vec<Span>,
     constructs: Vec<Construct>,
     headings: Vec<(Span, u8)>,
@@ -524,6 +680,8 @@ impl<'a> Builder<'a> {
             links: Vec::new(),
             quote_stack: Vec::new(),
             table_stack: Vec::new(),
+            table_cell_start: None,
+            tables: Vec::new(),
             html_stack: Vec::new(),
             constructs: Vec::new(),
             headings: Vec::new(),
@@ -601,7 +759,19 @@ impl<'a> Builder<'a> {
                     info,
                 });
             }
-            Tag::Table(_) => self.table_stack.push(range),
+            Tag::Table(alignments) => self.table_stack.push(TableFrame {
+                span_start: range.start,
+                alignments: alignments
+                    .iter()
+                    .map(|alignment| convert_alignment(*alignment))
+                    .collect(),
+                header: None,
+                rows: Vec::new(),
+                current: None,
+            }),
+            Tag::TableHead => self.start_table_row(range, true),
+            Tag::TableRow => self.start_table_row(range, false),
+            Tag::TableCell => self.table_cell_start = Some(range.start),
             Tag::HtmlBlock => self.html_stack.push(range),
             Tag::Superscript | Tag::Subscript => {}
             Tag::Strong => self.push_inline(InlineKind::Bold, range.start),
@@ -618,9 +788,6 @@ impl<'a> Builder<'a> {
                 self.push_inline(InlineKind::Image, range.start);
             }
             Tag::Paragraph
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
             | Tag::FootnoteDefinition(_)
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
@@ -649,10 +816,13 @@ impl<'a> Builder<'a> {
                 }
             }
             TagEnd::Table => {
-                if let Some(start) = self.table_stack.pop() {
-                    let span = Span::new(start.start, range.end.max(start.end));
-                    self.table_spans.push(span);
-                    self.unsupported_spans.push(span);
+                if let Some(frame) = self.table_stack.pop() {
+                    // 表格是已支持原子块：**不进** `unsupported_spans`（ADR 0019 S3a），
+                    // 但整表区间仍然登记为表格行，供 `LineKind::Table` / 不投影内部构造。
+                    if let Some(table) = self.build_table(frame, range.end) {
+                        self.table_spans.push(table.span);
+                        self.tables.push(table);
+                    }
                 }
             }
             TagEnd::HtmlBlock => {
@@ -668,10 +838,10 @@ impl<'a> Builder<'a> {
             TagEnd::Strikethrough => self.finish_inline(InlineKind::Strike, range.end),
             TagEnd::Link => self.finish_inline(InlineKind::Link, range.end),
             TagEnd::Image => self.finish_inline(InlineKind::Image, range.end),
+            TagEnd::TableHead => self.finish_table_row(true),
+            TagEnd::TableRow => self.finish_table_row(false),
+            TagEnd::TableCell => self.finish_table_cell(range.end),
             TagEnd::Paragraph
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::FootnoteDefinition
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
@@ -1153,6 +1323,127 @@ impl<'a> Builder<'a> {
         })
     }
 
+    /// 开始收集一行表格（表头或数据行）。
+    ///
+    /// `pulldown-cmark` 在 `TableHead` / `TableRow` 开始时给出整行区间（含行尾换行），
+    /// 这里先记下区间，cell 由后续 `TableCell` 事件补齐。
+    fn start_table_row(&mut self, range: Span, _header: bool) {
+        let Some(frame) = self.table_stack.last_mut() else {
+            return;
+        };
+        frame.current = Some(TableFrameRow {
+            span: range,
+            cells: Vec::new(),
+        });
+    }
+
+    /// 结束一行表格：表头行存进 `header`，其余按源码顺序进 `rows`。
+    fn finish_table_row(&mut self, header: bool) {
+        let Some(frame) = self.table_stack.last_mut() else {
+            return;
+        };
+        let Some(row) = frame.current.take() else {
+            return;
+        };
+        if header {
+            // GFM 表格恒有表头；重复的 TableHead 只保留第一个（防御：不覆盖已收集的行）。
+            if frame.header.is_none() {
+                frame.header = Some(row);
+            }
+        } else {
+            frame.rows.push(row);
+        }
+    }
+
+    /// 结束一个 cell：`Start(TableCell)` 的起点 + `End(TableCell)` 的终点。
+    fn finish_table_cell(&mut self, end: usize) {
+        let Some(start) = self.table_cell_start.take() else {
+            return;
+        };
+        let Some(frame) = self.table_stack.last_mut() else {
+            return;
+        };
+        let Some(row) = frame.current.as_mut() else {
+            return;
+        };
+        row.cells.push(Span::new(start.min(end), end.max(start)));
+    }
+
+    /// 把事件收集到的表格帧变成 [`TableBlock`]（区间按源码行裁齐，cell 去掉首尾空白）。
+    ///
+    /// 返回 `None` 的情况（宁可不产生表格块，也不猜偏移）：
+    /// - 没有表头行（GFM 不可能，防御异常事件流）；
+    /// - 表头行之后没有分隔行（区间越界）；
+    /// - 事件区间整体为空/倒序。
+    fn build_table(&self, frame: TableFrame, end: usize) -> Option<TableBlock> {
+        let header = frame.header?;
+        let source_len = self.source.len();
+        let start = frame.span_start.min(source_len);
+        let end = end.min(source_len).max(start);
+        if end <= start {
+            return None;
+        }
+        let first_line = self.line_index_at(start)?;
+        let last_line = self.line_index_at(end.saturating_sub(1))?;
+        if last_line < first_line {
+            return None;
+        }
+        // 整表区间不含最后一行之后的换行：Object 占位不能吞掉换行，否则会和下一段粘行。
+        let last = self.lines.get(last_line)?;
+        let span = Span::new(start, last.content_end.max(start));
+        let columns = frame.alignments.len().max(1);
+        let header = self.finish_table_source_row(header, columns)?;
+        // 分隔行紧跟表头行（GFM 语法要求如此，pulldown 也为它不产生 TableRow 事件）。
+        let delimiter_line = header.line.checked_add(1)?;
+        if delimiter_line > last_line {
+            return None;
+        }
+        let delimiter_info = self.lines.get(delimiter_line)?;
+        let delimiter = Span::new(delimiter_info.start, delimiter_info.content_end);
+        let mut alignments = frame.alignments;
+        alignments.resize(columns, TableAlignment::None);
+        let rows = frame
+            .rows
+            .into_iter()
+            .filter_map(|row| self.finish_table_source_row(row, columns))
+            .collect();
+        Some(TableBlock {
+            span,
+            header,
+            delimiter,
+            rows,
+            alignments,
+            columns,
+            first_line,
+            last_line,
+        })
+    }
+
+    /// 一行表格的原始区间 → [`TableRow`]：整行裁到源码行内容，cell 去首尾空白并补列。
+    fn finish_table_source_row(&self, row: TableFrameRow, columns: usize) -> Option<TableRow> {
+        let source_len = self.source.len();
+        let start = row.span.start.min(source_len);
+        let line = self.line_index_at(start)?;
+        let info = self.lines.get(line)?;
+        let content_end = info.content_end.max(info.start);
+        let row_start = start.min(content_end);
+        let mut cells = Vec::with_capacity(columns);
+        for raw in row.cells.into_iter().take(columns) {
+            let cell_start = raw.start.clamp(row_start, content_end);
+            let cell_end = raw.end.clamp(cell_start, content_end);
+            cells.push(trim_span(self.source, Span::new(cell_start, cell_end)));
+        }
+        // 列数不足（GFM 允许缺列）用空 cell 补齐，下游可以按列索引，不必判断长度。
+        while cells.len() < columns {
+            cells.push(Span::empty(content_end));
+        }
+        Some(TableRow {
+            span: Span::new(row_start, content_end),
+            line,
+            cells,
+        })
+    }
+
     fn finish(self) -> ParsedMarkdown {
         let Builder {
             source,
@@ -1167,6 +1458,7 @@ impl<'a> Builder<'a> {
             fence_spans,
             indented_spans,
             mut unsupported_spans,
+            mut tables,
             table_spans,
             html_spans,
             rule_lines,
@@ -1267,9 +1559,24 @@ impl<'a> Builder<'a> {
         images.dedup();
         links.sort_by_key(|link| (link.span.start, link.span.end));
         links.dedup();
-        // wiki 链接：自定义 inline pass；排除代码块/行内代码/转义（L1）。
-        let (wiki_links, wiki_constructs) = scan_wiki_links(source, &code_spans, &all);
+        tables.sort_by_key(|table| (table.span.start, table.span.end));
+        // wiki 链接：自定义 inline pass；排除代码块/行内代码/表格/转义（L1）。
+        // 表格是原子块：单元格里的 `[[...]]` 不参与源码投影（否则会与 Object 段重叠）。
+        let mut excluded = code_spans.clone();
+        excluded.extend(tables.iter().map(|table| table.span));
+        excluded.extend(
+            all.iter()
+                .filter(|construct| matches!(construct.kind, ConstructKind::InlineCode))
+                .map(|construct| construct.span),
+        );
+        let (wiki_links, wiki_constructs) = scan_wiki_links(source, &excluded);
         all.extend(wiki_constructs);
+        // 表格内部的行内构造不投影：整表要么是 Object 占位，要么原样显示源码。
+        all.retain(|construct| {
+            !tables.iter().any(|table| {
+                table.span.start <= construct.span.start && construct.span.end <= table.span.end
+            })
+        });
         all.sort_by_key(|construct| (construct.span.start, construct.span.end, construct.kind));
 
         // list block 按文档顺序（嵌套 list 的 End 是内层先到），排序后要重映射 list_index。
@@ -1301,6 +1608,7 @@ impl<'a> Builder<'a> {
             lists: list_blocks,
             items,
             images,
+            tables,
             links,
             wiki_links,
             constructs: all,
@@ -1688,19 +1996,8 @@ fn next_char_boundary(source: &str, at: usize, end: usize) -> usize {
 /// 扫描 `[[...]]` wiki 链接（L1）。
 ///
 /// 只接受单行、非代码、非转义的写法；`![[...]]` 暂不支持（当普通文本）。
-fn scan_wiki_links(
-    source: &str,
-    code_spans: &[Span],
-    constructs: &[Construct],
-) -> (Vec<WikiLink>, Vec<Construct>) {
+fn scan_wiki_links(source: &str, excluded: &[Span]) -> (Vec<WikiLink>, Vec<Construct>) {
     let bytes = source.as_bytes();
-    let mut excluded = code_spans.to_vec();
-    excluded.extend(
-        constructs
-            .iter()
-            .filter(|construct| matches!(construct.kind, ConstructKind::InlineCode))
-            .map(|construct| construct.span),
-    );
     let mut links = Vec::new();
     let mut wiki_constructs = Vec::new();
     let mut index = 0usize;
@@ -1828,6 +2125,32 @@ fn split_wiki_inner(
         return None;
     }
     Some((target, heading, alias))
+}
+
+/// `pulldown-cmark` 的对齐枚举 → 本 crate 的 [`TableAlignment`]。
+fn convert_alignment(alignment: Alignment) -> TableAlignment {
+    match alignment {
+        Alignment::None => TableAlignment::None,
+        Alignment::Left => TableAlignment::Left,
+        Alignment::Center => TableAlignment::Center,
+        Alignment::Right => TableAlignment::Right,
+    }
+}
+
+/// 去掉区间首尾的 ASCII 空白（GFM 规定 cell 内容去首尾空白）。
+///
+/// 只裁 ASCII 空白字节，因此端点仍落在 UTF-8 char 边界上。
+fn trim_span(source: &str, span: Span) -> Span {
+    let bytes = source.as_bytes();
+    let mut start = span.start.min(bytes.len());
+    let mut end = span.end.min(bytes.len()).max(start);
+    while start < end && matches!(bytes[start], b' ' | b'\t' | b'\r' | b'\n') {
+        start += 1;
+    }
+    while end > start && matches!(bytes[end - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        end -= 1;
+    }
+    Span::new(start, end)
 }
 
 fn is_escaped(bytes: &[u8], at: usize) -> bool {

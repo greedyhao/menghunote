@@ -90,17 +90,34 @@ pub use model::block::{BlockKind, BlockRun};
 pub use menghunote_markdown::{
     LineInfo as MarkdownLineInfo, LineKind as MarkdownLineKind, ListBlock as MarkdownListBlock,
     ListItem as MarkdownListItem, ListLineInfo as MarkdownListLineInfo, Span as MarkdownSpan,
+    TableAlignment as MarkdownTableAlignment,
 };
-pub use model::controller::{EditorController, GraphemeStep, OutcomeEffect};
+pub use model::controller::{EditorController, GraphemeStep, OutcomeEffect, TableCellTarget};
 pub use model::error::EditorError;
 pub use model::input::InputDocument;
 pub use model::markdown::{
     ConstructKind, MarkdownConstruct, MarkdownDocument, MarkdownError, MarkdownImage,
-    TASK_BOX_DISPLAY,
+    MarkdownTable, MarkdownTableRow, ProjectionCellReveal, TASK_BOX_DISPLAY,
 };
+pub use model::object::{ObjectBlock, ObjectKind};
 pub use model::projection::{
     Bias, BoundaryBias, ProjectionError, ProjectionMap, ProjectionPiece, Segment, SegmentKind,
     OBJECT_PLACEHOLDER, OBJECT_PLACEHOLDER_LEN,
 };
 pub use model::selection::Selection;
 pub use model::style::{StyleKind, StyleRun};
+// ADR 0019 S3b：表格「加行 / 加列 / 删除行 / 删除列」的源码构造（纯函数；控制器把它
+// 变成一次 `EditRequest`，app 只负责点击命中，不自己拼编辑）。
+pub use model::table_edit::{
+    append_column_insertions, append_row_insertions, delete_column_deletions, delete_row_deletion,
+    drop_target, empty_row_text, move_column_replacements, move_row_replacements, TableDeletion,
+    TableInsertion, TableReplacement,
+};
+// ADR 0019 S3b2：单元格就地编辑的纯函数（GFM 转义 / Tab 导航 / 删除行列后的选中格修正），
+// app 只读它们做提示，真正的源码写入仍然只有 `EditorController` 一条路径。
+// ADR 0019 S3b5：行列**重排**后的选中格修正也是纯函数（app 拖拽释放后只读它）。
+pub use model::table_cell_edit::{
+    cell_after_column_deletion, cell_after_column_move, cell_after_row_deletion,
+    cell_after_row_move, escape_cell_pipes, next_cell, previous_cell, sanitize_cell_text,
+    TableCellAddress,
+};

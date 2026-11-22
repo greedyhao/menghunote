@@ -65,10 +65,15 @@ use ropey::Rope;
 use crate::model::block::BlockRun;
 use crate::model::error::EditorError;
 use crate::model::input::InputDocument;
-use crate::model::markdown::{MarkdownDocument, MarkdownImage};
+use crate::model::markdown::{
+    MarkdownDocument, MarkdownImage, MarkdownTable, ProjectionCellReveal,
+};
+use crate::model::object::ObjectBlock;
 use crate::model::projection::ProjectionMap;
 use crate::model::selection::Selection;
 use crate::model::style::StyleRun;
+use crate::model::table_cell_edit;
+use crate::model::table_edit;
 
 /// 本地编辑在 `EditRequest.origin` 里的标记（会话用于排除后台变更）。
 const LOCAL_ORIGIN: &str = "local";
@@ -103,6 +108,50 @@ struct PreeditState {
     text: String,
 }
 
+/// 一个正在就地编辑的表格单元格（ADR 0019 S3b2）。
+///
+/// 用**行号**（表格对象行）+ 行列地址定位，而不是缓存 cell 的源码区间：cell 的
+/// 起止字节会随每次输入变化（cell 文本被解析器裁掉首尾空白、表格加列等），缓存旧
+/// 坐标必然错位。每次需要区间时都从**最新解析**重新取，因此“加行/加列后的新 cell”
+/// 天然可用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CellEditState {
+    /// 表格对象行（表头源码行号，0 起）。
+    line: usize,
+    /// 行下标（0 = 表头，1..=n = 数据行）。
+    row: usize,
+    /// 列下标（0 起）。
+    column: usize,
+    /// 进入编辑前的 cell 源码原文（Esc 取消时逐字节恢复）。
+    original_text: String,
+    /// 进入编辑前的 cell 源码区间（**会话/镜像基线坐标**，字节）。
+    original_span: crate::SourceRange,
+    /// 进入编辑前的 cell 起止 scalar（提交 `ScalarEdit` 用；也是基线坐标）。
+    original_start: UnicodeScalar,
+    original_end: UnicodeScalar,
+    /// 进入编辑前整篇镜像的**字节**长度（提交时据此算 cell 区域的新长度）。
+    base_len: usize,
+}
+
+/// 表格单元格编辑对外的地址（行 0 = 表头；ADR 0019 S3b2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TableCellTarget {
+    /// 表格对象行（表头源码行号，0 起）。
+    pub line: usize,
+    /// 行下标（0 = 表头）。
+    pub row: usize,
+    /// 列下标（0 起）。
+    pub column: usize,
+}
+
+impl TableCellTarget {
+    /// 是否表头行。
+    #[must_use]
+    pub const fn is_header(self) -> bool {
+        self.row == 0
+    }
+}
+
 /// 一个打开的正文文档的纯模型。
 #[derive(Debug, Clone)]
 pub struct EditorController {
@@ -126,6 +175,8 @@ pub struct EditorController {
     /// 普通单击 / 文本选区相交**不会**设置它 —— 对象显现源码只由工具条「编辑源码」
     /// 或 `F2` 触发，`Esc` / 点击块外 / `Ctrl+Enter` 清空（ADR 0019 §1）。
     object_edit_line: Option<usize>,
+    /// 正在就地编辑的表格单元格（ADR 0019 S3b2）；`None` = 不在单元格编辑态。
+    cell_edit: Option<CellEditState>,
     preedit: Option<PreeditState>,
     next_command_seq: u64,
     pending: Option<CommandId>,
@@ -156,6 +207,7 @@ impl EditorController {
             block_runs,
             list_marker_revealed,
             object_edit_line: None,
+            cell_edit: None,
             preedit: None,
             next_command_seq: 0,
             pending: None,
@@ -183,6 +235,7 @@ impl EditorController {
         self.block_runs = block_runs;
         self.list_marker_revealed = list_marker_revealed;
         self.object_edit_line = None;
+        self.cell_edit = None;
         self.preedit = None;
         self.pending = None;
         self.needs_resync = false;
@@ -318,7 +371,7 @@ impl EditorController {
             .unwrap_or(false)
     }
 
-    // ---- 图片对象（ADR 0019 S2a）----
+    // ---- Object Block（ADR 0019 S2a 图片 / S3a 表格）----
 
     /// 全部图片构造（含混排/行内图片；app 只把 `is_block()` 的当对象渲染）。
     #[must_use]
@@ -326,7 +379,37 @@ impl EditorController {
         self.markdown.images()
     }
 
-    /// 指定源码行上的整行独占图片（Object Block 候选）。
+    /// 全部表格块（含引用/列表/缩进里、不投影成对象的表格）。
+    #[must_use]
+    pub fn tables(&self) -> &[MarkdownTable] {
+        self.markdown.tables()
+    }
+
+    /// 全部整块 Object（图片 + 表格，按源码顺序；投影/选中/源码切换的唯一入口）。
+    #[must_use]
+    pub fn objects(&self) -> &[ObjectBlock] {
+        self.markdown.objects()
+    }
+
+    /// 指定源码行上的整块 Object（图片所在行 / 表格表头行）。
+    #[must_use]
+    pub fn object_at_line(&self, line: usize) -> Option<&ObjectBlock> {
+        self.markdown.object_at_line(line)
+    }
+
+    /// Object 对应的图片载荷（不是图片对象时 `None`）。
+    #[must_use]
+    pub fn image_of(&self, object: &ObjectBlock) -> Option<&MarkdownImage> {
+        self.markdown.object_image(object)
+    }
+
+    /// Object 对应的表格载荷（不是表格对象时 `None`）。
+    #[must_use]
+    pub fn table_of(&self, object: &ObjectBlock) -> Option<&MarkdownTable> {
+        self.markdown.object_table(object)
+    }
+
+    /// 指定源码行上的整行独占图片（Object Block 候选；图片专用便捷入口）。
     #[must_use]
     pub fn block_image_at_line(&self, line: usize) -> Option<&MarkdownImage> {
         self.markdown.block_image_at_line(line)
@@ -337,52 +420,53 @@ impl EditorController {
         self.markdown.block_images()
     }
 
-    /// 整行独占图片在当前投影里的 display 区间（未投影成对象时 `None`）。
+    /// 整块 Object 在当前投影里的 display 区间（未投影成对象时 `None`）。
     #[must_use]
     pub fn object_display_range(&self, line: usize) -> Option<Range<usize>> {
-        let image = self.markdown.block_image_at_line(line)?;
-        self.projection.object_display_range(image.span())
+        let object = self.markdown.object_at_line(line)?;
+        self.projection.object_display_range(object.span())
     }
 
-    /// 当前**显式源码模式**的图片行；普通点选/选区相交不会设置它。
+    /// 当前**显式源码模式**的对象行；普通点选/选区相交不会设置它。
     #[must_use]
     pub const fn object_source_edit_line(&self) -> Option<usize> {
         self.object_edit_line
     }
 
-    /// 是否正在编辑某个图片对象的源码。
+    /// 是否正在编辑某个对象（图片/表格）的源码。
     #[must_use]
     pub const fn is_editing_object_source(&self) -> bool {
         self.object_edit_line.is_some()
     }
 
-    /// 进入某个整行独占图片的**源码模式**（工具条「编辑源码」/ `F2`）。
+    /// 进入某个整块 Object 的**源码模式**（工具条「编辑源码」/ `F2`）。
     ///
-    /// 效果：该行不再投影成 Object（源码原样显示），caret 落到图片源码起点。
-    /// 行上没有整行独占图片时返回 `Ok(false)`（不改状态）。
+    /// 效果：该块不再投影成 Object（完整源码原样显示），caret 落到源码起点。
+    /// 行上没有整块 Object 时返回 `Ok(false)`（不改状态）。图片与表格走同一条路径。
     pub fn begin_object_source_edit(&mut self, line: usize) -> Result<bool, EditorError> {
-        let Some(image) = self.markdown.block_image_at_line(line).cloned() else {
+        self.ensure_no_cell_edit()?;
+        let Some(object) = self.markdown.object_at_line(line).cloned() else {
             return Ok(false);
         };
         let text = self.mirror.to_string();
-        let caret = SourceByte::new(image.span().start().get()).to_scalar(&text)?;
+        let caret = SourceByte::new(object.span().start().get()).to_scalar(&text)?;
         self.object_edit_line = Some(line);
         self.selection = Selection::caret(caret);
         self.refresh_projection();
         Ok(true)
     }
 
-    /// 退出图片源码模式（`Esc` / 点击块外 / `Ctrl+Enter`）。
+    /// 退出对象源码模式（`Esc` / 点击块外 / `Ctrl+Enter`）。
     ///
-    /// 退出后对象重新显示为图片；caret 放到对象源码末尾（图片之后），避免停在
+    /// 退出后对象重新显示为图片/表格；caret 放到对象源码末尾（块之后），避免停在
     /// 已被占位符覆盖的源码中间。返回是否真的退出过（未在编辑时 `false`）。
     pub fn end_object_source_edit(&mut self) -> bool {
         let Some(line) = self.object_edit_line.take() else {
             return false;
         };
-        if let Some(image) = self.markdown.block_image_at_line(line).cloned() {
+        if let Some(object) = self.markdown.object_at_line(line).cloned() {
             let text = self.mirror.to_string();
-            if let Ok(caret) = SourceByte::new(image.span().end().get()).to_scalar(&text) {
+            if let Ok(caret) = SourceByte::new(object.span().end().get()).to_scalar(&text) {
                 self.selection = Selection::caret(caret);
             }
         }
@@ -390,17 +474,19 @@ impl EditorController {
         true
     }
 
-    /// 删除一个整行独占图片的**完整源码跨度**（一次 `ScalarEdit` 事务）。
+    /// 删除一个整块 Object 的**完整源码跨度**（一次 `ScalarEdit` 事务）。
     ///
     /// 这是 ADR 0019「Delete/Backspace 先选块、再删整个源跨度」的落点：先选中对象
     /// 再由本方法删除；编辑器内部仍走 `compose_edits` 的同一条路径。
+    /// 表格删除会一次性去掉表头/分隔行/所有数据行（+ 块内换行）。
     pub fn delete_object(&mut self, line: usize) -> Result<Option<EditRequest>, EditorError> {
-        let Some(image) = self.markdown.block_image_at_line(line).cloned() else {
+        self.ensure_no_cell_edit()?;
+        let Some(object) = self.markdown.object_at_line(line).cloned() else {
             return Ok(None);
         };
         let text = self.mirror.to_string();
-        let start = SourceByte::new(image.span().start().get()).to_scalar(&text)?;
-        let end = SourceByte::new(image.span().end().get()).to_scalar(&text)?;
+        let start = SourceByte::new(object.span().start().get()).to_scalar(&text)?;
+        let end = SourceByte::new(object.span().end().get()).to_scalar(&text)?;
         self.selection = Selection::new(start, end);
         if self.object_edit_line == Some(line) {
             self.object_edit_line = None;
@@ -409,7 +495,7 @@ impl EditorController {
         self.delete_backward()
     }
 
-    /// 与当前（非空）文本选区相交的图片对象行号（按文档顺序）。
+    /// 与当前（非空）文本选区相交的对象行号（按文档顺序）。
     ///
     /// 折叠 caret 不算相交（边界上的 caret 是普通的文本落点）；对象**内部**没有
     /// 文本 caret，所以只有跨过对象的选区才会命中这里。
@@ -423,13 +509,14 @@ impl EditorController {
         }
         let (start, end) = (start.get(), end.get());
         self.markdown
-            .block_images()
-            .filter(|image| {
+            .objects()
+            .iter()
+            .filter(|object| {
                 self.projection
-                    .object_display_range(image.span())
+                    .object_display_range(object.span())
                     .is_some_and(|range| range.start < end && start < range.end)
             })
-            .map(MarkdownImage::line)
+            .map(|object| object.line())
             .collect()
     }
 
@@ -442,6 +529,7 @@ impl EditorController {
     ///   IME 组合期间由 `ensure_editable` 拒绝（app 必须先取消组合）。
     pub fn list_enter(&mut self) -> Result<Option<EditRequest>, EditorError> {
         self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
         if !self.selection.is_empty() {
             return self.compose_replace_selection("\n");
         }
@@ -505,6 +593,7 @@ impl EditorController {
     /// - 不是任务项 / 下标越界 → `Ok(None)`（不产生请求，不改文本）。
     pub fn toggle_task_marker(&mut self, index: usize) -> Result<Option<EditRequest>, EditorError> {
         self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
         let Some(item) = self.markdown.list_items().get(index) else {
             return Ok(None);
         };
@@ -526,6 +615,754 @@ impl EditorController {
         // 等长替换：原选区坐标不变；恢复后投影会按新 source 重建（显示新勾选态）。
         self.set_selection(selection)?;
         Ok(Some(request))
+    }
+
+    /// 表格「加行」（ADR 0019 S3b）：在最后一条数据行之后插入一条**空数据行**。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - 只插入、不替换：表头/分隔行/已有数据行**逐字节不变**，也不复制上一行内容；
+    /// - 新行的列数与表格一致、每个 cell 为空（[`table_edit::empty_row_text`]）；
+    /// - 一次点击产生**一个** `EditRequest`（单 `ScalarEdit`），由会话默认撤销组进
+    ///   undo（一次 `Ctrl+Z` 就回到原表）；
+    /// - caret/选区**不因结构操作跳走**：端点按插入点做文本位置映射（表格末尾 →
+    ///   新表格末尾），caret 绝不会落进表格源码内部（对象内部没有文本位置）；表格
+    ///   之外的 caret/选区不受影响；
+    /// - 不切换源码模式：表格仍按 Object Block 投影（`object_edit_line` 不变）；
+    /// - 不是表格对象 / 行号上没有对象 → `Ok(None)`（不产生请求，不改文本）。
+    pub fn append_table_row(&mut self, line: usize) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(None);
+        };
+        let source = self.mirror.to_string();
+        let insertions = table_edit::append_row_insertions(&source, &table);
+        self.compose_table_insertions(&source, insertions)
+    }
+
+    /// 表格「加列」（ADR 0019 S3b）：给表头、分隔行与**每一条数据行**末尾追加一列。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - 每行都在**行内容末尾**插入（只插入、不替换）：已有 cell 的字节、空白与
+    ///   对齐标记逐字保留；分隔行追加默认对齐（无冒号）的 `---`；
+    /// - 新 cell 为空；没有数据行的表格（只有表头 + 分隔行）也能加列；
+    /// - 一次点击产生**一个** `EditRequest`（每条行末尾一个互不重叠的 `ScalarEdit`，
+    ///   按位置升序），整批进同一个撤销组；
+    /// - caret/选区规则与 [`Self::append_table_row`] 相同（插入点按文本位置映射，
+    ///   caret 不会落进表格内部）；
+    /// - 不是表格对象 / 行号上没有对象 → `Ok(None)`。
+    pub fn append_table_column(&mut self, line: usize) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(None);
+        };
+        let source = self.mirror.to_string();
+        let insertions = table_edit::append_column_insertions(&source, &table);
+        self.compose_table_insertions(&source, insertions)
+    }
+
+    /// 在当前 caret / 选区处插入一张**默认 GFM 表格**（ADR 0019 S3b4：正文右键
+    /// 「插入 → 表格」）。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - 插入文本由 [`table_edit::new_table_insertion`] 给出：2 列 × 1 条数据行、
+    ///   cell 全空、分隔行 `---`（默认对齐）；**前后保证独占行块**（文档开头/末尾或
+    ///   空行处不重复补空行）；
+    /// - 一个 `EditRequest`（单 `ScalarEdit`）：`start == end` 是纯插入，非空选区则
+    ///   替换选区（与打字语义一致），由会话默认撤销组进 undo；
+    /// - caret 落在**插入文本之后** = 表格之后（插入文本恒以行尾结束，表格对象内部
+    ///   没有文本位置）；
+    /// - 插入完成即按新 source 重扫 Markdown：表格是整块 Object 时下一帧就按 Object
+    ///   投影（不切换源码模式；如果在代码块等不投影的上下文里插入，源码仍是合法文本）；
+    /// - 不是可编辑状态（持闸/在途命令/IME 组合/单元格编辑）→ 对应错误，不产生请求。
+    pub fn insert_table(&mut self) -> Result<EditRequest, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let source = self.mirror.to_string();
+        let selection = self.selection;
+        let start = selection.start().to_source_byte(&source)?.get();
+        let end = selection.end().to_source_byte(&source)?.get();
+        let replacement = table_edit::new_table_insertion(&source, start, end)?;
+        let edit = ScalarEdit {
+            start: selection.start(),
+            end: selection.end(),
+            replacement,
+        };
+        self.compose_edits(vec![edit])
+    }
+
+    /// 行号上的**整块表格**（不是表格 / 没有对象 → `None`）。克隆一份避免借用冲突。
+    fn table_object_at(&self, line: usize) -> Option<MarkdownTable> {
+        let object = self.markdown.object_at_line(line)?;
+        if !object.kind().is_table() {
+            return None;
+        }
+        self.markdown.object_table(object).cloned()
+    }
+
+    /// 表格「删除行」（ADR 0019 S3b）：删掉第 `row` 行（0 = 表头）**整行含行尾换行**。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - **首版明确不删表头**：`row == 0` → `Ok(None)`（不产生请求、不改正文）；
+    /// - 删除区间由 [`table_edit::delete_row_deletion`] 给出：整行内容 + 本行行尾换行，
+    ///   因此**不留空行**；表格在文档末尾且没有行尾换行时改删前一行的行尾；
+    /// - 一次点击产生**一个** `EditRequest`（单 `ScalarEdit`，替换成空串），由会话默认
+    ///   撤销组进 undo（一次 `Ctrl+Z` 恢复原表）；
+    /// - caret/选区按**删除区间**做文本位置映射，并夹到表格之外（对象内部没有文本
+    ///   位置，绝不让 caret 落进表格源码内部）；表格之外的 caret/选区只按删除量左移；
+    /// - 表格仍是 Object：不切换源码模式；
+    /// - 不是表格对象 / 行号上没有对象 / 行越界 → `Ok(None)`。
+    pub fn delete_table_row(
+        &mut self,
+        line: usize,
+        row: usize,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(None);
+        };
+        if row == 0 || row >= table.total_rows() {
+            return Ok(None);
+        }
+        let source = self.mirror.to_string();
+        let Some(deletion) = table_edit::delete_row_deletion(&source, &table, row) else {
+            return Ok(None);
+        };
+        self.compose_table_deletions(&source, line, vec![deletion])
+    }
+
+    /// 表格「删除列」（ADR 0019 S3b）：从表头、分隔行与所有数据行删掉第 `column` 列。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - **至少保留 1 列**：`columns() <= 1` 或 `column` 越界 → `Ok(None)`（不把表格
+    ///   改成非法结构：GFM 分隔行至少要有一个分隔 cell）；
+    /// - 删除区间由 [`table_edit::delete_column_deletions`] 给出：每行只删本列文本 +
+    ///   一侧分隔符与相邻空白，其它 cell 的字节、行首 `|`、分隔行的冒号（对齐）逐字保留；
+    /// - 每行一条互不重叠的 `ScalarEdit`（按位置升序），整批进**同一个** `EditRequest`
+    ///   = 一个撤销组；
+    /// - caret/选区规则与 [`Self::delete_table_row`] 相同（按删除区间映射并夹到表格外）；
+    /// - 不是表格对象 / 行号上没有对象 → `Ok(None)`。
+    pub fn delete_table_column(
+        &mut self,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(None);
+        };
+        if table.columns() <= 1 || column >= table.columns() {
+            return Ok(None);
+        }
+        let source = self.mirror.to_string();
+        let deletions = table_edit::delete_column_deletions(&source, &table, column);
+        if deletions.is_empty() {
+            return Ok(None);
+        }
+        self.compose_table_deletions(&source, line, deletions)
+    }
+
+    /// 表格「重排行」（ADR 0019 S3b5）：把第 `from` 条**数据行**移动到第 `to` 条。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - `from` / `to` 都是**数据行下标**（0 = 第一条数据行；表头与分隔行不参与，恒不动）；
+    /// - **只重排、不改内容**：整行内容按槽位移动，槽位之间的行尾换行留在原位 ——
+    ///   于是其它行、其它列、表格之外的字节**逐字节不变**，表格总字节数也不变；
+    /// - 一次拖动释放产生**一个** `EditRequest`（单条等长替换），由会话默认撤销组进
+    ///   undo（一次 `Ctrl+Z` 回到原顺序）；
+    /// - caret/选区**不变**：重排是等长置换，表格区间与 scalar 坐标都不动；只有落在
+    ///   表格源码内部的位置会被夹到表格末尾（对象内部没有文本落点）；
+    /// - 表格仍是 Object（不切换源码模式）；
+    /// - 不是表格对象 / 越界 / 原地 / 少于 2 条数据行 → `Ok(None)`（不产生请求）。
+    pub fn move_table_row(
+        &mut self,
+        line: usize,
+        from: usize,
+        to: usize,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(None);
+        };
+        if table.row_count() < 2 || from >= table.row_count() || to >= table.row_count() {
+            return Ok(None);
+        }
+        let source = self.mirror.to_string();
+        let replacements = table_edit::move_row_replacements(&source, &table, from, to);
+        if replacements.is_empty() {
+            return Ok(None);
+        }
+        self.compose_table_replacements(&source, line, replacements)
+    }
+
+    /// 表格「重排列」（ADR 0019 S3b5）：把第 `from` 列移动到第 `to` 列。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - 表头 / 分隔行 / **每一条**数据行同时重排该列：cell 文本与分隔行的对齐标记
+    ///   （`:-:` 等）一起移动，其它 cell 的字节、行首/行尾 `|` 与空白逐字节保留；
+    /// - 每行一条互不重叠的等长替换（按位置升序），整批进**同一个** `EditRequest`
+    ///   = 一个撤销组；表格总字节数不变；
+    /// - caret/选区规则与 [`Self::move_table_row`] 相同（不变，只夹到表格之外）；
+    /// - 缺列的行（GFM 把空列补在行尾）不猜：整次移动放弃（`Ok(None)`）；
+    /// - 不是表格对象 / 越界 / 原地 / 少于 2 列 → `Ok(None)`。
+    pub fn move_table_column(
+        &mut self,
+        line: usize,
+        from: usize,
+        to: usize,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        self.ensure_no_cell_edit()?;
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(None);
+        };
+        if table.columns() < 2 || from >= table.columns() || to >= table.columns() {
+            return Ok(None);
+        }
+        let source = self.mirror.to_string();
+        let replacements = table_edit::move_column_replacements(&source, &table, from, to);
+        if replacements.is_empty() {
+            return Ok(None);
+        }
+        self.compose_table_replacements(&source, line, replacements)
+    }
+
+    /// 把一组「等长替换」变成一次 `compose_edits`（表格行列重排的公共尾巴）。
+    ///
+    /// 选区恢复语义：重排**等长**且表格源码区间不变，因此端点坐标本身仍然有效，
+    /// 只把落在表格源码**内部**的端点夹到表格末尾（对象内部没有文本落点，与删除/插入
+    /// 的既有契约一致）。表格之外的 caret/选区**一个字节都不动**。
+    fn compose_table_replacements(
+        &mut self,
+        source: &str,
+        line: usize,
+        replacements: Vec<table_edit::TableReplacement>,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        if replacements.is_empty() {
+            return Ok(None);
+        }
+        let mut edits = Vec::with_capacity(replacements.len());
+        for replacement in &replacements {
+            let span = replacement.span();
+            let start = SourceByte::new(span.start().get()).to_scalar(source)?;
+            let end = SourceByte::new(span.end().get()).to_scalar(source)?;
+            edits.push(ScalarEdit {
+                start,
+                end,
+                replacement: replacement.text().to_owned(),
+            });
+        }
+        let selection = self.selection;
+        let request = self.compose_edits(edits)?;
+        let mapped = self.clamp_selection_outside_table(selection, line);
+        self.set_selection(mapped)?;
+        Ok(Some(request))
+    }
+
+    /// 把一组「删除源码区间」变成一次 `compose_edits`（全部替换成空串）。
+    ///
+    /// 选区恢复语义：端点按**删除区间**做文本位置映射（区间之后左移删除量；落在区间
+    /// 内部收敛到区间起点），随后再夹到**删除后的表格之外** —— 与插入不同，删除只会让
+    /// 表格变短：caret 在表格之外时只按删除量左移；落在被删区间里（含整表末尾恰好被删
+    /// 的情形）收敛到区间起点，通常就是新表格末尾或紧随其后的空行；万一仍落在表格源码
+    /// 内部（陈旧/异常坐标），推到新表格末尾，绝不留在源码内部。
+    fn compose_table_deletions(
+        &mut self,
+        source: &str,
+        line: usize,
+        deletions: Vec<table_edit::TableDeletion>,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        if deletions.is_empty() {
+            return Ok(None);
+        }
+        let mut edits = Vec::with_capacity(deletions.len());
+        for deletion in &deletions {
+            let span = deletion.span();
+            let start = SourceByte::new(span.start().get()).to_scalar(source)?;
+            let end = SourceByte::new(span.end().get()).to_scalar(source)?;
+            edits.push(ScalarEdit {
+                start,
+                end,
+                replacement: String::new(),
+            });
+        }
+        let selection = self.selection;
+        let request = self.compose_edits(edits)?;
+        let mapped = shift_selection_through_deletions(selection, &request.edits);
+        let mapped = self.clamp_selection_outside_table(mapped, line);
+        self.set_selection(mapped)?;
+        Ok(Some(request))
+    }
+
+    /// 把选区两端夹到 `line` 上表格的**源码区间之外**（严格在区间内部的位置推到表格末尾）。
+    ///
+    /// 对象内部没有文本落点：caret 落在表格源码区间里会被投影折回块首，用户下一次输入
+    /// 就跑到表格前面去了（S3a/S3b 的既有契约）。
+    fn clamp_selection_outside_table(&self, selection: Selection, line: usize) -> Selection {
+        let Some(table) = self.table_object_at(line) else {
+            return selection;
+        };
+        let text = self.mirror.to_string();
+        let Ok(start) = SourceByte::new(table.span().start().get()).to_scalar(&text) else {
+            return selection;
+        };
+        let Ok(end) = SourceByte::new(table.span().end().get()).to_scalar(&text) else {
+            return selection;
+        };
+        let clamp = |position: UnicodeScalar| {
+            if position.get() > start.get() && position.get() < end.get() {
+                UnicodeScalar::new(end.get())
+            } else {
+                position
+            }
+        };
+        Selection::new(clamp(selection.anchor()), clamp(selection.head()))
+    }
+
+    /// 把「字节位置 + 插入文本」变成一次 `compose_edits`（全部是空区间插入）。
+    ///
+    /// 选区恢复语义：端点按**文本位置**映射 —— 插入点在端点之前或正好等于端点时
+    /// 端点一起平移（插入点上的 caret 被推到插入文本之后）。于是“表格末尾 → 新表格
+    /// 末尾”，caret 永远不会落进表格源码内部（对象内部没有文本位置）。
+    fn compose_table_insertions(
+        &mut self,
+        source: &str,
+        insertions: Vec<table_edit::TableInsertion>,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        if insertions.is_empty() {
+            return Ok(None);
+        }
+        let mut edits = Vec::with_capacity(insertions.len());
+        for insertion in &insertions {
+            let at = SourceByte::new(insertion.at()).to_scalar(source)?;
+            edits.push(ScalarEdit {
+                start: at,
+                end: at,
+                replacement: insertion.text().to_owned(),
+            });
+        }
+        let selection = self.selection;
+        let request = self.compose_edits(edits)?;
+        let shifted = shift_selection_through_insertions(selection, &request.edits);
+        self.set_selection(shifted)?;
+        Ok(Some(request))
+    }
+
+    // ---- 表格单元格就地编辑（ADR 0019 S3b2）----
+    //
+    // ## 为什么“编辑中的 cell 文本”先进镜像、提交时只发一条 `ScalarEdit`
+    //
+    // 编辑中的 cell 文本必须**立刻可见**，而 display 永远由镜像派生（投影层只认
+    // source），所以每次按键都写镜像；但这些按键**不产生** `EditRequest`：
+    //
+    // - 一次单元格编辑在提交（Enter / Tab / 点击别处）时只产生**一条** `ScalarEdit`
+    //   （替换整个 cell 源码区间）→ 会话里就是一个撤销组；
+    // - `Esc` 取消直接恢复镜像的 cell 区间，**不产生任何请求**，也就没有“撤销一次
+    //   取消”的垃圾历史；
+    // - 因此“编辑期间镜像领先于会话”是**唯一**的临时不一致，且它有确定的收敛点：
+    //   提交（一条请求）或取消（恢复原状）。远端 delta / 撤销 / 重做会在应用前先
+    //   放弃这份草稿（见 [`Self::abort_cell_edit_draft`]），绝不带病套用 splice。
+    //
+    // ## 源码安全（GFM）
+    //
+    // 进入 cell 的替换文本统一经 [`table_cell_edit::sanitize_cell_text`]：换行 → 空格、
+    // 未转义的 `|` → `\|`。否则一行会变成两行 / 一格变成两格，表格结构当场被改坏。
+
+    /// 是否正在就地编辑某个表格单元格。
+    #[must_use]
+    pub fn is_editing_table_cell(&self) -> bool {
+        self.cell_edit.is_some()
+    }
+
+    /// 正在编辑的单元格地址（行 0 = 表头）。
+    #[must_use]
+    pub fn table_cell_edit_target(&self) -> Option<TableCellTarget> {
+        self.cell_edit.as_ref().map(|state| TableCellTarget {
+            line: state.line,
+            row: state.row,
+            column: state.column,
+        })
+    }
+
+    /// 正在编辑的 cell 文本在 display 上的字节区间（空 cell 返回 `None`）。
+    ///
+    /// app 用它判断“点击是否还落在这个 cell 里”，以及提交后把点击位置换算回新的
+    /// display（表格重新变成一个占位符，长度会变）。
+    #[must_use]
+    pub fn table_cell_edit_display_range(&self) -> Option<Range<usize>> {
+        let (start, end) = self.cell_scalars()?;
+        let text = self.mirror.to_string();
+        let start = UnicodeScalar::new(start).to_source_byte(&text).ok()?;
+        let end = UnicodeScalar::new(end).to_source_byte(&text).ok()?;
+        let start = self.projection.display_byte_at_source(start)?.get();
+        let end = self.projection.display_byte_at_source(end)?.get();
+        (start < end).then_some(start..end)
+    }
+
+    /// 正在编辑的 cell 在 display 上的**起点**字节（空 cell 也有落点，返回 seam 位置）。
+    ///
+    /// 与 [`Self::table_cell_edit_display_range`] 的区别：空 cell 的显示宽度是 0，
+    /// 但仍有一个“虚拟行”可以点击/落 caret，所以这里不看宽度。
+    #[must_use]
+    pub fn table_cell_edit_display_anchor(&self) -> Option<usize> {
+        let (start, _) = self.cell_scalars()?;
+        let text = self.mirror.to_string();
+        let start = UnicodeScalar::new(start).to_source_byte(&text).ok()?;
+        Some(self.projection.display_byte_at_source(start)?.get())
+    }
+
+    /// 进入某个表格单元格的**就地编辑**（`F2` / `Enter` / 再次单击 / 双击）。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - 只对**整块表格对象**生效（`ObjectBlock` 且是表格）；不是表格 / 行号上没有
+    ///   对象 / 行列越界 → `Ok(false)`，不改任何状态；
+    /// - 进入后 display 只显示该 cell 的源码原文（没有 `|`、没有整表源码）：投影把
+    ///   表格其余部分全部隐藏（[`ProjectionCellReveal`]）；
+    /// - caret 落在 cell 文本末尾；caret/选区此后一律被夹在 cell 内（表格其余部分
+    ///   在 display 上不可见，也不接受落点）；
+    /// - **不**改写 source：进入编辑本身不产生任何 `EditRequest`；
+    /// - 空 cell 也可以进入（编辑时是一行空文本）；但**缺列补出来的**空区间
+    ///   （cell 起点已在行内容末尾之外）拒绝进入 —— 往那里插字会把表格写坏。
+    pub fn begin_table_cell_edit(
+        &mut self,
+        line: usize,
+        row: usize,
+        column: usize,
+    ) -> Result<bool, EditorError> {
+        if self.needs_resync {
+            return Err(EditorError::ResyncRequired);
+        }
+        if self.preedit.is_some() {
+            return Err(EditorError::PreeditActive);
+        }
+        if let Some(state) = &self.cell_edit {
+            if state.line == line && state.row == row && state.column == column {
+                return Ok(true);
+            }
+            // 从另一格切过来（app 的 Tab 会先提交再进入；这里是防御）：先恢复原格。
+            self.cancel_table_cell_edit();
+        }
+        let Some(table) = self.table_object_at(line) else {
+            return Ok(false);
+        };
+        let Some(cell) = table.cell(row, column) else {
+            return Ok(false);
+        };
+        let Some(row_span) = table.row_span(row) else {
+            return Ok(false);
+        };
+        if cell.start() >= row_span.end() {
+            // 缺列补出来的空区间：行里根本没有这一格的 `|` 边界，插字会写坏表格。
+            return Ok(false);
+        }
+        let text = self.mirror.to_string();
+        let original_start = SourceByte::new(cell.start().get()).to_scalar(&text)?;
+        let original_end = SourceByte::new(cell.end().get()).to_scalar(&text)?;
+        let original_text = text
+            .get(cell.start().get()..cell.end().get())
+            .unwrap_or_default()
+            .to_owned();
+        self.cell_edit = Some(CellEditState {
+            line,
+            row,
+            column,
+            original_text,
+            original_span: cell,
+            original_start,
+            original_end,
+            base_len: text.len(),
+        });
+        // caret 落在 cell 文本末尾（空 cell 就是唯一的落点）。
+        self.selection = Selection::caret(original_end);
+        self.refresh_projection();
+        Ok(true)
+    }
+
+    /// 提交当前单元格编辑，返回**唯一**一条 `EditRequest`（没有实际改动时返回 `None`）。
+    ///
+    /// 契约（写死，测试钉住）：
+    ///
+    /// - 请求只有**一条** `ScalarEdit`：把进入编辑前的 cell 源码区间替换成当前的
+    ///   cell 源码区域（会话/镜像基线坐标），因此两侧 `|`、分隔行、其它 cell、对齐、
+    ///   行尾换行**逐字节不变**；
+    /// - 请求的 `edits` 用的是**进入编辑时**的坐标，而镜像此刻已经等于提交后的文本：
+    ///   控制器不再二次应用，只等会话回 `local_echo` 确认（[`Self::apply_outcome`]）；
+    /// - 文本与进入时完全相同 → 不发请求（空 op 请求不会推进 `live_rev`，会把单飞行
+    ///   的 `pending` 卡死）；
+    /// - 提交后 caret 落到**整表末尾**（对象内部没有文本落点，不能停在里面）；
+    /// - 表格/单元格在编辑期间消失（语法被改坏）→ 不产生请求，直接退出。
+    pub fn commit_table_cell_edit(&mut self) -> Result<Option<EditRequest>, EditorError> {
+        let Some(state) = self.cell_edit.clone() else {
+            return Ok(None);
+        };
+        if self.needs_resync {
+            return Err(EditorError::ResyncRequired);
+        }
+        if let Some(command_id) = self.pending.clone() {
+            // 单飞行：单元格编辑期间不允许有在途请求，走到这里说明状态不对，不猜。
+            return Err(EditorError::CommandInFlight(command_id));
+        }
+        let Some(replacement) = self.cell_region_text(&state) else {
+            // 表格/单元格已经不存在：直接退出编辑态（不产生请求）。
+            self.cell_edit = None;
+            self.refresh_projection();
+            return Ok(None);
+        };
+        self.cell_edit = None;
+        let request = if replacement == state.original_text {
+            None
+        } else {
+            let command_id = self.next_command_id();
+            let base_live_rev = self.snapshot.live_rev;
+            self.pending = Some(command_id.clone());
+            Some(EditRequest {
+                doc_id: self.snapshot.doc_id.clone(),
+                generation: self.snapshot.generation,
+                session_epoch: self.snapshot.session_epoch,
+                command_id,
+                base_live_rev,
+                edits: vec![ScalarEdit {
+                    start: state.original_start,
+                    end: state.original_end,
+                    replacement,
+                }],
+                origin: LOCAL_ORIGIN.to_owned(),
+                undo_group: None,
+            })
+        };
+        self.move_caret_to_object_end(state.line);
+        self.refresh_projection();
+        Ok(request)
+    }
+
+    /// 取消当前单元格编辑：把镜像里的 cell 区域恢复成进入前的原文，**不产生请求**。
+    ///
+    /// 返回是否真的取消过（不在编辑态时 `false`）。`Esc` / `Ctrl+Z`（编辑中）走这里；
+    /// 点击别处走的是**提交**（[`Self::commit_table_cell_edit`]），不是取消。
+    pub fn cancel_table_cell_edit(&mut self) -> bool {
+        let Some(state) = self.cell_edit.take() else {
+            return false;
+        };
+        if let Some(region) = self.current_cell_region(&state) {
+            if region != state.original_text {
+                let start = self.mirror.byte_to_char(state.original_span.start().get());
+                let end = self
+                    .mirror
+                    .byte_to_char(state.original_span.start().get() + region.len());
+                if start < end {
+                    self.mirror.remove(start..end);
+                }
+                self.mirror.insert(start, &state.original_text);
+            }
+        }
+        // 恢复后重新扫描：失败（理论上不可达）时保持镜像，仍退出编辑态。
+        let _ = self.refresh_markdown();
+        self.move_caret_to_object_end(state.line);
+        self.refresh_projection();
+        true
+    }
+
+    /// Tab / Shift+Tab：提交当前格并进入下一格（到表格末尾就退出编辑）。
+    ///
+    /// 返回 `(提交产生的请求, 是否仍在编辑下一格)`。导航按**最新解析**的行列数算，
+    /// 因此加行/加列之后的格子也在这条路径上。
+    pub fn advance_table_cell_edit(
+        &mut self,
+        forward: bool,
+    ) -> Result<(Option<EditRequest>, bool), EditorError> {
+        let Some(state) = self.cell_edit.clone() else {
+            return Ok((None, false));
+        };
+        let request = self.commit_table_cell_edit()?;
+        let Some(table) = self.table_object_at(state.line) else {
+            return Ok((request, false));
+        };
+        let next = if forward {
+            table_cell_edit::next_cell(state.row, state.column, table.row_count(), table.columns())
+        } else {
+            table_cell_edit::previous_cell(
+                state.row,
+                state.column,
+                table.row_count(),
+                table.columns(),
+            )
+        };
+        let Some(next) = next else {
+            // 表头之前 / 末格之后：留在表格外（caret 已经在整表末尾）。
+            return Ok((request, false));
+        };
+        let entered = self.begin_table_cell_edit(state.line, next.row, next.column)?;
+        Ok((request, entered))
+    }
+
+    /// 单元格编辑期间放弃草稿（远端 delta / 撤销 / 重做要按会话坐标改镜像之前调用）。
+    ///
+    /// 恢复镜像到基线文本（= 会话当前文本），因此随后的 `splice` 坐标重新合法。
+    pub(crate) fn abort_cell_edit_draft(&mut self) {
+        if self.cell_edit.is_some() {
+            self.cancel_table_cell_edit();
+        }
+    }
+
+    /// 当前 cell 的 `(起 scalar, 止 scalar)`（镜像坐标；不在编辑态/表格没了 → `None`）。
+    fn cell_scalars(&self) -> Option<(usize, usize)> {
+        let state = self.cell_edit.as_ref()?;
+        let table = self.table_object_at(state.line)?;
+        let cell = table.cell(state.row, state.column)?;
+        let start = self
+            .mirror
+            .byte_to_char(cell.start().get().min(self.mirror.len_bytes()));
+        let end = self
+            .mirror
+            .byte_to_char(cell.end().get().min(self.mirror.len_bytes()));
+        Some((start, end.max(start)))
+    }
+
+    /// 镜像里 cell 区域的**当前**文本（按原始区间起点 + 长度增量切）。
+    ///
+    /// 不能用“最新解析的 cell 区间”切片：解析器会裁掉 cell 首尾空白，用户敲进去的
+    /// 前导/尾随空格不在区间里，提交时就会与镜像不一致（会话与镜像分叉）。
+    fn current_cell_region(&self, state: &CellEditState) -> Option<String> {
+        let text = self.mirror.to_string();
+        let delta = text.len() as isize - state.base_len as isize;
+        let len = (state.original_span.len() as isize + delta).max(0) as usize;
+        let start = state.original_span.start().get();
+        if start > text.len() {
+            return None;
+        }
+        // 长度可能因为用户输入越界（极端情况）——夹回文本内，绝不 panic。
+        let end = (start + len).min(text.len());
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        Some(text[start..end].to_owned())
+    }
+
+    /// 提交用的 cell 区域文本（表格/单元格仍在时才有意义）。
+    fn cell_region_text(&self, state: &CellEditState) -> Option<String> {
+        // 先确认表格与单元格仍在最新解析里（表格被改坏时不再提交）。
+        let table = self.table_object_at(state.line)?;
+        table.cell(state.row, state.column)?;
+        self.current_cell_region(state)
+    }
+
+    /// caret 落到某个整块对象的末尾（对象内部没有文本落点）。
+    fn move_caret_to_object_end(&mut self, line: usize) {
+        let end = self
+            .markdown
+            .object_at_line(line)
+            .map(|object| object.span().end().get())
+            .unwrap_or_else(|| self.mirror.len_bytes());
+        let end = end.min(self.mirror.len_bytes());
+        let scalar = self.mirror.byte_to_char(end);
+        self.selection = Selection::caret(UnicodeScalar::new(scalar));
+    }
+
+    /// 把选区两端夹进当前 cell 文本（cell 之外在 display 上不可见，不接受落点）。
+    fn clamp_selection_to_cell(&self, selection: Selection) -> Selection {
+        let Some((start, end)) = self.cell_scalars() else {
+            return selection;
+        };
+        let clamp = |value: UnicodeScalar| UnicodeScalar::new(value.get().clamp(start, end));
+        let (anchor, head) = (clamp(selection.anchor()), clamp(selection.head()));
+        if anchor == selection.anchor() && head == selection.head() {
+            selection
+        } else {
+            Selection::new(anchor, head)
+        }
+    }
+
+    /// 单元格文本被解析器裁掉首尾空白后，caret 可能落在区间之外 → 收回 cell 内。
+    fn clamp_caret_to_cell(&mut self) {
+        let clamped = self.clamp_selection_to_cell(self.selection);
+        if clamped != self.selection {
+            self.selection = clamped;
+            self.refresh_projection();
+        }
+    }
+
+    /// 当前 cell 编辑对应的投影显现（表格/单元格已不存在 → `None`）。
+    fn cell_reveal(&self) -> Option<ProjectionCellReveal> {
+        let state = self.cell_edit.as_ref()?;
+        let object = self.markdown.object_at_line(state.line)?;
+        if !object.kind().is_table() {
+            return None;
+        }
+        let table = self.markdown.object_table(object)?;
+        Some(ProjectionCellReveal {
+            table: object.span(),
+            cell: table.cell(state.row, state.column)?,
+        })
+    }
+
+    /// 把一组编辑**只写进镜像**（cell 草稿），不产生 `EditRequest`。
+    ///
+    /// 替换文本先经 [`table_cell_edit::sanitize_cell_text`]（换行 → 空格、未转义 `|`
+    /// → `\|`），因此 cell 草稿永远是“表格结构安全”的源码；`start`/`end` 用清理后的
+    /// 长度更新 caret，保证 IME / 连续输入的下一个落点正确。
+    fn apply_cell_draft_edits(&mut self, edits: Vec<ScalarEdit>) -> Result<(), EditorError> {
+        self.ensure_editable()?;
+        if edits.is_empty() {
+            return Err(EditorError::EmptyEditSet);
+        }
+        self.validate_edits(&edits)?;
+        let Some((cell_start, cell_end)) = self.cell_scalars() else {
+            return Err(EditorError::CellEditInactive);
+        };
+        // caret/选区已经被夹进 cell，但**按 grapheme 删**的目标可能跨出边界（例如 caret
+        // 停在 cell 末尾按 Delete，下一个 grapheme 是 cell 之后的空格）：夹回 cell 内，
+        // 越界部分直接丢弃（对象内部/表格其它部分没有文本落点）。
+        let clamped: Vec<ScalarEdit> = edits
+            .into_iter()
+            .map(|edit| {
+                let start = edit.start.get().clamp(cell_start, cell_end);
+                let end = edit.end.get().clamp(start, cell_end);
+                ScalarEdit {
+                    start: UnicodeScalar::new(start),
+                    end: UnicodeScalar::new(end),
+                    replacement: edit.replacement,
+                }
+            })
+            .filter(|edit| edit.start != edit.end || !edit.replacement.is_empty())
+            .collect();
+        if clamped.is_empty() {
+            return Ok(());
+        }
+        let sanitized: Vec<ScalarEdit> = clamped
+            .into_iter()
+            .map(|edit| ScalarEdit {
+                start: edit.start,
+                end: edit.end,
+                replacement: table_cell_edit::sanitize_cell_text(&edit.replacement),
+            })
+            .collect();
+        self.apply_scalar_edits(&sanitized)?;
+        self.clamp_caret_to_cell();
+        Ok(())
+    }
+
+    /// 一次编辑：有 cell 草稿 → 只写镜像（`Ok(None)`）；否则走普通 `compose_edits`。
+    fn submit_or_draft(
+        &mut self,
+        edits: Vec<ScalarEdit>,
+    ) -> Result<Option<EditRequest>, EditorError> {
+        if self.cell_edit.is_some() {
+            self.apply_cell_draft_edits(edits)?;
+            return Ok(None);
+        }
+        self.compose_edits(edits).map(Some)
     }
 
     /// 当前逻辑显示文本（Markdown 标记按当前 selection 隐藏/显现）。
@@ -615,7 +1452,10 @@ impl EditorController {
     /// 直到新 ACK 的 `through_live_rev` 追上当前 `live_rev`。
     #[must_use]
     pub fn is_saved(&self) -> bool {
-        self.pending.is_none() && self.durable_through >= self.snapshot.live_rev
+        // 单元格草稿还没提交：即使 durable 已经追平当前 live_rev，也不算“已保存”。
+        self.pending.is_none()
+            && self.cell_edit.is_none()
+            && self.durable_through >= self.snapshot.live_rev
     }
 
     /// 消费一条 durable 确认：水位只前进，不回退（旧 ACK 不会把新输入标成已保存）。
@@ -632,6 +1472,9 @@ impl EditorController {
         }
         self.check_scalar(selection.anchor())?;
         self.check_scalar(selection.head())?;
+        // cell 就地编辑：caret/选区只允许落在 cell 文本内（表格其余部分在 display 上
+        // 不可见，也没有文本落点）。
+        let selection = self.clamp_selection_to_cell(selection);
         self.selection = selection;
         // 选择变 → 只重建投影（复用 MarkdownDocument）；caret 进出构造会改变隐藏集合。
         self.refresh_projection();
@@ -713,7 +1556,7 @@ impl EditorController {
             end: target.max(head),
             replacement: String::new(),
         };
-        self.compose_edits(vec![edit]).map(Some)
+        self.submit_or_draft(vec![edit])
     }
 
     /// 用 `replacement` 替换当前选区（空选区即插入）。
@@ -732,7 +1575,7 @@ impl EditorController {
             end: selection.end(),
             replacement: replacement.to_owned(),
         };
-        self.compose_edits(vec![edit]).map(Some)
+        self.submit_or_draft(vec![edit])
     }
 
     /// 提交一组编辑：校验（排序 / 不重叠 / 不越界）→ 乐观写入镜像 → 生成请求。
@@ -745,6 +1588,8 @@ impl EditorController {
     ///   `None`（S1 没有 UI 分组，交给会话默认分组）。
     pub fn compose_edits(&mut self, edits: Vec<ScalarEdit>) -> Result<EditRequest, EditorError> {
         self.ensure_editable()?;
+        // cell 草稿期间任何“通用编辑入口”都必须在会话坐标之外排队（见 cell 编辑小节）。
+        self.ensure_no_cell_edit()?;
         if edits.is_empty() {
             return Err(EditorError::EmptyEditSet);
         }
@@ -915,8 +1760,8 @@ impl EditorController {
             end: state.range.end(),
             replacement: committed.to_owned(),
         };
-        match self.compose_edits(vec![edit]) {
-            Ok(request) => Ok(Some(request)),
+        match self.submit_or_draft(vec![edit]) {
+            Ok(request) => Ok(request),
             Err(error) => {
                 // 提交失败（例如仍有在飞命令）时恢复组合，避免静默吞掉输入。
                 self.preedit = Some(state);
@@ -948,6 +1793,15 @@ impl EditorController {
         }
         if self.preedit.is_some() {
             return Err(EditorError::PreeditActive);
+        }
+        Ok(())
+    }
+
+    /// 结构类操作（加行加列 / 删除对象 / 任务框 / 列表 Enter / 源码模式）在单元格
+    /// 编辑期间一律拒绝：它们会按会话坐标改正文，而镜像此刻还压着未提交的 cell 草稿。
+    fn ensure_no_cell_edit(&self) -> Result<(), EditorError> {
+        if self.cell_edit.is_some() {
+            return Err(EditorError::CellEditActive);
         }
         Ok(())
     }
@@ -1047,11 +1901,15 @@ impl EditorController {
     fn refresh_markdown(&mut self) -> Result<(), EditorError> {
         let text = self.mirror.to_string();
         self.markdown = MarkdownDocument::parse(&text).map_err(EditorError::Markdown)?;
-        // 图片语法被改坏 / 行被删掉时，源码模式自动退出（不再有对应对象）。
+        // 图片/表格语法被改坏、行被删掉时，源码模式自动退出（不再有对应对象）。
         if let Some(line) = self.object_edit_line {
-            if self.markdown.block_image_at_line(line).is_none() {
+            if self.markdown.object_at_line(line).is_none() {
                 self.object_edit_line = None;
             }
+        }
+        // 单元格编辑同理：表格/该格已不存在时退出编辑态（不猜新坐标）。
+        if self.cell_edit.is_some() && self.cell_reveal().is_none() {
+            self.cell_edit = None;
         }
         // 块级语义只依赖 source：与投影一起在 source 变化时重建。
         self.block_runs = self.markdown.block_runs()?;
@@ -1065,10 +1923,12 @@ impl EditorController {
     /// 保守退回 identity）；列表 marker 的显现状态与投影一起在这里一次性刷新。
     fn refresh_projection(&mut self) {
         let revealed: Vec<usize> = self.object_edit_line.into_iter().collect();
-        self.projection = ProjectionMap::from_markdown_with_lists_and_objects(
+        let cell = self.cell_reveal();
+        self.projection = ProjectionMap::from_markdown_with_lists_and_objects_and_cell(
             &self.markdown,
             self.selection,
             &revealed,
+            cell,
         );
         let style_runs = self.markdown.style_runs(&self.projection);
         self.style_runs = style_runs;
@@ -1111,6 +1971,8 @@ impl EditorController {
     }
 
     fn apply_splice(&mut self, splice: &DeltaSplice) -> Result<(), EditorError> {
+        // 镜像里可能压着未提交的 cell 草稿；splice 是会话坐标，必须先恢复基线。
+        self.abort_cell_edit_draft();
         let at = splice.at.get();
         let delete =
             usize::try_from(splice.delete_scalars).map_err(|_| EditorError::ArithmeticOverflow)?;
@@ -1196,4 +2058,77 @@ fn transform_position(position: usize, at: usize, end: usize, inserted: usize) -
     } else {
         at
     }
+}
+
+/// 把 selection 两端按**一组纯插入**（`start == end`）变换（ADR 0019 S3b）。
+///
+/// 语义（写死，测试钉住）：
+///
+/// - 插入点**在端点之前或正好等于端点** → 端点按插入量平移。这是“文本位置不变”的
+///   语义：表格选中时 caret 在整表末尾，而新行/新列恰好插在那里，平移后 caret 仍
+///   停在**新表格的末尾**；不这样做的话 caret 会落进表格内部（对象内部没有文本
+///   位置，投影会把 caret 折回块首，用户下一次输入就跑到表格前面去了）；
+/// - 插入点在端点之后 → 不变（表格之前的 caret 不因加行加列而移动）。
+///
+/// 只接受纯插入：调用方是 [`EditorController::compose_table_insertions`]，
+/// 替换/删除走的仍是 [`transform_selection`]。
+fn shift_selection_through_insertions(selection: Selection, edits: &[ScalarEdit]) -> Selection {
+    let shift = |position: usize| -> usize {
+        let mut offset = 0usize;
+        for edit in edits {
+            debug_assert_eq!(
+                edit.start.get(),
+                edit.end.get(),
+                "结构插入必须都是空区间（纯插入）"
+            );
+            if edit.start.get() <= position {
+                offset = offset.saturating_add(units::scalar_len(&edit.replacement));
+            }
+        }
+        position.saturating_add(offset)
+    };
+    Selection::new(
+        UnicodeScalar::new(shift(selection.anchor().get())),
+        UnicodeScalar::new(shift(selection.head().get())),
+    )
+}
+
+/// 把 selection 两端按**一组删除**（`replacement` 为空）做文本位置映射（ADR 0019 S3b3）。
+///
+/// 语义（写死，测试钉住）：
+///
+/// - 端点**在删除区间之后**（含正好等于区间终点）→ 左移删除量（表格外的正文不会被
+///   多删/少移）；
+/// - 端点**落在删除区间内部** → 收敛到区间起点（该点在新文本里仍然存在；之后由调用方
+///   再夹到表格之外）；
+/// - 端点**在删除区间之前**（含正好等于区间起点）→ 不变；
+/// - 多个区间按位置升序，逐个累计左移量。
+///
+/// 只接受纯删除：调用方是 [`EditorController::compose_table_deletions`]；插入走的仍是
+/// [`shift_selection_through_insertions`]，替换走 [`transform_selection`]。
+fn shift_selection_through_deletions(selection: Selection, edits: &[ScalarEdit]) -> Selection {
+    let shift = |position: usize| -> usize {
+        let mut removed = 0usize;
+        for edit in edits {
+            debug_assert!(
+                edit.replacement.is_empty(),
+                "结构性删除必须都是纯删除（替换成空串）"
+            );
+            let start = edit.start.get();
+            let end = edit.end.get();
+            let inserted = units::scalar_len(&edit.replacement);
+            if position >= end {
+                removed =
+                    removed.saturating_add(end.saturating_sub(start).saturating_sub(inserted));
+            } else if position > start {
+                // 删除区间内部：收敛到区间起点（已删除量在它之前，先减掉）。
+                return start.saturating_sub(removed);
+            }
+        }
+        position.saturating_sub(removed)
+    };
+    Selection::new(
+        UnicodeScalar::new(shift(selection.anchor().get())),
+        UnicodeScalar::new(shift(selection.head().get())),
+    )
 }

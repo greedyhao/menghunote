@@ -15,8 +15,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::{px, Bounds, Pixels, Point, RenderImage, ShapedLine};
-use menghunote_editor::{Bias, StyleKind};
+use gpui::{point, px, size, Bounds, Pixels, Point, RenderImage, ShapedLine};
+use menghunote_editor::{Bias, MarkdownTableAlignment, ObjectKind, StyleKind};
 
 use super::glyph;
 use super::layout::LayoutFrame;
@@ -62,35 +62,407 @@ pub enum ObjectPaintState {
     Ready,
 }
 
-/// 一个**可见**的图片 Object 行（ADR 0019 S2a）：绘制、命中、工具条共用它。
-///
-/// `rect` 是**窗口坐标**的图片/占位框矩形；行高在布局度量里已经等于
-/// `rect 高度 + 上下内边距`，所以滚动/命中与 `LayoutFrame` 几何天然一致。
+/// 一个表格单元格的绘制数据（首版纯文本，不做行内富文本）。
 #[derive(Debug, Clone)]
-pub struct ObjectPaint {
-    /// 该图片在 `MarkdownDocument::images()` 里的下标（整个文档顺序）。
-    pub index: usize,
-    /// 源码行号（0 起）。
-    pub line: usize,
-    /// 视觉行号（0 起）。
-    pub row: usize,
-    /// 图片/占位框矩形（窗口坐标）。
+pub struct TableCellPaint {
+    /// 单元格矩形（窗口坐标，不含边框）。
     pub rect: Bounds<Pixels>,
+    /// 已 shaping 的文本（已按列宽截断；空 cell 为 `None`）。
+    pub text: Option<ShapedLine>,
+    /// 对齐方式（GFM 分隔行；表头与数据行共用）。
+    pub align: MarkdownTableAlignment,
+}
+
+/// 一行表格的绘制数据。
+#[derive(Debug, Clone)]
+pub struct TableRowPaint {
+    /// 整行矩形（窗口坐标；含单元格左右边界，不含行间分隔线）。
+    pub rect: Bounds<Pixels>,
+    /// 逐列单元格（长度 = 表格列数）。
+    pub cells: Vec<TableCellPaint>,
+    /// 是否表头行。
+    pub header: bool,
+    /// 行下标（**0 = 表头**，`1..=n` = 第 `row - 1` 条数据行）。
+    ///
+    /// 长表格按视口裁剪时 `rows` 只含可见行，下标不能由位置推断，必须随行一起带出来：
+    /// 单元格命中/编辑都靠它寻址（ADR 0019 S3b2）。
+    pub row: usize,
+}
+
+/// 一个**可见**表格对象的绘制数据（只含与视口相交的行，长表格按行裁剪）。
+#[derive(Debug, Clone)]
+pub struct TablePaint {
+    /// 表格外框矩形（窗口坐标）。
+    pub rect: Bounds<Pixels>,
+    /// 列数（≥ 1）。
+    pub columns: usize,
+    /// **全部**数据行数（不含表头；长表格被裁剪时仍用它算行号/拖拽槽位）。
+    pub row_count: usize,
+    /// 表头行（可能因滚动不可见，但表头行高仍计入几何）。
+    pub header: Option<TableRowPaint>,
+    /// 与视口相交的数据行。
+    pub rows: Vec<TableRowPaint>,
+    /// 数据行高度（布局度量与绘制共用）。
+    pub row_height: f32,
+    /// 表头行高度。
+    pub header_height: f32,
+    /// 单列宽度（像素；列把手/拖拽槽位的几何来源）。
+    pub column_width: f32,
+    /// 当前选中的单元格 `(row, column)`（row 0 = 表头）：绘制描边/底色用。
+    ///
+    /// 只影响绘制；命中一律走 [`EditorGeometry::table_cell_at`]（同一份矩形）。
+    pub selected_cell: Option<(usize, usize)>,
+}
+
+/// 一个被命中的表格单元格（窗口坐标 → 表格行/列）。
+///
+/// `row` 与 [`TableRowPaint::row`] 同一套下标（0 = 表头）；`object_line` 是表格对象行
+/// （表头源码行号），控制器用它再加上行列号定位 cell span。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TableCellHit {
+    /// 表格对象行（表头源码行号，0 起）。
+    pub object_line: usize,
+    /// 行下标（0 = 表头）。
+    pub row: usize,
+    /// 列下标（0 起）。
+    pub column: usize,
+}
+
+/// 表格拖拽把手的轴（ADR 0019 S3b5）：列把手水平拖、行把手垂直拖。
+///
+/// 两者共用同一套拖拽状态机（命中 → 拖动 → 插入槽位 → 释放重排），但**行把手不包含
+/// 表头行**：表头固定，不参与行重排。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TableDragAxis {
+    /// 列（下标 0 起；从表头顶部的小把手水平拖动）。
+    Column,
+    /// 数据行（下标 0 = 第一条数据行；从行左侧的小把手垂直拖动）。
+    Row,
+}
+
+/// 一个表格拖拽把手的几何（**绘制、命中、headless 断言同源**）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TableDragHandlePaint {
+    /// 轴向。
+    pub axis: TableDragAxis,
+    /// 表格对象行（表头源码行号）。
+    pub line: usize,
+    /// 列把手：列下标；行把手：数据行下标（0 起、不含表头）。
+    pub index: usize,
+    /// 绘制矩形（窗口坐标）：只画这个小胶囊，不遮挡正文/单元格文字。
+    pub paint: Bounds<Pixels>,
+    /// 命中矩形（窗口坐标）：比绘制矩形略大，避免“差 1px 点不中”。
+    pub hit: Bounds<Pixels>,
+}
+
+/// 图片对象的绘制载荷（已解码像素或占位框 + alt/状态文案）。
+#[derive(Debug, Clone)]
+pub struct ImagePaint {
     /// 已解码图片（`None` = 占位）。
     pub image: Option<Arc<RenderImage>>,
     /// 占位/alt 文本（已 shaping，单行；`None` = 图片已就绪或没有文案）。
     pub label: Option<ShapedLine>,
     /// 绘制状态。
     pub state: ObjectPaintState,
+}
+
+/// 一个 Object 的绘制载荷：图片像素 / GFM 表格。
+///
+/// 两个分支都装箱：`ShapedLine`/`TablePaint` 让 enum 本体很大，而 `ObjectPaint`
+/// 每帧按可见对象存进 `Vec`，不装箱会在滚动时反复拷贝大块内存。
+#[derive(Debug, Clone)]
+pub enum ObjectPaintContent {
+    /// 图片（已解码像素或占位框 + alt/状态文案）。
+    Image(Box<ImagePaint>),
+    /// GFM 表格（表格内不做富文本；单元格可就地编辑 —— 编辑态下整表不再投影成
+    /// 这个分支，display 只显示该 cell 文本，见 ADR 0019 S3b2）。
+    Table(Box<TablePaint>),
+}
+
+/// 一个**可见**的 Object 行（ADR 0019 S2a 图片 / S3a 表格）：绘制、命中、工具条共用它。
+///
+/// `rect` 是**窗口坐标**的块矩形；行高在布局度量里已经等于 `rect 高度 + 上下内边距`，
+/// 所以滚动/命中与 `LayoutFrame` 几何天然一致。表格虽然是多行源码，但在 display 上
+/// 只占**一个**视觉行（一个占位符），因此 `line` 是表头行、`row` 是那一个视觉行。
+#[derive(Debug, Clone)]
+pub struct ObjectPaint {
+    /// 对象种类（图片 / 表格）。
+    pub kind: ObjectKind,
+    /// 在同类集合里的下标（图片 → `images()`；表格 → `tables()`）。
+    pub index: usize,
+    /// 对象行（图片所在行 / 表格表头行；0 起）。
+    pub line: usize,
+    /// 结束源码行（0 起，含）。
+    pub end_line: usize,
+    /// 视觉行号（0 起）。
+    pub row: usize,
+    /// 块矩形（窗口坐标）。
+    pub rect: Bounds<Pixels>,
+    /// 绘制载荷。
+    pub content: ObjectPaintContent,
     /// 是否处于选中态（单击选中 / 文本选区相交）——画描边。
     pub selected: bool,
 }
 
-impl ObjectPaint {
-    /// 是否已解码（可画图片）。
+impl TableCellPaint {
+    /// 平移矩形（元素局部坐标 → 窗口坐标）。
+    fn translate(&mut self, origin: Point<Pixels>) {
+        self.rect = Bounds::new(self.rect.origin + origin, self.rect.size);
+    }
+}
+
+impl TableRowPaint {
+    /// 平移整行与全部单元格矩形。
+    fn translate(&mut self, origin: Point<Pixels>) {
+        self.rect = Bounds::new(self.rect.origin + origin, self.rect.size);
+        for cell in &mut self.cells {
+            cell.translate(origin);
+        }
+    }
+}
+
+impl TablePaint {
+    /// 平移表格外框与所有可见行/单元格矩形。
+    fn translate(&mut self, origin: Point<Pixels>) {
+        self.rect = Bounds::new(self.rect.origin + origin, self.rect.size);
+        if let Some(header) = &mut self.header {
+            header.translate(origin);
+        }
+        for row in &mut self.rows {
+            row.translate(origin);
+        }
+    }
+}
+
+impl TablePaint {
+    /// 第 `row` 条**数据行**（0 起、不含表头）的窗口矩形；越界返回 `None`。
+    ///
+    /// 行高固定，因此被视口裁剪掉的行也能算出矩形（拖拽槽位/指示线要用）。
     #[must_use]
-    pub const fn is_ready(&self) -> bool {
-        matches!(self.state, ObjectPaintState::Ready) && self.image.is_some()
+    pub fn data_row_rect(&self, row: usize) -> Option<Bounds<Pixels>> {
+        if row >= self.row_count {
+            return None;
+        }
+        let top = self.rect.origin.y.as_f32() + self.header_height + self.row_height * row as f32;
+        Some(Bounds::new(
+            point(self.rect.origin.x, px(top)),
+            size(self.rect.size.width, px(self.row_height)),
+        ))
+    }
+
+    /// 列把手（表头顶部的小胶囊）的绘制矩形；表头不在本帧可见范围时返回 `None`。
+    #[must_use]
+    pub fn column_handle_paint(&self, column: usize) -> Option<Bounds<Pixels>> {
+        if column >= self.columns || self.column_width <= 0.0 {
+            return None;
+        }
+        let width = theme::TABLE_DRAG_COLUMN_HANDLE_WIDTH.min(self.column_width - 4.0);
+        if width <= 0.0 {
+            return None;
+        }
+        let height = theme::TABLE_DRAG_COLUMN_HANDLE_HEIGHT;
+        let center_x = self.rect.origin.x.as_f32() + self.column_width * (column as f32 + 0.5);
+        let top = self.rect.origin.y.as_f32() - height / 2.0;
+        Some(Bounds::new(
+            point(px(center_x - width / 2.0), px(top)),
+            size(px(width), px(height)),
+        ))
+    }
+
+    /// 列把手的命中矩形：绘制矩形外扩 [`theme::TABLE_DRAG_HIT_PAD`]，但**不越过该表格
+    /// 对象行的上边**（越过会让悬停态在上下 1px 处抖动）。
+    #[must_use]
+    pub fn column_handle_hit(&self, column: usize) -> Option<Bounds<Pixels>> {
+        let paint = self.column_handle_paint(column)?;
+        let pad = theme::TABLE_DRAG_HIT_PAD;
+        let top =
+            (paint.origin.y.as_f32() - pad).max(self.rect.origin.y.as_f32() - theme::TABLE_PADDING);
+        Some(Bounds::new(
+            point(px(paint.origin.x.as_f32() - pad), px(top)),
+            size(
+                px(paint.size.width.as_f32() + pad * 2.0),
+                px(paint.origin.y.as_f32() + paint.size.height.as_f32() + pad - top),
+            ),
+        ))
+    }
+
+    /// 行把手（数据行左侧的小胶囊）的绘制矩形；`row` 是数据行下标（0 起、不含表头）。
+    #[must_use]
+    pub fn row_handle_paint(&self, row: usize) -> Option<Bounds<Pixels>> {
+        let row_rect = self.data_row_rect(row)?;
+        let width = theme::TABLE_DRAG_ROW_HANDLE_WIDTH;
+        let height = theme::TABLE_DRAG_ROW_HANDLE_HEIGHT
+            .min(self.row_height - 8.0)
+            .max(6.0);
+        let top = row_rect.origin.y.as_f32() + (self.row_height - height) / 2.0;
+        Some(Bounds::new(
+            point(px(self.rect.origin.x.as_f32() - width / 2.0), px(top)),
+            size(px(width), px(height)),
+        ))
+    }
+
+    /// 行把手的命中矩形：绘制矩形外扩 [`theme::TABLE_DRAG_HIT_PAD`]，纵向**夹在该数据行
+    /// 之内**（不越到相邻行，避免抢到相邻行的点击）。
+    #[must_use]
+    pub fn row_handle_hit(&self, row: usize) -> Option<Bounds<Pixels>> {
+        let paint = self.row_handle_paint(row)?;
+        let row_rect = self.data_row_rect(row)?;
+        let pad = theme::TABLE_DRAG_HIT_PAD;
+        let top = (paint.origin.y.as_f32() - pad).max(row_rect.origin.y.as_f32());
+        let bottom = (paint.origin.y.as_f32() + paint.size.height.as_f32() + pad)
+            .min(row_rect.origin.y.as_f32() + row_rect.size.height.as_f32());
+        Some(Bounds::new(
+            point(px(paint.origin.x.as_f32() - pad), px(top)),
+            size(
+                px(paint.size.width.as_f32() + pad * 2.0),
+                px((bottom - top).max(1.0)),
+            ),
+        ))
+    }
+
+    /// 指针位置 → **列插入槽位**（`0..=columns`）；`None` = 已拖出表格（释放即取消）。
+    ///
+    /// 槽位是“缝隙”：落在某列左半 → 插到该列之前，右半 → 之后。指针允许离开表格
+    /// [`theme::TABLE_DRAG_CANCEL_MARGIN`] 像素以内（把手本身就贴在边框上）。
+    #[must_use]
+    pub fn column_drop_slot(&self, position: Point<Pixels>) -> Option<usize> {
+        if self.columns == 0 || self.column_width <= 0.0 {
+            return None;
+        }
+        let left = self.rect.origin.x.as_f32();
+        let right = left + self.rect.size.width.as_f32();
+        let top = self.rect.origin.y.as_f32();
+        let bottom = top + self.rect.size.height.as_f32();
+        let margin = theme::TABLE_DRAG_CANCEL_MARGIN;
+        let (x, y) = (position.x.as_f32(), position.y.as_f32());
+        if x < left - margin || x > right + margin || y < top - margin || y > bottom + margin {
+            return None;
+        }
+        let local = (x - left).clamp(0.0, self.rect.size.width.as_f32());
+        let index = ((local / self.column_width).floor() as usize).min(self.columns - 1);
+        let offset = local - self.column_width * index as f32;
+        Some(if offset >= self.column_width / 2.0 {
+            index + 1
+        } else {
+            index
+        })
+    }
+
+    /// 指针位置 → **数据行插入槽位**（`0..=row_count`）；`None` = 已拖出表格。
+    ///
+    /// 指针在表头/分隔行上 → 槽位 0（插到第一条数据行之前）；在最后一行之下 →
+    /// 槽位 `row_count`。表头行**不参与**行重排，因此槽位永远落在数据行区间里。
+    #[must_use]
+    pub fn row_drop_slot(&self, position: Point<Pixels>) -> Option<usize> {
+        if self.row_count == 0 || self.row_height <= 0.0 {
+            return None;
+        }
+        let left = self.rect.origin.x.as_f32();
+        let right = left + self.rect.size.width.as_f32();
+        let top = self.rect.origin.y.as_f32();
+        let bottom = top + self.rect.size.height.as_f32();
+        let margin = theme::TABLE_DRAG_CANCEL_MARGIN;
+        let (x, y) = (position.x.as_f32(), position.y.as_f32());
+        if x < left - margin || x > right + margin || y < top - margin || y > bottom + margin {
+            return None;
+        }
+        let local = (y - top).max(0.0);
+        let rows_top = self.header_height;
+        let rows_bottom = rows_top + self.row_height * self.row_count as f32;
+        if local < rows_top {
+            return Some(0);
+        }
+        if local >= rows_bottom {
+            return Some(self.row_count);
+        }
+        let index =
+            (((local - rows_top) / self.row_height).floor() as usize).min(self.row_count - 1);
+        let offset = local - rows_top - self.row_height * index as f32;
+        Some(if offset >= self.row_height / 2.0 {
+            index + 1
+        } else {
+            index
+        })
+    }
+
+    /// 插入位置指示线矩形（窗口坐标）：列 = 竖线（2px），行 = 横线（2px）。
+    ///
+    /// 槽位越界返回 `None`（调用方不画）。
+    #[must_use]
+    pub fn drop_indicator_rect(&self, axis: TableDragAxis, slot: usize) -> Option<Bounds<Pixels>> {
+        let thickness = theme::TABLE_DRAG_INDICATOR_THICKNESS;
+        let left = self.rect.origin.x.as_f32();
+        let top = self.rect.origin.y.as_f32();
+        let right = left + self.rect.size.width.as_f32();
+        let bottom = top + self.rect.size.height.as_f32();
+        match axis {
+            TableDragAxis::Column => {
+                if slot > self.columns {
+                    return None;
+                }
+                let x = if slot >= self.columns {
+                    right - thickness
+                } else {
+                    (left + self.column_width * slot as f32 - thickness / 2.0)
+                        .clamp(left, (right - thickness).max(left))
+                };
+                Some(Bounds::new(
+                    point(px(x), px(top)),
+                    size(px(thickness), px((bottom - top).max(1.0))),
+                ))
+            }
+            TableDragAxis::Row => {
+                if slot > self.row_count {
+                    return None;
+                }
+                let rows_top = top + self.header_height;
+                let rows_bottom = rows_top + self.row_height * self.row_count as f32;
+                let y = if slot >= self.row_count {
+                    (rows_bottom - thickness).clamp(top, (bottom - thickness).max(top))
+                } else {
+                    (rows_top + self.row_height * slot as f32 - thickness / 2.0)
+                        .clamp(rows_top, (rows_bottom - thickness).max(rows_top))
+                };
+                Some(Bounds::new(
+                    point(px(left), px(y)),
+                    size(px((right - left).max(1.0)), px(thickness)),
+                ))
+            }
+        }
+    }
+}
+
+impl ObjectPaint {
+    /// 平移整个对象（含表格内部的表头/行/单元格矩形）。
+    ///
+    /// `object_paints` 产出的是**元素局部坐标**（绘制、命中、单元格 shaping 都在同一
+    /// 坐标系里算），元素 prepaint 在注册几何前统一加上 `bounds.origin`；表格的嵌套
+    /// 矩形必须一起平移，否则表头/单元格会画在错误位置。
+    pub fn translate(&mut self, origin: Point<Pixels>) {
+        self.rect = Bounds::new(self.rect.origin + origin, self.rect.size);
+        if let ObjectPaintContent::Table(table) = &mut self.content {
+            table.translate(origin);
+        }
+    }
+
+    /// 是否可直接绘制（图片已解码 / 表格恒可绘制）。
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        match &self.content {
+            ObjectPaintContent::Image(image) => {
+                matches!(image.state, ObjectPaintState::Ready) && image.image.is_some()
+            }
+            ObjectPaintContent::Table(_) => true,
+        }
+    }
+
+    /// 表格绘制载荷（图片对象返回 `None`）。
+    #[must_use]
+    pub fn table(&self) -> Option<&TablePaint> {
+        match &self.content {
+            ObjectPaintContent::Image(_) => None,
+            ObjectPaintContent::Table(table) => Some(table),
+        }
     }
 }
 
@@ -277,6 +649,34 @@ impl EditorGeometry {
     #[must_use]
     pub fn task_boxes(&self) -> &[TaskBoxPaint] {
         &self.task_boxes
+    }
+
+    /// 窗口坐标命中的表格单元格（ADR 0019 S3b2）。
+    ///
+    /// 只认**本帧画出来的**格子：长表格按视口裁剪后，看不见的行没有矩形，也就点不到。
+    /// 矩形来自 `table_paint`（`TableCellPaint.rect`），因此点击与绘制逐像素一致，
+    /// 绝不按字符宽度另算。
+    #[must_use]
+    pub fn table_cell_at(&self, position: Point<Pixels>) -> Option<TableCellHit> {
+        let row = self.row_at_y(position.y);
+        let object = self.object_row(row)?;
+        let table = object.table()?;
+        let rows = table.header.iter().chain(table.rows.iter());
+        for paint_row in rows {
+            if !paint_row.rect.contains(&position) {
+                continue;
+            }
+            for (column, cell) in paint_row.cells.iter().enumerate() {
+                if cell.rect.contains(&position) {
+                    return Some(TableCellHit {
+                        object_line: object.line,
+                        row: paint_row.row,
+                        column,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// 窗口坐标命中的任务复选框（矩形是占位区，不是方框本身）。

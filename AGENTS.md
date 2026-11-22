@@ -395,7 +395,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 356 / sync 605 / app `--features dev-sync` 427 / 默认 196 / storage 187 / editor 157 / markdown 22。
+> 测试：relay 356 / sync 605 / app `--features dev-sync` 462 / 默认 231 / storage 187 / editor 240 / markdown 28。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
@@ -434,6 +434,19 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **交互修复（2026-11-17）**：设置页按窗口高度限高并可滚动；wiki 链接悬停手形、
 > 末尾边界不跳转、点击仅命中 display 可见区间（修复上一行误跳）；右键菜单动作后
 > 吞掉同一次手势的 mouse-up，修复根目录笔记/文件夹右键重命名被立刻提交。
+> **S3b3/S3b4 表格删除与右键插入（2026-11-17）**：表格浮层增删行/删列
+>（表头不删、至少保留 1 列、删除后修正选中格）；编辑器右键「插入 → 表格」，
+> 默认 2 列 × 1 数据行，一条 EditRequest，右键不移动 caret。拖拽重排仍未做。
+> **S3b2 表格单元格编辑（2026-11-17）**：单击选中格、再次点击/F2/Enter 就地编辑；
+> 编辑态 display 只显示该 cell 文本，草稿只写镜像，提交/`Tab` 一条 `EditRequest`，
+> `Esc` 零请求恢复；未转义 `|` 写 `\|`；加行/加列/任务/图片回归通过。删除行列、
+> 拖拽重排仍未做。
+> **S3b1 表格加行/加列（2026-11-17）**：表格右下角浮层「+ 行」「+ 列」；只插入
+> 不替换，加列同时扩表头/分隔行/所有数据行；一次点击一个 EditRequest/undo 组，
+> caret 不落进表格内部。单元格编辑、删除行列、拖拽仍是 S3b2。
+> **S3a 表格 Object（2026-11-17）**：GFM 表格解析成 `TableBlock`（表头/分隔行/数据行/
+> cell 源码区间/对齐），图片与表格共用 `ObjectBlock` 投影；只读表格自绘、整块选中、
+> 工具条「编辑源码」/Esc 往返；单元格编辑、加行加列、拖拽仍是 S3b。
 > **S3 任务列表（2026-11-17）**：任务框 `[ ]`/`[x]` 解析出精确源码区间，
 > 隐藏态自绘复选框；点击只发一个 `EditRequest` 切换 3 字节（不动 caret/其它字节），
 > 进 undo；嵌套/有序/`[X]` 独立切换。表格 Object、物理资产 GC 仍未做。

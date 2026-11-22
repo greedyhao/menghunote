@@ -526,8 +526,28 @@ impl ProjectionMap {
         selection: Selection,
         revealed_object_lines: &[usize],
     ) -> Self {
+        Self::from_markdown_with_lists_and_objects_and_cell(
+            doc,
+            selection,
+            revealed_object_lines,
+            None,
+        )
+    }
+
+    /// 列表 + 对象 + **单元格就地编辑**感知的投影（ADR 0019 S3b2）。
+    ///
+    /// `cell` 为 `Some` 时，被编辑的那张表格不再投影成 `Object`，display 上只保留该
+    /// cell 的源码文本（表格其余部分隐藏）。display 与 source 在这一段仍然**逐字节
+    /// 相同**，因此 caret/选区/IME/双向映射全部沿用现有路径，不需要第二套坐标系。
+    #[must_use]
+    pub fn from_markdown_with_lists_and_objects_and_cell(
+        doc: &MarkdownDocument,
+        selection: Selection,
+        revealed_object_lines: &[usize],
+        cell: Option<crate::model::markdown::ProjectionCellReveal>,
+    ) -> Self {
         let pieces = doc
-            .projection_pieces_with_objects(selection, revealed_object_lines)
+            .projection_pieces_with_objects_and_cell(selection, revealed_object_lines, cell)
             .ok();
         let projection = pieces
             .as_deref()

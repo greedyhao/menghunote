@@ -189,6 +189,56 @@ pub fn shape_row_styled_at(
         .shape_line(shared, px(font_size), &runs, None)
 }
 
+/// 用带样式 runs shaping 一行文本，并在超过 `max_width` 时**按真实字形宽度截断**。
+///
+/// 表格单元格用它：GPUI 的文字绘制没有“按矩形裁剪”的参数，超宽文本会溢出到相邻
+/// 单元格，所以必须在这里按 shaping 宽度截断并补 `…`（不做“字符数 × 平均宽度”估算）。
+///
+/// 返回 `None`：文本为空 / 宽度非正 / 连一个省略号都放不下（该格不画字，但边框与
+/// 背景仍按几何绘制）。
+#[must_use]
+pub fn shape_row_truncated_at(
+    window: &Window,
+    text: &str,
+    spans: &[(usize, StyleKind)],
+    font_size: f32,
+    mono: bool,
+    max_width: f32,
+) -> Option<ShapedLine> {
+    if text.is_empty() || !max_width.is_finite() || max_width <= 0.0 {
+        return None;
+    }
+    let full = shape_row_styled_at(window, text, spans, font_size, mono);
+    if full.width().as_f32() <= max_width {
+        return Some(full);
+    }
+    let ellipsis = "…";
+    let ellipsis_spans = [(ellipsis.len(), StyleKind::Plain)];
+    let ellipsis = shape_row_styled_at(window, ellipsis, &ellipsis_spans, font_size, mono);
+    let ellipsis_width = ellipsis.width().as_f32();
+    let budget = (max_width - ellipsis_width).max(0.0);
+    if budget <= 0.0 {
+        return Some(ellipsis);
+    }
+    // `closest_index_for_x` 返回字节下标；吸附到 char 边界后再切（不切坏 UTF-8）。
+    let mut cut = full.closest_index_for_x(px(budget)).min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut == 0 {
+        return Some(ellipsis);
+    }
+    let truncated = format!("{}…", &text[..cut]);
+    let truncated_spans = [(truncated.len(), StyleKind::Plain)];
+    Some(shape_row_styled_at(
+        window,
+        &truncated,
+        &truncated_spans,
+        font_size,
+        mono,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{line_spans, text_runs};

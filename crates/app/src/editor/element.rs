@@ -25,7 +25,9 @@ use gpui::{
 };
 use menghunote_editor::{units, Bias, Selection};
 
-use super::geometry::{EditorGeometry, TaskBoxPaint};
+use super::geometry::{
+    EditorGeometry, ObjectPaintContent, TableCellPaint, TablePaint, TaskBoxPaint,
+};
 use super::layout::VisualLine;
 use super::shared::EditorShared;
 use super::theme;
@@ -264,10 +266,11 @@ impl EditorElement {
         }
     }
 
-    /// 画图片对象（ADR 0019 S2a）：已解码画图片；加载中/缺失/失败画占位框 + alt/状态文案。
+    /// 画 Object（ADR 0019 S2a 图片 / S3a 表格）。
     ///
-    /// 矩形来自 [`EditorGeometry::objects`]（prepaint 已经按 `LayoutFrame` 的行顶/行高算好），
-    /// 因此滚动、命中、选中框与文本几何是**同一套**坐标。
+    /// 矩形来自 [`EditorGeometry::objects`]（prepaint 已经按 `LayoutFrame` 的行顶/行高
+    /// 算好），因此滚动、命中、选中框与文本几何是**同一套**坐标。图片加载中/缺失/失败
+    /// 画占位框 + alt/状态文案；表格画只读 GFM 网格（表头底色/边框/单元格文本）。
     fn paint_objects(
         &self,
         bounds: Bounds<Pixels>,
@@ -277,38 +280,45 @@ impl EditorElement {
     ) {
         for object in geometry.objects() {
             let rect = object.rect;
-            if let Some(image) = &object.image {
-                // `bounds` 是视口裁剪框：图片可能被滚出视口，交给 gpui 裁剪。
-                if let Err(error) = window.paint_image(
-                    bounds,
-                    rect,
-                    Corners::default(),
-                    std::sync::Arc::clone(image),
-                    0,
-                    false,
-                ) {
-                    eprintln!("[menghunote] 绘制图片失败（降级为空白）：{error}");
-                }
-            } else {
-                window.paint_quad(quad(
-                    rect,
-                    Corners::default(),
-                    theme::object_placeholder_bg(),
-                    Edges::all(px(1.0)),
-                    theme::object_placeholder_border(),
-                    BorderStyle::default(),
-                ));
-                if let Some(label) = &object.label {
-                    let line_height = px(theme::OBJECT_LABEL_FONT_SIZE * 1.5);
-                    let origin = point(
-                        rect.origin.x + px(theme::OBJECT_LABEL_PAD_X),
-                        rect.origin.y + (rect.size.height - line_height) / 2.0,
-                    );
-                    if let Err(error) =
-                        label.paint(origin, line_height, TextAlign::Left, None, window, cx)
-                    {
-                        eprintln!("[menghunote] 绘制图片占位文案失败：{error}");
+            match &object.content {
+                ObjectPaintContent::Image(paint) => {
+                    if let Some(image) = &paint.image {
+                        // `bounds` 是视口裁剪框：图片可能被滚出视口，交给 gpui 裁剪。
+                        if let Err(error) = window.paint_image(
+                            bounds,
+                            rect,
+                            Corners::default(),
+                            std::sync::Arc::clone(image),
+                            0,
+                            false,
+                        ) {
+                            eprintln!("[menghunote] 绘制图片失败（降级为空白）：{error}");
+                        }
+                    } else {
+                        window.paint_quad(quad(
+                            rect,
+                            Corners::default(),
+                            theme::object_placeholder_bg(),
+                            Edges::all(px(1.0)),
+                            theme::object_placeholder_border(),
+                            BorderStyle::default(),
+                        ));
+                        if let Some(label) = &paint.label {
+                            let line_height = px(theme::OBJECT_LABEL_FONT_SIZE * 1.5);
+                            let origin = point(
+                                rect.origin.x + px(theme::OBJECT_LABEL_PAD_X),
+                                rect.origin.y + (rect.size.height - line_height) / 2.0,
+                            );
+                            if let Err(error) =
+                                label.paint(origin, line_height, TextAlign::Left, None, window, cx)
+                            {
+                                eprintln!("[menghunote] 绘制图片占位文案失败：{error}");
+                            }
+                        }
                     }
+                }
+                ObjectPaintContent::Table(table) => {
+                    Self::paint_table(table, window, cx);
                 }
             }
             if object.selected {
@@ -322,6 +332,106 @@ impl EditorElement {
                     BorderStyle::default(),
                 ));
             }
+        }
+    }
+
+    /// 画只读表格（ADR 0019 S3a）：外框底色 → 表头底色 → 单元格文字 → 网格线。
+    ///
+    /// `table.rows` 只含与视口相交的行（长表格按行裁剪，滚出视口的部分不绘制）；
+    /// 单元格文字已按列宽截断并补省略号，不会溢出到相邻列。
+    fn paint_table(table: &TablePaint, window: &mut Window, cx: &mut App) {
+        window.paint_quad(fill(table.rect, theme::table_bg()));
+        if let Some(header) = &table.header {
+            window.paint_quad(fill(header.rect, theme::table_header_bg()));
+        }
+        // 选中单元格的底色：画在单元格文字**之前**（文字仍然压在底色上，清晰可读）。
+        let selected = table
+            .selected_cell
+            .and_then(|(row, column)| table_cell_paint_at(table, row, column));
+        if let Some(cell) = selected {
+            window.paint_quad(fill(cell.rect, theme::table_cell_selected_bg()));
+        }
+        // 单元格文字：对齐方式来自 GFM 分隔行；`align_width` 用单元格内宽，
+        // 于是 Center/Right 由 GPUI 的 shaping 排版完成（不做像素估算）。
+        for row in table.header.iter().chain(table.rows.iter()) {
+            for cell in &row.cells {
+                let Some(text) = &cell.text else {
+                    continue;
+                };
+                let inner = Bounds::new(
+                    point(
+                        cell.rect.origin.x + px(theme::TABLE_CELL_PAD_X),
+                        cell.rect.origin.y,
+                    ),
+                    size(
+                        px(
+                            (cell.rect.size.width.as_f32() - theme::TABLE_CELL_PAD_X * 2.0)
+                                .max(0.0),
+                        ),
+                        cell.rect.size.height,
+                    ),
+                );
+                let align = match cell.align {
+                    menghunote_editor::MarkdownTableAlignment::Center => TextAlign::Center,
+                    menghunote_editor::MarkdownTableAlignment::Right => TextAlign::Right,
+                    menghunote_editor::MarkdownTableAlignment::None
+                    | menghunote_editor::MarkdownTableAlignment::Left => TextAlign::Left,
+                };
+                if let Err(error) = text.paint(
+                    inner.origin,
+                    inner.size.height,
+                    align,
+                    Some(inner.size.width),
+                    window,
+                    cx,
+                ) {
+                    eprintln!("[menghunote] 绘制表格单元格失败：{error}");
+                }
+            }
+        }
+        // 网格线：列分隔线（每行每列右侧）+ 行底线。边框宽度固定 1px。
+        let line = px(theme::TABLE_BORDER_WIDTH);
+        for row in table.header.iter().chain(table.rows.iter()) {
+            for (index, cell) in row.cells.iter().enumerate() {
+                if index == 0 {
+                    continue;
+                }
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(cell.rect.origin.x, cell.rect.origin.y),
+                        size(line, cell.rect.size.height),
+                    ),
+                    theme::table_border(),
+                ));
+            }
+            let bottom = row.rect.origin.y + row.rect.size.height - line;
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(row.rect.origin.x, bottom),
+                    size(row.rect.size.width, line),
+                ),
+                theme::table_border(),
+            ));
+        }
+        // 外框最后画：表头底色/网格线不得盖住 1px 边框。
+        window.paint_quad(quad(
+            table.rect,
+            Corners::default(),
+            transparent_black(),
+            Edges::all(px(theme::TABLE_BORDER_WIDTH)),
+            theme::table_border(),
+            BorderStyle::default(),
+        ));
+        // 选中单元格描边压在最上层（网格线不得盖住它）；矩形与命中/编辑共用一份。
+        if let Some(cell) = selected {
+            window.paint_quad(quad(
+                cell.rect,
+                Corners::default(),
+                transparent_black(),
+                Edges::all(px(theme::TABLE_CELL_SELECTED_BORDER)),
+                theme::table_cell_selected_border(),
+                BorderStyle::default(),
+            ));
         }
     }
 
@@ -403,8 +513,57 @@ impl EditorElement {
                 let toolbar_hit = down_view
                     .update(cx, |view, _| view.point_in_toolbar(event.position))
                     .unwrap_or(false);
+                // 正文右键菜单（ADR 0019 S3b4）：点菜单外 → 先关菜单，再照常处理这次
+                // 左键（落 caret / 选区）。菜单内的点击由菜单自己的按钮处理（上面已放行）。
+                let menu_hit = down_view
+                    .update(cx, |view, _| view.context_menu_contains(event.position))
+                    .unwrap_or(false);
+                if !menu_hit
+                    && down_view
+                        .update(cx, |view, _| view.context_menu_open())
+                        .unwrap_or(false)
+                {
+                    down_view
+                        .update(cx, |view, cx| view.close_context_menu(cx))
+                        .ok();
+                }
                 if toolbar_hit {
                     return;
+                }
+                // 表格行列拖拽（ADR 0019 S3b5）：把手是浮层 div（元素级监听先跑，拖拽已经
+                // 开始）；这里再兜一层 —— 拖拽中/按在把手上都不落 caret、不选单元格。
+                //
+                // 拖拽中又收到一次“按下”说明上一次手势的抬起丢了（例如在窗口外释放）：
+                // 直接取消，绝不让脏状态把这次点击吞掉、更不会在别处误重排。
+                if down_view
+                    .update(cx, |view, cx| view.cancel_table_drag(cx))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                // 单元格就地编辑（ADR 0019 S3b2）：点在正在编辑的那个 cell 所在的**视觉行**
+                // 上 → 照常落 caret（控制器会把 caret 夹在 cell 文本内）；点在别处 →
+                // 先提交（一次 `EditRequest` = 一个撤销组），再把这次点击落成 caret。
+                let editing_cell = down_view
+                    .update(cx, |view, _| view.is_editing_table_cell())
+                    .unwrap_or(false);
+                if editing_cell {
+                    let cell_row = down_view
+                        .update(cx, |view, _| view.table_cell_edit_display_anchor())
+                        .ok()
+                        .flatten()
+                        .map(|anchor| down_geometry.frame.row_of_byte(anchor));
+                    if cell_row != Some(down_geometry.row_at_y(event.position.y)) {
+                        let (byte, bias) = down_geometry
+                            .byte_at_with_bias(event.position)
+                            .unwrap_or((down_geometry.byte_at(event.position), Bias::Right));
+                        down_view
+                            .update(cx, |view, cx| {
+                                view.commit_table_cell_edit_and_place_caret(byte, bias, window, cx)
+                            })
+                            .ok();
+                        return;
+                    }
                 }
                 // 任务复选框（ADR 0019 S3）：只切换 source，不落正文 caret、不开始拖选。
                 if let Some((item, source)) = down_geometry
@@ -418,9 +577,29 @@ impl EditorElement {
                         .ok();
                     return;
                 }
-                // 图片对象：单击只选中块（描边），不展开源码、不产生对象内部 caret。
+                // 表格单元格（ADR 0019 S3b2）：单击只选中该格（不移动正文 caret）；
+                // 再次单击同一格 / 双击才进入就地编辑。点到表格的非单元格区域（内边距/
+                // 边框）仍然走 S3a 的整块选中。
                 if let Some(object) = down_geometry.object_at(event.position) {
                     let line = object.line;
+                    if object.kind.is_table() {
+                        if let Some(cell) = down_geometry.table_cell_at(event.position) {
+                            let click_count = event.click_count;
+                            down_view
+                                .update(cx, |view, cx| {
+                                    view.click_table_cell(
+                                        line,
+                                        cell.row,
+                                        cell.column,
+                                        click_count,
+                                        Some(window),
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                            return;
+                        }
+                    }
                     down_view
                         .update(cx, |view, cx| view.select_object_at(line, Some(window), cx))
                         .ok();
@@ -459,10 +638,48 @@ impl EditorElement {
             },
         );
 
+        // 右键：正文「插入 → 表格」菜单（ADR 0019 S3b4）。右键本身**不移动 caret**；
+        // 菜单里的插入动作使用打开菜单时的 caret/选区。
+        let right_view = self.view.downgrade();
+        window.on_mouse_event(
+            move |event: &MouseDownEvent,
+                  phase: DispatchPhase,
+                  _window: &mut Window,
+                  cx: &mut App| {
+                if !phase.bubble()
+                    || event.button != MouseButton::Right
+                    || !bounds.contains(&event.position)
+                {
+                    return;
+                }
+                let toolbar_hit = right_view
+                    .update(cx, |view, _| view.point_in_toolbar(event.position))
+                    .unwrap_or(false);
+                if toolbar_hit {
+                    // 右键落在浮层/菜单本身上：不重开菜单，也不打扰当前菜单。
+                    return;
+                }
+                right_view
+                    .update(cx, |view, cx| view.open_context_menu_at(event.position, cx))
+                    .ok();
+            },
+        );
+
         let move_view = self.view.downgrade();
         let move_geometry = Rc::clone(&geometry);
         window.on_mouse_event(
             move |event: &MouseMoveEvent, _phase: DispatchPhase, _: &mut Window, cx: &mut App| {
+                // 表格行列拖拽（ADR 0019 S3b5）：拖拽期间只更新插入槽位，**不动正文
+                // caret/选区**、也不改悬停目标（把手/工具条必须稳定）。
+                if move_view
+                    .update(cx, |view, _| view.table_drag_active())
+                    .unwrap_or(false)
+                {
+                    move_view
+                        .update(cx, |view, cx| view.update_table_drag(event.position, cx))
+                        .ok();
+                    return;
+                }
                 // 悬停 → 图片对象工具条（不依赖元素级 hover 命中链）。
                 move_view
                     .update(cx, |view, cx| view.hover_at(event.position, cx))
@@ -484,7 +701,23 @@ impl EditorElement {
 
         let up_view = self.view.downgrade();
         window.on_mouse_event(
-            move |_event: &MouseUpEvent, _phase: DispatchPhase, _: &mut Window, cx: &mut App| {
+            move |event: &MouseUpEvent,
+                  _phase: DispatchPhase,
+                  window: &mut Window,
+                  cx: &mut App| {
+                // 表格行列拖拽（ADR 0019 S3b5）：释放位置决定插入槽位 → 一次
+                // `EditRequest`（原地/表格外则取消，零请求）。必须在 `end_drag`
+                // 之前处理：它读的是拖拽状态，不是文本拖选锚点。
+                let dragging_table = up_view
+                    .update(cx, |view, _| view.table_drag_active())
+                    .unwrap_or(false);
+                if dragging_table {
+                    up_view
+                        .update(cx, |view, cx| {
+                            view.finish_table_drag(event.position, Some(window), cx)
+                        })
+                        .ok();
+                }
                 up_view.update(cx, |view, _cx| view.end_drag()).ok();
             },
         );
@@ -633,10 +866,14 @@ impl Element for EditorElement {
         // shaping；`WrapCache` 只缓存折行（纯文本函数），不会把样式缓存住。
         let styles = Rc::new(self.view.read(cx).style_runs_display());
         // 图片对象：几何矩形按 LayoutFrame 的行顶/行高算（元素局部坐标，下面再加 origin）。
-        let objects_local =
-            self.view
-                .read(cx)
-                .object_paints(window, &frame, scroll, content_width, first..last);
+        let objects_local = self.view.read(cx).object_paints(
+            window,
+            &frame,
+            scroll,
+            content_width,
+            bounds.size.height.as_f32(),
+            first..last,
+        );
         let object_rows: std::collections::HashSet<usize> =
             objects_local.iter().map(|object| object.row).collect();
         let shaped = frame.lines[first..last]
@@ -663,17 +900,11 @@ impl Element for EditorElement {
                 )
             })
             .collect();
-        // 局部坐标 → 窗口坐标（元素原点）。
+        // 局部坐标 → 窗口坐标（元素原点；表格内部的表头/行/单元格矩形一起平移）。
         let objects = objects_local
             .into_iter()
             .map(|mut object| {
-                object.rect = Bounds::new(
-                    point(
-                        object.rect.origin.x + bounds.origin.x,
-                        object.rect.origin.y + bounds.origin.y,
-                    ),
-                    object.rect.size,
-                );
+                object.translate(bounds.origin);
                 object
             })
             .collect();
@@ -828,6 +1059,18 @@ impl Element for EditorElement {
             cx,
         );
     }
+}
+
+/// 表格里第 `row` 行（0 = 表头）第 `column` 列单元格的绘制数据。
+///
+/// 长表格按视口裁剪后 `rows` 只含可见行：滚出视口的单元格返回 `None`（不画、不命中）。
+fn table_cell_paint_at(table: &TablePaint, row: usize, column: usize) -> Option<&TableCellPaint> {
+    table
+        .header
+        .iter()
+        .chain(table.rows.iter())
+        .find(|paint_row| paint_row.row == row)
+        .and_then(|paint_row| paint_row.cells.get(column))
 }
 
 /// 空行是否该画一条"选区窄高亮"。

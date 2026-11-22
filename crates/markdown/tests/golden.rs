@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use menghunote_markdown::{parse, ConstructKind, LineKind, Span};
+use menghunote_markdown::{parse, ConstructKind, LineKind, Span, TableAlignment};
 
 fn slice(source: &str, span: Span) -> &str {
     &source[span.start..span.end]
@@ -297,21 +297,228 @@ fn non_task_and_malformed_task_items_expose_no_box() {
 }
 
 #[test]
-fn tables_and_setext_are_unsupported_spans_not_constructs() {
-    let table = parse("| a | b |\n|---|---|\n| 1 | 2 |\n");
-    assert!(!table.unsupported_spans.is_empty());
+fn tables_have_a_block_tree_and_are_not_unsupported_spans() {
+    // ADR 0019 S3a：表格是**已支持原子块**（有自己的块树），不再进 `unsupported_spans`。
+    let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+    let table = parse(source);
+    assert!(
+        table.unsupported_spans.is_empty(),
+        "表格不得再作为未支持块：{:?}",
+        table.unsupported_spans
+    );
     assert_eq!(table.lines[0].kind, LineKind::Table);
+    assert_eq!(table.lines[2].kind, LineKind::Table);
+    assert_eq!(table.tables.len(), 1);
+    let block = &table.tables[0];
+    assert_eq!(slice(source, block.span), "| a | b |\n|---|---|\n| 1 | 2 |");
+    assert_eq!(block.columns, 2);
+    assert_eq!(block.alignments, vec![TableAlignment::None; 2]);
+    assert_eq!((block.first_line, block.last_line), (0, 2));
+    assert_eq!(slice(source, block.delimiter), "|---|---|");
+    assert_eq!(slice(source, block.header.span), "| a | b |");
+    assert_eq!(
+        block
+            .header
+            .cells
+            .iter()
+            .map(|cell| slice(source, *cell))
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+    assert_eq!(block.row_count(), 1);
+    let row = block.row(0).expect("必须有一条数据行");
+    assert_eq!(slice(source, row.span), "| 1 | 2 |");
+    assert_eq!(row.line, 2);
+    assert_eq!(
+        row.cells
+            .iter()
+            .map(|cell| slice(source, *cell))
+            .collect::<Vec<_>>(),
+        vec!["1", "2"]
+    );
+    // 表格内部不产生可投影构造（Object 是原子块）。
     assert!(table
         .constructs
         .iter()
-        .all(|construct| !construct.kind.is_inline()));
+        .all(|construct| construct.span.start < block.span.start
+            || construct.span.end > block.span.end));
 
+    // Setext 标题仍是未支持块（S1 决定不变）。
     let setext = parse("Title\n=====\n");
     assert!(!setext.unsupported_spans.is_empty());
     assert!(!setext
         .constructs
         .iter()
         .any(|construct| matches!(construct.kind, ConstructKind::Heading(_))));
+}
+
+#[test]
+fn table_alignment_columns_and_escaped_pipes_are_pinned() {
+    let source = "|a|b|c|d|\n|:--|:-:|--:|---|\n| 1 | 2 | 3 | 4 |\n| c\\|d | `x|y` | **e** |  |\n";
+    let doc = parse(source);
+    let table = doc.tables.first().expect("必须解析出一张表");
+    assert_eq!(table.columns, 4);
+    assert_eq!(
+        table.alignments,
+        vec![
+            TableAlignment::Left,
+            TableAlignment::Center,
+            TableAlignment::Right,
+            TableAlignment::None,
+        ]
+    );
+    assert_eq!(table.alignment(0), TableAlignment::Left);
+    assert_eq!(table.alignment(9), TableAlignment::None, "越界按默认对齐");
+    assert_eq!(table.row_count(), 2);
+
+    // escaped `|` 属于 cell 原文（源码逐字节保留，不把 `\\|` 当列边界）。
+    let row = table.row(1).expect("第二行数据");
+    assert_eq!(slice(source, row.cells[0]), "c\\|d");
+    // 行内代码里的 `|` 按 GFM 是列边界（要写 `\\|` 才是字面 pipe）：
+    // `` `x|y` `` 会被切分，plldown 也会抛掉多余列；这里只保证不 panic、列数稳定。
+    assert_eq!(row.cells.len(), 4);
+    // GFM 承认行内代码里的 `|` 仍是列边界（字面 pipe 必须写 `\|`）；`|  |` 多出的
+    // 第 5 列被丢弃，第 4 格正是后面的 `**e**`。
+    assert_eq!(slice(source, row.cells[3]), "**e**");
+    // 行内格式在表格里不投影（原子块）：没有 Bold 构造。
+    assert!(
+        !doc.constructs
+            .iter()
+            .any(|construct| construct.kind == ConstructKind::Bold),
+        "表格内部的 `**e**` 不应产生可投影构造"
+    );
+
+    // 对齐分隔行本身不是数据行，但整行区间可以按源码切片。
+    assert_eq!(slice(source, table.delimiter), "|:--|:-:|--:|---|");
+}
+
+#[test]
+fn escaped_pipes_inside_inline_code_are_one_cell() {
+    // GFM：cell 里的字面 pipe 必须转义（**包括行内代码内部**），`\|` 不切列。
+    let source = "| h | h |\n|---|---|\n| `a\\|b` | c |\n";
+    let doc = parse(source);
+    let table = doc.tables.first().expect("必须解析出表格");
+    assert_eq!(table.columns, 2);
+    let row = table.row(0).expect("一行数据");
+    assert_eq!(
+        slice(source, row.cells[0]),
+        "`a\\|b`",
+        "转义 pipe 属于 cell 原文"
+    );
+    assert_eq!(slice(source, row.cells[1]), "c");
+
+    // 未转义的 pipe（即使写在行内代码里）按 GFM 是列边界：`` `a|b` `` 被切开，
+    // 这里只钉住“不 panic、列数稳定、源码逐字节保留”的行为。
+    let unescaped = "| h | h |\n|---|---|\n| `a|b` | c |\n";
+    let doc = parse(unescaped);
+    let table = doc.tables.first().expect("仍必须解析出表格");
+    assert_eq!(table.columns, 2);
+    let row = table.row(0).expect("一行数据");
+    assert_eq!(slice(unescaped, row.cells[0]), "`a");
+    assert_eq!(slice(unescaped, row.cells[1]), "b`");
+}
+
+#[test]
+fn table_without_header_or_delimiter_is_not_a_table() {
+    for source in [
+        // 只有一行：没有分隔行，GFM 不认为它是表格。
+        "| 1 | 2 |\n",
+        // 分隔行放在第一行：pulldown 按普通段落处理。
+        "|---|---|\n|1|2|\n",
+    ] {
+        let doc = parse(source);
+        assert!(
+            doc.tables.is_empty(),
+            "{source:?} 不应该是表格：{:?}",
+            doc.tables
+        );
+        assert!(
+            doc.unsupported_spans.is_empty(),
+            "{source:?} 也不应该被当成未支持块：{:?}",
+            doc.unsupported_spans
+        );
+        assert!(doc.lines.iter().all(|line| line.kind != LineKind::Table));
+    }
+
+    // 表格前面的普通段落不影响表格从表头行开始（区间不吞前文）。
+    let after_paragraph = parse("intro\n\n| a |\n|---|\n");
+    let table = after_paragraph
+        .tables
+        .first()
+        .expect("前有段落时仍必须解析出表格");
+    assert_eq!(table.first_line, 2);
+    assert_eq!(table.span.start, 7);
+
+    // 空表头（`| | |`）仍是合法表格：两列都是空 cell。
+    let empty_header = parse("| | |\n|---|---|\n|1|2|\n");
+    let table = empty_header.tables.first().expect("空表头仍是表格");
+    assert_eq!(table.columns, 2);
+    // 空 cell 是“去掉首尾空白后”的空区间（`| |` 的中间空格被裁掉）。
+    assert_eq!(table.header.cells, vec![Span::empty(2), Span::empty(4)]);
+    assert_eq!(table.row_count(), 1);
+}
+
+#[test]
+fn table_rows_are_padded_and_truncated_to_the_header_columns() {
+    // 缺列：pulldown 会补空 cell（区间可能是空区间）；多列：多出的被丢弃。
+    let source = "| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |\n";
+    let doc = parse(source);
+    let table = doc.tables.first().expect("必须解析出表格");
+    assert_eq!(table.columns, 2);
+    assert_eq!(table.row_count(), 2);
+    assert_eq!(slice(source, table.rows[0].cells[0]), "1");
+    assert_eq!(slice(source, table.rows[0].cells[1]), "", "缺列补空 cell");
+    assert_eq!(
+        table.rows[0].cells[1].start, table.rows[0].cells[1].end,
+        "补出来的 cell 必须是空区间"
+    );
+    assert_eq!(slice(source, table.rows[1].cells[0]), "1");
+    assert_eq!(slice(source, table.rows[1].cells[1]), "2");
+    assert_eq!(table.rows[1].cells.len(), 2, "多出的列被丢弃");
+}
+
+#[test]
+fn table_span_excludes_the_trailing_newline_and_tracks_source_lines() {
+    let source = "前\n\n| a |\n|---|\n| b |\n\n后\n";
+    let doc = parse(source);
+    let table = doc.tables.first().expect("必须解析出表格");
+    let span_text = slice(source, table.span);
+    assert_eq!(span_text, "| a |\n|---|\n| b |");
+    assert!(
+        !span_text.ends_with('\n'),
+        "整表区间不得包含末尾换行（否则 Object 占位会和下一段粘行）"
+    );
+    assert_eq!((table.first_line, table.last_line), (2, 4));
+    // object 判定的前提：表格从行内容起点开始。
+    assert_eq!(table.span.start, doc.lines[table.first_line].content.start);
+
+    // CRLF：行区间不含 `\r`，cell 也不含。
+    let crlf = "| a | b |\r\n|---|---|\r\n| 1 | 2 |\r\n";
+    let doc = parse(crlf);
+    let table = doc.tables.first().expect("CRLF 表格也必须解析");
+    assert_eq!(slice(crlf, table.header.span), "| a | b |");
+    assert_eq!(slice(crlf, table.rows[0].span), "| 1 | 2 |");
+    assert_eq!(slice(crlf, table.rows[0].cells[1]), "2");
+}
+
+#[test]
+fn indented_quoted_and_list_tables_still_expose_spans() {
+    // 表格在引用/列表里仍然有块树（渲染是否投影成 Object 由 editor 决定）。
+    for (source, needle) in [
+        ("  | a |\n  |---|\n", "| a |"),
+        ("> | a |\n> |---|\n", "| a |"),
+        ("- | a |\n  |---|\n", "| a |"),
+    ] {
+        let doc = parse(source);
+        let table = doc
+            .tables
+            .first()
+            .unwrap_or_else(|| panic!("{source:?} 必须解析出表格"));
+        assert!(slice(source, table.span).starts_with(needle), "{source:?}");
+        assert_eq!(table.columns, 1);
+        assert_eq!(slice(source, table.header.cells[0]), "a");
+        assert_eq!(doc.lines[table.first_line].kind, LineKind::Table);
+    }
 }
 
 #[test]

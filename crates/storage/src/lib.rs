@@ -34,6 +34,7 @@
 //! ```
 
 mod actor;
+pub mod asset_gc;
 mod asset_store;
 mod baseline_apply;
 mod body_doc;
@@ -57,6 +58,7 @@ mod sync_bridge;
 mod tree_view;
 
 pub use actor::{AffectedGuard, Row, Statement, Vault};
+pub use asset_gc::{scan_asset_gc, AssetGcCandidate, AssetGcReport, ASSET_GC_MAX_CANDIDATES};
 pub use asset_store::{
     asset_content_hash, asset_meta_by_hash, count_unreferenced_assets, insert_asset,
     link_asset_ref, list_asset_refs, list_referenced_assets, replace_asset_refs,

@@ -75,6 +75,7 @@ use menghunote_markdown::{self as semantic, ParsedMarkdown, Span as SemanticSpan
 use menghunote_text::{CoordError, SourceByte, SourceRange, UnicodeScalar};
 
 use crate::model::block::BlockRun;
+use crate::model::object::{ObjectBlock, ObjectKind};
 use crate::model::projection::{ProjectionMap, ProjectionPiece};
 use crate::model::selection::Selection;
 use crate::model::style::StyleRun;
@@ -308,7 +309,7 @@ impl MarkdownWikiLink {
 /// 1. 图片 span 必须从行内容起点开始（行首缩进/列表 marker/引用前缀都会破坏它）；
 /// 2. 图片 span 之后到行内容结尾只能是空白（行尾空格/Tab 允许，不产生错位）；
 /// 3. 该行必须是普通段落（不是标题/引用/列表/围栏/缩进代码/表格/HTML/分隔线），
-///    且不在 `code_spans`/`unsupported_spans` 里。
+///    且不在 [`ParsedMarkdown::opaque_spans`]（代码 / 表格 / 未支持块）里。
 ///
 /// 不满足时 `block = false`：**首版保持源码原样显示**（混排/行内图片），
 /// 绝不原子替换半行内容（否则会产生错位）。
@@ -347,6 +348,188 @@ impl MarkdownImage {
     }
 
     /// 是否整行独占、可投影成 Object Block。
+    #[must_use]
+    pub const fn is_block(&self) -> bool {
+        self.block
+    }
+}
+
+/// 一行 GFM 表格（表头行或数据行）的 source 语义（ADR 0019 S3a）。
+///
+/// `cells` 与 [`MarkdownTable::columns`] 等长：缺列由解析器补空区间，
+/// 多列（GFM 会丢弃）不存在；cell 区间已去掉首尾空白，**不含** `|` 边界。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownTableRow {
+    span: SourceRange,
+    line: usize,
+    cells: Vec<SourceRange>,
+}
+
+impl MarkdownTableRow {
+    /// 整行内容区间（不含换行）。
+    #[must_use]
+    pub const fn span(&self) -> SourceRange {
+        self.span
+    }
+
+    /// 源码行号（0 起）。
+    #[must_use]
+    pub const fn line(&self) -> usize {
+        self.line
+    }
+
+    /// 每列 cell 的源码区间（长度 = 表格列数）。
+    #[must_use]
+    pub fn cells(&self) -> &[SourceRange] {
+        &self.cells
+    }
+
+    /// 第 `column` 列的 cell 区间；越界返回 `None`（不猜列，也不 panic）。
+    #[must_use]
+    pub fn cell(&self, column: usize) -> Option<SourceRange> {
+        self.cells.get(column).copied()
+    }
+}
+
+/// 单元格就地编辑的**投影显现**（ADR 0019 S3b2）。
+///
+/// 只描述“哪张表的哪一格正在编辑”：投影据此把整表压成该 cell 的一行源码文本
+/// （`Hidden` 前缀 + `Copy` cell + `Hidden` 后缀）。它不产生新文本，也不改源码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProjectionCellReveal {
+    /// 整表源码区间（= 原来 `Object` 段的 source 跨度）。
+    pub table: SourceRange,
+    /// 正在编辑的 cell 源码区间（**不含**两侧 `|` 与空白）。
+    pub cell: SourceRange,
+}
+
+/// 一个 GFM 表格块（ADR 0019 S3a：**只读渲染** + 编辑源码切换）。
+///
+/// 与 [`MarkdownImage`] 一样是**附加元数据**：投影仍通过
+/// [`ObjectBlock`]（`SegmentKind::Object`）实现，本类型只提供整块/行/单元格的
+/// source 区间、列数与对齐方式，**不产生任何新文本**。
+///
+/// # block 判定（写死，测试钉住）
+///
+/// 只有满足下列全部条件才是 Object Block（否则 `block = false`，首版原样显示源码）：
+///
+/// 1. 表格第一行是 `LineKind::Table`，且不在代码块/未支持块里（解析器保证）；
+/// 2. 第一行是**普通顶层行**：不是引用、不在列表项里；
+/// 3. 表格源码从该行**内容起点**开始（行首缩进不投影，避免与布局缩进打架）；
+/// 4. 表格区间结束在该行内容终点（不含末尾换行），且至少覆盖表头 + 分隔行。
+///
+/// 引用/列表/缩进里的表格仍然有完整块树（`tables()` 可查），只是不投影成对象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownTable {
+    span: SourceRange,
+    first_line: usize,
+    last_line: usize,
+    columns: usize,
+    alignments: Vec<semantic::TableAlignment>,
+    header: MarkdownTableRow,
+    delimiter: SourceRange,
+    rows: Vec<MarkdownTableRow>,
+    block: bool,
+}
+
+impl MarkdownTable {
+    /// 整表源码区间（表头行起点 .. 最后一行内容终点；**不含**末尾换行）。
+    #[must_use]
+    pub const fn span(&self) -> SourceRange {
+        self.span
+    }
+
+    /// 表头行行号（0 起；也是对象行）。
+    #[must_use]
+    pub const fn line(&self) -> usize {
+        self.first_line
+    }
+
+    /// 末行行号（0 起，含）。
+    #[must_use]
+    pub const fn end_line(&self) -> usize {
+        self.last_line
+    }
+
+    /// 列数（由分隔行决定；恒 ≥ 1）。
+    #[must_use]
+    pub const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// 每列对齐方式（长度 = [`Self::columns`]）。
+    #[must_use]
+    pub fn alignments(&self) -> &[semantic::TableAlignment] {
+        &self.alignments
+    }
+
+    /// 第 `column` 列的对齐方式（越界按默认对齐，不 panic）。
+    #[must_use]
+    pub fn alignment(&self, column: usize) -> semantic::TableAlignment {
+        self.alignments.get(column).copied().unwrap_or_default()
+    }
+
+    /// 表头行。
+    #[must_use]
+    pub const fn header(&self) -> &MarkdownTableRow {
+        &self.header
+    }
+
+    /// 分隔行整行区间（不含换行）。
+    #[must_use]
+    pub const fn delimiter(&self) -> SourceRange {
+        self.delimiter
+    }
+
+    /// 数据行（按源码顺序；不含表头与分隔行）。
+    #[must_use]
+    pub fn rows(&self) -> &[MarkdownTableRow] {
+        &self.rows
+    }
+
+    /// 数据行数。
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// 第 `row` 条数据行；越界返回 `None`。
+    #[must_use]
+    pub fn row(&self, row: usize) -> Option<&MarkdownTableRow> {
+        self.rows.get(row)
+    }
+
+    /// 第 `row` 行（**0 = 表头**，`1..=n` = 第 `row - 1` 条数据行）第 `column` 列的
+    /// cell 源码区间；任一越界返回 `None`。
+    ///
+    /// 这是单元格就地编辑（ADR 0019 S3b2）对外唯一的行寻址方式：UI 说的“第几行”
+    /// 含表头，而 [`Self::rows`] 不含表头，两套下标在 app 里混用必然错位。
+    #[must_use]
+    pub fn cell(&self, row: usize, column: usize) -> Option<SourceRange> {
+        if row == 0 {
+            self.header.cell(column)
+        } else {
+            self.rows.get(row - 1)?.cell(column)
+        }
+    }
+
+    /// 第 `row` 行（0 = 表头）的整行源码区间；越界返回 `None`。
+    #[must_use]
+    pub fn row_span(&self, row: usize) -> Option<SourceRange> {
+        if row == 0 {
+            Some(self.header.span())
+        } else {
+            self.rows.get(row - 1).map(MarkdownTableRow::span)
+        }
+    }
+
+    /// 总行数（含表头与分隔行的行号范围）：表头 + 数据行，用于 UI 越界校验。
+    #[must_use]
+    pub const fn total_rows(&self) -> usize {
+        self.rows.len() + 1
+    }
+
+    /// 是否整行独占、可投影成 Object Block（见类型文档的判定规则）。
     #[must_use]
     pub const fn is_block(&self) -> bool {
         self.block
@@ -407,6 +590,10 @@ pub struct MarkdownDocument {
     constructs: Vec<MarkdownConstruct>,
     /// 图片构造（S2a）：object 投影与 app 的图片加载都从这里取。
     images: Vec<MarkdownImage>,
+    /// 表格块（S3a）：object 投影与 app 的只读表格绘制都从这里取。
+    tables: Vec<MarkdownTable>,
+    /// 全部整块 Object（图片 + 表格，按 `span` 起点排序）：投影/选中/源码切换共用。
+    objects: Vec<ObjectBlock>,
     /// wiki 链接（L1）：点击/未解析样式/重命名改写用。
     wiki_links: Vec<MarkdownWikiLink>,
     /// 普通链接（点击打开外链用）。
@@ -422,6 +609,8 @@ impl MarkdownDocument {
     pub fn parse(source: &str) -> Result<Self, MarkdownError> {
         let semantic = semantic::parse(source);
         let images = collect_images(source, &semantic);
+        let tables = collect_tables(source, &semantic);
+        let objects = collect_objects(&images, &tables);
         let wiki_links = collect_wiki_links(source, &semantic);
         let links = collect_links(source, &semantic);
         let legacy = legacy_constructs(source)?;
@@ -446,6 +635,8 @@ impl MarkdownDocument {
             source: source.to_owned(),
             constructs,
             images,
+            tables,
+            objects,
             wiki_links,
             links,
             semantic,
@@ -481,9 +672,53 @@ impl MarkdownDocument {
     /// 同一行不可能有两个 Object Block（要求覆盖整行内容），所以这里返回第一个匹配。
     #[must_use]
     pub fn block_image_at_line(&self, line: usize) -> Option<&MarkdownImage> {
-        self.images
-            .iter()
-            .find(|image| image.block && image.line == line)
+        let object = self.object_at_line(line)?;
+        self.object_image(object)
+    }
+
+    /// 全部表格块（按文档顺序；含引用/列表/缩进里、不投影成对象的表格）。
+    #[must_use]
+    pub fn tables(&self) -> &[MarkdownTable] {
+        &self.tables
+    }
+
+    /// 只返回整行独占、可投影成 Object Block 的表格。
+    pub fn block_tables(&self) -> impl Iterator<Item = &MarkdownTable> + '_ {
+        self.tables.iter().filter(|table| table.block)
+    }
+
+    /// 全部整块 Object（图片 + 表格，按源码顺序）。
+    ///
+    /// 投影、选中、源码切换、删除**只走这一条路径**；不要再按图片/表格各写一套。
+    #[must_use]
+    pub fn objects(&self) -> &[ObjectBlock] {
+        &self.objects
+    }
+
+    /// 指定源码行上的整块 Object（图片所在行 / 表格表头行）；没有则 `None`。
+    ///
+    /// 同一行不可能有两个 Object Block（要求整行独占），所以返回第一个匹配。
+    #[must_use]
+    pub fn object_at_line(&self, line: usize) -> Option<&ObjectBlock> {
+        self.objects.iter().find(|object| object.line() == line)
+    }
+
+    /// Object 对应的图片载荷；不是图片对象时 `None`。
+    #[must_use]
+    pub fn object_image(&self, object: &ObjectBlock) -> Option<&MarkdownImage> {
+        if object.kind() != ObjectKind::Image {
+            return None;
+        }
+        self.images.get(object.index())
+    }
+
+    /// Object 对应的表格载荷；不是表格对象时 `None`。
+    #[must_use]
+    pub fn object_table(&self, object: &ObjectBlock) -> Option<&MarkdownTable> {
+        if object.kind() != ObjectKind::Table {
+            return None;
+        }
+        self.tables.get(object.index())
     }
 
     /// 新解析器的完整语义模型（列表块树 / 行信息）。
@@ -623,6 +858,27 @@ impl MarkdownDocument {
         selection: Selection,
         revealed_object_lines: &[usize],
     ) -> Result<Vec<ProjectionPiece>, MarkdownError> {
+        self.projection_pieces_with_objects_and_cell(selection, revealed_object_lines, None)
+    }
+
+    /// 在 [`Self::projection_pieces_with_objects`] 之上叠加**单元格就地编辑**的显现
+    /// （ADR 0019 S3b2）。
+    ///
+    /// `cell` 给出“正在编辑的整表 + cell”时：
+    ///
+    /// - 该表格**不再**产生 `Object` 片段（表格网格让位给一行文本）；
+    /// - 表格内除该 cell 之外的源码全部变成 `Hidden`（`|` / 分隔行 / 其它 cell 都不显示）；
+    /// - cell 本身保持 `Copy`：display 就是该 cell 的源码原文，caret/选区落在真实
+    ///   source 上（因此 IME / 双向映射 / 投影全部沿用现有路径，没有第二套坐标系）。
+    ///
+    /// 首版显示的就是**源码原文**（`\|` 不会被还原成 `|`，`**` 原样显示）：源码是
+    /// 唯一真源，用户没有实际改写这些字节时，保存回去的必须逐字不变。
+    pub fn projection_pieces_with_objects_and_cell(
+        &self,
+        selection: Selection,
+        revealed_object_lines: &[usize],
+        cell: Option<ProjectionCellReveal>,
+    ) -> Result<Vec<ProjectionPiece>, MarkdownError> {
         let mut hidden = self.hidden_ranges_for_selection_filtered(selection, false)?;
         let revealed = self.list_marker_reveals(selection)?;
         let mut replacements: Vec<ProjectionPiece> = Vec::new();
@@ -700,22 +956,39 @@ impl MarkdownDocument {
             }
         }
         hidden = kept;
-        let hidden = merge_ranges(&self.source, hidden)?;
-        // 图片对象：整行独占 + 不在显式源码模式里 → 原子对象片段。
+        let mut hidden = merge_ranges(&self.source, hidden)?;
+        // 整块 Object（图片 / 表格）：不在显式源码模式里 → 原子对象片段。
+        //
+        // 两种对象走**同一条**路径：block 判定已经把“引用/列表/缩进/表格里的图片”
+        // 和“引用/列表/缩进里的表格”排除掉了，所以这里不再按 kind 分支。
+        //
+        // 单元格就地编辑（ADR 0019 S3b2）：正在编辑的那张表**不**再是原子对象，
+        // 表格源码里除该 cell 之外的部分全部隐藏，display 上只剩 cell 文本。
         let mut objects: Vec<SourceRange> = Vec::new();
-        for image in &self.images {
-            if !image.block || revealed_object_lines.contains(&image.line) {
+        for object in &self.objects {
+            if revealed_object_lines.contains(&object.line()) {
+                continue;
+            }
+            let span = object.span();
+            if let Some(cell) = cell.filter(|cell| cell.table == span) {
+                if cell.cell.start() > span.start() {
+                    hidden.push(self.range(span.start().get(), cell.cell.start().get())?);
+                }
+                if cell.cell.end() < span.end() {
+                    hidden.push(self.range(cell.cell.end().get(), span.end().get())?);
+                }
                 continue;
             }
             // 防御：对象不能和隐藏/替换片段重叠（block 判定已排除列表/引用/标题行）。
             let overlaps = hidden.iter().chain(replacement_ranges.iter()).any(|range| {
-                range.start().get() < image.span.end().get()
-                    && image.span.start().get() < range.end().get()
+                range.start().get() < span.end().get() && span.start().get() < range.end().get()
             });
             if !overlaps {
-                objects.push(image.span);
+                objects.push(span);
             }
         }
+        // cell 编辑追加的隐藏段与已有隐藏段可能相邻（表格前面紧贴一个隐藏构造）→ 再合并一次。
+        let hidden = merge_ranges(&self.source, hidden)?;
         let mut pieces: Vec<ProjectionPiece> =
             hidden.into_iter().map(ProjectionPiece::Hidden).collect();
         pieces.extend(replacements);
@@ -1013,7 +1286,7 @@ fn collect_images(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownImage>
 /// 判定图片是否**整行独占**（可投影成 Object Block）。
 ///
 /// 条件（见 [`MarkdownImage`] 文档）：
-/// 1. 不在代码块 / 未支持块（表格、HTML）里；
+/// 1. 不在代码块 / 表格 / 未支持块（HTML）里；
 /// 2. 所在行是普通段落（不是标题/引用/列表/围栏/缩进代码/分隔线/表格/HTML）；
 /// 3. 图片 span 恰好从行内容起点开始；
 /// 4. 图片 span 之后到行内容结尾只有空白（行尾空格/Tab 允许）。
@@ -1023,12 +1296,8 @@ fn is_block_image(
     line: usize,
     image: &SemanticSpan,
 ) -> bool {
-    if inside_any(
-        image.start,
-        image.end,
-        &semantic.code_spans,
-        &semantic.unsupported_spans,
-    ) {
+    // 原子块（代码 / 表格 / 未支持块）里的图片一律不是 Object（表格内的图片见 S3a）。
+    if inside_any(image.start, image.end, &opaque_spans(semantic)) {
         return false;
     }
     let Some(info) = semantic.lines.get(line) else {
@@ -1045,14 +1314,126 @@ fn is_block_image(
         .is_some_and(|tail| tail.bytes().all(|byte| byte == b' ' || byte == b'\t'))
 }
 
+/// 新解析器的表格块 → editor 的 [`MarkdownTable`]（ADR 0019 S3a）。
+///
+/// 只做**区间换算 + block 判定**，不写任何新文本；行/格区间全部来自
+/// [`menghunote_markdown::TableBlock`] 的源码偏移，坐标越界整表跳过（保守）。
+fn collect_tables(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownTable> {
+    let mut tables = Vec::new();
+    for table in &semantic.tables {
+        let Some(span) = convert_span(source, table.span) else {
+            continue;
+        };
+        let Some(header) = convert_table_row(source, &table.header) else {
+            continue;
+        };
+        let Some(delimiter) = convert_span(source, table.delimiter) else {
+            continue;
+        };
+        let rows: Vec<MarkdownTableRow> = table
+            .rows
+            .iter()
+            .filter_map(|row| convert_table_row(source, row))
+            .collect();
+        if rows.len() != table.rows.len() {
+            // 任一行坐标不合法就整表不投影（不猜行号，避免页面错位）。
+            continue;
+        }
+        let block = is_block_table(semantic, table);
+        tables.push(MarkdownTable {
+            span,
+            first_line: table.first_line,
+            last_line: table.last_line,
+            columns: table.columns,
+            alignments: table.alignments.clone(),
+            header,
+            delimiter,
+            rows,
+            block,
+        });
+    }
+    tables
+}
+
+fn convert_table_row(source: &str, row: &semantic::TableRow) -> Option<MarkdownTableRow> {
+    let span = convert_span(source, row.span)?;
+    let cells: Option<Vec<SourceRange>> = row
+        .cells
+        .iter()
+        .map(|cell| convert_span(source, *cell))
+        .collect();
+    Some(MarkdownTableRow {
+        span,
+        line: row.line,
+        cells: cells?,
+    })
+}
+
+/// 判定表格是否**整行独占**（可投影成 Object Block）。
+///
+/// 条件（见 [`MarkdownTable`] 文档）：
+/// 1. 第一行是 `LineKind::Table`（不在代码/未支持块里）；
+/// 2. 第一行不是引用、不在列表项里；
+/// 3. 表格源码从该行内容起点开始（行首缩进不投影）；
+/// 4. 表格区间结束在该行内容终点，且至少覆盖表头 + 分隔行。
+fn is_block_table(semantic: &ParsedMarkdown, table: &semantic::TableBlock) -> bool {
+    let Some(info) = semantic.lines.get(table.first_line) else {
+        return false;
+    };
+    if info.kind != semantic::LineKind::Table || info.list.is_some() || !info.quote.is_empty() {
+        return false;
+    }
+    if table.span.start != info.content.start {
+        return false;
+    }
+    let Some(last) = semantic.lines.get(table.last_line) else {
+        return false;
+    };
+    table.last_line > table.first_line && table.span.end == last.content.end
+}
+
+/// 图片 + 表格 → 统一的 Object 列表（按源码顺序）。
+///
+/// 只收**整行独占**的块：`block = false` 的图片/表格首版保持源码原样显示。
+fn collect_objects(images: &[MarkdownImage], tables: &[MarkdownTable]) -> Vec<ObjectBlock> {
+    let mut objects = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        if !image.is_block() {
+            continue;
+        }
+        objects.push(ObjectBlock::new(
+            ObjectKind::Image,
+            image.span(),
+            image.line(),
+            image.line(),
+            index,
+        ));
+    }
+    for (index, table) in tables.iter().enumerate() {
+        if !table.is_block() {
+            continue;
+        }
+        objects.push(ObjectBlock::new(
+            ObjectKind::Table,
+            table.span(),
+            table.line(),
+            table.end_line(),
+            index,
+        ));
+    }
+    objects.sort_by_key(|object| (object.span().start().get(), object.span().end().get()));
+    objects
+}
+
 /// 新解析器 + 旧 scanner 的构造合并（规则见模块文档与 ADR 0019 S1 实施记录）。
 fn merge_constructs(
     source: &str,
     semantic: &ParsedMarkdown,
     mut legacy: Vec<MarkdownConstruct>,
 ) -> (Vec<MarkdownConstruct>, bool) {
-    // 1) 未支持块（表格 / HTML / 缩进代码 / Setext）、围栏代码内部、以及图片（S2 才做
-    //    Object）：旧 scanner 的**行内**构造一律丢弃（原样显示，不猜测）。
+    // 1) 原子块（代码 / 表格 / 未支持块）内部、以及图片（S2 才做 Object）内部：
+    //    旧 scanner 的**行内**构造一律丢弃（原样显示，不猜测）。
+    let opaque = opaque_spans(semantic);
     let image_spans: Vec<SemanticSpan> = semantic
         .constructs
         .iter()
@@ -1064,13 +1445,11 @@ fn merge_constructs(
             && (inside_any(
                 construct.span().start().get(),
                 construct.span().end().get(),
-                &semantic.code_spans,
-                &semantic.unsupported_spans,
+                &opaque,
             ) || inside_any(
                 construct.span().start().get(),
                 construct.span().end().get(),
                 &image_spans,
-                &[],
             )))
     });
 
@@ -1083,13 +1462,8 @@ fn merge_constructs(
         }
         if construct.kind.is_inline()
             && (semantic.uncertain_inline
-                || inside_any(
-                    construct.span.start,
-                    construct.span.end,
-                    &semantic.code_spans,
-                    &semantic.unsupported_spans,
-                )
-                || inside_any(construct.span.start, construct.span.end, &image_spans, &[]))
+                || inside_any(construct.span.start, construct.span.end, &opaque)
+                || inside_any(construct.span.start, construct.span.end, &image_spans))
         {
             continue;
         }
@@ -1140,14 +1514,14 @@ fn merge_constructs(
     (chosen, inline_fallback)
 }
 
-fn inside_any(
-    start: usize,
-    end: usize,
-    code: &[SemanticSpan],
-    unsupported: &[SemanticSpan],
-) -> bool {
-    code.iter()
-        .chain(unsupported.iter())
+/// `ParsedMarkdown` 的原子块区间（代码 / 表格 / 未支持块），一次性收集。
+fn opaque_spans(semantic: &ParsedMarkdown) -> Vec<SemanticSpan> {
+    semantic.opaque_spans().collect()
+}
+
+fn inside_any(start: usize, end: usize, spans: &[SemanticSpan]) -> bool {
+    spans
+        .iter()
         .any(|outer| outer.start <= start && end <= outer.end)
 }
 

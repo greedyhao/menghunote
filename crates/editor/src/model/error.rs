@@ -68,6 +68,11 @@ pub enum EditorError {
     /// 背压：请求**未被受理**（Loro / journal 均未改），可用同一个 `EditRequest`
     /// 与同一个 `command_id` 重试；本地乐观输入与 pending 命令都保留。
     Backpressured(CommandId),
+    /// 正在就地编辑表格单元格：结构类操作（加行加列 / 删除对象 / 任务框 / 列表 Enter /
+    /// 源码模式）在提交或取消之前一律拒绝（ADR 0019 S3b2）。
+    CellEditActive,
+    /// 没有进行中的单元格编辑，却收到只对单元格生效的操作。
+    CellEditInactive,
     /// 序号换算溢出（防御性分支，正常文档不会触发）。
     ArithmeticOverflow,
     /// 控制器需要按新的 `OpenSnapshot` 重建后才能继续编辑。
@@ -158,6 +163,10 @@ impl fmt::Display for EditorError {
                 f,
                 "命令 {command_id} 因背压暂未受理（Loro 未改），可用同一命令重试"
             ),
+            Self::CellEditActive => {
+                write!(f, "正在编辑表格单元格：请先提交（Enter）或取消（Esc）")
+            }
+            Self::CellEditInactive => write!(f, "当前没有进行中的表格单元格编辑"),
             Self::ArithmeticOverflow => write!(f, "序号换算溢出"),
             Self::ResyncRequired => write!(f, "控制器已失效，需要按新的 OpenSnapshot 重建"),
         }

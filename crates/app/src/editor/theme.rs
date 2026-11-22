@@ -340,3 +340,150 @@ pub fn object_toolbar_border() -> Rgba {
 pub fn object_toolbar_text() -> Rgba {
     rgb(0x1f2328)
 }
+
+// ---------------------------------------------------------------------------
+// 表格 Object Block（ADR 0019 S3a）
+// ---------------------------------------------------------------------------
+
+/// 表格对象与上下文字的间距（像素）：行高 = 表格高度 + 2 × 该值。
+pub const TABLE_PADDING: f32 = 6.0;
+/// 表头行高度（像素）：固定值，布局度量与绘制共用（不按字形高度估算）。
+pub const TABLE_HEADER_HEIGHT: f32 = 28.0;
+/// 数据行高度（像素）：固定值，长表格可以按行裁剪而无需逐行 shaping 定量。
+pub const TABLE_ROW_HEIGHT: f32 = 26.0;
+/// 单列最小宽度（像素）：窄窗口下优先保证可读，超出内容宽度的部分按裁剪处理。
+pub const TABLE_MIN_COLUMN_WIDTH: f32 = 56.0;
+/// 单元格左右内边距（像素）。
+pub const TABLE_CELL_PAD_X: f32 = 8.0;
+/// 单元格文字字号（像素）。
+pub const TABLE_FONT_SIZE: f32 = 13.0;
+/// 表格边框宽度（像素）。
+pub const TABLE_BORDER_WIDTH: f32 = 1.0;
+
+// ---------------------------------------------------------------------------
+// 表格右下角「加行 / 加列」浮层（ADR 0019 S3b）
+// ---------------------------------------------------------------------------
+
+/// 边缘操作浮层的高度（像素）。比悬浮工具条矮一档：它是贴在表格右下角的小胶囊，
+/// 不抢表头的视觉重心。
+pub const TABLE_ACTIONS_HEIGHT: f32 = 22.0;
+/// 单枚**插入**按钮最小宽度（像素）：`+ 行` / `+ 列` 同排。窄窗口下这两枚必须还能
+/// 单独放得下（S3b1 契约：320px 窗口里浮层仍夹在编辑区内）。
+pub const TABLE_ACTIONS_BUTTON_WIDTH: f32 = 34.0;
+/// 单枚**删除**按钮最小宽度（像素）：`删除行` / `删除列` 是 3 个 12px 汉字，
+/// 36 + 左右内边距 8 = 44，留 2px 余量。窄到放不下时整个删除组不显示（入口隐藏），
+/// 而不是把浮层挤出编辑区。
+pub const TABLE_ACTIONS_DELETE_BUTTON_WIDTH: f32 = 46.0;
+/// 浮层与表格下边框的间距（像素）：浮层整体落在表格**外面**，不遮挡单元格文本。
+pub const TABLE_ACTIONS_GAP: f32 = 2.0;
+/// 浮层视觉偏移（像素）：贴住表格右边缘。
+pub const TABLE_ACTIONS_PAD: f32 = 4.0;
+/// 按钮圆角（像素）。
+pub const TABLE_ACTIONS_RADIUS: f32 = 6.0;
+
+/// 边缘操作浮层底色（与悬浮工具条一致，压住下方文字也看得清）。
+#[must_use]
+pub fn table_actions_bg() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// 边缘操作浮层边框色。
+#[must_use]
+pub fn table_actions_border() -> Rgba {
+    rgb(0xd0d7de)
+}
+
+/// 边缘操作浮层按钮文字色。
+#[must_use]
+pub fn table_actions_text() -> Rgba {
+    rgb(0x1f2328)
+}
+
+/// 边缘操作浮层**禁用**按钮的文字色（例如只剩 1 列时的「删除列」）。
+///
+/// 禁用是“提示”而不是隐藏：按钮画出来但明显弱化，用户能看出这里以后可能有动作，
+/// 同时点击不产生任何请求（不把表格改成非法结构）。
+#[must_use]
+pub fn table_actions_text_disabled() -> Rgba {
+    rgb(0x8c959f)
+}
+
+// ---------------------------------------------------------------------------
+// 表格行列拖拽把手（ADR 0019 S3b5：拖拽重排行 / 列）
+// ---------------------------------------------------------------------------
+
+/// 列把手（表头顶部的小胶囊）宽度（像素）。
+pub const TABLE_DRAG_COLUMN_HANDLE_WIDTH: f32 = 18.0;
+/// 列把手高度（像素）：**压在表头上边框上**，一半在表格外、一半在表头内，不遮挡文字。
+pub const TABLE_DRAG_COLUMN_HANDLE_HEIGHT: f32 = 6.0;
+/// 行把手（数据行左侧的小胶囊）宽度（像素）。
+pub const TABLE_DRAG_ROW_HANDLE_WIDTH: f32 = 6.0;
+/// 行把手高度上限（像素）：实际高度 = `min(本值, 行高 - 8)`，压在表格左边框上。
+pub const TABLE_DRAG_ROW_HANDLE_HEIGHT: f32 = 14.0;
+/// 把手命中区在绘制矩形外扩的像素：更好点中，但仍不盖住单元格文字。
+pub const TABLE_DRAG_HIT_PAD: f32 = 3.0;
+/// 拖动时插入位置指示线宽度（像素）。
+pub const TABLE_DRAG_INDICATOR_THICKNESS: f32 = 2.0;
+/// 指针离开表格多远算“拖出表格 → 取消”（像素；任意方向）。
+pub const TABLE_DRAG_CANCEL_MARGIN: f32 = 24.0;
+
+/// 把手（可拖拽）底色：比边框略深，停在表头/行边框上仍然可见。
+#[must_use]
+pub fn table_drag_handle_bg() -> Rgba {
+    rgb(0x8c959f)
+}
+
+/// 把手悬停底色（drag affordance 的高亮）。
+#[must_use]
+pub fn table_drag_handle_hover_bg() -> Rgba {
+    rgb(0x57606a)
+}
+
+/// 拖动中的插入位置指示线颜色（主题强调色）。
+#[must_use]
+pub fn table_drag_indicator() -> Rgba {
+    rgb(0x0969da)
+}
+
+// ---------------------------------------------------------------------------
+// 正文右键菜单（ADR 0019 S3b4：「插入 → 表格」）
+// ---------------------------------------------------------------------------
+
+/// 右键菜单面板宽度（像素）。
+pub const EDITOR_CONTEXT_MENU_WIDTH: f32 = 148.0;
+/// 右键菜单面板高度（像素）：4px 内边距 ×2 + 分组标签 18 + gap 2 + 菜单项 24 + 边框 2。
+pub const EDITOR_CONTEXT_MENU_HEIGHT: f32 = 54.0;
+
+/// 表格外框 / 单元格分隔线颜色。
+#[must_use]
+pub fn table_border() -> Rgba {
+    rgb(0xd0d7de)
+}
+
+/// 表格底色（不透明，压住正文行背景）。
+#[must_use]
+pub fn table_bg() -> Rgba {
+    rgb(0xffffff)
+}
+
+/// 表头底色（与正文行区分）。
+#[must_use]
+pub fn table_header_bg() -> Rgba {
+    rgb(0xf6f8fa)
+}
+
+/// 选中单元格的底色（ADR 0019 S3b2）：与文本选区同色系，压在表格底色之上、
+/// 单元格文字之下，因此文字仍然清晰可读。
+#[must_use]
+pub fn table_cell_selected_bg() -> Rgba {
+    rgb(0xdbeafe)
+}
+
+/// 选中单元格的描边色（2px，压住 1px 网格线）。
+#[must_use]
+pub fn table_cell_selected_border() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 选中单元格的描边宽度（像素）。
+pub const TABLE_CELL_SELECTED_BORDER: f32 = 2.0;

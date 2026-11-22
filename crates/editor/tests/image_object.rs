@@ -76,7 +76,6 @@ fn inline_and_mixed_images_stay_source_only() {
         ("- ![a](asset://b)\n", "列表项里"),
         ("> ![a](asset://b)\n", "引用里"),
         ("# ![a](asset://b)\n", "标题里"),
-        ("| ![a](asset://b) |\n| --- |\n", "表格里"),
     ] {
         let doc = parse(source);
         assert_eq!(
@@ -100,6 +99,24 @@ fn inline_and_mixed_images_stay_source_only() {
             "{reason}：不得产生 Object 段"
         );
     }
+
+    // 表格里的图片：图片本身不是 Object（不满足整行独占），但**整张表**是（S3a）：
+    // display 只有表格占位符，图片源码同样不可见，也绝不会出现第二个 Object 段。
+    let table = "| ![a](asset://b) |\n| --- |\n";
+    let doc = parse(table);
+    assert_eq!(doc.images().len(), 1, "图片仍被解析出来（metadata 保留）");
+    assert!(!doc.images()[0].is_block(), "表格里的图片不能单独成为对象");
+    assert_eq!(doc.tables().len(), 1);
+    assert!(doc.tables()[0].is_block(), "整张表是 Object Block");
+    let map = project(&doc, table.chars().count());
+    let display = map.display_text();
+    assert_eq!(display.matches(OBJECT_PLACEHOLDER).count(), 1);
+    assert!(
+        !display.contains("![a]"),
+        "表格内的图片源码随整表一起被占位：{display:?}"
+    );
+    assert_eq!(map.object_segments().len(), 1, "整表一个 Object 段");
+    assert_eq!(map.object_segments()[0].0, doc.tables()[0].span());
 
     // 围栏代码里的 `![...]` 是字面文本，pulldown 根本不发图片事件：源码原样显示。
     let fenced = "```\n![a](asset://b)\n```\n";
