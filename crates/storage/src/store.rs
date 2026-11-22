@@ -362,8 +362,43 @@ pub fn append_updates(
     expected_head_seq: u64,
     records: &[UpdateRecord],
 ) -> Result<HeadState, StorageError> {
+    append_updates_inner(vault, doc_id, expected_head_seq, records, &[])
+}
+
+/// A 事务内同时写出站同步意图（一 update 一 intent）。
+pub(crate) fn append_updates_with_sync_intents(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[UpdateRecord],
+    intents: &[crate::sync_bridge::SyncIntent],
+) -> Result<HeadState, StorageError> {
+    append_updates_inner(vault, doc_id, expected_head_seq, records, intents)
+}
+
+fn append_updates_inner(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[UpdateRecord],
+    intents: &[crate::sync_bridge::SyncIntent],
+) -> Result<HeadState, StorageError> {
     if records.is_empty() {
+        if !intents.is_empty() {
+            return Err(StorageError::Corrupt {
+                context: "空 update 批次不能带 sync intent".to_owned(),
+            });
+        }
         return load_head(vault, doc_id);
+    }
+    if !intents.is_empty() && intents.len() != records.len() {
+        return Err(StorageError::Corrupt {
+            context: format!(
+                "append_updates: records={} intents={} 必须一对一",
+                records.len(),
+                intents.len()
+            ),
+        });
     }
 
     let last = &records
@@ -374,7 +409,7 @@ pub fn append_updates(
         .update;
     let head_seq = expected_head_seq + records.len() as u64;
 
-    let mut statements = Vec::with_capacity(records.len() + 2);
+    let mut statements = Vec::with_capacity(records.len() + 2 + intents.len());
 
     // 第 0 条就是 CAS：head_seq 必须还是调用方看到的那个值。
     // 放在最前面，过期基准会在碰到任何唯一约束之前就被守卫拦下，报 HeadConflict 而不是 UNIQUE。
@@ -416,6 +451,27 @@ pub fn append_updates(
             Value::Integer(i64_of(head_seq)?),
         ],
     ));
+
+    for (index, intent) in intents.iter().enumerate() {
+        if intent.message_id.is_empty() || intent.batch_id.is_empty() || intent.key_epoch == 0 {
+            return Err(StorageError::Corrupt {
+                context: "sync intent message/batch/epoch 非法".to_owned(),
+            });
+        }
+        let seq = expected_head_seq + 1 + index as u64;
+        statements.push(Statement::new(
+            "INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,object_id,state,ciphertext) \
+             VALUES(?1,?2,?3,?4,?5,?6,'pending',NULL)",
+            vec![
+                Value::Text(intent.message_id.clone()),
+                Value::Text(intent.batch_id.clone()),
+                Value::Text(doc_id.to_owned()),
+                Value::Integer(i64_of(seq)?),
+                Value::Integer(i64_of(intent.key_epoch)?),
+                Value::Blob(intent.object_id.to_vec()),
+            ],
+        ));
+    }
 
     match vault.exec_transaction(&statements, &[AffectedGuard::exactly(0, 1)]) {
         Ok(_) => Ok(HeadState {

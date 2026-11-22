@@ -13,7 +13,7 @@ use rusqlite::{Connection, Transaction};
 use crate::error::StorageError;
 
 /// 本程序支持的最高 schema 版本。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 单步迁移：把库从 `version - 1` 升到 `version`。
 struct Migration {
@@ -26,11 +26,18 @@ struct Migration {
 }
 
 /// 迁移表，必须按 `version` 升序且连续（v1、v2、v3…）。
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "初始 schema",
-    run: migrate_v1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "初始 schema",
+        run: migrate_v1,
+    },
+    Migration {
+        version: 2,
+        name: "S7 同步桥",
+        run: migrate_v2,
+    },
+];
 
 /// 读取当前 schema 版本（`PRAGMA user_version`）。
 pub(crate) fn user_version(conn: &Connection) -> Result<i64, StorageError> {
@@ -82,4 +89,9 @@ fn migration_failed(migration: &Migration, source: rusqlite::Error) -> StorageEr
 /// DDL 原样放在 `schema/v1.sql` 里，避免把建表语句拆碎在 Rust 字符串中而走样。
 fn migrate_v1(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(include_str!("schema/v1.sql"))
+}
+
+/// migration v2：同步 outbox parts / inbox / 本地 cursor（ADR 0006 §5）。
+fn migrate_v2(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(include_str!("schema/v2.sql"))
 }

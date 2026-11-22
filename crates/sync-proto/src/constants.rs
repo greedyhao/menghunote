@@ -25,6 +25,8 @@ pub const SIGN_AUTH_DOMAIN: &[u8] = b"MN/v1/auth\0";
 pub const SIGN_MANAGE_DOMAIN: &[u8] = b"MN/v1/manage\0";
 /// ObjectCommit 签名域。
 pub const SIGN_OBJECT_COMMIT_DOMAIN: &[u8] = b"MN/v1/object-commit\0";
+/// DeviceCertV1 管理签名域（§17.1）。
+pub const SIGN_DEVICE_CERT_DOMAIN: &[u8] = b"MN/v1/device-cert\0";
 /// CheckpointCommit 签名域。
 pub const SIGN_CHECKPOINT_DOMAIN: &[u8] = b"MN/v1/checkpoint\0";
 /// cursor HMAC 域（relay 使用）。

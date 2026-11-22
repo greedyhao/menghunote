@@ -1,0 +1,34 @@
+[package]
+name = "menghunote-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 依赖边界（ADR 0006 §6/§11）：relay 只依赖 sync-proto + HTTP + SQLite + 公钥签名/MAC。
+# 明确不依赖 storage / Loro / Tantivy / GPUI。
+menghunote-sync-proto = { path = "../sync-proto" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "original-uri", "ws"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+# 随机字节（challenge nonce / token / id）：只做 CSPRNG，不引 rand 全家桶。
+getrandom = "0.2"
+# 公钥签名：Ed25519 验签的纯 Rust 实现（不引 ring/OpenSSL，保持可交叉编译）。
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# 集成测试要直接断言 schema/原始行（模拟崩溃点、统计分片数）。
+rusqlite = { version = "0.41", features = ["bundled"] }
+# in-process 路由测试（Router::oneshot），不需要真实监听端口。
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# WS 客户端（测试 /wake 的吊销断开）；与 axum 0.8 内部依赖同版本线。
+tokio-tungstenite = "0.27"
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }

@@ -696,6 +696,82 @@ fn limits_and_nul_domains_are_frozen() {
     assert_eq!(info.len(), 11 + 1 + 8 + 32);
 }
 
+fn sample_grant() -> GrantAadV1 {
+    GrantAadV1 {
+        pv: 1,
+        vault_id: std::array::from_fn(|index| index as u8),
+        epoch: 2,
+        recipient_device_id: std::array::from_fn(|index| 0x10 + index as u8),
+        recipient_x25519_pub: std::array::from_fn(|index| 0x20 + index as u8),
+        manager_rev: 3,
+        grant_id: std::array::from_fn(|index| 0x40 + index as u8),
+    }
+}
+
+#[test]
+fn grant_aad_golden_vector_and_signed_bytes() {
+    let grant = sample_grant();
+    let cde = grant.encode().expect("grant encode");
+    assert_eq!(
+        hex(&cde),
+        concat!(
+            "a7000101",
+            "50000102030405060708090a0b0c0d0e0f",
+            "0202",
+            "0350101112131415161718191a1b1c1d1e1f",
+            "045820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+            "0503",
+            "0650404142434445464748494a4b4c4d4e4f",
+        )
+    );
+    assert_eq!(GrantAadV1::decode(&cde).expect("grant decode"), grant);
+
+    let enc = [0xaa; 32];
+    let ciphertext_sha = [0xbb; 32];
+    let signed = grant
+        .grant_signed_bytes(&enc, &ciphertext_sha)
+        .expect("grant signed bytes");
+    assert_eq!(&signed[..cde.len()], cde.as_slice());
+    assert_eq!(&signed[cde.len()..cde.len() + 32], &enc);
+    assert_eq!(&signed[cde.len() + 32..], &ciphertext_sha);
+    assert_eq!(signed.len(), cde.len() + 64);
+    assert_eq!(
+        grant_signed_bytes(&grant, &enc, &ciphertext_sha).expect("free fn"),
+        signed
+    );
+
+    // 未知键/截断拒绝。
+    let mut value = decode_cde(&cde).unwrap();
+    let CdeValue::Map(entries) = &mut value else {
+        panic!("map");
+    };
+    entries.push((7, CdeValue::UInt(0)));
+    assert!(GrantAadV1::decode(&encode_cde(&value).unwrap()).is_err());
+    assert!(GrantAadV1::decode(&cde[..cde.len() - 1]).is_err());
+}
+
+#[test]
+fn device_cert_signed_bytes_golden_domain() {
+    let cert = sample_cert();
+    let cde = cert.encode().expect("cert encode");
+    let signed = cert.device_cert_signed_bytes().expect("signed");
+    assert_eq!(
+        &signed[..18],
+        &[
+            0x4d, 0x4e, 0x2f, 0x76, 0x31, 0x2f, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x2d, 0x63,
+            0x65, 0x72, 0x74, 0x00,
+        ],
+        "MN/v1/device-cert 后接单个 0x00"
+    );
+    assert_eq!(&signed[18..], cde.as_slice());
+    assert_eq!(
+        hex(&signed[18..]),
+        "a700500101010101010101010101010101010101500202020202020202020202020202020202582003030303030303030303030303030303030303030303030303030303030303030358200404040404040404040404040404040404040404040404040404040404040404040505020603"
+    );
+    assert_eq!(device_cert_signed_bytes(&cert).expect("free fn"), signed);
+    assert!(SIGN_DEVICE_CERT_DOMAIN.ends_with(b"\0"));
+}
+
 #[test]
 fn error_codes_are_stable() {
     assert_eq!(ErrorCode::BadCursor.as_str(), "BAD_CURSOR");

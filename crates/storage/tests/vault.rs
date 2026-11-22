@@ -5,11 +5,11 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use menghunote_storage::{StorageError, Value, Vault};
+use menghunote_storage::{StorageError, Value, Vault, SCHEMA_VERSION};
 use tempfile::TempDir;
 
-/// ADR 0001 §7 附录 DDL 里应当出现的全部表。
-const CORE_TABLES: [&str; 15] = [
+/// ADR 0001 §7 附录 DDL 以及 v2 同步桥里应当出现的全部表。
+const CORE_TABLES: [&str; 17] = [
     "asset_refs",
     "assets",
     "chunks",
@@ -21,7 +21,9 @@ const CORE_TABLES: [&str; 15] = [
     "note_tags",
     "notes",
     "projection_outbox",
+    "sync_inbox",
     "sync_outbox",
+    "sync_outbox_parts",
     "tags",
     "tree",
     "versions",
@@ -97,8 +99,8 @@ fn open_creates_full_schema_and_verifies_pragmas() {
 
     let vault = Vault::open(&path).expect("首次打开应当建库成功");
 
-    // 1. 迁移到 v1
-    assert_eq!(vault.user_version().expect("读取 user_version"), 1);
+    // 1. 迁移到 v2
+    assert_eq!(vault.user_version().expect("读取 user_version"), 2);
     assert_eq!(vault.path(), path.as_path(), "句柄应记录真实路径");
 
     // 2. 父目录与库文件都被创建出来
@@ -154,14 +156,14 @@ fn reopen_same_path_is_idempotent() {
     let table_count_before;
     {
         let vault = open_vault(&path);
-        assert_eq!(vault.user_version().expect("读取 user_version"), 1);
+        assert_eq!(vault.user_version().expect("读取 user_version"), 2);
         table_count_before = count_user_tables(&vault);
     } // 这里触发 Drop：优雅关闭工作线程、关闭连接
 
     let vault = open_vault(&path);
     assert_eq!(
         vault.user_version().expect("第二次读取 user_version"),
-        1,
+        2,
         "重复打开不应改变 schema 版本"
     );
     assert_eq!(
@@ -173,7 +175,7 @@ fn reopen_same_path_is_idempotent() {
     // 再开一次，确认数据与版本都稳定
     drop(vault);
     let vault = open_vault(&path);
-    assert_eq!(vault.user_version().expect("第三次读取 user_version"), 1);
+    assert_eq!(vault.user_version().expect("第三次读取 user_version"), 2);
     assert_eq!(count_user_tables(&vault), table_count_before);
 }
 
@@ -306,9 +308,9 @@ fn rejects_database_from_newer_schema() {
     let path = vault_path(&dir);
     {
         let vault = open_vault(&path);
-        // 模拟"被更新版本的程序升级过"的库
+        // 模拟"被更新版本的程序升级过"的库；与当前 schema 版本解耦。
         vault
-            .exec_batch("PRAGMA user_version = 99")
+            .exec_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
             .expect("设置 user_version");
     }
 
@@ -317,9 +319,9 @@ fn rejects_database_from_newer_schema() {
         matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 99,
-                supported: 1
-            }
+                found,
+                supported
+            } if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION
         ),
         "错误类型不符：{error}"
     );
@@ -339,7 +341,7 @@ fn failed_statement_does_not_kill_worker() {
     );
 
     // 单条语句失败不应影响工作线程，句柄仍可继续使用
-    assert_eq!(vault.user_version().expect("读取 user_version"), 1);
+    assert_eq!(vault.user_version().expect("读取 user_version"), 2);
     let affected = vault
         .exec(
             "INSERT INTO meta(key, value) VALUES(?1, ?2)",

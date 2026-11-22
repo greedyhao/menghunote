@@ -139,6 +139,22 @@ pub enum StorageError {
         node_id: String,
     },
 
+    /// 同步桥 CAS/幂等冲突：同一 message/epoch 已存在不同字节，或旧 ACK/旧 digest。
+    #[error("同步状态冲突：{context}")]
+    SyncConflict {
+        /// 具体上下文（message/epoch/digest）。
+        context: String,
+    },
+
+    /// 同步 log_id 与本地已记录的不一致（relay reset 必须显式迁移，不能静默归零）。
+    #[error("同步 log_id 不一致：本地 {expected:?}，收到 {found:?}")]
+    SyncLogMismatch {
+        /// 本地记录的 log_id。
+        expected: Vec<u8>,
+        /// 新收到的 log_id。
+        found: Vec<u8>,
+    },
+
     /// 数据库中出现不自洽状态（缺行、seq 断档、重放结果与记录不一致等）。
     #[error("存储状态不自洽：{context}")]
     Corrupt {

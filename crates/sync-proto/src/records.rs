@@ -1055,6 +1055,113 @@ impl Challenge {
     }
 }
 
+/// HPKE grant 的 AAD（ADR 0006 §17.2）；字段按整数键 0..6 声明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantAadV1 {
+    pub pv: u16,
+    pub vault_id: VaultId,
+    pub epoch: u64,
+    pub recipient_device_id: DeviceId,
+    pub recipient_x25519_pub: X25519PublicKey,
+    pub manager_rev: u64,
+    pub grant_id: [u8; 16],
+}
+
+impl GrantAadV1 {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        encode(&self.to_cde()?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
+        let fields = into_record_fields(decode(bytes)?, 7)?;
+        let value = Self {
+            pv: expect_u16(fields[0].clone(), "GrantAadV1.pv")?,
+            vault_id: expect_bytes_n::<16>(fields[1].clone(), "GrantAadV1.vault_id")?,
+            epoch: expect_i64_max(fields[2].clone(), "GrantAadV1.epoch")?,
+            recipient_device_id: expect_bytes_n::<16>(
+                fields[3].clone(),
+                "GrantAadV1.recipient_device_id",
+            )?,
+            recipient_x25519_pub: expect_bytes_n::<32>(
+                fields[4].clone(),
+                "GrantAadV1.recipient_x25519_pub",
+            )?,
+            manager_rev: expect_i64_max(fields[5].clone(), "GrantAadV1.manager_rev")?,
+            grant_id: expect_bytes_n::<16>(fields[6].clone(), "GrantAadV1.grant_id")?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn to_cde(&self) -> Result<CdeValue, ProtoError> {
+        self.validate()?;
+        Ok(CdeValue::Map(vec![
+            (0, CdeValue::UInt(u64::from(self.pv))),
+            (1, CdeValue::Bytes(self.vault_id.to_vec())),
+            (2, CdeValue::UInt(self.epoch)),
+            (3, CdeValue::Bytes(self.recipient_device_id.to_vec())),
+            (4, CdeValue::Bytes(self.recipient_x25519_pub.to_vec())),
+            (5, CdeValue::UInt(self.manager_rev)),
+            (6, CdeValue::Bytes(self.grant_id.to_vec())),
+        ]))
+    }
+
+    pub fn validate(&self) -> Result<(), ProtoError> {
+        if self.pv != 1 {
+            return Err(ProtoError::UnsupportedVersion(self.pv));
+        }
+        if self.epoch == 0 {
+            return Err(ProtoError::Invalid("GrantAadV1.epoch 必须 >0".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// AAD 字节 = `CDE(GrantAadV1)`。
+    pub fn aad_bytes(&self) -> Result<Vec<u8>, ProtoError> {
+        self.encode()
+    }
+
+    /// HPKE 外层管理签名待签字节 = `AAD || enc32 || sha256(hpke_ciphertext)`。
+    ///
+    /// 本函数只拼字节，不计算 SHA256；`ciphertext_sha256` 由 sync 计算。
+    pub fn grant_signed_bytes(
+        &self,
+        enc: &[u8; 32],
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<Vec<u8>, ProtoError> {
+        let aad = self.aad_bytes()?;
+        let mut out = Vec::with_capacity(aad.len() + 32 + 32);
+        out.extend_from_slice(&aad);
+        out.extend_from_slice(enc);
+        out.extend_from_slice(ciphertext_sha256);
+        Ok(out)
+    }
+}
+
+/// `DeviceCertV1` 的管理签名待签字节：`MN/v1/device-cert\0 || CDE(cert)`。
+pub fn device_cert_signed_bytes(cert: &DeviceCertV1) -> Result<Vec<u8>, ProtoError> {
+    let mut out = Vec::with_capacity(crate::constants::SIGN_DEVICE_CERT_DOMAIN.len());
+    out.extend_from_slice(crate::constants::SIGN_DEVICE_CERT_DOMAIN);
+    out.extend_from_slice(&cert.encode()?);
+    Ok(out)
+}
+
+impl DeviceCertV1 {
+    /// 管理签名待签字节；与 [`device_cert_signed_bytes`] 相同。
+    pub fn device_cert_signed_bytes(&self) -> Result<Vec<u8>, ProtoError> {
+        device_cert_signed_bytes(self)
+    }
+}
+
+/// `GrantAadV1` 外层管理签名待签字节的便捷函数。
+pub fn grant_signed_bytes(
+    grant: &GrantAadV1,
+    enc: &[u8; 32],
+    ciphertext_sha256: &[u8; 32],
+) -> Result<Vec<u8>, ProtoError> {
+    grant.grant_signed_bytes(enc, ciphertext_sha256)
+}
+
 /// ObjectCommit 签名载荷。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectCommit {

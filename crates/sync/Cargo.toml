@@ -1,0 +1,60 @@
+[package]
+name = "menghunote-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+menghunote-storage = { path = "../storage" }
+menghunote-sync-proto = { path = "../sync-proto" }
+
+# 密钥派生与 AEAD（ADR 0006 §2/§3）：
+# - Argon2id 是口令 KEK 的唯一 KDF（m=64MiB/t=3/p=1，salt16/out32）；
+# - HKDF-SHA256 分用途子密钥（域分隔符见 domain.rs，§14 要求真正的 0x00 结尾）；
+# - XChaCha20-Poly1305 是 v1 唯一的密文套件（cipher_suite=1），槽体/数据对象共用。
+argon2 = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+
+# 设备签名（RFC 8032 Ed25519）。`zeroize` 让 SigningKey drop 时擦除种子。
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+
+# HPKE RFC 9180 base mode：KEM 0x0020 / KDF 0x0001 / AEAD 0x0003（ADR 0006 §4）。
+# 只开需要的特性，避免把 ML-KEM/SHAKE 等 PQ 套件一并编进来。
+# `getrandom` 是 hpke 内部生成临时 X25519 密钥的唯一随机源；nonce 由 HPKE 自身
+# 按 RFC 9180 §5.2 的 seq 派生，**不在这里自造**。
+hpke = { version = "0.15.1", default-features = false, features = [
+    "alloc",
+    "x25519",
+    "chacha",
+    "getrandom",
+] }
+
+# 恢复码编码（BIP-350 Bech32m，HRP=mnrec）。
+bech32 = "0.11"
+
+# 秘密类型：Zeroizing + 常量时间比较。
+zeroize = { version = "1", features = ["zeroize_derive"] }
+subtle = "2"
+
+# 随机字节：统一走 getrandom（失败可返回错误，不像 OsRng 那样 panic）。
+getrandom = "0.2"
+thiserror = "2"
+
+# 同步引擎的依赖判定需要解码 base_vv/end_vv（`VersionVector`）。与 storage 同一版本，
+# 不新增构建负担；ADR §11 步 4 明确 sync 侧负责 Loro import 的本地 seq 分配。
+loro = "1.17.1"
+
+[dev-dependencies]
+# 测试临时目录必须落在 CARGO_TARGET_TMPDIR（本机 cargo 子进程不能写 %TEMP%）。
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI（CryptProtectData/CryptUnprotectData，CurrentUser，ADR 0006 §3）。
+# 只开两个必需特性，避免引入整个 Win32 面。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+] }
