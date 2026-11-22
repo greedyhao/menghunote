@@ -86,9 +86,9 @@ fn heading_marker_is_hashes_plus_one_space() {
     assert_eq!(markers_of(&parse("###### h").constructs()[0]), vec![(0, 7)]);
     assert!(parse("####### h").constructs().is_empty());
     assert!(parse("#nospace").constructs().is_empty());
-    // 行尾没有内容也合法（内容为空区间）。
+    // `#` 单独一行没有空格：按 Markdown 语法要求，不渲染为标题。
     let bare = parse("#");
-    assert_eq!(content_of(&bare.constructs()[0]), (1, 1));
+    assert!(bare.constructs().is_empty());
     // 行首 ≤3 个空格的缩进不进入标记（`# ` 才是标记）。
     assert_eq!(markers_of(&parse("  # h").constructs()[0]), vec![(2, 4)]);
 }
@@ -568,4 +568,29 @@ fn inline_construct_content_is_parsed_recursively() {
     let code = parse("`a **b** c`");
     assert_eq!(code.constructs().len(), 1);
     assert_eq!(code.constructs()[0].kind(), ConstructKind::InlineCode);
+}
+
+#[test]
+fn bare_markers_do_not_become_blocks_through_legacy_fallback() {
+    // 新解析器不把无空格 marker 当块；旧 scanner 只允许行内 fallback，不能补成列表/标题。
+    for source in ["-", "1.", "#"] {
+        let doc = parse(source);
+        assert!(
+            !doc.constructs().iter().any(|construct| matches!(
+                construct.kind(),
+                ConstructKind::ListItem | ConstructKind::Heading
+            )),
+            "无空格 marker 不得变成块：{source:?}"
+        );
+    }
+    for source in ["- ", "1. ", "# "] {
+        let doc = parse(source);
+        assert!(
+            doc.constructs().iter().any(|construct| matches!(
+                construct.kind(),
+                ConstructKind::ListItem | ConstructKind::Heading
+            )),
+            "有空格 marker 应成为块：{source:?}"
+        );
+    }
 }

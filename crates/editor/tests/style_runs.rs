@@ -15,7 +15,9 @@ fn parse(source: &str) -> MarkdownDocument {
 }
 
 fn project(doc: &MarkdownDocument, caret: usize) -> ProjectionMap {
-    ProjectionMap::from_markdown(doc, Selection::caret(UnicodeScalar::new(caret)))
+    // ADR 0019 S1：生产路径是列表感知投影（列表 marker → bullet/编号）；
+    // 本文件覆盖语义样式，断言必须与 controller/app 同一条路径。
+    ProjectionMap::from_markdown_with_lists(doc, Selection::caret(UnicodeScalar::new(caret)))
 }
 
 /// 返回 `(display_text, runs)`。

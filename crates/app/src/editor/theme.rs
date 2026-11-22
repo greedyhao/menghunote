@@ -163,6 +163,10 @@ pub fn code_block_font() -> Font {
 
 /// 引用块每层缩进（像素）。嵌套引用按层数累加。
 pub const QUOTE_INDENT_PER_LEVEL: f32 = 16.0;
+
+/// 列表每层缩进（像素）。bullet/number 的 gutter 由该层级缩进 + marker 显示宽度组成，
+/// 续行 hanging indent 与 marker 宽度**同一来源**（ADR 0019 S1：度量/绘制/命中共用几何）。
+pub const LIST_INDENT_PER_LEVEL: f32 = 24.0;
 /// 引用块左侧竖条宽度（像素）。
 pub const QUOTE_BAR_WIDTH: f32 = 3.0;
 /// 竖条与文字之间的距离（像素）。

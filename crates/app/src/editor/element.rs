@@ -214,8 +214,13 @@ impl EditorElement {
             let row = geometry.visible_start + offset;
             // 引用行有缩进：文字原点用该行自己的左边界（PAD_X 与 indent 只在这里加一次）。
             let origin = point(geometry.text_left_for_row(row), geometry.row_top(row));
-            // 引用块左侧竖条：贴在该行文字左边界左侧。
-            if geometry.frame.row_indent(row) > 0.0 {
+            // 引用块左侧竖条：只按 quote depth 画；列表 gutter 不是引用。
+            if geometry
+                .frame
+                .lines
+                .get(row)
+                .is_some_and(|line| line.quote_bar)
+            {
                 let bar_x = origin.x - px(theme::QUOTE_BAR_WIDTH + theme::QUOTE_BAR_GAP);
                 window.paint_quad(fill(
                     Bounds::new(
@@ -379,7 +384,7 @@ impl Element for EditorElement {
         let wrap_width =
             (bounds.size.width.as_f32() - theme::PAD_X * 2.0).max(super::layout::MIN_WRAP_WIDTH);
         // 块级度量（标题字号 / 代码块等宽）：连同文本一起进 `WrapCache` 的键。
-        let metrics = self.view.read(cx).block_metrics();
+        let metrics = self.view.read(cx).block_metrics(window);
 
         let frame = self.shared.frame(super::shared::WrapRequest {
             text: &text,

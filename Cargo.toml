@@ -4,6 +4,7 @@ members = [
     "crates/app",
     "crates/storage",
     "crates/editor",
+    "crates/markdown",
     "crates/text",
     "crates/search",
     "crates/sync-proto",

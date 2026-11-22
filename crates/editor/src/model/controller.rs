@@ -116,6 +116,10 @@ pub struct EditorController {
     style_runs: Vec<StyleRun>,
     /// 块级语义（每行一个 run）；**只在 source 变化时重建**，selection 不影响。
     block_runs: Vec<BlockRun>,
+    /// 每个列表 marker 在当前 selection 下是否显现（与 projection 同步重建）。
+    ///
+    /// app 逐行算 gutter 时按行 O(1) 查询，不能对每个 item 重新换算 selection。
+    list_marker_revealed: Vec<bool>,
     preedit: Option<PreeditState>,
     next_command_seq: u64,
     pending: Option<CommandId>,
@@ -131,9 +135,10 @@ impl EditorController {
     pub fn open(snapshot: OpenSnapshot) -> Result<Self, EditorError> {
         let markdown = MarkdownDocument::parse(&snapshot.markdown)?;
         let selection = Selection::default();
-        let projection = ProjectionMap::from_markdown(&markdown, selection);
+        let projection = ProjectionMap::from_markdown_with_lists(&markdown, selection);
         let style_runs = markdown.style_runs(&projection);
         let block_runs = markdown.block_runs()?;
+        let list_marker_revealed = markdown.list_marker_reveals(selection)?;
         let mirror = Rope::from_str(&snapshot.markdown);
         Ok(Self {
             snapshot,
@@ -143,6 +148,7 @@ impl EditorController {
             projection,
             style_runs,
             block_runs,
+            list_marker_revealed,
             preedit: None,
             next_command_seq: 0,
             pending: None,
@@ -157,9 +163,10 @@ impl EditorController {
     pub fn adopt_snapshot(&mut self, snapshot: OpenSnapshot) -> Result<(), EditorError> {
         let markdown = MarkdownDocument::parse(&snapshot.markdown)?;
         let selection = Selection::default();
-        let projection = ProjectionMap::from_markdown(&markdown, selection);
+        let projection = ProjectionMap::from_markdown_with_lists(&markdown, selection);
         let style_runs = markdown.style_runs(&projection);
         let block_runs = markdown.block_runs()?;
+        let list_marker_revealed = markdown.list_marker_reveals(selection)?;
         self.mirror = Rope::from_str(&snapshot.markdown);
         self.snapshot = snapshot;
         self.markdown = markdown;
@@ -167,6 +174,7 @@ impl EditorController {
         self.projection = projection;
         self.style_runs = style_runs;
         self.block_runs = block_runs;
+        self.list_marker_revealed = list_marker_revealed;
         self.preedit = None;
         self.pending = None;
         self.needs_resync = false;
@@ -246,6 +254,106 @@ impl EditorController {
     #[must_use]
     pub fn block_runs(&self) -> &[BlockRun] {
         &self.block_runs
+    }
+
+    /// 逐源码行语义（引用前缀 / 列表归属 / 围栏），来自 ADR 0019 S1 的解析器。
+    ///
+    /// 与 [`Self::block_runs`] 一样只依赖 source；列表 layout 用它算 gutter 与
+    /// hanging indent。app **不要**自己重新扫列表语法。
+    #[must_use]
+    pub fn line_infos(&self) -> &[menghunote_markdown::LineInfo] {
+        self.markdown.line_infos()
+    }
+
+    /// 列表块树（按文档顺序）。
+    #[must_use]
+    pub fn lists(&self) -> &[menghunote_markdown::ListBlock] {
+        self.markdown.lists()
+    }
+
+    /// 列表项（按文档顺序）。
+    #[must_use]
+    pub fn list_items(&self) -> &[menghunote_markdown::ListItem] {
+        self.markdown.list_items()
+    }
+
+    /// 第 `index` 个列表项隐藏态下显示的 marker（bullet / 右对齐编号）。
+    #[must_use]
+    pub fn list_marker_text(&self, index: usize) -> Option<String> {
+        self.markdown.list_marker_text(index)
+    }
+
+    /// 第 `index` 个列表项的源码 marker（caret 进入时显示）。
+    #[must_use]
+    pub fn list_marker_source(&self, index: usize) -> Option<&str> {
+        self.markdown.list_marker_source(index)
+    }
+
+    /// caret/选区是否落在该列表 marker 上（Typora 规则：进入 marker 才显示源码）。
+    ///
+    /// O(1)：状态在投影重建时一次性算好（见 `list_marker_reveals`）。
+    #[must_use]
+    pub fn list_marker_revealed(&self, index: usize) -> bool {
+        self.list_marker_revealed
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// 列表 Enter：同级新建 item；空项退出列表。返回 `None` 时调用方按普通换行处理。
+    ///
+    /// - 只在 item **首行**、caret 位于 marker 之后时接管；续行/子段落不猜测结构，
+    ///   交回普通 `\n` 插入（S1 限制）；
+    /// - 有非空选区时先按普通替换处理（不在这里猜结构）；
+    /// - 编辑仍然走 [`Self::compose_edits`]：一次按键一个 `EditRequest`，
+    ///   IME 组合期间由 `ensure_editable` 拒绝（app 必须先取消组合）。
+    pub fn list_enter(&mut self) -> Result<Option<EditRequest>, EditorError> {
+        self.ensure_editable()?;
+        if !self.selection.is_empty() {
+            return self.compose_replace_selection("\n");
+        }
+        let text = self.mirror.to_string();
+        let caret = self.selection.head().to_source_byte(&text)?;
+        let lines = self.markdown.line_infos();
+        let line_index = text[..caret.get()]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let Some(line) = lines.get(line_index) else {
+            return Ok(None);
+        };
+        let Some(list) = &line.list else {
+            return Ok(None);
+        };
+        let item = &self.markdown.list_items()[list.item];
+        if item.first_line != line_index || caret.get() < item.content_start {
+            return Ok(None);
+        }
+        let source = text.as_str();
+        let empty = source
+            .get(item.content_start..line.content.end)
+            .is_some_and(|rest| rest.trim().is_empty());
+        let (start, end, replacement) = if empty {
+            // 空项退出：删除前导空白 + marker（保留引用前缀），光标落到行首内容区。
+            let start = item.hidden_prefix.start;
+            let end = item.marker.end;
+            (start, end, String::new())
+        } else {
+            let prefix = source
+                .get(line.span.start..item.marker.start)
+                .unwrap_or_default();
+            let marker = next_marker(source, item);
+            let caret = caret.get();
+            (caret, caret, format!("\n{prefix}{marker}"))
+        };
+        let start = SourceByte::new(start).to_scalar(source)?;
+        let end = SourceByte::new(end).to_scalar(source)?;
+        let edit = ScalarEdit {
+            start,
+            end,
+            replacement,
+        };
+        self.compose_edits(vec![edit]).map(Some)
     }
 
     /// 当前逻辑显示文本（Markdown 标记按当前 selection 隐藏/显现）。
@@ -775,12 +883,16 @@ impl EditorController {
 
     /// selection 变：复用已缓存的 MarkdownDocument，只重建投影与样式区间。
     ///
-    /// 投影 / 样式构造都不会失败（选区非法时 `ProjectionMap::from_markdown`
-    /// 保守退回 identity）。
+    /// 投影 / 样式构造都不会失败（选区非法时 `ProjectionMap::from_markdown_with_lists`
+    /// 保守退回 identity）；列表 marker 的显现状态与投影一起在这里一次性刷新。
     fn refresh_projection(&mut self) {
-        self.projection = ProjectionMap::from_markdown(&self.markdown, self.selection);
+        self.projection = ProjectionMap::from_markdown_with_lists(&self.markdown, self.selection);
         let style_runs = self.markdown.style_runs(&self.projection);
         self.style_runs = style_runs;
+        self.list_marker_revealed = self
+            .markdown
+            .list_marker_reveals(self.selection)
+            .unwrap_or_default();
     }
 
     fn apply_applied(&mut self, applied: Applied) -> Result<OutcomeEffect, EditorError> {
@@ -869,6 +981,18 @@ impl EditorController {
                 Ok(Some(scalar))
             }
         }
+    }
+}
+
+/// 列表 Enter 新 item 的源码 marker：无序沿用 bullet，有序 +1。
+fn next_marker(source: &str, item: &menghunote_markdown::ListItem) -> String {
+    if item.ordered {
+        format!("{}{} ", item.number.saturating_add(1), item.delimiter)
+    } else {
+        source
+            .get(item.marker.start..item.marker.end)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{} ", item.delimiter))
     }
 }
 

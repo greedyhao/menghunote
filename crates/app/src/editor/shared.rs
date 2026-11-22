@@ -55,6 +55,11 @@ impl WrapCache {
             && frame.metrics.iter().zip(metrics).all(|(a, b)| {
                 (a.font_size - b.font_size).abs() < 0.01
                     && (a.line_height - b.line_height).abs() < 0.01
+                    // 列表 gutter/hanging indent 也是布局输入：caret 进入 marker 会改变
+                    // marker 显示宽度，度量变了但文本可能暂时相同（空 item），必须重排。
+                    && (a.indent - b.indent).abs() < 0.01
+                    && (a.wrap_indent - b.wrap_indent).abs() < 0.01
+                    && a.mono == b.mono
             });
         hit.then(|| Rc::clone(frame))
     }

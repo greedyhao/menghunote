@@ -15,3 +15,6 @@ menghunote-storage = { path = "../storage" }
 # 1.6.1 是 crates.io 上的当前稳定版；ropey 另有 2.0.0-beta.1，本切片不采用
 # 未冻结 API 的 beta，等它稳定后再评估。
 ropey = "1.6"
+# ADR 0019 S1：Markdown 语义由 pulldown-cmark 适配层负责，editor 只消费带 source byte
+# offsets 的构造/列表模型。纯 crate，不依赖 GPUI/storage，依赖方向 editor → markdown。
+menghunote-markdown = { path = "../markdown" }

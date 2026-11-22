@@ -71,10 +71,11 @@
 use std::error::Error;
 use std::fmt;
 
+use menghunote_markdown::{self as semantic, ParsedMarkdown, Span as SemanticSpan};
 use menghunote_text::{CoordError, SourceByte, SourceRange, UnicodeScalar};
 
 use crate::model::block::BlockRun;
-use crate::model::projection::ProjectionMap;
+use crate::model::projection::{ProjectionMap, ProjectionPiece};
 use crate::model::selection::Selection;
 use crate::model::style::StyleRun;
 
@@ -102,6 +103,15 @@ pub enum ConstructKind {
 }
 
 impl ConstructKind {
+    /// 是否属于行内构造。
+    #[must_use]
+    pub const fn is_inline(self) -> bool {
+        matches!(
+            self,
+            Self::Bold | Self::Emphasis | Self::InlineCode | Self::Strike | Self::Link
+        )
+    }
+
     /// 是否属于块级构造（整行/整块范围，内部可再嵌套行内构造）。
     #[must_use]
     pub const fn is_block(self) -> bool {
@@ -122,6 +132,38 @@ pub struct MarkdownConstruct {
 }
 
 impl MarkdownConstruct {
+    /// 校验并构造（区间端点/包含关系不合法时返回 `None`，由调用方保守跳过）。
+    fn checked(
+        kind: ConstructKind,
+        span: SourceRange,
+        markers: Vec<SourceRange>,
+        content: SourceRange,
+    ) -> Option<Self> {
+        if span.is_empty() || markers.is_empty() {
+            return None;
+        }
+        let mut previous_end = span.start().get();
+        for marker in &markers {
+            if marker.is_empty()
+                || marker.start().get() < span.start().get()
+                || marker.end().get() > span.end().get()
+                || marker.start().get() < previous_end
+            {
+                return None;
+            }
+            previous_end = marker.end().get();
+        }
+        if content.start().get() < span.start().get() || content.end().get() > span.end().get() {
+            return None;
+        }
+        Some(Self {
+            kind,
+            span,
+            markers,
+            content,
+        })
+    }
+
     /// 构造类型。
     #[must_use]
     pub const fn kind(&self) -> ConstructKind {
@@ -187,34 +229,247 @@ impl From<CoordError> for MarkdownError {
 }
 
 /// 一份源码的 Markdown 构造表 + 显现计算。
+///
+/// **解析来源（ADR 0019 S1）**：
+/// - 块级/行内构造优先由 [`menghunote_markdown`]（pulldown-cmark + span adapter）
+///   生成；列表块树、逐行语义（[`Self::line_infos`]）也只来自它；
+/// - 旧自研 scanner 保留为 **fallback**：当新解析器的行内构造与旧结果无法逐一对齐
+///   （例如 `**a****b**` 这类旧 scanner 已专门处理的相邻定界符、`***` 等定界符
+///   嵌套），整篇行内投影退回旧 scanner，保证“定位不确定的构造原样显示”；
+/// - 两者都只产出 source 区间，**从不重新序列化 AST**。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownDocument {
     source: String,
     constructs: Vec<MarkdownConstruct>,
+    /// 新解析器的完整语义（列表/行信息），即使行内投影回退到旧 scanner 也保留。
+    semantic: ParsedMarkdown,
+    /// 行内投影是否退回旧 scanner（只影响 inline 构造，不影响列表/块级）。
+    inline_fallback: bool,
 }
 
 impl MarkdownDocument {
-    /// 扫描源码。空文档、纯文本都返回空构造表（不报错）。
+    /// 解析源码。空文档、纯文本都返回空构造表（不报错）。
     pub fn parse(source: &str) -> Result<Self, MarkdownError> {
-        let mut parser = Parser {
-            source,
-            len: source.len(),
-            constructs: Vec::new(),
-        };
-        parser.run()?;
-        let mut constructs = parser.constructs;
-        // 稳定排序：嵌套构造按起点（同起点按终点）排列，渲染层可直接顺序消费。
-        constructs.sort_by_key(|construct| {
-            (
-                construct.span.start().get(),
-                construct.span.end().get(),
-                construct.kind,
-            )
-        });
+        let semantic = semantic::parse(source);
+        let legacy = legacy_constructs(source)?;
+        let (constructs, inline_fallback) = merge_constructs(source, &semantic, legacy);
         Ok(Self {
             source: source.to_owned(),
             constructs,
+            semantic,
+            inline_fallback,
         })
+    }
+
+    /// 新解析器的完整语义模型（列表块树 / 行信息）。
+    #[must_use]
+    pub fn semantic(&self) -> &ParsedMarkdown {
+        &self.semantic
+    }
+
+    /// 行内投影是否退回了旧 scanner（诊断/测试用）。
+    #[must_use]
+    pub const fn inline_fallback(&self) -> bool {
+        self.inline_fallback
+    }
+
+    /// 逐源码行语义（与 [`Self::source`] 的 `\n` 切分一一对应）。
+    #[must_use]
+    pub fn line_infos(&self) -> &[semantic::LineInfo] {
+        &self.semantic.lines
+    }
+
+    /// 列表块（按文档顺序）。
+    #[must_use]
+    pub fn lists(&self) -> &[semantic::ListBlock] {
+        &self.semantic.lists
+    }
+
+    /// 列表项（按文档顺序）。
+    #[must_use]
+    pub fn list_items(&self) -> &[semantic::ListItem] {
+        &self.semantic.items
+    }
+
+    /// 第 `index` 个列表项在**隐藏态**下要显示的 marker 文本（bullet / 右对齐编号）。
+    ///
+    /// 有序列表示例（最大编号 10）：`" 9. "`、`"10. "` —— 编号右对齐、宽度稳定。
+    #[must_use]
+    pub fn list_marker_text(&self, index: usize) -> Option<String> {
+        let item = self.semantic.items.get(index)?;
+        if item.marker.is_empty() {
+            return None;
+        }
+        if item.ordered {
+            Some(format!(
+                "{:>width$}. ",
+                item.number,
+                width = item.number_width.max(1)
+            ))
+        } else {
+            Some("• ".to_owned())
+        }
+    }
+
+    /// 第 `index` 个列表项的**源码** marker（`- ` / `1. `；caret 进入时显示它）。
+    #[must_use]
+    pub fn list_marker_source(&self, index: usize) -> Option<&str> {
+        let item = self.semantic.items.get(index)?;
+        self.source.get(item.marker.start..item.marker.end)
+    }
+
+    /// caret/选区是否落在该列表 marker 上（Typora 规则：进入 marker 区域才显示源码）。
+    ///
+    /// 与构造显现规则不同：caret 恰好在 `marker.end`（内容起点）时**不**显现，
+    /// 这样按 `End`/点内容时仍显示 bullet。
+    pub fn list_marker_revealed(
+        &self,
+        index: usize,
+        selection: Selection,
+    ) -> Result<bool, MarkdownError> {
+        let item = self
+            .semantic
+            .items
+            .get(index)
+            .ok_or(MarkdownError::InternalRange {
+                start: index,
+                end: index,
+                len: self.semantic.items.len(),
+            })?;
+        if item.marker.is_empty() {
+            return Ok(false);
+        }
+        let marker = self.range(item.marker.start, item.marker.end)?;
+        let start = selection.start().to_source_byte(&self.source)?.get();
+        let end = selection.end().to_source_byte(&self.source)?.get();
+        if start == end {
+            Ok(marker.start().get() <= start && start < marker.end().get())
+        } else {
+            Ok(marker.start().get() < end && marker.end().get() > start)
+        }
+    }
+
+    /// 一次性算出所有列表 marker 的显现状态（`true` = 显示源码 marker）。
+    ///
+    /// app 逐行取 marker 状态时不要对每个 item 调 [`Self::list_marker_revealed`]
+    /// （每次都会把 selection 换算成 source byte，是 O(n)）；这里只换算一次。
+    pub fn list_marker_reveals(&self, selection: Selection) -> Result<Vec<bool>, MarkdownError> {
+        let (start, end) = self.selection_bytes(selection)?;
+        Ok(self
+            .semantic
+            .items
+            .iter()
+            .map(|item| {
+                if item.marker.is_empty() {
+                    return false;
+                }
+                if start == end {
+                    item.marker.start <= start && start < item.marker.end
+                } else {
+                    item.marker.start < end && item.marker.end > start
+                }
+            })
+            .collect())
+    }
+
+    fn selection_bytes(&self, selection: Selection) -> Result<(usize, usize), MarkdownError> {
+        let start = selection.start().to_source_byte(&self.source)?.get();
+        let end = selection.end().to_source_byte(&self.source)?.get();
+        Ok((start, end))
+    }
+
+    /// 生成当前 selection 下的投影片段（列表 marker → bullet/编号）。
+    ///
+    /// 规则：
+    /// - 非列表构造：沿用 [`Self::hidden_ranges_for_selection`] 的显现规则，只是
+    ///   **跳过 `ListItem`**（列表 marker 由本方法统一处理）；
+    /// - 列表 marker 未显现 → `Replace` 成 `list_marker_text`；
+    /// - 列表行前导空白（布局缩进由 app 提供）→ 永远 `Hidden`；
+    /// - 返回片段有序、不重叠、非空。
+    pub fn projection_pieces(
+        &self,
+        selection: Selection,
+    ) -> Result<Vec<ProjectionPiece>, MarkdownError> {
+        let mut hidden = self.hidden_ranges_for_selection_filtered(selection, false)?;
+        let revealed = self.list_marker_reveals(selection)?;
+        let mut replacements: Vec<ProjectionPiece> = Vec::new();
+        for index in 0..self.semantic.items.len() {
+            let item = &self.semantic.items[index];
+            if item.marker.is_empty() || revealed.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(text) = self.list_marker_text(index) else {
+                continue;
+            };
+            let marker = self.range(item.marker.start, item.marker.end)?;
+            replacements.push(ProjectionPiece::Replace(marker, text));
+        }
+        for line in &self.semantic.lines {
+            let Some(list) = &line.list else {
+                continue;
+            };
+            if !list.hidden_prefix.is_empty() {
+                hidden.push(self.range(list.hidden_prefix.start, list.hidden_prefix.end)?);
+            }
+        }
+
+        // Replace 优先：从 hidden 里扣除替换段（列表 marker 不应被当作隐藏标记）。
+        // hidden 已排序合并、replacements 按 marker 顺序（文档顺序）排序；单趟线性扣除，
+        // 避免 “每个 marker × 全部 hidden” 的平方级路径。
+        hidden = merge_ranges(&self.source, hidden)?;
+        hidden.sort_by_key(|range| (range.start().get(), range.end().get()));
+        replacements.sort_by_key(|piece| piece.source().start().get());
+        let replacement_ranges: Vec<SourceRange> =
+            replacements.iter().map(ProjectionPiece::source).collect();
+        let mut kept: Vec<SourceRange> = Vec::with_capacity(hidden.len());
+        let mut replacement_cursor = 0usize;
+        for hidden_range in &hidden {
+            let mut cursor = hidden_range.start().get();
+            let hidden_end = hidden_range.end().get();
+            while replacement_cursor < replacement_ranges.len()
+                && replacement_ranges[replacement_cursor].end().get() <= cursor
+            {
+                replacement_cursor += 1;
+            }
+            let mut index = replacement_cursor;
+            while index < replacement_ranges.len()
+                && replacement_ranges[index].start().get() < hidden_end
+            {
+                let replacement = replacement_ranges[index];
+                let replacement_start = replacement.start().get();
+                if replacement_start > cursor {
+                    kept.push(self.range(cursor, replacement_start.min(hidden_end))?);
+                }
+                cursor = cursor.max(replacement.end().get().min(hidden_end));
+                if cursor >= hidden_end {
+                    break;
+                }
+                index += 1;
+            }
+            if cursor < hidden_end {
+                kept.push(self.range(cursor, hidden_end)?);
+            }
+        }
+        hidden = kept;
+        let hidden = merge_ranges(&self.source, hidden)?;
+        let mut pieces: Vec<ProjectionPiece> =
+            hidden.into_iter().map(ProjectionPiece::Hidden).collect();
+        pieces.extend(replacements);
+        pieces.sort_by_key(|piece| (piece.source().start().get(), piece.source().end().get()));
+        // 相邻 hidden 合并（Replace 不合并：文本可能不同）。
+        let mut merged: Vec<ProjectionPiece> = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            match (&mut merged.last_mut(), &piece) {
+                (Some(ProjectionPiece::Hidden(last)), ProjectionPiece::Hidden(next))
+                    if next.start().get() <= last.end().get() =>
+                {
+                    *last =
+                        self.range(last.start().get(), last.end().get().max(next.end().get()))?;
+                }
+                _ => merged.push(piece),
+            }
+        }
+        Ok(merged)
     }
 
     /// 原始 source。
@@ -258,10 +513,13 @@ impl MarkdownDocument {
         caret: UnicodeScalar,
     ) -> Result<Vec<SourceRange>, MarkdownError> {
         let at = caret.to_source_byte(&self.source)?.get();
-        self.hidden_ranges(|construct| {
-            let span = construct.span();
-            span.start().get() <= at && at <= span.end().get()
-        })
+        self.hidden_ranges_filtered(
+            |construct| {
+                let span = construct.span();
+                span.start().get() <= at && at <= span.end().get()
+            },
+            true,
+        )
     }
 
     /// 给定选区（scalar 坐标，半开区间），返回当前应隐藏的 source 字节区间。
@@ -271,45 +529,51 @@ impl MarkdownDocument {
         &self,
         selection: Selection,
     ) -> Result<Vec<SourceRange>, MarkdownError> {
+        self.hidden_ranges_for_selection_filtered(selection, true)
+    }
+
+    /// 列表感知投影用：跳过 `ListItem` 构造（marker 由 [`Self::projection_pieces`]
+    /// 统一替换成 bullet/编号）。
+    fn hidden_ranges_for_selection_filtered(
+        &self,
+        selection: Selection,
+        include_list: bool,
+    ) -> Result<Vec<SourceRange>, MarkdownError> {
         let start = selection.start().to_source_byte(&self.source)?.get();
         let end = selection.end().to_source_byte(&self.source)?.get();
         if start == end {
-            return self.hidden_ranges_for_caret(selection.start());
+            return self.hidden_ranges_filtered(
+                |construct| {
+                    let span = construct.span();
+                    span.start().get() <= start && start <= span.end().get()
+                },
+                include_list,
+            );
         }
-        self.hidden_ranges(|construct| {
-            let span = construct.span();
-            span.start().get() < end && span.end().get() > start
-        })
+        self.hidden_ranges_filtered(
+            |construct| {
+                let span = construct.span();
+                span.start().get() < end && span.end().get() > start
+            },
+            include_list,
+        )
     }
 
-    /// 收集未显现构造的标记区间，排序并合并相邻/重叠段（保证有序、不重叠）。
-    fn hidden_ranges(
+    fn hidden_ranges_filtered(
         &self,
         reveal: impl Fn(&MarkdownConstruct) -> bool,
+        include_list: bool,
     ) -> Result<Vec<SourceRange>, MarkdownError> {
         let mut ranges: Vec<SourceRange> = Vec::new();
         for construct in &self.constructs {
+            if !include_list && construct.kind() == ConstructKind::ListItem {
+                continue;
+            }
             if !reveal(construct) {
                 ranges.extend(construct.markers.iter().copied());
             }
         }
-        ranges.sort_by_key(|range| (range.start().get(), range.end().get()));
-
-        let mut merged: Vec<SourceRange> = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            match merged.last().copied() {
-                Some(last) if range.start().get() <= last.end().get() => {
-                    let combined =
-                        self.range(last.start().get(), last.end().get().max(range.end().get()))?;
-                    // `last()` 刚刚返回过值，这里只会命中一次；用 if let 避免 unwrap。
-                    if let Some(slot) = merged.last_mut() {
-                        *slot = combined;
-                    }
-                }
-                _ => merged.push(range),
-            }
-        }
-        Ok(merged)
+        merge_ranges(&self.source, ranges)
     }
 
     fn range(&self, start: usize, end: usize) -> Result<SourceRange, MarkdownError> {
@@ -321,6 +585,198 @@ impl MarkdownDocument {
             },
         )
     }
+}
+
+/// 合并有序/无序、可能重叠的 source 区间（保证升序、不重叠）。
+fn merge_ranges(
+    source: &str,
+    mut ranges: Vec<SourceRange>,
+) -> Result<Vec<SourceRange>, MarkdownError> {
+    ranges.sort_by_key(|range| (range.start().get(), range.end().get()));
+    let mut merged: Vec<SourceRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last().copied() {
+            Some(last) if range.start().get() <= last.end().get() => {
+                let combined = span_of(
+                    source,
+                    last.start().get(),
+                    last.end().get().max(range.end().get()),
+                )?;
+                if let Some(slot) = merged.last_mut() {
+                    *slot = combined;
+                }
+            }
+            _ => merged.push(range),
+        }
+    }
+    Ok(merged)
+}
+
+fn span_of(source: &str, start: usize, end: usize) -> Result<SourceRange, MarkdownError> {
+    SourceRange::within(source, SourceByte::new(start), SourceByte::new(end)).map_err(|_| {
+        MarkdownError::InternalRange {
+            start,
+            end,
+            len: source.len(),
+        }
+    })
+}
+
+/// 旧自研 scanner：作为新解析器行内投影的 fallback（见 [`MarkdownDocument`] 文档）。
+fn legacy_constructs(source: &str) -> Result<Vec<MarkdownConstruct>, MarkdownError> {
+    let mut parser = Parser {
+        source,
+        len: source.len(),
+        constructs: Vec::new(),
+    };
+    parser.run()?;
+    let mut constructs = parser.constructs;
+    constructs.sort_by_key(|construct| {
+        (
+            construct.span.start().get(),
+            construct.span.end().get(),
+            construct.kind,
+        )
+    });
+    Ok(constructs)
+}
+
+/// 新解析器 + 旧 scanner 的构造合并（规则见模块文档与 ADR 0019 S1 实施记录）。
+fn merge_constructs(
+    source: &str,
+    semantic: &ParsedMarkdown,
+    mut legacy: Vec<MarkdownConstruct>,
+) -> (Vec<MarkdownConstruct>, bool) {
+    // 1) 未支持块（表格 / HTML / 缩进代码 / Setext）、围栏代码内部、以及图片（S2 才做
+    //    Object）：旧 scanner 的**行内**构造一律丢弃（原样显示，不猜测）。
+    let image_spans: Vec<SemanticSpan> = semantic
+        .constructs
+        .iter()
+        .filter(|construct| construct.kind == semantic::ConstructKind::Image)
+        .map(|construct| construct.span)
+        .collect();
+    legacy.retain(|construct| {
+        !(construct.kind().is_inline()
+            && (inside_any(
+                construct.span().start().get(),
+                construct.span().end().get(),
+                &semantic.code_spans,
+                &semantic.unsupported_spans,
+            ) || inside_any(
+                construct.span().start().get(),
+                construct.span().end().get(),
+                &image_spans,
+                &[],
+            )))
+    });
+
+    // 2) 新解析器构造 → editor 构造（Image 留给 S2；定位不合法的构造直接跳过）。
+    let mut semantic_blocks = Vec::new();
+    let mut semantic_inlines = Vec::new();
+    for construct in &semantic.constructs {
+        if construct.kind == semantic::ConstructKind::Image {
+            continue;
+        }
+        if construct.kind.is_inline()
+            && (semantic.uncertain_inline
+                || inside_any(
+                    construct.span.start,
+                    construct.span.end,
+                    &semantic.code_spans,
+                    &semantic.unsupported_spans,
+                )
+                || inside_any(construct.span.start, construct.span.end, &image_spans, &[]))
+        {
+            continue;
+        }
+        let Some(converted) = convert_construct(source, construct) else {
+            continue;
+        };
+        if converted.kind().is_block() {
+            semantic_blocks.push(converted);
+        } else {
+            semantic_inlines.push(converted);
+        }
+    }
+
+    // 3) 行内：旧 scanner 覆盖的每一种构造都必须能在新解析器里找到同 kind/同 span 的
+    //    对应项；否则整篇行内退回旧 scanner（保守：宁可少隐藏，也不隐藏错）。
+    let legacy_inlines: Vec<MarkdownConstruct> = legacy
+        .iter()
+        .filter(|construct| construct.kind().is_inline())
+        .cloned()
+        .collect();
+    let inline_fallback = semantic.uncertain_inline
+        || legacy_inlines.iter().any(|legacy| {
+            !semantic_inlines
+                .iter()
+                .any(|new| new.kind() == legacy.kind() && new.span() == legacy.span())
+        });
+    let chosen_inlines = if inline_fallback {
+        legacy_inlines
+    } else {
+        semantic_inlines
+    };
+
+    // 4) 块级：**只以新解析器为准**，不再用旧 scanner 补位。
+    //    补位会把 `-` / `#`（无空格）重新识别成列表/标题，违背 Markdown 语法；
+    //    未支持构造由 `unsupported_spans` 原样显示。旧 scanner 只保留行内 fallback。
+    let mut chosen = semantic_blocks;
+    chosen.extend(chosen_inlines);
+    chosen.sort_by_key(|construct| {
+        (
+            construct.span.start().get(),
+            construct.span.end().get(),
+            construct.kind,
+        )
+    });
+    chosen.dedup_by(|a, b| {
+        a.kind == b.kind && a.span == b.span && a.markers == b.markers && a.content == b.content
+    });
+    (chosen, inline_fallback)
+}
+
+fn inside_any(
+    start: usize,
+    end: usize,
+    code: &[SemanticSpan],
+    unsupported: &[SemanticSpan],
+) -> bool {
+    code.iter()
+        .chain(unsupported.iter())
+        .any(|outer| outer.start <= start && end <= outer.end)
+}
+
+fn convert_construct(source: &str, construct: &semantic::Construct) -> Option<MarkdownConstruct> {
+    let kind = match construct.kind {
+        semantic::ConstructKind::Heading(_) => ConstructKind::Heading,
+        semantic::ConstructKind::BlockQuote => ConstructKind::BlockQuote,
+        semantic::ConstructKind::ListItem => ConstructKind::ListItem,
+        semantic::ConstructKind::FencedCode => ConstructKind::FencedCode,
+        semantic::ConstructKind::Bold => ConstructKind::Bold,
+        semantic::ConstructKind::Emphasis => ConstructKind::Emphasis,
+        semantic::ConstructKind::InlineCode => ConstructKind::InlineCode,
+        semantic::ConstructKind::Strike => ConstructKind::Strike,
+        semantic::ConstructKind::Link => ConstructKind::Link,
+        semantic::ConstructKind::Image => return None,
+    };
+    let span = convert_span(source, construct.span)?;
+    let markers: Option<Vec<SourceRange>> = construct
+        .markers
+        .iter()
+        .map(|marker| convert_span(source, *marker))
+        .collect();
+    let content = convert_span(source, construct.content)?;
+    MarkdownConstruct::checked(kind, span, markers?, content)
+}
+
+fn convert_span(source: &str, span: SemanticSpan) -> Option<SourceRange> {
+    SourceRange::within(
+        source,
+        SourceByte::new(span.start),
+        SourceByte::new(span.end),
+    )
+    .ok()
 }
 
 /// 围栏代码块扫描状态。

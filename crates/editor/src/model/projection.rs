@@ -5,8 +5,9 @@
 //! - [`SegmentKind::Copy`]：可见段，source 与 display 逐字节相同（等宽）；
 //! - [`SegmentKind::Elide`]：省略段，source 非空、display 宽度为 0
 //!   （Markdown 标记被隐藏）；
-//! - `Replace` / `Object` 仍为后续切片预留，本层不生成，查询遇到时返回 `None`
-//!   （构造器 `from_segments` 也会拒绝它们）。
+//! - `Object` 仍为后续切片预留，本层不生成，查询遇到时返回 `None`；
+//! - `Replace` 在 ADR 0019 S1 启用：列表 marker 的 display 是 bullet/编号，source 是
+//!   `- ` / `1. `。端点偏置见下文。
 //!
 //! 段表**完整、有序、无重叠**地覆盖 `[0, source_len)`，且 display 区间连续；
 //! 查询一律先在段表里定位、再段内换算，绝不用"display = source + 常数偏移"。
@@ -82,6 +83,28 @@ pub enum SegmentKind {
     Object,
 }
 
+/// 一个投影片段：要么整段隐藏（Elide），要么替换成另一段 display 文本（Replace）。
+///
+/// `Replace` 的 source 区间是**完整 marker**（`- ` / `1. `），display 文本是 bullet /
+/// 右对齐编号；两段都在源码里真实存在，不是 AST 重新序列化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionPiece {
+    /// 隐藏该 source 区间（display 宽度为 0）。
+    Hidden(SourceRange),
+    /// 用 `display` 文本替换该 source 区间。
+    Replace(SourceRange, String),
+}
+
+impl ProjectionPiece {
+    /// 片段对应的 source 区间。
+    #[must_use]
+    pub const fn source(&self) -> SourceRange {
+        match self {
+            Self::Hidden(range) | Self::Replace(range, _) => *range,
+        }
+    }
+}
+
 /// 多对一区间的边界取向（ADR 0002 §4：隐藏区间的内部点没有唯一逆像）。
 ///
 /// `Copy` 段内部无歧义；只有省略段边界用它区分左右侧。规则见模块文档。
@@ -94,13 +117,15 @@ pub enum BoundaryBias {
 }
 
 /// 一个投影段：source 区间 ↔ 逻辑显示串的 byte 区间。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     source: SourceRange,
     display_start: DisplayByte,
     display_end: DisplayByte,
     kind: SegmentKind,
     bias: BoundaryBias,
+    /// `Replace` 段的 display 文本（其它段为 `None`）。
+    text: Option<String>,
 }
 
 impl Segment {
@@ -116,6 +141,7 @@ impl Segment {
             display_end: DisplayByte::new(display_end),
             kind: SegmentKind::Copy,
             bias: BoundaryBias::After,
+            text: None,
         })
     }
 
@@ -132,42 +158,82 @@ impl Segment {
             display_end: display_at,
             kind: SegmentKind::Elide,
             bias: BoundaryBias::After,
+            text: None,
+        })
+    }
+
+    /// 构造 Replace 段：source 非空，display 是**另一段文本**（宽度按 UTF-8 bytes）。
+    ///
+    /// 列表 marker 用：source `- `（或 `1. `）→ display `"• "`（或右对齐编号）。
+    pub fn replace(
+        source: SourceRange,
+        text: impl Into<String>,
+        display_start: DisplayByte,
+    ) -> Result<Self, ProjectionError> {
+        if source.is_empty() {
+            return Err(ProjectionError::InvalidLayout(
+                "Replace 段的 source 区间不能为空",
+            ));
+        }
+        let text = text.into();
+        if text.is_empty() {
+            return Err(ProjectionError::InvalidLayout(
+                "Replace 段的 display 文本不能为空",
+            ));
+        }
+        let display_end = display_start
+            .get()
+            .checked_add(text.len())
+            .ok_or(ProjectionError::Overflow)?;
+        Ok(Self {
+            source,
+            display_start,
+            display_end: DisplayByte::new(display_end),
+            kind: SegmentKind::Replace,
+            bias: BoundaryBias::After,
+            text: Some(text),
         })
     }
 
     /// source 半开区间。
     #[must_use]
-    pub const fn source(self) -> SourceRange {
+    pub const fn source(&self) -> SourceRange {
         self.source
     }
 
     /// 显示串起始 byte（含）。
     #[must_use]
-    pub const fn display_start(self) -> DisplayByte {
+    pub const fn display_start(&self) -> DisplayByte {
         self.display_start
     }
 
     /// 显示串结束 byte（不含）。
     #[must_use]
-    pub const fn display_end(self) -> DisplayByte {
+    pub const fn display_end(&self) -> DisplayByte {
         self.display_end
     }
 
     /// 段类型。
     #[must_use]
-    pub const fn kind(self) -> SegmentKind {
+    pub const fn kind(&self) -> SegmentKind {
         self.kind
     }
 
     /// 边界 bias（历史预留字段；真实偏置规则见模块文档）。
     #[must_use]
-    pub const fn bias(self) -> BoundaryBias {
+    pub const fn bias(&self) -> BoundaryBias {
         self.bias
+    }
+
+    /// `Replace` 段的 display 文本（其它段返回 `None`）。
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
     }
 
     /// 显示宽度（UTF-8 bytes）。
     #[must_use]
-    pub fn display_len(self) -> usize {
+    pub fn display_len(&self) -> usize {
         self.display_end.get() - self.display_start.get()
     }
 }
@@ -239,7 +305,7 @@ impl ProjectionMap {
     ///
     /// 校验：段按 source 与 display 都从 0 起连续覆盖；Copy 段两侧宽度相等；
     /// Elide 段 display 宽度为零；端点落在 scalar 边界；空文档只允许空段表。
-    /// 本层只接受 `Copy` / `Elide`（`Replace` / `Object` 尚未实现）。
+    /// 本层接受 `Copy` / `Elide` / `Replace`（`Object` 留给 S2）。
     pub fn from_segments(source: &str, segments: Vec<Segment>) -> Result<Self, ProjectionError> {
         let source_len = units::byte_len(source);
         if source_len == 0 && !segments.is_empty() {
@@ -282,9 +348,23 @@ impl ProjectionMap {
                         ));
                     }
                 }
-                SegmentKind::Replace | SegmentKind::Object => {
+                SegmentKind::Replace => {
+                    let text = segment.text.as_deref().unwrap_or_default();
+                    if text.is_empty() {
+                        return Err(ProjectionError::InvalidLayout(
+                            "Replace 段必须有非空 display 文本",
+                        ));
+                    }
+                    if text.len() != segment.display_len() {
+                        return Err(ProjectionError::InvalidLayout(
+                            "Replace 段的 display 宽度必须等于替换文本长度",
+                        ));
+                    }
+                    display.push_str(text);
+                }
+                SegmentKind::Object => {
                     return Err(ProjectionError::InvalidLayout(
-                        "本层只支持 Copy / Elide 段（Replace / Object 尚未实现）",
+                        "本层不支持 Object 段（ADR 0019 S2 起）",
                     ));
                 }
             }
@@ -306,6 +386,69 @@ impl ProjectionMap {
             display_byte_len: display_cursor,
             display,
             segments,
+        })
+    }
+
+    /// 由**投影片段**构造段表（ADR 0019 S1：列表 marker 用 `Replace`）。
+    ///
+    /// 片段必须按 source 起点有序、互不重叠、非空；片段之间的空隙自动成为 `Copy`。
+    pub fn from_pieces(source: &str, pieces: &[ProjectionPiece]) -> Result<Self, ProjectionError> {
+        let source_len = units::byte_len(source);
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut source_cursor = 0usize;
+        let mut display_cursor = 0usize;
+        for piece in pieces {
+            let range = piece.source();
+            let start = range.start().get();
+            let end = range.end().get();
+            if start < source_cursor || start >= end || end > source_len {
+                return Err(ProjectionError::InvalidLayout(
+                    "投影片段必须有序、非空、互不重叠且在 source 范围内",
+                ));
+            }
+            if start > source_cursor {
+                let visible = Self::source_range(source, source_cursor, start)?;
+                let segment = Segment::copy(visible, DisplayByte::new(display_cursor))?;
+                display_cursor = segment.display_end().get();
+                segments.push(segment);
+            }
+            let range = Self::source_range(source, start, end)?;
+            let segment = match piece {
+                ProjectionPiece::Hidden(_) => {
+                    Segment::elide(range, DisplayByte::new(display_cursor))?
+                }
+                ProjectionPiece::Replace(_, text) => {
+                    Segment::replace(range, text.clone(), DisplayByte::new(display_cursor))?
+                }
+            };
+            display_cursor = segment.display_end().get();
+            segments.push(segment);
+            source_cursor = end;
+        }
+        if source_cursor < source_len {
+            let visible = Self::source_range(source, source_cursor, source_len)?;
+            let segment = Segment::copy(visible, DisplayByte::new(display_cursor))?;
+            segments.push(segment);
+        }
+        Self::from_segments(source, segments)
+    }
+
+    /// 由 `MarkdownDocument` 的投影片段构造（列表 marker 会变成 bullet/编号）。
+    ///
+    /// 与 [`Self::from_markdown`] 的区别：后者只做 `Copy/Elide`（S2 行为，供旧测试与
+    /// 保守回退使用）；本方法是 app 生产路径，`ListItem` marker 走 `Replace`。
+    pub fn from_markdown_with_lists(doc: &MarkdownDocument, selection: Selection) -> Self {
+        let pieces = doc.projection_pieces(selection).ok();
+        let projection = pieces
+            .as_deref()
+            .and_then(|pieces| Self::from_pieces(doc.source(), pieces).ok());
+        projection.unwrap_or_else(|| {
+            Self::identity(doc.source()).unwrap_or_else(|_| Self {
+                source_len: doc.source_len(),
+                display_byte_len: 0,
+                display: String::new(),
+                segments: Vec::new(),
+            })
         })
     }
 
@@ -413,9 +556,9 @@ impl ProjectionMap {
             SegmentKind::Copy => Some(DisplayByte::new(
                 segment.display_start().get() + (at - segment.source.start().get()),
             )),
-            // 省略段内部（含段首）：Before 偏置 → 段起点对应的 display 位置。
-            SegmentKind::Elide => Some(segment.display_start()),
-            _ => None,
+            // 省略/替换段内部（含段首）：Before 偏置 → 段起点对应的 display 位置。
+            SegmentKind::Elide | SegmentKind::Replace => Some(segment.display_start()),
+            SegmentKind::Object => None,
         }
     }
 
@@ -441,7 +584,12 @@ impl ProjectionMap {
         }
     }
 
-    /// `Left` 偏置的实现：该 display 位置上若有零宽隐藏段，取段起点。
+    /// `Left` 偏置的实现。
+    ///
+    /// - 该 display 位置上若有零宽隐藏段：取段起点（原来的语义）；
+    /// - 落在 `Replace` 段内部 / 起点 / **终点**：取替换段 source 起点（marker 之前），
+    ///   这样点 bullet 的右半会停在 marker 里（Typora 规则：进入 marker 显现源码）；
+    /// - 其余：与 Right 等价（可见字符内部无歧义）。
     fn source_byte_at_display_left(&self, display: DisplayByte) -> Option<SourceByte> {
         let at = display.get();
         if at > self.display_byte_len {
@@ -460,7 +608,16 @@ impl ProjectionMap {
             debug_assert!(start <= end, "隐藏段起点不应晚于终点");
             return Some(SourceByte::new(start));
         }
-        // 没有隐藏段：与 Right 等价（可见字符内部无歧义）。
+        // Replace 段：起点/内部/终点都取 source 起点（marker 起点）。
+        for segment in &self.segments {
+            if segment.kind == SegmentKind::Replace
+                && segment.display_start().get() <= at
+                && at <= segment.display_end().get()
+            {
+                return Some(segment.source.start());
+            }
+        }
+        // 没有隐藏/替换段：与 Right 等价（可见字符内部无歧义）。
         self.source_byte_at_display(display)
     }
 
@@ -487,9 +644,9 @@ impl ProjectionMap {
             SegmentKind::Copy => Some(SourceByte::new(
                 segment.source.start().get() + (at - segment.display_start().get()),
             )),
-            // 只有尾部零宽段会走到这里；保守取段起点（正常不可达）。
-            SegmentKind::Elide => Some(segment.source.start()),
-            _ => None,
+            // 零宽隐藏段 / 替换段：都取 source 起点（替换文本内部没有可停的 source 位置）。
+            SegmentKind::Elide | SegmentKind::Replace => Some(segment.source.start()),
+            SegmentKind::Object => None,
         }
     }
 
@@ -501,6 +658,20 @@ impl ProjectionMap {
         }
         if self.segments.is_empty() {
             return None;
+        }
+        // 选区恰好结束在 Replace 段末尾：把可见 marker 的 source 完整包含进来。
+        if let Some(segment) = self.segments.iter().find(|segment| {
+            segment.kind == SegmentKind::Replace && segment.display_end().get() == at
+        }) {
+            return Some(segment.source.end());
+        }
+        // 选区结束在 Replace 段内部：同样包含整个 marker（display 上选了 bullet 的一部分）。
+        if let Some(segment) = self.segments.iter().find(|segment| {
+            segment.kind == SegmentKind::Replace
+                && segment.display_start().get() < at
+                && at < segment.display_end().get()
+        }) {
+            return Some(segment.source.end());
         }
         if at == self.display_byte_len {
             // 末尾端点：取最后一个可见段末尾（不吞掉尾部隐藏标记）。
@@ -533,7 +704,15 @@ impl ProjectionMap {
                     ))
                 }
             }
-            _ => self.segments[index..]
+            SegmentKind::Replace => {
+                if at <= segment.display_start().get() {
+                    // 选区在 marker 之前结束：不包含 marker。
+                    Some(segment.source.start())
+                } else {
+                    Some(segment.source.end())
+                }
+            }
+            SegmentKind::Elide | SegmentKind::Object => self.segments[index..]
                 .iter()
                 .find(|next| next.kind == SegmentKind::Copy)
                 .map(|next| next.source.start()),

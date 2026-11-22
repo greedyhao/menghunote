@@ -38,8 +38,11 @@ pub struct VisualLine {
     pub line_height: f32,
     /// 该行是否用等宽字体（围栏代码块）。
     pub mono: bool,
-    /// 该行左侧缩进（像素）：引用块按层累加，其余为 0。
+    /// 该**视觉行**左侧缩进（像素）：引用块按层累加；列表首行是 gutter 起点，
+    /// 续行是 hanging indent（与 marker 显示宽度一致）。逐行可变。
     pub indent: f32,
+    /// 该行是否属于引用块（决定是否画左侧竖条；列表缩进不能画）。
+    pub quote_bar: bool,
 }
 
 impl VisualLine {
@@ -59,8 +62,15 @@ pub struct LineMetric {
     pub line_height: f32,
     /// 是否用等宽字体（围栏代码块）。
     pub mono: bool,
-    /// 该行左侧缩进（像素）：引用块按层累加，其余为 0。
+    /// 该源码行**首行**左侧缩进（像素）：引用块 / 列表 gutter 起点。
     pub indent: f32,
+    /// 该源码行软折行后（第 2 行起）的左侧缩进（像素）：列表 hanging indent。
+    ///
+    /// 普通行等于 `indent`；列表 item 首行等于 `indent + marker 显示宽度`，于是
+    /// 续行正好对齐内容列。折行宽度按两者较大值收窄（保守，不会伸到右边界外）。
+    pub wrap_indent: f32,
+    /// 引用块嵌套层数（0 = 非引用）；列表缩进不计入。
+    pub quote_depth: usize,
 }
 
 impl LineMetric {
@@ -72,6 +82,8 @@ impl LineMetric {
             line_height: super::theme::DEFAULT_LINE_HEIGHT,
             mono: false,
             indent: 0.0,
+            wrap_indent: 0.0,
+            quote_depth: 0,
         }
     }
 
@@ -83,6 +95,8 @@ impl LineMetric {
             line_height: super::theme::line_height_for(font_size),
             mono: false,
             indent: 0.0,
+            wrap_indent: 0.0,
+            quote_depth: 0,
         }
     }
 }
@@ -304,6 +318,21 @@ pub fn wrap_with(
             } else {
                 0.0
             },
+            wrap_indent: if metric.wrap_indent.is_finite() && metric.wrap_indent > 0.0 {
+                metric.wrap_indent
+            } else {
+                0.0
+            },
+            quote_depth: metric.quote_depth,
+        };
+        let metric = LineMetric {
+            // hanging indent 不能小于首行缩进（否则续行会跑到 gutter 左边）。
+            wrap_indent: if metric.wrap_indent.is_finite() && metric.wrap_indent > 0.0 {
+                metric.wrap_indent.max(metric.indent)
+            } else {
+                metric.indent
+            },
+            ..metric
         };
         let content_end = if raw.ends_with('\n') {
             offset + raw.len() - 1
@@ -313,8 +342,9 @@ pub fn wrap_with(
         let content = &text[offset..content_end];
         let mut start = offset;
         let mut row_in_line = 0usize;
-        // 缩进吃掉可用宽度：引用行折行必须更窄，否则文字会伸到右边界外。
-        let line_wrap_width = (wrap_width - metric.indent).max(MIN_WRAP_WIDTH);
+        // 缩进吃掉可用宽度：引用行/列表续行折行必须更窄，否则文字会伸到右边界外。
+        let line_wrap_width =
+            (wrap_width - metric.indent.max(metric.wrap_indent)).max(MIN_WRAP_WIDTH);
         for end in boundaries(content, line_wrap_width) {
             let end = offset + end.min(content.len());
             // 断行函数给出退化边界（<= 当前起点）时跳过，避免产生空视觉行或死循环。
@@ -328,7 +358,12 @@ pub fn wrap_with(
                 font_size: metric.font_size,
                 line_height: metric.line_height,
                 mono: metric.mono,
-                indent: metric.indent,
+                indent: if row_in_line == 0 {
+                    metric.indent
+                } else {
+                    metric.wrap_indent
+                },
+                quote_bar: metric.quote_depth > 0,
             });
             start = end;
             row_in_line += 1;
@@ -343,7 +378,12 @@ pub fn wrap_with(
                 font_size: metric.font_size,
                 line_height: metric.line_height,
                 mono: metric.mono,
-                indent: metric.indent,
+                indent: if row_in_line == 0 {
+                    metric.indent
+                } else {
+                    metric.wrap_indent
+                },
+                quote_bar: metric.quote_depth > 0,
             });
         }
         offset += raw.len();
@@ -362,6 +402,7 @@ pub fn wrap_with(
             line_height: metric.line_height,
             mono: metric.mono,
             indent: metric.indent,
+            quote_bar: metric.quote_depth > 0,
         });
     }
 
@@ -757,6 +798,70 @@ mod tests {
             );
             assert!((0.0..=content - viewport).contains(&scroll));
         }
+    }
+
+    #[test]
+    fn list_hanging_indent_applies_to_wrapped_rows() {
+        // 列表 item 首行：gutter 起点 10px；续行 hanging indent 36px（= indent + marker 宽度）。
+        let metric = LineMetric {
+            indent: 10.0,
+            wrap_indent: 36.0,
+            ..LineMetric::body()
+        };
+        let mut boundaries = |line: &str, width: f32| {
+            // 折行宽度必须按较大的 hanging indent 收窄，否则续行会伸到右边界外。
+            assert!(width <= 200.0 - 36.0 + 0.01, "wrap width = {width}");
+            vec![line.len() / 2]
+        };
+        let frame = wrap_with(
+            "abcdefgh",
+            200.0,
+            LineMetric::body(),
+            &[metric],
+            &mut boundaries,
+        );
+        assert_eq!(frame.row_count(), 2);
+        assert_eq!(frame.row_indent(0), 10.0, "首行从 gutter 起点开始");
+        assert_eq!(frame.row_indent(1), 36.0, "续行对齐内容列");
+        assert_eq!(frame.lines[0].indent, 10.0);
+        assert_eq!(frame.lines[1].indent, 36.0);
+    }
+
+    #[test]
+    fn quote_bar_is_driven_by_quote_depth_not_list_indent() {
+        let list_metric = LineMetric {
+            indent: 10.0,
+            wrap_indent: 36.0,
+            quote_depth: 0,
+            ..LineMetric::body()
+        };
+        let quote_metric = LineMetric {
+            quote_depth: 1,
+            ..LineMetric::body()
+        };
+        let mut boundaries = |_line: &str, _width: f32| Vec::new();
+        let frame = wrap_with(
+            "list\nquote\n",
+            200.0,
+            LineMetric::body(),
+            &[list_metric, quote_metric],
+            &mut boundaries,
+        );
+        assert!(!frame.lines[0].quote_bar, "列表缩进不能画引用竖条");
+        assert!(frame.lines[1].quote_bar, "真正引用行必须画竖条");
+    }
+
+    #[test]
+    fn list_empty_line_uses_first_line_indent() {
+        let metric = LineMetric {
+            indent: 10.0,
+            wrap_indent: 36.0,
+            ..LineMetric::body()
+        };
+        let mut boundaries = |_line: &str, _width: f32| Vec::new();
+        let frame = wrap_with("", 200.0, LineMetric::body(), &[metric], &mut boundaries);
+        assert_eq!(frame.row_count(), 1);
+        assert_eq!(frame.row_indent(0), 10.0, "空 item 的 gutter 仍要占位");
     }
 
     #[test]

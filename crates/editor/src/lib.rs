@@ -85,6 +85,12 @@ pub use menghunote_text::{
 pub mod model;
 
 pub use model::block::{BlockKind, BlockRun};
+// ADR 0019 S1：列表/行语义由 menghunote-markdown 定义，editor 原样再导出（同一类型，
+// 不是副本）；app 用它们算 gutter / hanging indent，不自己重扫 Markdown。
+pub use menghunote_markdown::{
+    LineInfo as MarkdownLineInfo, LineKind as MarkdownLineKind, ListBlock as MarkdownListBlock,
+    ListItem as MarkdownListItem, ListLineInfo as MarkdownListLineInfo, Span as MarkdownSpan,
+};
 pub use model::controller::{EditorController, GraphemeStep, OutcomeEffect};
 pub use model::error::EditorError;
 pub use model::input::InputDocument;

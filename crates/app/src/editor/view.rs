@@ -47,7 +47,7 @@ use gpui::{
 };
 use menghunote_editor::{
     Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, Selection,
-    SourceByte, StyleKind, UnicodeScalar,
+    SourceByte, SourceRange, StyleKind, UnicodeScalar,
 };
 #[cfg(feature = "dev-sync")]
 use menghunote_storage::session::{
@@ -139,6 +139,9 @@ pub struct EditorView {
     composition: Composition,
     /// 已发出的 `EditRequest` 计数：日志里用来证明"一次 commit 只有一个请求"。
     request_seq: u64,
+    /// 本次 Enter 已由 key_down 落成编辑：平台随后送来的同一个 `\n` 文本输入要消费掉，
+    /// 否则一次按键会变成两个 EditRequest（结构编辑 + 普通换行）。
+    pending_enter_text_input: bool,
     /// 下一次绘制选区时是否把几何明细打到 stderr（拖拽/点击时置位，task-19 诊断用）。
     dump_selection: bool,
     /// 上一次观察到的「外部提交闸门持有中」状态（ADR 0009 切片 3b）。
@@ -175,6 +178,7 @@ impl EditorView {
             vault_label,
             composition: Composition::default(),
             request_seq: 0,
+            pending_enter_text_input: false,
             dump_selection: false,
             held: false,
             #[cfg(feature = "dev-sync")]
@@ -299,49 +303,151 @@ impl EditorView {
         self.controller.display_text().into_owned()
     }
 
-    /// 逐**源码行**的度量（字号/行高/是否等宽），来自块级语义 `block_runs()`。
+    /// 逐**源码行**的度量（字号/行高/是否等宽/缩进），来自块级语义 + 列表块树。
     ///
-    /// 标题按 level 放大，围栏代码块用等宽字体，其余正文默认。
-    pub(crate) fn block_metrics(&self) -> Vec<super::layout::LineMetric> {
-        use menghunote_editor::BlockKind;
-        // 引用缩进要看**源码行**的前缀（`>` 的层数），投影里 `>` 是隐藏的。
+    /// 列表几何（ADR 0019 S1）：
+    /// - **首行**：`indent = 引用缩进 + depth × LIST_INDENT`；bullet/number 就在
+    ///   display 文本行首，所以 `wrap_indent = indent + marker 显示宽度`；
+    /// - **续行/子段落/内部围栏**：`indent = wrap_indent = 引用缩进 + depth × LIST_INDENT
+    ///   + marker 显示宽度`，即 hanging indent，正好对齐内容列；
+    /// - marker 显示宽度用**真实 shaping**（与绘制同一字体/字号）测量，不用字符数估算；
+    ///   caret 进入 marker、显示源码 `- ` 时宽度会变，`WrapCache` 的度量键包含
+    ///   `indent/wrap_indent`，因此会自动重排。
+    pub(crate) fn block_metrics(&self, window: &Window) -> Vec<super::layout::LineMetric> {
+        use menghunote_editor::{BlockKind, MarkdownLineKind};
+        use std::collections::HashMap;
+
+        // 引用缩进要看**源码行**的前缀（`>` 在投影里是隐藏的）。
         let source = self.controller.source_text();
         let source_lines: Vec<&str> = source.split_inclusive('\n').collect();
+        let line_infos = self.controller.line_infos();
+        let items = self.controller.list_items();
+        // 键包含字号与等宽标记：同一个 "• " 在标题行/正文行宽度不同，不能混用。
+        let mut marker_widths: HashMap<(u32, bool, String), f32> = HashMap::new();
+
         self.controller
             .block_runs()
             .iter()
             .enumerate()
             .map(|(index, run)| {
-                // 引用行每层 16px；层数从源码行前缀数出来（`> > x` = 2 层）。
-                let indent = if run.kind() == BlockKind::BlockQuote {
-                    let line = source_lines.get(index).copied().unwrap_or("");
-                    super::layout::quote_indent(super::layout::quote_depth(line))
-                } else {
-                    0.0
-                };
-                match run.kind() {
+                let source_line = source_lines.get(index).copied().unwrap_or("");
+                let quote_depth = super::layout::quote_depth(source_line);
+                let quote = super::layout::quote_indent(quote_depth);
+                let line_info = line_infos.get(index);
+
+                let (mut font_size, mut line_height, mut mono) = match run.kind() {
                     BlockKind::Heading => {
                         let level = run.level().unwrap_or(1);
-                        let font_size = theme::heading_font_size(level);
-                        super::layout::LineMetric {
-                            font_size,
-                            line_height: theme::line_height_for(font_size),
-                            mono: false,
-                            indent,
-                        }
+                        let size = theme::heading_font_size(level);
+                        (size, theme::line_height_for(size), false)
                     }
-                    BlockKind::FencedCode => super::layout::LineMetric {
-                        font_size: theme::FONT_SIZE,
-                        line_height: theme::DEFAULT_LINE_HEIGHT,
-                        mono: true,
-                        indent,
-                    },
+                    BlockKind::FencedCode => (theme::FONT_SIZE, theme::DEFAULT_LINE_HEIGHT, true),
                     BlockKind::BlockQuote | BlockKind::ListItem | BlockKind::Paragraph => {
-                        super::layout::LineMetric {
-                            indent,
-                            ..super::layout::LineMetric::body()
-                        }
+                        (theme::FONT_SIZE, theme::DEFAULT_LINE_HEIGHT, false)
                     }
+                };
+                // 嵌套在列表里的围栏（旧 scanner 看不到的 4+ 空格围栏）也必须是等宽。
+                if line_info.is_some_and(|info| {
+                    matches!(
+                        info.kind,
+                        MarkdownLineKind::FencedCode | MarkdownLineKind::IndentedCode
+                    )
+                }) {
+                    mono = true;
+                }
+
+                let mut indent = quote;
+                let mut wrap_indent = quote;
+                // 无缩进的惰性续行（例如删掉 `2.` 的 `.` 后只剩 `2`）仍被 pulldown
+                // 归到上一个 item 的 paragraph；编辑体验上它已经不在列表里，不能再按
+                // 续行挂到内容列。只有真缩进的续行/子段落才保留 hanging indent。
+                let list = line_info
+                    .and_then(|info| info.list.as_ref())
+                    .filter(|list| {
+                        list_indent_applies(
+                            list.is_item_start,
+                            list.hidden_prefix.is_empty(),
+                            source_line.trim().is_empty(),
+                        )
+                    });
+                if let Some(list) = list {
+                    let level_indent = quote + list.depth as f32 * theme::LIST_INDENT_PER_LEVEL;
+                    let marker = items
+                        .get(list.item)
+                        .map(|_| {
+                            if self.controller.list_marker_revealed(list.item) {
+                                self.controller
+                                    .list_marker_source(list.item)
+                                    .unwrap_or_default()
+                                    .to_owned()
+                            } else {
+                                self.controller
+                                    .list_marker_text(list.item)
+                                    .unwrap_or_default()
+                            }
+                        })
+                        .unwrap_or_default();
+                    // marker 只在 item 首行显示：续行（尤其内部围栏的等宽行）要用
+                    // **首行**的字体/字号测宽度，否则 hanging indent 会与内容列错位。
+                    let (marker_font_size, marker_mono) = if list.is_item_start {
+                        (font_size, mono)
+                    } else {
+                        let first_line = items.get(list.item).map_or(0, |item| item.first_line);
+                        let first_size = self.controller.block_runs().get(first_line).map_or(
+                            theme::FONT_SIZE,
+                            |first| match first.kind() {
+                                BlockKind::Heading => {
+                                    theme::heading_font_size(first.level().unwrap_or(1))
+                                }
+                                _ => theme::FONT_SIZE,
+                            },
+                        );
+                        (first_size, false)
+                    };
+                    let key = (marker_font_size.to_bits(), marker_mono, marker.clone());
+                    let width = if marker.is_empty() {
+                        0.0
+                    } else if let Some(width) = marker_widths.get(&key) {
+                        *width
+                    } else {
+                        let spans = [(marker.len(), StyleKind::Plain)];
+                        let width = super::glyph::shape_row_styled_at(
+                            window,
+                            &marker,
+                            &spans,
+                            marker_font_size,
+                            marker_mono,
+                        )
+                        .width()
+                        .as_f32();
+                        let width = if width.is_finite() {
+                            width.max(0.0)
+                        } else {
+                            0.0
+                        };
+                        marker_widths.insert(key, width);
+                        width
+                    };
+                    if list.is_item_start {
+                        indent = level_indent;
+                        wrap_indent = level_indent + width;
+                    } else {
+                        indent = level_indent + width;
+                        wrap_indent = indent;
+                    }
+                }
+                // 标题字号只由 block_runs 决定；行高与之配套（逐行可变）。
+                if matches!(run.kind(), BlockKind::Heading) {
+                    font_size = font_size.max(theme::FONT_SIZE);
+                    line_height = theme::line_height_for(font_size);
+                }
+                super::layout::LineMetric {
+                    font_size,
+                    line_height,
+                    mono,
+                    indent,
+                    wrap_indent,
+                    quote_depth,
                 }
             })
             .collect()
@@ -495,6 +601,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_enter_text_input = false;
         // 入参是**布局（display）字节**：先在 display 空间吸附 grapheme，
         // 再经投影回到 source scalar（隐藏标记后 display 比 source 短）。
         let display_byte = self.snap_display_byte(display_byte);
@@ -565,6 +672,10 @@ impl EditorView {
     /// 只处理**无修饰键**与 `Shift`（扩选）；带 Ctrl / Alt 的组合留给后续切片
     /// （按词移动、命令面板等）。
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key.as_str() != "enter" {
+            // 平台没有补发 Enter 文本输入时，标记不能留到下一次普通输入。
+            self.pending_enter_text_input = false;
+        }
         let modifiers = event.keystroke.modifiers;
         if std::env::var_os("MENGHUNOTE_TRACE_MENU").is_some() {
             eprintln!(
@@ -646,8 +757,13 @@ impl EditorView {
         }
         let extend = modifiers.shift;
         match event.keystroke.key.as_str() {
-            // 换行：走和 IME 上屏同一条路径（一次 EditRequest）。
-            "enter" => self.insert_text("\n", cx),
+            // 换行：列表 item 会同级续写/空项退出；其余情况与 IME 上屏同一条路径。
+            // `prevent_default` 阻止平台随后把 Enter 再当文本输入插一个 `\n`
+            // （否则一次按键会落两个 EditRequest：结构编辑 + 普通换行）。
+            "enter" => {
+                window.prevent_default();
+                self.enter_newline(cx);
+            }
             // 退格 / Delete：删什么由编辑器按 grapheme 决定（app 不自己拼 ScalarEdit）。
             "backspace" => self.delete_grapheme(GraphemeStep::Backward, cx),
             "delete" => self.delete_grapheme(GraphemeStep::Forward, cx),
@@ -796,6 +912,7 @@ impl EditorView {
         selected: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
+        self.pending_enter_text_input = false;
         if self.frozen_by_external_commit() {
             // Held：连接收组合会走到 `driver.begin_composition()`（3a 会拒绝进入组合），
             // 所以整段忽略；Held 结束后平台会重新发起组合。
@@ -830,6 +947,7 @@ impl EditorView {
 
     /// 组合提交：`text` 是平台给的最终文本，**只产生一个 `EditRequest`**。
     pub(crate) fn commit_composition(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.pending_enter_text_input = false;
         if self.frozen_by_external_commit() {
             // Held：既不结束组合闸门（3a 的状态优先），也不产生编辑请求。
             eprintln!("[menghunote] Held 期间收到 IME 上屏：已忽略（不落库）");
@@ -858,8 +976,51 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Enter：列表内同级新建 / 空项退出；其余情况插入普通换行。
+    ///
+    /// **IME 守卫**：组合期间先取消组合并**丢弃本次结构动作**（ADR 0019 §1：
+    /// IME 合成期间不触发结构动作）。结构编辑仍走 [`Self::submit_request`]，
+    /// 一次按键一个 `EditRequest`。
+    fn enter_newline(&mut self, cx: &mut Context<Self>) {
+        // 新的 Enter 一律从干净状态开始：上一次平台没有补发 `\n` 时不能吃掉这一次。
+        self.pending_enter_text_input = false;
+        if self.frozen_by_external_commit() {
+            return;
+        }
+        if self.is_composing() {
+            self.cancel_composition(cx);
+            return;
+        }
+        match self.controller.list_enter() {
+            Ok(Some(request)) => {
+                eprintln!("[menghunote] 列表 Enter：结构编辑 {}", request.command_id);
+                self.submit_request(Some(request));
+                self.ensure_caret_visible(self.controller.selection().head());
+                self.pending_enter_text_input = true;
+            }
+            Ok(None) => {
+                eprintln!("[menghunote] Enter：非列表/续行，按普通换行处理");
+                self.insert_text("\n", cx);
+                self.pending_enter_text_input = true;
+            }
+            Err(EditorError::PreeditActive) => {
+                eprintln!("[menghunote] 列表 Enter 被拒（组合中）：先取消组合，本次按键丢弃");
+                self.cancel_composition(cx);
+            }
+            Err(error) => eprintln!("[menghunote] 列表 Enter 失败：{error}"),
+        }
+        cx.notify();
+    }
+
     /// 普通文本输入（无组合：打字 / 粘贴）。
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text == "\n" && self.pending_enter_text_input {
+            // Enter 已经由 key_down 处理（结构编辑或普通换行），这里只消费平台的回声。
+            self.pending_enter_text_input = false;
+            eprintln!("[menghunote] 已消费平台重复的 Enter 文本输入（避免双换行）");
+            return;
+        }
+        self.pending_enter_text_input = false;
         if self.frozen_by_external_commit() {
             // Held：打字/粘贴一律忽略（控制器镜像也不能先乐观改动，否则之后无法对齐）。
             return;
@@ -943,6 +1104,48 @@ impl EditorView {
         }
     }
 
+    /// 空列表项行尾的 Backspace 目标：marker 最后一个空格/Tab（source 单字节）。
+    ///
+    /// 只在“collapsed caret 在该 item marker 之后、且 item 内容只有空白”时生效；
+    /// 这样 `1. ` 退格只得到 `1.`（不再渲染列表），而不是把 `1. ` 整段删掉。
+    fn empty_list_item_space_range(&self) -> Option<SourceRange> {
+        let selection = self.controller.selection();
+        if !selection.is_empty() {
+            return None;
+        }
+        let source = self.controller.source_text();
+        let head = selection.head().to_source_byte(&source).ok()?.get();
+        let line_index = source.as_bytes()[..head]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        let line = self.controller.line_infos().get(line_index)?;
+        let list = line.list.as_ref()?;
+        let item = self.controller.list_items().get(list.item)?;
+        if item.first_line != line_index || head < item.marker.end {
+            return None;
+        }
+        if !source
+            .get(item.content_start..line.content.end)?
+            .trim()
+            .is_empty()
+        {
+            return None;
+        }
+        let marker = source.get(item.marker.start..item.marker.end)?;
+        let last = *marker.as_bytes().last()?;
+        if last != b' ' && last != b'\t' {
+            return None;
+        }
+        let start = item.marker.end.checked_sub(1)?;
+        SourceRange::within(
+            &source,
+            SourceByte::new(start),
+            SourceByte::new(item.marker.end),
+        )
+        .ok()
+    }
+
     /// 本次删除在 **source** 坐标下的最小区间（display 取相邻可见 grapheme）。
     ///
     /// 有选区时删选区；否则按方向取显示上相邻的一个 grapheme。跨构造的选区会把
@@ -951,6 +1154,14 @@ impl EditorView {
         &mut self,
         step: GraphemeStep,
     ) -> Option<menghunote_editor::SourceRange> {
+        // 空列表项的 Backspace：只删 marker 末尾那一个空格/Tab，不把整个 marker 删掉。
+        // 否则 display 上 bullet 是一个 Replace 段，按可见 grapheme 反查会一次删掉
+        // `1. `（甚至连同缩进），用户再按 Enter 时只剩一段残留空格。
+        if matches!(step, GraphemeStep::Backward) {
+            if let Some(range) = self.empty_list_item_space_range() {
+                return Some(range);
+            }
+        }
         let projection = self.controller.projection();
         let (start, end) = match self.controller.selection_in_display() {
             Some((start, end)) if start != end => (start.get(), end.get()),
@@ -965,7 +1176,52 @@ impl EditorView {
                 (range.start, range.end)
             }
         };
-        projection.source_range_of_display_range(DisplayByte::new(start)..DisplayByte::new(end))
+        let range = projection
+            .source_range_of_display_range(DisplayByte::new(start)..DisplayByte::new(end))?;
+        if matches!(step, GraphemeStep::Backward) {
+            Some(self.expand_dangling_list_indent(range))
+        } else {
+            Some(range)
+        }
+    }
+
+    /// 删掉列表 marker 最后一个字符时，如果整行只剩缩进空白，就把缩进一起删掉。
+    ///
+    /// 场景：`  - ` 先删空格得到 `  -`，再删 `-`；普通 grapheme 删除只删 `-`，
+    /// 会留下 `  `，随后 Enter 就在一个“空缩进行”上继续。这里只在**删除后整行
+    /// 全空白、且原行只包含缩进 + marker 字符**时扩展删除范围，不影响正常文本
+    /// 行尾空格（`abc  ` 这种原行含字母，不会触发）。
+    fn expand_dangling_list_indent(&self, range: SourceRange) -> SourceRange {
+        if !self.controller.selection().is_empty() {
+            return range;
+        }
+        let source = self.controller.source_text();
+        let start = range.start().get();
+        let end = range.end().get();
+        if start > end || end > source.len() {
+            return range;
+        }
+        let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+        let line_end = source[start..]
+            .find('\n')
+            .map_or(source.len(), |index| start + index);
+        let line = &source[line_start..line_end];
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || !trimmed.bytes().all(|byte| {
+                byte.is_ascii_digit() || matches!(byte, b'-' | b'*' | b'+' | b'.' | b')')
+            })
+        {
+            return range;
+        }
+        let mut remaining = String::with_capacity(line.len());
+        remaining.push_str(&source[line_start..start]);
+        remaining.push_str(&source[end..line_end]);
+        if !remaining.chars().all(char::is_whitespace) {
+            return range;
+        }
+        SourceRange::within(&source, SourceByte::new(line_start), SourceByte::new(end))
+            .unwrap_or(range)
     }
 
     /// 退格 / Delete：走与普通输入**完全相同**的一条路径。
@@ -1792,6 +2048,16 @@ fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
     byte
 }
 
+/// 列表续行是否应该占用列表缩进。
+///
+/// 无缩进、非空、且不是 item 首行的行是“惰性续行”：删掉 marker 后用户看到的是
+/// 普通段落，不能再按列表内容列缩进；真正缩进的续行/子段落仍要 hanging indent。
+/// 空白行也不继承缩进——它没有可见字符，但光标/折行仍会落在列表内容列，形成
+/// “看不见的缩进”。
+fn list_indent_applies(is_item_start: bool, hidden_prefix_empty: bool, blank: bool) -> bool {
+    is_item_start || (!blank && !hidden_prefix_empty)
+}
+
 #[cfg(test)]
 mod search_shortcut_tests {
     use super::is_search_shortcut;
@@ -1814,5 +2080,23 @@ mod search_shortcut_tests {
         assert!(!is_search_shortcut(&keystroke("ctrl-shift-k")));
         assert!(!is_search_shortcut(&keystroke("ctrl-alt-f")));
         assert!(!is_search_shortcut(&keystroke("ctrl-j")));
+    }
+}
+
+#[cfg(test)]
+mod list_indent_tests {
+    use super::list_indent_applies;
+
+    #[test]
+    fn unindented_lazy_continuation_is_not_list_indented() {
+        assert!(!list_indent_applies(false, true, false));
+    }
+
+    #[test]
+    fn indented_continuation_keeps_indent_but_blank_line_does_not() {
+        assert!(list_indent_applies(false, false, false));
+        assert!(list_indent_applies(true, true, false));
+        assert!(!list_indent_applies(false, true, true));
+        assert!(!list_indent_applies(false, false, true));
     }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "menghunote-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# ADR 0019 §1：Markdown 语义由成熟解析器负责，投影/编辑仍归 editor。
+# `=0.13.6` 精确 pin：解析器的事件/偏移语义是 span adapter 的依据，升级必须先跑
+# 本 crate 的 golden 测试（偏移会随版本变化）。
+# `default-features = false`：不要 getopts（CLI）与 html（HTML 渲染）。
+# 0.13.6 的 feature 表只有 default = ["getopts", "html"]，**没有** `text` feature；
+# 关掉 default 后剩下的就是纯事件流（Event::Text/偏移），符合 ADR §1 的意图。
+pulldown-cmark = { version = "=0.13.6", default-features = false }
+# 坐标统一用 SourceByte/SourceRange；本 crate 不依赖 editor/storage/GPUI。
+menghunote-text = { path = "../text" }
