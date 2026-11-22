@@ -1,31 +1,33 @@
-# 同步评审精简稿（272K 上下文，第三轮 P1 后更新）
+# 同步评审精简稿（272K 上下文，Phase 1B MVP 后）
 
-> 代码/文档截止 **`7583d8a`**。包含 M3/M4、marker/Corrupt/checked_add/pin、close 短路、
-> 正向重试白名单。**Phase 1B 仍未实现**。约 678,452 字符，估计 **20–25 万 token**。
-> 若平台仍报超限：删附录 C 完整 diff，或改用分片版。
+> 代码/文档截止 **`038e92c`**。包含 Phase 1B checkpoint 快速追赶、M3/M4、
+> marker/Corrupt/pin/close 修复。**Phase 1B 是 MVP，不是全量设计收口**。
+> 约 738,337 字符，估计 **23–27 万 token**；附录 C 只放 Phase 1B diff
+> （`7583d8a..038e92c`），完整历史 diff 在 1M 稿。真实 relay RTT/TLS **未做**。
 
 ## 提示词（复制给模型）
 
-你是 Rust / Loro / SQLite 评审者。只依据本 Markdown；不要假设能运行 cargo、访问仓库或工具。
-先确认是否读到“附录 C 完整 diff”末尾；若没有，指出最后看到的文件/函数。按下面审：
+你是 Rust / Loro / SQLite 同步评审者。只依据本 Markdown；不要假设能运行 cargo 或访问仓库。
+先确认是否读到附录 C 末尾；若没有，指出最后看到的文件/函数。按下面审：
 
-1. **P1-3 生产 flush**：HeadConflict 同后台线程有界重建、成功 DurableAck、失败可读
-   “需要重开”；单 writer/无第二 journal/不阻塞 UI；兼容 head 才同字节重试，未知 ops fail-closed；
-   永久 Corrupt/Loro 是否 fail-closed、不落无限 Retryable；close 是否短路。
-2. **verify marker 门禁**：batch/assets/finish 在任何解码/写前拒绝 marker、零写；finishable=false；
-   finish 是否先查 marker 再 load_journal；abort 清 marker 且保留 merged 数据。
-3. **不可恢复 flush 可读**：last_write_error/CloseReport.flush_error；UI 关闭/切换阻断与
-   “导出/重开”仍缺是否阻断。
-4. **detached oplog**：11 用例；仍缺未知 peer、from 超前 doc VV、重复 import、多 peer 乱序、
-   大文档 detached merge。
-5. **M3**：1 MiB 单条 ≈2 ms、256 条 ≈5 ms、4096 页 12.2s（FakeRelay artifact）；45s@20MiB
-   是 verify/attached merge，不是 per-page replay；阈值未改。
-6. **M4/边界**：结构 local_extra、SyncContext intent seq、Retryable、二次 HeadConflict、
-   auto-abort/rotation、损坏 marker、pin、checked_add（不可达分支）、结构 verify deleted 语义。
-7. **硬性检查**：integrated>=S 前不删 inbox/skipped_asset；seq=head+1；received/integrated 连续；
-   remote/adopt 不产生 outbox；无第二写连接/网络持闸。
+1. **Phase 1B 双模式**：Mandatory（gc_floor>received，不受 16MiB 拦截）/
+   Opportunistic（S-received>=25_000 且快照估算<=16MiB）；`should_attempt`、
+   manifest 预检、fallback 后二次决策；强制失败 Paused、机会性回退普通 pull。
+2. **prepare/integrate 拆分**：prepare 是否真的不写库/不持闸；只下载缺失资产；
+   integrate 是否只在持闸后 baseline_apply/finish/游标 CAS；fallback 的 S/cursor 绑定。
+3. **inbox prune**：`prune_covered_inbox` 的 `EXISTS integrated>=S` 证明；缺失/不足水位、
+   并发推进、log incarnation 边界。
+4. **S 之后普通 pull**：cursor 前移、下一轮增量、本地 op/outbox 保留。
+5. **失败语义**：Mandatory Paused；Opportunistic prepare 回退；Opportunistic integrate
+   失败直接返回错误是否有丢数据/卡死风险。
+6. **gate_hold_ms**：只记录（>3s 告警）不硬中止；3s 预算/verify 风险。
+7. **Phase1A/1B 交互**：detached merge、verify、finishable、marker、prune 顺序。
+8. **测试覆盖**：决策、prepare 零写、Mandatory 公共入口、S 后 pull、prune watermark；
+   缺 DevLocal/app 端到端、Opportunistic 真实触发、integrate 失败回退。
 
-输出完成/部分/不能判断 + 必须修正 + 未关风险；不要假设 Phase1B 已实现。
+硬性检查：integrated>=S 前不删 inbox/skipped_asset；seq=head+1；received/integrated 连续；
+remote/adopt 不产生 outbox；无第二写连接/网络持闸；不改 relay wire/schema。
+输出完成/部分/不能判断 + 必须修正 + 未关风险。
 
 ---
 
@@ -33,29 +35,396 @@
 
 | 项 | 状态 | 证据 |
 |---|---|---|
-| P1-3 生产 flush | 完成（功能） | 3 个 flush_*；Corrupt/Loro 永久 fail-closed；close 短路 |
-| verify marker 门禁 | 完成 | marker_blocks...；batch/assets/finish 零写；finish 先 marker |
-| 不可恢复 flush 可读 | **部分**：后端完成，UI 未接 | driver_forwards...、close_report...；close 5s→<1s |
-| detached oplog | 部分 | 11 用例成立；5 个矩阵缺口仍在 |
-| M4 门禁 | 完成 | 结构 local_extra、SyncContext、Retryable、二次冲突、auto-abort、损坏 marker、pin |
-| M3 标定 | 完成 | ~2ms/~5ms replay、4096 页；修正 §10.4 |
-| 结构 verify 并发删除 | 已定案 | snapshot 含 deleted；删除是 meta 事件，verify 不误写 marker |
-| Phase1B | 未实现 | — |
+| Phase 1B Mandatory/Opportunistic | 完成（MVP） | catchup::decide/should_attempt；3 条决策单测 |
+| catchup prepare 不写库 | 完成 | catchup_prepare_writes_nothing... |
+| manifest 预检/缺失资产 | 完成（代码） | bootstrap::probe、load_baseline 本地资产跳过 |
+| catchup integrate 持闸/游标 CAS | 完成 | BootstrapAdvancement::CatchUp；Mandatory 公共入口测试 |
+| S 后普通 pull | 完成 | 追赶测试追加源端 push/目标 pull |
+| prune only integrated>=S | 完成 | prune_covered_inbox + watermark 测试 |
+| 失败 Paused/回退 | 部分 | Mandatory Paused；Opportunistic prepare 回退；integrate 失败未回退 |
+| gate_hold 硬预算 | 未做 | 只记录/告警 |
+| 真实 RTT | 未做（按用户） | 无真实 relay 标定 |
 
 ```text
-storage 301 / 0 / 1 ignored(bench)
-sync 639 / 0 / 4 ignored(manual/probes)
-app 740 / dev-sync 891
-workspace 2916 / 0；workspace dev-sync 3067 / 0
-fmt / clippy workspace -D warnings 全绿
+sync 646 / 0 / 4 ignored; storage 310 / 0 / 1 ignored; app 740 / 0
+workspace 2932 / 0；dev-sync 3083 / 0；fmt/clippy 全绿
 ```
-
-**M3**：1 MiB 单条 ≈1.996 ms；256 条 ≈5.322 ms；4096 页 scan_ms≈12.2s（visitor≈33ms，
-其余 FakeRelay 夹具；RSS≈202MiB）。45s@20MiB 是 verify/attached merge。阈值未改。
 
 ---
 
 # 附录 A：关键文档
+
+## `sync-fast-catchup-plan.md`（含 §11 实现）
+
+`````markdown
+# 同步快速追赶（历史链压缩）计划
+
+> 2026-11-20 计划；2026-11-22 已实现 Phase 1B MVP（见 §11），未改 relay wire/schema。
+> 关联：ADR 0006（同步 v1）、ADR 0012（自动同步两阶段）、ADR 0013（生产 relay）。
+
+## 1. 结论先行
+
+- 现在慢的主要不是“relay 不会压缩”，而是**已有设备追赶时逐条回放 relay update 日志**：
+  `SyncEngine::pull` 按页取日志（默认 256 条/页）→ 每条 `ingest_update` 落 inbox →
+  `integrate_dependency_ordered` 再按对象集成。差异越大，事件数、解密/验签、写 inbox、
+  Loro import 的次数都线性增长。
+- **不建议**按“r1→r2→…→r7 只留 id、最后留 r7”直接改 relay：relay 只持有密文，
+  不能解析/合并 Loro op；中间 update 在“还没有 checkpoint 覆盖、或有设备仍需要”时
+  不能只留 id，否则会破坏因果/合并与回滚保护。Loro 也没有“单一获胜版本 r7”的概念，
+  多设备是 op 合并，不是覆盖式版本链。
+- **正确等价物**：relay 已有的 **checkpoint（全历史快照）+ 日志 GC** 就是“最终状态 + 可裁剪旧段”。
+  当前缺的是**客户端在落后很多时主动用 checkpoint 快速追赶**，而不是逐条回放。
+- 第一版可以**不改 relay wire/schema**：复用现有 `/bootstrap`（它已支持作用在已有库上，
+  通过 `baseline_apply` 把快照 merge 进现有 Loro 文档，并保留本地离线 ops），
+  追赶后从 checkpoint 覆盖位置继续拉增量。
+
+## 2. 现状（代码依据）
+
+- `crates/sync/src/engine.rs::pull`：
+  - 只有 `state.gc_floor > local.received_seq` 才 `Paused(CursorExpired)`；否则从本地游标
+    一页页拉日志；
+  - `Update` 逐条进 inbox，`Asset` 做持久 skipped 记录；`checkpoint/control` 在此路径暂停。
+- `crates/sync/src/bootstrap.rs`：
+  - `/bootstrap` 取最新两份 published checkpoint，下载 manifest/snapshot/asset，全量校验后
+    通过 `menghunote_storage::baseline_apply` 写入；
+  - **允许已有库**：docs 先 `import(snapshot)`，再以旧 head VV 导出本地增量，保留本地离线 op；
+    水位/游标只允许前进（`max` 语义 + CAS），不覆盖已有进度；
+  - 失败走 staging journal，可续跑；fallback checkpoint 只在下载/校验阶段切换。
+- `crates/storage/src/baseline_apply.rs`：快照导入 + 本地增量保留 + 资产 staging 的既有实现。
+- relay `checkpoints`/`gc`：保留最近两份有效 checkpoint，日志前缀按覆盖/租约 GC；
+  checkpoint 是密文快照，relay 不解析明文。
+
+## 3. 方案对比
+
+### A. 客户端 checkpoint 快速追赶（推荐，第一版）
+
+**触发**（任一）：
+- `head_seq - received_seq` 超过事件阈值（例如 2000 条）；
+- 估算待拉字节超过阈值（例如 32 MiB）；
+- `CursorExpired`（无可用日志窗口）；
+- 或距离上次成功同步超过一定时间且差异大（谨慎，先用显式指标）。
+
+**流程**：
+1. flush 本地编辑（保证本地 op 已 durable、可导出为 baseline delta）；
+2. 取 relay state/最新 checkpoint（/bootstrap 现有返回即可）；
+3. 下载/解密/验签/校验 snapshot，`baseline_apply` merge 到现有 docs（保留本地未上传 op）；
+4. 将 `received/integrated` 推进到 checkpoint S；**把 relay cursor 前移到 checkpoint cursor**
+   （现有 bootstrap 为了“不回退”而保留旧 cursor；追赶场景需要在确认 S 覆盖后允许前进，
+   否则会反复拉取已被快照覆盖的旧事件）；
+5. 从 S 之后拉剩余 update，按正常路径集成；
+6. 本地未上传 op 照常上传，最终双向收敛。
+
+**优点**：不改 wire/schema；复用已验证的 bootstrap/baseline_apply；失败 fail-closed；
+对“差异极大/游标过期”效果最好。
+**代价**：checkpoint 是全历史快照，下载体积可能大于增量；必须按事件数/字节估算选择，
+小差异仍走增量。
+
+### B. relay 更积极地生成/裁剪 checkpoint（第二版）
+
+- 当前 checkpoint 触发是 16 MiB 新增 update 或 24h（ADR 0006 的维护策略）。
+- 可评估改为“事件数/字节/时间”三选一（例如 2–4 MiB 或 5–15 分钟或 1000 事件），
+  让旧日志更早可 GC；代价是客户端上传快照更频繁、relay 存储/CPU 增加。
+- 这不是“中间只留 id”，而是**更早把中间段替换成一份有签名的最终快照**；
+  GC 仍必须保留两份有效基线。
+- 需要单独压测 checkpoint 生成/上传成本，不能只看同步端。
+
+### C. 浅快照 / 增量快照 / 文档级快照（wire v2，暂不做）
+
+- 当前 `SnapshotV1` 强制 `full_history=true`（ADR 0006），不允许 state-only/shallow；
+  这是为了保证任意设备可独立导入、CRDT 因果完整。
+- 若要进一步压缩快照，需要协议 v2：base checkpoint + delta ops、每文档快照、
+  或 shallow + 明确不可合并边界；涉及 wire/签名/GC/回滚，风险高，等 A/B 测量后再说。
+- 不能把“只留 r1..r7 的 id”当低成本优化：没有 op 就无法重建/合并，ID 本身不携带变更。
+
+### D. 点对点/局域网直连（长期）
+
+- 如果两台设备在同一局域网，直接交换 Loro snapshot/update 可绕开 relay 往返；
+  但这与当前“relay 为唯一传输”模型不同，涉及发现/鉴权/NAT，单独立项。
+
+## 4. 分阶段计划
+
+### Phase 0：度量与基线（必须先做）
+
+- 增加同步计数（只读、脱敏）：`events_fetched`、`bytes_fetched`、`updates_integrated`、
+  `snapshot_bytes`、`catchup_used`、各阶段耗时；面板/日志可见（与用户要的同步日志功能共用）。
+- 构造两设备压测：A 生成 N 次编辑（例如 500/2000/10000 个 update，正文 1–10 MB），
+  B 从不同落后位置追赶；记录时间、内存、DB 增长、relay 流量。
+- 先找瓶颈：网络/解密验签/inbox 写入/Loro import/投影。没有数字不做“压缩”。
+
+### Phase 1：checkpoint 快速追赶（MVP）
+
+- 新增 `SyncCatchUp` 决策：根据 `head_seq`、`received_seq`、页面大小、checkpoint 覆盖 S
+  估算 `replay` vs `snapshot+delta` 成本；默认保守阈值，可配置/可关闭。
+- 复用 `bootstrap::run`（已有库路径）；bootstrap 后增加“追赶专用”游标前进：
+  仅当写后 watermark `>= S` 且 checkpoint 校验通过，把 cursor CAS 到 checkpoint cursor。
+- 失败路径：任何快照校验/合并/游标 CAS 失败 → 不前进、保留 journal/旧游标，回退普通 pull；
+  不能把快照失败变成“卡在暂停”。
+- 保留本地离线 op：用现有 `baseline_apply` 的“旧 head VV 导出增量”测试；
+  追赶后本地编辑不能丢/不能重复。
+- 验收：
+  - 5k update、落后远端的设备追赶时间显著下降（目标 ≥50%，按实测调）；
+  - 本地未上传编辑完整保留；
+  - 快照损坏/签名失败/epoch 不符/预算不足时不前进、不丢数据；
+  - 两张 checkpoint（primary/fallback）与 gc_floor 边界正确；
+  - 新设备 bootstrap、已有设备追赶、近端增量三种路径都回归。
+
+### Phase 2：relay 压缩策略调优
+
+- 基于 Phase 0 数据决定 checkpoint 触发阈值（事件/字节/时间），只改策略不改 wire；
+- 验证 GC 仍保留两份有效基线、读取租约、回滚防护；
+- 目标：让“old log”更快被 checkpoint 覆盖，减少下一次追赶的 replay 量；
+- 观察 relay 存储峰值/上传耗时，不接受“客户端快、服务器爆”的方案。
+
+### Phase 3：仅在有数据支撑时做 wire v2
+
+- 如果 Phase 1 的快照下载仍是主要成本（大库/多文档），再设计增量快照/文档级快照；
+- 必须新 ADR、版本协商、签名/GC/回滚/兼容旧客户端；不做半成品。
+
+## 5. 关键决策点（需确认）
+
+1. **第一版是否接受“全历史快照”体积**？接受则 Phase 1 不需改 relay；不接受则要直接进 Phase 3（wire v2）。
+2. **阈值策略**：按落后事件数、估算字节、还是固定“超过 N 分钟/游标将过期”？
+   默认建议：`events > 2000 || estimated_bytes > 32 MiB || cursor_expired`，实测后调。
+3. **本地未上传编辑**：快照 merge 后继续上传（推荐，现有 baseline_apply 已支持）还是先强制上传再追赶？
+4. **relay 自动 checkpoint**：是否允许更高频维护（更多 CPU/带宽换更快追赶）？
+5. **“中间版本只留 id”**：如果坚持，需要先定义“谁保证所有设备都已覆盖、谁有权丢弃密文 op”，
+   否则会破坏离线设备/回滚保护；建议不接受。
+
+## 6. 风险与边界
+
+- Loro 不可“改写历史”；压缩只能是快照 + 日志裁剪，不能把 op 合并成单一 r7。
+- checkpoint 是全历史快照，可能比增量更大；必须成本估算，不能无条件使用。
+- bootstrap 在已有库上会 merge 快照；本地 op 保留逻辑依赖 `baseline_apply` 的旧 VV 导出，
+  要为崩溃/resume/并发编辑补测试。
+- 游标前进必须 CAS + 单调；不能因为追赶把 confirmed_highwater 回退。
+- 同步中结构/正文写入持闸；追赶期间 UI 必须明确“正在快速追赶/全量重建”，不能假装空闲。
+- relay 只存密文；任何“服务端按 revision 合并”的方案都需要明文或额外元数据，涉及隐私边界。
+
+## 7. 建议下一步
+
+先做 **Phase 0 + Phase 1**（不改 relay）：
+1. 加同步计量与两设备压测脚本；
+2. 用现有 `/bootstrap` 在已有库上做 checkpoint 追赶，补游标前进/本地 op 保留测试；
+3. 拿实测数据决定是否调 checkpoint 频率，再决定是否上 wire v2。
+
+这样能先回答“到底慢在哪”，避免为一个未验证的“只留 id”方案改 relay 协议。
+
+---
+
+## 8. 高级模型评审后的修正（2026-11-20）
+
+评审同意 Phase 0/1、否定“服务端只留 id”，以下 6 点按代码结构逐条核对：
+
+1. **触发公式**：必须用 `S - received_seq`（能被 checkpoint 真正抵消的窗口），不能只看
+   `head - received`。`/bootstrap` 响应没有快照字节数，决策前要额外取一次 manifest
+   （体积小、已签名）读 `docs.total_plain_len`；估算 replay 字节不足时用事件数 × 平均
+   update 大小，另加单次快照硬上限（§9 已收紧为机会性 16 MiB；强制追赶只受本地磁盘预算）。
+2. **Asset 不能“全部跳过”**：当前 `pull` 对 ASSET 并不是只留 skipped 记录，而是
+   `persist_skipped_asset` **真实下载、验签、解密并落库**（否则同步后图片取不到）。
+   `bootstrap::load_baseline` 也是无条件 `download_assets`，`verify_imported` 还要求
+   每个资产字节存在。正确做法：用 `asset_bytes(vault, hash)` 预检，**只下载本地缺失的
+   资产**；如果要做“完全不下载、按需拉取”，必须先补一个网络按需资产服务，否则会留下
+   永久缺失的图片。
+3. **CursorExpired**：当前 `pull` 直接 `Paused(CursorExpired)`，没有自动恢复；强制追赶失败
+   不能回退普通 `pull`（会立即再次过期）。机会性失败可降级并冷却，强制失败必须进入
+   明确的 Paused/指数退避。
+4. **Inbox 清理**：`bootstrap::finalize` 把 `integrated` 推进到 S 后，≤S 的 inbox 行对
+   coverage 证明可由 `integrated` 前缀覆盖；但**只能在 finalize 成功且 integrated ≥ S
+   之后**清（或标记 covered），否则会破坏 checkpoint 的本地 coverage 证明。`sync_inbox`
+   目前没有这个清理 API，需要新增。
+5. **写闸临界区**：当前自动同步已有 `sync_prepare`（网络、不持闸）/ `sync_integrate`
+   （持闸）两阶段，这是正确骨架；但 `bootstrap::run` 是“下载+校验+写库”一体的，
+   **不能直接塞进 sync_once 持闸**。需要拆成：
+   - `catchup_prepare`：不持闸，选 checkpoint、下 manifest/snapshot（+缺失 asset）、
+     验签/验 VV，结果暂存在 worker（内存/临时文件，受上限保护）；
+   - `catchup_integrate`：持闸，flush 本地、读旧 VV、`baseline_apply`、清 inbox、
+     CAS 游标；随后普通 pull 拉 S 之后增量。
+   导入本身仍可能占闸数秒，但网络绝不占闸；需要记录 `gate_hold_ms` 实测。
+6. **Phase 0 批处理**：当前 `store_inbox_verified` 每条事件一次 `vault.exec`（独立事务），
+   确有逐条 fsync/逐条 Loro import 的放大效应；压测必须包含“单页 256 条合并事务 /
+   按文档聚合 import / 页面级一次投影”对照，不能只测快照方案。
+
+另外两个评审点确认成立：fallback 必须用**实际选中的** checkpoint S 推进游标；
+epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当损坏回退。
+
+---
+
+## 9. Phase 1A/1B 架构评审修订（2026-11-21）
+
+> 本节是**权威约束**；§6 的“500 条”初值已被本节取代。Phase 1B MVP 已于
+> 2026-11-22 实现（见 §11）；阈值/标定结论仍以本节为准。
+
+### 9.1 双模式触发与双向成本模型
+
+**强制追赶（Mandatory）**
+- 条件：`state.gc_floor > local.received_seq`（普通 `pull` 会 `CursorExpired`）。
+- **不受任何机会性快照体积上限拦截**；只受本地磁盘安全预算保护（基线快照 + 临时
+  staging + 资产解压的峰值需预留）。
+- 失败必须进入明确的 `Paused` + 指数退避，**严禁回退普通 `pull`**（会立即再次过期，
+  形成死循环）。成功后才允许恢复普通 pull。
+- 强制追赶也不使用 `N_min`/成本交叉：只要能拿到合法 checkpoint，就必须尽快离开
+  过期游标。
+
+**机会性追赶（Opportunistic）**
+- 先取已签名的小体积 `manifest`，读**实际选定** checkpoint 的 `S` 与
+  `docs.total_plain_len`；fallback 时使用 fallback 的 `S`，不能拿 `head` 或 primary
+  的 `S` 代替。
+- 仅当同时满足才启动：
+  1. `S.saturating_sub(local.received_seq) >= N_min`，默认 **`N_min = 25_000`**
+     （可配置）。不得用 `head - received_seq`；
+  2. **快照密文字节硬上限默认 `16 MiB`**（可配置范围 8–16 MiB）。这是机会性上限，
+     不是 128 MiB 那种无分批保护的上限；超过即不启动机会性追赶，走普通聚合 pull。
+     下限 8 MiB 用于更保守的 rollout；
+  3. **双向成本交叉**：`estimated_replay_bytes >= max(8 MiB, 2.0 *
+     manifest.docs.total_plain_len)`，**且**预估增量集成时间 >
+     `1.5 *` 预估快照总耗时（下载 + 解密/验签 + merge + verify，按实测常数估）。
+     防止为几百 KB 增量去拉十几 MB 全库快照。
+- **单次持闸预算 3 000 ms**：`gate_hold_ms` 必须 < 3 s。选点时按当前 release 实测
+  （16 MiB 优化后 storage merge ≈0.1 s，见 §9.4）估算；估算超预算就不进机会性追赶。
+  实际持闸若超预算，`catchup_integrate` 必须中止并走无损回退，不能继续持闸。
+- 任一环节失败：清理临时 staging、记录冷却窗口（指数退避）、**无损回退普通聚合
+  pull**；不能卡死同步，也不能把失败当作 checkpoint 损坏而降级。
+
+### 9.2 写闸拆分与 gate_hold_ms
+
+- `catchup_prepare`（**不持写闸**）：`/bootstrap` 选 primary/fallback；fallback 必须
+  把**实际选中的** `S` 与 `checkpoint_cursor` 一起绑定到后续 integrate，不能沿用
+  primary 的值。验签 manifest 与 snapshot；用 `asset_bytes(vault, hash)` 预检
+  （长度 + SHA256），**只下载本地缺失的资产**；全部校验（含 epoch/轮换）通过后
+  暂存到有容量上限的 staging。
+- epoch/rotation 跨越未处理控制边界时：安全暂停等待控制帧，**不得当作快照损坏降级**。
+- `catchup_integrate`（**持写闸**）：先 flush 本地未落盘改动 → 分批/紧凑执行优化后的
+  `baseline_apply`（每批 5 篇；复用 detached oplog 合并，避免 attached 大文本重放）→
+  `finish_baseline_apply` 单调 CAS 推进水位与 cursor 到**实际选定且成功导入的**
+  checkpoint 的 `S`/cursor（fallback 时误用 primary S 是硬错误）→ 记录 `gate_hold_ms`。
+  `verify_imported` 放在闸外或单独预算内，不计入 3 s 持闸；若必须放入持闸，16 MiB
+  上限需按 §9.4 的 verify 实测重新收紧。
+- 复用 ADR 0012 现有 `sync_prepare`/`sync_integrate` 骨架，但 `bootstrap::run` 单体
+  不能直接塞进 `sync_once` 的持闸段。
+
+### 9.3 Inbox 清理与 Coverage 证明边界
+
+- 新增 `prune_covered_inbox(vault, up_to_seq)`：**仅在 `finalize` 事务成功且持久化
+  `integrated_seq >= S` 之后**清理（或标记覆盖）`relay_seq <= S` 的 inbox 记录。
+- 清理前必须让 coverage 证明可由 `integrated` 前缀（及 durable skipped-asset/
+  pending receipt 证据）覆盖；任何时刻崩溃都不能破坏 ADR 0006 的本地 checkpoint
+  coverage 证明。
+- 禁止在 finalize 之前按游标直接删除 inbox 行。
+
+### 9.4 Stage 1A Release 标定结论与缺陷收口（2026-11-21）
+
+`--release` 重跑后（详见 `sync-phase0-metrics.md` §8）：
+
+- 聚合正文把 `doc_loads` 从“每条一次”降到“每文档每页一次”：单文档 2000 条
+  `2000 → 8`、5000 条 `5000 → 20`；5000 条/20 篇 `5000 → 400`。
+  integrate 墙钟：2000 单文档 `28.9 s → 86 ms`，5000 单文档 `147.0 s → 275 ms`，
+  5000/20 篇 `14.9 s → 0.76 s`；**O(历史 × 事件) 已消除**。
+- Phase 1A 缺陷收口：聚合路径先用 `load_head` 预检，纯已覆盖组不再重放（`doc_loads=0`）、
+  纯 deferred 组不占预算（防跨文档饥饿）；同文档内存多轮 import 自愈物理乱序；
+  `baseline_apply` 去掉二次 snapshot import，detached oplog 合并把 5/20 MiB
+  storage merge 从 `2.7–4.1 s / 44.6–61.3 s` 降到 **35 ms / 110 ms**；
+  `actor` 批量写锁改 `BEGIN IMMEDIATE`，`skipped_received` 扫描加
+  `ORDER BY key LIMIT 4096` 并支持跨窗口推进。
+- `baseline_apply` 5→20 MiB 旧实现的 **14.8–16.9×** 超线性根因：**Loro attached
+  import 对“大文本 op + 非空本地文档”的 diff/state 应用**，占 gate 97.9–99.8%；
+  snapshot decode 3.4×、pending_update 3.35×，都接近线性。detached oplog 合并绕开
+  state/diff 后 gate 5→20 为 3.1–3.7×（4× 数据，亚线性）。
+- **但闸外 `verify_imported` 仍 2.7 s / 45.1 s（16.7×）**：它仍走 attached
+  `load_body_doc` 重放大 update。这是 Phase 1B 前的残余风险：`gate_hold` 小不代表
+  首次打开/B 物化小；后续应把合并结果落 `loro_docs.snapshot`（`store_snapshot`
+  已有）或等 Loro 侧优化，不能把 16 MiB 机会性上限当成“全链路 <3 s”。
+- **`N_min=25 000`、`16 MiB` 机会性硬上限** 是本次 release 数据 + 3 s 持闸预算的
+  默认值；最终值仍需用户确认。强制追赶不使用这两个阈值。
+- Phase 1B **尚未实现**；上述阈值确认后再编码。
+- Phase 1A 代码已落地：批量 inbox 原子化、按文档聚合 integrate、release 标定、
+  precheck/乱序/防饥饿、baseline detached merge；完整评审入口见
+  [`sync-review-packet-20261121.md`](sync-review-packet-20261121.md)，
+  文件清单见 [`sync-phase1a-review-index.md`](sync-phase1a-review-index.md)。
+
+---
+
+## 10. 性能校准（2026-11-21 review 后）
+
+> 本节只校准**结论口径**，不改变 §9.1 的 3 s 持闸预算 / 16 MiB 机会性硬上限 /
+> `N_min` / 成本交叉；也**不表示** Phase 1B 已实现（无 `CatchUpMode`、无
+> prepare/integrate 拆分、无 snapshot merge 实测）。
+
+1. **`N_min = 25 000` 是诚实兜底，不是“保守”。** 聚合后的 5 000 条尾部 replay
+   只要 0.28 s（单文档）/ 0.76 s（20 篇）；而机会性追赶要下载/解密/验签整份快照，
+   并在闸外 `verify_imported` 重放。按 §9.4 的形状，5 MiB verify 已 2.7 s、
+   20 MiB 约 45 s（5→20 为 16.7×）。25k 以下启动快照追赶，省下的 replay 远小于
+   快照 + verify 的固定成本——这是成本交叉算出来的 floor，不是故意调高的保守值。
+2. **Phase 1B 的核心价值是 correctness，不是速度。** 当 `gc_floor > received_seq`
+   时普通 `pull` 只会 `CursorExpired`，没有可回退的增量路径；checkpoint 追赶是
+   唯一能离开过期游标的路径。速度收益只在“≥25k 事件、且差距极大”的极端场景成立；
+   近端增量继续走普通聚合 pull，不为了“快”而拉整库快照。
+3. **16× 超线性重放只是被移出持闸段，没有被消除。** detached oplog 把 5→20 MiB
+   的 storage merge 压到 35 / 110 ms（3.1×，4× 数据），但闸外 `verify_imported`
+   仍走 attached `load_body_doc` 重放大 update：5 MiB ≈2.7 s、20 MiB ≈45 s
+   （最终 release 复跑 58.8 s，同量级；5→20 约 16–17×）。因此“`gate_hold` 小”
+   不能当成“全链路 <3 s”，也不能据此放高 16 MiB 机会性上限。
+4. **“每页 ~2 s/篇”的折算不成立；大文档成本在 verify，不在纯 replay。** M3 实测
+   （`sync-phase0-metrics.md` §8.7.7）：1 MiB 单文档、1 条大 insert 的
+   `load_body_doc` ≈2 ms；拆成 256 条 4 KiB update ≈6 ms。§10.3 的 45 s@20MiB
+   是 **baseline_apply 的 `verify_imported`**（`local` + `baseline_merge` 两行
+   update 的 attached import/merge），不是 aggregate 每页的 `load_body_doc`。
+   因此：
+   - 不能再拿“1 MiB 每页 2 s”给 25k/16 MiB 阈值背书；
+   - 也不能反过来宣称“大文档没问题”：**verify/attached merge 仍可能 45 s+**，
+     且 107 KiB 基准没有覆盖“大文档 + 多 update + 并发合并”的 verify 形状；
+   - 机会性追赶若启用，仍必须单独标定 verify 的大文档形状，不能只测 per-page replay。
+5. **阈值与预算不动。** §9.1 的 3 s 持闸预算、16 MiB 机会性硬上限、`N_min =
+   25 000`、2.0×/1.5× 成本交叉全部保留；Phase 1B **未实现**，上述数字只用于
+   评审与后续设计。
+
+
+---
+
+## 11. Phase 1B MVP 实现（2026-11-22）
+
+### 已实现
+
+- **`bootstrap::prepare` / `bootstrap::integrate` 拆分**：prepare 只做
+  `/bootstrap` 选择/下载/解密/验签/校验，不写本地库；integrate 才走
+  `baseline_apply`/`finalize`/abort。`run` 仍等价于 `prepare + integrate`。
+- **`BootstrapAdvancement::CatchUp`**：成功导入并证明 `integrated >= S` 后允许把
+  relay cursor 前移到实际选中 checkpoint 的 cursor；`MaxOnly` 仍是新设备 bootstrap 的
+  原有 max 语义。
+- **`catchup` 模块**：
+  - `CatchUpMode::{Mandatory, Opportunistic}`、`CatchUpConfig`（`N_min=25_000`、
+    16 MiB 机会性上限）、`decide`、`should_attempt`；
+  - `prepare`（不持闸）与 `integrate`（调用方持闸）；integrate 后调用
+    `prune_covered_inbox`，只在 `integrated >= S` 时删除已覆盖行。
+- **两阶段接入**：`DevLocal::sync_prepare` 在强制过期或落后上界 ≥ `N_min` 时先准备
+  catchup，命中后跳过普通 pull；`DevLocal::sync_integrate_with_catchup` 在持闸段
+  执行追赶，并返回 `IntegratePhaseReport.catchup`；app worker 已携带
+  `PrepareReport.catchup`。
+- **完整 `sync_once`**：同样先尝试 catchup，再走普通 push/pull/integrate；强制追赶失败
+  映射为 `Paused(CatchupFailed)`，不回退普通 pull。
+- **缺失资产**：`load_baseline` 接收 vault；本地已有同 hash/长度/SHA256 的资产不再
+  从 relay 下载，仍纳入 verify/apply。
+- **机会性失败回退**：prepare 阶段失败时尚未写库，返回 `None` 让普通聚合 pull 继续；
+  Mandatory 失败仍 `Paused(CatchupFailed)`。
+- **S 之后普通 pull**：追赶测试追加“源端 checkpoint 后 push、目标端普通 pull”回归。
+- **测试**：`catchup` 决策单测、`bootstrap` prepare 不写库 + integrate 前移 cursor +
+  保留本地 op + 缺失资产、`prune_covered_inbox` watermark 门禁。
+
+### MVP 的已知限制
+
+1. **机会性已先做 manifest 预检**（`bootstrap::probe`）：只下载 manifest 读实际选中
+   checkpoint 的 S/明文字节，满足阈值才进入完整 snapshot 下载；下载后仍会用实际
+   fallback 的 S/字节复核一次，超限丢弃并回退普通 pull。
+2. **成本交叉只做了事件差 + 16 MiB 快照上限**，没有 §9.1 的 1.5× 时间交叉；
+   16 MiB 的 `verify_imported` 仍可能超过 3 s 持闸预算（见 §10）。
+3. **`gate_hold_ms` 只记录在报告/日志，未作为硬中止条件**；超 3 s 不会自动无损回退。
+4. **强制失败只映射 `Paused(CatchupFailed)`**，没有独立指数退避状态机；依赖 app 的
+   自动同步冷却。
+5. **快照/资产全量下载**；未做增量/文档级快照（wire v2）。
+6. **真实 relay RTT/TLS 未标定**；机会性追赶默认仍只由 `N_min`/16 MiB 控制，
+   生产启用前必须补真实标定（按用户要求本轮不测）。
+7. **UI 未单独显示“快速追赶”阶段**；报告字段已有，但面板仍按普通 prepare 文案。
+
+`````
 
 ## `sync-hardening-20261121.md`
 
@@ -153,14 +522,14 @@ cargo test -p menghunote-storage                    274 passed / 0 failed (1 ign
 cargo test -p menghunote-sync                       634 passed / 0 failed (3 ignored manual)
 cargo test -p menghunote-app                        740 passed / 0 failed
 cargo test -p menghunote-app --features dev-sync    891 passed / 0 failed
-cargo test --workspace                             2884 passed / 0 failed
-cargo test --workspace --features menghunote-app/dev-sync 3035 passed / 0 failed
+cargo test --workspace                             2932 passed / 0 failed
+cargo test --workspace --features menghunote-app/dev-sync 3083 passed / 0 failed
 ```
 
 > **最终复跑（2026-11-21 评审收尾）**：review 后新增 P1 门禁/访问器/资产批测试，当前计数
-> workspace **2916 / 0**、`--features menghunote-app/dev-sync` **3067 / 0**；
-> storage **301** / sync **639**。
-> 上面的 2884 / 3035 是本文件收尾时点的批次，差异来自同轮后续新增的测试，两批计数
+> workspace **2932 / 0**、`--features menghunote-app/dev-sync` **3083 / 0**；
+> storage **310** / sync **646** / app **740**。
+> 上面的 2926 / 3077 是本文件收尾时点的批次；同轮后续新增测试已计入
 > 按批次引用，不要把增量当成回归。scan 探针的批次口径：最终 release 复跑
 > **0.428 / 4.039 ms** 与 `sync-phase0-metrics.md` §8.7.4 的初次 3-run
 > **0.479 / 3.796 ms** 是两批，不要混算（详见该文件 §8.7.6）。
@@ -183,7 +552,8 @@ cargo test --workspace --features menghunote-app/dev-sync 3035 passed / 0 failed
 
 基线：`7a1a8e9`（在 §1/§2 的 P1/P2 修复之上）。只改 `storage::baseline_apply` 与
 `sync::bootstrap` 的本地语义；**没有** relay / sync-proto wire / DDL / 迁移 / checkpoint /
-游标连续推进改动，也**没有**实现 Phase1B。
+游标连续推进改动。**Phase1B 当时未实现；2026-11-22 已单独实现 MVP，见
+`sync-fast-catchup-plan.md` §11。**
 
 ### 8.1 失败不回滚已 merge 的 Loro 数据
 
@@ -308,7 +678,9 @@ cargo test -p menghunote-sync --test bootstrap \
 
 - 未新增/修改任何 DDL、迁移、`baseline_apply.status` 取值；
 - 未改 relay、`sync-proto` wire/schema、checkpoint 签名/验证、游标连续推进；
-- 未实现 Phase1B（gate_hold 报告、更强的批次/finish 门禁等）；
+- 当时未实现 Phase1B（gate_hold 报告、更强的批次/finish 门禁等）；**Phase1B MVP
+  已在 2026-11-22 实现，见 `sync-fast-catchup-plan.md` §11；gate_hold 硬中止、manifest
+  预检、时间成本交叉仍待。**
 - 未 commit。
 
 
@@ -398,12 +770,68 @@ cargo test -p menghunote-sync --test bootstrap \
     - 结构 verify 的并发删除语义已按当前实现定案：`StructureDoc::snapshot()` 返回**全量
       节点**（含 `deleted`），删除是 grow-only meta 事件而不是 `LoroTree::delete`；因此
       本地并发删除基线笔记不会让 `merged_notes` 缺项，verify 不会误写 marker。产品语义是
-      “删笔记不删正文，恢复仍可用”；`verify_imported` 已加注释。若未来改成物理删节点，
-      必须重新定义 verify。
+      “删笔记不删正文，恢复仍可用”；`verify_imported` 已加注释，结构侧新增
+      `deleted_note_remains_in_snapshot_with_note_identity` 钉住“deleted 节点仍保留
+      note/body 身份”。若未来改成物理删节点，必须重新定义 verify。
     - `auto_rebuilt` 粒度仍是每条 flush 命令一次，不是每批一次；慢盘多批场景可能保守地
       进入不可恢复，已在 `flush.rs` 注释写明，未改行为。
     - UI 的关闭/切换阻断 + “导出/复制 live 正文 → 重开”仍未接；detached 五项、4096+1 页、
       真实 RTT、`unrecoverable && pending_len==0` 无 ACK 仍未补。
+
+
+13. **第四轮评审 P1/P2 修补（2026-11-21）**：
+    - `Sqlite` 不再整类可重试：只有 `DatabaseBusy`/`DatabaseLocked` 进入
+      `is_retryable_write_error`；`ConstraintViolation`/`ReadOnly`/`CannotOpen`/
+      `DatabaseCorrupt`/`NotFound` 等永久错误直接 `Unrecoverable`。新增
+      `flush_treats_permanent_sqlite_error_as_unrecoverable` 与分类单测
+      `retryable_write_error_is_a_positive_whitelist`。
+    - 普通写失败的“可重试”集成用例改用**真实外部写锁**产生 SQLITE_BUSY，不再用
+      `RAISE(ABORT)`（它实际是 `ConstraintViolation`，现在按永久错误处理）。原
+      “重建后重试 Retryable”集成用例因无法用真实 BUSY 精确卡在重建后而移除；
+      分类由单测覆盖，**RebuildOutcome::Retryable 的直接集成覆盖暂时缺一条**。
+    - `apply_selected` 的 marker 写失败改报 `StorageError::SyncConflict`（journal 仍可
+      续跑，不是数据损坏），保留原始 verify 根因。
+    - `read_meta_array` 长度非法改报 `SyncError::LocalCorrupt`，与 pin 结构校验统一；
+      新增 `read_meta_array_rejects_wrong_length_as_local_corrupt`。
+    - `finalize` 在“已有进度、不改写 cursor”时也对 `sync.relay_cursor` 做 CAS 自写回，
+      防止读完 cursor 后被并发改写而静默放过；暂无专门的并发注入用例。
+    - 未处理：`state_from_journal` 的 `finishable` 在计数相等时仍做 O(N) 逐项校验
+      （Phase1B 高频状态查询需缓存/近似）；结构 verify deleted 语义已定案但依赖当前
+      snapshot 实现；UI 救济、detached 五项、真实 RTT、4096+1 页、pending_len==0 无 ACK
+      仍未补。
+
+
+14. **实现收口（2026-11-21，非 RTT）**：
+    - detached 矩阵补齐 5 项：本地未知 peer、`from` 超前本地 VV、同一 update 重复 import、
+      多 peer 物理乱序、大文档 merge；`body_doc_detached_oplog` 现在 **16** 用例。
+    - `coverage_scan_rejects_more_than_max_pages`：S=4096×256+1，validate 用满 4096 页后
+      返回 `未证明覆盖到 S（页数超过上限）`；`PageIndexRelay` 只替换 `log` 为 partition_point
+      切片，避免 FakeRelay 的 O(S²) 夹具。生产文案仍不含数字 4096。
+    - `state_from_journal` 的 `finishable` 改为 O(1) 计数近似；逐项 applied/摘要证明只在
+      `finish_baseline_apply` 做，读状态不再 O(N)。
+    - flusher 在 `unrecoverable` 时即使 `pending_len==0` 也不补发确认 ACK（防御分支，无专门
+      注入用例）。
+    - `RebuildOutcome::Retryable` 的分类抽成 `rebuild_write_error_outcome` 并单测 BUSY /
+      Constraint；完整 flusher 路径的 Retryable 仍无直接集成用例（真实 BUSY 难以精确卡在
+      重建后）。
+    - UI：切换前 `CloseReport.needs_reopen`/`flush_error` 阻断并复制 `source_text`；关窗前
+      `last_write_error` 不可恢复则复制正文并通过 `on_window_should_close` 返回 false 取消关窗。
+      没有单独的“导出”按钮，救济是自动复制到剪贴板 + 保留现场。
+    - 不再把真实 RTT 当本地可测项；机会性追赶启用前必须真实 relay 标定。
+    - 仍未补：`finalize` cursor CAS 的并发注入用例、`unrecoverable && pending_len==0` 的
+      专门测试、Rebuild Retryable 的完整路径集成、UI 真机观感验证。
+
+
+15. **Phase 1B MVP（2026-11-22，独立于本硬化清单）**：
+    - `bootstrap::prepare` 不写库、`bootstrap::integrate` 写库；`BootstrapAdvancement::CatchUp`
+      在 `integrated>=S` 后前移 cursor。
+    - `catchup` 模块：Mandatory（gc_floor>received，不受 16MiB 上限）与 Opportunistic
+      （S-received>=25k 且快照估算<=16MiB）；失败强制 `Paused(CatchupFailed)`，不回退普通 pull。
+    - `prune_covered_inbox` 只在 `integrated>=S` 的同一 SQL 证明下删除；两阶段
+      `sync_prepare/sync_integrate_with_catchup` 与完整 `sync_once` 已接入。
+    - 测试：catchup 决策 3、bootstrap prepare 零写/integrate cursor+本地 op、inbox watermark。
+    - 已知限制：机会性未做 manifest 预检（可能先下载后丢弃）、无 1.5× 时间成本交叉、
+      `gate_hold_ms` 未硬中止、真实 RTT 未标定、UI 未单独显示追赶阶段。
 
 `````
 
@@ -568,48 +996,4188 @@ verify 的 45 s 折算成 per-page replay。
 
 `````
 
-## `sync-fast-catchup-plan.md` §10
-
-`````markdown
-## 10. 性能校准（2026-11-21 review 后）
-
-> 本节只校准**结论口径**，不改变 §9.1 的 3 s 持闸预算 / 16 MiB 机会性硬上限 /
-> `N_min` / 成本交叉；也**不表示** Phase 1B 已实现（无 `CatchUpMode`、无
-> prepare/integrate 拆分、无 snapshot merge 实测）。
-
-1. **`N_min = 25 000` 是诚实兜底，不是“保守”。** 聚合后的 5 000 条尾部 replay
-   只要 0.28 s（单文档）/ 0.76 s（20 篇）；而机会性追赶要下载/解密/验签整份快照，
-   并在闸外 `verify_imported` 重放。按 §9.4 的形状，5 MiB verify 已 2.7 s、
-   20 MiB 约 45 s（5→20 为 16.7×）。25k 以下启动快照追赶，省下的 replay 远小于
-   快照 + verify 的固定成本——这是成本交叉算出来的 floor，不是故意调高的保守值。
-2. **Phase 1B 的核心价值是 correctness，不是速度。** 当 `gc_floor > received_seq`
-   时普通 `pull` 只会 `CursorExpired`，没有可回退的增量路径；checkpoint 追赶是
-   唯一能离开过期游标的路径。速度收益只在“≥25k 事件、且差距极大”的极端场景成立；
-   近端增量继续走普通聚合 pull，不为了“快”而拉整库快照。
-3. **16× 超线性重放只是被移出持闸段，没有被消除。** detached oplog 把 5→20 MiB
-   的 storage merge 压到 35 / 110 ms（3.1×，4× 数据），但闸外 `verify_imported`
-   仍走 attached `load_body_doc` 重放大 update：5 MiB ≈2.7 s、20 MiB ≈45 s
-   （最终 release 复跑 58.8 s，同量级；5→20 约 16–17×）。因此“`gate_hold` 小”
-   不能当成“全链路 <3 s”，也不能据此放高 16 MiB 机会性上限。
-4. **“每页 ~2 s/篇”的折算不成立；大文档成本在 verify，不在纯 replay。** M3 实测
-   （`sync-phase0-metrics.md` §8.7.7）：1 MiB 单文档、1 条大 insert 的
-   `load_body_doc` ≈2 ms；拆成 256 条 4 KiB update ≈6 ms。§10.3 的 45 s@20MiB
-   是 **baseline_apply 的 `verify_imported`**（`local` + `baseline_merge` 两行
-   update 的 attached import/merge），不是 aggregate 每页的 `load_body_doc`。
-   因此：
-   - 不能再拿“1 MiB 每页 2 s”给 25k/16 MiB 阈值背书；
-   - 也不能反过来宣称“大文档没问题”：**verify/attached merge 仍可能 45 s+**，
-     且 107 KiB 基准没有覆盖“大文档 + 多 update + 并发合并”的 verify 形状；
-   - 机会性追赶若启用，仍必须单独标定 verify 的大文档形状，不能只测 per-page replay。
-5. **阈值与预算不动。** §9.1 的 3 s 持闸预算、16 MiB 机会性硬上限、`N_min =
-   25 000`、2.0×/1.5× 成本交叉全部保留；Phase 1B **未实现**，上述数字只用于
-   评审与后续设计。
-
-`````
-
 ---
 
 # 附录 B：改动代码与关键测试
+
+
+## `crates/sync/src/catchup.rs`
+
+`````rust
+//! Phase 1B：checkpoint 快速追赶（双模式 + prepare/integrate 拆分）。
+//!
+//! 约束见 `docs/notes/sync-fast-catchup-plan.md` §9：
+//! - **Mandatory**：`gc_floor > received_seq`，普通 pull 必然 `CursorExpired`；不受
+//!   机会性快照上限拦截，失败进入明确 `Paused`，禁止回退普通 pull。
+//! - **Opportunistic**：`S - received_seq >= N_min` 且快照密文估算不超过 16 MiB；
+//!   任一不满足走普通聚合 pull。
+//! - 网络/下载/验签在 [`prepare`]（不持写闸）；写库/水位/游标在 [`integrate`]（调用方
+//!   持外部提交闸）。本模块不碰 wire/schema。
+
+use menghunote_storage::{sync_cursor_state, Vault};
+
+use crate::bootstrap::{self, BootstrapPins, PreparedBootstrap};
+use crate::error::SyncError;
+use crate::relay::{RelayClient, RelayState};
+
+/// 机会性追赶的最小事件差（plan §9.1）。
+pub const DEFAULT_N_MIN: u64 = 25_000;
+/// 机会性追赶的快照密文硬上限（plan §9.1）。
+pub const DEFAULT_OPPORTUNISTIC_MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+/// 明文快照 → 密文的保守安全系数（信封/分片/编码开销）。
+const SNAPSHOT_CIPHERTEXT_FACTOR: u64 = 2;
+
+/// 追赶模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUpMode {
+    /// 游标已过期，必须用 checkpoint 才能继续。
+    Mandatory,
+    /// 落后足够多且快照成本可接受，主动追赶。
+    Opportunistic,
+}
+
+/// 追赶阈值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchUpConfig {
+    /// 机会性追赶的最小事件差。
+    pub n_min: u64,
+    /// 机会性追赶允许的快照密文字节上限。
+    pub opportunistic_max_snapshot_bytes: u64,
+}
+
+impl Default for CatchUpConfig {
+    fn default() -> Self {
+        Self {
+            n_min: DEFAULT_N_MIN,
+            opportunistic_max_snapshot_bytes: DEFAULT_OPPORTUNISTIC_MAX_SNAPSHOT_BYTES,
+        }
+    }
+}
+
+/// 一次追赶决策（只读，不含明文）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchUpDecision {
+    /// 强制或机会性。
+    pub mode: CatchUpMode,
+    /// 实际选中 checkpoint 的覆盖水位 S。
+    pub checkpoint_s: u64,
+    /// `S - received_seq`（饱和）。
+    pub gap_events: u64,
+    /// 快照明文字节估算（已乘安全系数）。
+    pub estimated_snapshot_bytes: u64,
+}
+
+/// 是否值得进入网络准备（避免正常近端同步无条件下载整份快照）。
+///
+/// 强制条件用 `gc_floor > received`；机会性先用 `head_seq - received` 做上界，
+/// 真正的 `S - received` 与快照上限在 [`prepare`] 拿到实际 checkpoint 后再判。
+#[must_use]
+pub fn should_attempt(state: &RelayState, local_received_seq: u64, config: &CatchUpConfig) -> bool {
+    state.gc_floor > local_received_seq
+        || state.head_seq.saturating_sub(local_received_seq) >= config.n_min
+}
+
+/// 决策：只依赖 relay state / 本地 received / 实际选中 checkpoint S / 快照估算。
+///
+/// 强制模式不受快照上限拦截；机会性必须同时满足事件差和快照上限。
+#[must_use]
+pub fn decide(
+    state: &RelayState,
+    local_received_seq: u64,
+    checkpoint_s: u64,
+    estimated_snapshot_bytes: u64,
+    config: &CatchUpConfig,
+) -> Option<CatchUpDecision> {
+    let gap_events = checkpoint_s.saturating_sub(local_received_seq);
+    if state.gc_floor > local_received_seq {
+        return Some(CatchUpDecision {
+            mode: CatchUpMode::Mandatory,
+            checkpoint_s,
+            gap_events,
+            estimated_snapshot_bytes,
+        });
+    }
+    if gap_events >= config.n_min
+        && estimated_snapshot_bytes <= config.opportunistic_max_snapshot_bytes
+    {
+        return Some(CatchUpDecision {
+            mode: CatchUpMode::Opportunistic,
+            checkpoint_s,
+            gap_events,
+            estimated_snapshot_bytes,
+        });
+    }
+    None
+}
+
+/// 已下载/校验、尚未写库的追赶候选。
+#[derive(Debug)]
+pub struct CatchUpPrepared {
+    prepared: PreparedBootstrap,
+    decision: CatchUpDecision,
+}
+
+impl CatchUpPrepared {
+    /// 决策。
+    #[must_use]
+    pub fn decision(&self) -> CatchUpDecision {
+        self.decision
+    }
+
+    /// 实际选中 checkpoint 的 S。
+    #[must_use]
+    pub fn checkpoint_s(&self) -> u64 {
+        self.prepared.covered_seq()
+    }
+
+    /// 实际选中 checkpoint 的 cursor。
+    #[must_use]
+    pub fn checkpoint_cursor(&self) -> &str {
+        self.prepared.checkpoint_cursor()
+    }
+
+    /// 是否使用 fallback。
+    #[must_use]
+    pub fn used_fallback(&self) -> bool {
+        self.prepared.used_fallback()
+    }
+
+    /// 已选中文档数。
+    #[must_use]
+    pub fn doc_count(&self) -> usize {
+        self.prepared.doc_count()
+    }
+
+    /// 已选中资产数。
+    #[must_use]
+    pub fn asset_count(&self) -> usize {
+        self.prepared.asset_count()
+    }
+}
+
+/// 追赶写库报告（不含明文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpReport {
+    /// 模式。
+    pub mode: CatchUpMode,
+    /// 实际选中 checkpoint 的 S。
+    pub checkpoint_s: u64,
+    /// 是否使用 fallback。
+    pub used_fallback: bool,
+    /// 导入文档 id（用于追赶后物化；不含明文）。
+    pub docs: Vec<String>,
+    /// 导入资产数。
+    pub assets: usize,
+    /// 清理的 inbox 行数（仅在 integrated>=S 后）。
+    pub pruned_inbox: usize,
+    /// 写闸内耗时（毫秒）；只记录，不自动中止。
+    pub gate_hold_ms: u64,
+}
+
+/// 网络准备：选 checkpoint、下载/验签/校验，**不写本地库**。
+///
+/// 返回 `None` 表示不需要追赶（普通 pull 更便宜）；调用方应继续普通 pull。
+pub fn prepare<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    root: &crate::keys::RootSecretV1,
+    pins: &BootstrapPins,
+    config: &CatchUpConfig,
+) -> Result<Option<CatchUpPrepared>, SyncError> {
+    let local = sync_cursor_state(vault)?;
+    let state = client.state()?;
+    if state.vault_id != vault_id {
+        return Err(SyncError::RelayWire("state.vault_id 与本地不一致"));
+    }
+    if let Some(log_id) = local.log_id {
+        if log_id != state.log_id {
+            return Err(SyncError::Paused(crate::relay::PauseReason::LogIdChanged));
+        }
+    }
+    if state.epoch != root.key_epoch {
+        return Err(SyncError::Paused(crate::relay::PauseReason::EpochMismatch));
+    }
+
+    // 1) 只拉 manifest 预检：先在真正下载快照之前用实际选中 checkpoint 的 S/明文字节
+    //    判断机会性是否值得；不满足直接回普通 pull，不浪费带宽。
+    let probe = match bootstrap::probe(client, vault_id, root, pins) {
+        Ok(probe) => probe,
+        Err(error) => {
+            if state.gc_floor > local.received_seq {
+                eprintln!("[sync] mandatory catchup probe failed: {error}");
+                return Err(SyncError::Paused(crate::relay::PauseReason::CatchupFailed));
+            }
+            eprintln!("[sync] opportunistic catchup probe failed, fallback to pull: {error}");
+            return Ok(None);
+        }
+    };
+    let probe_estimated = probe
+        .estimated_plain_bytes()
+        .saturating_mul(SNAPSHOT_CIPHERTEXT_FACTOR);
+    if decide(
+        &state,
+        local.received_seq,
+        probe.covered_seq(),
+        probe_estimated,
+        config,
+    )
+    .is_none()
+    {
+        return Ok(None);
+    }
+
+    // 2) 预检通过后才下载 snapshot/缺失资产。fallback 可能和预检不同，实际 S/字节
+    //    必须在下载完成后再判一次；mandatory 仍不受机会性上限拦截。
+    let prepared = match bootstrap::prepare(vault, client, vault_id, peer_id, root, pins) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if state.gc_floor > local.received_seq {
+                eprintln!("[sync] mandatory catchup prepare failed: {error}");
+                return Err(SyncError::Paused(crate::relay::PauseReason::CatchupFailed));
+            }
+            eprintln!("[sync] opportunistic catchup prepare failed, fallback to pull: {error}");
+            return Ok(None);
+        }
+    };
+    let actual_estimated = prepared
+        .estimated_snapshot_bytes()
+        .saturating_mul(SNAPSHOT_CIPHERTEXT_FACTOR);
+    let Some(actual_decision) = decide(
+        &state,
+        local.received_seq,
+        prepared.covered_seq(),
+        actual_estimated,
+        config,
+    ) else {
+        // 预检主基线可接受，实际 fallback 超限：丢弃已下载快照，走普通 pull。
+        return Ok(None);
+    };
+    Ok(Some(CatchUpPrepared {
+        prepared,
+        decision: actual_decision,
+    }))
+}
+
+/// 写库：baseline_apply → finish/游标 CAS → 清理已覆盖 inbox。
+///
+/// 调用方必须持有外部提交写闸；网络已在 [`prepare`] 完成。
+pub fn integrate(
+    vault: &Vault,
+    peer_id: u64,
+    prepared: &CatchUpPrepared,
+) -> Result<CatchUpReport, SyncError> {
+    let started = std::time::Instant::now();
+    let report = bootstrap::integrate(
+        vault,
+        peer_id,
+        &prepared.prepared,
+        bootstrap::BootstrapAdvancement::CatchUp,
+        None,
+    )?;
+    let cursor = sync_cursor_state(vault)?;
+    if cursor.integrated_seq < report.covered_seq {
+        return Err(SyncError::LocalCorrupt(
+            "catchup integrate 返回成功但 integrated_seq 未覆盖 checkpoint S",
+        ));
+    }
+    let pruned = menghunote_storage::prune_covered_inbox(
+        vault,
+        &prepared.prepared.log_id(),
+        report.covered_seq,
+    )?;
+    let gate_hold_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if gate_hold_ms > 3_000 {
+        eprintln!("[sync] catchup gate_hold_ms={gate_hold_ms} 超过 3s 预算（只记录，未自动中止）");
+    }
+    Ok(CatchUpReport {
+        mode: prepared.decision.mode,
+        checkpoint_s: report.covered_seq,
+        used_fallback: report.used_fallback,
+        docs: report.docs.into_iter().map(|(doc_id, _)| doc_id).collect(),
+        assets: report.assets,
+        pruned_inbox: pruned,
+        gate_hold_ms,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(head_seq: u64, gc_floor: u64) -> RelayState {
+        RelayState {
+            vault_id: [1; 16],
+            log_id: [2; 16],
+            instance_id: [3; 16],
+            epoch: 1,
+            control_rev: 0,
+            auth_rev: 0,
+            head_seq,
+            gc_floor,
+            current_rotation_id: None,
+        }
+    }
+
+    #[test]
+    fn mandatory_wins_even_when_snapshot_exceeds_opportunistic_cap() {
+        let decision = decide(
+            &state(100_000, 11_000),
+            10_000,
+            90_000,
+            u64::MAX,
+            &CatchUpConfig::default(),
+        )
+        .expect("过期游标必须强制追赶");
+        assert_eq!(decision.mode, CatchUpMode::Mandatory);
+        assert_eq!(decision.gap_events, 80_000);
+    }
+
+    #[test]
+    fn opportunistic_requires_n_min_and_snapshot_cap() {
+        let config = CatchUpConfig::default();
+        let below_min = decide(&state(100_000, 0), 99_000, 99_000, 1, &config);
+        assert!(below_min.is_none(), "事件差不足不得机会性追赶");
+
+        let ok = decide(
+            &state(100_000, 0),
+            70_000,
+            95_000,
+            16 * 1024 * 1024,
+            &config,
+        )
+        .expect("25k 且快照正好 16MiB 应允许");
+        assert_eq!(ok.mode, CatchUpMode::Opportunistic);
+
+        let too_big = decide(
+            &state(100_000, 0),
+            70_000,
+            95_000,
+            16 * 1024 * 1024 + 1,
+            &config,
+        );
+        assert!(too_big.is_none(), "超过机会性快照上限必须回退普通 pull");
+    }
+
+    #[test]
+    fn should_attempt_only_for_expired_or_large_gap() {
+        let config = CatchUpConfig::default();
+        assert!(should_attempt(&state(100_000, 0), 75_000, &config));
+        assert!(!should_attempt(&state(100_000, 0), 90_000, &config));
+        assert!(should_attempt(&state(100_000, 20_000), 10_000, &config));
+    }
+}
+
+`````
+
+
+## `crates/sync/src/bootstrap.rs`
+
+`````rust
+//! 新设备 bootstrap（S7-18；ADR §3.7/§4/§7/§25.3；评审 0002 P1-4）。
+//!
+//! 本模块先落"数据恢复"这一段：给定已解出的 root（由槽解封或后续恢复流程提供），
+//! `POST /bootstrap` 取两份基线 → 下 manifest/snapshot/asset → 全量校验 → 空库落库。
+//!
+//! **可恢复导入（P1-4）**：docs/structure/assets 的写入全部经过 storage 的
+//! `baseline_apply` staging journal（`begin_baseline_apply` / `apply_baseline_batch` /
+//! `apply_baseline_assets`）。下载/写入阶段任一步失败都**不**清 journal、**不**推进任何
+//! 水位；下一次调用按同一份基线幂等续跑。只有全部实际导入并通过读回校验后，才在**一个**
+//! SQLite 事务里推进 `cursor/received/integrated/confirmed_highwater`（CAS）。
+//!
+//! **读回校验失败（同步硬化 P1）**：`verify_imported` 失败时**不回滚**已 merge 的
+//! Loro/资产数据（CRDT merge 幂等；回滚会丢本地编辑），而是写一条只本地可见的
+//! `sync.baseline_verify_failed` 失败标记（storage `mark_baseline_verify_failed`）。
+//! journal 仍是 `staging`（schema 的 status CHECK 只允许 `staging/completed`，见
+//! `docs/notes/sync-hardening-20261121.md` §8），但下一次 `begin_baseline_apply` 会拒绝，
+//! 必须先 `abort_baseline_apply` 清理（abort 同时删标记，已导入数据保留）。
+//!
+//! **闸外编辑**：verify 不与编辑互斥，判定用「导出点 VV ⊆ 当前 VV」而不是相等；只有
+//! 本地没有快照之外的 op 时才逐字节比较正文（见 [`check_imported_doc`]）。
+//!
+//! **水位单调（P1-4）**：bootstrap 允许作用在已有库上，但禁止降低任何单调值：
+//! `received/integrated/highwater` 取 `max(现有, baseline S)`；已有进度时保留现有 relay
+//! 游标（不把已经消费过的位置回退）；`instance/log_id/epoch/control rev+hash` 只允许
+//! 前进或不变。storage 的 `finish_baseline_apply` 会把 highwater 直接写成 baseline S，
+//! 对"已有 highwater 高于 S"的库会降低水位，因此本模块在同一个事务里自行做
+//! `max` 语义的 CAS 推进，随后清掉 staging（`abort_baseline_apply` 只清 journal，
+//! 不删已导入的 Loro/asset 数据）。
+//!
+//! **实际 VV 校验（P1-4）**：每个 snapshot 都在独立的空 `LoroDoc` 里 import，比较
+//! actual VV / frontier 与 manifest 声明（既不虚高也不缺 op），并校验 full-history、
+//! 信封字段、app schema / min_reader；结构文档再重放出结构树，校验"结构引用的正文
+//! 文档必须都在基线 manifest 里"。不只信声明。
+//!
+//! **fallback**：primary 任一阶段（下载/解密/摘要/VV/结构语义）失败才整体切 fallback；
+//! 选中哪个基线就只用**它自己的** S / cursor；写入阶段失败不切 fallback（避免半库
+//! 换 S），必须原样重试或人工 abort journal。
+//!
+//! **写库路径**：全部经 storage 公开 API（`BodyDoc`/`StructureWriter`/`baseline_apply`），
+//! 不直连 SQLite；只有最终的水位推进用 `Vault::exec_transaction` 的单事务 CAS
+//! （storage 没有提供 max 语义的 finish，且本任务写作用域不允许改 storage）。
+//!
+//! **已知边界**：relay `/bootstrap` 不返回完整签名 checkpoint 链；本模块只验证
+//! `CheckpointCommit` 的生产者签名、manifest/refs 摘要、以及所有实际对象。新设备无旧
+//! 水位，无法检测"有效签名的旧基线回滚"（ADR §10 已记录）；已有库用本地 pins 检测
+//! `instance/log_id/epoch/control_rev/highwater` 的回退。
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
+
+use loro::VersionVector;
+use sha2::{Digest, Sha256};
+
+use crate::checkpoint::{verify_asset_plaintext, AssetRef, KIND_BODY, KIND_STRUCTURE};
+use crate::control_pin::BootstrapAnchorV1;
+use crate::device::verify_signature;
+use crate::engine::RELAY_CURSOR_META;
+use crate::error::SyncError;
+use crate::keys::RootSecretV1;
+use crate::relay::{
+    BootstrapBundle, BootstrapCheckpoint, ManagerChainEntry, RelayClient, RelayState,
+};
+use crate::rotation::ManagerTransitionV1;
+use crate::upload::fetch_object;
+use menghunote_storage::{
+    abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, asset_bytes,
+    baseline_apply_state, begin_baseline_apply, load_body_doc, load_structure,
+    mark_baseline_verify_failed, record_baseline_verify_time, sync_cursor_state, AffectedGuard,
+    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc, Statement, StructureDoc,
+    StructureWriter, Value, Vault, APP_DOC_SCHEMA, CODEC_VERSION, META_SYNC_CONFIRMED_HIGHWATER,
+    META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, MIN_READER,
+    STRUCTURE_DOC_ID,
+};
+use menghunote_sync_proto::{
+    checkpoint_signing_input, refs_digest_input, CheckpointCommit, Envelope, EnvelopeHeader,
+    ManifestDoc, ManifestV1, ObjectRefV1, ObjectType, SnapshotV1,
+};
+
+/// 每批写入的文档数（storage 的 baseline batch 是单事务；分批只为控制单事务大小）。
+const BOOTSTRAP_DOC_BATCH: usize = 64;
+/// bootstrap 写入 `baseline_apply.source_cursor` 的前缀：用于区分 bootstrap 的 staging
+/// 与轮换（`rotation_apply` 传空串）的 staging，防止误清别人的 journal。
+const JOURNAL_SOURCE_PREFIX: &str = "bootstrap:";
+
+/// `meta` 键：bootstrap pin 的 relay instance id（16B，只允许相等）。
+pub const META_BOOTSTRAP_INSTANCE: &str = "sync.pinned_instance";
+/// `meta` 键：bootstrap pin 的 epoch（BE64，只允许前进）。
+pub const META_BOOTSTRAP_EPOCH: &str = "sync.pinned_epoch";
+/// `meta` 键：bootstrap pin 的 control_rev（BE64，只允许前进）。
+pub const META_BOOTSTRAP_CONTROL_REV: &str = "sync.pinned_control_rev";
+/// `meta` 键：bootstrap pin 的控制头摘要（32B，见 [`control_head_hash`]；同 rev 必须相等）。
+pub const META_BOOTSTRAP_CONTROL_HASH: &str = "sync.pinned_control_hash";
+
+/// bootstrap 结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapReport {
+    /// 使用的 checkpoint id。
+    pub checkpoint_id: [u8; 16],
+    /// 覆盖水位 S。
+    pub covered_seq: u64,
+    /// 是否回退到 fallback。
+    pub used_fallback: bool,
+    /// 导入文档（structure 的文本为 None）。
+    pub docs: Vec<(String, Option<String>)>,
+    /// 导入资产数。
+    pub assets: usize,
+    /// S 对应的 relay 游标。
+    pub cursor: String,
+    /// 是否验证了 checkpoint 发布签名（relay 返回键 6/7 且验签通过）。
+    pub signed_checkpoint: bool,
+}
+
+/// bootstrap 前本地已经可信的单调值（P1-4 "已有库保护"）。
+///
+/// 新设备全部为 `None`；已有设备由 [`BootstrapPins::from_vault`] 从本库 meta 读出，
+/// 或由调用方用 identity（`pinned_instance/control_rev/current_epoch`）填充后调用
+/// [`run_with_pins`]。bootstrap 只允许这些值前进/不变，绝不回退。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BootstrapPins {
+    /// relay instance id（防换实例/静默回滚）。
+    pub instance_id: Option<[u8; 16]>,
+    /// relay log_id（restore 必须显式换新，不能静默归零）。
+    pub log_id: Option<[u8; 16]>,
+    /// 当前密钥代。
+    pub epoch: Option<u64>,
+    /// 已信任的管理控制链版本。
+    pub control_rev: Option<u64>,
+    /// 已信任的控制头摘要（见 [`control_head_hash`]）。
+    pub control_hash: Option<[u8; 32]>,
+    /// 已确认的 relay 水位。
+    pub highwater: Option<u64>,
+}
+
+impl BootstrapPins {
+    /// 从本库持久化的 pin（`sync.pinned_*`）与同步游标读出已有可信值。
+    ///
+    /// pin 缺失（新设备/首次 bootstrap）返回 `None`，不报错；pin 存在但长度非法按
+    /// 本地损坏处理（不能静默忽略，否则等于绕过单调保护）。
+    pub fn from_vault(vault: &Vault) -> Result<Self, SyncError> {
+        let cursor = sync_cursor_state(vault)?;
+        Ok(Self {
+            instance_id: read_meta_array::<16>(vault, META_BOOTSTRAP_INSTANCE)?,
+            log_id: cursor.log_id,
+            epoch: read_meta_u64(vault, META_BOOTSTRAP_EPOCH)?,
+            control_rev: read_meta_u64(vault, META_BOOTSTRAP_CONTROL_REV)?,
+            control_hash: read_meta_array::<32>(vault, META_BOOTSTRAP_CONTROL_HASH)?,
+            highwater: cursor.confirmed_highwater,
+        })
+    }
+
+    /// 把 `sync.pinned_*` 读成一个**带自己 rev/epoch/log** 的 bootstrap 锚（ADR 0013 §2）。
+    ///
+    /// 语义：
+    /// - `control_hash` 与 `control_rev` 必须成对：只有 hash 没有 rev 是本地损坏
+    ///   （既有行为）；只有 rev 没有 hash 时返回 `None`——rev 只是下界，不构成摘要锚；
+    /// - hash 存在时 `epoch` / `log_id` 必须齐全：历史视图复算需要锚**自己的**坐标，
+    ///   缺任一项都不能把摘要当"同 rev 校验"用（否则旧锚会在 rev 前进后被静默忽略）。
+    ///   这是 fail-closed：缺字段报 [`SyncError::LocalCorrupt`]，**不**降级成"没有锚"。
+    pub fn control_anchor(&self) -> Result<Option<BootstrapAnchorV1>, SyncError> {
+        let Some(hash) = self.control_hash else {
+            // 只有 rev 下界（历史实例/未写摘要）不构成摘要锚；单调性仍由 control_rev 保证。
+            return Ok(None);
+        };
+        let rev = self.control_rev.ok_or(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 control_rev",
+        ))?;
+        let epoch = self.epoch.ok_or(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 epoch（无法按历史视图复算摘要）",
+        ))?;
+        let log_id = self.log_id.ok_or(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 log_id（无法按历史视图复算摘要）",
+        ))?;
+        Ok(Some(BootstrapAnchorV1 {
+            rev,
+            hash,
+            epoch,
+            log_id,
+        }))
+    }
+}
+
+/// 测试用故障注入点（生产调用路径不会构造）。
+///
+/// 语义等价于"进程在崩溃点直接消失"：不再执行后续步骤、不清理 journal、不推进水位。
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapFault {
+    /// 正文批次写完后崩溃（structure / assets / 水位都未写）。
+    AfterBodies,
+    /// structure 文档已写入、结构投影尚未执行时崩溃。
+    BeforeStructureProjection,
+    /// 全部 assets 已写入、读回校验与水位推进之前崩溃。
+    AfterAssets,
+    /// 水位事务读取当前状态之后、提交之前，模拟另一个写者改写了 relay 游标，
+    /// 迫使 CAS 失败（整笔事务回滚）。
+    CursorCasConflict,
+    /// 读回校验阶段注入一次「本地 VV 未覆盖快照」失败：用于验证失败标记、
+    /// `begin` 拒绝续跑与 `abort` 清理路径（不改数据库里的真实数据）。
+    VerifyVvNotCovered,
+}
+
+/// 故障注入伪造的 peer id（只在校验失败测试路径出现；不影响真实数据）。
+const VERIFY_FAULT_PEER: u64 = 0x0BAD_5EED;
+
+#[derive(Debug)]
+struct VerifiedDoc {
+    doc_id: String,
+    kind: u64,
+    snapshot: SnapshotV1,
+    actual_vv: VersionVector,
+    /// 正文文本（structure 为 `None`）。
+    text: Option<String>,
+}
+
+#[derive(Debug)]
+struct VerifiedAsset {
+    object_id: [u8; 32],
+    real_sha256: [u8; 32],
+    byte_len: u64,
+    media_type: String,
+    data: Vec<u8>,
+}
+
+/// 选中的基线：manifest/docs/assets + 基线本身 + 结构语义。
+#[derive(Debug)]
+struct SelectedBaseline {
+    checkpoint: BootstrapCheckpoint,
+    used_fallback: bool,
+    docs: Vec<VerifiedDoc>,
+    assets: Vec<VerifiedAsset>,
+    /// structure 快照声明的 `note_id -> body_doc_id`（用于导入后的结构投影校验）。
+    structure_notes: BTreeMap<String, String>,
+}
+
+/// bootstrap 写库阶段对游标/水位的推进策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapAdvancement {
+    /// 新设备/普通 bootstrap：只允许前进，已有进度时保留旧游标（max 语义）。
+    MaxOnly,
+    /// Phase 1B 追赶：成功导入并证明 `integrated >= S` 后，把 relay cursor 前移到
+    /// 实际选中 checkpoint 的 cursor（S 覆盖已消费前缀）。
+    CatchUp,
+}
+
+/// `catchup_prepare` 的结果：网络阶段已完成、**尚未写本地库**的基线。
+///
+/// 生命周期只到 `catchup_integrate`；内含快照/资产明文，不能持久化到磁盘/日志。
+#[derive(Debug)]
+pub struct PreparedBootstrap {
+    selected: SelectedBaseline,
+    state: RelayState,
+    chain: Vec<ManagerChainEntry>,
+    control_hash: [u8; 32],
+    pins: BootstrapPins,
+}
+
+impl PreparedBootstrap {
+    /// 实际选中的 checkpoint 覆盖水位 S（fallback 时是 fallback 的 S）。
+    #[must_use]
+    pub fn covered_seq(&self) -> u64 {
+        self.selected.checkpoint.covered_seq
+    }
+
+    /// 实际选中的 checkpoint 游标（fallback 时是 fallback 的 cursor）。
+    #[must_use]
+    pub fn checkpoint_cursor(&self) -> &str {
+        &self.selected.checkpoint.cursor
+    }
+
+    /// 是否使用了 fallback。
+    #[must_use]
+    pub fn used_fallback(&self) -> bool {
+        self.selected.used_fallback
+    }
+
+    /// 已选中的文档/资产数量（用于决策/报告，不暴露明文）。
+    #[must_use]
+    pub fn doc_count(&self) -> usize {
+        self.selected.docs.len()
+    }
+
+    /// 已选中的资产数量。
+    #[must_use]
+    pub fn asset_count(&self) -> usize {
+        self.selected.assets.len()
+    }
+
+    /// 已选中的文档 id（用于追赶后物化/报告；不含明文）。
+    #[must_use]
+    pub fn doc_ids(&self) -> Vec<String> {
+        self.selected
+            .docs
+            .iter()
+            .map(|doc| doc.doc_id.clone())
+            .collect()
+    }
+
+    /// 当前 relay log incarnation（追赶后清理 inbox 必须绑定它）。
+    #[must_use]
+    pub fn log_id(&self) -> [u8; 16] {
+        self.state.log_id
+    }
+
+    /// 快照明文字节估算（文档 Loro snapshot + 资产字节）；调用方按密文上限再乘
+    /// 安全系数，不能把它当成精确的 wire 字节数。
+    #[must_use]
+    pub fn estimated_snapshot_bytes(&self) -> u64 {
+        let docs = self
+            .selected
+            .docs
+            .iter()
+            .map(|doc| u64::try_from(doc.snapshot.loro_snapshot_bytes.len()).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add);
+        let assets = self
+            .selected
+            .assets
+            .iter()
+            .map(|asset| asset.byte_len)
+            .fold(0u64, u64::saturating_add);
+        docs.saturating_add(assets)
+    }
+}
+
+/// 只下载 manifest 的预检结果（不下载 snapshot/asset，不写库）。
+///
+/// Phase 1B 机会性追赶先用它读实际选中 checkpoint 的 S / 明文字节估算；避免为了
+/// 一个十几 MB 的快照先下载整份数据再回退。
+#[derive(Debug)]
+pub struct BootstrapProbe {
+    checkpoint: BootstrapCheckpoint,
+    used_fallback: bool,
+    estimated_plain_bytes: u64,
+}
+
+impl BootstrapProbe {
+    /// 实际选中 checkpoint 的 S。
+    #[must_use]
+    pub fn covered_seq(&self) -> u64 {
+        self.checkpoint.covered_seq
+    }
+
+    /// 实际选中 checkpoint 的 cursor。
+    #[must_use]
+    pub fn checkpoint_cursor(&self) -> &str {
+        &self.checkpoint.cursor
+    }
+
+    /// 是否使用 fallback。
+    #[must_use]
+    pub fn used_fallback(&self) -> bool {
+        self.used_fallback
+    }
+
+    /// manifest 声明的明文字节（文档 + 资产）；不是 wire 密文字节。
+    #[must_use]
+    pub fn estimated_plain_bytes(&self) -> u64 {
+        self.estimated_plain_bytes
+    }
+}
+
+/// 只拉 manifest 的预检；选择逻辑与 `prepare` 相同，但不下载 snapshot/asset。
+pub fn probe<C: RelayClient>(
+    client: &mut C,
+    vault_id: [u8; 16],
+    root: &RootSecretV1,
+    pins: &BootstrapPins,
+) -> Result<BootstrapProbe, SyncError> {
+    if root.vault_id != vault_id {
+        return Err(SyncError::Object("bootstrap root 与 vault 不符"));
+    }
+    let bundle = client.bootstrap()?;
+    let state = client.state()?;
+    let chain = client.management_chain()?;
+    let control_hash = control_head_hash(&state, &chain);
+    validate_remote(vault_id, root, pins, &bundle, &state, &chain, &control_hash)?;
+
+    let mut last_error: Option<SyncError> = None;
+    for (checkpoint, used_fallback) in [
+        (bundle.primary.clone(), false),
+        (bundle.fallback.clone(), true),
+    ] {
+        let result = (|| {
+            if checkpoint.epoch != state.epoch || checkpoint.epoch != bundle.epoch {
+                return Err(SyncError::Object("bootstrap 基线 epoch 与 relay 不一致"));
+            }
+            if checkpoint.covered_seq > bundle.head_seq || checkpoint.covered_seq > state.head_seq {
+                return Err(SyncError::Object("bootstrap 基线 S 超过 relay head"));
+            }
+            if checkpoint.covered_seq < bundle.gc_floor || checkpoint.covered_seq < state.gc_floor {
+                return Err(SyncError::Object("bootstrap 基线 S 低于 relay GC floor"));
+            }
+            if checkpoint.cursor.is_empty() {
+                return Err(SyncError::Object("bootstrap 基线缺 relay 游标"));
+            }
+            let (manifest, digest) = fetch_manifest(client, root, &checkpoint)?;
+            verify_checkpoint_commit(client, &checkpoint, &manifest, &digest)?;
+            verify_manifest(&manifest, vault_id, &checkpoint, state.epoch)?;
+            let docs = manifest
+                .docs
+                .iter()
+                .map(|doc| doc.total_plain_len)
+                .fold(0u64, u64::saturating_add);
+            let assets = manifest
+                .assets
+                .iter()
+                .map(|asset| asset.byte_len)
+                .fold(0u64, u64::saturating_add);
+            Ok(BootstrapProbe {
+                checkpoint,
+                used_fallback,
+                estimated_plain_bytes: docs.saturating_add(assets),
+            })
+        })();
+        match result {
+            Ok(probe) => return Ok(probe),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("bootstrap 至少尝试过一个基线"))
+}
+
+/// 用已解出的 root 执行数据 bootstrap；本地 pins 从本库 meta 读取。
+pub fn run<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    root: &RootSecretV1,
+) -> Result<BootstrapReport, SyncError> {
+    let pins = BootstrapPins::from_vault(vault)?;
+    run_with_pins(vault, client, vault_id, peer_id, root, &pins)
+}
+
+/// 用调用方提供的本地 pins 执行 bootstrap（已有设备传 identity 的 pin）。
+pub fn run_with_pins<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    root: &RootSecretV1,
+    pins: &BootstrapPins,
+) -> Result<BootstrapReport, SyncError> {
+    run_inner(vault, client, vault_id, peer_id, root, pins, None)
+}
+
+/// 测试入口：在指定阶段注入崩溃/并发冲突（见 [`BootstrapFault`]）。
+#[doc(hidden)]
+pub fn run_with_fault<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    root: &RootSecretV1,
+    fault: BootstrapFault,
+) -> Result<BootstrapReport, SyncError> {
+    let pins = BootstrapPins::from_vault(vault)?;
+    run_inner(vault, client, vault_id, peer_id, root, &pins, Some(fault))
+}
+
+/// 网络准备阶段：选 checkpoint、下载/解密/验签/校验，**不写本地库**。
+///
+/// Phase 1B 的 `catchup_prepare` 直接复用它；不持写闸。
+pub fn prepare<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    root: &RootSecretV1,
+    pins: &BootstrapPins,
+) -> Result<PreparedBootstrap, SyncError> {
+    if root.vault_id != vault_id {
+        return Err(SyncError::Object("bootstrap root 与 vault 不符"));
+    }
+    let bundle = client.bootstrap()?;
+    let state = client.state()?;
+    let chain = client.management_chain()?;
+    let control_hash = control_head_hash(&state, &chain);
+    validate_remote(vault_id, root, pins, &bundle, &state, &chain, &control_hash)?;
+
+    // 选中哪个基线，就只用它的 S/cursor/manifest/docs；primary 任一阶段失败才整体切 fallback。
+    // 所有下载/解密/摘要/VV/结构语义校验都在写库之前完成。
+    let mut selected: Option<SelectedBaseline> = None;
+    let mut last_error: Option<SyncError> = None;
+    for (checkpoint, used_fallback) in [
+        (bundle.primary.clone(), false),
+        (bundle.fallback.clone(), true),
+    ] {
+        match load_baseline(
+            vault,
+            client,
+            root,
+            vault_id,
+            peer_id,
+            &checkpoint,
+            &bundle,
+            &state,
+        ) {
+            Ok(baseline) => {
+                selected = Some(SelectedBaseline {
+                    used_fallback,
+                    ..baseline
+                });
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let selected = selected.ok_or_else(|| last_error.expect("bootstrap 至少尝试过一个基线"))?;
+    Ok(PreparedBootstrap {
+        selected,
+        state,
+        chain,
+        control_hash,
+        pins: *pins,
+    })
+}
+
+/// 写库阶段：复用 `baseline_apply` 的 staging journal 与实际导入/读回校验/水位 CAS。
+///
+/// 调用方必须持有外部提交写闸；网络已在 [`prepare`] 完成。
+pub fn integrate(
+    vault: &Vault,
+    peer_id: u64,
+    prepared: &PreparedBootstrap,
+    advancement: BootstrapAdvancement,
+    fault: Option<BootstrapFault>,
+) -> Result<BootstrapReport, SyncError> {
+    let selected = &prepared.selected;
+
+    // 实际导入（staging journal 可续跑）；失败时 journal 保留，下一次按同一基线续跑。
+    let report_docs = apply_selected(vault, peer_id, selected, fault)?;
+
+    // 全部实际写入 + 读回校验通过后，才在一个事务里推进水位（max 语义 + CAS）。
+    finalize(
+        vault,
+        selected,
+        &prepared.state,
+        &prepared.chain,
+        &prepared.control_hash,
+        &prepared.pins,
+        advancement,
+        fault,
+    )?;
+
+    // 成功后才清 staging journal；若这里失败，重试会幂等重放并再次清理。
+    let _cleared = abort_baseline_apply(vault)?;
+
+    Ok(BootstrapReport {
+        checkpoint_id: selected.checkpoint.checkpoint_id,
+        covered_seq: selected.checkpoint.covered_seq,
+        used_fallback: selected.used_fallback,
+        docs: report_docs,
+        assets: selected.assets.len(),
+        cursor: selected.checkpoint.cursor.clone(),
+        signed_checkpoint: true,
+    })
+}
+
+fn run_inner<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    root: &RootSecretV1,
+    pins: &BootstrapPins,
+    fault: Option<BootstrapFault>,
+) -> Result<BootstrapReport, SyncError> {
+    let prepared = prepare(vault, client, vault_id, peer_id, root, pins)?;
+    integrate(
+        vault,
+        peer_id,
+        &prepared,
+        BootstrapAdvancement::MaxOnly,
+        fault,
+    )
+}
+
+/// 校验本地 durable bootstrap 锚（ADR 0013 §3；`validate_remote`/`finalize` 共用）。
+///
+/// 两类视图必须分开，**不能**把旧 hash 挂到 `max(rev)` 上比较：
+///
+/// - `anchor.rev == state.control_rev`：摘要必须逐字节等于当前视图（`epoch`/`log_id`
+///   由当前 state 决定；同 rev 换 epoch/log/hash 都是 equivocation）；
+/// - `anchor.rev <  state.control_rev`：**不能忽略**旧锚，也不能拿新 rev 的坐标复算；
+///   按锚自己的 `rev/epoch/log` + 截断到该 rev 的管理链复算，证明当前链仍包含旧锚
+///   认证过的前缀；复算不出视图 → [`SyncError::NeedsTrust`]，摘要不符 → equivocation。
+fn verify_bootstrap_anchor(
+    anchor: &BootstrapAnchorV1,
+    state: &RelayState,
+    chain: &[ManagerChainEntry],
+    current_hash: &[u8; 32],
+) -> Result<(), SyncError> {
+    if anchor.rev > state.control_rev {
+        return Err(SyncError::ControlRollback {
+            expected: anchor.rev,
+            actual: state.control_rev,
+        });
+    }
+    if anchor.rev == state.control_rev {
+        if anchor.hash != *current_hash {
+            return Err(SyncError::Equivocation(
+                "bootstrap 控制头同 rev 但 hash 变化（同 rev 历史不完整）",
+            ));
+        }
+        return Ok(());
+    }
+    let computed = control_head_hash_at(state.vault_id, state.instance_id, anchor, chain).ok_or(
+        SyncError::NeedsTrust("bootstrap 旧锚的 rev 不在当前管理链视图内，无法证明历史前缀"),
+    )?;
+    if computed != anchor.hash {
+        return Err(SyncError::Equivocation(
+            "bootstrap 旧锚未被当前管理链覆盖（rev 前进但前缀被重写）",
+        ));
+    }
+    Ok(())
+}
+
+/// 本地 pin 的**结构**校验：`control_hash` 与 `control_rev` 必须成对。
+///
+/// 只有 hash 没有 rev 是本地损坏（无法按 rev 选择同 rev/历史锚视图）；必须在
+/// `validate_remote` 与 `finalize` 两条路径都检查，不能只在前者检查。
+fn validate_pin_shape(pins: &BootstrapPins) -> Result<(), SyncError> {
+    if pins.control_hash.is_some() && pins.control_rev.is_none() {
+        return Err(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 control_rev",
+        ));
+    }
+    Ok(())
+}
+
+/// relay 侧与本地 pins 的写前校验：任何不满足都必须在写库前失败。
+fn validate_remote(
+    vault_id: [u8; 16],
+    root: &RootSecretV1,
+    pins: &BootstrapPins,
+    bundle: &BootstrapBundle,
+    state: &RelayState,
+    chain: &[ManagerChainEntry],
+    control_hash: &[u8; 32],
+) -> Result<(), SyncError> {
+    validate_pin_shape(pins)?;
+    if state.vault_id != vault_id {
+        return Err(SyncError::RelayWire(
+            "bootstrap state.vault_id 与本地不一致",
+        ));
+    }
+    if root.key_epoch != state.epoch {
+        return Err(SyncError::Object("bootstrap root epoch 与 relay 不一致"));
+    }
+    if bundle.epoch != state.epoch {
+        return Err(SyncError::RelayWire("bootstrap epoch 与 state 不一致"));
+    }
+    // bundle 先取、state 后取；head 只能前进，倒退说明 relay 换库/回滚。
+    if bundle.head_seq > state.head_seq {
+        return Err(SyncError::RelayWire("bootstrap/state head_seq 回退"));
+    }
+    if let Some(instance) = pins.instance_id {
+        if instance != state.instance_id {
+            return Err(SyncError::Object(
+                "bootstrap relay instance 与本地 pin 不符",
+            ));
+        }
+    }
+    if let Some(log_id) = pins.log_id {
+        if log_id != state.log_id {
+            return Err(SyncError::Storage(
+                menghunote_storage::StorageError::SyncLogMismatch {
+                    expected: log_id.to_vec(),
+                    found: state.log_id.to_vec(),
+                },
+            ));
+        }
+    }
+    if let Some(epoch) = pins.epoch {
+        if epoch > state.epoch {
+            return Err(SyncError::Object("bootstrap 不允许回退 epoch"));
+        }
+    }
+    if let Some(rev) = pins.control_rev {
+        if rev > state.control_rev {
+            return Err(SyncError::Object("bootstrap 不允许回退 control_rev"));
+        }
+        if let Some(anchor) = pins.control_anchor()? {
+            verify_bootstrap_anchor(&anchor, state, chain, control_hash)?;
+        }
+    } else if pins.control_hash.is_some() {
+        return Err(SyncError::LocalCorrupt(
+            "bootstrap pins 有 control_hash 但缺 control_rev",
+        ));
+    }
+    if let Some(highwater) = pins.highwater {
+        if highwater > state.head_seq {
+            return Err(SyncError::Paused(
+                crate::relay::PauseReason::RollbackDetected,
+            ));
+        }
+    }
+    // 管理链必须是单调 rev 序列（内容摘要见 control_head_hash；完整链认证属于轮换阶段 A）。
+    let mut previous_rev = 0u64;
+    for entry in chain {
+        if entry.rev <= previous_rev {
+            return Err(SyncError::RelayWire("bootstrap 管理链 rev 不递增"));
+        }
+        previous_rev = entry.rev;
+    }
+    Ok(())
+}
+
+/// 控制头摘要：绑定 relay 可见的控制头坐标（instance/log/epoch/control_rev）与管理转换链。
+///
+/// 这是本地 pin 的摘要定义（不是 relay 内部的 `control_head` hash）：同一 `control_rev`
+/// 下 relay 换 instance/log/epoch 或重写管理链都会改变摘要；rev 前进时允许摘要变化
+/// （单调性由 `control_rev` 保证）。完整管理链的签名认证属于轮换阶段 A（ADR §28.2），
+/// 本模块只做"同 rev 不得换内容"的回退检测。
+#[must_use]
+pub fn control_head_hash(state: &RelayState, chain: &[ManagerChainEntry]) -> [u8; 32] {
+    control_head_hash_parts(
+        state.vault_id,
+        state.instance_id,
+        state.log_id,
+        state.epoch,
+        state.control_rev,
+        chain,
+    )
+}
+
+/// [`control_head_hash`] 的**坐标化**输入：调用方可以显式给出历史视图的坐标
+/// （ADR 0013 §3「按旧 rev/epoch/log/管理链视图验证」）。
+///
+/// 摘要公式与 [`control_head_hash`] 逐字节相同；`chain` 必须是**该 rev 下**的管理链
+/// （即按 `entry.rev <= control_rev` 截断后的前缀）。
+#[must_use]
+pub fn control_head_hash_parts(
+    vault_id: [u8; 16],
+    instance_id: [u8; 16],
+    log_id: [u8; 16],
+    epoch: u64,
+    control_rev: u64,
+    chain: &[ManagerChainEntry],
+) -> [u8; 32] {
+    let mut input = Vec::new();
+    input.extend_from_slice(b"menghunote/bootstrap/control-head/v1\0");
+    input.extend_from_slice(&vault_id);
+    input.extend_from_slice(&instance_id);
+    input.extend_from_slice(&log_id);
+    input.extend_from_slice(&epoch.to_be_bytes());
+    input.extend_from_slice(&control_rev.to_be_bytes());
+    input.extend_from_slice(&u32::try_from(chain.len()).unwrap_or(u32::MAX).to_be_bytes());
+    for entry in chain {
+        input.extend_from_slice(&entry.rev.to_be_bytes());
+        input.extend_from_slice(&entry.pubkey);
+        input.extend_from_slice(
+            &u32::try_from(entry.transition.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
+        input.extend_from_slice(&entry.transition);
+        push_optional_signature(&mut input, entry.old_signature);
+        push_optional_signature(&mut input, entry.new_signature);
+    }
+    Sha256::digest(&input).into()
+}
+
+/// 按 bootstrap 锚**自己的** rev/epoch/log 视图复算控制头摘要（ADR 0013 §3）。
+///
+/// 为什么不能用当前 head 的坐标：摘要把 `(epoch, control_rev)` 也哈希进去，rev 前进后
+/// 同一条历史管理链会算出不同摘要。历史锚只能按"它当初记录的坐标 + 当时的管理链"复算：
+///
+/// - `epoch` / `log_id` / `rev` 取自锚本身（本地 durable 事实，relay 不能改）；
+/// - 管理链按**生效 epoch** 截断：`/control` 键 5 的 `rev` 是**管理 rev**（不是 control
+///   rev），每条转换记录 `from_epoch → to_epoch`；epoch 只能由 activation 推进，因此
+///   "锚当时的链" = rev1 genesis + `to_epoch <= anchor.epoch` 的转换（必须仍是链前缀）；
+/// - `instance_id` 取自本地 pin/身份（换实例另有独立检查）。
+///
+/// 返回 `None` = 无法重建该历史视图（链不完整/非前缀/转换不可解码），调用方必须
+/// fail-closed，不能把"视图不可用"当成"验证通过"。
+#[must_use]
+pub fn control_head_hash_at(
+    vault_id: [u8; 16],
+    instance_id: [u8; 16],
+    anchor: &BootstrapAnchorV1,
+    chain: &[ManagerChainEntry],
+) -> Option<[u8; 32]> {
+    if chain.first().is_none_or(|entry| entry.rev != 1) {
+        return None;
+    }
+    // rev1 的 `transition` 是 genesis 原字节（不是 ManagerTransitionV1），不参与解码。
+    let mut end = 1usize;
+    for (index, entry) in chain.iter().enumerate().skip(1) {
+        let transition = ManagerTransitionV1::decode(&entry.transition).ok()?;
+        if transition.new_rev != entry.rev {
+            return None;
+        }
+        if transition.to_epoch <= anchor.epoch {
+            if index != end {
+                // 更早的转换不属于历史视图，后面却又出现属于它的转换 = 非前缀，拒绝。
+                return None;
+            }
+            end = index + 1;
+        }
+    }
+    Some(control_head_hash_parts(
+        vault_id,
+        instance_id,
+        anchor.log_id,
+        anchor.epoch,
+        anchor.rev,
+        &chain[..end],
+    ))
+}
+
+fn push_optional_signature(input: &mut Vec<u8>, signature: Option<[u8; 64]>) {
+    match signature {
+        None => input.push(0),
+        Some(signature) => {
+            input.push(1);
+            input.extend_from_slice(&signature);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_baseline<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    root: &RootSecretV1,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    checkpoint: &BootstrapCheckpoint,
+    bundle: &BootstrapBundle,
+    state: &RelayState,
+) -> Result<SelectedBaseline, SyncError> {
+    if checkpoint.epoch != state.epoch || checkpoint.epoch != bundle.epoch {
+        return Err(SyncError::Object("bootstrap 基线 epoch 与 relay 不一致"));
+    }
+    // "≤S"：基线只能覆盖 relay 已经产生的水位；低于 GC floor 的游标已不可继续。
+    if checkpoint.covered_seq > bundle.head_seq || checkpoint.covered_seq > state.head_seq {
+        return Err(SyncError::Object("bootstrap 基线 S 超过 relay head"));
+    }
+    // 低于 GC floor 的游标已经不可继续：两次请求之间 floor 也可能前进，取较大者。
+    if checkpoint.covered_seq < bundle.gc_floor || checkpoint.covered_seq < state.gc_floor {
+        return Err(SyncError::Object("bootstrap 基线 S 低于 relay GC floor"));
+    }
+    if checkpoint.cursor.is_empty() {
+        return Err(SyncError::Object("bootstrap 基线缺 relay 游标"));
+    }
+
+    let (manifest, manifest_digest) = fetch_manifest(client, root, checkpoint)?;
+    verify_checkpoint_commit(client, checkpoint, &manifest, &manifest_digest)?;
+    verify_manifest(&manifest, vault_id, checkpoint, state.epoch)?;
+    let docs = download_docs(client, root, peer_id, &manifest)?;
+    let structure_notes = verify_structure_semantics(&docs, peer_id)?;
+    let assets = download_assets(vault, client, root, &manifest)?;
+    Ok(SelectedBaseline {
+        checkpoint: checkpoint.clone(),
+        used_fallback: false,
+        docs,
+        assets,
+        structure_notes,
+    })
+}
+
+fn verify_checkpoint_commit<C: RelayClient>(
+    client: &mut C,
+    checkpoint: &BootstrapCheckpoint,
+    manifest: &ManifestV1,
+    manifest_digest: &[u8; 32],
+) -> Result<(), SyncError> {
+    let signed_commit = checkpoint
+        .signed_commit
+        .as_deref()
+        .ok_or(SyncError::Object("bootstrap 缺 CheckpointCommit"))?;
+    let signature = checkpoint
+        .signature
+        .ok_or(SyncError::Object("bootstrap 缺 checkpoint 签名"))?;
+    let commit = CheckpointCommit::decode(signed_commit)?;
+    crate::checkpoint::require_current_checkpoint_validation(&commit)?;
+    if commit.vault_id != manifest.vault_id
+        || commit.checkpoint_id != checkpoint.checkpoint_id
+        || commit.epoch != checkpoint.epoch
+        || commit.covered_relay_seq != checkpoint.covered_seq
+        || commit.manifest_object_id != checkpoint.manifest_oid
+        || commit.manifest_digest != *manifest_digest
+    {
+        return Err(SyncError::Object("bootstrap checkpoint commit 与响应不符"));
+    }
+    // ADR §21：manifest 条目已带 key_epoch/total_plain_len/object_digest，可只凭 manifest
+    // 重算 refs_digest；不再依赖 GET objects。
+    let refs = manifest_refs(manifest);
+    let refs_digest: [u8; 32] = Sha256::digest(refs_digest_input(&refs)?).into();
+    if commit.refs_digest != refs_digest {
+        return Err(SyncError::Object("bootstrap refs_digest 与 manifest 不符"));
+    }
+    if let Some(refs_digest) = checkpoint.refs_digest {
+        if commit.refs_digest != refs_digest {
+            return Err(SyncError::Object("bootstrap refs_digest 与 commit 不符"));
+        }
+    }
+    let certificate = client
+        .device_cert(&commit.producer_device_id)?
+        .ok_or(SyncError::Object("bootstrap 缺 checkpoint 生产者证书"))?;
+    let input = checkpoint_signing_input(&commit)?;
+    verify_signature(&certificate.sign_ed25519_pub, &input, &signature)?;
+    Ok(())
+}
+
+/// 先读第 0 片信封拿 part_count/total_len，再按实际片数重算 object_digest 并读全对象。
+///
+/// 这样多片 manifest 也能校验（`/bootstrap` 响应不直接给 manifest 的 part_count/digest，
+/// 只能先看信封，再让签名 commit 绑定重算出的 digest）。
+fn fetch_manifest<C: RelayClient>(
+    client: &mut C,
+    root: &RootSecretV1,
+    checkpoint: &BootstrapCheckpoint,
+) -> Result<(ManifestV1, [u8; 32]), SyncError> {
+    let first = client.part(&checkpoint.manifest_oid, 0)?;
+    let envelope = Envelope::decode(&first)?;
+    if envelope.header.object_type != ObjectType::Manifest
+        || envelope.header.object_id != checkpoint.manifest_oid
+        || envelope.header.part_count == 0
+    {
+        return Err(SyncError::Object("bootstrap manifest 信封字段不符"));
+    }
+    if envelope.header.generation != 0 || envelope.header.sender_seq != 0 {
+        return Err(SyncError::Object("bootstrap manifest 信封字段不符"));
+    }
+    let digest = object_digest_of(client, &checkpoint.manifest_oid, envelope.header.part_count)?;
+    let (header, bytes) = fetch_object(
+        client,
+        root,
+        ObjectType::Manifest,
+        &checkpoint.manifest_oid,
+        envelope.header.part_count,
+        envelope.header.total_plaintext_len,
+        &digest,
+        &[],
+    )?;
+    if header.key_epoch != checkpoint.epoch {
+        return Err(SyncError::Object(
+            "bootstrap manifest epoch 与 checkpoint 不符",
+        ));
+    }
+    Ok((ManifestV1::decode(&bytes)?, digest))
+}
+
+fn object_digest_of<C: RelayClient>(
+    client: &mut C,
+    object_id: &[u8; 32],
+    part_count: u32,
+) -> Result<[u8; 32], SyncError> {
+    let mut digests = Vec::with_capacity(part_count as usize);
+    for index in 0..part_count {
+        let bytes = client.part(object_id, index)?;
+        digests.push(Sha256::digest(&bytes).into());
+    }
+    let input = menghunote_sync_proto::object_digest_input(part_count, &digests)?;
+    Ok(Sha256::digest(&input).into())
+}
+
+/// 由 manifest 重建 refs 集合（`refs_digest` 的唯一口径）。
+///
+/// `pub(crate)`：I 阶段的 checkpoint 级认证（`rotation_apply::verify_checkpoint_authorization`）
+/// 必须复算 `refs_digest`，复用本函数而不是复制一份口径（ADR §21：manifest 条目已带
+/// key_epoch/total_plain_len/object_digest，只凭 manifest 就能重算）。
+pub(crate) fn manifest_refs(manifest: &ManifestV1) -> Vec<ObjectRefV1> {
+    let mut refs = Vec::with_capacity(manifest.docs.len() + manifest.assets.len());
+    refs.extend(manifest.docs.iter().map(|doc| ObjectRefV1 {
+        object_id: doc.snapshot_object_id,
+        object_type: ObjectType::Snapshot,
+        generation: doc.generation,
+        key_epoch: doc.key_epoch,
+        part_count: doc.part_count,
+        total_plain_len: doc.total_plain_len,
+        object_digest: doc.object_digest,
+    }));
+    refs.extend(manifest.assets.iter().map(|asset| ObjectRefV1 {
+        object_id: asset.object_id,
+        object_type: ObjectType::Asset,
+        generation: 0,
+        key_epoch: asset.key_epoch,
+        part_count: asset.part_count,
+        total_plain_len: asset.total_plain_len,
+        object_digest: asset.object_digest,
+    }));
+    refs
+}
+
+fn verify_manifest(
+    manifest: &ManifestV1,
+    vault_id: [u8; 16],
+    checkpoint: &BootstrapCheckpoint,
+    epoch: u64,
+) -> Result<(), SyncError> {
+    if manifest.vault_id != vault_id
+        || manifest.checkpoint_id != checkpoint.checkpoint_id
+        || manifest.covered_relay_seq != checkpoint.covered_seq
+        || manifest.key_epoch != epoch
+    {
+        return Err(SyncError::Object("bootstrap manifest 与 checkpoint 不符"));
+    }
+    if manifest.min_reader > u32::try_from(MIN_READER).unwrap_or(u32::MAX) {
+        return Err(SyncError::Object("bootstrap 基线要求更高的 reader"));
+    }
+    if manifest.docs.is_empty() {
+        return Err(SyncError::Object("bootstrap manifest 没有文档"));
+    }
+    // 结构文档的 ID 是 storage 的固定常量：apply_baseline_batch 依赖它写 `kind='structure'`，
+    // 允许 manifest 声明别的 ID 会让结构被当成正文落库。
+    if manifest.structure_doc_id != STRUCTURE_DOC_ID {
+        return Err(SyncError::Object(
+            "bootstrap manifest structure_doc_id 非法",
+        ));
+    }
+    let mut doc_ids = BTreeSet::new();
+    let mut snapshot_ids = BTreeSet::new();
+    let mut structure_docs = 0usize;
+    for doc in &manifest.docs {
+        if !doc_ids.insert(doc.doc_id.as_str()) || !snapshot_ids.insert(doc.snapshot_object_id) {
+            return Err(SyncError::Object("bootstrap manifest 文档/对象重复"));
+        }
+        if doc.kind != KIND_BODY && doc.kind != KIND_STRUCTURE {
+            return Err(SyncError::Object("bootstrap manifest 文档 kind 非法"));
+        }
+        if doc.key_epoch != epoch {
+            return Err(SyncError::Object("bootstrap manifest 文档 epoch 不符"));
+        }
+        if doc.doc_id == STRUCTURE_DOC_ID {
+            structure_docs += 1;
+            if doc.kind != KIND_STRUCTURE {
+                return Err(SyncError::Object("bootstrap 结构文档 kind 非法"));
+            }
+        } else if doc.kind == KIND_STRUCTURE {
+            return Err(SyncError::Object("bootstrap manifest 含多余结构文档"));
+        }
+    }
+    if structure_docs != 1 {
+        return Err(SyncError::Object("bootstrap manifest 缺 structure 文档"));
+    }
+    let mut asset_objects = BTreeSet::new();
+    let mut asset_hashes = BTreeSet::new();
+    for asset in &manifest.assets {
+        if !asset_objects.insert(asset.object_id) || !asset_hashes.insert(asset.real_sha256) {
+            return Err(SyncError::Object("bootstrap manifest 资产重复"));
+        }
+        if asset.key_epoch != epoch {
+            return Err(SyncError::Object("bootstrap manifest 资产 epoch 不符"));
+        }
+    }
+    Ok(())
+}
+
+fn download_docs<C: RelayClient>(
+    client: &mut C,
+    root: &RootSecretV1,
+    peer_id: u64,
+    manifest: &ManifestV1,
+) -> Result<Vec<VerifiedDoc>, SyncError> {
+    let mut docs = Vec::with_capacity(manifest.docs.len());
+    for doc in &manifest.docs {
+        let (header, bytes) = fetch_self_described(
+            client,
+            root,
+            ObjectType::Snapshot,
+            &doc.snapshot_object_id,
+            &doc.object_digest,
+            &[],
+        )?;
+        if header.part_count != doc.part_count
+            || header.generation != doc.generation
+            || header.key_epoch != manifest.key_epoch
+            || header.sender_seq != 0
+        {
+            return Err(SyncError::Object("bootstrap 快照信封字段不符"));
+        }
+        let snapshot = SnapshotV1::decode(&bytes)?;
+        if !snapshot.full_history
+            || snapshot.doc_id != doc.doc_id
+            || snapshot.kind != doc.kind
+            || snapshot.generation != doc.generation
+            || snapshot.vv != doc.vv
+            || snapshot.frontier != doc.frontier
+        {
+            return Err(SyncError::Object("bootstrap 快照与 manifest 不符"));
+        }
+        if snapshot.codec_version != CODEC_VERSION
+            || snapshot.app_doc_schema != u32::try_from(APP_DOC_SCHEMA).unwrap_or(u32::MAX)
+            || snapshot.min_reader > u32::try_from(MIN_READER).unwrap_or(u32::MAX)
+        {
+            return Err(SyncError::Object("bootstrap 快照 app schema/codec 不可读"));
+        }
+        // 实际 VV/frontier：独立空 LoroDoc import 后再比，不只信 manifest 声明。
+        let actual_vv = verify_snapshot_history(&snapshot, doc)?;
+        let text = if doc.kind == KIND_BODY {
+            let body = BodyDoc::restore(
+                doc.doc_id.clone(),
+                peer_id,
+                Some(&snapshot.loro_snapshot_bytes),
+                &[],
+            )?;
+            Some(body.text())
+        } else {
+            None
+        };
+        docs.push(VerifiedDoc {
+            doc_id: doc.doc_id.clone(),
+            kind: doc.kind,
+            snapshot,
+            actual_vv,
+            text,
+        });
+    }
+    Ok(docs)
+}
+
+/// 把 snapshot 导入独立空 `LoroDoc`，校验 actual VV/frontier 与 manifest 声明一致。
+///
+/// 相等比较同时排除两种攻击：宣称了不存在的 op（虚高）与真实历史里缺 op。
+fn verify_snapshot_history(
+    snapshot: &SnapshotV1,
+    manifest_doc: &ManifestDoc,
+) -> Result<VersionVector, SyncError> {
+    if !snapshot.full_history {
+        return Err(SyncError::Object("bootstrap 快照不是 full-history"));
+    }
+    let doc = loro::LoroDoc::new();
+    doc.import(&snapshot.loro_snapshot_bytes)
+        .map_err(|_| SyncError::Object("bootstrap 快照 Loro 数据非法"))?;
+    // shallow snapshot 的 VV/frontier 仍可能自洽，必须再问 Loro 的 shallow 状态。
+    crate::checkpoint::ensure_snapshot_full_history(&doc)?;
+    let actual_vv = doc.oplog_vv();
+    let declared_vv = decode_vv(&manifest_doc.vv)?;
+    if actual_vv != declared_vv {
+        return Err(SyncError::Object(
+            "bootstrap 快照实际 VV 与 manifest 声明不一致",
+        ));
+    }
+    let actual_frontier = doc.state_frontiers();
+    if manifest_doc.frontier.is_empty() {
+        if actual_frontier.iter().next().is_some() {
+            return Err(SyncError::Object(
+                "bootstrap manifest frontier 为空但快照有实际 frontier",
+            ));
+        }
+    } else if actual_frontier.encode() != manifest_doc.frontier {
+        return Err(SyncError::Object(
+            "bootstrap 快照 frontier 与 manifest 声明不一致",
+        ));
+    }
+    Ok(actual_vv)
+}
+
+/// 结构语义校验：结构快照里的每篇笔记必须指向基线 manifest 内的正文文档。
+fn verify_structure_semantics(
+    docs: &[VerifiedDoc],
+    peer_id: u64,
+) -> Result<BTreeMap<String, String>, SyncError> {
+    let structure = docs
+        .iter()
+        .find(|doc| doc.kind == KIND_STRUCTURE)
+        .ok_or(SyncError::Object("bootstrap 缺 structure 文档"))?;
+    let doc = StructureDoc::restore(peer_id, Some(&structure.snapshot.loro_snapshot_bytes), &[])?;
+    let snapshot = doc.snapshot()?;
+    let manifest_kinds: BTreeMap<&str, u64> = docs
+        .iter()
+        .map(|doc| (doc.doc_id.as_str(), doc.kind))
+        .collect();
+    let mut notes = BTreeMap::new();
+    for node in &snapshot.nodes {
+        if node.note_id.is_some() != node.body_doc_id.is_some() {
+            return Err(SyncError::Object("bootstrap 结构节点笔记字段不成对"));
+        }
+        if !node.is_note() {
+            continue;
+        }
+        let note_id = node.note_id.clone().unwrap_or_default();
+        let body_doc_id = node.body_doc_id.clone().unwrap_or_default();
+        if manifest_kinds.get(body_doc_id.as_str()) != Some(&KIND_BODY) {
+            return Err(SyncError::Object(
+                "bootstrap 结构引用的正文文档不在基线 manifest",
+            ));
+        }
+        if notes.insert(note_id, body_doc_id).is_some() {
+            return Err(SyncError::Object("bootstrap 结构快照 note_id 重复"));
+        }
+    }
+    Ok(notes)
+}
+
+fn download_assets<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    root: &RootSecretV1,
+    manifest: &ManifestV1,
+) -> Result<Vec<VerifiedAsset>, SyncError> {
+    let mut assets = Vec::with_capacity(manifest.assets.len());
+    for manifest_asset in &manifest.assets {
+        // 已有同 hash/长度的本地资产不重复下载；只拉缺失的（plan §8.2）。
+        if let Some(local) = menghunote_storage::asset_bytes(vault, manifest_asset.real_sha256)? {
+            if u64::try_from(local.len()).ok() == Some(manifest_asset.byte_len)
+                && <[u8; 32]>::from(Sha256::digest(&local)) == manifest_asset.real_sha256
+            {
+                assets.push(VerifiedAsset {
+                    object_id: manifest_asset.object_id,
+                    real_sha256: manifest_asset.real_sha256,
+                    byte_len: manifest_asset.byte_len,
+                    media_type: manifest_asset.media_type.clone(),
+                    data: local,
+                });
+                continue;
+            }
+        }
+        let expected = crate::checkpoint::asset_object_id(
+            root,
+            &manifest_asset.real_sha256,
+            manifest_asset.byte_len,
+            &manifest_asset.media_type,
+        )?;
+        if expected != manifest_asset.object_id {
+            return Err(SyncError::Object("bootstrap 资产 object_id 与根不符"));
+        }
+        let (header, bytes) = fetch_self_described(
+            client,
+            root,
+            ObjectType::Asset,
+            &manifest_asset.object_id,
+            &manifest_asset.object_digest,
+            &[],
+        )?;
+        if header.part_count != manifest_asset.part_count || header.key_epoch != manifest.key_epoch
+        {
+            return Err(SyncError::Object(
+                "bootstrap 资产片数/epoch 与 manifest 不符",
+            ));
+        }
+        // ADR §31：ASSET 的 header producer 固定为 0，且 message_id 必须由 identical
+        // asset header 确定性派生（跨设备/重传的密文字节才可能一致）。
+        if header.producer_device_id != [0u8; 16]
+            || header.generation != 0
+            || header.sender_seq != 0
+        {
+            return Err(SyncError::Object("bootstrap 资产信封字段不符（§31）"));
+        }
+        if header.message_id != crate::upload::asset_message_id(root, &manifest_asset.object_id)? {
+            return Err(SyncError::Object("bootstrap 资产 message_id 非确定性派生"));
+        }
+        let reference = AssetRef {
+            real_sha256: manifest_asset.real_sha256,
+            byte_len: manifest_asset.byte_len,
+            media_type: manifest_asset.media_type.clone(),
+            object: crate::upload::UploadedObject {
+                object_id: manifest_asset.object_id,
+                part_count: manifest_asset.part_count,
+                total_plain_len: header.total_plaintext_len,
+                object_digest: manifest_asset.object_digest,
+            },
+        };
+        verify_asset_plaintext(&bytes, &reference)?;
+        let body_start = 42 + manifest_asset.media_type.len();
+        let data = bytes
+            .get(body_start..)
+            .ok_or(SyncError::Object("bootstrap 资产明文越界"))?
+            .to_vec();
+        assets.push(VerifiedAsset {
+            object_id: manifest_asset.object_id,
+            real_sha256: manifest_asset.real_sha256,
+            byte_len: manifest_asset.byte_len,
+            media_type: manifest_asset.media_type.clone(),
+            data,
+        });
+    }
+    Ok(assets)
+}
+
+/// 读第 0 片拿 header，再按 header 的 part_count/total_len 读全对象并校验摘要/解密。
+fn fetch_self_described<C: RelayClient>(
+    client: &mut C,
+    root: &RootSecretV1,
+    object_type: ObjectType,
+    object_id: &[u8; 32],
+    expected_digest: &[u8; 32],
+    descriptor: &[u8],
+) -> Result<(EnvelopeHeader, Vec<u8>), SyncError> {
+    let first = client.part(object_id, 0)?;
+    let envelope = Envelope::decode(&first)?;
+    if envelope.header.object_type != object_type
+        || envelope.header.object_id != *object_id
+        || envelope.header.part_count == 0
+    {
+        return Err(SyncError::Object("bootstrap 对象 header 不符"));
+    }
+    fetch_object(
+        client,
+        root,
+        object_type,
+        object_id,
+        envelope.header.part_count,
+        envelope.header.total_plaintext_len,
+        expected_digest,
+        descriptor,
+    )
+}
+
+/// 清掉"上一次 bootstrap 选了另一份基线"的 staging（数据是 CRDT merge，重放幂等）。
+///
+/// 轮换的 baseline apply 传空 `source_cursor`，这里用前缀区分，绝不误清轮换 journal。
+fn reconcile_journal(
+    vault: &Vault,
+    checkpoint_id: &[u8; 16],
+    baseline_s: u64,
+    source_cursor: &str,
+) -> Result<(), SyncError> {
+    let Some(state) = baseline_apply_state(vault)? else {
+        return Ok(());
+    };
+    if state.status != BaselineApplyStatus::Staging {
+        return Ok(());
+    }
+    let same = state.checkpoint_id == *checkpoint_id
+        && state.baseline_s == baseline_s
+        && state.source_cursor == source_cursor;
+    if same {
+        return Ok(());
+    }
+    if state.source_cursor.starts_with(JOURNAL_SOURCE_PREFIX) {
+        let _aborted = abort_baseline_apply(vault)?;
+        return Ok(());
+    }
+    Err(SyncError::Storage(
+        menghunote_storage::StorageError::SyncConflict {
+            context: "已有非 bootstrap 的 baseline apply staging（轮换？），拒绝 bootstrap"
+                .to_owned(),
+        },
+    ))
+}
+
+/// staging journal + 分批导入 docs/structure/assets；返回按 manifest 顺序的报告文本。
+fn apply_selected(
+    vault: &Vault,
+    peer_id: u64,
+    selected: &SelectedBaseline,
+    fault: Option<BootstrapFault>,
+) -> Result<Vec<(String, Option<String>)>, SyncError> {
+    let checkpoint_id = selected.checkpoint.checkpoint_id;
+    let baseline_s = selected.checkpoint.covered_seq;
+    let source_cursor = format!("{JOURNAL_SOURCE_PREFIX}{}", selected.checkpoint.cursor);
+    // 完整性基准：本 checkpoint 覆盖的全部文档与资产都必须出现在 apply 批里。
+    // 集合由 begin 记录，任何"少导入一批"的续跑都不会被误当成完整
+    // （rotation 的 finish 会直接 Conflict；bootstrap 的 finalize 另有逐项读回校验）。
+    let expected = BaselineExpectation::new(
+        selected.docs.iter().map(|doc| doc.doc_id.clone()),
+        selected.assets.iter().map(|asset| asset.object_id),
+    );
+    reconcile_journal(vault, &checkpoint_id, baseline_s, &source_cursor)?;
+    begin_baseline_apply(vault, &checkpoint_id, baseline_s, &source_cursor, &expected)?;
+
+    // body → structure → asset（structure 投影依赖正文行已存在；与旧实现的顺序一致）。
+    let bodies: Vec<&VerifiedDoc> = selected
+        .docs
+        .iter()
+        .filter(|doc| doc.kind == KIND_BODY)
+        .collect();
+    for chunk in bodies.chunks(BOOTSTRAP_DOC_BATCH) {
+        let batch: Vec<(String, Vec<u8>)> = chunk
+            .iter()
+            .map(|doc| (doc.doc_id.clone(), doc.snapshot.loro_snapshot_bytes.clone()))
+            .collect();
+        apply_baseline_batch(vault, &batch, &[])?;
+    }
+    if fault == Some(BootstrapFault::AfterBodies) {
+        return Err(injected_fault());
+    }
+
+    let structure = selected
+        .docs
+        .iter()
+        .find(|doc| doc.kind == KIND_STRUCTURE)
+        .ok_or(SyncError::Object("bootstrap 缺 structure 文档"))?;
+    apply_baseline_batch(
+        vault,
+        &[(
+            structure.doc_id.clone(),
+            structure.snapshot.loro_snapshot_bytes.clone(),
+        )],
+        &[],
+    )?;
+    if fault == Some(BootstrapFault::BeforeStructureProjection) {
+        return Err(injected_fault());
+    }
+    let mut writer = StructureWriter::open(vault, peer_id)?;
+    writer.commit("bootstrap")?;
+
+    if !selected.assets.is_empty() {
+        let assets: Vec<BaselineAsset> = selected
+            .assets
+            .iter()
+            .map(|asset| BaselineAsset {
+                object_id: asset.object_id,
+                asset_hash: asset.real_sha256,
+                byte_len: asset.byte_len,
+                media_type: Some(asset.media_type.clone()),
+                data: asset.data.clone(),
+            })
+            .collect();
+        apply_baseline_assets(vault, &assets)?;
+    }
+    if fault == Some(BootstrapFault::AfterAssets) {
+        return Err(injected_fault());
+    }
+
+    // 读回校验的耗时只作诊断指标（不参与决策）；失败也要记录。
+    let verify_started = Instant::now();
+    let verified = verify_imported(vault, peer_id, selected, fault);
+    record_baseline_verify_time(verify_started.elapsed());
+    match verified {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            // 不回滚已 merge 的 Loro/资产，也不改 journal.status（schema CHECK 只有
+            // staging/completed）：只写失败标记，让下一次 begin 拒绝续跑，直到 abort。
+            if let Err(mark_error) = mark_baseline_verify_failed(vault, &error.to_string()) {
+                // 不能把原始 verify 错误替换成 marker 写错误：调用方需要根因；同时
+                // 明确 marker 未持久化意味着 journal 仍可续跑，必须先 abort。
+                return Err(SyncError::Storage(
+                    menghunote_storage::StorageError::SyncConflict {
+                        context: format!(
+                            "baseline 读回校验失败：{error}；另外写失败标记也失败（{mark_error}），journal 仍可续跑，必须先 abort_baseline_apply"
+                        ),
+                    },
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// 单篇文档的读回校验：导出点 VV ⊆ 当前本地 VV，且仅在无本地 extra 时比较正文。
+///
+/// - 方向固定为「快照/导出点 VV 必须被本地 VV 覆盖」：`actual_vv.sub_iter(local_vv)`
+///   为空才通过；**不要求相等**。导出点之后本地新增的 op 是合法编辑（verify 不与编辑
+///   互斥），相等比较会把它误判成失败；
+/// - 只有 `local_vv ⊆ actual_vv`（本地没有快照之外的 op）时，Loro 才保证本地正文等于
+///   快照正文，此时才做逐字节比较；有本地 extra 时正文必然已被合并改写，比较必然误报。
+fn check_imported_doc(
+    actual_vv: &VersionVector,
+    local_vv: &VersionVector,
+    expected_text: Option<&str>,
+    actual_text: &str,
+) -> Result<(), &'static str> {
+    if actual_vv.sub_iter(local_vv).next().is_some() {
+        return Err("bootstrap 导入后本地 VV 未覆盖快照");
+    }
+    if local_vv.sub_iter(actual_vv).next().is_none() {
+        if let Some(expected) = expected_text {
+            if expected != actual_text {
+                return Err("bootstrap 后正文与快照不一致");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 读回校验：本地 VV 必须覆盖快照、正文/结构投影/资产必须与快照一致。
+fn verify_imported(
+    vault: &Vault,
+    peer_id: u64,
+    selected: &SelectedBaseline,
+    fault: Option<BootstrapFault>,
+) -> Result<Vec<(String, Option<String>)>, SyncError> {
+    let mut body_texts: BTreeMap<String, String> = BTreeMap::new();
+    for (index, doc) in selected
+        .docs
+        .iter()
+        .filter(|doc| doc.kind == KIND_BODY)
+        .enumerate()
+    {
+        let (body, head) = load_body_doc(vault, &doc.doc_id, peer_id, None)?;
+        let local_vv = head.version_vector()?;
+        // 测试故障注入：伪造一个「导出点有、本地没有」的 op，制造真实的 VV 未覆盖失败。
+        let actual_vv = if fault == Some(BootstrapFault::VerifyVvNotCovered) && index == 0 {
+            let mut mismatched = doc.actual_vv.clone();
+            mismatched.insert(VERIFY_FAULT_PEER, 1);
+            mismatched
+        } else {
+            doc.actual_vv.clone()
+        };
+        let text = body.text();
+        if let Err(reason) = check_imported_doc(&actual_vv, &local_vv, doc.text.as_deref(), &text) {
+            return Err(SyncError::Object(reason));
+        }
+        body_texts.insert(doc.doc_id.clone(), text);
+    }
+
+    // 结构重放一致性 + 基线声明的每篇笔记都已投影且正文存在。
+    //
+    // `StructureSnapshot` 是**全量节点**（including deleted），删除是 grow-only meta
+    // 事件而不是 LoroTree::delete；因此本地并发删除基线笔记不会让这里缺项，也不会
+    // 误写失败 marker。verify 只要求“基线声明的 note/body 仍存在”，不把 deleted 当作
+    // 结构缺失；这是当前产品语义（删笔记不删正文，恢复仍可用）。
+    let (structure, _head) = load_structure(vault, peer_id)?;
+    let merged = structure.snapshot()?;
+    let merged_notes: BTreeMap<&str, &str> = merged
+        .nodes
+        .iter()
+        .filter(|node| node.is_note())
+        .filter_map(|node| Some((node.note_id.as_deref()?, node.body_doc_id.as_deref()?)))
+        .collect();
+    for (note_id, body_doc_id) in &selected.structure_notes {
+        if merged_notes.get(note_id.as_str()) != Some(&body_doc_id.as_str()) {
+            return Err(SyncError::Object("bootstrap 结构投影与快照不一致"));
+        }
+        if !body_texts.contains_key(body_doc_id) {
+            return Err(SyncError::Object("bootstrap 结构引用的正文缺失"));
+        }
+    }
+
+    for asset in &selected.assets {
+        match asset_bytes(vault, asset.real_sha256)? {
+            Some(stored) if stored == asset.data => {}
+            _ => return Err(SyncError::Object("bootstrap 资产未正确落库")),
+        }
+    }
+
+    Ok(selected
+        .docs
+        .iter()
+        .map(|doc| {
+            let text = if doc.kind == KIND_STRUCTURE {
+                None
+            } else {
+                body_texts.get(&doc.doc_id).cloned()
+            };
+            (doc.doc_id.clone(), text)
+        })
+        .collect())
+}
+
+/// 原子推进水位（max 语义 + CAS）。
+///
+/// 只允许前进：`received/integrated = max(现有, S)`、`highwater = max(现有, pin, S)`；
+/// 已有进度时保留现有 relay 游标（不把已消费的位置回退）。`instance/log_id/epoch/
+/// control_rev/control_hash` 只允许前进或不变。任何一项回退都在**写事务之前**硬失败。
+#[allow(clippy::too_many_arguments)]
+fn finalize(
+    vault: &Vault,
+    selected: &SelectedBaseline,
+    state: &RelayState,
+    chain: &[ManagerChainEntry],
+    control_hash: &[u8; 32],
+    pins: &BootstrapPins,
+    advancement: BootstrapAdvancement,
+    fault: Option<BootstrapFault>,
+) -> Result<(), SyncError> {
+    let s = selected.checkpoint.covered_seq;
+    let cursor_state = sync_cursor_state(vault)?;
+    if let Some(log_id) = &cursor_state.log_id {
+        if *log_id != state.log_id {
+            return Err(SyncError::Storage(
+                menghunote_storage::StorageError::SyncLogMismatch {
+                    expected: log_id.to_vec(),
+                    found: state.log_id.to_vec(),
+                },
+            ));
+        }
+    }
+    let stored = BootstrapPins::from_vault(vault)?;
+    validate_pin_shape(&stored)?;
+    if let Some(instance) = stored.instance_id {
+        if instance != state.instance_id {
+            return Err(SyncError::Object("bootstrap 不允许更换 relay instance"));
+        }
+    }
+    if let Some(epoch) = stored.epoch {
+        if epoch > state.epoch {
+            return Err(SyncError::Object("bootstrap 不允许回退 epoch"));
+        }
+    }
+    if let Some(rev) = stored.control_rev {
+        if rev > state.control_rev {
+            return Err(SyncError::Object("bootstrap 不允许回退 control_rev"));
+        }
+        // 与 `validate_remote` 同一口径：两类视图（同 rev 摘要 / 异 rev 历史锚）都验，
+        // 不因 rev 前进就跳过旧摘要（ADR 0013 §3）。
+        if let Some(anchor) = stored.control_anchor()? {
+            verify_bootstrap_anchor(&anchor, state, chain, control_hash)?;
+        }
+    }
+    if let Some(highwater) = pins.highwater {
+        if highwater > state.head_seq {
+            return Err(SyncError::Paused(
+                crate::relay::PauseReason::RollbackDetected,
+            ));
+        }
+    }
+    if let Some(highwater) = stored.highwater {
+        if highwater > state.head_seq {
+            return Err(SyncError::Paused(
+                crate::relay::PauseReason::RollbackDetected,
+            ));
+        }
+    }
+
+    let current_cursor = vault.get_meta(RELAY_CURSOR_META)?;
+    let raw_received = vault.get_meta(META_SYNC_RECEIVED_SEQ)?;
+    let raw_integrated = vault.get_meta(META_SYNC_INTEGRATED_SEQ)?;
+    let raw_highwater = vault.get_meta(META_SYNC_CONFIRMED_HIGHWATER)?;
+
+    let received_target = cursor_state.received_seq.max(s);
+    let integrated_target = cursor_state.integrated_seq.max(s);
+    let mut highwater_target = cursor_state.confirmed_highwater.unwrap_or(0).max(s);
+    if let Some(pin) = pins.highwater {
+        highwater_target = highwater_target.max(pin);
+    }
+    let has_progress = cursor_state.received_seq > 0
+        || cursor_state.integrated_seq > 0
+        || cursor_state
+            .confirmed_highwater
+            .is_some_and(|value| value > 0);
+    if has_progress && current_cursor.is_none() {
+        return Err(SyncError::LocalCorrupt("本地已有同步水位但缺 relay 游标"));
+    }
+    // 已有进度时保留现有游标：baseline 的 cursor 只用于"从零开始"的设备，避免回退。
+    // Phase 1B 追赶例外：导入并读回校验成功后，S 已覆盖旧前缀，允许前移到 checkpoint
+    // cursor（最终仍由后续 `advance_cursor` 条件约束，不能因低 S 回退）。
+    let write_cursor = !has_progress || advancement == BootstrapAdvancement::CatchUp;
+
+    let mut statements = Vec::new();
+    let mut guards = Vec::new();
+    // 已有进度时不改写 cursor，但仍要 CAS 自写回一次：若并发写者在读完
+    // current_cursor 之后改写了 sync.relay_cursor，这里必须 Conflict，而不是静默
+    // 放过一个已经变化的游标。
+    if !write_cursor {
+        if let Some(cursor) = current_cursor.as_deref() {
+            push_meta_cas_bytes(
+                &mut statements,
+                &mut guards,
+                RELAY_CURSOR_META,
+                Some(cursor),
+                cursor,
+            );
+        }
+    }
+    if cursor_state.log_id.is_none() {
+        push_meta_insert_absent(
+            &mut statements,
+            &mut guards,
+            META_SYNC_LOG_ID,
+            &state.log_id,
+        );
+    }
+    if raw_received.is_none() || received_target != cursor_state.received_seq {
+        push_meta_cas_u64(
+            &mut statements,
+            &mut guards,
+            META_SYNC_RECEIVED_SEQ,
+            cursor_state.received_seq,
+            received_target,
+        );
+    }
+    if raw_integrated.is_none() || integrated_target != cursor_state.integrated_seq {
+        push_meta_cas_u64(
+            &mut statements,
+            &mut guards,
+            META_SYNC_INTEGRATED_SEQ,
+            cursor_state.integrated_seq,
+            integrated_target,
+        );
+    }
+    if raw_highwater.is_none() || cursor_state.confirmed_highwater != Some(highwater_target) {
+        push_meta_cas_opt_u64(
+            &mut statements,
+            &mut guards,
+            META_SYNC_CONFIRMED_HIGHWATER,
+            cursor_state.confirmed_highwater,
+            highwater_target,
+        );
+    }
+    if write_cursor {
+        push_meta_cas_opt_bytes(
+            &mut statements,
+            &mut guards,
+            RELAY_CURSOR_META,
+            current_cursor.as_deref(),
+            selected.checkpoint.cursor.as_bytes(),
+        );
+    }
+    if stored.instance_id.is_none() {
+        push_meta_insert_absent(
+            &mut statements,
+            &mut guards,
+            META_BOOTSTRAP_INSTANCE,
+            &state.instance_id,
+        );
+    }
+    if stored.epoch != Some(state.epoch) {
+        push_meta_cas_opt_u64(
+            &mut statements,
+            &mut guards,
+            META_BOOTSTRAP_EPOCH,
+            stored.epoch,
+            state.epoch,
+        );
+    }
+    if stored.control_rev != Some(state.control_rev) {
+        push_meta_cas_opt_u64(
+            &mut statements,
+            &mut guards,
+            META_BOOTSTRAP_CONTROL_REV,
+            stored.control_rev,
+            state.control_rev,
+        );
+    }
+    if stored.control_hash != Some(*control_hash) {
+        push_meta_cas_opt_bytes(
+            &mut statements,
+            &mut guards,
+            META_BOOTSTRAP_CONTROL_HASH,
+            stored.control_hash.as_ref().map(<[u8; 32]>::as_slice),
+            control_hash,
+        );
+    }
+
+    // 模拟并发写者在水位事务提交前改写游标：CAS 必须失败且整笔回滚。
+    if fault == Some(BootstrapFault::CursorCasConflict) {
+        if !write_cursor {
+            return Err(injected_fault());
+        }
+        vault.set_meta(RELAY_CURSOR_META, b"fault-cursor")?;
+    }
+
+    match vault.exec_transaction(&statements, &guards) {
+        Ok(_) => Ok(()),
+        Err(menghunote_storage::StorageError::GuardFailed { .. }) => Err(SyncError::Object(
+            "bootstrap 水位 CAS 冲突（游标/水位已被并发写入），未推进",
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn injected_fault() -> SyncError {
+    SyncError::Object("bootstrap 注入故障（测试）")
+}
+
+fn push_meta_insert_absent(
+    statements: &mut Vec<Statement>,
+    guards: &mut Vec<AffectedGuard>,
+    key: &str,
+    value: &[u8],
+) {
+    let index = statements.len();
+    statements.push(Statement::new(
+        "INSERT INTO meta(key,value) SELECT ?1,?2 \
+         WHERE NOT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        vec![Value::Text(key.to_owned()), Value::Blob(value.to_vec())],
+    ));
+    guards.push(AffectedGuard::exactly(index, 1));
+}
+
+fn push_meta_cas_u64(
+    statements: &mut Vec<Statement>,
+    guards: &mut Vec<AffectedGuard>,
+    key: &str,
+    old: u64,
+    new: u64,
+) {
+    if old == 0 {
+        // 0 与"meta 缺失"等价：插入，或 CAS 更新已存在的 0。
+        let index = statements.len();
+        statements.push(Statement::new(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value=?3",
+            vec![
+                Value::Text(key.to_owned()),
+                Value::Blob(new.to_be_bytes().to_vec()),
+                Value::Blob(old.to_be_bytes().to_vec()),
+            ],
+        ));
+        guards.push(AffectedGuard::exactly(index, 1));
+        return;
+    }
+    push_meta_cas_bytes(
+        statements,
+        guards,
+        key,
+        Some(&old.to_be_bytes()),
+        &new.to_be_bytes(),
+    );
+}
+
+fn push_meta_cas_opt_u64(
+    statements: &mut Vec<Statement>,
+    guards: &mut Vec<AffectedGuard>,
+    key: &str,
+    old: Option<u64>,
+    new: u64,
+) {
+    match old {
+        None => push_meta_insert_absent(statements, guards, key, &new.to_be_bytes()),
+        Some(old) => push_meta_cas_u64(statements, guards, key, old, new),
+    }
+}
+
+fn push_meta_cas_opt_bytes(
+    statements: &mut Vec<Statement>,
+    guards: &mut Vec<AffectedGuard>,
+    key: &str,
+    old: Option<&[u8]>,
+    new: &[u8],
+) {
+    match old {
+        None => push_meta_insert_absent(statements, guards, key, new),
+        Some(old) => push_meta_cas_bytes(statements, guards, key, Some(old), new),
+    }
+}
+
+fn push_meta_cas_bytes(
+    statements: &mut Vec<Statement>,
+    guards: &mut Vec<AffectedGuard>,
+    key: &str,
+    old: Option<&[u8]>,
+    new: &[u8],
+) {
+    let Some(old) = old else {
+        push_meta_insert_absent(statements, guards, key, new);
+        return;
+    };
+    let index = statements.len();
+    statements.push(Statement::new(
+        "UPDATE meta SET value=?3 WHERE key=?1 AND value=?2",
+        vec![
+            Value::Text(key.to_owned()),
+            Value::Blob(old.to_vec()),
+            Value::Blob(new.to_vec()),
+        ],
+    ));
+    guards.push(AffectedGuard::exactly(index, 1));
+}
+
+fn decode_vv(bytes: &[u8]) -> Result<VersionVector, SyncError> {
+    if bytes.is_empty() {
+        return Ok(VersionVector::new());
+    }
+    VersionVector::decode(bytes).map_err(|_| SyncError::Object("bootstrap 快照 VV 非法"))
+}
+
+fn read_meta_array<const N: usize>(vault: &Vault, key: &str) -> Result<Option<[u8; N]>, SyncError> {
+    match vault.get_meta(key)? {
+        None => Ok(None),
+        Some(bytes) => bytes
+            .try_into()
+            .map(Some)
+            .map_err(|_| SyncError::LocalCorrupt("bootstrap 本地 pin 长度非法")),
+    }
+}
+
+fn read_meta_u64(vault: &Vault, key: &str) -> Result<Option<u64>, SyncError> {
+    match read_meta_array::<8>(vault, key)? {
+        None => Ok(None),
+        Some(bytes) => Ok(Some(u64::from_be_bytes(bytes))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use menghunote_storage::{
+        append_updates, baseline_verify_failure, create_body_doc, load_head, StorageError,
+        UpdateRecord,
+    };
+
+    fn manifest(key_epoch: u64, total_plain_len: u64) -> ManifestV1 {
+        ManifestV1 {
+            vault_id: [1; 16],
+            key_epoch: 1,
+            checkpoint_id: [2; 16],
+            covered_relay_seq: 3,
+            min_reader: 1,
+            structure_doc_id: "structure".to_owned(),
+            docs: vec![ManifestDoc {
+                doc_id: "structure".to_owned(),
+                kind: KIND_STRUCTURE,
+                generation: 1,
+                key_epoch,
+                vv: vec![1],
+                frontier: vec![2],
+                snapshot_object_id: [3; 32],
+                part_count: 1,
+                total_plain_len,
+                object_digest: [4; 32],
+            }],
+            assets: vec![],
+        }
+    }
+
+    fn digest(value: &ManifestV1) -> [u8; 32] {
+        Sha256::digest(refs_digest_input(&manifest_refs(value)).expect("refs")).into()
+    }
+
+    #[test]
+    fn read_meta_array_rejects_wrong_length_as_local_corrupt() {
+        let (_dir, vault) = fresh_vault();
+        vault
+            .set_meta(META_BOOTSTRAP_EPOCH, b"short")
+            .expect("写坏 pin");
+        let error = BootstrapPins::from_vault(&vault).expect_err("短 pin 必须拒绝");
+        assert!(
+            matches!(error, SyncError::LocalCorrupt(_)),
+            "pin 长度非法必须是 LocalCorrupt，实际 {error:?}"
+        );
+    }
+
+    #[test]
+    fn pin_shape_rejects_hash_without_rev_on_both_paths() {
+        let pins = BootstrapPins {
+            control_hash: Some([0x42; 32]),
+            control_rev: None,
+            ..BootstrapPins::default()
+        };
+        let error = validate_pin_shape(&pins).expect_err("hash 无 rev 必须拒绝");
+        assert!(
+            matches!(error, SyncError::LocalCorrupt(_)),
+            "应当是 LocalCorrupt，实际 {error:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_key_epoch_or_total_len_tamper_changes_refs_digest() {
+        let base = digest(&manifest(1, 100));
+        assert_ne!(
+            digest(&manifest(2, 100)),
+            base,
+            "key_epoch 篡改必须改变 refs_digest"
+        );
+        assert_ne!(
+            digest(&manifest(1, 101)),
+            base,
+            "total_plain_len 篡改必须改变 refs_digest"
+        );
+    }
+
+    fn document() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let doc = loro::LoroDoc::new();
+        doc.get_text("body")
+            .insert(0, "hello")
+            .expect("insert body text");
+        doc.commit();
+        (
+            doc.export(loro::ExportMode::Snapshot).expect("snapshot"),
+            doc.oplog_vv().encode(),
+            doc.state_frontiers().encode(),
+        )
+    }
+
+    fn snapshot(loro: Vec<u8>, vv: Vec<u8>, frontier: Vec<u8>) -> SnapshotV1 {
+        SnapshotV1 {
+            doc_id: "doc".to_owned(),
+            kind: KIND_BODY,
+            generation: 1,
+            codec_version: CODEC_VERSION.to_owned(),
+            app_doc_schema: u32::try_from(APP_DOC_SCHEMA).unwrap_or(1),
+            min_reader: 1,
+            full_history: true,
+            vv,
+            frontier,
+            loro_snapshot_bytes: loro,
+        }
+    }
+
+    fn manifest_doc(vv: Vec<u8>, frontier: Vec<u8>) -> ManifestDoc {
+        ManifestDoc {
+            doc_id: "doc".to_owned(),
+            kind: KIND_BODY,
+            generation: 1,
+            key_epoch: 1,
+            vv,
+            frontier,
+            snapshot_object_id: [7; 32],
+            part_count: 1,
+            total_plain_len: 1,
+            object_digest: [8; 32],
+        }
+    }
+
+    #[test]
+    fn actual_vv_must_match_manifest_claim() {
+        let (loro, vv, frontier) = document();
+        verify_snapshot_history(
+            &snapshot(loro.clone(), vv.clone(), frontier.clone()),
+            &manifest_doc(vv.clone(), frontier.clone()),
+        )
+        .expect("真实历史必须通过");
+
+        // manifest 宣称一个不存在的 peer 的 ops（虚高）：实际 import 必须识破。
+        let mut inflated = VersionVector::decode(&vv).expect("vv");
+        inflated.insert(0xDEAD, 9);
+        assert!(
+            verify_snapshot_history(
+                &snapshot(loro.clone(), inflated.encode(), frontier.clone()),
+                &manifest_doc(inflated.encode(), frontier.clone()),
+            )
+            .is_err(),
+            "虚高 VV 必须被实际 Loro 导入拒绝"
+        );
+
+        // frontier 与 manifest 声明不一致。
+        let mut wrong_frontier = VersionVector::new();
+        wrong_frontier.insert(7, 1);
+        assert!(
+            verify_snapshot_history(
+                &snapshot(loro, vv.clone(), frontier),
+                &manifest_doc(vv, wrong_frontier.encode()),
+            )
+            .is_err(),
+            "frontier 不一致必须拒绝"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_concurrent_local_edits_after_export() {
+        // 导出点（快照）VV：peer 7 有 2 个 op、peer 8 有 1 个。
+        let mut exported_vv = VersionVector::new();
+        exported_vv.insert(7, 2);
+        exported_vv.insert(8, 1);
+
+        // 导出点之后本地继续编辑：当前 VV 严格包含导出点，但不相等。
+        let mut local_vv = exported_vv.clone();
+        local_vv.insert(9, 1);
+        assert_ne!(local_vv, exported_vv);
+        check_imported_doc(
+            &exported_vv,
+            &local_vv,
+            Some("导出点正文"),
+            "导出点正文 + 本地新编辑",
+        )
+        .expect("导出点 VV ⊆ 当前 VV 时必须接受并发本地编辑（不要求相等）");
+
+        // 没有本地 extra（VV 相等）时才逐字节比较正文：不一致必须失败。
+        assert!(
+            check_imported_doc(&exported_vv, &exported_vv, Some("期望正文"), "实际正文").is_err(),
+            "无本地 extra 时正文不一致必须失败"
+        );
+        check_imported_doc(&exported_vv, &exported_vv, Some("同一正文"), "同一正文")
+            .expect("无本地 extra 且正文一致必须通过");
+
+        // 当前 VV 缺少导出点里的 op：方向不能反（不是相等/双向比较）。
+        let mut missing_vv = VersionVector::new();
+        missing_vv.insert(7, 2);
+        assert!(
+            check_imported_doc(&exported_vv, &missing_vv, Some("正文"), "正文").is_err(),
+            "导出点 VV 未被本地覆盖时必须失败"
+        );
+    }
+
+    #[test]
+    fn full_history_is_mandatory() {
+        let (loro, vv, frontier) = document();
+        let mut value = snapshot(loro, vv.clone(), frontier.clone());
+        value.full_history = false;
+        assert!(verify_snapshot_history(&value, &manifest_doc(vv, frontier)).is_err());
+    }
+
+    #[test]
+    fn structure_semantics_require_referenced_body_in_manifest() {
+        let peer = 7u64;
+        let structure = menghunote_storage::StructureDoc::create(peer).expect("structure");
+        let seed = structure
+            .create_note("标题", 1_700_000_000)
+            .expect("create note");
+        let bytes = structure.export_snapshot().expect("snapshot");
+        let doc = VerifiedDoc {
+            doc_id: STRUCTURE_DOC_ID.to_owned(),
+            kind: KIND_STRUCTURE,
+            snapshot: SnapshotV1 {
+                doc_id: STRUCTURE_DOC_ID.to_owned(),
+                kind: KIND_STRUCTURE,
+                generation: 1,
+                codec_version: CODEC_VERSION.to_owned(),
+                app_doc_schema: 1,
+                min_reader: 1,
+                full_history: true,
+                vv: Vec::new(),
+                frontier: Vec::new(),
+                loro_snapshot_bytes: bytes,
+            },
+            actual_vv: VersionVector::new(),
+            text: None,
+        };
+        // 结构引用了 seed.body_doc_id，但基线 manifest 里没有它：必须拒绝。
+        assert!(verify_structure_semantics(std::slice::from_ref(&doc), peer).is_err());
+
+        // 正文在 manifest 里时通过，并给出 note_id -> body_doc_id。
+        let body = VerifiedDoc {
+            doc_id: seed.body_doc_id.clone(),
+            kind: KIND_BODY,
+            snapshot: SnapshotV1 {
+                doc_id: seed.body_doc_id.clone(),
+                kind: KIND_BODY,
+                generation: 1,
+                codec_version: CODEC_VERSION.to_owned(),
+                app_doc_schema: 1,
+                min_reader: 1,
+                full_history: true,
+                vv: Vec::new(),
+                frontier: Vec::new(),
+                loro_snapshot_bytes: Vec::new(),
+            },
+            actual_vv: VersionVector::new(),
+            text: Some(String::new()),
+        };
+        let notes = verify_structure_semantics(&[doc, body], peer).expect("结构语义通过");
+        assert_eq!(notes.get(&seed.note_id), Some(&seed.body_doc_id));
+    }
+
+    #[test]
+    fn manifest_structure_doc_must_be_storage_constant() {
+        let mut value = manifest(1, 100);
+        value.structure_doc_id = "other".to_owned();
+        let checkpoint = BootstrapCheckpoint {
+            checkpoint_id: value.checkpoint_id,
+            epoch: value.key_epoch,
+            covered_seq: value.covered_relay_seq,
+            manifest_oid: [8; 32],
+            refs_digest: None,
+            cursor: "c3".to_owned(),
+            signed_commit: None,
+            signature: None,
+        };
+        assert!(verify_manifest(&value, value.vault_id, &checkpoint, 1).is_err());
+    }
+
+    #[test]
+    fn control_head_hash_binds_coordinates_and_chain() {
+        let state = RelayState {
+            vault_id: [1; 16],
+            log_id: [2; 16],
+            instance_id: [3; 16],
+            epoch: 4,
+            control_rev: 5,
+            auth_rev: 1,
+            head_seq: 10,
+            gc_floor: 0,
+            current_rotation_id: None,
+        };
+        let base = control_head_hash(&state, &[]);
+        let mut other_instance = state.clone();
+        other_instance.instance_id = [9; 16];
+        assert_ne!(control_head_hash(&other_instance, &[]), base);
+        let mut other_rev = state.clone();
+        other_rev.control_rev = 6;
+        assert_ne!(control_head_hash(&other_rev, &[]), base);
+        let entry = ManagerChainEntry {
+            rev: 2,
+            pubkey: [7; 32],
+            transition: vec![1, 2, 3],
+            old_rev: 1,
+            old_signature: Some([4; 64]),
+            new_signature: None,
+        };
+        assert_ne!(control_head_hash(&state, &[entry]), base);
+    }
+
+    /// 单测用的临时 vault：lib 单测没有编译期 `CARGO_TARGET_TMPDIR`，回退到仓库 `target/tmp`。
+    fn fresh_vault() -> (tempfile::TempDir, Vault) {
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")
+            });
+        std::fs::create_dir_all(&base).expect("创建 target/tmp");
+        let dir = tempfile::Builder::new()
+            .prefix("bootstrap-gate-")
+            .tempdir_in(&base)
+            .expect("创建临时目录");
+        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开 vault");
+        (dir, vault)
+    }
+
+    /// 基线 staging 的预期参与集合（本文件两个用例都只声明文档）。
+    fn expectation(docs: &[&str]) -> BaselineExpectation {
+        BaselineExpectation::new(
+            docs.iter().map(|doc_id| (*doc_id).to_owned()),
+            std::iter::empty::<[u8; 32]>(),
+        )
+    }
+
+    /// 生成一份基线快照（另一个 peer 的空文档，只含给定正文）。
+    fn baseline_snapshot(doc_id: &str, peer_id: u64, text: &str) -> Vec<u8> {
+        let doc = BodyDoc::create(doc_id, peer_id).expect("创建基线 LoroDoc");
+        doc.insert_scalars(0, text).expect("写基线正文");
+        doc.export_snapshot().expect("导出基线 snapshot")
+    }
+
+    /// 在本地先提交一条正文 update（证明 abort 不会丢本地已 merge 的 op）。
+    fn seed_local_body(vault: &Vault, doc_id: &str, peer_id: u64, text: &str) {
+        create_body_doc(vault, doc_id).expect("建 loro_docs 行");
+        let doc = BodyDoc::create(doc_id, peer_id).expect("创建本地 BodyDoc");
+        doc.insert_scalars(0, text).expect("写本地正文");
+        let head = load_head(vault, doc_id).expect("读本地 head");
+        let base = head.version_vector().expect("解码 head_vv");
+        let update = doc.pending_update(&base).expect("导出本地增量");
+        append_updates(
+            vault,
+            doc_id,
+            head.head_seq,
+            &[UpdateRecord::new("local-merge", update)],
+        )
+        .expect("提交本地增量");
+    }
+
+    #[test]
+    fn reconcile_journal_auto_aborts_bootstrap_staging_and_clears_marker() {
+        let (_dir, vault) = fresh_vault();
+        // 本地先有一份正文；随后 baseline 批次与它 merge（staging 里已有 merged 数据）。
+        seed_local_body(&vault, "doc-merged", 0xA11CE, "local-merged|");
+        begin_baseline_apply(
+            &vault,
+            &[1; 16],
+            10,
+            "bootstrap:relay-cursor-10",
+            &expectation(&["doc-merged"]),
+        )
+        .expect("begin bootstrap staging");
+        let applied = apply_baseline_batch(
+            &vault,
+            &[(
+                "doc-merged".to_owned(),
+                baseline_snapshot("doc-merged", 0xB0B, "baseline-merged"),
+            )],
+            &[],
+        )
+        .expect("merge baseline snapshot");
+        assert_eq!(applied.applied_docs, 1, "前置条件：基线批次已 merge");
+        mark_baseline_verify_failed(&vault, "读回校验失败：注入").expect("写失败标记");
+        assert!(
+            baseline_apply_state(&vault).expect("state").is_some(),
+            "前置条件：staging journal 必须存在"
+        );
+
+        // 换新基线（checkpoint / S / source 全不同）：bootstrap staging 必须 auto-abort。
+        reconcile_journal(&vault, &[2; 16], 20, "bootstrap:relay-cursor-20")
+            .expect("bootstrap 换基线应 auto-abort 旧 staging");
+
+        assert!(
+            baseline_apply_state(&vault).expect("state").is_none(),
+            "auto-abort 后 staging journal 必须清除"
+        );
+        assert_eq!(
+            baseline_verify_failure(&vault).expect("读失败标记"),
+            None,
+            "auto-abort 必须同时清除 verify 失败标记"
+        );
+        // 已 merge 的 Loro 数据保留（abort 只清 journal，不回滚 CRDT merge）。
+        let (merged, _) =
+            load_body_doc(&vault, "doc-merged", 0xA11CE, None).expect("读回 merged 文档");
+        let merged_text = merged.text();
+        assert!(
+            merged_text.contains("local-merged"),
+            "auto-abort 不得丢本地已 merge 的 op，实际={merged_text:?}"
+        );
+        assert!(
+            merged_text.contains("baseline-merged"),
+            "auto-abort 不得回滚已 merge 的基线数据，实际={merged_text:?}"
+        );
+        // 新基线可以直接 begin（旧 journal/marker 不会挡住续跑）。
+        let reopened = begin_baseline_apply(
+            &vault,
+            &[2; 16],
+            20,
+            "bootstrap:relay-cursor-20",
+            &expectation(&["doc-merged"]),
+        )
+        .expect("auto-abort 后必须能以新基线重新 begin");
+        assert_eq!(reopened.status, BaselineApplyStatus::Staging);
+        assert_eq!(reopened.applied_docs, 0, "新基线应是全新 journal");
+    }
+
+    #[test]
+    fn reconcile_journal_refuses_rotation_staging_without_abort() {
+        // 轮换的 baseline apply 传空 source（rotation_apply.rs）；非 bootstrap 前缀同样拒绝。
+        for source_cursor in ["", "rotation:custom"] {
+            let (_dir, vault) = fresh_vault();
+            begin_baseline_apply(
+                &vault,
+                &[3; 16],
+                5,
+                source_cursor,
+                &expectation(&["doc-rotation"]),
+            )
+            .expect("begin rotation staging");
+            mark_baseline_verify_failed(&vault, "轮换中的失败标记").expect("写失败标记");
+
+            let error = reconcile_journal(&vault, &[4; 16], 9, "bootstrap:relay-cursor-9")
+                .expect_err("不得 auto-abort 非 bootstrap 的 staging");
+            match &error {
+                SyncError::Storage(StorageError::SyncConflict { context }) => {
+                    assert!(
+                        context.contains("非 bootstrap"),
+                        "错误必须点明拒绝原因，实际：{context}"
+                    );
+                }
+                other => panic!("应当拒绝为 SyncConflict，实际 {other:?}"),
+            }
+
+            // journal 与失败标记都必须原样保留：绝不能被误当成 bootstrap 的 staging 清掉。
+            let state = baseline_apply_state(&vault)
+                .expect("state")
+                .expect("轮换 journal 必须保留");
+            assert_eq!(state.status, BaselineApplyStatus::Staging);
+            assert_eq!(state.checkpoint_id, [3; 16]);
+            assert_eq!(state.baseline_s, 5);
+            assert_eq!(state.source_cursor, source_cursor);
+            assert!(!state.finishable, "失败标记存在时不得 finishable");
+            assert_eq!(
+                baseline_verify_failure(&vault)
+                    .expect("读失败标记")
+                    .as_deref(),
+                Some("轮换中的失败标记"),
+                "拒绝 auto-abort 时绝不能误清失败标记"
+            );
+        }
+    }
+}
+
+`````
+
+
+## `crates/sync/src/dev_local.rs`
+
+`````rust
+//! ADR 0009 切片 4b：**GPUI-free** 的 dev-local 同步编排（Create / 发布初始基线 / Join / SyncOnce）。
+//!
+//! 本模块只做"把 `crates/sync` 已有的真实步骤按 ADR 0009 的顺序串起来"，不新增协议、
+//! 不改 wire、不碰 UI/worker（切片 4c 才接 `SyncService`）。它存在的理由是：同样的
+//! 编排写在 `examples/e2e_common.rs` 里只能给 example 用，而 app 的 dev-sync worker
+//! 需要一个**可测、无 GPUI**的库入口。
+//!
+//! ## 编排
+//!
+//! 1. [`DevLocal::create`]：`POST /v1/vaults`（genesis）→ 新建本地 SQLite vault →
+//!    落 `sync.relay_cursor`（relay 提供时）/ `sync.log_id` / 展示标签 /
+//!    **初始 recovery 槽材料** → **上传初始 recovery 槽**（KEY_SLOT staging）并落
+//!    「已上传」标记。槽必须在恢复码还在内存里的这一刻上传：KEY_SLOT 对象的 MNE1
+//!    密钥 `K_slot_mne = HKDF(恢复码种子)` 不可逆，恢复码又不落盘，事后无法补传；
+//! 2. 发布初始基线有两条入口，共用同一条核心路径（sync + 两份 checkpoint）：
+//!    - [`DevLocal::publish_initial_pair`]（CLI）：校验恢复码与本地管理身份一致 →
+//!      上传/重传初始 recovery 槽（幂等）→ 核心；
+//!    - [`DevLocal::publish_initial_pair_with_identity`]（面板 worker）：**不接收恢复码**，
+//!      信任锚是受保护身份里的 `manager_seed`（Join 设备没有 → 明确拒绝），初始槽以
+//!      Create 落下的「已上传」标记为前提（旧实例明确失败并指向 CLI 路径）；
+//!
+//!    两条入口随后都跑一轮完整 `SyncOnce`（让覆盖证明只认 durable 事实）→ 用
+//!    [`CheckpointWriter`] 发布**两份**真实同 epoch checkpoint（manifest/snapshot/
+//!    asset/refs），并把最新一份落成 durable 事实；
+//! 3. [`DevLocal::join`]：只接收 `vault_id + 恢复码 + 新路径`。`RecoverySeed →
+//!    ManagementKey::from_recovery` → `recovery_enroll::self_enroll` 建管理信任锚并
+//!    自批新设备 → `bootstrap::run_with_pins` 认证读取并导入基线 → pins/cursor 由
+//!    bootstrap 落库，identity 只返回给调用方（**不读 A 的目录/identity/root**，
+//!    也不在 vault 里写任何私钥或恢复码）；
+//! 4. [`DevLocal::sync_once`]：构造借用型 [`SyncEngine`]，按 `encrypt_pending → push →
+//!    pull → integrate → ack` 跑一轮，返回 [`SyncReport`]（游标由 engine 自己推进）；
+//! 5. ADR 0010 切片 2a-2 的两个**只读/管理**入口，给 dev-only 设备列表 UI 用：
+//!    [`DevLocal::members`]（已验证控制链的只读成员视图）与 [`DevLocal::revoke_device`]
+//!    （管理密钥 + 管理端 helper 移除一台设备的访问，**不轮换密钥**、不删本地身份）。
+//!
+//! ## 凭据模型（dev-only）
+//!
+//! dev-local 只有**恢复码**一种凭据：`create` 不接收口令，因此 password 槽材料只存在于
+//! 进程内、不上传、不落盘（口令槽 onboarding 属于切片 4c 的正式流程）。所以
+//! `create` / [`DevLocal::publish_initial_pair`] 上传的是 **genesis 生成的那一个 recovery
+//! 槽**（staging），Join 全程只靠恢复码解出根。
+//!
+//! 面板的「发布基线」走 [`DevLocal::publish_initial_pair_with_identity`]：它**不需要恢复码**
+//! （恢复码在 Create 之后就不在进程里了），只要求身份里有管理私钥，且初始槽已由 Create
+//! 上传过（[`INITIAL_SLOT_UPLOADED_META`]）。这是 ADR 0009 切片 4c-4 的取舍：为了让面板
+//! 能一键发布，把"只有恢复码能做的事"（上传初始槽）前移到 Create，发布本身只做
+//! "同步 + 两份 checkpoint"。
+//!
+//! ## 安全与非目标
+//!
+//! - relay 接入统一走 [`crate::relay_context::RelayContext`]：本模块的每个操作都从
+//!   **同一个** context 取客户端/传输（不再各自拼 `StdTcpTransport`）；URL 兼容入口
+//!   只是先构造一个 `local_dev` context。`remote_tls` 的 Create/Join 初始化在
+//!   [`crate::remote_init`]（S3b），本模块保持 local_dev 语义。普通同步的
+//!   生产 TLS 由 app 按公开配置的模式用 `remote_tls` context 打开；本模块不实现验签——测试用
+//!   `menghunote-dev-relay`，它是**放行验签**的测试脚手架，**非生产**；正式鉴权负例
+//!   必须走 relay 生产 hook；
+//! - 不在这里写 app 的受保护身份文件（`DevIdentityStore` 负责 DPAPI/Linux 主钥封装）：
+//!   identity 只经返回值交给调用方，绝不进 vault meta/明文配置/日志；
+//! - 恢复码只以 `String` 形式交给调用方（ADR 0009：仅临时显示，提交后清除），本模块
+//!   自身不打印、不落盘；`setup_secret` 只回显、不持久化；
+//! - 初始 recovery 槽材料（描述符 + 包裹根密文）会写入 vault meta
+//!   [`INITIAL_RECOVERY_SLOT_META`]：那是**已经要发到 relay 的密文**，不含根/恢复码明文；
+//!   它让"发布基线"可重复且幂等（同一 slot_id/描述符，relay 只登记一次）。
+//!
+//! ## 失败可恢复性
+//!
+//! - `create` 是新建库：路径已存在直接拒绝；任何一步失败都**不留下**可被误用的本地
+//!   vault（已创建的文件会被清掉）。relay 侧可能留下一个"没有槽、没有 checkpoint"
+//!   的空 vault，它无法被任何设备使用，重试 `create` 会建新的；
+//! - `publish_initial_pair` 先做恢复码一致性校验（错了在**任何上传之前**失败），再做
+//!   槽上传/同步/两份 checkpoint；它是幂等的，失败后重跑会补齐（relay 只把最新的两份
+//!   published 作为 `/bootstrap` 的候选）；
+//! - `join` 失败不写 cursor/identity：bootstrap 只在全部导入通过后一个事务推进水位；
+//!   失败时本模块清掉新建的本地文件（不在新目录留半初始化库），调用方重新 Join 即可。
+
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::checkpoint::{CheckpointReport, CheckpointWriter, StorageAssets};
+use crate::device::{DeviceSigningKey, ManagementKey};
+use crate::device_management::{RevokeContext, RevokeOutcome};
+use crate::engine::{
+    AckReport, AssetSyncReport, EngineConfig, EngineIdentity, IntegrateConfig, IntegrateReport,
+    PullReport, PushReport, SyncEngine, SyncReport, RELAY_CURSOR_META,
+};
+use crate::error::SyncError;
+use crate::genesis;
+use crate::http_relay::{Clock, HttpRelayClient, MemberView, SystemClock};
+use crate::http_transport::{HttpTransport, TransportTimeouts, DEFAULT_TRANSPORT_TIMEOUTS};
+use crate::identity::LocalIdentityV1;
+use crate::ids;
+use crate::init_session::InitSession;
+use crate::keys::RootSecretV1;
+use crate::random::{array, OsRandom};
+use crate::recovery::{management_seed, RecoverySeed};
+use crate::relay::RelayClient as _;
+use crate::relay_context::{RelayContext, RelayTarget};
+use crate::slot::{KeySlotV1, WrappedRoot};
+use crate::{DeviceId, VaultId};
+use menghunote_storage::{
+    ensure_structure_row, load_head, materialize_body, pending_outbox, set_sync_log_id, Vault,
+    STRUCTURE_DOC_ID,
+};
+use menghunote_sync_proto::{SlotDescriptorV1, SlotKind};
+
+// ADR 0009 Phase 2（切片 5）：轮换的库级入口与结果类型，与 Create/Join/SyncOnce 同层导出。
+pub use crate::dev_local_rotation::{ApplyOutcome, RotationOutcome};
+
+/// `meta` 键：dev-local 实例的展示标签（仅本机，非 wire；Join 不导入）。
+pub const VAULT_LABEL_META: &str = "dev.local.vault_label";
+/// `meta` 键：genesis 生成的初始 recovery 槽材料（描述符 CDE + `nonce||ciphertext`）。
+///
+/// **只含密文**：包裹根用 `HKDF(恢复码)` 派生 KEK 加 AEAD，槽体与上传到 relay 的
+/// KEY_SLOT 明文逐字节相同；恢复码本身不落盘。写入后只由
+/// [`DevLocal::upload_initial_slot`] 读取（复用同一 slot_id，relay 幂等）。
+pub const INITIAL_RECOVERY_SLOT_META: &str = "dev.local.initial_recovery_slot.v1";
+/// `meta` 键：初始 recovery 槽**已上传到 relay** 的 durable 事实（ADR 0009 切片 4c-4）。
+///
+/// 记录 `slot_id`（32B）+ 确定性 `message_id`（16B），两者都是公开事实，不含恢复码/根。
+/// 它是"只凭身份发布基线"（[`DevLocal::publish_initial_pair_with_identity`]）的前置条件：
+/// 上传 KEY_SLOT 需要的 `K_slot_mne` 只能由恢复码种子派生，恢复码不落盘 → 事后无法补传，
+/// 所以缺这条事实的旧实例必须明确失败并指向 CLI 的恢复码路径（不静默发布一个 B 无法
+/// Join 的假基线）。
+pub const INITIAL_SLOT_UPLOADED_META: &str = "dev.local.initial_slot_uploaded.v1";
+/// `meta` 键：最近一次发布基线的**较新**那份 checkpoint。
+pub const PUBLISHED_BASELINE_META: &str = "dev.local.published_baseline.v1";
+
+/// 初始 recovery 槽记录 magic（"MenghuNote Dev Local Slot v1"）。
+const INITIAL_SLOT_MAGIC: &[u8; 8] = b"MN/DLS1\0";
+/// 初始 recovery 槽「已上传」记录 magic。
+const INITIAL_SLOT_UPLOADED_MAGIC: &[u8; 8] = b"MN/DLS2\0";
+/// 已发布基线记录 magic。
+const PUBLISHED_BASELINE_MAGIC: &[u8; 8] = b"MN/DLB1\0";
+/// 槽描述符 CDE 的合理上限（`SlotDescriptorV1` 现在是 ~70B，留余量防止坏长度读爆内存）。
+const MAX_SLOT_DESCRIPTOR_LEN: usize = 4096;
+/// KEY_SLOT `message_id` 派生的域分隔（非秘密；换它等于换对象字节，会导致 409）。
+const KEY_SLOT_MESSAGE_DOMAIN: &[u8] = b"MN/v1/dev-local/key-slot-message\0";
+
+/// 一轮同步的可选注入项（ADR 0012 S1）：**传输预算** + **集成前守卫**。
+///
+/// 为什么需要它：`DevLocal` 过去自己构造 transport（超时预算接不进来），而且
+/// `integrate` 一旦开始就没有"取消/授权复核"的边界。两者都必须由调用方（app 的
+/// worker）决定，所以收进一个显式结构，而不是在 `DevLocal` 内部硬编。
+///
+/// - `transport = None`：保持历史默认（连接/读写 30s、无整次请求预算）；
+/// - `before_integrate = None`：不做额外复核（CLI/测试路径）。
+#[derive(Default)]
+pub struct SyncOnceOptions<'a> {
+    /// 传输超时预算；`None` = 历史默认（向后兼容）。
+    pub transport: Option<TransportTimeouts>,
+    /// `integrate` 之前最后一道门：返回 `Err` 即**不 append**（取消/授权已失效）。
+    pub before_integrate: Option<&'a mut (dyn FnMut() -> Result<(), SyncError> + 'a)>,
+}
+
+/// dev-local 编排入口（纯函数集合，无状态）。
+pub struct DevLocal;
+
+/// `create` 的结果：本地 vault + 正式身份 + 恢复码。
+///
+/// **不实现 `Debug`/`Display`**：`identity` 与 `recovery_code` 都是秘密材料
+/// （`LocalIdentityV1` 本身也不实现，避免误打印）。
+pub struct CreatedVault {
+    /// 新开的本地库（已建 structure 行、游标、log_id 与标签）。
+    pub vault: Vault,
+    /// genesis 身份（含管理私钥；app 由 `DevIdentityStore` 受保护落盘）。
+    pub identity: LocalIdentityV1,
+    /// 新 vault 的 id（Join 时展示/输入的公开标识）。
+    pub vault_id: VaultId,
+    /// 一次性展示给用户的恢复码（`mnrec1...`，**不得**写日志/配置）。
+    pub recovery_code: String,
+    /// 回显调用方传入的 setup secret（dev-only；**不得**落盘/写日志）。
+    pub setup_secret: String,
+}
+
+/// `join` 的结果：新设备自己的 vault + 设备身份。
+pub struct JoinedVault {
+    /// 新开的本地库（已由 bootstrap 导入基线并落 pins/cursor）。
+    pub vault: Vault,
+    /// 新设备身份（`manager_seed = None`：普通设备没有管理私钥）。
+    pub identity: LocalIdentityV1,
+    /// 加入的 vault id。
+    pub vault_id: VaultId,
+}
+
+/// [`DevLocal::published_baseline`] 读出的 durable 事实（本地 meta，非 wire）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedBaseline {
+    /// 较新那份 checkpoint 的 id。
+    pub checkpoint_id: [u8; 16],
+    /// 该 checkpoint 的 epoch。
+    pub epoch: u64,
+    /// 该 checkpoint 固定的 S。
+    pub covered_seq: u64,
+    /// relay 记录的发布时间（Unix 秒）。
+    pub published_at: u64,
+}
+
+/// [`DevLocal::revoke_device`] 的结果：relay 事实 + **刷新后**的成员视图（ADR 0010 切片 2a-2）。
+///
+/// 两个字段都不含秘密：`outcome` 只有目标设备/`changed`/`auth_rev`/`control_rev`；
+/// `members` 是只读投影（`MemberView` 的 `Debug` 只打印 id/status/fingerprint）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedDevice {
+    /// 管理端请求返回的事实（`control_rev` 不变、`auth_rev` 可能已前进）。
+    pub outcome: RevokeOutcome,
+    /// 吊销**之后**重新拉取的成员视图（已按 `device_id` 稳定升序）。
+    pub members: Vec<MemberView>,
+}
+
+/// 两阶段同步 **Prepare** 阶段的报告（encrypt/push/pull；不含 integrate/ack）。
+#[derive(Debug, Default)]
+pub struct PrepareReport {
+    /// 本轮新加密的本地意图数。
+    pub encrypted: usize,
+    /// 推送结果。
+    pub push: PushReport,
+    /// 增量资产上传结果（正文 push 之后、pull 之前）。
+    pub assets: AssetSyncReport,
+    /// 拉取结果（游标已 durable 推进）；切换为 checkpoint 追赶时为默认值。
+    pub pull: PullReport,
+    /// Phase 1B：已准备好、等待持闸的追赶候选；`None` = 本轮走普通聚合 pull。
+    pub catchup: Option<crate::catchup::CatchUpPrepared>,
+}
+
+/// 两阶段同步 **Integrate** 阶段的报告。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegratePhaseReport {
+    /// 集成结果（integrated/deferred/批次/是否投影）。
+    pub integrate: IntegrateReport,
+    /// 本阶段 head **真的前进**的文档（结构 + 正文；UI 据此判断交付/刷新）。
+    pub changed_heads: Vec<String>,
+    /// `watch_doc` 是否真的前进（= 需要交付）。
+    pub watch_doc_changed: bool,
+    /// 本阶段按 durable outbox 触发物化的正文篇数（changed heads → 物化/索引更新）。
+    pub materialized: usize,
+    /// 物化失败篇数（失败只记日志，不影响已 durable 的 CRDT 集成结论）。
+    pub materialize_failed: usize,
+    /// Phase 1B：本轮是否执行了 checkpoint 追赶。
+    pub catchup: Option<crate::catchup::CatchUpReport>,
+}
+
+/// 两阶段同步 **Finish** 阶段的报告（push tail + ack）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FinishReport {
+    /// 上报的 received/integrated 游标。
+    pub ack: AckReport,
+    /// tail 阶段新加密的本地意图数。
+    pub encrypted: usize,
+    /// tail 推送结果。
+    pub push: PushReport,
+}
+
+impl DevLocal {
+    /// Create：对真实 relay 走 genesis，并新建（**必须是新路径**）本地 vault。
+    ///
+    /// 初始化走 ADR 0013 S2b 的受限能力 [`InitSession::new_genesis`]：
+    ///
+    /// 1. 先在本地生成 vault/device **材料**（不联网），再开新库并写 durable pending
+    ///    （`sync.init_pending`）——顺序是"先记录意图、再联网"；
+    /// 2. `POST /v1/vaults`（写前先推进 `GenesisRequested`）；成功后**不重复**创建；
+    /// 3. 用本地提交证书复算 rev1 `record_hash`，验证 relay 当前链/前缀，再 durable
+    ///    提交强 pin（`sync.control_pin`，rev1 record 锚）；
+    /// 4. 写本地事实（structure/label/cursor/log_id/初始槽材料）→ 上传初始 recovery 槽
+    ///    → pending 进入 `Done` 并清理（app 走 [`Self::create_deferring_identity`]：
+    ///    停在 `PinCommitted`，身份 rename 成功后再推进 `IdentityWritten → Done`）。
+    ///
+    /// 失败语义沿用 ADR 0009（app 验收依赖它）：**任何返回错误都清掉本次新建的库文件**
+    /// （relay 侧可能留下一个没有槽/没有 checkpoint 的空 vault，重试会建新的）；
+    /// pending 的用途是**崩溃**（进程消失、清理代码没跑）之后的对账，见
+    /// [`crate::init_session::reconcile`]。
+    ///
+    /// 口令：dev-local 不接收口令，genesis 的 password 槽材料用一次随机口令生成后**丢弃**
+    /// （不上传、不落盘），因此该 vault 只能靠恢复码加入——这是 ADR 0009 Phase 1 的
+    /// dev-only 取舍，口令 onboarding 在切片 4c。
+    pub fn create(
+        relay_url: &str,
+        setup_secret: &str,
+        vault_path: &Path,
+        vault_label: &str,
+    ) -> Result<CreatedVault, SyncError> {
+        Self::create_inner(relay_url, setup_secret, vault_path, vault_label, true)
+    }
+
+    /// **app 专用**：与 [`Self::create`] 完全相同，但 pending 停在 `PinCommitted`。
+    ///
+    /// 调用方必须在身份**原子落盘**（`DevIdentityStore::persist_protected` 的临时文件 +
+    /// rename）之后调用 [`crate::init_session::mark_identity_written`] 与
+    /// `finish_identity_written`。这样"relay 已建 vault、本地身份还没落盘"的崩溃窗口
+    /// 有 durable pending 可对账（ADR 0013 §2/S3），而不是靠重跑 genesis。
+    ///
+    /// 失败语义与 [`Self::create`] 一致：返回错误时清掉本次新建的本地文件。
+    pub fn create_deferring_identity(
+        relay_url: &str,
+        setup_secret: &str,
+        vault_path: &Path,
+        vault_label: &str,
+    ) -> Result<CreatedVault, SyncError> {
+        Self::create_inner(relay_url, setup_secret, vault_path, vault_label, false)
+    }
+
+    fn create_inner(
+        relay_url: &str,
+        setup_secret: &str,
+        vault_path: &Path,
+        vault_label: &str,
+        finish_identity: bool,
+    ) -> Result<CreatedVault, SyncError> {
+        if vault_path.as_os_str().is_empty() {
+            return Err(SyncError::LocalCorrupt("Create 需要明确的 vault 路径"));
+        }
+        if vault_path.exists() {
+            return Err(SyncError::LocalCorrupt(
+                "Create 只接受尚不存在的 vault 路径（已有库请按其身份使用）",
+            ));
+        }
+
+        // 0. 按唯一权威策略构造 context（local_dev 只接受 http + loopback 白名单）。
+        let context = RelayContext::local_dev(relay_url, DEFAULT_TRANSPORT_TIMEOUTS)?;
+
+        // 1. 本地材料：vault_id/device_id 必须**先进 pending**，之后才能发请求。
+        let vault_id: VaultId = array(&mut OsRandom)?;
+        let device_id: DeviceId = array(&mut OsRandom)?;
+        let throwaway_password = throwaway_password()?;
+        let materials = genesis::build_materials(
+            vault_id,
+            device_id,
+            &throwaway_password,
+            SystemClock.now_secs(),
+            &mut OsRandom,
+        )?;
+        let session = InitSession::new_genesis(context, &materials)?;
+        let context = session.context().clone();
+
+        // 2. 新库（pending 需要 SQLite；genesis 失败时会连同 pending 一起清掉）。
+        let vault = match Vault::open(vault_path) {
+            Ok(vault) => vault,
+            Err(error) => {
+                remove_vault_files(vault_path);
+                return Err(SyncError::Storage(error));
+            }
+        };
+        let created = (|| -> Result<(LocalIdentityV1, String), SyncError> {
+            session.prepare_pending(&vault, SystemClock.now_secs())?;
+            let receipt = session.request_genesis(&vault, &materials, setup_secret)?;
+            let report = session.finalize_genesis(&vault, &materials, &receipt)?;
+
+            ensure_structure_row(&vault)?;
+            vault.set_meta(VAULT_LABEL_META, vault_label.as_bytes())?;
+            // 初始游标：genesis 响应键 5（旧 relay 可能没有 —— 那就留空，publish 时用
+            // `GET /state` 键 14 兜底，且绝不把"缺失"当成 0 号游标）。
+            if let Some(cursor) = &receipt.initial_cursor {
+                vault.set_meta(RELAY_CURSOR_META, cursor.as_bytes())?;
+            }
+            // log_id 来自 genesis 响应：先钉住 relay 日志代，pull 再复核。
+            set_sync_log_id(&vault, &receipt.log_id)?;
+            // 初始 recovery 槽材料（密文）留给发布/Join 复用（同一 slot_id 幂等）。
+            let slot_record = encode_initial_slot(&materials.recovery_slot)?;
+            vault.set_meta(INITIAL_RECOVERY_SLOT_META, &slot_record)?;
+
+            // 初始 recovery 槽必须**现在**上传（ADR 0009 切片 4c-4）：KEY_SLOT 对象的 MNE1
+            // 密钥 `K_slot_mne = HKDF(恢复码种子)` 不可逆，而恢复码只在这一刻还在内存里、不落盘。
+            // 这一步是初始化内部操作（`open_for_init` 跳过 pending 守卫）。
+            Self::upload_initial_slot_during_init(
+                &context,
+                &vault,
+                &report.identity,
+                &materials.recovery_seed,
+            )?;
+
+            // 本地初始化完成：pending → Done → 清理（清理只在 Done）。
+            // app 的延迟路径停在 PinCommitted，等身份 rename 成功后由调用方推进。
+            if finish_identity {
+                session.finish(&vault)?;
+            }
+            Ok((report.identity, materials.recovery_code.as_str().to_owned()))
+        })();
+        match created {
+            Ok((identity, recovery_code)) => Ok(CreatedVault {
+                vault,
+                vault_id: identity.vault_id,
+                recovery_code,
+                identity,
+                setup_secret: setup_secret.to_owned(),
+            }),
+            Err(error) => {
+                drop(vault);
+                remove_vault_files(vault_path);
+                Err(error)
+            }
+        }
+    }
+
+    /// CLI 路径的发布初始基线：**用恢复码**确认管理身份，然后与身份路径共用同一条核心。
+    ///
+    /// 步骤（顺序不可交换）：
+    /// 1. 恢复码必须与本地管理身份一致（`HKDF(R) == identity.manager_seed`）——错了在
+    ///    任何上传之前失败，避免用一个错码把 KEY_SLOT 密文写坏；
+    /// 2. 上传 genesis 的 recovery 槽（staging；`PUT key-slots` 对同 slot_id 同描述符幂等；
+    ///    新实例在 Create 时已上传过一次，这里只是补齐旧实例或灾后重传）并落 durable 标记；
+    /// 3. 核心：一轮完整 `SyncOnce`（覆盖证明只认 durable 事实）+ 连续两份同 epoch
+    ///    checkpoint（见 [`Self::publish_baseline_core_with`]）。
+    ///
+    /// 这条入口保留给 CLI（`--dev-sync-publish`）、自动化与恢复场景；面板按钮走
+    /// [`Self::publish_initial_pair_with_identity`]（不需要恢复码）。
+    pub fn publish_initial_pair<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        recovery_code: &str,
+    ) -> Result<CheckpointReport, SyncError> {
+        let seed = RecoverySeed::from_code(recovery_code)?;
+        verify_recovery_matches(identity, &seed)?;
+        // 预算取历史默认（本入口没有 per-call 预算参数）；显式 context 用自己的预算。
+        let context = target.relay_context(None)?;
+        Self::upload_initial_slot(&context, vault, identity, &seed)?;
+        Self::publish_baseline_core_with(&context, vault, identity, SyncOnceOptions::default())
+    }
+
+    /// **只凭受保护身份**发布初始基线（ADR 0009 切片 4c-4；面板「发布基线」的库入口）。
+    ///
+    /// 与 [`Self::publish_initial_pair`] 的差别只有"信任锚 + 初始槽"两步：
+    ///
+    /// - **不接收恢复码**：管理私钥（`identity.manager_seed`）必须存在，且派生出的管理公钥
+    ///   必须等于身份里 pin 住的 `pinned_manager`。Join 设备没有管理私钥 → 明确错误，
+    ///   绝不退化成"用设备 key 冒充管理"；
+    /// - 初始 recovery 槽由 Create 上传（恢复码当时还在内存里），这里只做 fail-closed
+    ///   校验：槽材料与身份/库自洽 + [`INITIAL_SLOT_UPLOADED_META`] 存在。旧实例（建库时
+    ///   没传过槽）明确失败并指向 CLI 的恢复码路径——**绝不**静默发布一份 B 无法 Join 的
+    ///   假基线；
+    /// - 其余（sync + 两份 checkpoint + durable 基线事实）与 CLI 路径**逐字节同一条**
+    ///   核心路径（[`Self::publish_baseline_core_with`]），不复制逻辑。
+    ///
+    /// 幂等语义同 4b：重跑会多一对真实 checkpoint，`/bootstrap` 只取最新两份 published。
+    pub fn publish_initial_pair_with_identity<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+    ) -> Result<CheckpointReport, SyncError> {
+        Self::publish_initial_pair_with_identity_with(
+            target,
+            vault,
+            identity,
+            SyncOnceOptions::default(),
+        )
+    }
+
+    /// 同 [`Self::publish_initial_pair_with_identity`]，但接收**传输预算 + 集成前守卫**
+    /// （ADR 0012 S1：发布内部也跑一轮同步并 `integrate`，所以与同步共用同一条安全纪律）。
+    pub fn publish_initial_pair_with_identity_with<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        options: SyncOnceOptions<'_>,
+    ) -> Result<CheckpointReport, SyncError> {
+        // 先拒 Join 设备（真正原因），再看槽材料/上传标记（保持既有错误优先级：
+        // 本地可判定原因先于 URL/网络配置错误）。
+        require_manager_identity(identity)?;
+        let slot = load_initial_slot(vault, &identity.vault_id)?;
+        verify_identity_slot_consistency(identity, &slot)?;
+        if !initial_slot_uploaded(vault, &slot)? {
+            return Err(SyncError::Unsupported(
+                "本实例建库时没有上传初始 recovery 槽（旧版本 Create）：面板无法补传\
+                 （K_slot_mne 只能由恢复码派生）；请先用 --dev-sync-publish 与恢复码补一次，\
+                 之后面板「发布基线」一直可用",
+            ));
+        }
+        let context = target.relay_context(options.transport)?;
+        Self::publish_baseline_core_with(&context, vault, identity, options)
+    }
+
+    /// 上传 genesis 的初始 recovery 槽（staging）并落 durable 标记。
+    ///
+    /// **只有恢复码在内存里的调用点能用**：`create`（genesis 刚返回）与
+    /// [`Self::publish_initial_pair`]（CLI，恢复码来自环境变量）。KEY_SLOT 对象的 MNE1
+    /// 密钥 `K_slot_mne = HKDF(恢复码种子)` 不可逆，恢复码又不落盘，所以事后（只有
+    /// `manager_seed` 时）无法补传——这是 ADR 0009 切片 4c-4 把槽上传前移的根因。
+    ///
+    /// message id 确定性派生，整份 KEY_SLOT 对象逐字节可复现，重传 relay 幂等接受。
+    fn upload_initial_slot(
+        context: &RelayContext,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        seed: &RecoverySeed,
+    ) -> Result<(), SyncError> {
+        Self::upload_initial_slot_with(context, vault, identity, seed, false)
+    }
+
+    /// Create 内部的初始槽上传：pending 尚未收尾，走 `open_for_init`（跳过 pending 守卫）。
+    pub(crate) fn upload_initial_slot_during_init(
+        context: &RelayContext,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        seed: &RecoverySeed,
+    ) -> Result<(), SyncError> {
+        Self::upload_initial_slot_with(context, vault, identity, seed, true)
+    }
+
+    fn upload_initial_slot_with(
+        context: &RelayContext,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        seed: &RecoverySeed,
+        during_init: bool,
+    ) -> Result<(), SyncError> {
+        let slot = load_initial_slot(vault, &identity.vault_id)?;
+        verify_identity_slot_consistency(identity, &slot)?;
+
+        let root = root_of(identity);
+        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+        let pinned = if during_init {
+            context.open_for_init(vault, identity)?
+        } else {
+            context.open(vault, identity)?
+        };
+        let mut client = pinned.into_client();
+        ensure_cursor(&mut client, vault)?;
+        let message_id = key_slot_message_id(&slot)?;
+        {
+            let mut writer = CheckpointWriter::new(
+                vault,
+                &mut client,
+                identity.vault_id,
+                identity.device_id,
+                signing_key,
+                root,
+                identity.loro_peer_id(),
+            );
+            writer.upload_recovery_slot(&slot, seed, message_id)?;
+        }
+        write_initial_slot_uploaded(vault, &slot.descriptor.slot_id, &message_id)
+    }
+
+    /// 发布核心：一轮完整 `SyncOnce` + 两份真实同 epoch checkpoint（两条入口共用）。
+    ///
+    /// - 一轮完整 `SyncOnce`：覆盖证明只认 durable 事实（integrated 前缀/skipped-asset
+    ///   记录），所以本地刚建好的笔记必须先推送到 relay 并拉回 integrate；
+    /// - 连续两份同 epoch checkpoint（`CheckpointWriter` 的 prepare→validate→promote）：
+    ///   `/bootstrap` 只按 `published_at DESC` 取最新两份 published，所以**必须**成对发布。
+    ///
+    /// 资产源用 [`StorageAssets`]（真实 storage 资产；空库自然是 0 个资产），不用合成
+    /// fixture。返回值是**较新那份** checkpoint 的报告（pair = 前一份 + 这一份）。
+    fn publish_baseline_core_with(
+        context: &RelayContext,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        mut options: SyncOnceOptions<'_>,
+    ) -> Result<CheckpointReport, SyncError> {
+        let root = root_of(identity);
+        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+        let mut client = context.open(vault, identity)?.into_client();
+        // 缺 `sync.relay_cursor` 时用 `GET /state` 键 14 兜底（旧 relay 兼容）。
+        ensure_cursor(&mut client, vault)?;
+
+        // 1) 发布前把 durable 数据推/拉平（错误一律向上传播：暂停=不得发布基线）。
+        //    集成前守卫与同步共用一条：取消/授权已失效时**不 append**。
+        {
+            let engine_identity = EngineIdentity {
+                device_id: identity.device_id,
+                signing_key: signing_key.clone(),
+                peer_id: identity.loro_peer_id(),
+            };
+            let mut engine = SyncEngine::new(vault, &mut client, engine_identity, root.clone());
+            match options.before_integrate.as_mut() {
+                Some(guard) => engine.sync_once_with_guard(&mut **guard)?,
+                None => engine.sync_once()?,
+            };
+        }
+
+        // 2) 两份真实 checkpoint（prepare→validate→promote 全部真实读回/导入）。
+        let mut writer = CheckpointWriter::new(
+            vault,
+            &mut client,
+            identity.vault_id,
+            identity.device_id,
+            signing_key,
+            root,
+            identity.loro_peer_id(),
+        );
+        let _first = writer.create_checkpoint(&StorageAssets)?;
+        let second = writer.create_checkpoint(&StorageAssets)?;
+        write_published_baseline(vault, &second)?;
+        Ok(second)
+    }
+
+    /// Join：只给 `vault_id + 恢复码 + 新路径`，不读 A 的目录/identity/root。
+    ///
+    /// 初始化走 ADR 0013 S2b 的受限能力 [`InitSession::new_fresh_recovery`]：
+    ///
+    /// 1. 恢复码 → 恢复种子 →（会话内）管理私钥（管理信任锚）；
+    /// 2. 新库 + durable pending（`Prepared`）→ 写前推进 `GenesisRequested` → `self_enroll`
+    ///    自批新设备（唯一允许 unpinned 消费 `/control` 的路径，仍强制管理锚 + 逐条签名）；
+    /// 3. 认证 `bootstrap::run_with_pins` 导入基线并单事务推进 pins/cursor；
+    /// 4. 用**同一验证视图**提交 record pin + bootstrap 锚（`commit_recovery_pin`）；
+    /// 5. pending → `Done` → 清理（清理只在 Done）；app 走
+    ///    [`Self::join_deferring_identity`] 时停在 `PinCommitted`，身份落盘后再推进。
+    ///
+    /// 失败语义沿用 ADR 0009（app 验收依赖它）：**返回错误时清掉本次新建的本地文件**，
+    /// 不写 cursor/identity（bootstrap 只在全部导入成功后推进水位）；pending 的用途是
+    /// **崩溃**之后的启动对账（[`crate::init_session::reconcile`]）。
+    pub fn join(
+        relay_url: &str,
+        vault_id: &VaultId,
+        recovery_code: &str,
+        vault_path: &Path,
+    ) -> Result<JoinedVault, SyncError> {
+        Self::join_inner(relay_url, vault_id, recovery_code, vault_path, true)
+    }
+
+    /// **app 专用**：与 [`Self::join`] 相同，但 pending 停在 `PinCommitted`。
+    ///
+    /// 与 [`Self::create_deferring_identity`] 对称：身份原子落盘后由调用方调用
+    /// [`crate::init_session::mark_identity_written`] + `finish_identity_written`，
+    /// 崩溃窗口由启动对账（[`crate::init_session::reconcile`]）补 finalize。
+    pub fn join_deferring_identity(
+        relay_url: &str,
+        vault_id: &VaultId,
+        recovery_code: &str,
+        vault_path: &Path,
+    ) -> Result<JoinedVault, SyncError> {
+        Self::join_inner(relay_url, vault_id, recovery_code, vault_path, false)
+    }
+
+    fn join_inner(
+        relay_url: &str,
+        vault_id: &VaultId,
+        recovery_code: &str,
+        vault_path: &Path,
+        finish_identity: bool,
+    ) -> Result<JoinedVault, SyncError> {
+        if vault_path.as_os_str().is_empty() {
+            return Err(SyncError::LocalCorrupt("Join 需要明确的 vault 路径"));
+        }
+        if vault_path.exists() {
+            return Err(SyncError::LocalCorrupt(
+                "Join 只接受尚不存在的 vault 路径（已有库请按其身份使用）",
+            ));
+        }
+
+        // 1. 恢复码 → 恢复种子；管理锚由 InitSession 从种子推导（不信任 relay 的公钥）。
+        let seed = RecoverySeed::from_code(recovery_code)?;
+        let context = RelayContext::local_dev(relay_url, DEFAULT_TRANSPORT_TIMEOUTS)?;
+        let session = InitSession::new_fresh_recovery(context, *vault_id, &seed)?;
+
+        // 2. 新库（pending 需要 SQLite；任何失败都清掉刚建的文件）。
+        let vault = match Vault::open(vault_path) {
+            Ok(vault) => vault,
+            Err(error) => {
+                remove_vault_files(vault_path);
+                return Err(SyncError::Storage(error));
+            }
+        };
+        let joined = (|| -> Result<LocalIdentityV1, SyncError> {
+            session.prepare_pending(&vault, SystemClock.now_secs())?;
+            let recovered = session.recover_identity(&vault, SystemClock.now_secs())?;
+            session.commit_recovery_pin(&vault, &recovered.identity)?;
+            if finish_identity {
+                session.finish(&vault)?;
+            }
+            Ok(recovered.identity)
+        })();
+
+        match joined {
+            Ok(identity) => Ok(JoinedVault {
+                vault,
+                identity,
+                vault_id: *vault_id,
+            }),
+            Err(error) => {
+                // 失败不留下半初始化库（cursor/identity 都没写；文件也清掉，重试从头来）。
+                drop(vault);
+                remove_vault_files(vault_path);
+                Err(error)
+            }
+        }
+    }
+
+    /// SyncOnce：一轮完整同步（`encrypt_pending → push → pull → integrate → ack`）。
+    ///
+    /// [`SyncEngine`] 是借用型的，每次调用内构造；游标/水位由 engine 自己按 durable 事实推进。
+    ///
+    /// 这是**向后兼容入口**（CLI/测试/旧调用）：传输预算与集成前守卫都用历史默认
+    /// （ADR 0012 S1）。需要可配预算或取消复核时用 [`Self::sync_once_with`]。
+    pub fn sync_once<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+    ) -> Result<SyncReport, SyncError> {
+        Self::sync_once_with(target, vault, identity, SyncOnceOptions::default())
+    }
+
+    /// 同 [`Self::sync_once`]，但由调用方注入**传输预算**与**集成前守卫**（ADR 0012 S1）。
+    ///
+    /// `options.before_integrate` 在 `integrate` 之前调用一次：返回 `Err` 时本轮
+    /// **不会追加任何本地行**（取消/授权已失效），已推送的对象与已拉取的 inbox 保持
+    /// durable 事实（重试可复用）。进入 integrate 后事务必须跑完，不再中断。
+    pub fn sync_once_with<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        mut options: SyncOnceOptions<'_>,
+    ) -> Result<SyncReport, SyncError> {
+        let context = target.relay_context(options.transport)?;
+        let root = root_of(identity);
+        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+        let mut client = context.open(vault, identity)?.into_client();
+        // pull 必须有游标：B 由 bootstrap 落库，A 由 genesis 落库；旧 relay 两者都没有时
+        // 用 `GET /state` 键 14 兜底（绝不把"缺失"当成 0 号游标硬编）。
+        ensure_cursor(&mut client, vault)?;
+        // Phase 1B：完整 sync_once 也先尝试 checkpoint 追赶；失败不回退普通 pull
+        // （Mandatory 时普通 pull 只会再次 CursorExpired）。追赶在调用方的
+        // `before_integrate` 守卫之后写入，语义与普通 integrate 相同。
+        let pins = crate::bootstrap::BootstrapPins::from_vault(vault)?;
+        let catchup_config = crate::catchup::CatchUpConfig::default();
+        let local = menghunote_storage::sync_cursor_state(vault)?;
+        let state = client.state()?;
+        if crate::catchup::should_attempt(&state, local.received_seq, &catchup_config) {
+            let prepared = crate::catchup::prepare(
+                vault,
+                &mut client,
+                root.vault_id,
+                identity.loro_peer_id(),
+                &root,
+                &pins,
+                &catchup_config,
+            )?;
+            if let Some(prepared) = prepared {
+                if let Some(guard) = options.before_integrate.as_mut() {
+                    guard()?;
+                }
+                crate::catchup::integrate(vault, identity.loro_peer_id(), &prepared)?;
+            }
+        }
+        let engine_identity = EngineIdentity {
+            device_id: identity.device_id,
+            signing_key,
+            peer_id: identity.loro_peer_id(),
+        };
+        let mut engine = SyncEngine::new(vault, &mut client, engine_identity, root);
+        match options.before_integrate.as_mut() {
+            Some(guard) => engine.sync_once_with_guard(&mut **guard),
+            None => engine.sync_once(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // ADR 0012 S2a：可暂停的两阶段同步（Prepare / Integrate / Finish）
+    // ------------------------------------------------------------------
+    //
+    // 三个入口各自**重新构造** client/engine：真正的事实只存在 DB（outbox/inbox/
+    // cursor/pins），不依赖进程内 engine。调用方（app 的 worker）负责在阶段之间等待
+    // 授权/交付回执；本模块只保证每一步"只做这一阶段的事"：
+    //
+    // - `sync_prepare`：encrypt → push → pull（**不** integrate、**不** ack）；
+    // - `sync_integrate`：integrate（外加授权 head 复核），**不** ack；
+    // - `sync_finish`：push tail（若有）→ ack。
+
+    /// 两阶段同步的 **Prepare** 阶段：加密待发送意图 → 推送 → 拉取一页。
+    ///
+    /// 明确**不**做 `integrate`/`ack`：本阶段只把远端变化落成 durable inbox 并推进
+    /// pull 游标，正文/结构 head 一律不动。因此 UI 在网络阶段不需要持闸、可以继续编辑。
+    pub fn sync_prepare<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+    ) -> Result<PrepareReport, SyncError> {
+        let context = target.relay_context(transport)?;
+        let root = root_of(identity);
+        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+        let mut client = context.open(vault, identity)?.into_client();
+        ensure_cursor(&mut client, vault)?;
+        // Phase 1B：网络阶段先决策/下载 checkpoint；不写库、不持闸。
+        // 若决策为 None，继续普通 push + pull（快照可能已下载但未写，属于保守的
+        // 机会性误判；Mandatory 命中时必须跳过普通 pull，否则会立即 CursorExpired）。
+        let pins = crate::bootstrap::BootstrapPins::from_vault(vault)?;
+        let catchup_config = crate::catchup::CatchUpConfig::default();
+        // 近端同步不下载快照：只有强制过期或落后上界达到 N_min 才进入 prepare。
+        let catchup = {
+            let local = menghunote_storage::sync_cursor_state(vault)?;
+            let state = client.state()?;
+            if crate::catchup::should_attempt(&state, local.received_seq, &catchup_config) {
+                crate::catchup::prepare(
+                    vault,
+                    &mut client,
+                    root.vault_id,
+                    identity.loro_peer_id(),
+                    &root,
+                    &pins,
+                    &catchup_config,
+                )?
+            } else {
+                None
+            }
+        };
+        let engine_identity = EngineIdentity {
+            device_id: identity.device_id,
+            signing_key,
+            peer_id: identity.loro_peer_id(),
+        };
+        let mut engine = SyncEngine::new(vault, &mut client, engine_identity, root);
+        let config = EngineConfig::default();
+        let encrypted = engine.encrypt_pending(config.send_batch)?;
+        let push = engine.push()?;
+        // ADR 0012 两阶段路径的资产上传点：与完整 `sync_once` 同一阶段（正文之后、
+        // pull 之前），保证自动同步（S3）也会增量上传新资产。
+        let assets = engine.upload_pending_assets()?;
+        let pull = if catchup.is_some() {
+            PullReport::default()
+        } else {
+            engine.pull()?
+        };
+        Ok(PrepareReport {
+            encrypted,
+            push,
+            assets,
+            pull,
+            catchup,
+        })
+    }
+
+    /// 两阶段同步的 **Integrate** 阶段：把 durable verified inbox 集成进本地库。
+    ///
+    /// `expect_head` 是调用方（UI 持闸）给出的授权基准：`(doc_id, durable_head_seq)`。
+    /// 任一条不满足就返回 [`SyncError::CancelledBeforeIntegrate`]，**不 append**：
+    ///
+    /// - 库中该文档 head 已被移动（授权失效 / 本地还有未持闸写入）；
+    /// - 调用方在进入本阶段前已复核取消标志（见 app worker：先查 `OpControl`，再调本函数）。
+    ///
+    /// `watch_doc` 是 UI 准备 adopt 的活动文档：报告里会给出它的 head 是否在本阶段前进了，
+    /// 供 UI 判定"是否需要交付"。**不** ack（ack 属于 Finish，等 UI adopt/end 之后）。
+    ///
+    /// 集成本身按 ADR 0012 S2b 的**依赖顺序**收敛（结构 → 只投影 → 正文公平轮转），
+    /// 因此调用方不需要"再联网补一轮"来修结构/正文依赖。
+    pub fn sync_integrate<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+        expect_head: Option<(&str, u64)>,
+        watch_doc: &str,
+    ) -> Result<IntegratePhaseReport, SyncError> {
+        Self::sync_integrate_with_config(
+            target,
+            vault,
+            identity,
+            transport,
+            expect_head,
+            watch_doc,
+            IntegrateConfig::default(),
+        )
+    }
+
+    /// 同 [`Self::sync_integrate`]，但携带 Prepare 阶段准备好的 checkpoint 追赶候选。
+    ///
+    /// 追赶写入/水位/游标在持闸段完成；`integrated >= S` 后清理已覆盖 inbox。
+    pub fn sync_integrate_with_catchup<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+        expect_head: Option<(&str, u64)>,
+        watch_doc: &str,
+        catchup: Option<&crate::catchup::CatchUpPrepared>,
+    ) -> Result<IntegratePhaseReport, SyncError> {
+        Self::sync_integrate_with_config_and_catchup(
+            target,
+            vault,
+            identity,
+            transport,
+            expect_head,
+            watch_doc,
+            IntegrateConfig::default(),
+            catchup,
+        )
+    }
+
+    /// 同 [`Self::sync_integrate`]，但显式指定集成批次预算（测试/诊断用）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_integrate_with_config<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+        expect_head: Option<(&str, u64)>,
+        watch_doc: &str,
+        integrate_config: IntegrateConfig,
+    ) -> Result<IntegratePhaseReport, SyncError> {
+        Self::sync_integrate_with_config_and_catchup(
+            target,
+            vault,
+            identity,
+            transport,
+            expect_head,
+            watch_doc,
+            integrate_config,
+            None,
+        )
+    }
+
+    /// 同 [`Self::sync_integrate_with_config`]，可附加 checkpoint 追赶。
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_integrate_with_config_and_catchup<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+        expect_head: Option<(&str, u64)>,
+        watch_doc: &str,
+        integrate_config: IntegrateConfig,
+        catchup: Option<&crate::catchup::CatchUpPrepared>,
+    ) -> Result<IntegratePhaseReport, SyncError> {
+        // Integrate 前复核授权基准（ADR 0012 S2b）：head 被推进 = 授权已失效，
+        // 一律不 append；inbox/outbox 原样保留，调用方可按新授权重试。
+        if let Some((doc_id, expected)) = expect_head {
+            let head = load_head(vault, doc_id)?;
+            if head.head_seq != expected {
+                return Err(SyncError::CancelledBeforeIntegrate);
+            }
+        }
+        let before = load_head(vault, watch_doc)?.head_seq;
+        let peer_id = identity.loro_peer_id();
+        let catchup_report = match catchup {
+            Some(prepared) => match crate::catchup::integrate(vault, peer_id, prepared) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    if prepared.decision().mode == crate::catchup::CatchUpMode::Mandatory {
+                        eprintln!("[sync] mandatory catchup integrate failed: {error}");
+                        return Err(SyncError::Paused(crate::relay::PauseReason::CatchupFailed));
+                    }
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        let context = target.relay_context(transport)?;
+        let root = root_of(identity);
+        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+        let mut client = context.open(vault, identity)?.into_client();
+        ensure_cursor(&mut client, vault)?;
+        let engine_identity = EngineIdentity {
+            device_id: identity.device_id,
+            signing_key,
+            peer_id,
+        };
+        let mut engine = SyncEngine::new(vault, &mut client, engine_identity, root);
+        let outcome = engine.integrate_dependency_ordered(integrate_config)?;
+        drop(engine);
+        // changed heads（正文）触发一次**现有接口**的物化：B 事务写 `notes.body_md`
+        // 并发布 `BodyMaterialized` 事件（索引器据此增量更新）。结构投影的事件由
+        // `StructureWriter::commit` 自己发布（`StructureProjected`）。
+        let mut changed_heads = outcome.changed_heads;
+        if let Some(report) = &catchup_report {
+            for doc_id in &report.docs {
+                if !changed_heads.iter().any(|head| head == doc_id) {
+                    changed_heads.push(doc_id.clone());
+                }
+            }
+        }
+        let (materialized, materialize_failed) =
+            materialize_changed_bodies(vault, peer_id, &changed_heads);
+        let after = load_head(vault, watch_doc)?.head_seq;
+        let watch_doc_changed = after != before;
+        Ok(IntegratePhaseReport {
+            integrate: outcome.report,
+            changed_heads,
+            watch_doc_changed,
+            materialized,
+            materialize_failed,
+            catchup: catchup_report,
+        })
+    }
+
+    /// 两阶段同步的 **Finish** 阶段：推送本阶段新落库的本地意图（若有）→ 上报 ACK。
+    ///
+    /// 调用方契约：UI 已经把 integrate 的 durable 变化 adopt 进 live、并 `end` 释放闸门。
+    /// 本阶段不再 `pull`/`integrate`：它只做 "让 relay 知道本机已经收到/整合到哪" 以及
+    /// 清掉本轮 Held 期间新产生的本地意图。
+    pub fn sync_finish<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+    ) -> Result<FinishReport, SyncError> {
+        let context = target.relay_context(transport)?;
+        let root = root_of(identity);
+        let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+        let mut client = context.open(vault, identity)?.into_client();
+        ensure_cursor(&mut client, vault)?;
+        let engine_identity = EngineIdentity {
+            device_id: identity.device_id,
+            signing_key,
+            peer_id: identity.loro_peer_id(),
+        };
+        let mut engine = SyncEngine::new(vault, &mut client, engine_identity, root);
+        let config = EngineConfig::default();
+        // 先推 tail（Held 窗口内新落库的本地意图），再上报 received/integrated 游标。
+        let encrypted = engine.encrypt_pending(config.send_batch)?;
+        let push = engine.push()?;
+        let ack = engine.ack()?;
+        Ok(FinishReport {
+            ack,
+            encrypted,
+            push,
+        })
+    }
+
+    /// ADR 0010 切片 2a-2：读一次**已验证控制链的只读成员视图**（设备列表 UI 的数据源）。
+    ///
+    /// 只构造一个**临时** `HttpRelayClient`（用完即丢，不缓存 token/控制链）：调用方拿到的
+    /// 只有 [`MemberView`]——它不含 token/密钥，`Debug` 也只打印 id/status/fingerprint。
+    /// 缓存失效语义由 2a-1 的 [`HttpRelayClient::members`] 负责（先比对 `/state.auth_rev`
+    /// 再决定是否重新拉控制链）；每次新客户端天然读到最新的 `auth_rev`。
+    ///
+    /// 失败即真实失败（relay 不可达 / 被吊销 `REVOKED` / 控制链 pin 不符），不返回旧快照。
+    pub fn members<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+    ) -> Result<Vec<MemberView>, SyncError> {
+        let context = target.relay_context(None)?;
+        let mut client = context.open(vault, identity)?.into_client();
+        client.members()
+    }
+
+    /// ADR 0010 切片 1b + 2a-2：**移除一台设备对 relay 的访问**（不轮换密钥）。
+    ///
+    /// 语义与安全边界严格照 ADR 0010：
+    ///
+    /// - 只是诚实 relay 上的**访问撤销**（`auth_rev` 前进、目标 `status=revoked`），
+    ///   不是签名成员移除、也不是密码学撤销：被移除设备仍可能用它已获得的旧 root 解密
+    ///   旧/同 epoch 密文；管理材料（`manager_seed`/恢复码）**不会被撤销**；
+    /// - **禁止移除本机**（这里在任何网络动作之前拒绝；helper 里还有第二道）；
+    /// - **必须有管理密钥**：只有 `manager_seed` 在身份里的设备（Create/恢复码路径）能管理；
+    ///   Join 设备明确失败，绝不退化成"用设备 key 冒充管理"；
+    /// - 不删本地身份 / `manager_seed` / 恢复材料 / 笔记，不自动轮换、不把 revoked 翻回 active；
+    /// - `request_id` 每次调用随机 16B（`OsRandom`）：响应丢失就整次重试（新 id），
+    ///   不拿旧 id 去撞 relay；`expected_control_rev` 取刚读到的 `/state.control_rev`
+    ///   （独立吊销**不推进** `control_rev`，CAS 冲突时应刷新后重试）。
+    ///
+    /// 成功后**重新拉一次成员视图**再返回，调用方（worker）可直接把最新列表投影到面板，
+    /// 不需要另发一条列表命令。
+    ///
+    /// ## 这是**默认**移除路径，且**永不**轮换（task-123）
+    ///
+    /// 本调用只产生"设备访问已吊销"这一件事：返回的 [`RevokedDevice::outcome`] 里
+    /// `changed`/`auth_rev` 可能变化，`control_rev` 与 vault 的 `key_epoch` **保持不变**
+    /// （测试断言 relay `/state`、DB 与两台设备的本地身份 epoch）。它**不会**、也**不得**
+    /// 被改成隐式触发轮换：需要新 root / 重加密历史时必须由用户显式走
+    /// [`crate::dev_local::DevLocal::rotate`]（opt-in），两者的 wire 与错误语义互不复用。
+    pub fn revoke_device<T: RelayTarget + ?Sized>(
+        relay: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        target: DeviceId,
+    ) -> Result<RevokedDevice, SyncError> {
+        // ① 本机守卫：先于任何 IO（打开库/读身份以外）拒绝。
+        if target == identity.device_id {
+            return Err(SyncError::Unsupported(
+                "禁止移除本机设备：会立即自断同步与管理访问（ADR 0010）；请用另一台管理设备或恢复码",
+            ));
+        }
+        // ② 管理密钥必须来自受保护身份（Join 设备没有）：缺它就直接失败。
+        let Some(seed) = identity.manager_seed.clone() else {
+            return Err(SyncError::Unsupported(
+                "本机没有管理密钥（Join 设备）：无法移除设备；请用 Create 设备或最新恢复码操作",
+            ));
+        };
+        let manager = ManagementKey::from_seed(seed);
+
+        // ③ CAS 基准取当前 `/state.control_rev`（独立吊销不推进它；不盲用 identity 里的旧值）。
+        let context = relay.relay_context(None)?;
+        let mut client = context.open(vault, identity)?.into_client();
+        let state = client.state()?;
+        if state.instance_id != identity.pinned_instance {
+            return Err(SyncError::RelayWire("relay instance 与本地 pin 不符"));
+        }
+
+        // ④ 每次点击一个新 request_id（去重 scope 是固定 `management/device-revoke`，
+        //    target 在 canonical body 里，跨设备不会碰撞）。
+        let request_id: [u8; 16] = array(&mut OsRandom)?;
+        let ctx = RevokeContext::from_identity(
+            context.origin_str().as_str(),
+            identity,
+            state.control_rev,
+            SystemClock.now_secs(),
+        )
+        .with_api_version(context.api_version());
+        let mut transport = context.transport()?;
+        let outcome = crate::device_management::revoke_device(
+            &mut transport,
+            &ctx,
+            &manager,
+            target,
+            request_id,
+        )?;
+
+        // ⑤ 只读刷新：`auth_rev` 已前进，新客户端自然读到吊销后的成员集合。
+        let members = Self::members(&context, vault, identity)?;
+        Ok(RevokedDevice { outcome, members })
+    }
+
+    /// 读 dev-local 实例标签（[`VAULT_LABEL_META`]；Join 的库没有，返回 `None`）。
+    pub fn vault_label(vault: &Vault) -> Result<Option<String>, SyncError> {
+        match vault.get_meta(VAULT_LABEL_META)? {
+            None => Ok(None),
+            Some(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| SyncError::LocalCorrupt("vault 标签不是 UTF-8")),
+        }
+    }
+
+    /// 读最近一次发布基线的 durable 事实（[`PUBLISHED_BASELINE_META`]）。
+    pub fn published_baseline(vault: &Vault) -> Result<Option<PublishedBaseline>, SyncError> {
+        let Some(bytes) = vault.get_meta(PUBLISHED_BASELINE_META)? else {
+            return Ok(None);
+        };
+        decode_published_baseline(&bytes).map(Some)
+    }
+}
+
+// ---------------------------------------------------------------- 内部助手
+
+/// genesis 的 password 槽材料只用于凑齐 `GenesisMaterials`（本模块不上传口令槽）：
+/// 用 32B 随机数的十六进制当一次性口令，构造完立即丢弃。
+pub(crate) fn throwaway_password() -> Result<String, SyncError> {
+    let bytes: [u8; 32] = array(&mut OsRandom)?;
+    Ok(ids::hex_of(&bytes))
+}
+
+/// 身份的当前 epoch 根。
+pub(crate) fn root_of(identity: &LocalIdentityV1) -> RootSecretV1 {
+    RootSecretV1::new(
+        identity.vault_id,
+        identity.current_epoch,
+        identity.current_root.clone(),
+    )
+}
+
+/// 对 changed heads 里的**正文**文档触发一次现有接口的物化（`projection_outbox` →
+/// `notes.body_md`，成功时发布 `BodyMaterialized` → 索引增量）。
+///
+/// 只处理派生数据：失败计入返回值并打日志，不改 CRDT 事实、也不改变集成结论
+/// （搜索索引还有周期对账兜底）。结构文档的投影事件由 `StructureWriter::commit`
+/// 自己发布。
+fn materialize_changed_bodies(
+    vault: &Vault,
+    peer_id: u64,
+    changed_heads: &[String],
+) -> (usize, usize) {
+    if changed_heads.is_empty() {
+        return (0, 0);
+    }
+    let pending = match pending_outbox(vault) {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!("[dev-sync] 读取 projection_outbox 失败（跳过本轮物化）：{error}");
+            return (0, changed_heads.len());
+        }
+    };
+    let mut materialized = 0usize;
+    let mut failed = 0usize;
+    for item in pending {
+        if item.doc_id == STRUCTURE_DOC_ID || !changed_heads.iter().any(|head| head == &item.doc_id)
+        {
+            continue;
+        }
+        let Some(note_id) = item.note_id else {
+            // 结构投影还没建立 notes 行：不是失败，等下一轮结构/索引对账。
+            continue;
+        };
+        match materialize_body(vault, &note_id, &item.doc_id, item.target_seq, peer_id) {
+            Ok(_) => materialized += 1,
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "[dev-sync] 正文物化失败（{}，目标 seq {}）：{error}",
+                    item.doc_id, item.target_seq
+                );
+            }
+        }
+    }
+    (materialized, failed)
+}
+
+/// 把 `PeerId` 的 u64 映射回 16B（`identity.peer_id` 的存储形态）。
+///
+/// 受限初始化入口（[`crate::init_session`]）也用同一条映射：Join 的 peer 口径只能有
+/// 一处，不允许各写一套。
+pub(crate) fn peer_bytes_of(peer_id: u64) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&peer_id.to_be_bytes());
+    bytes
+}
+
+/// 缺 `sync.relay_cursor` 时用 relay `GET /state` 键 14 兜底（genesis 键 5 的旧 relay 兼容）。
+fn ensure_cursor<T: HttpTransport>(
+    client: &mut HttpRelayClient<T>,
+    vault: &Vault,
+) -> Result<(), SyncError> {
+    if vault.get_meta(RELAY_CURSOR_META)?.is_none() {
+        let cursor = client.initial_cursor()?;
+        vault.set_meta(RELAY_CURSOR_META, cursor.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// 恢复码必须与本地管理身份一致：`HKDF(R, vault_id, "MN/v1/management-ed25519\0")`
+/// 逐字节等于 identity 里的 `manager_seed`。错码在这里失败，**不必先上传任何对象**。
+fn verify_recovery_matches(
+    identity: &LocalIdentityV1,
+    seed: &RecoverySeed,
+) -> Result<(), SyncError> {
+    let Some(stored) = &identity.manager_seed else {
+        return Err(SyncError::Unsupported(
+            "发布初始基线需要 genesis 身份（含管理私钥）：Join 设备不能发布",
+        ));
+    };
+    let derived = management_seed(seed, &identity.vault_id)?;
+    if !derived.ct_eq(stored) {
+        return Err(SyncError::RecoveryCode("恢复码与本地管理身份不匹配"));
+    }
+    Ok(())
+}
+
+/// 身份 ↔ 初始 recovery 槽的自洽校验（不联网、不碰秘密输出）。
+///
+/// 三条都对应真实故障模式，缺一不可：
+/// 1. 槽归属 = 身份 vault（加载时已校验，这里再兜一次防"换库/换身份"的错配）；
+/// 2. 槽 epoch = 身份当前 epoch：轮换过 epoch 的实例不能再用"初始基线"发布（否则会拿
+///    旧 epoch 的槽配新 root，Join 端解出的根对不上）；
+/// 3. 管理私钥必须存在，且派生公钥 == `pinned_manager`（管理 pin 自洽）：Join 设备没有
+///    管理私钥 → 明确拒绝，绝不退化成"用设备 key 冒充管理"。
+fn verify_identity_slot_consistency(
+    identity: &LocalIdentityV1,
+    slot: &KeySlotV1,
+) -> Result<(), SyncError> {
+    if slot.descriptor.vault_id != identity.vault_id {
+        return Err(SyncError::LocalCorrupt(
+            "初始 recovery 槽的 vault 归属与身份不一致",
+        ));
+    }
+    if slot.descriptor.key_epoch != identity.current_epoch {
+        return Err(SyncError::Unsupported(
+            "初始基线只能在 genesis epoch 发布：初始槽的 epoch 与身份当前 epoch 不一致\
+             （轮换之后不能用初始基线发布）",
+        ));
+    }
+    require_manager_identity(identity)
+}
+
+/// 管理密钥（信任锚）必须来自受保护身份，且与 `pinned_manager` 自洽。
+///
+/// 这条校验**先于**读槽/任何上传：Join 设备（`manager_seed = None`）必须在拿到"缺初始槽"
+/// 之类无关错误之前就看到真正原因，也绝不退化成"用设备 key 冒充管理"。
+fn require_manager_identity(identity: &LocalIdentityV1) -> Result<(), SyncError> {
+    let Some(seed) = identity.manager_seed.clone() else {
+        return Err(SyncError::Unsupported(
+            "发布初始基线需要 genesis 身份（含管理私钥）：Join 设备没有管理密钥，不能发布",
+        ));
+    };
+    if ManagementKey::from_seed(seed).public_key() != identity.pinned_manager {
+        return Err(SyncError::LocalCorrupt(
+            "身份的管理私钥与 pinned_manager 不一致（身份文件被换过或损坏）",
+        ));
+    }
+    Ok(())
+}
+
+/// 初始 recovery 槽（KEY_SLOT 对象）的确定性 `message_id`。
+///
+/// `message_id` 进 MNE1 header/AAD；relay 对同 `object_id` 换了 `message_id`（=不同信封
+/// 字节）会返回 409 ID_CONFLICT，而"上传初始槽 / 发布基线"都是**可重跑**的动作（Create
+/// 传过一次、CLI 发布补传、checkpoint 失败后重试）。所以这里只用槽材料（slot_id + 描述符
+/// CDE，都是非秘密）派生一个稳定 id：重试/重启/跨入口都得到逐字节相同的 KEY_SLOT 对象，
+/// relay 按幂等接受。
+fn key_slot_message_id(slot: &KeySlotV1) -> Result<[u8; 16], SyncError> {
+    let descriptor = slot.descriptor.encode()?;
+    let mut hasher = Sha256::new();
+    hasher.update(KEY_SLOT_MESSAGE_DOMAIN);
+    hasher.update(slot.descriptor.slot_id);
+    hasher.update(&descriptor);
+    let digest = hasher.finalize();
+    let mut message_id = [0u8; 16];
+    message_id.copy_from_slice(&digest[..16]);
+    Ok(message_id)
+}
+
+/// 从 `meta` 读回 genesis 的 recovery 槽（描述符 + 包裹根），并校验归属。
+fn load_initial_slot(vault: &Vault, vault_id: &VaultId) -> Result<KeySlotV1, SyncError> {
+    let bytes = vault
+        .get_meta(INITIAL_RECOVERY_SLOT_META)?
+        .ok_or(SyncError::LocalCorrupt(
+            "vault 缺 genesis 初始 recovery 槽记录（只有 DevLocal::create 的库能发布基线）",
+        ))?;
+    decode_initial_slot(&bytes, vault_id)
+}
+
+/// `magic || u32 BE(descriptor_len) || CDE(descriptor) || nonce||ciphertext`。
+pub(crate) fn encode_initial_slot(slot: &KeySlotV1) -> Result<Vec<u8>, SyncError> {
+    let descriptor = slot.descriptor.encode()?;
+    let descriptor_len = u32::try_from(descriptor.len())
+        .map_err(|_| SyncError::LocalCorrupt("初始槽描述符长度超出 u32"))?;
+    let wrapped = slot.wrapped_bytes();
+    let mut out =
+        Vec::with_capacity(INITIAL_SLOT_MAGIC.len() + 4 + descriptor.len() + wrapped.len());
+    out.extend_from_slice(INITIAL_SLOT_MAGIC);
+    out.extend_from_slice(&descriptor_len.to_be_bytes());
+    out.extend_from_slice(&descriptor);
+    out.extend_from_slice(&wrapped);
+    Ok(out)
+}
+
+/// 解析 [`encode_initial_slot`] 的记录；任何不自洽都按本地损坏处理（不猜、不修复）。
+fn decode_initial_slot(bytes: &[u8], vault_id: &VaultId) -> Result<KeySlotV1, SyncError> {
+    let header_len = INITIAL_SLOT_MAGIC.len() + 4;
+    if bytes.len() < header_len || !bytes.starts_with(INITIAL_SLOT_MAGIC) {
+        return Err(SyncError::LocalCorrupt(
+            "初始 recovery 槽记录 magic/长度不符",
+        ));
+    }
+    let mut raw_len = [0u8; 4];
+    raw_len.copy_from_slice(&bytes[INITIAL_SLOT_MAGIC.len()..header_len]);
+    let descriptor_len = usize::try_from(u32::from_be_bytes(raw_len))
+        .map_err(|_| SyncError::LocalCorrupt("初始 recovery 槽描述符长度非法"))?;
+    let descriptor_end = header_len
+        .checked_add(descriptor_len)
+        .ok_or(SyncError::LocalCorrupt("初始 recovery 槽描述符长度溢出"))?;
+    if descriptor_len == 0
+        || descriptor_len > MAX_SLOT_DESCRIPTOR_LEN
+        || descriptor_end >= bytes.len()
+    {
+        return Err(SyncError::LocalCorrupt(
+            "初始 recovery 槽记录的分段长度非法",
+        ));
+    }
+    let descriptor = SlotDescriptorV1::decode(&bytes[header_len..descriptor_end])?;
+    if descriptor.vault_id != *vault_id {
+        return Err(SyncError::LocalCorrupt("初始 recovery 槽的 vault 归属不符"));
+    }
+    if descriptor.kind != SlotKind::Recovery {
+        return Err(SyncError::LocalCorrupt("初始槽记录不是 recovery 槽"));
+    }
+    let wrapped = WrappedRoot::from_bytes(&bytes[descriptor_end..])
+        .map_err(|_| SyncError::LocalCorrupt("初始 recovery 槽的槽体损坏"))?;
+    Ok(KeySlotV1 {
+        descriptor,
+        wrapped,
+    })
+}
+
+/// `magic || slot_id(32) || message_id(16)`（初始 recovery 槽「已上传」记录）。
+fn encode_initial_slot_uploaded(slot_id: &[u8; 32], message_id: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(INITIAL_SLOT_UPLOADED_MAGIC.len() + 32 + 16);
+    out.extend_from_slice(INITIAL_SLOT_UPLOADED_MAGIC);
+    out.extend_from_slice(slot_id);
+    out.extend_from_slice(message_id);
+    out
+}
+
+/// 解析 [`encode_initial_slot_uploaded`] 的记录（长度/magic 不符按本地损坏处理）。
+fn decode_initial_slot_uploaded(bytes: &[u8]) -> Result<([u8; 32], [u8; 16]), SyncError> {
+    let expected = INITIAL_SLOT_UPLOADED_MAGIC.len() + 32 + 16;
+    if bytes.len() != expected || !bytes.starts_with(INITIAL_SLOT_UPLOADED_MAGIC) {
+        return Err(SyncError::LocalCorrupt(
+            "初始 recovery 槽上传记录 magic/长度不符",
+        ));
+    }
+    let mut slot_id = [0u8; 32];
+    let mut message_id = [0u8; 16];
+    slot_id.copy_from_slice(&bytes[INITIAL_SLOT_UPLOADED_MAGIC.len()..][..32]);
+    message_id.copy_from_slice(&bytes[INITIAL_SLOT_UPLOADED_MAGIC.len() + 32..]);
+    Ok((slot_id, message_id))
+}
+
+/// 上传成功后写 durable 标记（`create` / CLI 发布都会走这里；重传幂等）。
+fn write_initial_slot_uploaded(
+    vault: &Vault,
+    slot_id: &[u8; 32],
+    message_id: &[u8; 16],
+) -> Result<(), SyncError> {
+    vault.set_meta(
+        INITIAL_SLOT_UPLOADED_META,
+        &encode_initial_slot_uploaded(slot_id, message_id),
+    )?;
+    Ok(())
+}
+
+/// 初始 recovery 槽是否**当前这份槽材料**已经上传过（`false` = 旧版本 Create 的实例）。
+///
+/// 记录存在但 `slot_id` 对不上 → 本地事实自相矛盾（换过库/槽材料），按损坏 fail-closed，
+/// 不猜、不重写。
+fn initial_slot_uploaded(vault: &Vault, slot: &KeySlotV1) -> Result<bool, SyncError> {
+    let Some(bytes) = vault.get_meta(INITIAL_SLOT_UPLOADED_META)? else {
+        return Ok(false);
+    };
+    let (slot_id, _message_id) = decode_initial_slot_uploaded(&bytes)?;
+    if slot_id != slot.descriptor.slot_id {
+        return Err(SyncError::LocalCorrupt(
+            "初始 recovery 槽上传记录与本库槽材料不一致（不重写、不猜）",
+        ));
+    }
+    Ok(true)
+}
+
+/// 把"最新一份已发布 checkpoint"落成本地 durable 事实（不覆盖更旧的两份，只记较新的）。
+fn write_published_baseline(vault: &Vault, report: &CheckpointReport) -> Result<(), SyncError> {
+    let published_at = report
+        .published_at
+        .ok_or(SyncError::LocalCorrupt("checkpoint report 缺发布时间"))?;
+    let mut out = Vec::with_capacity(PUBLISHED_BASELINE_MAGIC.len() + 16 + 24);
+    out.extend_from_slice(PUBLISHED_BASELINE_MAGIC);
+    out.extend_from_slice(&report.checkpoint_id);
+    out.extend_from_slice(&report.epoch.to_be_bytes());
+    out.extend_from_slice(&report.covered_seq.to_be_bytes());
+    out.extend_from_slice(&published_at.to_be_bytes());
+    vault.set_meta(PUBLISHED_BASELINE_META, &out)?;
+    Ok(())
+}
+
+/// 解析 [`write_published_baseline`] 的记录。
+fn decode_published_baseline(bytes: &[u8]) -> Result<PublishedBaseline, SyncError> {
+    let expected = PUBLISHED_BASELINE_MAGIC.len() + 16 + 8 * 3;
+    if bytes.len() != expected || !bytes.starts_with(PUBLISHED_BASELINE_MAGIC) {
+        return Err(SyncError::LocalCorrupt("已发布基线记录 magic/长度不符"));
+    }
+    let mut checkpoint_id = [0u8; 16];
+    let mut offset = PUBLISHED_BASELINE_MAGIC.len();
+    checkpoint_id.copy_from_slice(&bytes[offset..offset + 16]);
+    offset += 16;
+    let mut field = |name: &'static str| -> Result<u64, SyncError> {
+        let end = offset
+            .checked_add(8)
+            .ok_or(SyncError::LocalCorrupt("已发布基线记录越界"))?;
+        let raw = bytes
+            .get(offset..end)
+            .ok_or(SyncError::LocalCorrupt(name))?;
+        offset = end;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(raw);
+        Ok(u64::from_be_bytes(buf))
+    };
+    let epoch = field("已发布基线记录缺 epoch")?;
+    let covered_seq = field("已发布基线记录缺 covered_seq")?;
+    let published_at = field("已发布基线记录缺 published_at")?;
+    Ok(PublishedBaseline {
+        checkpoint_id,
+        epoch,
+        covered_seq,
+        published_at,
+    })
+}
+
+/// 清掉"本次调用刚建出来"的 vault 文件（主文件 + WAL 边车）与**空**实例目录。
+///
+/// 只允许在调用方已确认路径原本不存在时使用；失败路径尽力而为，不掩盖原始错误。
+///
+/// 目录只在"刚被本次初始化创建且为空"时删除（`remove_dir` 对非空目录失败，因此用户
+/// 已有内容的目录不会被删）：Create 现在必须**先**建库写 pending、再联网（ADR 0013
+/// S2b 的写前记录），所以"联网失败不该留下实例目录"这条既有验收要靠这里兜住。
+pub(crate) fn remove_vault_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+`````
 
 
 ## `crates/storage/src/session/flush.rs`
@@ -1103,7 +5671,10 @@ fn flusher_main(
         // 否则「手动保存」在无脏数据时永远等不到 ACK。
         let confirmation = {
             let guard = lock(&state);
-            if guard.journal.pending_len() == 0
+            // 不可恢复时即使 pending_len==0（防御性状态，正常路径不可达）也不能补发
+            // 确认票据：那会让等待方误以为 durable 成功。
+            if guard.unrecoverable.is_none()
+                && guard.journal.pending_len() == 0
                 && emitted_max.is_none_or(|through| through < command.target_live_rev)
             {
                 Some((
@@ -1133,13 +5704,20 @@ fn flusher_main(
 ///（`Corrupt`、`Loro`、`LoroEncode`、`Coord`、schema 漂移、通道关闭等）都是永久性
 /// 本地状态错误，重试不会自愈，必须 fail-closed 到“需要重开文档”。
 fn is_retryable_write_error(error: &StorageError) -> bool {
-    matches!(
-        error,
+    match error {
         StorageError::Io(_)
-            | StorageError::Sqlite(_)
-            | StorageError::SnapshotBusy { .. }
-            | StorageError::WriteBackpressure { .. }
-    )
+        | StorageError::SnapshotBusy { .. }
+        | StorageError::WriteBackpressure { .. } => true,
+        // SQLite 错误不能整类重试：ConstraintViolation/ReadOnly/CannotOpen/
+        // DatabaseCorrupt/NotFound/Misuse 等都是永久错误，重试只会无限撞同一面墙。
+        // 只有 BUSY/LOCKED 这类并发等待值得下一次 flush 再试。
+        StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ),
+        StorageError::Sqlite(_) => false,
+        _ => false,
+    }
 }
 
 /// head 冲突后自动重建 sink 的结果（P1-3 生产接线）。
@@ -1151,6 +5729,24 @@ enum RebuildOutcome {
     Unrecoverable(String),
     /// 重建后重试遇到普通写失败（磁盘/SQLite 等）：journal 保留，下一次 flush 再试。
     Retryable(String),
+}
+
+/// 重建后重试失败的分类（独立出来便于单测 `RebuildOutcome::Retryable` 分支）。
+fn rebuild_write_error_outcome(
+    doc_id: &str,
+    pending: usize,
+    error: StorageError,
+) -> RebuildOutcome {
+    if !is_retryable_write_error(&error) {
+        return RebuildOutcome::Unrecoverable(reopen_message(
+            doc_id,
+            pending,
+            format!("自动重建后重试前缀遇到永久性 Corrupt，不再自动重试：{error}"),
+        ));
+    }
+    RebuildOutcome::Retryable(format!(
+        "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
+    ))
 }
 
 /// `HeadConflict` 后的有界自动重建：`load_head` → 新 CAS 基准 sink → 重试同一前缀一次。
@@ -1255,16 +5851,7 @@ fn retry_prefix_after_rebuild(
             pending,
             format!("自动重建后再发生 head 冲突（基准 {expected}，实际 {actual}）"),
         )),
-        Err(error) if !is_retryable_write_error(&error) => {
-            RebuildOutcome::Unrecoverable(reopen_message(
-                doc_id,
-                pending,
-                format!("自动重建后重试前缀遇到永久性 Corrupt，不再自动重试：{error}"),
-            ))
-        }
-        Err(error) => RebuildOutcome::Retryable(format!(
-            "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
-        )),
+        Err(error) => rebuild_write_error_outcome(doc_id, pending, error),
     }
 }
 
@@ -1276,6 +5863,54 @@ fn reopen_message(doc_id: &str, pending: usize, reason: String) -> String {
          请关闭并重开该文档，从 durable 前缀重新加载后再继续编辑；\
          重开前未 durable 的本地改动不会自动落库"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_error(code: rusqlite::ErrorCode, extended_code: i32) -> StorageError {
+        StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            None,
+        ))
+    }
+
+    #[test]
+    fn retryable_write_error_is_a_positive_whitelist() {
+        assert!(is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::DatabaseBusy,
+            5
+        )));
+        assert!(is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::DatabaseLocked,
+            6
+        )));
+        assert!(!is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::ConstraintViolation,
+            1811
+        )));
+        assert!(!is_retryable_write_error(&sqlite_error(
+            rusqlite::ErrorCode::ReadOnly,
+            8
+        )));
+        assert!(!is_retryable_write_error(&StorageError::Corrupt {
+            context: "test".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn rebuild_write_error_outcome_maps_busy_to_retryable_and_permanent_to_unrecoverable() {
+        let busy = sqlite_error(rusqlite::ErrorCode::DatabaseBusy, 5);
+        let retryable = rebuild_write_error_outcome("doc-1", 2, busy);
+        assert!(matches!(retryable, RebuildOutcome::Retryable(_)));
+        let permanent = sqlite_error(rusqlite::ErrorCode::ConstraintViolation, 1811);
+        let unrecoverable = rebuild_write_error_outcome("doc-1", 2, permanent);
+        assert!(matches!(unrecoverable, RebuildOutcome::Unrecoverable(_)));
+    }
 }
 
 `````
@@ -4015,17 +8650,22 @@ fn state_from_journal(
         Some(expected) => (Some(expected.doc_count()), Some(expected.asset_count())),
         None => (None, None),
     };
-    // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
-    // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
+    // finishable 是 **O(1) 近似**：只校验 status 与「已应用计数 == 预期计数」。
+    // 逐项 `applied=1`/摘要的精确证明只在 `finish_baseline_apply` 里做：
+    //   - 这样 Phase1B 的 catchup 循环每次 batch 后读 state 不会做 O(N) 查询；
+    //   - 代价是计数相等但底层行损坏时 finishable 可能短暂为 true，finish 会
+    //     `Conflict` 且零写，不会误推进水位。
     //
     // 失败标记存在时 journal 仍是 staging（schema v3 的 CHECK 只允许 staging/completed），
-    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false，否则 UI/续跑逻辑
-    // 会把"读回校验失败"当成"可以 finish"。标记损坏返回 Corrupt，同样是 fail-closed。
+    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false。
     let verify_failed = baseline_verify_failure(vault)?.is_some();
     let finishable = !verify_failed
         && journal.status == BaselineApplyStatus::Staging
         && match &expected {
-            Some(expected) => expected_is_complete(vault, journal, expected)?,
+            Some(expected) => {
+                journal.applied_docs == expected.doc_count()
+                    && journal.applied_assets == expected.asset_count()
+            }
             None => false,
         };
     Ok(BaselineApplyState {
@@ -4228,2038 +8868,1542 @@ fn hex32(bytes: &[u8; 32]) -> String {
 `````
 
 
-## `crates/sync/src/bootstrap.rs`
+## `crates/storage/src/sync_bridge.rs`
 
 `````rust
-//! 新设备 bootstrap（S7-18；ADR §3.7/§4/§7/§25.3；评审 0002 P1-4）。
+//! S7 同步桥：出站意图 → 加密 parts → 推送/ACK；入站 verified inbox → 本地 seq → integrate。
 //!
-//! 本模块先落"数据恢复"这一段：给定已解出的 root（由槽解封或后续恢复流程提供），
-//! `POST /bootstrap` 取两份基线 → 下 manifest/snapshot/asset → 全量校验 → 空库落库。
+//! 本模块只碰 SQLite；不做 Argon、AEAD、HTTP、Loro 解码。ADR 0006 §5 的
+//! 关键约束：
 //!
-//! **可恢复导入（P1-4）**：docs/structure/assets 的写入全部经过 storage 的
-//! `baseline_apply` staging journal（`begin_baseline_apply` / `apply_baseline_batch` /
-//! `apply_baseline_assets`）。下载/写入阶段任一步失败都**不**清 journal、**不**推进任何
-//! 水位；下一次调用按同一份基线幂等续跑。只有全部实际导入并通过读回校验后，才在**一个**
-//! SQLite 事务里推进 `cursor/received/integrated/confirmed_highwater`（CAS）。
-//!
-//! **读回校验失败（同步硬化 P1）**：`verify_imported` 失败时**不回滚**已 merge 的
-//! Loro/资产数据（CRDT merge 幂等；回滚会丢本地编辑），而是写一条只本地可见的
-//! `sync.baseline_verify_failed` 失败标记（storage `mark_baseline_verify_failed`）。
-//! journal 仍是 `staging`（schema 的 status CHECK 只允许 `staging/completed`，见
-//! `docs/notes/sync-hardening-20261121.md` §8），但下一次 `begin_baseline_apply` 会拒绝，
-//! 必须先 `abort_baseline_apply` 清理（abort 同时删标记，已导入数据保留）。
-//!
-//! **闸外编辑**：verify 不与编辑互斥，判定用「导出点 VV ⊆ 当前 VV」而不是相等；只有
-//! 本地没有快照之外的 op 时才逐字节比较正文（见 [`check_imported_doc`]）。
-//!
-//! **水位单调（P1-4）**：bootstrap 允许作用在已有库上，但禁止降低任何单调值：
-//! `received/integrated/highwater` 取 `max(现有, baseline S)`；已有进度时保留现有 relay
-//! 游标（不把已经消费过的位置回退）；`instance/log_id/epoch/control rev+hash` 只允许
-//! 前进或不变。storage 的 `finish_baseline_apply` 会把 highwater 直接写成 baseline S，
-//! 对"已有 highwater 高于 S"的库会降低水位，因此本模块在同一个事务里自行做
-//! `max` 语义的 CAS 推进，随后清掉 staging（`abort_baseline_apply` 只清 journal，
-//! 不删已导入的 Loro/asset 数据）。
-//!
-//! **实际 VV 校验（P1-4）**：每个 snapshot 都在独立的空 `LoroDoc` 里 import，比较
-//! actual VV / frontier 与 manifest 声明（既不虚高也不缺 op），并校验 full-history、
-//! 信封字段、app schema / min_reader；结构文档再重放出结构树，校验"结构引用的正文
-//! 文档必须都在基线 manifest 里"。不只信声明。
-//!
-//! **fallback**：primary 任一阶段（下载/解密/摘要/VV/结构语义）失败才整体切 fallback；
-//! 选中哪个基线就只用**它自己的** S / cursor；写入阶段失败不切 fallback（避免半库
-//! 换 S），必须原样重试或人工 abort journal。
-//!
-//! **写库路径**：全部经 storage 公开 API（`BodyDoc`/`StructureWriter`/`baseline_apply`），
-//! 不直连 SQLite；只有最终的水位推进用 `Vault::exec_transaction` 的单事务 CAS
-//! （storage 没有提供 max 语义的 finish，且本任务写作用域不允许改 storage）。
-//!
-//! **已知边界**：relay `/bootstrap` 不返回完整签名 checkpoint 链；本模块只验证
-//! `CheckpointCommit` 的生产者签名、manifest/refs 摘要、以及所有实际对象。新设备无旧
-//! 水位，无法检测"有效签名的旧基线回滚"（ADR §10 已记录）；已有库用本地 pins 检测
-//! `instance/log_id/epoch/control_rev/highwater` 的回退。
+//! - A 事务只写「出站意图」，worker 在事务外加密后 CAS 落 parts；
+//! - 同一 message/epoch 的既有 parts 必须与再次提交的字节完全一致，否则冲突；
+//! - ACK 用 `(message_id, epoch, object_digest)` CAS，旧 ACK 不能删除新行；
+//! - 入站对象先 durable 写 inbox（依赖未齐也保存），再由 sync 层决定何时可 integrate；
+//! - `allocate_local_seq_for_import` 只返回 `head_seq+1`，**绝不把 sender_seq 写进 loro_updates.seq`。
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use std::collections::BTreeMap;
 
-use loro::VersionVector;
-use sha2::{Digest, Sha256};
+use rusqlite::types::Value;
 
-use crate::checkpoint::{verify_asset_plaintext, AssetRef, KIND_BODY, KIND_STRUCTURE};
-use crate::control_pin::BootstrapAnchorV1;
-use crate::device::verify_signature;
-use crate::engine::RELAY_CURSOR_META;
-use crate::error::SyncError;
-use crate::keys::RootSecretV1;
-use crate::relay::{
-    BootstrapBundle, BootstrapCheckpoint, ManagerChainEntry, RelayClient, RelayState,
-};
-use crate::rotation::ManagerTransitionV1;
-use crate::upload::fetch_object;
-use menghunote_storage::{
-    abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, asset_bytes,
-    baseline_apply_state, begin_baseline_apply, load_body_doc, load_structure,
-    mark_baseline_verify_failed, record_baseline_verify_time, sync_cursor_state, AffectedGuard,
-    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc, Statement, StructureDoc,
-    StructureWriter, Value, Vault, APP_DOC_SCHEMA, CODEC_VERSION, META_SYNC_CONFIRMED_HIGHWATER,
-    META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, MIN_READER,
-    STRUCTURE_DOC_ID,
-};
-use menghunote_sync_proto::{
-    checkpoint_signing_input, refs_digest_input, CheckpointCommit, Envelope, EnvelopeHeader,
-    ManifestDoc, ManifestV1, ObjectRefV1, ObjectType, SnapshotV1,
+use crate::actor::{AffectedGuard, Statement};
+use crate::error::StorageError;
+use crate::store;
+use crate::Vault;
+
+// 同步 `meta` 键与「连续前缀」的低层实现放在 `sync_meta`（直接跑在 `Connection` 上，
+// 这样批量 inbox 的插入与前缀推进能共用一个事务）；这里保持原有的公开路径。
+use crate::sync_meta::{meta_bytes_of, skipped_received_key, ConsumedPrefix};
+pub use crate::sync_meta::{
+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
+    META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
 };
 
-/// 每批写入的文档数（storage 的 baseline batch 是单事务；分批只为控制单事务大小）。
-const BOOTSTRAP_DOC_BATCH: usize = 64;
-/// bootstrap 写入 `baseline_apply.source_cursor` 的前缀：用于区分 bootstrap 的 staging
-/// 与轮换（`rotation_apply` 传空串）的 staging，防止误清别人的 journal。
-const JOURNAL_SOURCE_PREFIX: &str = "bootstrap:";
-
-/// `meta` 键：bootstrap pin 的 relay instance id（16B，只允许相等）。
-pub const META_BOOTSTRAP_INSTANCE: &str = "sync.pinned_instance";
-/// `meta` 键：bootstrap pin 的 epoch（BE64，只允许前进）。
-pub const META_BOOTSTRAP_EPOCH: &str = "sync.pinned_epoch";
-/// `meta` 键：bootstrap pin 的 control_rev（BE64，只允许前进）。
-pub const META_BOOTSTRAP_CONTROL_REV: &str = "sync.pinned_control_rev";
-/// `meta` 键：bootstrap pin 的控制头摘要（32B，见 [`control_head_hash`]；同 rev 必须相等）。
-pub const META_BOOTSTRAP_CONTROL_HASH: &str = "sync.pinned_control_hash";
-
-/// bootstrap 结果。
+/// 出站意图（A 事务内与 update 一起落库）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BootstrapReport {
-    /// 使用的 checkpoint id。
-    pub checkpoint_id: [u8; 16],
-    /// 覆盖水位 S。
-    pub covered_seq: u64,
-    /// 是否回退到 fallback。
-    pub used_fallback: bool,
-    /// 导入文档（structure 的文本为 None）。
-    pub docs: Vec<(String, Option<String>)>,
-    /// 导入资产数。
-    pub assets: usize,
-    /// S 对应的 relay 游标。
-    pub cursor: String,
-    /// 是否验证了 checkpoint 发布签名（relay 返回键 6/7 且验签通过）。
-    pub signed_checkpoint: bool,
+pub struct SyncIntent {
+    /// 稳定 message id（UUID 文本；parts 表以 UTF-8 字节存同一值）。
+    pub message_id: String,
+    /// 逻辑 batch，通常与 `UpdateRecord.batch_id` 相同。
+    pub batch_id: String,
+    /// 加密 epoch。
+    pub key_epoch: u64,
+    /// 对象名（32B；asset 为 HMAC 对象名，其他为随机 32B）。
+    pub object_id: [u8; 32],
 }
 
-/// bootstrap 前本地已经可信的单调值（P1-4 "已有库保护"）。
+/// 本地写入的**同步上下文**：本机 peer + 当前加密 epoch。
 ///
-/// 新设备全部为 `None`；已有设备由 [`BootstrapPins::from_vault`] 从本库 meta 读出，
-/// 或由调用方用 identity（`pinned_instance/control_rev/current_epoch`）填充后调用
-/// [`run_with_pins`]。bootstrap 只允许这些值前进/不变，绝不回退。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BootstrapPins {
-    /// relay instance id（防换实例/静默回滚）。
-    pub instance_id: Option<[u8; 16]>,
-    /// relay log_id（restore 必须显式换新，不能静默归零）。
-    pub log_id: Option<[u8; 16]>,
-    /// 当前密钥代。
-    pub epoch: Option<u64>,
-    /// 已信任的管理控制链版本。
-    pub control_rev: Option<u64>,
-    /// 已信任的控制头摘要（见 [`control_head_hash`]）。
-    pub control_hash: Option<[u8; 32]>,
-    /// 已确认的 relay 水位。
-    pub highwater: Option<u64>,
-}
-
-impl BootstrapPins {
-    /// 从本库持久化的 pin（`sync.pinned_*`）与同步游标读出已有可信值。
-    ///
-    /// pin 缺失（新设备/首次 bootstrap）返回 `None`，不报错；pin 存在但长度非法按
-    /// 本地损坏处理（不能静默忽略，否则等于绕过单调保护）。
-    pub fn from_vault(vault: &Vault) -> Result<Self, SyncError> {
-        let cursor = sync_cursor_state(vault)?;
-        Ok(Self {
-            instance_id: read_meta_array::<16>(vault, META_BOOTSTRAP_INSTANCE)?,
-            log_id: cursor.log_id,
-            epoch: read_meta_u64(vault, META_BOOTSTRAP_EPOCH)?,
-            control_rev: read_meta_u64(vault, META_BOOTSTRAP_CONTROL_REV)?,
-            control_hash: read_meta_array::<32>(vault, META_BOOTSTRAP_CONTROL_HASH)?,
-            highwater: cursor.confirmed_highwater,
-        })
-    }
-
-    /// 把 `sync.pinned_*` 读成一个**带自己 rev/epoch/log** 的 bootstrap 锚（ADR 0013 §2）。
-    ///
-    /// 语义：
-    /// - `control_hash` 与 `control_rev` 必须成对：只有 hash 没有 rev 是本地损坏
-    ///   （既有行为）；只有 rev 没有 hash 时返回 `None`——rev 只是下界，不构成摘要锚；
-    /// - hash 存在时 `epoch` / `log_id` 必须齐全：历史视图复算需要锚**自己的**坐标，
-    ///   缺任一项都不能把摘要当"同 rev 校验"用（否则旧锚会在 rev 前进后被静默忽略）。
-    ///   这是 fail-closed：缺字段报 [`SyncError::LocalCorrupt`]，**不**降级成"没有锚"。
-    pub fn control_anchor(&self) -> Result<Option<BootstrapAnchorV1>, SyncError> {
-        let Some(hash) = self.control_hash else {
-            // 只有 rev 下界（历史实例/未写摘要）不构成摘要锚；单调性仍由 control_rev 保证。
-            return Ok(None);
-        };
-        let rev = self.control_rev.ok_or(SyncError::LocalCorrupt(
-            "bootstrap pins 有 control_hash 但缺 control_rev",
-        ))?;
-        let epoch = self.epoch.ok_or(SyncError::LocalCorrupt(
-            "bootstrap pins 有 control_hash 但缺 epoch（无法按历史视图复算摘要）",
-        ))?;
-        let log_id = self.log_id.ok_or(SyncError::LocalCorrupt(
-            "bootstrap pins 有 control_hash 但缺 log_id（无法按历史视图复算摘要）",
-        ))?;
-        Ok(Some(BootstrapAnchorV1 {
-            rev,
-            hash,
-            epoch,
-            log_id,
-        }))
-    }
-}
-
-/// 测试用故障注入点（生产调用路径不会构造）。
+/// ADR 0009 切片 2b：真实本地写入（正文 session flush、结构提交）在 A 事务里
+/// 顺手写 `sync_outbox` 意图。这里只放"派生意图所需的常量"：
 ///
-/// 语义等价于"进程在崩溃点直接消失"：不再执行后续步骤、不清理 journal、不推进水位。
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootstrapFault {
-    /// 正文批次写完后崩溃（structure / assets / 水位都未写）。
-    AfterBodies,
-    /// structure 文档已写入、结构投影尚未执行时崩溃。
-    BeforeStructureProjection,
-    /// 全部 assets 已写入、读回校验与水位推进之前崩溃。
-    AfterAssets,
-    /// 水位事务读取当前状态之后、提交之前，模拟另一个写者改写了 relay 游标，
-    /// 迫使 CAS 失败（整笔事务回滚）。
-    CursorCasConflict,
-    /// 读回校验阶段注入一次「本地 VV 未覆盖快照」失败：用于验证失败标记、
-    /// `begin` 拒绝续跑与 `abort` 清理路径（不改数据库里的真实数据）。
-    VerifyVvNotCovered,
-}
-
-/// 故障注入伪造的 peer id（只在校验失败测试路径出现；不影响真实数据）。
-const VERIFY_FAULT_PEER: u64 = 0x0BAD_5EED;
-
-struct VerifiedDoc {
-    doc_id: String,
-    kind: u64,
-    snapshot: SnapshotV1,
-    actual_vv: VersionVector,
-    /// 正文文本（structure 为 `None`）。
-    text: Option<String>,
-}
-
-struct VerifiedAsset {
-    object_id: [u8; 32],
-    real_sha256: [u8; 32],
-    byte_len: u64,
-    media_type: String,
-    data: Vec<u8>,
-}
-
-/// 选中的基线：manifest/docs/assets + 基线本身 + 结构语义。
-struct SelectedBaseline {
-    checkpoint: BootstrapCheckpoint,
-    used_fallback: bool,
-    docs: Vec<VerifiedDoc>,
-    assets: Vec<VerifiedAsset>,
-    /// structure 快照声明的 `note_id -> body_doc_id`（用于导入后的结构投影校验）。
-    structure_notes: BTreeMap<String, String>,
-}
-
-/// 用已解出的 root 执行数据 bootstrap；本地 pins 从本库 meta 读取。
-pub fn run<C: RelayClient>(
-    vault: &Vault,
-    client: &mut C,
-    vault_id: [u8; 16],
-    peer_id: u64,
-    root: &RootSecretV1,
-) -> Result<BootstrapReport, SyncError> {
-    let pins = BootstrapPins::from_vault(vault)?;
-    run_with_pins(vault, client, vault_id, peer_id, root, &pins)
-}
-
-/// 用调用方提供的本地 pins 执行 bootstrap（已有设备传 identity 的 pin）。
-pub fn run_with_pins<C: RelayClient>(
-    vault: &Vault,
-    client: &mut C,
-    vault_id: [u8; 16],
-    peer_id: u64,
-    root: &RootSecretV1,
-    pins: &BootstrapPins,
-) -> Result<BootstrapReport, SyncError> {
-    run_inner(vault, client, vault_id, peer_id, root, pins, None)
-}
-
-/// 测试入口：在指定阶段注入崩溃/并发冲突（见 [`BootstrapFault`]）。
-#[doc(hidden)]
-pub fn run_with_fault<C: RelayClient>(
-    vault: &Vault,
-    client: &mut C,
-    vault_id: [u8; 16],
-    peer_id: u64,
-    root: &RootSecretV1,
-    fault: BootstrapFault,
-) -> Result<BootstrapReport, SyncError> {
-    let pins = BootstrapPins::from_vault(vault)?;
-    run_inner(vault, client, vault_id, peer_id, root, &pins, Some(fault))
-}
-
-fn run_inner<C: RelayClient>(
-    vault: &Vault,
-    client: &mut C,
-    vault_id: [u8; 16],
-    peer_id: u64,
-    root: &RootSecretV1,
-    pins: &BootstrapPins,
-    fault: Option<BootstrapFault>,
-) -> Result<BootstrapReport, SyncError> {
-    if root.vault_id != vault_id {
-        return Err(SyncError::Object("bootstrap root 与 vault 不符"));
-    }
-    let bundle = client.bootstrap()?;
-    let state = client.state()?;
-    let chain = client.management_chain()?;
-    let control_hash = control_head_hash(&state, &chain);
-    validate_remote(vault_id, root, pins, &bundle, &state, &chain, &control_hash)?;
-
-    // 选中哪个基线，就只用它的 S/cursor/manifest/docs；primary 任一阶段失败才整体切 fallback。
-    // 所有下载/解密/摘要/VV/结构语义校验都在写库之前完成。
-    let mut selected: Option<SelectedBaseline> = None;
-    let mut last_error: Option<SyncError> = None;
-    for (checkpoint, used_fallback) in [
-        (bundle.primary.clone(), false),
-        (bundle.fallback.clone(), true),
-    ] {
-        match load_baseline(
-            client,
-            root,
-            vault_id,
-            peer_id,
-            &checkpoint,
-            &bundle,
-            &state,
-        ) {
-            Ok(baseline) => {
-                selected = Some(SelectedBaseline {
-                    used_fallback,
-                    ..baseline
-                });
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let selected = selected.ok_or_else(|| last_error.expect("bootstrap 至少尝试过一个基线"))?;
-
-    // 实际导入（staging journal 可续跑）；失败时 journal 保留，下一次按同一基线续跑。
-    let report_docs = apply_selected(vault, peer_id, &selected, fault)?;
-
-    // 全部实际写入 + 读回校验通过后，才在一个事务里推进水位（max 语义 + CAS）。
-    finalize(vault, &selected, &state, &chain, &control_hash, pins, fault)?;
-
-    // 成功后才清 staging journal；若这里失败，重试会幂等重放并再次清理。
-    let _cleared = abort_baseline_apply(vault)?;
-
-    Ok(BootstrapReport {
-        checkpoint_id: selected.checkpoint.checkpoint_id,
-        covered_seq: selected.checkpoint.covered_seq,
-        used_fallback: selected.used_fallback,
-        docs: report_docs,
-        assets: selected.assets.len(),
-        cursor: selected.checkpoint.cursor,
-        signed_checkpoint: true,
-    })
-}
-
-/// 校验本地 durable bootstrap 锚（ADR 0013 §3；`validate_remote`/`finalize` 共用）。
+/// - `peer_id`：来自持久设备身份（`LocalIdentityV1::loro_peer_id()`），**不是**常量 1；
+/// - `key_epoch`：Phase 1 恒为 `1`（ADR 0006 genesis 初始代），**禁止**写成 0
+///   （0 在 `validate_intent` 里就是非法值，会让整笔 A 事务失败）。
 ///
-/// 两类视图必须分开，**不能**把旧 hash 挂到 `max(rev)` 上比较：
-///
-/// - `anchor.rev == state.control_rev`：摘要必须逐字节等于当前视图（`epoch`/`log_id`
-///   由当前 state 决定；同 rev 换 epoch/log/hash 都是 equivocation）；
-/// - `anchor.rev <  state.control_rev`：**不能忽略**旧锚，也不能拿新 rev 的坐标复算；
-///   按锚自己的 `rev/epoch/log` + 截断到该 rev 的管理链复算，证明当前链仍包含旧锚
-///   认证过的前缀；复算不出视图 → [`SyncError::NeedsTrust`]，摘要不符 → equivocation。
-fn verify_bootstrap_anchor(
-    anchor: &BootstrapAnchorV1,
-    state: &RelayState,
-    chain: &[ManagerChainEntry],
-    current_hash: &[u8; 32],
-) -> Result<(), SyncError> {
-    if anchor.rev > state.control_rev {
-        return Err(SyncError::ControlRollback {
-            expected: anchor.rev,
-            actual: state.control_rev,
-        });
-    }
-    if anchor.rev == state.control_rev {
-        if anchor.hash != *current_hash {
-            return Err(SyncError::Equivocation(
-                "bootstrap 控制头同 rev 但 hash 变化（同 rev 历史不完整）",
-            ));
-        }
-        return Ok(());
-    }
-    let computed = control_head_hash_at(state.vault_id, state.instance_id, anchor, chain).ok_or(
-        SyncError::NeedsTrust("bootstrap 旧锚的 rev 不在当前管理链视图内，无法证明历史前缀"),
-    )?;
-    if computed != anchor.hash {
-        return Err(SyncError::Equivocation(
-            "bootstrap 旧锚未被当前管理链覆盖（rev 前进但前缀被重写）",
-        ));
-    }
-    Ok(())
+/// `None` 表示不产生意图（默认路径 / remote 导入路径），行为与切片 2a 之前逐字节一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyncContext {
+    /// 本机 Loro peer id（`0` 非法：Loro 不接受 0 peer）。
+    pub peer_id: u64,
+    /// 当前加密 epoch（Phase 1 = 1；必须 > 0）。
+    pub key_epoch: u64,
 }
 
-/// 本地 pin 的**结构**校验：`control_hash` 与 `control_rev` 必须成对。
-///
-/// 只有 hash 没有 rev 是本地损坏（无法按 rev 选择同 rev/历史锚视图）；必须在
-/// `validate_remote` 与 `finalize` 两条路径都检查，不能只在前者检查。
-fn validate_pin_shape(pins: &BootstrapPins) -> Result<(), SyncError> {
-    if pins.control_hash.is_some() && pins.control_rev.is_none() {
-        return Err(SyncError::LocalCorrupt(
-            "bootstrap pins 有 control_hash 但缺 control_rev",
-        ));
+impl SyncContext {
+    /// 构造上下文（调用方保证两个值都 > 0；不做隐式回退）。
+    #[must_use]
+    pub const fn new(peer_id: u64, key_epoch: u64) -> Self {
+        Self { peer_id, key_epoch }
     }
-    Ok(())
+
+    /// 校验：peer / epoch 都必须 > 0，否则明确报错（不静默替换成常量）。
+    pub fn validate(self) -> Result<(), StorageError> {
+        if self.peer_id == 0 {
+            return Err(StorageError::Corrupt {
+                context: "SyncContext.peer_id 必须 >0（0 不是合法 Loro peer）".to_owned(),
+            });
+        }
+        if self.key_epoch == 0 {
+            return Err(StorageError::Corrupt {
+                context: "SyncContext.key_epoch 必须 >0（Phase 1 = 1，禁止常量 0）".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
-/// relay 侧与本地 pins 的写前校验：任何不满足都必须在写库前失败。
-fn validate_remote(
-    vault_id: [u8; 16],
-    root: &RootSecretV1,
-    pins: &BootstrapPins,
-    bundle: &BootstrapBundle,
-    state: &RelayState,
-    chain: &[ManagerChainEntry],
-    control_hash: &[u8; 32],
-) -> Result<(), SyncError> {
-    validate_pin_shape(pins)?;
-    if state.vault_id != vault_id {
-        return Err(SyncError::RelayWire(
-            "bootstrap state.vault_id 与本地不一致",
-        ));
-    }
-    if root.key_epoch != state.epoch {
-        return Err(SyncError::Object("bootstrap root epoch 与 relay 不一致"));
-    }
-    if bundle.epoch != state.epoch {
-        return Err(SyncError::RelayWire("bootstrap epoch 与 state 不一致"));
-    }
-    // bundle 先取、state 后取；head 只能前进，倒退说明 relay 换库/回滚。
-    if bundle.head_seq > state.head_seq {
-        return Err(SyncError::RelayWire("bootstrap/state head_seq 回退"));
-    }
-    if let Some(instance) = pins.instance_id {
-        if instance != state.instance_id {
-            return Err(SyncError::Object(
-                "bootstrap relay instance 与本地 pin 不符",
-            ));
-        }
-    }
-    if let Some(log_id) = pins.log_id {
-        if log_id != state.log_id {
-            return Err(SyncError::Storage(
-                menghunote_storage::StorageError::SyncLogMismatch {
-                    expected: log_id.to_vec(),
-                    found: state.log_id.to_vec(),
-                },
-            ));
-        }
-    }
-    if let Some(epoch) = pins.epoch {
-        if epoch > state.epoch {
-            return Err(SyncError::Object("bootstrap 不允许回退 epoch"));
-        }
-    }
-    if let Some(rev) = pins.control_rev {
-        if rev > state.control_rev {
-            return Err(SyncError::Object("bootstrap 不允许回退 control_rev"));
-        }
-        if let Some(anchor) = pins.control_anchor()? {
-            verify_bootstrap_anchor(&anchor, state, chain, control_hash)?;
-        }
-    } else if pins.control_hash.is_some() {
-        return Err(SyncError::LocalCorrupt(
-            "bootstrap pins 有 control_hash 但缺 control_rev",
-        ));
-    }
-    if let Some(highwater) = pins.highwater {
-        if highwater > state.head_seq {
-            return Err(SyncError::Paused(
-                crate::relay::PauseReason::RollbackDetected,
-            ));
-        }
-    }
-    // 管理链必须是单调 rev 序列（内容摘要见 control_head_hash；完整链认证属于轮换阶段 A）。
-    let mut previous_rev = 0u64;
-    for entry in chain {
-        if entry.rev <= previous_rev {
-            return Err(SyncError::RelayWire("bootstrap 管理链 rev 不递增"));
-        }
-        previous_rev = entry.rev;
-    }
-    Ok(())
-}
-
-/// 控制头摘要：绑定 relay 可见的控制头坐标（instance/log/epoch/control_rev）与管理转换链。
+/// 本地意图 ID 的确定性派生域（版本化；改算法必须换常量）。
 ///
-/// 这是本地 pin 的摘要定义（不是 relay 内部的 `control_head` hash）：同一 `control_rev`
-/// 下 relay 换 instance/log/epoch 或重写管理链都会改变摘要；rev 前进时允许摘要变化
-/// （单调性由 `control_rev` 保证）。完整管理链的签名认证属于轮换阶段 A（ADR §28.2），
-/// 本模块只做"同 rev 不得换内容"的回退检测。
+/// 三个派生都从这里起头：message id / object id 必须**纯函数**地由
+/// `(doc_id, seq, peer, epoch)` 决定，重试才不会产生新 ID（ADR 0009）。
+pub const SYNC_INTENT_ID_DOMAIN: &[u8] = b"MN/dev-sync-intent/v1\0";
+
+/// 确定性 message id（32 位小写 hex = 16B wire id）。
+///
+/// **为什么不是可读串**：`crates/sync` 的 `engine::decode_message_id` 只接受
+/// 16 字节的 hax/UUID 文本（32 个 hex 字符，允许带 `-`），可读的
+/// `doc#seq@epoch` 会让 engine 直接报 `LocalCorrupt`。所以这里取
+/// `sha256(domain‖"message"‖doc_id‖NUL‖seq_be‖peer_be‖epoch_be)` 的前 16B。
+///
+/// 纯函数语义：同一 `(doc_id, seq, peer_id, key_epoch)` 永远得到同一个 id；
+/// 不同 seq / epoch 必然不同（hash 输入不同）。
 #[must_use]
-pub fn control_head_hash(state: &RelayState, chain: &[ManagerChainEntry]) -> [u8; 32] {
-    control_head_hash_parts(
-        state.vault_id,
-        state.instance_id,
-        state.log_id,
-        state.epoch,
-        state.control_rev,
-        chain,
-    )
-}
-
-/// [`control_head_hash`] 的**坐标化**输入：调用方可以显式给出历史视图的坐标
-/// （ADR 0013 §3「按旧 rev/epoch/log/管理链视图验证」）。
-///
-/// 摘要公式与 [`control_head_hash`] 逐字节相同；`chain` 必须是**该 rev 下**的管理链
-/// （即按 `entry.rev <= control_rev` 截断后的前缀）。
-#[must_use]
-pub fn control_head_hash_parts(
-    vault_id: [u8; 16],
-    instance_id: [u8; 16],
-    log_id: [u8; 16],
-    epoch: u64,
-    control_rev: u64,
-    chain: &[ManagerChainEntry],
-) -> [u8; 32] {
-    let mut input = Vec::new();
-    input.extend_from_slice(b"menghunote/bootstrap/control-head/v1\0");
-    input.extend_from_slice(&vault_id);
-    input.extend_from_slice(&instance_id);
-    input.extend_from_slice(&log_id);
-    input.extend_from_slice(&epoch.to_be_bytes());
-    input.extend_from_slice(&control_rev.to_be_bytes());
-    input.extend_from_slice(&u32::try_from(chain.len()).unwrap_or(u32::MAX).to_be_bytes());
-    for entry in chain {
-        input.extend_from_slice(&entry.rev.to_be_bytes());
-        input.extend_from_slice(&entry.pubkey);
-        input.extend_from_slice(
-            &u32::try_from(entry.transition.len())
-                .unwrap_or(u32::MAX)
-                .to_be_bytes(),
-        );
-        input.extend_from_slice(&entry.transition);
-        push_optional_signature(&mut input, entry.old_signature);
-        push_optional_signature(&mut input, entry.new_signature);
-    }
-    Sha256::digest(&input).into()
-}
-
-/// 按 bootstrap 锚**自己的** rev/epoch/log 视图复算控制头摘要（ADR 0013 §3）。
-///
-/// 为什么不能用当前 head 的坐标：摘要把 `(epoch, control_rev)` 也哈希进去，rev 前进后
-/// 同一条历史管理链会算出不同摘要。历史锚只能按"它当初记录的坐标 + 当时的管理链"复算：
-///
-/// - `epoch` / `log_id` / `rev` 取自锚本身（本地 durable 事实，relay 不能改）；
-/// - 管理链按**生效 epoch** 截断：`/control` 键 5 的 `rev` 是**管理 rev**（不是 control
-///   rev），每条转换记录 `from_epoch → to_epoch`；epoch 只能由 activation 推进，因此
-///   "锚当时的链" = rev1 genesis + `to_epoch <= anchor.epoch` 的转换（必须仍是链前缀）；
-/// - `instance_id` 取自本地 pin/身份（换实例另有独立检查）。
-///
-/// 返回 `None` = 无法重建该历史视图（链不完整/非前缀/转换不可解码），调用方必须
-/// fail-closed，不能把"视图不可用"当成"验证通过"。
-#[must_use]
-pub fn control_head_hash_at(
-    vault_id: [u8; 16],
-    instance_id: [u8; 16],
-    anchor: &BootstrapAnchorV1,
-    chain: &[ManagerChainEntry],
-) -> Option<[u8; 32]> {
-    if chain.first().is_none_or(|entry| entry.rev != 1) {
-        return None;
-    }
-    // rev1 的 `transition` 是 genesis 原字节（不是 ManagerTransitionV1），不参与解码。
-    let mut end = 1usize;
-    for (index, entry) in chain.iter().enumerate().skip(1) {
-        let transition = ManagerTransitionV1::decode(&entry.transition).ok()?;
-        if transition.new_rev != entry.rev {
-            return None;
-        }
-        if transition.to_epoch <= anchor.epoch {
-            if index != end {
-                // 更早的转换不属于历史视图，后面却又出现属于它的转换 = 非前缀，拒绝。
-                return None;
-            }
-            end = index + 1;
-        }
-    }
-    Some(control_head_hash_parts(
-        vault_id,
-        instance_id,
-        anchor.log_id,
-        anchor.epoch,
-        anchor.rev,
-        &chain[..end],
-    ))
-}
-
-fn push_optional_signature(input: &mut Vec<u8>, signature: Option<[u8; 64]>) {
-    match signature {
-        None => input.push(0),
-        Some(signature) => {
-            input.push(1);
-            input.extend_from_slice(&signature);
-        }
-    }
-}
-
-fn load_baseline<C: RelayClient>(
-    client: &mut C,
-    root: &RootSecretV1,
-    vault_id: [u8; 16],
-    peer_id: u64,
-    checkpoint: &BootstrapCheckpoint,
-    bundle: &BootstrapBundle,
-    state: &RelayState,
-) -> Result<SelectedBaseline, SyncError> {
-    if checkpoint.epoch != state.epoch || checkpoint.epoch != bundle.epoch {
-        return Err(SyncError::Object("bootstrap 基线 epoch 与 relay 不一致"));
-    }
-    // "≤S"：基线只能覆盖 relay 已经产生的水位；低于 GC floor 的游标已不可继续。
-    if checkpoint.covered_seq > bundle.head_seq || checkpoint.covered_seq > state.head_seq {
-        return Err(SyncError::Object("bootstrap 基线 S 超过 relay head"));
-    }
-    // 低于 GC floor 的游标已经不可继续：两次请求之间 floor 也可能前进，取较大者。
-    if checkpoint.covered_seq < bundle.gc_floor || checkpoint.covered_seq < state.gc_floor {
-        return Err(SyncError::Object("bootstrap 基线 S 低于 relay GC floor"));
-    }
-    if checkpoint.cursor.is_empty() {
-        return Err(SyncError::Object("bootstrap 基线缺 relay 游标"));
-    }
-
-    let (manifest, manifest_digest) = fetch_manifest(client, root, checkpoint)?;
-    verify_checkpoint_commit(client, checkpoint, &manifest, &manifest_digest)?;
-    verify_manifest(&manifest, vault_id, checkpoint, state.epoch)?;
-    let docs = download_docs(client, root, peer_id, &manifest)?;
-    let structure_notes = verify_structure_semantics(&docs, peer_id)?;
-    let assets = download_assets(client, root, &manifest)?;
-    Ok(SelectedBaseline {
-        checkpoint: checkpoint.clone(),
-        used_fallback: false,
-        docs,
-        assets,
-        structure_notes,
-    })
-}
-
-fn verify_checkpoint_commit<C: RelayClient>(
-    client: &mut C,
-    checkpoint: &BootstrapCheckpoint,
-    manifest: &ManifestV1,
-    manifest_digest: &[u8; 32],
-) -> Result<(), SyncError> {
-    let signed_commit = checkpoint
-        .signed_commit
-        .as_deref()
-        .ok_or(SyncError::Object("bootstrap 缺 CheckpointCommit"))?;
-    let signature = checkpoint
-        .signature
-        .ok_or(SyncError::Object("bootstrap 缺 checkpoint 签名"))?;
-    let commit = CheckpointCommit::decode(signed_commit)?;
-    crate::checkpoint::require_current_checkpoint_validation(&commit)?;
-    if commit.vault_id != manifest.vault_id
-        || commit.checkpoint_id != checkpoint.checkpoint_id
-        || commit.epoch != checkpoint.epoch
-        || commit.covered_relay_seq != checkpoint.covered_seq
-        || commit.manifest_object_id != checkpoint.manifest_oid
-        || commit.manifest_digest != *manifest_digest
-    {
-        return Err(SyncError::Object("bootstrap checkpoint commit 与响应不符"));
-    }
-    // ADR §21：manifest 条目已带 key_epoch/total_plain_len/object_digest，可只凭 manifest
-    // 重算 refs_digest；不再依赖 GET objects。
-    let refs = manifest_refs(manifest);
-    let refs_digest: [u8; 32] = Sha256::digest(refs_digest_input(&refs)?).into();
-    if commit.refs_digest != refs_digest {
-        return Err(SyncError::Object("bootstrap refs_digest 与 manifest 不符"));
-    }
-    if let Some(refs_digest) = checkpoint.refs_digest {
-        if commit.refs_digest != refs_digest {
-            return Err(SyncError::Object("bootstrap refs_digest 与 commit 不符"));
-        }
-    }
-    let certificate = client
-        .device_cert(&commit.producer_device_id)?
-        .ok_or(SyncError::Object("bootstrap 缺 checkpoint 生产者证书"))?;
-    let input = checkpoint_signing_input(&commit)?;
-    verify_signature(&certificate.sign_ed25519_pub, &input, &signature)?;
-    Ok(())
-}
-
-/// 先读第 0 片信封拿 part_count/total_len，再按实际片数重算 object_digest 并读全对象。
-///
-/// 这样多片 manifest 也能校验（`/bootstrap` 响应不直接给 manifest 的 part_count/digest，
-/// 只能先看信封，再让签名 commit 绑定重算出的 digest）。
-fn fetch_manifest<C: RelayClient>(
-    client: &mut C,
-    root: &RootSecretV1,
-    checkpoint: &BootstrapCheckpoint,
-) -> Result<(ManifestV1, [u8; 32]), SyncError> {
-    let first = client.part(&checkpoint.manifest_oid, 0)?;
-    let envelope = Envelope::decode(&first)?;
-    if envelope.header.object_type != ObjectType::Manifest
-        || envelope.header.object_id != checkpoint.manifest_oid
-        || envelope.header.part_count == 0
-    {
-        return Err(SyncError::Object("bootstrap manifest 信封字段不符"));
-    }
-    if envelope.header.generation != 0 || envelope.header.sender_seq != 0 {
-        return Err(SyncError::Object("bootstrap manifest 信封字段不符"));
-    }
-    let digest = object_digest_of(client, &checkpoint.manifest_oid, envelope.header.part_count)?;
-    let (header, bytes) = fetch_object(
-        client,
-        root,
-        ObjectType::Manifest,
-        &checkpoint.manifest_oid,
-        envelope.header.part_count,
-        envelope.header.total_plaintext_len,
-        &digest,
-        &[],
-    )?;
-    if header.key_epoch != checkpoint.epoch {
-        return Err(SyncError::Object(
-            "bootstrap manifest epoch 与 checkpoint 不符",
-        ));
-    }
-    Ok((ManifestV1::decode(&bytes)?, digest))
-}
-
-fn object_digest_of<C: RelayClient>(
-    client: &mut C,
-    object_id: &[u8; 32],
-    part_count: u32,
-) -> Result<[u8; 32], SyncError> {
-    let mut digests = Vec::with_capacity(part_count as usize);
-    for index in 0..part_count {
-        let bytes = client.part(object_id, index)?;
-        digests.push(Sha256::digest(&bytes).into());
-    }
-    let input = menghunote_sync_proto::object_digest_input(part_count, &digests)?;
-    Ok(Sha256::digest(&input).into())
-}
-
-/// 由 manifest 重建 refs 集合（`refs_digest` 的唯一口径）。
-///
-/// `pub(crate)`：I 阶段的 checkpoint 级认证（`rotation_apply::verify_checkpoint_authorization`）
-/// 必须复算 `refs_digest`，复用本函数而不是复制一份口径（ADR §21：manifest 条目已带
-/// key_epoch/total_plain_len/object_digest，只凭 manifest 就能重算）。
-pub(crate) fn manifest_refs(manifest: &ManifestV1) -> Vec<ObjectRefV1> {
-    let mut refs = Vec::with_capacity(manifest.docs.len() + manifest.assets.len());
-    refs.extend(manifest.docs.iter().map(|doc| ObjectRefV1 {
-        object_id: doc.snapshot_object_id,
-        object_type: ObjectType::Snapshot,
-        generation: doc.generation,
-        key_epoch: doc.key_epoch,
-        part_count: doc.part_count,
-        total_plain_len: doc.total_plain_len,
-        object_digest: doc.object_digest,
-    }));
-    refs.extend(manifest.assets.iter().map(|asset| ObjectRefV1 {
-        object_id: asset.object_id,
-        object_type: ObjectType::Asset,
-        generation: 0,
-        key_epoch: asset.key_epoch,
-        part_count: asset.part_count,
-        total_plain_len: asset.total_plain_len,
-        object_digest: asset.object_digest,
-    }));
-    refs
-}
-
-fn verify_manifest(
-    manifest: &ManifestV1,
-    vault_id: [u8; 16],
-    checkpoint: &BootstrapCheckpoint,
-    epoch: u64,
-) -> Result<(), SyncError> {
-    if manifest.vault_id != vault_id
-        || manifest.checkpoint_id != checkpoint.checkpoint_id
-        || manifest.covered_relay_seq != checkpoint.covered_seq
-        || manifest.key_epoch != epoch
-    {
-        return Err(SyncError::Object("bootstrap manifest 与 checkpoint 不符"));
-    }
-    if manifest.min_reader > u32::try_from(MIN_READER).unwrap_or(u32::MAX) {
-        return Err(SyncError::Object("bootstrap 基线要求更高的 reader"));
-    }
-    if manifest.docs.is_empty() {
-        return Err(SyncError::Object("bootstrap manifest 没有文档"));
-    }
-    // 结构文档的 ID 是 storage 的固定常量：apply_baseline_batch 依赖它写 `kind='structure'`，
-    // 允许 manifest 声明别的 ID 会让结构被当成正文落库。
-    if manifest.structure_doc_id != STRUCTURE_DOC_ID {
-        return Err(SyncError::Object(
-            "bootstrap manifest structure_doc_id 非法",
-        ));
-    }
-    let mut doc_ids = BTreeSet::new();
-    let mut snapshot_ids = BTreeSet::new();
-    let mut structure_docs = 0usize;
-    for doc in &manifest.docs {
-        if !doc_ids.insert(doc.doc_id.as_str()) || !snapshot_ids.insert(doc.snapshot_object_id) {
-            return Err(SyncError::Object("bootstrap manifest 文档/对象重复"));
-        }
-        if doc.kind != KIND_BODY && doc.kind != KIND_STRUCTURE {
-            return Err(SyncError::Object("bootstrap manifest 文档 kind 非法"));
-        }
-        if doc.key_epoch != epoch {
-            return Err(SyncError::Object("bootstrap manifest 文档 epoch 不符"));
-        }
-        if doc.doc_id == STRUCTURE_DOC_ID {
-            structure_docs += 1;
-            if doc.kind != KIND_STRUCTURE {
-                return Err(SyncError::Object("bootstrap 结构文档 kind 非法"));
-            }
-        } else if doc.kind == KIND_STRUCTURE {
-            return Err(SyncError::Object("bootstrap manifest 含多余结构文档"));
-        }
-    }
-    if structure_docs != 1 {
-        return Err(SyncError::Object("bootstrap manifest 缺 structure 文档"));
-    }
-    let mut asset_objects = BTreeSet::new();
-    let mut asset_hashes = BTreeSet::new();
-    for asset in &manifest.assets {
-        if !asset_objects.insert(asset.object_id) || !asset_hashes.insert(asset.real_sha256) {
-            return Err(SyncError::Object("bootstrap manifest 资产重复"));
-        }
-        if asset.key_epoch != epoch {
-            return Err(SyncError::Object("bootstrap manifest 资产 epoch 不符"));
-        }
-    }
-    Ok(())
-}
-
-fn download_docs<C: RelayClient>(
-    client: &mut C,
-    root: &RootSecretV1,
-    peer_id: u64,
-    manifest: &ManifestV1,
-) -> Result<Vec<VerifiedDoc>, SyncError> {
-    let mut docs = Vec::with_capacity(manifest.docs.len());
-    for doc in &manifest.docs {
-        let (header, bytes) = fetch_self_described(
-            client,
-            root,
-            ObjectType::Snapshot,
-            &doc.snapshot_object_id,
-            &doc.object_digest,
-            &[],
-        )?;
-        if header.part_count != doc.part_count
-            || header.generation != doc.generation
-            || header.key_epoch != manifest.key_epoch
-            || header.sender_seq != 0
-        {
-            return Err(SyncError::Object("bootstrap 快照信封字段不符"));
-        }
-        let snapshot = SnapshotV1::decode(&bytes)?;
-        if !snapshot.full_history
-            || snapshot.doc_id != doc.doc_id
-            || snapshot.kind != doc.kind
-            || snapshot.generation != doc.generation
-            || snapshot.vv != doc.vv
-            || snapshot.frontier != doc.frontier
-        {
-            return Err(SyncError::Object("bootstrap 快照与 manifest 不符"));
-        }
-        if snapshot.codec_version != CODEC_VERSION
-            || snapshot.app_doc_schema != u32::try_from(APP_DOC_SCHEMA).unwrap_or(u32::MAX)
-            || snapshot.min_reader > u32::try_from(MIN_READER).unwrap_or(u32::MAX)
-        {
-            return Err(SyncError::Object("bootstrap 快照 app schema/codec 不可读"));
-        }
-        // 实际 VV/frontier：独立空 LoroDoc import 后再比，不只信 manifest 声明。
-        let actual_vv = verify_snapshot_history(&snapshot, doc)?;
-        let text = if doc.kind == KIND_BODY {
-            let body = BodyDoc::restore(
-                doc.doc_id.clone(),
-                peer_id,
-                Some(&snapshot.loro_snapshot_bytes),
-                &[],
-            )?;
-            Some(body.text())
-        } else {
-            None
-        };
-        docs.push(VerifiedDoc {
-            doc_id: doc.doc_id.clone(),
-            kind: doc.kind,
-            snapshot,
-            actual_vv,
-            text,
-        });
-    }
-    Ok(docs)
-}
-
-/// 把 snapshot 导入独立空 `LoroDoc`，校验 actual VV/frontier 与 manifest 声明一致。
-///
-/// 相等比较同时排除两种攻击：宣称了不存在的 op（虚高）与真实历史里缺 op。
-fn verify_snapshot_history(
-    snapshot: &SnapshotV1,
-    manifest_doc: &ManifestDoc,
-) -> Result<VersionVector, SyncError> {
-    if !snapshot.full_history {
-        return Err(SyncError::Object("bootstrap 快照不是 full-history"));
-    }
-    let doc = loro::LoroDoc::new();
-    doc.import(&snapshot.loro_snapshot_bytes)
-        .map_err(|_| SyncError::Object("bootstrap 快照 Loro 数据非法"))?;
-    // shallow snapshot 的 VV/frontier 仍可能自洽，必须再问 Loro 的 shallow 状态。
-    crate::checkpoint::ensure_snapshot_full_history(&doc)?;
-    let actual_vv = doc.oplog_vv();
-    let declared_vv = decode_vv(&manifest_doc.vv)?;
-    if actual_vv != declared_vv {
-        return Err(SyncError::Object(
-            "bootstrap 快照实际 VV 与 manifest 声明不一致",
-        ));
-    }
-    let actual_frontier = doc.state_frontiers();
-    if manifest_doc.frontier.is_empty() {
-        if actual_frontier.iter().next().is_some() {
-            return Err(SyncError::Object(
-                "bootstrap manifest frontier 为空但快照有实际 frontier",
-            ));
-        }
-    } else if actual_frontier.encode() != manifest_doc.frontier {
-        return Err(SyncError::Object(
-            "bootstrap 快照 frontier 与 manifest 声明不一致",
-        ));
-    }
-    Ok(actual_vv)
-}
-
-/// 结构语义校验：结构快照里的每篇笔记必须指向基线 manifest 内的正文文档。
-fn verify_structure_semantics(
-    docs: &[VerifiedDoc],
-    peer_id: u64,
-) -> Result<BTreeMap<String, String>, SyncError> {
-    let structure = docs
-        .iter()
-        .find(|doc| doc.kind == KIND_STRUCTURE)
-        .ok_or(SyncError::Object("bootstrap 缺 structure 文档"))?;
-    let doc = StructureDoc::restore(peer_id, Some(&structure.snapshot.loro_snapshot_bytes), &[])?;
-    let snapshot = doc.snapshot()?;
-    let manifest_kinds: BTreeMap<&str, u64> = docs
-        .iter()
-        .map(|doc| (doc.doc_id.as_str(), doc.kind))
-        .collect();
-    let mut notes = BTreeMap::new();
-    for node in &snapshot.nodes {
-        if node.note_id.is_some() != node.body_doc_id.is_some() {
-            return Err(SyncError::Object("bootstrap 结构节点笔记字段不成对"));
-        }
-        if !node.is_note() {
-            continue;
-        }
-        let note_id = node.note_id.clone().unwrap_or_default();
-        let body_doc_id = node.body_doc_id.clone().unwrap_or_default();
-        if manifest_kinds.get(body_doc_id.as_str()) != Some(&KIND_BODY) {
-            return Err(SyncError::Object(
-                "bootstrap 结构引用的正文文档不在基线 manifest",
-            ));
-        }
-        if notes.insert(note_id, body_doc_id).is_some() {
-            return Err(SyncError::Object("bootstrap 结构快照 note_id 重复"));
-        }
-    }
-    Ok(notes)
-}
-
-fn download_assets<C: RelayClient>(
-    client: &mut C,
-    root: &RootSecretV1,
-    manifest: &ManifestV1,
-) -> Result<Vec<VerifiedAsset>, SyncError> {
-    let mut assets = Vec::with_capacity(manifest.assets.len());
-    for manifest_asset in &manifest.assets {
-        let expected = crate::checkpoint::asset_object_id(
-            root,
-            &manifest_asset.real_sha256,
-            manifest_asset.byte_len,
-            &manifest_asset.media_type,
-        )?;
-        if expected != manifest_asset.object_id {
-            return Err(SyncError::Object("bootstrap 资产 object_id 与根不符"));
-        }
-        let (header, bytes) = fetch_self_described(
-            client,
-            root,
-            ObjectType::Asset,
-            &manifest_asset.object_id,
-            &manifest_asset.object_digest,
-            &[],
-        )?;
-        if header.part_count != manifest_asset.part_count || header.key_epoch != manifest.key_epoch
-        {
-            return Err(SyncError::Object(
-                "bootstrap 资产片数/epoch 与 manifest 不符",
-            ));
-        }
-        // ADR §31：ASSET 的 header producer 固定为 0，且 message_id 必须由 identical
-        // asset header 确定性派生（跨设备/重传的密文字节才可能一致）。
-        if header.producer_device_id != [0u8; 16]
-            || header.generation != 0
-            || header.sender_seq != 0
-        {
-            return Err(SyncError::Object("bootstrap 资产信封字段不符（§31）"));
-        }
-        if header.message_id != crate::upload::asset_message_id(root, &manifest_asset.object_id)? {
-            return Err(SyncError::Object("bootstrap 资产 message_id 非确定性派生"));
-        }
-        let reference = AssetRef {
-            real_sha256: manifest_asset.real_sha256,
-            byte_len: manifest_asset.byte_len,
-            media_type: manifest_asset.media_type.clone(),
-            object: crate::upload::UploadedObject {
-                object_id: manifest_asset.object_id,
-                part_count: manifest_asset.part_count,
-                total_plain_len: header.total_plaintext_len,
-                object_digest: manifest_asset.object_digest,
-            },
-        };
-        verify_asset_plaintext(&bytes, &reference)?;
-        let body_start = 42 + manifest_asset.media_type.len();
-        let data = bytes
-            .get(body_start..)
-            .ok_or(SyncError::Object("bootstrap 资产明文越界"))?
-            .to_vec();
-        assets.push(VerifiedAsset {
-            object_id: manifest_asset.object_id,
-            real_sha256: manifest_asset.real_sha256,
-            byte_len: manifest_asset.byte_len,
-            media_type: manifest_asset.media_type.clone(),
-            data,
-        });
-    }
-    Ok(assets)
-}
-
-/// 读第 0 片拿 header，再按 header 的 part_count/total_len 读全对象并校验摘要/解密。
-fn fetch_self_described<C: RelayClient>(
-    client: &mut C,
-    root: &RootSecretV1,
-    object_type: ObjectType,
-    object_id: &[u8; 32],
-    expected_digest: &[u8; 32],
-    descriptor: &[u8],
-) -> Result<(EnvelopeHeader, Vec<u8>), SyncError> {
-    let first = client.part(object_id, 0)?;
-    let envelope = Envelope::decode(&first)?;
-    if envelope.header.object_type != object_type
-        || envelope.header.object_id != *object_id
-        || envelope.header.part_count == 0
-    {
-        return Err(SyncError::Object("bootstrap 对象 header 不符"));
-    }
-    fetch_object(
-        client,
-        root,
-        object_type,
-        object_id,
-        envelope.header.part_count,
-        envelope.header.total_plaintext_len,
-        expected_digest,
-        descriptor,
-    )
-}
-
-/// 清掉"上一次 bootstrap 选了另一份基线"的 staging（数据是 CRDT merge，重放幂等）。
-///
-/// 轮换的 baseline apply 传空 `source_cursor`，这里用前缀区分，绝不误清轮换 journal。
-fn reconcile_journal(
-    vault: &Vault,
-    checkpoint_id: &[u8; 16],
-    baseline_s: u64,
-    source_cursor: &str,
-) -> Result<(), SyncError> {
-    let Some(state) = baseline_apply_state(vault)? else {
-        return Ok(());
-    };
-    if state.status != BaselineApplyStatus::Staging {
-        return Ok(());
-    }
-    let same = state.checkpoint_id == *checkpoint_id
-        && state.baseline_s == baseline_s
-        && state.source_cursor == source_cursor;
-    if same {
-        return Ok(());
-    }
-    if state.source_cursor.starts_with(JOURNAL_SOURCE_PREFIX) {
-        let _aborted = abort_baseline_apply(vault)?;
-        return Ok(());
-    }
-    Err(SyncError::Storage(
-        menghunote_storage::StorageError::SyncConflict {
-            context: "已有非 bootstrap 的 baseline apply staging（轮换？），拒绝 bootstrap"
-                .to_owned(),
-        },
-    ))
-}
-
-/// staging journal + 分批导入 docs/structure/assets；返回按 manifest 顺序的报告文本。
-fn apply_selected(
-    vault: &Vault,
-    peer_id: u64,
-    selected: &SelectedBaseline,
-    fault: Option<BootstrapFault>,
-) -> Result<Vec<(String, Option<String>)>, SyncError> {
-    let checkpoint_id = selected.checkpoint.checkpoint_id;
-    let baseline_s = selected.checkpoint.covered_seq;
-    let source_cursor = format!("{JOURNAL_SOURCE_PREFIX}{}", selected.checkpoint.cursor);
-    // 完整性基准：本 checkpoint 覆盖的全部文档与资产都必须出现在 apply 批里。
-    // 集合由 begin 记录，任何"少导入一批"的续跑都不会被误当成完整
-    // （rotation 的 finish 会直接 Conflict；bootstrap 的 finalize 另有逐项读回校验）。
-    let expected = BaselineExpectation::new(
-        selected.docs.iter().map(|doc| doc.doc_id.clone()),
-        selected.assets.iter().map(|asset| asset.object_id),
+pub fn intent_message_id(doc_id: &str, seq: u64, ctx: SyncContext) -> String {
+    let digest = intent_digest(
+        b"message\0",
+        &[
+            doc_id.as_bytes(),
+            &[0],
+            &seq.to_be_bytes(),
+            &ctx.peer_id.to_be_bytes(),
+            &ctx.key_epoch.to_be_bytes(),
+        ],
     );
-    reconcile_journal(vault, &checkpoint_id, baseline_s, &source_cursor)?;
-    begin_baseline_apply(vault, &checkpoint_id, baseline_s, &source_cursor, &expected)?;
+    hex_lower(&digest[..16])
+}
 
-    // body → structure → asset（structure 投影依赖正文行已存在；与旧实现的顺序一致）。
-    let bodies: Vec<&VerifiedDoc> = selected
-        .docs
-        .iter()
-        .filter(|doc| doc.kind == KIND_BODY)
-        .collect();
-    for chunk in bodies.chunks(BOOTSTRAP_DOC_BATCH) {
-        let batch: Vec<(String, Vec<u8>)> = chunk
-            .iter()
-            .map(|doc| (doc.doc_id.clone(), doc.snapshot.loro_snapshot_bytes.clone()))
-            .collect();
-        apply_baseline_batch(vault, &batch, &[])?;
-    }
-    if fault == Some(BootstrapFault::AfterBodies) {
-        return Err(injected_fault());
-    }
+/// 确定性 object id（32B）。
+///
+/// `sha256(domain‖"object"‖message_id‖peer_be‖epoch_be)`：对象名与 message 一一对应，
+/// 重试/重打包时同样的 message 得到同样的对象名。
+#[must_use]
+pub fn intent_object_id(message_id: &str, ctx: SyncContext) -> [u8; 32] {
+    intent_digest(
+        b"object\0",
+        &[
+            message_id.as_bytes(),
+            &ctx.peer_id.to_be_bytes(),
+            &ctx.key_epoch.to_be_bytes(),
+        ],
+    )
+}
 
-    let structure = selected
-        .docs
-        .iter()
-        .find(|doc| doc.kind == KIND_STRUCTURE)
-        .ok_or(SyncError::Object("bootstrap 缺 structure 文档"))?;
-    apply_baseline_batch(
+/// 为一条**本地** update 派生一条出站意图。
+///
+/// `seq` 必须是这次 A 事务里该 update 真正落库的 `loro_updates.seq`
+/// （= `expected_head_seq + 1 + index`），否则意图与数据对不上。
+pub fn local_sync_intent(
+    doc_id: &str,
+    seq: u64,
+    batch_id: &str,
+    ctx: SyncContext,
+) -> Result<SyncIntent, StorageError> {
+    ctx.validate()?;
+    if doc_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "sync intent doc_id 不能为空".to_owned(),
+        });
+    }
+    let message_id = intent_message_id(doc_id, seq, ctx);
+    validate_intent(&message_id, batch_id, seq, ctx.key_epoch)?;
+    Ok(SyncIntent {
+        batch_id: batch_id.to_owned(),
+        object_id: intent_object_id(&message_id, ctx),
+        message_id,
+        key_epoch: ctx.key_epoch,
+    })
+}
+
+/// 同事务写入「一 update 一**可选**意图」：`None` = 该条不产生意图（remote 导入）。
+///
+/// 一次 flush 的连续前缀可能**混**本地编辑与远端导入（`JournalOrigin`），而
+/// remote/import/adopt **绝不能**产生出站意图（否则会把刚收到的数据再推回 relay）。
+/// 这里仍是一条 A 事务、按位置一一对应，只是允许某些位置为空。
+///
+/// `slots` 空 = 本批没有**任何**出站意图；来源标记用 [`store::OriginMarks`]
+/// （`AllLocal` / 与 records 等长的 `PerRecord`），**不再用空切片**表示「全部本地」。
+pub(crate) fn append_updates_with_intent_slots(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[store::UpdateRecord],
+    slots: &[Option<SyncIntent>],
+    origin: store::OriginMarks<'_>,
+) -> Result<store::HeadState, StorageError> {
+    if !slots.is_empty() && slots.len() != records.len() {
+        return Err(StorageError::Corrupt {
+            context: format!(
+                "append_updates_with_intent_slots: records={} slots={} 必须一对一",
+                records.len(),
+                slots.len()
+            ),
+        });
+    }
+    store::append_updates_with_intent_slots(
         vault,
-        &[(
-            structure.doc_id.clone(),
-            structure.snapshot.loro_snapshot_bytes.clone(),
-        )],
-        &[],
-    )?;
-    if fault == Some(BootstrapFault::BeforeStructureProjection) {
-        return Err(injected_fault());
-    }
-    let mut writer = StructureWriter::open(vault, peer_id)?;
-    writer.commit("bootstrap")?;
+        doc_id,
+        expected_head_seq,
+        records,
+        slots,
+        origin,
+    )
+}
 
-    if !selected.assets.is_empty() {
-        let assets: Vec<BaselineAsset> = selected
-            .assets
-            .iter()
-            .map(|asset| BaselineAsset {
-                object_id: asset.object_id,
-                asset_hash: asset.real_sha256,
-                byte_len: asset.byte_len,
-                media_type: Some(asset.media_type.clone()),
-                data: asset.data.clone(),
+fn intent_digest(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(SYNC_INTENT_ID_DOMAIN);
+    hasher.update(tag);
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+/// outbox 状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyncOutboxState {
+    Pending,
+    Encrypted,
+    Sent,
+    Acked,
+}
+
+impl SyncOutboxState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Encrypted => "encrypted",
+            Self::Sent => "sent",
+            Self::Acked => "acked",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "encrypted" => Ok(Self::Encrypted),
+            "sent" => Ok(Self::Sent),
+            "acked" => Ok(Self::Acked),
+            other => Err(StorageError::Corrupt {
+                context: format!("未知 sync_outbox.state {other:?}"),
+            }),
+        }
+    }
+}
+
+/// 一条待处理出站消息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncOutboxRow {
+    pub message_id: String,
+    pub batch_id: String,
+    pub doc_id: String,
+    pub seq: u64,
+    pub key_epoch: u64,
+    pub object_id: Option<[u8; 32]>,
+    pub state: SyncOutboxState,
+    pub cipher_digest: Option<[u8; 32]>,
+}
+
+/// 一个已加密的 MNE1 part。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncEncryptedPart {
+    /// 0-based 连续下标（0..part_count-1）。
+    pub part_no: u32,
+    /// exact MNE1 envelope bytes（header+ciphertext）。
+    pub envelope: Vec<u8>,
+    /// 该 part envelope 的 SHA256（sync 计算，storage 不验哈希）。
+    pub digest: [u8; 32],
+}
+
+/// 从数据库读出的 part。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncOutboxPart {
+    pub message_id: String,
+    pub epoch: u64,
+    pub part_no: u32,
+    pub envelope: Vec<u8>,
+    pub digest: [u8; 32],
+}
+
+/// inbox 状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyncInboxState {
+    Received,
+    Verified,
+    Integrated,
+    Quarantine,
+}
+
+impl SyncInboxState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Verified => "verified",
+            Self::Integrated => "integrated",
+            Self::Quarantine => "quarantine",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "received" => Ok(Self::Received),
+            "verified" => Ok(Self::Verified),
+            "integrated" => Ok(Self::Integrated),
+            "quarantine" => Ok(Self::Quarantine),
+            other => Err(StorageError::Corrupt {
+                context: format!("未知 sync_inbox.state {other:?}"),
+            }),
+        }
+    }
+}
+
+/// 一条入站对象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncInboxRow {
+    pub log_id: [u8; 16],
+    pub relay_seq: u64,
+    pub object_id: [u8; 32],
+    pub epoch: u64,
+    pub state: SyncInboxState,
+    pub verified_payload: Option<Vec<u8>>,
+}
+
+/// 批量写入的一行**已验签 / 已解密**入站事实（[`store_inbox_verified_batch`] 的输入）。
+///
+/// 字段与 [`store_inbox_verified`] 的参数一一对应；依赖是否齐仍由 sync 层判断，
+/// storage 只负责 durable 落行与推进 `received` 连续前缀。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedInboxRow {
+    /// relay 日志 incarnation（同一批必须一致）。
+    pub log_id: [u8; 16],
+    /// relay 日志序号（必须 > 0；同一批内不得重复）。
+    pub relay_seq: u64,
+    /// 密文对象名（32B）。
+    pub object_id: [u8; 32],
+    /// 加密 epoch（必须 > 0）。
+    pub epoch: u64,
+    /// 已解密并完成载荷校验的 `UpdateV1` 明文（写入 `sync_inbox.verified_payload`）。
+    pub verified_payload: Vec<u8>,
+}
+
+/// 本地同步水位（`meta` 约定）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncCursorState {
+    pub received_seq: u64,
+    pub integrated_seq: u64,
+    pub log_id: Option<[u8; 16]>,
+    pub confirmed_highwater: Option<u64>,
+}
+
+/// 在 A 事务内追加 update 的同时写出站意图。
+///
+/// `intents.len()` 必须与 `records.len()` 相同（一 update 一意图）。
+pub fn append_updates_with_sync_intents(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[store::UpdateRecord],
+    intents: &[SyncIntent],
+) -> Result<store::HeadState, StorageError> {
+    if intents.len() != records.len() {
+        return Err(StorageError::Corrupt {
+            context: format!(
+                "append_updates_with_sync_intents: records={} intents={} 必须一对一",
+                records.len(),
+                intents.len()
+            ),
+        });
+    }
+    let slots: Vec<Option<SyncIntent>> = intents.iter().cloned().map(Some).collect();
+    store::append_updates_with_intent_slots(
+        vault,
+        doc_id,
+        expected_head_seq,
+        records,
+        &slots,
+        store::OriginMarks::AllLocal,
+    )
+}
+
+/// 单独记录一条出站意图（调用方已确认 update 落库）。
+///
+/// 若希望意图与 update 同事务，请用 [`append_updates_with_sync_intents`]。
+pub fn enqueue_sync_intent(
+    vault: &Vault,
+    message_id: &str,
+    batch_id: &str,
+    doc_id: &str,
+    seq: u64,
+    key_epoch: u64,
+    object_id: &[u8; 32],
+) -> Result<(), StorageError> {
+    validate_intent(message_id, batch_id, seq, key_epoch)?;
+    let affected = vault.exec(
+        "INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,object_id,state,ciphertext) \
+         VALUES(?1,?2,?3,?4,?5,?6,'pending',NULL)",
+        &[
+            Value::Text(message_id.to_owned()),
+            Value::Text(batch_id.to_owned()),
+            Value::Text(doc_id.to_owned()),
+            Value::Integer(i64_of(seq)?),
+            Value::Integer(i64_of(key_epoch)?),
+            Value::Blob(object_id.to_vec()),
+        ],
+    )?;
+    if affected != 1 {
+        return Err(StorageError::SyncConflict {
+            context: format!("message {message_id} 已存在"),
+        });
+    }
+    Ok(())
+}
+
+/// 读指定状态的 outbox 行。
+pub fn outbox_rows(
+    vault: &Vault,
+    state: SyncOutboxState,
+    limit: usize,
+) -> Result<Vec<SyncOutboxRow>, StorageError> {
+    let rows = vault.query(
+        "SELECT message_id,batch_id,doc_id,seq,key_epoch,object_id,state,cipher_digest \
+         FROM sync_outbox WHERE state=?1 ORDER BY doc_id,seq,message_id LIMIT ?2",
+        &[
+            Value::Text(state.as_str().to_owned()),
+            Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+        ],
+    )?;
+    rows.iter().map(row_to_outbox).collect()
+}
+
+/// 待加密（state=pending）的意图。
+pub fn pending_encryption(vault: &Vault, limit: usize) -> Result<Vec<SyncOutboxRow>, StorageError> {
+    outbox_rows(vault, SyncOutboxState::Pending, limit)
+}
+
+/// 待发送（state=encrypted）的批次。
+pub fn pending_send(vault: &Vault, limit: usize) -> Result<Vec<SyncOutboxRow>, StorageError> {
+    outbox_rows(vault, SyncOutboxState::Encrypted, limit)
+}
+
+/// 按 message_id 读一行。
+pub fn outbox_row(vault: &Vault, message_id: &str) -> Result<Option<SyncOutboxRow>, StorageError> {
+    let rows = vault.query(
+        "SELECT message_id,batch_id,doc_id,seq,key_epoch,object_id,state,cipher_digest \
+         FROM sync_outbox WHERE message_id=?1",
+        &[Value::Text(message_id.to_owned())],
+    )?;
+    rows.first().map(row_to_outbox).transpose()
+}
+
+/// 读某 message/epoch 的全部 parts，按 part_no 升序。
+pub fn outbox_parts(
+    vault: &Vault,
+    message_id: &str,
+    epoch: u64,
+) -> Result<Vec<SyncOutboxPart>, StorageError> {
+    let rows = vault.query(
+        "SELECT message_id,epoch,part_no,envelope,digest FROM sync_outbox_parts \
+         WHERE message_id=?1 AND epoch=?2 ORDER BY part_no",
+        &[
+            Value::Blob(message_id.as_bytes().to_vec()),
+            Value::Integer(i64_of(epoch)?),
+        ],
+    )?;
+    rows.iter()
+        .map(|row| {
+            Ok(SyncOutboxPart {
+                message_id: text_from_blob(row, 0, "sync_outbox_parts.message_id")?,
+                epoch: u64_of(row, 1, "sync_outbox_parts.epoch")?,
+                part_no: u32_of(row, 2, "sync_outbox_parts.part_no")?,
+                envelope: blob_of(row, 3, "sync_outbox_parts.envelope")?,
+                digest: array32(row, 4, "sync_outbox_parts.digest")?,
+            })
+        })
+        .collect()
+}
+
+/// CAS 写入一批加密 parts，并把 outbox 置为 encrypted。
+///
+/// 同一 `(message_id, epoch)` 已有 parts 时，必须与新提交的整批字节完全一致；
+/// 否则返回 [`StorageError::SyncConflict`]（不会覆盖旧 parts）。
+pub fn store_encrypted_parts(
+    vault: &Vault,
+    message_id: &str,
+    epoch: u64,
+    object_digest: &[u8; 32],
+    parts: &[SyncEncryptedPart],
+) -> Result<(), StorageError> {
+    if message_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "message_id 不能为空".to_owned(),
+        });
+    }
+    if parts.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: format!("message {message_id} 没有 parts"),
+        });
+    }
+    for (index, part) in parts.iter().enumerate() {
+        if part.part_no != index as u32 {
+            return Err(StorageError::Corrupt {
+                context: format!(
+                    "message {message_id} parts 必须从 0 连续：第 {index} 项是 {}",
+                    part.part_no
+                ),
+            });
+        }
+        if part.envelope.is_empty() {
+            return Err(StorageError::Corrupt {
+                context: format!("message {message_id} 第 {index} 片信封为空"),
+            });
+        }
+    }
+
+    let outbox = outbox_row(vault, message_id)?.ok_or_else(|| StorageError::Corrupt {
+        context: format!("sync_outbox 缺少 message {message_id}"),
+    })?;
+    if outbox.key_epoch != epoch {
+        return Err(StorageError::SyncConflict {
+            context: format!(
+                "message {message_id} epoch={epoch}，outbox 为 {}",
+                outbox.key_epoch
+            ),
+        });
+    }
+    if outbox.state == SyncOutboxState::Acked {
+        return Err(StorageError::SyncConflict {
+            context: format!("message {message_id} 已 ACK，拒绝重加密"),
+        });
+    }
+
+    let existing = outbox_parts(vault, message_id, epoch)?;
+    let mut missing = Vec::new();
+    if !existing.is_empty() {
+        if let Some(old_digest) = outbox.cipher_digest {
+            if old_digest != *object_digest {
+                return Err(StorageError::SyncConflict {
+                    context: format!("message {message_id}/{epoch} 整体 digest 不一致"),
+                });
+            }
+        }
+        if existing.len() != parts.len() {
+            return Err(StorageError::SyncConflict {
+                context: format!(
+                    "message {message_id}/{epoch} 已有 {} parts，本次 {} parts",
+                    existing.len(),
+                    parts.len()
+                ),
+            });
+        }
+        for (old, new) in existing.iter().zip(parts) {
+            if old.part_no != new.part_no
+                || old.envelope != new.envelope
+                || old.digest != new.digest
+            {
+                return Err(StorageError::SyncConflict {
+                    context: format!(
+                        "message {message_id}/{epoch} 第 {} 片字节不一致",
+                        new.part_no
+                    ),
+                });
+            }
+        }
+    } else {
+        missing.extend(parts.iter());
+    }
+
+    let mut statements = Vec::with_capacity(1 + missing.len());
+    statements.push(Statement::new(
+        "UPDATE sync_outbox SET state='encrypted', cipher_digest=?2 \
+         WHERE message_id=?1 AND key_epoch=?3 AND state IN('pending','encrypted','sent')",
+        vec![
+            Value::Text(message_id.to_owned()),
+            Value::Blob(object_digest.to_vec()),
+            Value::Integer(i64_of(epoch)?),
+        ],
+    ));
+    for part in missing {
+        statements.push(Statement::new(
+            "INSERT INTO sync_outbox_parts(message_id,epoch,part_no,envelope,digest) \
+             VALUES(?1,?2,?3,?4,?5)",
+            vec![
+                Value::Blob(message_id.as_bytes().to_vec()),
+                Value::Integer(i64_of(epoch)?),
+                Value::Integer(i64::from(part.part_no)),
+                Value::Blob(part.envelope.clone()),
+                Value::Blob(part.digest.to_vec()),
+            ],
+        ));
+    }
+
+    match vault.exec_transaction(&statements, &[AffectedGuard::exactly(0, 1)]) {
+        Ok(_) => Ok(()),
+        Err(StorageError::GuardFailed { .. }) => Err(StorageError::SyncConflict {
+            context: format!("message {message_id}/{epoch} 状态已变化，未写入 parts"),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+/// 把已加密批次标记为已发送（CAS digest）。
+pub fn mark_sent(
+    vault: &Vault,
+    message_id: &str,
+    epoch: u64,
+    object_digest: &[u8; 32],
+) -> Result<bool, StorageError> {
+    let affected = vault.exec(
+        "UPDATE sync_outbox SET state='sent' \
+         WHERE message_id=?1 AND key_epoch=?2 AND cipher_digest=?3 \
+           AND state IN('encrypted','sent')",
+        &[
+            Value::Text(message_id.to_owned()),
+            Value::Integer(i64_of(epoch)?),
+            Value::Blob(object_digest.to_vec()),
+        ],
+    )?;
+    Ok(affected == 1)
+}
+
+/// durable ACK：CAS 成功后删除该 outbox 行及其 parts。
+///
+/// 旧 ACK 的 digest 对不上时只返回 `false`，**不会**删除同 doc/seq 的新 message。
+pub fn mark_acked(
+    vault: &Vault,
+    message_id: &str,
+    epoch: u64,
+    object_digest: &[u8; 32],
+) -> Result<bool, StorageError> {
+    let statements = [
+        Statement::new(
+            "DELETE FROM sync_outbox_parts WHERE message_id=?1 AND epoch=?2",
+            vec![
+                Value::Blob(message_id.as_bytes().to_vec()),
+                Value::Integer(i64_of(epoch)?),
+            ],
+        ),
+        Statement::new(
+            "DELETE FROM sync_outbox \
+             WHERE message_id=?1 AND key_epoch=?2 AND cipher_digest=?3 \
+               AND state IN('encrypted','sent')",
+            vec![
+                Value::Text(message_id.to_owned()),
+                Value::Integer(i64_of(epoch)?),
+                Value::Blob(object_digest.to_vec()),
+            ],
+        ),
+    ];
+    match vault.exec_transaction(&statements, &[AffectedGuard::exactly(1, 1)]) {
+        Ok(_) => Ok(true),
+        Err(StorageError::GuardFailed { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// `doc_id/seq` 是否仍被未 ACK 的 outbox 引用。
+///
+/// 只有返回 `false` 时才允许回收 `loro_updates`（经验证 snapshot VV 覆盖
+/// 属于 sync 层的独立条件，本函数不解析 Loro）。
+pub fn update_referenced_by_outbox(
+    vault: &Vault,
+    doc_id: &str,
+    seq: u64,
+) -> Result<bool, StorageError> {
+    let rows = vault.query(
+        "SELECT count(*) FROM sync_outbox WHERE doc_id=?1 AND seq=?2",
+        &[Value::Text(doc_id.to_owned()), Value::Integer(i64_of(seq)?)],
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|value| match value {
+            Value::Integer(value) => Some(*value > 0),
+            _ => None,
+        })
+        .unwrap_or(false))
+}
+
+/// `doc_id/seq` 的 update 是否已无未 ACK outbox 引用、可回收。
+///
+/// 这只是**必要**条件；调用方还必须确认“经验证 snapshot VV 已覆盖该 seq”。
+pub fn can_recycle_update(vault: &Vault, doc_id: &str, seq: u64) -> Result<bool, StorageError> {
+    Ok(!update_referenced_by_outbox(vault, doc_id, seq)?)
+}
+
+/// `meta` 键：轮换后必须 repack outbox 的持久屏障（sync 阶段 H 写入 `b"1"`）。
+pub const META_SYNC_REPACK_REQUIRED: &str = "sync.repack_required";
+
+/// 旧 outbox 行的 CAS 键：message/epoch/整体 digest 必须同时匹配。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxKey {
+    pub message_id: String,
+    pub epoch: u64,
+    pub cipher_digest: [u8; 32],
+}
+
+/// repack 后要写入的一个 MNE1 part。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackPart {
+    pub part_no: u32,
+    pub envelope: Vec<u8>,
+    pub digest: [u8; 32],
+}
+
+/// 一条 outbox 重打包目标（保留旧行的 doc_id/seq/batch_id，只换消息元数据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackSpec {
+    pub message_id: String,
+    pub object_id: [u8; 32],
+    pub epoch: u64,
+    pub parts: Vec<RepackPart>,
+    pub cipher_digest: [u8; 32],
+}
+
+/// repack 结果；`NotFound`/`Conflict` 都保证**没有改动任何行**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepackOutcome {
+    Repacked,
+    NotFound,
+    Conflict,
+}
+
+/// candidate 里的 parts 摘要（不把 envelope 全量搬进列表）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackPartSummary {
+    pub part_no: u32,
+    pub envelope_len: usize,
+    pub digest: [u8; 32],
+}
+
+/// 一条待 repack 的旧 outbox 及其 parts 摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRepackCandidate {
+    pub message_id: String,
+    pub batch_id: String,
+    pub doc_id: String,
+    pub seq: u64,
+    pub key_epoch: u64,
+    pub object_id: Option<[u8; 32]>,
+    pub state: SyncOutboxState,
+    pub cipher_digest: Option<[u8; 32]>,
+    pub parts: Vec<RepackPartSummary>,
+}
+
+/// `sync.repack_required` 屏障读取；未知值按损坏处理，避免静默漏 repack。
+pub fn repack_required(vault: &Vault) -> Result<bool, StorageError> {
+    match vault.get_meta(META_SYNC_REPACK_REQUIRED)? {
+        None => Ok(false),
+        Some(value) if value == b"0" || value.is_empty() => Ok(false),
+        Some(value) if value == b"1" => Ok(true),
+        Some(value) => Err(StorageError::Corrupt {
+            context: format!(
+                "meta {META_SYNC_REPACK_REQUIRED} 非法值：{}",
+                String::from_utf8_lossy(&value)
+            ),
+        }),
+    }
+}
+
+/// 写 `sync.repack_required` 屏障；与 sync 现有 `vault.set_meta` 使用同一 meta 键。
+pub fn set_repack_required(vault: &Vault, required: bool) -> Result<(), StorageError> {
+    vault.set_meta(
+        META_SYNC_REPACK_REQUIRED,
+        if required { b"1" } else { b"0" },
+    )
+}
+
+/// 列出仍未 ACK（pending/encrypted/sent）、且 key_epoch 不是给定当前 epoch 的 outbox 行。
+///
+/// `encrypted` 表示 parts 已 durable 但尚未发送；换 epoch 后同样必须重包，不能漏掉。
+pub fn outbox_repack_candidates(
+    vault: &Vault,
+    current_epoch: u64,
+) -> Result<Vec<OutboxRepackCandidate>, StorageError> {
+    let rows = vault.query(
+        "SELECT message_id,batch_id,doc_id,seq,key_epoch,object_id,state,cipher_digest \
+         FROM sync_outbox WHERE state IN('pending','encrypted','sent') AND key_epoch<>?1 \
+         ORDER BY doc_id,seq,message_id",
+        &[Value::Integer(i64_of(current_epoch)?)],
+    )?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let row = row_to_outbox(row)?;
+        let parts = outbox_parts(vault, &row.message_id, row.key_epoch)?
+            .into_iter()
+            .map(|part| RepackPartSummary {
+                part_no: part.part_no,
+                envelope_len: part.envelope.len(),
+                digest: part.digest,
             })
             .collect();
-        apply_baseline_assets(vault, &assets)?;
+        out.push(OutboxRepackCandidate {
+            message_id: row.message_id,
+            batch_id: row.batch_id,
+            doc_id: row.doc_id,
+            seq: row.seq,
+            key_epoch: row.key_epoch,
+            object_id: row.object_id,
+            state: row.state,
+            cipher_digest: row.cipher_digest,
+            parts,
+        });
     }
-    if fault == Some(BootstrapFault::AfterAssets) {
-        return Err(injected_fault());
+    Ok(out)
+}
+
+/// 原子地把一条旧 outbox 重打包为新的 message/object/epoch/parts。
+///
+/// 先做无写入的旧行 CAS 校验；校验通过后在**同一个事务**里：
+/// 删除旧 parts → 删除旧 outbox 行 → 插入新 outbox 行 → 插入新 parts。
+/// 旧行已被 ACK、epoch/digest 不匹配或事务中途失败时，旧行与旧 parts 都保持不变。
+pub fn repack_outbox(
+    vault: &Vault,
+    old: &OutboxKey,
+    new: &RepackSpec,
+) -> Result<RepackOutcome, StorageError> {
+    validate_repack_spec(new)?;
+    if old.message_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "repack old.message_id 不能为空".to_owned(),
+        });
     }
 
-    // 读回校验的耗时只作诊断指标（不参与决策）；失败也要记录。
-    let verify_started = Instant::now();
-    let verified = verify_imported(vault, peer_id, selected, fault);
-    record_baseline_verify_time(verify_started.elapsed());
-    match verified {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            // 不回滚已 merge 的 Loro/资产，也不改 journal.status（schema CHECK 只有
-            // staging/completed）：只写失败标记，让下一次 begin 拒绝续跑，直到 abort。
-            if let Err(mark_error) = mark_baseline_verify_failed(vault, &error.to_string()) {
-                // 不能把原始 verify 错误替换成 marker 写错误：调用方需要根因；同时
-                // 明确 marker 未持久化意味着 journal 仍可续跑，必须先 abort。
-                return Err(SyncError::Storage(
-                    menghunote_storage::StorageError::Corrupt {
-                        context: format!(
-                            "baseline 读回校验失败：{error}；另外写失败标记也失败（{mark_error}），                             journal 仍可续跑，必须先 abort_baseline_apply"
-                        ),
-                    },
-                ));
-            }
-            Err(error)
+    let old_row = outbox_row(vault, &old.message_id)?;
+    let Some(old_row) = old_row else {
+        return Ok(RepackOutcome::NotFound);
+    };
+    if old_row.state == SyncOutboxState::Acked
+        || old_row.key_epoch != old.epoch
+        || old_row.cipher_digest != Some(old.cipher_digest)
+    {
+        return Ok(RepackOutcome::Conflict);
+    }
+    // 若新旧 CAS 键完全相同，迟到的旧 ACK 仍可能命中新行；这不是一次有效的重包。
+    if new.message_id == old.message_id
+        && new.epoch == old.epoch
+        && new.cipher_digest == old.cipher_digest
+    {
+        return Ok(RepackOutcome::Conflict);
+    }
+
+    // 旧 parts 必须是连续 0..n-1；数据库损坏时不能静默搬走。
+    let old_parts = outbox_parts(vault, &old.message_id, old.epoch)?;
+    for (index, part) in old_parts.iter().enumerate() {
+        if part.part_no != index as u32 {
+            return Err(StorageError::Corrupt {
+                context: format!(
+                    "旧 outbox {}/{} parts 不连续：第 {index} 项是 {}",
+                    old.message_id, old.epoch, part.part_no
+                ),
+            });
         }
+    }
+
+    // 同一 message_id 只能有一行；复用旧 message 时由事务内“先删后插”保证。
+    if new.message_id != old.message_id && outbox_row(vault, &new.message_id)?.is_some() {
+        return Ok(RepackOutcome::Conflict);
+    }
+
+    let mut statements = Vec::with_capacity(2 + 1 + new.parts.len());
+    statements.push(Statement::new(
+        "DELETE FROM sync_outbox_parts WHERE message_id=?1 AND epoch=?2",
+        vec![
+            Value::Blob(old.message_id.as_bytes().to_vec()),
+            Value::Integer(i64_of(old.epoch)?),
+        ],
+    ));
+    statements.push(Statement::new(
+        "DELETE FROM sync_outbox \
+         WHERE message_id=?1 AND key_epoch=?2 AND cipher_digest=?3 \
+           AND state IN('pending','encrypted','sent')",
+        vec![
+            Value::Text(old.message_id.clone()),
+            Value::Integer(i64_of(old.epoch)?),
+            Value::Blob(old.cipher_digest.to_vec()),
+        ],
+    ));
+    statements.push(Statement::new(
+        "INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,ciphertext,object_id,state,cipher_digest) \
+         VALUES(?1,?2,?3,?4,?5,NULL,?6,'encrypted',?7)",
+        vec![
+            Value::Text(new.message_id.clone()),
+            Value::Text(old_row.batch_id.clone()),
+            Value::Text(old_row.doc_id.clone()),
+            Value::Integer(i64_of(old_row.seq)?),
+            Value::Integer(i64_of(new.epoch)?),
+            Value::Blob(new.object_id.to_vec()),
+            Value::Blob(new.cipher_digest.to_vec()),
+        ],
+    ));
+    for part in &new.parts {
+        statements.push(Statement::new(
+            "INSERT INTO sync_outbox_parts(message_id,epoch,part_no,envelope,digest) \
+             VALUES(?1,?2,?3,?4,?5)",
+            vec![
+                Value::Blob(new.message_id.as_bytes().to_vec()),
+                Value::Integer(i64_of(new.epoch)?),
+                Value::Integer(i64::from(part.part_no)),
+                Value::Blob(part.envelope.clone()),
+                Value::Blob(part.digest.to_vec()),
+            ],
+        ));
+    }
+
+    let mut guards = vec![
+        AffectedGuard::exactly(0, old_parts.len()),
+        AffectedGuard::exactly(1, 1),
+        AffectedGuard::exactly(2, 1),
+    ];
+    guards.extend((0..new.parts.len()).map(|index| AffectedGuard::exactly(3 + index, 1)));
+
+    match vault.exec_transaction(&statements, &guards) {
+        Ok(_) => Ok(RepackOutcome::Repacked),
+        Err(StorageError::GuardFailed { .. }) => Ok(RepackOutcome::Conflict),
+        Err(error) => Err(error),
     }
 }
 
-/// 单篇文档的读回校验：导出点 VV ⊆ 当前本地 VV，且仅在无本地 extra 时比较正文。
-///
-/// - 方向固定为「快照/导出点 VV 必须被本地 VV 覆盖」：`actual_vv.sub_iter(local_vv)`
-///   为空才通过；**不要求相等**。导出点之后本地新增的 op 是合法编辑（verify 不与编辑
-///   互斥），相等比较会把它误判成失败；
-/// - 只有 `local_vv ⊆ actual_vv`（本地没有快照之外的 op）时，Loro 才保证本地正文等于
-///   快照正文，此时才做逐字节比较；有本地 extra 时正文必然已被合并改写，比较必然误报。
-fn check_imported_doc(
-    actual_vv: &VersionVector,
-    local_vv: &VersionVector,
-    expected_text: Option<&str>,
-    actual_text: &str,
-) -> Result<(), &'static str> {
-    if actual_vv.sub_iter(local_vv).next().is_some() {
-        return Err("bootstrap 导入后本地 VV 未覆盖快照");
+fn validate_repack_spec(spec: &RepackSpec) -> Result<(), StorageError> {
+    if spec.message_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "repack new.message_id 不能为空".to_owned(),
+        });
     }
-    if local_vv.sub_iter(actual_vv).next().is_none() {
-        if let Some(expected) = expected_text {
-            if expected != actual_text {
-                return Err("bootstrap 后正文与快照不一致");
-            }
+    if spec.epoch == 0 {
+        return Err(StorageError::Corrupt {
+            context: "repack new.epoch 必须 >0".to_owned(),
+        });
+    }
+    if spec.parts.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "repack new.parts 不能为空".to_owned(),
+        });
+    }
+    for (index, part) in spec.parts.iter().enumerate() {
+        if part.part_no != index as u32 {
+            return Err(StorageError::Corrupt {
+                context: format!(
+                    "repack new.parts 必须从 0 连续：第 {index} 项是 {}",
+                    part.part_no
+                ),
+            });
+        }
+        if part.envelope.is_empty() {
+            return Err(StorageError::Corrupt {
+                context: format!("repack new.parts 第 {index} 片信封为空"),
+            });
+        }
+        if part.digest.len() != 32 {
+            return Err(StorageError::Corrupt {
+                context: format!("repack new.parts 第 {index} 片 digest 不是 32B"),
+            });
         }
     }
     Ok(())
 }
 
-/// 读回校验：本地 VV 必须覆盖快照、正文/结构投影/资产必须与快照一致。
-fn verify_imported(
+fn validate_intent(
+    message_id: &str,
+    batch_id: &str,
+    seq: u64,
+    key_epoch: u64,
+) -> Result<(), StorageError> {
+    if message_id.is_empty() || batch_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "sync intent message_id/batch_id 不能为空".to_owned(),
+        });
+    }
+    if seq == 0 || key_epoch == 0 {
+        return Err(StorageError::Corrupt {
+            context: "sync intent seq/key_epoch 必须 >0".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn row_to_outbox(row: &crate::Row) -> Result<SyncOutboxRow, StorageError> {
+    let object_id = row
+        .get(5)
+        .and_then(blob_value)
+        .map(|bytes| array32_bytes(bytes, "sync_outbox.object_id"))
+        .transpose()?;
+    let cipher_digest = row
+        .get(7)
+        .and_then(blob_value)
+        .map(|bytes| array32_bytes(bytes, "sync_outbox.cipher_digest"))
+        .transpose()?;
+    Ok(SyncOutboxRow {
+        message_id: text_of(row, 0, "sync_outbox.message_id")?,
+        batch_id: text_of(row, 1, "sync_outbox.batch_id")?,
+        doc_id: text_of(row, 2, "sync_outbox.doc_id")?,
+        seq: u64_of(row, 3, "sync_outbox.seq")?,
+        key_epoch: u64_of(row, 4, "sync_outbox.key_epoch")?,
+        object_id,
+        state: SyncOutboxState::parse(&text_of(row, 6, "sync_outbox.state")?)?,
+        cipher_digest,
+    })
+}
+
+/// 入站：durable 保存已验签/已解密对象（依赖是否齐由 sync 层决定）。
+pub fn store_inbox_verified(
     vault: &Vault,
-    peer_id: u64,
-    selected: &SelectedBaseline,
-    fault: Option<BootstrapFault>,
-) -> Result<Vec<(String, Option<String>)>, SyncError> {
-    let mut body_texts: BTreeMap<String, String> = BTreeMap::new();
-    for (index, doc) in selected
-        .docs
-        .iter()
-        .filter(|doc| doc.kind == KIND_BODY)
-        .enumerate()
-    {
-        let (body, head) = load_body_doc(vault, &doc.doc_id, peer_id, None)?;
-        let local_vv = head.version_vector()?;
-        // 测试故障注入：伪造一个「导出点有、本地没有」的 op，制造真实的 VV 未覆盖失败。
-        let actual_vv = if fault == Some(BootstrapFault::VerifyVvNotCovered) && index == 0 {
-            let mut mismatched = doc.actual_vv.clone();
-            mismatched.insert(VERIFY_FAULT_PEER, 1);
-            mismatched
-        } else {
-            doc.actual_vv.clone()
-        };
-        let text = body.text();
-        if let Err(reason) = check_imported_doc(&actual_vv, &local_vv, doc.text.as_deref(), &text) {
-            return Err(SyncError::Object(reason));
+    log_id: &[u8; 16],
+    relay_seq: u64,
+    object_id: &[u8; 32],
+    epoch: u64,
+    verified_payload: &[u8],
+) -> Result<(), StorageError> {
+    if relay_seq == 0 || epoch == 0 {
+        return Err(StorageError::Corrupt {
+            context: "inbox relay_seq/epoch 必须 >0".to_owned(),
+        });
+    }
+    ensure_log_id(vault, log_id)?;
+
+    let rows = vault.query(
+        "SELECT object_id,epoch,state,verified_payload FROM sync_inbox \
+         WHERE log_id=?1 AND relay_seq=?2",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(relay_seq)?),
+        ],
+    )?;
+    if let Some(row) = rows.first() {
+        let old_object = array32(row, 0, "sync_inbox.object_id")?;
+        let old_epoch = u64_of(row, 1, "sync_inbox.epoch")?;
+        let old_payload = row.get(3).and_then(blob_value).unwrap_or_default();
+        if old_object != *object_id || old_epoch != epoch || old_payload != verified_payload {
+            return Err(StorageError::SyncConflict {
+                context: format!("inbox {log_id:?}/{relay_seq} 字节不一致"),
+            });
         }
-        body_texts.insert(doc.doc_id.clone(), text);
+        advance_received_prefix(vault)?;
+        return Ok(());
     }
 
-    // 结构重放一致性 + 基线声明的每篇笔记都已投影且正文存在。
-    //
-    // `StructureSnapshot` 是**全量节点**（including deleted），删除是 grow-only meta
-    // 事件而不是 LoroTree::delete；因此本地并发删除基线笔记不会让这里缺项，也不会
-    // 误写失败 marker。verify 只要求“基线声明的 note/body 仍存在”，不把 deleted 当作
-    // 结构缺失；这是当前产品语义（删笔记不删正文，恢复仍可用）。
-    let (structure, _head) = load_structure(vault, peer_id)?;
-    let merged = structure.snapshot()?;
-    let merged_notes: BTreeMap<&str, &str> = merged
-        .nodes
-        .iter()
-        .filter(|node| node.is_note())
-        .filter_map(|node| Some((node.note_id.as_deref()?, node.body_doc_id.as_deref()?)))
-        .collect();
-    for (note_id, body_doc_id) in &selected.structure_notes {
-        if merged_notes.get(note_id.as_str()) != Some(&body_doc_id.as_str()) {
-            return Err(SyncError::Object("bootstrap 结构投影与快照不一致"));
-        }
-        if !body_texts.contains_key(body_doc_id) {
-            return Err(SyncError::Object("bootstrap 结构引用的正文缺失"));
-        }
+    let changed = vault.exec(
+        "INSERT INTO sync_inbox(log_id,relay_seq,object_id,epoch,state,verified_payload) \
+         VALUES(?1,?2,?3,?4,'verified',?5)",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(relay_seq)?),
+            Value::Blob(object_id.to_vec()),
+            Value::Integer(i64_of(epoch)?),
+            Value::Blob(verified_payload.to_vec()),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::SyncConflict {
+            context: format!("inbox {log_id:?}/{relay_seq} 写入冲突"),
+        });
     }
+    advance_received_prefix(vault)?;
+    Ok(())
+}
 
-    for asset in &selected.assets {
-        match asset_bytes(vault, asset.real_sha256)? {
-            Some(stored) if stored == asset.data => {}
-            _ => return Err(SyncError::Object("bootstrap 资产未正确落库")),
-        }
+/// 入站批量入口：**一个事务**完成「既有行比对 + 新行插入 + `received` 前缀推进」。
+///
+/// 语义与逐条入口**完全一致**：
+///
+/// - 已存在同 `(log_id, relay_seq)` 行、且 `object_id/epoch/verified_payload` 完全相同 →
+///   幂等跳过（不重写、不报错，也不触发任何写入守卫）；
+/// - 已存在同行但字节不同 → [`StorageError::SyncConflict`]，**整批一行都不写**；
+/// - 新行插入与 `received` 连续前缀推进在**同一个** SQLite 事务里（Phase 1A-1），
+///   一次提交只产生一次 fsync；冲突/崩溃只会整批回滚，不存在"行写了、前缀没推进"的
+///   半提交状态；前缀只覆盖已消费的连续序号（含 `sync.skipped_received` 的 ASSET 标记）。
+///
+/// 输入先按 `relay_seq` 升序**稳定排序**（不要求调用方预排序；允许序号不连续，例如一页里
+/// 混有已消费的 ASSET 序号）；同一批里出现重复 `relay_seq` 直接拒绝——一条日志不可能有
+/// 两个同序号事件，静默去重会掩盖上游错误。全部校验/排序在 worker 的事务入口
+/// （`actor` 模块的 `ExecInboxBatch` 命令）再做一遍，这里只负责搬运数据。
+///
+/// 返回**本次新插入**的行数（幂等跳过的行不计）。
+pub fn store_inbox_verified_batch(
+    vault: &Vault,
+    rows: &[VerifiedInboxRow],
+) -> Result<usize, StorageError> {
+    if rows.is_empty() {
+        return Ok(0);
     }
-
-    Ok(selected
-        .docs
+    let batch = rows
         .iter()
-        .map(|doc| {
-            let text = if doc.kind == KIND_STRUCTURE {
-                None
-            } else {
-                body_texts.get(&doc.doc_id).cloned()
-            };
-            (doc.doc_id.clone(), text)
+        .map(|row| crate::actor::InboxBatchRow {
+            log_id: row.log_id,
+            relay_seq: row.relay_seq,
+            object_id: row.object_id,
+            epoch: row.epoch,
+            verified_payload: row.verified_payload.clone(),
         })
+        .collect();
+    vault.exec_inbox_batch(batch)
+}
+
+/// 读当前已验证、且落在 durable 连续接收前缀内的 inbox 行。
+///
+/// 依赖完整性由 sync 层判断（本 crate 不解析 Loro VV）；这里的 "ready"
+/// 指 cryptographically verified + durable + **属于当前 `sync.log_id`** +
+/// `relay_seq <= received_seq`，不在连续前缀内的行保持 durable，等前面的缺口补齐。
+/// 排序为 `(log_id, relay_seq)`。
+///
+/// 清理已被 `integrated` 前缀覆盖的 inbox 行（Phase 1B 追赶后）。
+///
+/// **安全边界**：只删除 `relay_seq <= up_to_seq` 且同一 SQL 内证明
+/// `sync.integrated_seq >= up_to_seq` 的行；证明不成立时一行不删。调用方还必须保证
+/// `log_id` 是当前 relay incarnation，且 `up_to_seq` 是实际成功的 checkpoint S。
+///
+/// 为什么不用先读后删：读 `integrated` 与 DELETE 之间可能被并发推进/回退；
+/// `EXISTS` 子查询把证明和删除放在同一条原子语句里。BLOB 按 8 字节 BE 比较。
+pub fn prune_covered_inbox(
+    vault: &Vault,
+    log_id: &[u8; 16],
+    up_to_seq: u64,
+) -> Result<usize, StorageError> {
+    let up_to = i64_of(up_to_seq)?;
+    let statements = [Statement::new(
+        "DELETE FROM sync_inbox \
+         WHERE log_id=?1 AND relay_seq<=?2 \
+           AND EXISTS (SELECT 1 FROM meta \
+                        WHERE key=?3 AND typeof(value)='blob' AND length(value)=8 \
+                          AND value>=?4)",
+        vec![
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(up_to),
+            Value::Text(META_SYNC_INTEGRATED_SEQ.to_owned()),
+            Value::Blob(up_to_seq.to_be_bytes().to_vec()),
+        ],
+    )];
+    let changed = vault.exec_transaction(&statements, &[])?;
+    Ok(changed.first().copied().unwrap_or(0))
+}
+
+/// **incarnation 过滤**（ADR 0006 §5）：`sync_inbox` 的 `log_id` 是写入时那代 relay
+/// 日志的 incarnation。restore 迁移 `sync.log_id` 后，旧 incarnation 的行仍然 durable
+/// （不能在迁移时静默删数据），但绝不能进入 ready——`relay_seq` 只在同一 incarnation
+/// 内有序，跨代比较没有意义。过滤条件里的 `log_id` 由 [`read_current_log_id`] 读出后
+/// 作为 SQL 参数绑定，不做子查询以便调用方/测试都看到同一个显式值。
+///
+/// `sync.log_id` 不存在（新库尚未绑定 relay 日志代）时返回空：没有当前 incarnation
+/// 就没有可匹配的行；新库此时 `received` 也是 0，所以与旧实现（不按 log 过滤）的结果
+/// 一致，不会把其它 incarnation 的遗留行漏出来。`sync.log_id` 存在但不是 16B →
+/// [`StorageError::Corrupt`]（与 [`sync_cursor_state`] 同口径），不静默当作"没有 log"。
+pub fn take_inbox_ready(vault: &Vault, limit: usize) -> Result<Vec<SyncInboxRow>, StorageError> {
+    let Some(log_id) = read_current_log_id(vault)? else {
+        return Ok(Vec::new());
+    };
+    let received = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
+    let rows = vault.query(
+        "SELECT log_id,relay_seq,object_id,epoch,state,verified_payload \
+         FROM sync_inbox WHERE log_id=?1 AND state='verified' AND relay_seq<=?2 \
+         ORDER BY log_id,relay_seq LIMIT ?3",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(received)?),
+            Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+        ],
+    )?;
+    rows.iter().map(row_to_inbox).collect()
+}
+
+/// 统计「已验证、属于当前 incarnation、落在 durable 连续接收前缀内、尚未集成」的行数。
+///
+/// 语义（ADR 0012 S2b）：这些行不是"丢失"——它们要么依赖未就绪（deferred），要么被
+/// 批次预算留在本轮之后。调用方用它上报"已接收·待应用 N"，并据此判断"还有没有
+/// 可继续的工作"，而不是循环刷最早的一批。
+///
+/// 与 [`take_inbox_ready`] 同口径：只计当前 `sync.log_id` 的行，旧 incarnation 的
+/// verified 行即使 `relay_seq <= received` 也不计。`sync.log_id` 不存在返回 0
+/// （没有当前 incarnation 就没有 ready 行）；存在但长度非法 → [`StorageError::Corrupt`]。
+pub fn count_inbox_ready(vault: &Vault) -> Result<u64, StorageError> {
+    let Some(log_id) = read_current_log_id(vault)? else {
+        return Ok(0);
+    };
+    let received = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
+    let rows = vault.query(
+        "SELECT COUNT(*) FROM sync_inbox \
+         WHERE log_id=?1 AND state='verified' AND relay_seq<=?2",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(received)?),
+        ],
+    )?;
+    rows.first()
+        .map(|row| u64_of(row, 0, "sync_inbox.count"))
+        .transpose()?
+        .ok_or_else(|| StorageError::Corrupt {
+            context: "sync_inbox 计数缺失".to_owned(),
+        })
+}
+
+/// 带调用方依赖判断的 ready 选择器；不满足的项保持 durable verified。
+///
+/// 底层走 [`take_inbox_ready`]，因此同样只选择当前 `sync.log_id` 的行。
+pub fn take_inbox_ready_where(
+    vault: &Vault,
+    limit: usize,
+    mut is_ready: impl FnMut(&SyncInboxRow) -> bool,
+) -> Result<Vec<SyncInboxRow>, StorageError> {
+    let rows = take_inbox_ready(vault, limit.saturating_mul(16).max(limit))?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| is_ready(row))
+        .take(limit)
         .collect())
 }
 
-/// 原子推进水位（max 语义 + CAS）。
+/// 为 remote import 分配本地 `loro_updates.seq = head_seq + 1`。
 ///
-/// 只允许前进：`received/integrated = max(现有, S)`、`highwater = max(现有, pin, S)`；
-/// 已有进度时保留现有 relay 游标（不把已消费的位置回退）。`instance/log_id/epoch/
-/// control_rev/control_hash` 只允许前进或不变。任何一项回退都在**写事务之前**硬失败。
-fn finalize(
+/// **只分配，不写库**；调用方必须在同一 A 事务里把该 seq 用在
+/// `loro_updates.seq`，禁止直接使用 sender_seq。
+pub fn allocate_local_seq_for_import(vault: &Vault, doc_id: &str) -> Result<u64, StorageError> {
+    let head = store::load_head(vault, doc_id)?;
+    head.head_seq
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("{doc_id} 本地 seq 溢出"),
+        })
+}
+
+/// 把一个 verified inbox 行标为 integrated，并推进连续 integrated 前缀。
+pub fn mark_integrated(
     vault: &Vault,
-    selected: &SelectedBaseline,
-    state: &RelayState,
-    chain: &[ManagerChainEntry],
-    control_hash: &[u8; 32],
-    pins: &BootstrapPins,
-    fault: Option<BootstrapFault>,
-) -> Result<(), SyncError> {
-    let s = selected.checkpoint.covered_seq;
-    let cursor_state = sync_cursor_state(vault)?;
-    if let Some(log_id) = &cursor_state.log_id {
-        if *log_id != state.log_id {
-            return Err(SyncError::Storage(
-                menghunote_storage::StorageError::SyncLogMismatch {
-                    expected: log_id.to_vec(),
-                    found: state.log_id.to_vec(),
-                },
-            ));
+    log_id: &[u8; 16],
+    relay_seq: u64,
+) -> Result<(), StorageError> {
+    let changed = vault.exec(
+        "UPDATE sync_inbox SET state='integrated' \
+         WHERE log_id=?1 AND relay_seq=?2 AND state='verified'",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(relay_seq)?),
+        ],
+    )?;
+    if changed == 0 {
+        let rows = vault.query(
+            "SELECT state FROM sync_inbox WHERE log_id=?1 AND relay_seq=?2",
+            &[
+                Value::Blob(log_id.to_vec()),
+                Value::Integer(i64_of(relay_seq)?),
+            ],
+        )?;
+        let Some(row) = rows.first() else {
+            return Err(StorageError::Corrupt {
+                context: format!("inbox {log_id:?}/{relay_seq} 不存在"),
+            });
+        };
+        let state = text_of(row, 0, "sync_inbox.state")?;
+        if state != SyncInboxState::Integrated.as_str() {
+            return Err(StorageError::SyncConflict {
+                context: format!("inbox {log_id:?}/{relay_seq} 当前 state={state}，不能 integrate"),
+            });
         }
     }
-    let stored = BootstrapPins::from_vault(vault)?;
-    validate_pin_shape(&stored)?;
-    if let Some(instance) = stored.instance_id {
-        if instance != state.instance_id {
-            return Err(SyncError::Object("bootstrap 不允许更换 relay instance"));
-        }
-    }
-    if let Some(epoch) = stored.epoch {
-        if epoch > state.epoch {
-            return Err(SyncError::Object("bootstrap 不允许回退 epoch"));
-        }
-    }
-    if let Some(rev) = stored.control_rev {
-        if rev > state.control_rev {
-            return Err(SyncError::Object("bootstrap 不允许回退 control_rev"));
-        }
-        // 与 `validate_remote` 同一口径：两类视图（同 rev 摘要 / 异 rev 历史锚）都验，
-        // 不因 rev 前进就跳过旧摘要（ADR 0013 §3）。
-        if let Some(anchor) = stored.control_anchor()? {
-            verify_bootstrap_anchor(&anchor, state, chain, control_hash)?;
-        }
-    }
-    if let Some(highwater) = pins.highwater {
-        if highwater > state.head_seq {
-            return Err(SyncError::Paused(
-                crate::relay::PauseReason::RollbackDetected,
-            ));
-        }
-    }
-    if let Some(highwater) = stored.highwater {
-        if highwater > state.head_seq {
-            return Err(SyncError::Paused(
-                crate::relay::PauseReason::RollbackDetected,
-            ));
-        }
-    }
-
-    let current_cursor = vault.get_meta(RELAY_CURSOR_META)?;
-    let raw_received = vault.get_meta(META_SYNC_RECEIVED_SEQ)?;
-    let raw_integrated = vault.get_meta(META_SYNC_INTEGRATED_SEQ)?;
-    let raw_highwater = vault.get_meta(META_SYNC_CONFIRMED_HIGHWATER)?;
-
-    let received_target = cursor_state.received_seq.max(s);
-    let integrated_target = cursor_state.integrated_seq.max(s);
-    let mut highwater_target = cursor_state.confirmed_highwater.unwrap_or(0).max(s);
-    if let Some(pin) = pins.highwater {
-        highwater_target = highwater_target.max(pin);
-    }
-    let has_progress = cursor_state.received_seq > 0
-        || cursor_state.integrated_seq > 0
-        || cursor_state
-            .confirmed_highwater
-            .is_some_and(|value| value > 0);
-    if has_progress && current_cursor.is_none() {
-        return Err(SyncError::LocalCorrupt("本地已有同步水位但缺 relay 游标"));
-    }
-    // 已有进度时保留现有游标：baseline 的 cursor 只用于"从零开始"的设备，避免回退。
-    let write_cursor = !has_progress;
-
-    let mut statements = Vec::new();
-    let mut guards = Vec::new();
-    if cursor_state.log_id.is_none() {
-        push_meta_insert_absent(
-            &mut statements,
-            &mut guards,
-            META_SYNC_LOG_ID,
-            &state.log_id,
-        );
-    }
-    if raw_received.is_none() || received_target != cursor_state.received_seq {
-        push_meta_cas_u64(
-            &mut statements,
-            &mut guards,
-            META_SYNC_RECEIVED_SEQ,
-            cursor_state.received_seq,
-            received_target,
-        );
-    }
-    if raw_integrated.is_none() || integrated_target != cursor_state.integrated_seq {
-        push_meta_cas_u64(
-            &mut statements,
-            &mut guards,
-            META_SYNC_INTEGRATED_SEQ,
-            cursor_state.integrated_seq,
-            integrated_target,
-        );
-    }
-    if raw_highwater.is_none() || cursor_state.confirmed_highwater != Some(highwater_target) {
-        push_meta_cas_opt_u64(
-            &mut statements,
-            &mut guards,
-            META_SYNC_CONFIRMED_HIGHWATER,
-            cursor_state.confirmed_highwater,
-            highwater_target,
-        );
-    }
-    if write_cursor {
-        push_meta_cas_opt_bytes(
-            &mut statements,
-            &mut guards,
-            RELAY_CURSOR_META,
-            current_cursor.as_deref(),
-            selected.checkpoint.cursor.as_bytes(),
-        );
-    }
-    if stored.instance_id.is_none() {
-        push_meta_insert_absent(
-            &mut statements,
-            &mut guards,
-            META_BOOTSTRAP_INSTANCE,
-            &state.instance_id,
-        );
-    }
-    if stored.epoch != Some(state.epoch) {
-        push_meta_cas_opt_u64(
-            &mut statements,
-            &mut guards,
-            META_BOOTSTRAP_EPOCH,
-            stored.epoch,
-            state.epoch,
-        );
-    }
-    if stored.control_rev != Some(state.control_rev) {
-        push_meta_cas_opt_u64(
-            &mut statements,
-            &mut guards,
-            META_BOOTSTRAP_CONTROL_REV,
-            stored.control_rev,
-            state.control_rev,
-        );
-    }
-    if stored.control_hash != Some(*control_hash) {
-        push_meta_cas_opt_bytes(
-            &mut statements,
-            &mut guards,
-            META_BOOTSTRAP_CONTROL_HASH,
-            stored.control_hash.as_ref().map(<[u8; 32]>::as_slice),
-            control_hash,
-        );
-    }
-
-    // 模拟并发写者在水位事务提交前改写游标：CAS 必须失败且整笔回滚。
-    if fault == Some(BootstrapFault::CursorCasConflict) {
-        if !write_cursor {
-            return Err(injected_fault());
-        }
-        vault.set_meta(RELAY_CURSOR_META, b"fault-cursor")?;
-    }
-
-    match vault.exec_transaction(&statements, &guards) {
-        Ok(_) => Ok(()),
-        Err(menghunote_storage::StorageError::GuardFailed { .. }) => Err(SyncError::Object(
-            "bootstrap 水位 CAS 冲突（游标/水位已被并发写入），未推进",
-        )),
-        Err(error) => Err(error.into()),
-    }
+    advance_integrated_prefix(vault)?;
+    Ok(())
 }
 
-fn injected_fault() -> SyncError {
-    SyncError::Object("bootstrap 注入故障（测试）")
-}
-
-fn push_meta_insert_absent(
-    statements: &mut Vec<Statement>,
-    guards: &mut Vec<AffectedGuard>,
-    key: &str,
-    value: &[u8],
-) {
-    let index = statements.len();
-    statements.push(Statement::new(
-        "INSERT INTO meta(key,value) SELECT ?1,?2 \
-         WHERE NOT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
-        vec![Value::Text(key.to_owned()), Value::Blob(value.to_vec())],
-    ));
-    guards.push(AffectedGuard::exactly(index, 1));
-}
-
-fn push_meta_cas_u64(
-    statements: &mut Vec<Statement>,
-    guards: &mut Vec<AffectedGuard>,
-    key: &str,
-    old: u64,
-    new: u64,
-) {
-    if old == 0 {
-        // 0 与"meta 缺失"等价：插入，或 CAS 更新已存在的 0。
-        let index = statements.len();
+/// 批量把同一 log 的多条 verified inbox 行标为 integrated（**一个事务**）。
+///
+/// Phase 1A-1 为聚合 integrate 准备的 API：调用方在整批正文/依赖都落库后一次性标记，
+/// 再统一调用 [`advance_integrated_prefix`]（本函数**不推进**前缀）。
+///
+/// 严格语义：`relay_seqs` 中每一行都必须存在且当前 `state='verified'`；任何一行
+/// 不存在 / 已 integrated / 其它 state → 整批回滚并返回 [`StorageError::SyncConflict`]，
+/// 不会留下半批已 integrated 的行。重复序号同理（第二次更新影响 0 行）整批回滚。
+///
+/// 返回标记的行数（= 输入行数；空输入返回 0）。
+pub fn mark_integrated_batch(
+    vault: &Vault,
+    log_id: &[u8; 16],
+    relay_seqs: &[u64],
+) -> Result<usize, StorageError> {
+    if relay_seqs.is_empty() {
+        return Ok(0);
+    }
+    let mut statements = Vec::with_capacity(relay_seqs.len());
+    let mut guards = Vec::with_capacity(relay_seqs.len());
+    for (index, relay_seq) in relay_seqs.iter().enumerate() {
         statements.push(Statement::new(
-            "INSERT INTO meta(key,value) VALUES(?1,?2) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value=?3",
+            "UPDATE sync_inbox SET state='integrated' \
+             WHERE log_id=?1 AND relay_seq=?2 AND state='verified'",
             vec![
-                Value::Text(key.to_owned()),
-                Value::Blob(new.to_be_bytes().to_vec()),
-                Value::Blob(old.to_be_bytes().to_vec()),
+                Value::Blob(log_id.to_vec()),
+                Value::Integer(i64_of(*relay_seq)?),
             ],
         ));
         guards.push(AffectedGuard::exactly(index, 1));
-        return;
     }
-    push_meta_cas_bytes(
-        statements,
-        guards,
-        key,
-        Some(&old.to_be_bytes()),
-        &new.to_be_bytes(),
-    );
-}
-
-fn push_meta_cas_opt_u64(
-    statements: &mut Vec<Statement>,
-    guards: &mut Vec<AffectedGuard>,
-    key: &str,
-    old: Option<u64>,
-    new: u64,
-) {
-    match old {
-        None => push_meta_insert_absent(statements, guards, key, &new.to_be_bytes()),
-        Some(old) => push_meta_cas_u64(statements, guards, key, old, new),
+    match vault.exec_transaction(&statements, &guards) {
+        Ok(_) => Ok(relay_seqs.len()),
+        // 守卫不满足 = 某行不存在或已不是 verified；exec_transaction 已整笔回滚。
+        Err(StorageError::GuardFailed { .. }) => Err(StorageError::SyncConflict {
+            context: format!(
+                "inbox {log_id:?} 批量 integrate 失败：某行不存在或当前不是 verified（整批已回滚）"
+            ),
+        }),
+        Err(error) => Err(error),
     }
 }
 
-fn push_meta_cas_opt_bytes(
-    statements: &mut Vec<Statement>,
-    guards: &mut Vec<AffectedGuard>,
-    key: &str,
-    old: Option<&[u8]>,
-    new: &[u8],
-) {
-    match old {
-        None => push_meta_insert_absent(statements, guards, key, new),
-        Some(old) => push_meta_cas_bytes(statements, guards, key, Some(old), new),
-    }
-}
-
-fn push_meta_cas_bytes(
-    statements: &mut Vec<Statement>,
-    guards: &mut Vec<AffectedGuard>,
-    key: &str,
-    old: Option<&[u8]>,
-    new: &[u8],
-) {
-    let Some(old) = old else {
-        push_meta_insert_absent(statements, guards, key, new);
-        return;
-    };
-    let index = statements.len();
-    statements.push(Statement::new(
-        "UPDATE meta SET value=?3 WHERE key=?1 AND value=?2",
-        vec![
-            Value::Text(key.to_owned()),
-            Value::Blob(old.to_vec()),
-            Value::Blob(new.to_vec()),
+/// 把 inbox 行标为 quarantine（完整性失败/依赖永久缺失）。
+pub fn mark_inbox_quarantine(
+    vault: &Vault,
+    log_id: &[u8; 16],
+    relay_seq: u64,
+) -> Result<(), StorageError> {
+    let changed = vault.exec(
+        "UPDATE sync_inbox SET state='quarantine' \
+         WHERE log_id=?1 AND relay_seq=?2 AND state IN('received','verified')",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(relay_seq)?),
         ],
-    ));
-    guards.push(AffectedGuard::exactly(index, 1));
+    )?;
+    if changed == 0 {
+        return Err(StorageError::SyncConflict {
+            context: format!("inbox {log_id:?}/{relay_seq} 不能进入 quarantine"),
+        });
+    }
+    Ok(())
 }
 
-fn decode_vv(bytes: &[u8]) -> Result<VersionVector, SyncError> {
-    if bytes.is_empty() {
-        return Ok(VersionVector::new());
-    }
-    VersionVector::decode(bytes).map_err(|_| SyncError::Object("bootstrap 快照 VV 非法"))
+fn row_to_inbox(row: &crate::Row) -> Result<SyncInboxRow, StorageError> {
+    Ok(SyncInboxRow {
+        log_id: array16(row, 0, "sync_inbox.log_id")?,
+        relay_seq: u64_of(row, 1, "sync_inbox.relay_seq")?,
+        object_id: array32(row, 2, "sync_inbox.object_id")?,
+        epoch: u64_of(row, 3, "sync_inbox.epoch")?,
+        state: SyncInboxState::parse(&text_of(row, 4, "sync_inbox.state")?)?,
+        verified_payload: row.get(5).and_then(blob_value),
+    })
 }
 
-fn read_meta_array<const N: usize>(vault: &Vault, key: &str) -> Result<Option<[u8; N]>, SyncError> {
-    match vault.get_meta(key)? {
-        None => Ok(None),
-        Some(bytes) => bytes
-            .try_into()
-            .map(Some)
-            .map_err(|_| SyncError::Object("bootstrap 本地 pin 长度非法")),
-    }
+/// 读本地同步水位。
+pub fn sync_cursor_state(vault: &Vault) -> Result<SyncCursorState, StorageError> {
+    Ok(SyncCursorState {
+        received_seq: read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0),
+        integrated_seq: read_meta_u64(vault, META_SYNC_INTEGRATED_SEQ)?.unwrap_or(0),
+        log_id: read_current_log_id(vault)?,
+        confirmed_highwater: read_meta_u64(vault, META_SYNC_CONFIRMED_HIGHWATER)?,
+    })
 }
 
-fn read_meta_u64(vault: &Vault, key: &str) -> Result<Option<u64>, SyncError> {
-    match read_meta_array::<8>(vault, key)? {
-        None => Ok(None),
-        Some(bytes) => Ok(Some(u64::from_be_bytes(bytes))),
-    }
+/// 读当前 relay 日志 incarnation（`sync.log_id`，BLOB 16B）。
+///
+/// - 不存在（新库/尚未绑定）：`Ok(None)`，调用方按"没有当前 incarnation"处理
+///   （ready 视为空，绝不回退成"不过滤 log"）；
+/// - 存在但不是 16B：[`StorageError::Corrupt`]，与 [`sync_cursor_state`] 的既有口径一致。
+fn read_current_log_id(vault: &Vault) -> Result<Option<[u8; 16]>, StorageError> {
+    read_meta(vault, META_SYNC_LOG_ID)?
+        .map(|bytes| array16_bytes(bytes, "sync.log_id"))
+        .transpose()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use menghunote_storage::{
-        append_updates, baseline_verify_failure, create_body_doc, load_head, StorageError,
-        UpdateRecord,
-    };
+/// 写入 `sync.log_id`；已有不同值则拒绝（restore 必须显式迁移）。
+pub fn set_sync_log_id(vault: &Vault, log_id: &[u8; 16]) -> Result<(), StorageError> {
+    ensure_log_id(vault, log_id)
+}
 
-    fn manifest(key_epoch: u64, total_plain_len: u64) -> ManifestV1 {
-        ManifestV1 {
-            vault_id: [1; 16],
-            key_epoch: 1,
-            checkpoint_id: [2; 16],
-            covered_relay_seq: 3,
-            min_reader: 1,
-            structure_doc_id: "structure".to_owned(),
-            docs: vec![ManifestDoc {
-                doc_id: "structure".to_owned(),
-                kind: KIND_STRUCTURE,
-                generation: 1,
-                key_epoch,
-                vv: vec![1],
-                frontier: vec![2],
-                snapshot_object_id: [3; 32],
-                part_count: 1,
-                total_plain_len,
-                object_digest: [4; 32],
-            }],
-            assets: vec![],
-        }
-    }
+/// 写 confirmed highwater（BE64 BLOB）。
+pub fn set_confirmed_highwater(vault: &Vault, value: u64) -> Result<(), StorageError> {
+    write_meta(vault, META_SYNC_CONFIRMED_HIGHWATER, &value.to_be_bytes())
+}
 
-    fn digest(value: &ManifestV1) -> [u8; 32] {
-        Sha256::digest(refs_digest_input(&manifest_refs(value)).expect("refs")).into()
-    }
-
-    #[test]
-    fn pin_shape_rejects_hash_without_rev_on_both_paths() {
-        let pins = BootstrapPins {
-            control_hash: Some([0x42; 32]),
-            control_rev: None,
-            ..BootstrapPins::default()
-        };
-        let error = validate_pin_shape(&pins).expect_err("hash 无 rev 必须拒绝");
-        assert!(
-            matches!(error, SyncError::LocalCorrupt(_)),
-            "应当是 LocalCorrupt，实际 {error:?}"
-        );
-    }
-
-    #[test]
-    fn manifest_key_epoch_or_total_len_tamper_changes_refs_digest() {
-        let base = digest(&manifest(1, 100));
-        assert_ne!(
-            digest(&manifest(2, 100)),
-            base,
-            "key_epoch 篡改必须改变 refs_digest"
-        );
-        assert_ne!(
-            digest(&manifest(1, 101)),
-            base,
-            "total_plain_len 篡改必须改变 refs_digest"
-        );
-    }
-
-    fn document() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let doc = loro::LoroDoc::new();
-        doc.get_text("body")
-            .insert(0, "hello")
-            .expect("insert body text");
-        doc.commit();
-        (
-            doc.export(loro::ExportMode::Snapshot).expect("snapshot"),
-            doc.oplog_vv().encode(),
-            doc.state_frontiers().encode(),
-        )
-    }
-
-    fn snapshot(loro: Vec<u8>, vv: Vec<u8>, frontier: Vec<u8>) -> SnapshotV1 {
-        SnapshotV1 {
-            doc_id: "doc".to_owned(),
-            kind: KIND_BODY,
-            generation: 1,
-            codec_version: CODEC_VERSION.to_owned(),
-            app_doc_schema: u32::try_from(APP_DOC_SCHEMA).unwrap_or(1),
-            min_reader: 1,
-            full_history: true,
-            vv,
-            frontier,
-            loro_snapshot_bytes: loro,
-        }
-    }
-
-    fn manifest_doc(vv: Vec<u8>, frontier: Vec<u8>) -> ManifestDoc {
-        ManifestDoc {
-            doc_id: "doc".to_owned(),
-            kind: KIND_BODY,
-            generation: 1,
-            key_epoch: 1,
-            vv,
-            frontier,
-            snapshot_object_id: [7; 32],
-            part_count: 1,
-            total_plain_len: 1,
-            object_digest: [8; 32],
-        }
-    }
-
-    #[test]
-    fn actual_vv_must_match_manifest_claim() {
-        let (loro, vv, frontier) = document();
-        verify_snapshot_history(
-            &snapshot(loro.clone(), vv.clone(), frontier.clone()),
-            &manifest_doc(vv.clone(), frontier.clone()),
-        )
-        .expect("真实历史必须通过");
-
-        // manifest 宣称一个不存在的 peer 的 ops（虚高）：实际 import 必须识破。
-        let mut inflated = VersionVector::decode(&vv).expect("vv");
-        inflated.insert(0xDEAD, 9);
-        assert!(
-            verify_snapshot_history(
-                &snapshot(loro.clone(), inflated.encode(), frontier.clone()),
-                &manifest_doc(inflated.encode(), frontier.clone()),
-            )
-            .is_err(),
-            "虚高 VV 必须被实际 Loro 导入拒绝"
-        );
-
-        // frontier 与 manifest 声明不一致。
-        let mut wrong_frontier = VersionVector::new();
-        wrong_frontier.insert(7, 1);
-        assert!(
-            verify_snapshot_history(
-                &snapshot(loro, vv.clone(), frontier),
-                &manifest_doc(vv, wrong_frontier.encode()),
-            )
-            .is_err(),
-            "frontier 不一致必须拒绝"
-        );
-    }
-
-    #[test]
-    fn verify_accepts_concurrent_local_edits_after_export() {
-        // 导出点（快照）VV：peer 7 有 2 个 op、peer 8 有 1 个。
-        let mut exported_vv = VersionVector::new();
-        exported_vv.insert(7, 2);
-        exported_vv.insert(8, 1);
-
-        // 导出点之后本地继续编辑：当前 VV 严格包含导出点，但不相等。
-        let mut local_vv = exported_vv.clone();
-        local_vv.insert(9, 1);
-        assert_ne!(local_vv, exported_vv);
-        check_imported_doc(
-            &exported_vv,
-            &local_vv,
-            Some("导出点正文"),
-            "导出点正文 + 本地新编辑",
-        )
-        .expect("导出点 VV ⊆ 当前 VV 时必须接受并发本地编辑（不要求相等）");
-
-        // 没有本地 extra（VV 相等）时才逐字节比较正文：不一致必须失败。
-        assert!(
-            check_imported_doc(&exported_vv, &exported_vv, Some("期望正文"), "实际正文").is_err(),
-            "无本地 extra 时正文不一致必须失败"
-        );
-        check_imported_doc(&exported_vv, &exported_vv, Some("同一正文"), "同一正文")
-            .expect("无本地 extra 且正文一致必须通过");
-
-        // 当前 VV 缺少导出点里的 op：方向不能反（不是相等/双向比较）。
-        let mut missing_vv = VersionVector::new();
-        missing_vv.insert(7, 2);
-        assert!(
-            check_imported_doc(&exported_vv, &missing_vv, Some("正文"), "正文").is_err(),
-            "导出点 VV 未被本地覆盖时必须失败"
-        );
-    }
-
-    #[test]
-    fn full_history_is_mandatory() {
-        let (loro, vv, frontier) = document();
-        let mut value = snapshot(loro, vv.clone(), frontier.clone());
-        value.full_history = false;
-        assert!(verify_snapshot_history(&value, &manifest_doc(vv, frontier)).is_err());
-    }
-
-    #[test]
-    fn structure_semantics_require_referenced_body_in_manifest() {
-        let peer = 7u64;
-        let structure = menghunote_storage::StructureDoc::create(peer).expect("structure");
-        let seed = structure
-            .create_note("标题", 1_700_000_000)
-            .expect("create note");
-        let bytes = structure.export_snapshot().expect("snapshot");
-        let doc = VerifiedDoc {
-            doc_id: STRUCTURE_DOC_ID.to_owned(),
-            kind: KIND_STRUCTURE,
-            snapshot: SnapshotV1 {
-                doc_id: STRUCTURE_DOC_ID.to_owned(),
-                kind: KIND_STRUCTURE,
-                generation: 1,
-                codec_version: CODEC_VERSION.to_owned(),
-                app_doc_schema: 1,
-                min_reader: 1,
-                full_history: true,
-                vv: Vec::new(),
-                frontier: Vec::new(),
-                loro_snapshot_bytes: bytes,
-            },
-            actual_vv: VersionVector::new(),
-            text: None,
-        };
-        // 结构引用了 seed.body_doc_id，但基线 manifest 里没有它：必须拒绝。
-        assert!(verify_structure_semantics(std::slice::from_ref(&doc), peer).is_err());
-
-        // 正文在 manifest 里时通过，并给出 note_id -> body_doc_id。
-        let body = VerifiedDoc {
-            doc_id: seed.body_doc_id.clone(),
-            kind: KIND_BODY,
-            snapshot: SnapshotV1 {
-                doc_id: seed.body_doc_id.clone(),
-                kind: KIND_BODY,
-                generation: 1,
-                codec_version: CODEC_VERSION.to_owned(),
-                app_doc_schema: 1,
-                min_reader: 1,
-                full_history: true,
-                vv: Vec::new(),
-                frontier: Vec::new(),
-                loro_snapshot_bytes: Vec::new(),
-            },
-            actual_vv: VersionVector::new(),
-            text: Some(String::new()),
-        };
-        let notes = verify_structure_semantics(&[doc, body], peer).expect("结构语义通过");
-        assert_eq!(notes.get(&seed.note_id), Some(&seed.body_doc_id));
-    }
-
-    #[test]
-    fn manifest_structure_doc_must_be_storage_constant() {
-        let mut value = manifest(1, 100);
-        value.structure_doc_id = "other".to_owned();
-        let checkpoint = BootstrapCheckpoint {
-            checkpoint_id: value.checkpoint_id,
-            epoch: value.key_epoch,
-            covered_seq: value.covered_relay_seq,
-            manifest_oid: [8; 32],
-            refs_digest: None,
-            cursor: "c3".to_owned(),
-            signed_commit: None,
-            signature: None,
-        };
-        assert!(verify_manifest(&value, value.vault_id, &checkpoint, 1).is_err());
-    }
-
-    #[test]
-    fn control_head_hash_binds_coordinates_and_chain() {
-        let state = RelayState {
-            vault_id: [1; 16],
-            log_id: [2; 16],
-            instance_id: [3; 16],
-            epoch: 4,
-            control_rev: 5,
-            auth_rev: 1,
-            head_seq: 10,
-            gc_floor: 0,
-            current_rotation_id: None,
-        };
-        let base = control_head_hash(&state, &[]);
-        let mut other_instance = state.clone();
-        other_instance.instance_id = [9; 16];
-        assert_ne!(control_head_hash(&other_instance, &[]), base);
-        let mut other_rev = state.clone();
-        other_rev.control_rev = 6;
-        assert_ne!(control_head_hash(&other_rev, &[]), base);
-        let entry = ManagerChainEntry {
-            rev: 2,
-            pubkey: [7; 32],
-            transition: vec![1, 2, 3],
-            old_rev: 1,
-            old_signature: Some([4; 64]),
-            new_signature: None,
-        };
-        assert_ne!(control_head_hash(&state, &[entry]), base);
-    }
-
-    /// 单测用的临时 vault：lib 单测没有编译期 `CARGO_TARGET_TMPDIR`，回退到仓库 `target/tmp`。
-    fn fresh_vault() -> (tempfile::TempDir, Vault) {
-        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")
-            });
-        std::fs::create_dir_all(&base).expect("创建 target/tmp");
-        let dir = tempfile::Builder::new()
-            .prefix("bootstrap-gate-")
-            .tempdir_in(&base)
-            .expect("创建临时目录");
-        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开 vault");
-        (dir, vault)
-    }
-
-    /// 基线 staging 的预期参与集合（本文件两个用例都只声明文档）。
-    fn expectation(docs: &[&str]) -> BaselineExpectation {
-        BaselineExpectation::new(
-            docs.iter().map(|doc_id| (*doc_id).to_owned()),
-            std::iter::empty::<[u8; 32]>(),
-        )
-    }
-
-    /// 生成一份基线快照（另一个 peer 的空文档，只含给定正文）。
-    fn baseline_snapshot(doc_id: &str, peer_id: u64, text: &str) -> Vec<u8> {
-        let doc = BodyDoc::create(doc_id, peer_id).expect("创建基线 LoroDoc");
-        doc.insert_scalars(0, text).expect("写基线正文");
-        doc.export_snapshot().expect("导出基线 snapshot")
-    }
-
-    /// 在本地先提交一条正文 update（证明 abort 不会丢本地已 merge 的 op）。
-    fn seed_local_body(vault: &Vault, doc_id: &str, peer_id: u64, text: &str) {
-        create_body_doc(vault, doc_id).expect("建 loro_docs 行");
-        let doc = BodyDoc::create(doc_id, peer_id).expect("创建本地 BodyDoc");
-        doc.insert_scalars(0, text).expect("写本地正文");
-        let head = load_head(vault, doc_id).expect("读本地 head");
-        let base = head.version_vector().expect("解码 head_vv");
-        let update = doc.pending_update(&base).expect("导出本地增量");
-        append_updates(
-            vault,
-            doc_id,
-            head.head_seq,
-            &[UpdateRecord::new("local-merge", update)],
-        )
-        .expect("提交本地增量");
-    }
-
-    #[test]
-    fn reconcile_journal_auto_aborts_bootstrap_staging_and_clears_marker() {
-        let (_dir, vault) = fresh_vault();
-        // 本地先有一份正文；随后 baseline 批次与它 merge（staging 里已有 merged 数据）。
-        seed_local_body(&vault, "doc-merged", 0xA11CE, "local-merged|");
-        begin_baseline_apply(
-            &vault,
-            &[1; 16],
-            10,
-            "bootstrap:relay-cursor-10",
-            &expectation(&["doc-merged"]),
-        )
-        .expect("begin bootstrap staging");
-        let applied = apply_baseline_batch(
-            &vault,
-            &[(
-                "doc-merged".to_owned(),
-                baseline_snapshot("doc-merged", 0xB0B, "baseline-merged"),
-            )],
-            &[],
-        )
-        .expect("merge baseline snapshot");
-        assert_eq!(applied.applied_docs, 1, "前置条件：基线批次已 merge");
-        mark_baseline_verify_failed(&vault, "读回校验失败：注入").expect("写失败标记");
-        assert!(
-            baseline_apply_state(&vault).expect("state").is_some(),
-            "前置条件：staging journal 必须存在"
-        );
-
-        // 换新基线（checkpoint / S / source 全不同）：bootstrap staging 必须 auto-abort。
-        reconcile_journal(&vault, &[2; 16], 20, "bootstrap:relay-cursor-20")
-            .expect("bootstrap 换基线应 auto-abort 旧 staging");
-
-        assert!(
-            baseline_apply_state(&vault).expect("state").is_none(),
-            "auto-abort 后 staging journal 必须清除"
-        );
-        assert_eq!(
-            baseline_verify_failure(&vault).expect("读失败标记"),
-            None,
-            "auto-abort 必须同时清除 verify 失败标记"
-        );
-        // 已 merge 的 Loro 数据保留（abort 只清 journal，不回滚 CRDT merge）。
-        let (merged, _) =
-            load_body_doc(&vault, "doc-merged", 0xA11CE, None).expect("读回 merged 文档");
-        let merged_text = merged.text();
-        assert!(
-            merged_text.contains("local-merged"),
-            "auto-abort 不得丢本地已 merge 的 op，实际={merged_text:?}"
-        );
-        assert!(
-            merged_text.contains("baseline-merged"),
-            "auto-abort 不得回滚已 merge 的基线数据，实际={merged_text:?}"
-        );
-        // 新基线可以直接 begin（旧 journal/marker 不会挡住续跑）。
-        let reopened = begin_baseline_apply(
-            &vault,
-            &[2; 16],
-            20,
-            "bootstrap:relay-cursor-20",
-            &expectation(&["doc-merged"]),
-        )
-        .expect("auto-abort 后必须能以新基线重新 begin");
-        assert_eq!(reopened.status, BaselineApplyStatus::Staging);
-        assert_eq!(reopened.applied_docs, 0, "新基线应是全新 journal");
-    }
-
-    #[test]
-    fn reconcile_journal_refuses_rotation_staging_without_abort() {
-        // 轮换的 baseline apply 传空 source（rotation_apply.rs）；非 bootstrap 前缀同样拒绝。
-        for source_cursor in ["", "rotation:custom"] {
-            let (_dir, vault) = fresh_vault();
-            begin_baseline_apply(
-                &vault,
-                &[3; 16],
-                5,
-                source_cursor,
-                &expectation(&["doc-rotation"]),
-            )
-            .expect("begin rotation staging");
-            mark_baseline_verify_failed(&vault, "轮换中的失败标记").expect("写失败标记");
-
-            let error = reconcile_journal(&vault, &[4; 16], 9, "bootstrap:relay-cursor-9")
-                .expect_err("不得 auto-abort 非 bootstrap 的 staging");
-            match &error {
-                SyncError::Storage(StorageError::SyncConflict { context }) => {
-                    assert!(
-                        context.contains("非 bootstrap"),
-                        "错误必须点明拒绝原因，实际：{context}"
-                    );
-                }
-                other => panic!("应当拒绝为 SyncConflict，实际 {other:?}"),
+/// 单条入口的 `sync.log_id` 校验（走 Vault 命令，独立事务）。
+///
+/// 批量 inbox 事务内的同语义校验在 `sync_meta::ensure_log_id_on`（直接跑在连接/事务上）；
+/// 两处必须保持一致：不存在则写，存在不同则 `SyncLogMismatch`。
+fn ensure_log_id(vault: &Vault, log_id: &[u8; 16]) -> Result<(), StorageError> {
+    match read_meta(vault, META_SYNC_LOG_ID)? {
+        Some(existing) => {
+            if existing.as_slice() != log_id {
+                return Err(StorageError::SyncLogMismatch {
+                    expected: existing,
+                    found: log_id.to_vec(),
+                });
             }
-
-            // journal 与失败标记都必须原样保留：绝不能被误当成 bootstrap 的 staging 清掉。
-            let state = baseline_apply_state(&vault)
-                .expect("state")
-                .expect("轮换 journal 必须保留");
-            assert_eq!(state.status, BaselineApplyStatus::Staging);
-            assert_eq!(state.checkpoint_id, [3; 16]);
-            assert_eq!(state.baseline_s, 5);
-            assert_eq!(state.source_cursor, source_cursor);
-            assert!(!state.finishable, "失败标记存在时不得 finishable");
-            assert_eq!(
-                baseline_verify_failure(&vault)
-                    .expect("读失败标记")
-                    .as_deref(),
-                Some("轮换中的失败标记"),
-                "拒绝 auto-abort 时绝不能误清失败标记"
-            );
         }
+        None => write_meta(vault, META_SYNC_LOG_ID, log_id)?,
     }
+    Ok(())
+}
+
+fn advance_received_prefix(vault: &Vault) -> Result<(), StorageError> {
+    vault.advance_consumed_prefix(ConsumedPrefix::Received)
+}
+
+/// 把已集成连续前缀推进到最大已消费序号（**一次**写最终值）。
+///
+/// 供聚合 integrate 的调用方在整批正文都落库后调用一次（Phase 1A-1）。语义与旧实现
+/// 一致：只认 inbox `state='integrated'` 或 `sync.skipped_received` 标记，扫窗口后
+/// 一次写最终值；崩溃只会少推进，下次调用重算。
+pub fn advance_integrated_prefix(vault: &Vault) -> Result<(), StorageError> {
+    vault.advance_consumed_prefix(ConsumedPrefix::Integrated)
+}
+
+/// 登记一个**不写 inbox**、但已 durable 消费的事件（ASSET），并推进连续接收前缀。
+///
+/// 调用方必须先把该事件的事实（对 ASSET 是 skipped-asset HMAC 记录）durable 化，
+/// 再调用本函数；顺序保证"received 只覆盖已消费的事件"。
+pub fn mark_skipped_event_received(
+    vault: &Vault,
+    log_id: &[u8; 16],
+    relay_seq: u64,
+) -> Result<(), StorageError> {
+    let key = skipped_received_key(log_id, relay_seq)?;
+    write_meta(vault, &key, b"1")?;
+    advance_received_prefix(vault)
+}
+
+/// 读一条 meta（同步桥经 Vault 命令的读取路径）。
+///
+/// 类型判定与 [`Vault::get_meta`] / `sync_meta::read_meta_on` 共用同一个 helper
+/// [`meta_bytes_of`]：**只认 BLOB**，其它类型是 [`StorageError::Corrupt`]。
+/// 这里以前把 TEXT 当"缺失"，会让 `sync.log_id` / `sync.repack_required` /
+/// `sync.received_seq` 这些持久屏障与游标被静默绕过。
+fn read_meta(vault: &Vault, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+    let rows = vault.query(
+        "SELECT value FROM meta WHERE key=?1",
+        &[Value::Text(key.to_owned())],
+    )?;
+    let Some(value) = rows.first().and_then(|row| row.first()) else {
+        return Ok(None);
+    };
+    Ok(Some(meta_bytes_of(key, value.clone())?))
+}
+
+fn read_meta_u64(vault: &Vault, key: &str) -> Result<Option<u64>, StorageError> {
+    let Some(bytes) = read_meta(vault, key)? else {
+        return Ok(None);
+    };
+    if bytes.len() != 8 {
+        return Err(StorageError::Corrupt {
+            context: format!("{key} 应为 BE64 8B，实际 {}B", bytes.len()),
+        });
+    }
+    Ok(Some(u64::from_be_bytes(bytes.try_into().expect("长度8"))))
+}
+
+fn write_meta(vault: &Vault, key: &str, value: &[u8]) -> Result<(), StorageError> {
+    vault.exec(
+        "INSERT INTO meta(key,value) VALUES(?1,?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        &[Value::Text(key.to_owned()), Value::Blob(value.to_vec())],
+    )?;
+    Ok(())
+}
+
+fn text_of(row: &crate::Row, index: usize, field: &str) -> Result<String, StorageError> {
+    match row.get(index) {
+        Some(Value::Text(value)) => Ok(value.clone()),
+        other => Err(StorageError::Corrupt {
+            context: format!("{field} 类型异常：{other:?}"),
+        }),
+    }
+}
+
+fn text_from_blob(row: &crate::Row, index: usize, field: &str) -> Result<String, StorageError> {
+    let bytes = blob_of(row, index, field)?;
+    String::from_utf8(bytes).map_err(|_| StorageError::Corrupt {
+        context: format!("{field} 不是 UTF-8 message id"),
+    })
+}
+
+fn blob_of(row: &crate::Row, index: usize, field: &str) -> Result<Vec<u8>, StorageError> {
+    row.get(index)
+        .and_then(blob_value)
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("{field} 缺失或类型异常"),
+        })
+}
+
+fn blob_value(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Blob(bytes) => Some(bytes.clone()),
+        _ => None,
+    }
+}
+
+fn array16(row: &crate::Row, index: usize, field: &str) -> Result<[u8; 16], StorageError> {
+    array16_bytes(blob_of(row, index, field)?, field)
+}
+
+fn array32(row: &crate::Row, index: usize, field: &str) -> Result<[u8; 32], StorageError> {
+    array32_bytes(blob_of(row, index, field)?, field)
+}
+
+fn array16_bytes(bytes: Vec<u8>, field: &str) -> Result<[u8; 16], StorageError> {
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| StorageError::Corrupt {
+            context: format!("{field} 应为 16B，实际 {}B", bytes.len()),
+        })
+}
+
+fn array32_bytes(bytes: Vec<u8>, field: &str) -> Result<[u8; 32], StorageError> {
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| StorageError::Corrupt {
+            context: format!("{field} 应为 32B，实际 {}B", bytes.len()),
+        })
+}
+
+fn u64_of(row: &crate::Row, index: usize, field: &str) -> Result<u64, StorageError> {
+    match row.get(index) {
+        Some(Value::Integer(value)) => u64::try_from(*value).map_err(|_| StorageError::Corrupt {
+            context: format!("{field} 为负数"),
+        }),
+        other => Err(StorageError::Corrupt {
+            context: format!("{field} 类型异常：{other:?}"),
+        }),
+    }
+}
+
+fn u32_of(row: &crate::Row, index: usize, field: &str) -> Result<u32, StorageError> {
+    let value = u64_of(row, index, field)?;
+    u32::try_from(value).map_err(|_| StorageError::Corrupt {
+        context: format!("{field} 超出 u32"),
+    })
+}
+
+fn i64_of(value: u64) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|_| StorageError::Corrupt {
+        context: format!("数值 {value} 超出 SQLite INTEGER"),
+    })
+}
+
+/// 出站 digest 的 map 形式；用于按 message 聚合时去重（本模块内部）。
+#[allow(dead_code)]
+fn group_parts_by_message(parts: Vec<SyncOutboxPart>) -> BTreeMap<String, Vec<SyncOutboxPart>> {
+    let mut grouped = BTreeMap::new();
+    for part in parts {
+        grouped
+            .entry(part.message_id.clone())
+            .or_insert_with(Vec::new)
+            .push(part);
+    }
+    grouped
 }
 
 `````
@@ -7432,6 +11576,19 @@ pub struct CloseReport {
     /// 「需要重开文档」）优先，否则是最近一次普通写失败。关闭之后会话可能被丢弃，
     /// 调用方只能靠这份报告知道「没排空是为什么」，因此它必须随报告一起返回。
     pub flush_error: Option<String>,
+}
+
+impl CloseReport {
+    /// 这次关闭是否暴露了需要“重开文档”的不可恢复失败。
+    ///
+    /// 只看 `flush_error` 的统一文案（`reopen_message`）；普通磁盘/SQLite 的瞬时失败
+    /// 也可能带 `flush_error`，但允许下一次再 flush，不应被 UI 当成永久坏状态。
+    #[must_use]
+    pub fn needs_reopen(&self) -> bool {
+        self.flush_error
+            .as_deref()
+            .is_some_and(|message| message.contains("需要重开文档"))
+    }
 }
 
 /// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
@@ -8610,6 +12767,53 @@ fn flush_reports_unrecoverable_after_bounded_rebuild() {
 
 /// P1-3 的另一个不可恢复分支：自动重建要读新 head，读不到/解码失败同样必须 fail-closed
 /// （不尝试写、不无限重试），并明确提示需要重开文档。
+/// 永久性 SQLite 错误（约束/ReadOnly/NotFound 等）也不能整类当成 Retryable；
+/// 只有 BUSY/LOCKED 才值得下一次 flush 再试。
+#[test]
+fn flush_treats_permanent_sqlite_error_as_unrecoverable() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let mut session = open_session(&vault, options(PEER_A));
+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
+
+    vault
+        .exec(
+            "CREATE TRIGGER fail_updates BEFORE INSERT ON loro_updates \
+             BEGIN SELECT RAISE(FAIL, 'permanent sqlite failure'); END",
+            &[],
+        )
+        .expect("创建永久失败触发器");
+
+    let ticket = session.flush(FlushReason::Manual);
+    assert!(
+        session
+            .wait_for_durable(ticket.target_live_rev, Duration::from_secs(1))
+            .is_none(),
+        "永久 SQLite 错误不得发 DurableAck"
+    );
+    let message = session.last_write_error().expect("必须有可读失败原因");
+    assert!(
+        message.contains("永久性") || message.contains("需要重开文档"),
+        "永久 SQLite 错误必须 fail-closed：{message}"
+    );
+    assert_eq!(session.pending_len(), 1, "不可恢复时 journal 必须保留");
+    assert_eq!(head(&vault, "doc-1").head_seq, 0, "整笔事务必须回滚");
+
+    vault
+        .exec("DROP TRIGGER fail_updates", &[])
+        .expect("移除触发器");
+    // 不可恢复后不会自动重试；重开会话才能继续。
+    let mut reopened = open_session(&vault, options(PEER_A));
+    reopened.apply(request(&reopened, "c2", 0, vec![edit(0, 0, "重开")]));
+    let ticket = reopened.flush(FlushReason::Manual);
+    assert!(
+        reopened
+            .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
+            .is_some(),
+        "重开会话后应恢复"
+    );
+}
+
 /// 永久性 Corrupt 不能被当成“下次再试”的 Retryable：它不会自愈。
 /// 用 `head_seq = i64::MAX` 构造 `seq = head + 1` 的 `i64_of` 溢出（append_update 返回
 /// Corrupt），断言 flusher 直接进入不可恢复，而不是每次重试同一永久错误。
@@ -8833,19 +13037,21 @@ fn flush_rebuild_keeps_sync_intent_seq_at_new_head_plus_one() {
 /// 移除注入后同一前缀必须能成功落库。
 #[test]
 fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
-    let (_dir, vault) = fresh_vault();
+    let (dir, vault) = fresh_vault();
     let _seed = seed_note(&vault, "note-1", "doc-1");
     let mut session = open_session(&vault, options_with_sync());
     session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
     assert_eq!(session.pending_len(), 1);
 
-    // 注入非 HeadConflict 的写失败：A 事务在 INSERT 处被 SQLite ABORT。
-    let trigger = SqlTrigger::install(
-        &vault,
-        "injected_flush_disk_failure",
-        "CREATE TRIGGER injected_flush_disk_failure BEFORE INSERT ON loro_updates \
-         BEGIN SELECT RAISE(ABORT, 'injected disk'); END;",
-    );
+    // 真实瞬时错误：外部连接持有写锁，且本 Vault 关闭 busy 等待，A 事务拿到
+    // SQLITE_BUSY（不是约束/只读/损坏等永久错误）。
+    vault
+        .query("PRAGMA busy_timeout=0", &[])
+        .expect("关闭 busy 等待");
+    let blocker = rusqlite::Connection::open(vault_path(&dir)).expect("打开外部连接");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("外部连接占写锁");
 
     let ticket = session.flush(FlushReason::Manual);
     let message = wait_for_write_error(&session, Duration::from_secs(10));
@@ -8855,8 +13061,8 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
         "普通写失败不得升级成不可恢复：{message}"
     );
     assert!(
-        message.contains("injected disk"),
-        "失败原因必须来自注入的写失败：{message}"
+        message.contains("锁") || message.contains("locked") || message.contains("busy"),
+        "失败原因必须来自 BUSY：{message}"
     );
     assert!(
         session
@@ -8864,6 +13070,12 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
             .is_none(),
         "普通写失败不得发出 DurableAck"
     );
+
+    blocker.execute_batch("ROLLBACK").expect("释放外部写锁");
+    drop(blocker);
+    vault
+        .query("PRAGMA busy_timeout=5000", &[])
+        .expect("恢复 busy 等待");
 
     // 前缀原样保留；没有 durable/head/intent 被写。
     assert_eq!(session.pending_len(), 1, "失败后必须保留同一前缀");
@@ -8881,8 +13093,7 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
     assert_eq!(head(&vault, "doc-1").head_seq, 0, "失败事务不得推进 head");
     assert_eq!(outbox_count(&vault), 0, "失败事务不得留下本地 intent");
 
-    // DROP 触发器后重试：同一前缀成功，水位/正文/intent 都补齐。
-    trigger.remove();
+    // 锁释放后重试：同一前缀成功，水位/正文/intent 都补齐。
     let ticket = session.flush(FlushReason::Manual);
     let ack = session
         .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
@@ -8923,98 +13134,6 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
 ///
 /// 注入点选 `BEFORE INSERT ON loro_updates`：第一次写会在 CAS（第 0 条语句）就因 head
 /// 过期失败，根本到不了 INSERT，因此触发器只命中「重建后的重试」这一次。
-#[test]
-fn flush_rebuild_retryable_write_failure_keeps_prefix_then_recovers() {
-    let (_dir, vault) = fresh_vault();
-    let _seed = seed_note(&vault, "note-1", "doc-1");
-    let mut session = open_session(&vault, options_with_sync());
-
-    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
-    let remote = BodyDoc::create("doc-1", PEER_B).expect("远端副本");
-    remote.insert_scalars(0, "远端").expect("远端编辑");
-    let remote_bytes = remote.export_all_updates().expect("导出远端 update");
-    let remote_update = pending(&remote, &loro::VersionVector::default()).expect("远端增量");
-    session
-        .apply_remote(&remote_bytes)
-        .expect("导入远端 update")
-        .expect("必须有变更");
-
-    // 外部先落同一份 update：head 0→1，让本命令第 1 次写入必然拿到 HeadConflict。
-    append_updates(
-        &vault,
-        "doc-1",
-        0,
-        &[UpdateRecord::new("external-1", remote_update)],
-    )
-    .expect("外部推进 head");
-
-    let trigger = SqlTrigger::install(
-        &vault,
-        "injected_rebuild_retry_disk",
-        "CREATE TRIGGER injected_rebuild_retry_disk BEFORE INSERT ON loro_updates \
-         BEGIN SELECT RAISE(ABORT, 'injected retry disk'); END;",
-    );
-
-    let ticket = session.flush(FlushReason::Manual);
-    let message = wait_for_write_error(&session, Duration::from_secs(10));
-    assert!(
-        message.contains("自动重建后重试前缀失败"),
-        "必须走 RebuildOutcome::Retryable：{message}"
-    );
-    assert!(
-        !message.contains("需要重开文档"),
-        "可重试失败不得升级成不可恢复：{message}"
-    );
-    assert!(
-        session
-            .wait_for_durable(ticket.target_live_rev, Duration::ZERO)
-            .is_none(),
-        "重建后的重试失败不得发出 DurableAck"
-    );
-    assert_eq!(session.pending_len(), 2, "同一前缀必须原样保留");
-    assert_eq!(session.durable_head_seq(), 0);
-    assert_eq!(outbox_count(&vault), 0, "回滚的写事务不得留下 intent");
-    assert_eq!(
-        count(
-            &vault,
-            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-            &[],
-        ),
-        1,
-        "只有外部那条：重建后的重试整笔回滚"
-    );
-    assert_eq!(head(&vault, "doc-1").head_seq, 1);
-
-    // 移除注入后下一次 flush：仍从旧 CAS 基准开始，先冲突、再自动重建，这次成功。
-    trigger.remove();
-    let ticket = session.flush(FlushReason::Manual);
-    let ack = session
-        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
-        .expect("注入移除后必须收敛到 DurableAck");
-    assert_eq!(ack.through_live_rev, LiveRev(2));
-    assert_eq!(ack.head_seq, 3);
-    assert_eq!(session.pending_len(), 0);
-    assert_eq!(
-        session.last_write_error(),
-        None,
-        "成功写入后必须清空失败原因"
-    );
-    assert_eq!(outbox_count(&vault), 1);
-    let row = outbox_row(&vault, &intent_message_id("doc-1", 2, SYNC_CTX))
-        .expect("读 intent")
-        .expect("重建后的本地 intent");
-    assert_eq!(row.seq, 2);
-    assert_eq!(row.key_epoch, SYNC_CTX.key_epoch);
-}
-
-/// 二次冲突门禁：`auto_rebuilt` 用尽后重试仍撞 head 冲突时，必须 fail-closed 进入
-/// 不可恢复态（提示重开），journal/库原样保留，后续 flush 立即失败不再碰数据库。
-///
-/// 注入 `BEFORE UPDATE OF head_seq ON loro_docs ... RAISE(IGNORE)`：第一次写因为 head 已是
-/// 1（外部推进）而天然 CAS 失败，不触发该触发器；重建后的重试 CAS 命中 `head_seq=1` 时
-/// 被 `RAISE(IGNORE)` 跳过（0 行），稳定复现「同一命令内第二次 HeadConflict」的交错。
-/// `head_seq <= CAS 基准` 的回退分支要求第一次写入失败后 head 倒退，公开接口下
-/// `head_seq` 只前进、无法确定性构造，因此本测试只覆盖“二次冲突”这一支。
 #[test]
 fn flush_reports_unrecoverable_on_second_head_conflict() {
     let (_dir, vault) = fresh_vault();
@@ -9224,6 +13343,10 @@ fn close_report_surfaces_unrecoverable_flush_error() {
         "CloseReport 的原因必须可执行：{close_error}"
     );
     assert!(report.timed_out, "不可恢复时关闭必然超时：{report:?}");
+    assert!(
+        report.needs_reopen(),
+        "不可恢复报告必须被 UI 识别为需要重开"
+    );
     assert_eq!(report.pending_edits, 1, "未 ACK 条目必须原样保留");
     assert!(
         report.durable.is_none(),
@@ -9274,15 +13397,20 @@ use loro::{ExportMode, LoroDoc, LoroTree, LoroValue, TreeID, VersionVector};
 use support::*;
 
 use menghunote_storage::{
-    apply_baseline_batch, begin_baseline_apply, doc_updates_since, finish_baseline_apply,
-    load_body_doc, BaselineApplyFinish, BaselineExpectation, BodyDoc, StoredLoroUpdate, Vault,
-    BASELINE_MERGE_BATCH,
+    append_updates, apply_baseline_batch, baseline_apply_debug_counters, begin_baseline_apply,
+    doc_updates_since, finish_baseline_apply, load_body_doc, reset_baseline_apply_debug,
+    BaselineApplyFinish, BaselineExpectation, BodyDoc, PendingUpdate, StoredLoroUpdate,
+    UpdateRecord, Vault, BASELINE_MERGE_BATCH,
 };
 
 /// 本地设备（attached 侧）。
 const A_PEER: u64 = PEER_A;
 /// 远端基线导出方（与本地不同的 peer）。
 const B_PEER: u64 = PEER_B;
+/// 第三个 peer：只出现在基线快照里、本地从未导入的远端设备（本地未知 peer）。
+const C_PEER: u64 = 3;
+/// 第四个 peer：本地以非因果顺序导入的另一个远端设备。
+const D_PEER: u64 = 4;
 
 // ---------------------------------------------------------------------------
 // 正文（LoroText）用例的脚手架
@@ -9318,10 +13446,34 @@ fn snapshot_vv(snapshot: &[u8]) -> VersionVector {
 /// VV 的规范表示：`VersionVector::encode` 的字节顺序取决于 import 顺序（不是规范形式），
 /// 所以按 peer 排序后比较「peer -> counter」集合；语义相等即等价。
 fn canonical_vv(bytes: &[u8]) -> Vec<(u64, i32)> {
-    let vv = VersionVector::decode(bytes).expect("VV 可解码");
+    canonical_of_vv(&VersionVector::decode(bytes).expect("VV 可解码"))
+}
+
+/// 同 [`canonical_vv`]，但输入已是解码后的 VV（断言 blob 元信息与文档 VV 用）。
+fn canonical_of_vv(vv: &VersionVector) -> Vec<(u64, i32)> {
     let mut entries: Vec<(u64, i32)> = vv.iter().map(|(peer, counter)| (*peer, *counter)).collect();
     entries.sort_unstable();
     entries
+}
+
+/// 单个 peer 的计数（缺失按 0 处理，与 `VersionVector` 语义一致）。
+fn counter_of(vv: &VersionVector, peer: u64) -> i32 {
+    vv.iter()
+        .find(|(candidate, _)| **candidate == peer)
+        .map(|(_, counter)| *counter)
+        .unwrap_or(0)
+}
+
+/// 已编码 VV 里的 peer 集合（升序）。
+///
+/// 多 peer 用例用它断言 merged oplog VV 覆盖了场景的全部 peer：`oplog_frontiers` 只是
+/// DAG tips，被后续 op 依赖的 peer 会从 tips 里消失，不能当成「peer 全集」。
+fn vv_peers(bytes: &[u8]) -> Vec<u64> {
+    let vv = VersionVector::decode(bytes).expect("VV 可解码");
+    let mut peers: Vec<u64> = vv.keys().copied().collect();
+    peers.sort_unstable();
+    peers.dedup();
+    peers
 }
 
 /// `loro_updates` 里 baseline merge 追加的那一行。
@@ -9333,6 +13485,10 @@ struct DetachedMerge {
 }
 
 /// 驱动生产 `existing_local_extra`（detached）分支，并取回它落库的差集。
+///
+/// 常规两 peer 用例走这个入口：期望合并后的 oplog frontier（DAG tips）恰好是
+/// 本地 + 基线两个 peer。多 peer 边界用例用 [`merge_detached_with_peers`] 显式给出
+/// 该场景期望的 frontier peer 集合，断言不放宽。
 fn merge_detached(
     vault: &Vault,
     doc_id: &str,
@@ -9340,6 +13496,33 @@ fn merge_detached(
     local: &BodyDoc,
     baseline_s: u64,
     cursor: &str,
+) -> DetachedMerge {
+    merge_detached_with_peers(
+        vault,
+        doc_id,
+        snapshot,
+        local,
+        baseline_s,
+        cursor,
+        &[A_PEER, B_PEER],
+    )
+}
+
+/// 同 [`merge_detached`]，但合并后 oplog **frontier（DAG tips）** 的 peer 集合由
+/// 调用方给出（升序）。
+///
+/// 注意 frontier 是 DAG tips，不是「peer 全集」：某一 peer 的 op 一旦被后续 op 依赖
+/// （例如基线在未知 peer C 的 op 之后继续写），它就不再是 tip。真正的全量证据是
+/// merged `end_vv`，由各多 peer 用例用 [`vv_peers`] 单独断言，并与
+/// [`assert_detached_matches_attached`] 的 attached VV 逐项相等。
+fn merge_detached_with_peers(
+    vault: &Vault,
+    doc_id: &str,
+    snapshot: &[u8],
+    local: &BodyDoc,
+    baseline_s: u64,
+    cursor: &str,
+    expected_peers: &[u64],
 ) -> DetachedMerge {
     let local_delta = local
         .pending_update(&snapshot_vv(snapshot))
@@ -9359,22 +13542,33 @@ fn merge_detached(
         .expect("detached 分支必须落一条 baseline_merge 差集");
     assert!(!merged.payload.is_empty(), "detached 导出的差集不能为空");
 
-    // 分支守卫：detached 合并后的 oplog frontier 必须同时包含本地与基线两个 peer。
-    // 若生产误走 attached 分支，这里只会是基线 state 的单 peer frontier。
+    // 分支守卫：detached 合并后的 oplog frontier 必须与场景一致。
+    // 若生产误走 attached 分支，这里只会是基线 state 的 peer 集合。
     let frontier = loro::Frontiers::decode(&merged.end_frontier).expect("frontier 可解码");
     let mut peers: Vec<u64> = frontier.iter().map(|id| id.peer).collect();
     peers.sort_unstable();
     peers.dedup();
     assert_eq!(
-        peers,
-        vec![A_PEER, B_PEER],
-        "detached 分支未生效？合并后的 oplog frontier 必须同时包含两个 peer"
+        peers.as_slice(),
+        expected_peers,
+        "detached 分支未生效？合并后的 oplog frontier peer 集合必须与场景一致（实际 {peers:?}）"
     );
 
     DetachedMerge {
         merged,
         local_delta,
     }
+}
+
+/// `loro_updates` 里 `batch_id == BASELINE_MERGE_BATCH` 的全部行（按 seq 升序）。
+///
+/// 幂等用例用它证明「重放/重复投递不新增、不改写 detached 落库的差集行」。
+fn baseline_merge_rows(vault: &Vault, doc_id: &str) -> Vec<StoredLoroUpdate> {
+    doc_updates_since(vault, doc_id, 0)
+        .expect("读 loro_updates")
+        .into_iter()
+        .filter(|update| update.batch_id == BASELINE_MERGE_BATCH)
+        .collect()
 }
 
 /// 断言 detached 结果与 attached 路径完全等价，返回合并后的正文。
@@ -10034,8471 +14228,7048 @@ fn precomposed_vs_decomposed_accent_merges_without_normalization() {
     assert_ne!(text, "e\u{301}e\u{301}", "不得做 NFD 归一化：{text:?}");
 }
 
+// ---------------------------------------------------------------------------
+// 5. 边界：基线 VV 里含本地从未导入的 peer
+// ---------------------------------------------------------------------------
+
+/// 基线快照里带一个本地从未导入的 peer C（基线 VV 有 C、本地 VV 没有）时，
+/// detached 导出/合并必须被钉死为：
+/// - 不 panic、不把 C 的 op 丢掉（否则本地会永久缺一段远端历史）；
+/// - 本地差集只含本地 peer 的 op——C 已在基线 VV 覆盖范围内，不能重复导出；
+/// - merged 差集恰好是「基线相对本地 VV 的差集」：单独重放等于基线文本（含未知 peer C 的 op），
+///   而不是全量历史、也不是空集。
+#[test]
+fn detached_baseline_vv_with_unimported_peer_keeps_both_sides_once() {
+    let (_dir, vault) = fresh_vault();
+
+    // 本地 peer A：独立文档，从未导入基线（本地 VV 只有 A）。
+    let local = seed_note(&vault, "note-1", "doc-1");
+    local.insert_scalars(0, "LOCAL").expect("本地编辑");
+    commit_now(&vault, &local, "local-batch");
+
+    // 基线：peer B 先导入 peer C 的 update（本地从未见过 C），再追加自己的文本。
+    let third = BodyDoc::create("doc-1", C_PEER).expect("第三台设备文档");
+    third.insert_scalars(0, "C").expect("C 的文本");
+    let third_update = third
+        .pending_update(&VersionVector::new())
+        .expect("C 的增量");
+    let remote = BodyDoc::create("doc-1", B_PEER).expect("基线文档");
+    remote
+        .import(&third_update.payload)
+        .expect("基线导入 C 的 op");
+    remote
+        .insert_scalars(remote.scalar_len(), "BASE")
+        .expect("基线文本");
+    let snapshot = remote.export_snapshot().expect("基线快照");
+
+    let baseline_vv = snapshot_vv(&snapshot);
+    let local_vv = local.vv();
+    assert!(
+        counter_of(&baseline_vv, C_PEER) > 0,
+        "基线 VV 必须含本地从未导入的 peer C：{baseline_vv:?}"
+    );
+    assert_eq!(
+        counter_of(&local_vv, C_PEER),
+        0,
+        "本地 VV 不得含 C peer（否则测不到「本地未知 peer」）"
+    );
+    // 生产分支守卫：本地在基线之外还有 op（A 不在基线 VV 里）。
+    assert!(
+        local_vv.sub_iter(&baseline_vv).next().is_some(),
+        "本地必须相对基线有额外 op，否则生产走 attached 分支"
+    );
+
+    let parts = merge_detached_with_peers(
+        &vault,
+        "doc-1",
+        &snapshot,
+        &local,
+        5,
+        "cursor-1",
+        &[A_PEER, B_PEER],
+    );
+    // detached 合并后的 oplog VV 必须覆盖全部三个 peer（未知 peer C 的 op 不能丢）。
+    assert_eq!(
+        vv_peers(&parts.merged.end_vv),
+        vec![A_PEER, B_PEER, C_PEER],
+        "合并后的 oplog VV 必须含未知 peer C"
+    );
+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
+
+    assert_eq!(
+        text.len(),
+        "LOCAL".len() + "CBASE".len(),
+        "不得有重复或残留字符：{text:?}"
+    );
+    assert_eq!(
+        text.matches("LOCAL").count(),
+        1,
+        "本地文本必须恰好一次：{text:?}"
+    );
+    assert_eq!(
+        text.matches("CBASE").count(),
+        1,
+        "基线文本必须恰好一次：{text:?}"
+    );
+
+    // 本地差集只含本地 peer 的 op：单独重放就是本地文本，不含 C/B 的历史。
+    let local_delta_alone = BodyDoc::restore(
+        "local-delta-probe",
+        A_PEER,
+        None,
+        std::slice::from_ref(&parts.local_delta),
+    )
+    .expect("本地差集可重放");
+    assert_eq!(
+        local_delta_alone.text(),
+        "LOCAL",
+        "本地差集不得包含基线 op：{local_delta_alone:?}"
+    );
+    assert_eq!(
+        canonical_vv(&local_delta_alone.vv().encode()),
+        canonical_of_vv(&local_vv),
+        "本地差集的 VV 必须等于本地 VV"
+    );
+
+    // merged 差集 = 基线相对本地 VV 的差集：单独重放恰好是基线文本（C 的 op 必须在内）。
+    let merged_alone = BodyDoc::restore(
+        "merged-probe",
+        A_PEER,
+        None,
+        std::slice::from_ref(&parts.merged.payload),
+    )
+    .expect("merged 差集可重放");
+    assert_eq!(
+        merged_alone.text(),
+        "CBASE",
+        "merged 差集必须正好覆盖基线文本：{merged_alone:?}"
+    );
+    assert_eq!(
+        canonical_vv(&merged_alone.vv().encode()),
+        canonical_of_vv(&baseline_vv),
+        "merged 差集的 VV 必须等于基线 VV（未知 peer C 的 op 不能丢）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. 边界：`from` 超前于 doc 当前 VV（病态输入）
+// ---------------------------------------------------------------------------
+
+/// `from`（基线 VV）对本地 peer 的计数严格超前于本地文档当前 VV 时（病态输入：基线
+/// 声称包含本地还没拿到的 A op），按现有生产 API 的语义钉死：
+/// 不 panic、不报错：`export(updates(from))` 对超前的 from 只导出**未被覆盖**的 op；
+/// 本地差集 = 未被 from 覆盖的 peer 的 op（C/D），绝不把 A 的旧 op 再导出一遍；
+/// 也不退化成空集（C/D 是本地真正多出来的 op）。
+/// 断言用 blob 元信息（partial_start_vv / partial_end_vv）证明导出区间，不靠猜测文本顺序。
+#[test]
+fn detached_export_from_ahead_of_local_vv_keeps_only_uncovered_ops() {
+    let (_dir, vault) = fresh_vault();
+
+    // peer A 的两笔历史：基线包含 A 的全量（A:1..4），本地只导入前半（A:1..2）。
+    let a_doc = BodyDoc::create("doc-1", A_PEER).expect("A 文档");
+    a_doc.insert_scalars(0, "A1").expect("A 第一笔");
+    let a_first = a_doc
+        .pending_update(&VersionVector::new())
+        .expect("A 第一笔增量");
+    a_doc.insert_scalars(2, "A2").expect("A 第二笔");
+    let a_all = a_doc
+        .pending_update(&VersionVector::new())
+        .expect("A 全量增量");
+
+    // 本地：A 的前半 + 两个本地真正多出来的 peer（C/D）。
+    let third = BodyDoc::create("doc-1", C_PEER).expect("C 文档");
+    third.insert_scalars(0, "C").expect("C 文本");
+    let third_update = third.pending_update(&VersionVector::new()).expect("C 增量");
+    let fourth = BodyDoc::create("doc-1", D_PEER).expect("D 文档");
+    fourth.insert_scalars(0, "D").expect("D 文本");
+    let fourth_update = fourth
+        .pending_update(&VersionVector::new())
+        .expect("D 增量");
+    let local = seed_note(&vault, "note-1", "doc-1");
+    local.import(&a_first.payload).expect("本地导入 A 前半");
+    local.import(&third_update.payload).expect("本地导入 C");
+    local.import(&fourth_update.payload).expect("本地导入 D");
+    commit_now(&vault, &local, "local-batch");
+
+    // 基线：导入 A 的全量（对 A 的计数超前本地）再写自己的文本。
+    let remote = BodyDoc::create("doc-1", B_PEER).expect("基线文档");
+    remote.import(&a_all.payload).expect("基线导入 A 全量");
+    remote.insert_scalars(0, "BASE").expect("基线文本");
+    let snapshot = remote.export_snapshot().expect("基线快照");
+
+    let baseline_vv = snapshot_vv(&snapshot);
+    let local_vv = local.vv();
+    assert!(
+        counter_of(&baseline_vv, A_PEER) > counter_of(&local_vv, A_PEER),
+        "基线对 A 的计数必须严格超前本地（from 超前）：baseline={baseline_vv:?} local={local_vv:?}"
+    );
+    assert!(
+        local_vv.sub_iter(&baseline_vv).next().is_some(),
+        "本地必须相对基线有额外 op（C/D），否则生产走 attached 分支"
+    );
+
+    let parts = merge_detached_with_peers(
+        &vault,
+        "doc-1",
+        &snapshot,
+        &local,
+        6,
+        "cursor-2",
+        &[B_PEER, C_PEER, D_PEER],
+    );
+    // detached 合并后的 oplog VV 必须覆盖全部四个 peer（A 的基线 op 与本地 C/D 的 op 都在）。
+    assert_eq!(
+        vv_peers(&parts.merged.end_vv),
+        vec![A_PEER, B_PEER, C_PEER, D_PEER],
+        "合并后的 oplog VV 必须含全部四个 peer"
+    );
+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
+
+    assert_eq!(
+        text.len(),
+        "BASEA1A2CD".len(),
+        "不得有重复或残留字符：{text:?}"
+    );
+    for marker in ["BASE", "A1A2", "C", "D"] {
+        assert_eq!(
+            text.matches(marker).count(),
+            1,
+            "{marker} 必须恰好一次：{text:?}"
+        );
+    }
+
+    // 本地差集：blob 元信息证明只导出 C/D（A 的旧 op 被 from 覆盖，不重复导出）。
+    let delta_meta =
+        LoroDoc::decode_import_blob_meta(&parts.local_delta, true).expect("本地差集元信息");
+    assert_eq!(
+        canonical_of_vv(&delta_meta.partial_start_vv),
+        vec![(C_PEER, 0), (D_PEER, 0)],
+        "本地差集必须从 C/D 的 0 开始（不含 A 的 op）"
+    );
+    assert_eq!(
+        canonical_of_vv(&delta_meta.partial_end_vv),
+        vec![
+            (C_PEER, counter_of(&local_vv, C_PEER)),
+            (D_PEER, counter_of(&local_vv, D_PEER)),
+        ],
+        "本地差集终点必须是 C/D 的本地计数"
+    );
+    // 单独重放：只有 C/D 两个字符（依赖缺失的 op 不会凭空出现）。
+    let local_delta_alone = BodyDoc::restore(
+        "local-delta-probe",
+        A_PEER,
+        None,
+        std::slice::from_ref(&parts.local_delta),
+    )
+    .expect("本地差集可重放");
+    assert_eq!(
+        local_delta_alone.text().chars().count(),
+        2,
+        "本地差集只应含 C/D：{local_delta_alone:?}"
+    );
+    assert_eq!(local_delta_alone.text().matches('C').count(), 1);
+    assert_eq!(local_delta_alone.text().matches('D').count(), 1);
+    assert!(
+        !local_delta_alone.text().contains('A'),
+        "不得把 A 的旧 op 再导出：{local_delta_alone:?}"
+    );
+
+    // merged 差集：起点 = 本地 VV（A:2、B:0），终点 = 基线 VV（A:4、B:4）。
+    let merged_meta =
+        LoroDoc::decode_import_blob_meta(&parts.merged.payload, true).expect("merged 元信息");
+    assert_eq!(
+        canonical_of_vv(&merged_meta.partial_start_vv),
+        vec![(A_PEER, counter_of(&local_vv, A_PEER)), (B_PEER, 0)],
+        "merged 差集必须从本地 VV 起算（超前 from 的语义）"
+    );
+    assert_eq!(
+        canonical_of_vv(&merged_meta.partial_end_vv),
+        vec![
+            (A_PEER, counter_of(&baseline_vv, A_PEER)),
+            (B_PEER, counter_of(&baseline_vv, B_PEER)),
+        ],
+        "merged 差集终点必须是基线 VV"
+    );
+    // 单独重放 merged 差集：A 的后续 op 缺依赖、B 的 op 依赖也未满足 → 不产生可见文本；
+    // 关键是否定断言：绝不能把本地独有的 C/D 再导出一遍。
+    let merged_alone = BodyDoc::restore(
+        "merged-probe",
+        A_PEER,
+        None,
+        std::slice::from_ref(&parts.merged.payload),
+    )
+    .expect("merged 差集可重放");
+    assert_eq!(
+        merged_alone.text(),
+        "",
+        "merged 差集单独重放不得产生文本：{merged_alone:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. 边界：同一个 update 重复 import 的幂等性
+// ---------------------------------------------------------------------------
+
+/// 同一个 update 重复 import 的幂等性。两轮 apply 走**不同**的生产分支：
+/// 首轮：本地有 extra → `existing_local_extra`（detached）分支，落一条 baseline_merge；
+/// 次轮：同一 snapshot digest 已应用 → 生产在 detached 之前短路到
+/// `replayed_same_digest` 分支，**不得**再进 detached，也不得新增 baseline_merge、
+/// 推进 head_seq、改 head_vv/head_frontier 或文本。
+/// 另在 Loro 层直接钉住「同一 update 导入两次不产生新 op」（`import_oplog_only` 依赖的
+/// 不变量），并在数据库层钉住「重复投递同一 payload 行经 `load_body_doc` 重放不变」。
+#[test]
+fn detached_same_update_reimport_is_idempotent() {
+    let (_dir, vault) = fresh_vault();
+    let local = seed_note(&vault, "note-1", "doc-1");
+    local.insert_scalars(0, "LOCAL").expect("本地编辑");
+    commit_now(&vault, &local, "local-batch");
+
+    let remote = memory_doc("doc-1", B_PEER, "BASE");
+    let snapshot = remote.export_snapshot().expect("基线快照");
+
+    // 首轮：detached 分支（重放计数清零后再调用，断言生产真的进了这个分支）。
+    reset_baseline_apply_debug();
+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 5, "cursor-1");
+    let first = baseline_apply_debug_counters();
+    assert_eq!(
+        first.existing_local_extra, 1,
+        "首轮必须命中 detached 分支：{first:?}"
+    );
+    assert_eq!(
+        first.replayed_same_digest, 0,
+        "首轮不应走重放分支：{first:?}"
+    );
+
+    let head_before = head(&vault, "doc-1");
+    let rows_before = baseline_merge_rows(&vault, "doc-1");
+    assert_eq!(
+        rows_before.len(),
+        1,
+        "首轮必须恰好落一条 baseline_merge 差集"
+    );
+
+    // 次轮：同一 snapshot 在同一 staging 再 apply 一次（同一 digest）。
+    apply_baseline_batch(&vault, &[("doc-1".to_owned(), snapshot.clone())], &[])
+        .expect("同一 digest 重放必须成功");
+    let second = baseline_apply_debug_counters();
+    assert_eq!(
+        second.existing_local_extra, 1,
+        "重放不得再进 detached 分支：{second:?}"
+    );
+    assert_eq!(
+        second.replayed_same_digest, 1,
+        "同一 digest 必须走生产既有的 replayed_same_digest 分支：{second:?}"
+    );
+
+    let rows_after = baseline_merge_rows(&vault, "doc-1");
+    assert_eq!(rows_after.len(), 1, "重放不得新增 baseline_merge 行");
+    assert_eq!(
+        rows_after[0].payload, rows_before[0].payload,
+        "重放不得改写差集 payload"
+    );
+    assert_eq!(
+        rows_after[0].end_vv, rows_before[0].end_vv,
+        "重放不得改写差集 VV"
+    );
+    assert_eq!(
+        rows_after[0].end_frontier, rows_before[0].end_frontier,
+        "重放不得改写差集 frontier"
+    );
+
+    let head_after = head(&vault, "doc-1");
+    assert_eq!(
+        head_after.head_seq, head_before.head_seq,
+        "重放不得推进 head_seq"
+    );
+    assert_eq!(
+        head_after.head_vv, head_before.head_vv,
+        "重放不得改 head_vv"
+    );
+    assert_eq!(
+        head_after.head_frontier, head_before.head_frontier,
+        "重放不得改 head_frontier"
+    );
+
+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
+    assert_eq!(
+        text.len(),
+        "LOCAL".len() + "BASE".len(),
+        "重放不得重复文本：{text:?}"
+    );
+    assert_eq!(text.matches("LOCAL").count(), 1);
+    assert_eq!(text.matches("BASE").count(), 1);
+
+    // Loro 层：同一 update 导入两次不产生新 op（`import_oplog_only` 依赖的不变量）。
+    let once = BodyDoc::restore(
+        "idem-once",
+        A_PEER,
+        None,
+        std::slice::from_ref(&parts.merged.payload),
+    )
+    .expect("单次导入");
+    let twice = BodyDoc::restore(
+        "idem-twice",
+        A_PEER,
+        None,
+        &[parts.merged.payload.clone(), parts.merged.payload.clone()],
+    )
+    .expect("重复导入");
+    assert_eq!(once.text(), twice.text(), "重复 import 不得改文本");
+    assert_eq!(
+        once.vv().encode(),
+        twice.vv().encode(),
+        "重复 import 不得改 VV"
+    );
+    assert_eq!(
+        once.frontiers().encode(),
+        twice.frontiers().encode(),
+        "重复 import 不得改 frontier"
+    );
+
+    // 数据库层：同一 payload 再落一行（模拟 relay 重复投递），生产读取路径必须幂等。
+    let duplicate = UpdateRecord::new(
+        "duplicate-delivery",
+        PendingUpdate {
+            payload: parts.merged.payload.clone(),
+            end_frontier: parts.merged.end_frontier.clone(),
+            end_vv: parts.merged.end_vv.clone(),
+        },
+    );
+    append_updates(&vault, "doc-1", head_after.head_seq, &[duplicate]).expect("重复投递落库");
+    let (loaded, loaded_head) =
+        load_body_doc(&vault, "doc-1", A_PEER, None).expect("重复投递后重放");
+    assert_eq!(loaded.text(), text, "重复投递不得改文本");
+    assert_eq!(
+        canonical_vv(&loaded.vv().encode()),
+        canonical_vv(&parts.merged.end_vv)
+    );
+    assert_eq!(
+        loaded_head.head_vv, parts.merged.end_vv,
+        "重复投递不得改 head_vv"
+    );
+    assert_eq!(loaded_head.head_frontier, parts.merged.end_frontier);
+    assert_eq!(
+        baseline_merge_rows(&vault, "doc-1").len(),
+        1,
+        "重复投递不得新增 baseline_merge 行"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. 边界：多 peer 物理乱序导入
+// ---------------------------------------------------------------------------
+
+/// 多 peer 物理乱序：D 的 update 先于它依赖的 C、C 又先于它依赖的基线 S0 导入本地
+/// （Loro 先把它们挂成 pending，依赖到齐后一次性应用），然后本地再编辑。之后
+/// detached 导出必须与 attached 参考完全一致，且 merged 差集只含新基线 S1 新产生的
+/// B op——不重复导出本地已导入的 A/C/D op。
+#[test]
+fn detached_multi_peer_out_of_order_imports_match_attached() {
+    let (_dir, vault) = fresh_vault();
+
+    // 基线 S0（peer B）。
+    let remote = memory_doc("doc-1", B_PEER, "BASE");
+    let first = remote.export_snapshot().expect("基线 S0");
+    let first_vv = snapshot_vv(&first);
+
+    // C：在 S0 上插入；D：在 S0 + C 上插入（D 的 op 因果依赖 C 的 op）。
+    let third = BodyDoc::restore("doc-1", C_PEER, Some(&first), &[]).expect("C 文档");
+    third.insert_scalars(0, "CCC").expect("C 文本");
+    let third_update = third.pending_update(&first_vv).expect("C 增量");
+    let fourth = BodyDoc::restore("doc-1", D_PEER, Some(&first), &[]).expect("D 文档");
+    fourth.import(&third_update.payload).expect("D 导入 C");
+    fourth.insert_scalars(0, "DDD").expect("D 文本");
+    let fourth_update = fourth.pending_update(&third.vv()).expect("D 增量");
+
+    // 本地 peer A：物理导入顺序 D → C → S0，与因果顺序完全相反。
+    let local = seed_note(&vault, "note-1", "doc-1");
+    local
+        .import(&fourth_update.payload)
+        .expect("本地先导 D（缺依赖）");
+    local
+        .import(&third_update.payload)
+        .expect("本地再导 C（缺基线）");
+    local.import(&first).expect("本地最后导基线 S0");
+    assert_eq!(
+        local.text().matches("BASE").count(),
+        1,
+        "乱序导入后基线文本必须就位：{:?}",
+        local.text()
+    );
+    assert_eq!(
+        local.text().matches("CCC").count(),
+        1,
+        "乱序导入后 C 文本必须就位：{:?}",
+        local.text()
+    );
+    assert_eq!(
+        local.text().matches("DDD").count(),
+        1,
+        "乱序导入后 D 文本必须就位：{:?}",
+        local.text()
+    );
+    local.insert_scalars(0, "AAA").expect("本地编辑");
+    commit_now(&vault, &local, "local-batch");
+
+    // 远端在 S0 之后继续写：新基线 S1 必须带来新 op（否则 merged 差集测不到内容）。
+    remote
+        .insert_scalars(remote.scalar_len(), "NEW")
+        .expect("远端新文本");
+    let second = remote.export_snapshot().expect("基线 S1");
+    let second_vv = snapshot_vv(&second);
+    let local_vv = local.vv();
+    assert!(
+        local_vv.sub_iter(&second_vv).next().is_some(),
+        "本地必须相对新基线有额外 op（A/C/D）"
+    );
+
+    let parts = merge_detached_with_peers(
+        &vault,
+        "doc-1",
+        &second,
+        &local,
+        7,
+        "cursor-3",
+        &[A_PEER, B_PEER],
+    );
+    // detached 合并后的 oplog VV 必须覆盖全部四个 peer（乱序导入的 A/C/D 与基线的 B）。
+    assert_eq!(
+        vv_peers(&parts.merged.end_vv),
+        vec![A_PEER, B_PEER, C_PEER, D_PEER],
+        "合并后的 oplog VV 必须含全部四个 peer"
+    );
+    let text = assert_detached_matches_attached(&vault, "doc-1", &second, &parts);
+
+    assert_eq!(
+        text.len(),
+        "AAADDDCCCBASENEW".len(),
+        "不得有重复或残留字符：{text:?}"
+    );
+    for marker in ["AAA", "DDD", "CCC", "BASE", "NEW"] {
+        assert_eq!(
+            text.matches(marker).count(),
+            1,
+            "{marker} 必须恰好一次：{text:?}"
+        );
+    }
+
+    // 本地差集：从 0 起算 A/C/D 的 op，且**不含**基线 S0 的 B op（B 已被 from 覆盖）。
+    let delta_meta =
+        LoroDoc::decode_import_blob_meta(&parts.local_delta, true).expect("本地差集元信息");
+    assert_eq!(
+        canonical_of_vv(&delta_meta.partial_start_vv),
+        vec![(A_PEER, 0), (C_PEER, 0), (D_PEER, 0)],
+        "本地差集必须从 A/C/D 的 0 起算"
+    );
+    assert_eq!(
+        canonical_of_vv(&delta_meta.partial_end_vv),
+        vec![
+            (A_PEER, counter_of(&local_vv, A_PEER)),
+            (C_PEER, counter_of(&local_vv, C_PEER)),
+            (D_PEER, counter_of(&local_vv, D_PEER)),
+        ],
+        "本地差集终点必须是 A/C/D 的本地计数"
+    );
+    assert!(
+        canonical_of_vv(&delta_meta.partial_end_vv)
+            .iter()
+            .all(|(peer, _)| *peer != B_PEER),
+        "本地差集不得包含基线 S0 的 op（from 已覆盖）"
+    );
+
+    // merged 差集：起点 = 本地 VV 的 B 计数（S0 已导入），终点 = 新基线 VV，只含 B 的新 op。
+    let merged_meta =
+        LoroDoc::decode_import_blob_meta(&parts.merged.payload, true).expect("merged 元信息");
+    assert_eq!(
+        canonical_of_vv(&merged_meta.partial_start_vv),
+        vec![(B_PEER, counter_of(&local_vv, B_PEER))],
+        "merged 差集必须从本地 VV 的 B 计数起算"
+    );
+    assert_eq!(
+        canonical_of_vv(&merged_meta.partial_end_vv),
+        vec![(B_PEER, counter_of(&second_vv, B_PEER))],
+        "merged 差集终点必须是新基线 VV"
+    );
+    let merged_alone = BodyDoc::restore(
+        "merged-probe",
+        A_PEER,
+        None,
+        std::slice::from_ref(&parts.merged.payload),
+    )
+    .expect("merged 差集可重放");
+    assert!(
+        !merged_alone.text().contains("AAA")
+            && !merged_alone.text().contains("CCC")
+            && !merged_alone.text().contains("DDD"),
+        "merged 差集不得把本地 op 再导出一遍：{merged_alone:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. 边界：大文档（10,000 scalar / 10,000 op）
+// ---------------------------------------------------------------------------
+
+/// 大文档：基线 10,000 字（100 块 × 100 字，逐块提交 = 大量 op），本地另有编辑。
+/// detached merge 后文本必须与 attached 参考逐字节一致（字符数/字节数精确），
+/// 且 merged 差集单独重放恰好还原基线原文（不含本地文本）。
+#[test]
+fn detached_large_document_merge_matches_attached() {
+    let (_dir, vault) = fresh_vault();
+    let local = seed_note(&vault, "note-1", "doc-1");
+    local.insert_scalars(0, "LOCAL").expect("本地编辑");
+    commit_now(&vault, &local, "local-batch");
+
+    // 基线：100 块 × 100 字 = 10,000 个 scalar（每块一次提交）。
+    let remote = BodyDoc::create("doc-1", B_PEER).expect("基线文档");
+    let chunk = "基".repeat(100);
+    for index in 0..100 {
+        let end = remote.scalar_len();
+        remote.insert_scalars(end, &chunk).expect("基线分块写入");
+        assert_eq!(
+            remote.scalar_len(),
+            (index + 1) * 100,
+            "基线长度必须逐块增长"
+        );
+    }
+    let snapshot = remote.export_snapshot().expect("大文档基线快照");
+    let baseline_vv = snapshot_vv(&snapshot);
+    assert_eq!(
+        counter_of(&baseline_vv, B_PEER),
+        10_000,
+        "基线必须是 10,000 个 op"
+    );
+
+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 12, "cursor-4");
+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
+
+    assert_eq!(
+        text.matches('基').count(),
+        10_000,
+        "基线字符必须恰好 10,000 个"
+    );
+    assert_eq!(text.matches("LOCAL").count(), 1, "本地文本必须恰好一次");
+    assert_eq!(text.chars().count(), 10_005, "scalar 总数必须是 10,000 + 5");
+    assert_eq!(text.len(), 30_005, "UTF-8 字节数必须原样保留（基 3B/字）");
+    assert_eq!(
+        text.replace("LOCAL", ""),
+        "基".repeat(10_000),
+        "除本地前缀外必须与基线逐字节一致"
+    );
+
+    // merged 差集 = 基线相对本地 VV 的差集：单独重放恰好是基线原文（不含 LOCAL）。
+    let merged_alone = BodyDoc::restore(
+        "merged-probe",
+        A_PEER,
+        None,
+        std::slice::from_ref(&parts.merged.payload),
+    )
+    .expect("大差集可重放");
+    assert_eq!(
+        merged_alone.scalar_len(),
+        10_000,
+        "merged 差集必须覆盖全部基线 op"
+    );
+    assert_eq!(
+        merged_alone.text(),
+        "基".repeat(10_000),
+        "merged 差集单独重放必须等于基线原文"
+    );
+    assert_eq!(
+        canonical_vv(&merged_alone.vv().encode()),
+        canonical_of_vv(&baseline_vv),
+        "merged 差集 VV 必须等于基线 VV"
+    );
+}
+
+`````
+
+
+## `crates/storage/tests/sync_inbox_batch.rs`
+
+`````rust
+//! 批量 inbox API（Phase 1A-1）：与逐条入口的语义一致性、冲突不半写、前缀推进，
+//! 以及批量 integrate 的严格全 verified 语义。
+//!
+//! 批量入口 [menghunote_storage::store_inbox_verified_batch] 现在是「既有行比对 +
+//! 新行插入 + `received` 前缀推进」同一事务；这里只断言**行为**（与逐条一致、冲突整批
+//! 回滚），不对实现（几条 SQL/几次事务）做断言。竞态本身不易在单测里构造，
+//! 用「先插入后批量含同 seq」覆盖幂等与冲突两条路径。
+//!
+//! 末尾另有一组前缀扫描窗口用例：`sync.skipped_received` 标记超过 4096 条（窗口上限）
+//! 时必须跨窗口继续扫描，且多个来源同时被截断时不能提前判定缺口。
+
+mod support;
+
+use support::*;
+
+use menghunote_storage::{
+    advance_integrated_prefix, append_updates_with_integrated_marks, count_inbox_ready, load_head,
+    mark_integrated, mark_integrated_batch, mark_skipped_event_received, prune_covered_inbox,
+    set_sync_log_id, store_inbox_verified, store_inbox_verified_batch, sync_cursor_state,
+    take_inbox_ready, take_inbox_ready_where, StorageError, UpdateRecord, Value, Vault,
+    VerifiedInboxRow, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ,
+    META_SYNC_SKIPPED_RECEIVED_PREFIX,
+};
+
+const LOG_ID: [u8; 16] = [0x3a; 16];
+
+/// 另一个 incarnation（restore 迁移后当前 `sync.log_id` 可能变成它，旧行仍然 durable）。
+const OTHER_LOG_ID: [u8; 16] = [0x5b; 16];
+
+fn bind_log(vault: &Vault) {
+    set_sync_log_id(vault, &LOG_ID).expect("写 sync.log_id");
+}
+
+fn row(seq: u64, seed: u8, payload_len: usize) -> VerifiedInboxRow {
+    VerifiedInboxRow {
+        log_id: LOG_ID,
+        relay_seq: seq,
+        object_id: [seed; 32],
+        epoch: 1,
+        verified_payload: vec![seed; payload_len],
+    }
+}
+
+fn rows(count: u64, offset: u64) -> Vec<VerifiedInboxRow> {
+    (1..=count)
+        .map(|index| {
+            let seed = u8::try_from(index % 251).expect("seed 在 u8 内");
+            row(
+                offset + index,
+                seed,
+                32 + usize::try_from(index).unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+fn received(vault: &Vault) -> u64 {
+    sync_cursor_state(vault).expect("游标状态").received_seq
+}
+
+/// 一个 `sync.skipped_received` 标记的完整键（与生产写入格式逐字节一致）。
+fn skipped_key(seq: u64) -> String {
+    let hex: String = LOG_ID.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{META_SYNC_SKIPPED_RECEIVED_PREFIX}{hex}.{seq:020}")
+}
+
+/// 直接写一批 `sync.skipped_received` 标记（**一个**事务，只付一次 fsync）。
+///
+/// 生产路径 [mark_skipped_event_received] 每写一个标记就推进一次前缀；这里要构造数千个
+/// 标记验证**扫描窗口本身**，所以直接准备 durable 状态，不逐条触发推进。
+fn seed_skipped_markers(vault: &Vault, seqs: impl IntoIterator<Item = u64>) {
+    let mut sql = String::from("BEGIN IMMEDIATE;\n");
+    let mut count = 0usize;
+    for seq in seqs {
+        sql.push_str("INSERT INTO meta(key,value) VALUES('");
+        sql.push_str(&skipped_key(seq));
+        sql.push_str("',x'31');\n");
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    sql.push_str("COMMIT;\n");
+    vault.exec_batch(&sql).expect("批量写入 skipped 标记");
+}
+
+fn integrated(vault: &Vault) -> u64 {
+    sync_cursor_state(vault).expect("游标状态").integrated_seq
+}
+
+/// 各行的 `(relay_seq, state)`，按 seq 升序（批量 integrate 断言用）。
+fn inbox_states(vault: &Vault) -> Vec<(u64, String)> {
+    inbox_rows(vault)
+        .into_iter()
+        .map(|(seq, _, _, state, _)| (seq, state))
+        .collect()
+}
+
+/// 一条 inbox 行（测试断言用）：`(seq, object_id, epoch, state, 明文负载)`。
+type InboxRow = (u64, [u8; 32], u64, String, Vec<u8>);
+
+/// 读出 inbox 的全部行（按 relay_seq 升序）。
+fn inbox_rows(vault: &Vault) -> Vec<InboxRow> {
+    vault
+        .query(
+            "SELECT relay_seq,object_id,epoch,state,verified_payload FROM sync_inbox \
+             WHERE log_id=?1 ORDER BY relay_seq",
+            &[Value::Blob(LOG_ID.to_vec())],
+        )
+        .expect("读 sync_inbox")
+        .iter()
+        .map(|row| {
+            let seq = match row.first() {
+                Some(Value::Integer(value)) => u64::try_from(*value).expect("seq 非负"),
+                other => panic!("relay_seq 类型异常：{other:?}"),
+            };
+            let object_id: [u8; 32] = match row.get(1) {
+                Some(Value::Blob(bytes)) => bytes.as_slice().try_into().expect("object_id 32B"),
+                other => panic!("object_id 类型异常：{other:?}"),
+            };
+            let epoch = match row.get(2) {
+                Some(Value::Integer(value)) => u64::try_from(*value).expect("epoch 非负"),
+                other => panic!("epoch 类型异常：{other:?}"),
+            };
+            let state = match row.get(3) {
+                Some(Value::Text(value)) => value.clone(),
+                other => panic!("state 类型异常：{other:?}"),
+            };
+            let payload = match row.get(4) {
+                Some(Value::Blob(bytes)) => bytes.clone(),
+                other => panic!("verified_payload 类型异常：{other:?}"),
+            };
+            (seq, object_id, epoch, state, payload)
+        })
+        .collect()
+}
+
+#[test]
+fn batch_matches_per_row_for_256_rows() {
+    let (_dir_row, vault_row) = fresh_vault();
+    let (_dir_batch, vault_batch) = fresh_vault();
+    bind_log(&vault_row);
+    bind_log(&vault_batch);
+    let input = rows(256, 0);
+
+    for item in &input {
+        store_inbox_verified(
+            &vault_row,
+            &item.log_id,
+            item.relay_seq,
+            &item.object_id,
+            item.epoch,
+            &item.verified_payload,
+        )
+        .expect("逐条写入");
+    }
+    let inserted = store_inbox_verified_batch(&vault_batch, &input).expect("批量写入");
+
+    assert_eq!(inserted, input.len(), "首次批量写入必须全部是新行");
+    assert_eq!(received(&vault_row), 256);
+    assert_eq!(received(&vault_batch), 256, "前缀必须推进到整页末尾");
+    assert_eq!(
+        inbox_rows(&vault_row),
+        inbox_rows(&vault_batch),
+        "逐条与批量必须产生逐字节相同的 inbox 表"
+    );
+    assert_eq!(count_inbox_ready(&vault_row).unwrap(), 256);
+    assert_eq!(count_inbox_ready(&vault_batch).unwrap(), 256);
+    let ready_row = take_inbox_ready(&vault_row, 16).expect("逐条 ready");
+    let ready_batch = take_inbox_ready(&vault_batch, 16).expect("批量 ready");
+    assert_eq!(ready_row, ready_batch);
+}
+
+#[test]
+fn batch_is_idempotent_and_returns_zero_for_known_rows() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    let input = rows(4, 0);
+    assert_eq!(store_inbox_verified_batch(&vault, &input).unwrap(), 4);
+
+    // 同字节重放：不新增、不改写、前缀不变。
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &input).unwrap(),
+        0,
+        "同字节重放必须幂等跳过"
+    );
+    assert_eq!(inbox_rows(&vault).len(), 4);
+    assert_eq!(received(&vault), 4);
+
+    // 混合：一部分已存在（一致）+ 一部分新行 → 只插入新行，返回值只数新行。
+    let mut mixed = rows(4, 0);
+    mixed.extend(rows(2, 4));
+    assert_eq!(store_inbox_verified_batch(&vault, &mixed).unwrap(), 2);
+    assert_eq!(inbox_rows(&vault).len(), 6, "既有 1..4 不得重写，只补 5/6");
+    assert_eq!(received(&vault), 6);
+}
+
+#[test]
+fn batch_conflict_rejects_whole_batch_without_partial_write() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    store_inbox_verified(&vault, &LOG_ID, 5, &[0x55; 32], 1, b"existing-5").expect("预置 5");
+    let before = inbox_rows(&vault);
+    let before_received = received(&vault);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before_received, 0, "缺 1..4，前缀只能停在 0");
+
+    // 4 / 6 是合法新行，5 与既有行字节不同 → 整批拒绝，4/6 也不能写。
+    let conflicting = vec![
+        row(4, 0x44, 16),
+        VerifiedInboxRow {
+            log_id: LOG_ID,
+            relay_seq: 5,
+            object_id: [0x55; 32],
+            epoch: 1,
+            verified_payload: b"different-5".to_vec(),
+        },
+        row(6, 0x66, 16),
+    ];
+    let error = store_inbox_verified_batch(&vault, &conflicting).expect_err("冲突必须报错");
+    assert!(
+        matches!(error, menghunote_storage::StorageError::SyncConflict { .. }),
+        "冲突必须是 SyncConflict，实际 {error:?}"
+    );
+    assert_eq!(inbox_rows(&vault), before, "冲突批次不得写入任何行");
+    assert_eq!(received(&vault), before_received, "冲突批次不得推进前缀");
+}
+
+#[test]
+fn batch_conflict_does_not_advance_prefix_for_known_rows() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    // 先有 1..3；批里 1..3 一致 + 4 新 + 5 冲突（不存在 5 但先单独写一条不同字节）。
+    store_inbox_verified_batch(&vault, &rows(3, 0)).expect("预置 1..3");
+    store_inbox_verified(&vault, &LOG_ID, 5, &[0x99; 32], 1, b"five").expect("预置 5");
+    let before = inbox_rows(&vault);
+    let before_received = received(&vault);
+    assert_eq!(before_received, 3);
+
+    let mut batch = rows(5, 0);
+    batch[3] = row(4, 0x04, 8);
+    batch[4] = VerifiedInboxRow {
+        log_id: LOG_ID,
+        relay_seq: 5,
+        object_id: [0x99; 32],
+        epoch: 1,
+        verified_payload: b"other-five".to_vec(),
+    };
+    let error = store_inbox_verified_batch(&vault, &batch).expect_err("5 冲突");
+    assert!(matches!(
+        error,
+        menghunote_storage::StorageError::SyncConflict { .. }
+    ));
+    assert_eq!(inbox_rows(&vault), before, "冲突批次不得写入 4");
+    assert_eq!(received(&vault), before_received);
+}
+
+#[test]
+fn batch_sorts_unsorted_input_and_rejects_duplicate_seq() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    let mut shuffled = rows(3, 0);
+    shuffled.swap(0, 2);
+    shuffled.swap(0, 1);
+    assert_eq!(shuffled[0].relay_seq, 2, "输入确实乱序");
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &shuffled).unwrap(),
+        3,
+        "批量入口必须自己按 relay_seq 稳定排序"
+    );
+    assert_eq!(received(&vault), 3);
+    let states: Vec<String> = inbox_rows(&vault)
+        .into_iter()
+        .map(|(seq, _, _, state, _)| format!("{seq}:{state}"))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            "1:verified".to_owned(),
+            "2:verified".to_owned(),
+            "3:verified".to_owned()
+        ]
+    );
+
+    // 同一批重复 seq：直接拒绝，且不写入任何行。
+    let before = inbox_rows(&vault);
+    let duplicated = vec![row(4, 0xa4, 8), row(4, 0xa4, 8), row(5, 0xa5, 8)];
+    let error = store_inbox_verified_batch(&vault, &duplicated).expect_err("重复 seq 必须拒绝");
+    assert!(
+        matches!(error, menghunote_storage::StorageError::Corrupt { .. }),
+        "重复 seq 是上游错误（Corrupt），实际 {error:?}"
+    );
+    assert_eq!(inbox_rows(&vault), before);
+    assert_eq!(received(&vault), 3);
+}
+
+#[test]
+fn batch_advances_prefix_only_over_contiguous_consumed_seq() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+
+    // 不连续（缺 3）：前缀只能到 2。
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(2, 0)).unwrap(), 2);
+    let gap = vec![row(4, 0x44, 8)];
+    assert_eq!(store_inbox_verified_batch(&vault, &gap).unwrap(), 1);
+    assert_eq!(received(&vault), 2, "缺 3 时前缀必须停在 2");
+
+    // 补上 3 → 一次性推进到 4（跨过此前 durable 的 4）。
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &[row(3, 0x33, 8)]).unwrap(),
+        1
+    );
+    assert_eq!(received(&vault), 4);
+
+    // ASSET 这类不写 inbox 的事件用 skipped_received 标记参与前缀推进。
+    mark_skipped_event_received(&vault, &LOG_ID, 5).expect("标记 5 已消费");
+    assert_eq!(received(&vault), 5, "skipped 标记不写 inbox 也要推进前缀");
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &[row(6, 0x66, 8)]).unwrap(),
+        1
+    );
+    assert_eq!(received(&vault), 6);
+}
+
+#[test]
+fn batch_rejects_mixed_log_id_and_invalid_seq_without_writing() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+
+    let mixed = vec![
+        row(1, 0x11, 8),
+        VerifiedInboxRow {
+            log_id: [0x3b; 16],
+            relay_seq: 2,
+            object_id: [0x22; 32],
+            epoch: 1,
+            verified_payload: vec![0x22; 8],
+        },
+    ];
+    assert!(store_inbox_verified_batch(&vault, &mixed).is_err());
+    assert!(inbox_rows(&vault).is_empty());
+
+    let mut zero_seq = vec![row(1, 0x11, 8)];
+    zero_seq[0].relay_seq = 0;
+    assert!(store_inbox_verified_batch(&vault, &zero_seq).is_err());
+    let mut zero_epoch = vec![row(1, 0x11, 8)];
+    zero_epoch[0].epoch = 0;
+    assert!(store_inbox_verified_batch(&vault, &zero_epoch).is_err());
+    assert!(inbox_rows(&vault).is_empty());
+    assert_eq!(received(&vault), 0);
+
+    // 空批次是合法 no-op（便于调用方无条件调用）。
+    assert_eq!(store_inbox_verified_batch(&vault, &[]).unwrap(), 0);
+}
+
+#[test]
+fn batch_rejects_rows_from_a_different_log_than_the_vault() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    // 与已绑定的 log_id 不同 → SyncLogMismatch（relay reset 必须显式迁移）。
+    let other = vec![VerifiedInboxRow {
+        log_id: [0x3c; 16],
+        relay_seq: 1,
+        object_id: [0x11; 32],
+        epoch: 1,
+        verified_payload: vec![0x11; 4],
+    }];
+    let error = store_inbox_verified_batch(&vault, &other).expect_err("不同 log_id 必须拒绝");
+    assert!(
+        matches!(
+            error,
+            menghunote_storage::StorageError::SyncLogMismatch { .. }
+        ),
+        "实际 {error:?}"
+    );
+}
+
+#[test]
+fn batch_full_idempotent_replay_repairs_unadvanced_prefix() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    let input = rows(4, 0);
+    assert_eq!(store_inbox_verified_batch(&vault, &input).unwrap(), 4);
+
+    // 模拟「行已经提交、前缀还停在 0」（旧实现事务边界之间崩溃留下的状态）。
+    vault
+        .set_meta(META_SYNC_RECEIVED_SEQ, &0u64.to_be_bytes())
+        .expect("手动退回前缀");
+    assert_eq!(received(&vault), 0);
+
+    // 全幂等重放：不新增、不报错、返回 0，但仍要把前缀补到最新。
+    assert_eq!(store_inbox_verified_batch(&vault, &input).unwrap(), 0);
+    assert_eq!(inbox_rows(&vault).len(), 4);
+    assert_eq!(received(&vault), 4, "全幂等重放也要把前缀推进到最新");
+}
+
+/// 预置 1..3（连续前缀=3）与 seq5 后，整批 1..6（1..3 幂等、4/6 新、5 被改坏）：
+/// 必须整批回滚（4/6 不写、1..3/5 不变、received 保持在 3）。
+fn assert_tamper_rolls_back_whole_batch(label: &str, mutate: impl FnOnce(&mut VerifiedInboxRow)) {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+    let existing = VerifiedInboxRow {
+        log_id: LOG_ID,
+        relay_seq: 5,
+        object_id: [0x55; 32],
+        epoch: 1,
+        verified_payload: b"existing-5".to_vec(),
+    };
+    store_inbox_verified(
+        &vault,
+        &existing.log_id,
+        existing.relay_seq,
+        &existing.object_id,
+        existing.epoch,
+        &existing.verified_payload,
+    )
+    .expect("预置 seq5");
+    let before = inbox_rows(&vault);
+    assert_eq!(before.len(), 4);
+    assert_eq!(received(&vault), 3, "缺 4，前缀只能停在 3");
+
+    let mut tampered = existing;
+    mutate(&mut tampered);
+    let mut batch = rows(6, 0);
+    batch[4] = tampered; // seq5
+    let error = match store_inbox_verified_batch(&vault, &batch) {
+        Ok(inserted) => panic!("{label} 篡改必须报错，实际插入 {inserted} 行"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, StorageError::SyncConflict { .. }),
+        "{label}: 冲突必须是 SyncConflict，实际 {error:?}"
+    );
+    assert_eq!(inbox_rows(&vault), before, "{label}: 整批回滚，既有行不变");
+    assert_eq!(
+        received(&vault),
+        3,
+        "{label}: 冲突批次不得推进 received 前缀（4/6 都没写）"
+    );
+}
+
+#[test]
+fn batch_tampered_object_id_epoch_or_payload_rolls_back_whole_batch() {
+    assert_tamper_rolls_back_whole_batch("object_id", |row| row.object_id = [0x99; 32]);
+    assert_tamper_rolls_back_whole_batch("epoch", |row| row.epoch = 2);
+    assert_tamper_rolls_back_whole_batch("payload", |row| {
+        row.verified_payload = b"tampered".to_vec();
+    });
+}
+
+#[test]
+fn batch_conflict_rolls_back_log_id_binding_written_in_the_same_transaction() {
+    let (_dir, vault) = fresh_vault();
+    // 手工写一条 inbox 行但不写 sync.log_id（模拟旧库/异常状态）：
+    // 批量入口必须在事务里补写 log_id，而冲突时这笔补写也要回滚。
+    vault
+        .exec(
+            "INSERT INTO sync_inbox(log_id,relay_seq,object_id,epoch,state,verified_payload) \
+             VALUES(?1,?2,?3,?4,'verified',?5)",
+            &[
+                Value::Blob(LOG_ID.to_vec()),
+                Value::Integer(5),
+                Value::Blob(vec![0x55; 32]),
+                Value::Integer(1),
+                Value::Blob(b"existing-5".to_vec()),
+            ],
+        )
+        .expect("手工预置 inbox 行");
+    assert!(vault
+        .get_meta(META_SYNC_LOG_ID)
+        .expect("读 log_id")
+        .is_none());
+
+    let conflicting = vec![
+        row(4, 0x44, 16),
+        VerifiedInboxRow {
+            log_id: LOG_ID,
+            relay_seq: 5,
+            object_id: [0x55; 32],
+            epoch: 1,
+            verified_payload: b"different".to_vec(),
+        },
+    ];
+    let error = store_inbox_verified_batch(&vault, &conflicting).expect_err("冲突必须报错");
+    assert!(
+        matches!(error, StorageError::SyncConflict { .. }),
+        "实际 {error:?}"
+    );
+    assert!(
+        vault
+            .get_meta(META_SYNC_LOG_ID)
+            .expect("读 log_id")
+            .is_none(),
+        "sync.log_id 的补写必须与新行一起回滚"
+    );
+    assert_eq!(received(&vault), 0);
+    assert_eq!(inbox_rows(&vault).len(), 1, "新行 4 不得写入");
+}
+
+#[test]
+fn batch_integrate_marks_all_verified_and_prefix_advances_only_on_demand() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+    assert_eq!(received(&vault), 3);
+    assert_eq!(integrated(&vault), 0);
+
+    // 空输入是合法 no-op。
+    assert_eq!(mark_integrated_batch(&vault, &LOG_ID, &[]).unwrap(), 0);
+
+    assert_eq!(
+        mark_integrated_batch(&vault, &LOG_ID, &[1, 2, 3]).unwrap(),
+        3
+    );
+    assert_eq!(
+        inbox_states(&vault),
+        vec![
+            (1, "integrated".to_owned()),
+            (2, "integrated".to_owned()),
+            (3, "integrated".to_owned())
+        ]
+    );
+    assert_eq!(
+        integrated(&vault),
+        0,
+        "mark_integrated_batch 不得自己推进 integrated 前缀"
+    );
+
+    // 调用方在整批正文完成后统一推进一次。
+    advance_integrated_prefix(&vault).expect("推进 integrated 前缀");
+    assert_eq!(integrated(&vault), 3);
+    // 再推进一次是幂等 no-op。
+    advance_integrated_prefix(&vault).expect("重复推进");
+    assert_eq!(integrated(&vault), 3);
+
+    // 单条入口行为保持：已 integrated 的行重复标记仍是成功（幂等）。
+    mark_integrated(&vault, &LOG_ID, 2).expect("单条幂等");
+    assert_eq!(integrated(&vault), 3);
+}
+
+#[test]
+fn batch_integrate_rolls_back_when_a_row_is_not_verified() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+    // 先把 seq2 标成 integrated：1 未集成，连续前缀仍停在 0。
+    mark_integrated(&vault, &LOG_ID, 2).expect("先集成 seq2");
+    assert_eq!(integrated(&vault), 0);
+    let before = inbox_rows(&vault);
+
+    let error =
+        mark_integrated_batch(&vault, &LOG_ID, &[1, 2, 3]).expect_err("seq2 已不是 verified");
+    assert!(
+        matches!(error, StorageError::SyncConflict { .. }),
+        "含已 integrated 行必须整批冲突，实际 {error:?}"
+    );
+    assert_eq!(
+        inbox_rows(&vault),
+        before,
+        "整批回滚：1/3 必须仍是 verified"
+    );
+    assert_eq!(integrated(&vault), 0);
+}
+
+#[test]
+fn batch_integrate_rolls_back_when_a_row_is_missing() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(2, 0)).unwrap(), 2);
+    let before = inbox_rows(&vault);
+
+    let error = mark_integrated_batch(&vault, &LOG_ID, &[1, 9]).expect_err("seq9 不存在");
+    assert!(
+        matches!(error, StorageError::SyncConflict { .. }),
+        "含不存在行必须整批冲突，实际 {error:?}"
+    );
+    assert_eq!(
+        inbox_rows(&vault),
+        before,
+        "整批回滚：seq1 必须仍是 verified"
+    );
+    assert_eq!(integrated(&vault), 0);
+}
+
+#[test]
+fn batch_integrate_prefix_crosses_asset_skipped_marker() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+    // seq4 是 ASSET：不写 inbox，只留 durable skipped 标记。
+    mark_skipped_event_received(&vault, &LOG_ID, 4).expect("标记 seq4 已消费");
+    assert_eq!(received(&vault), 4);
+
+    assert_eq!(
+        mark_integrated_batch(&vault, &LOG_ID, &[1, 2, 3]).unwrap(),
+        3
+    );
+    assert_eq!(integrated(&vault), 0);
+    advance_integrated_prefix(&vault).expect("推进 integrated 前缀");
+    assert_eq!(
+        integrated(&vault),
+        4,
+        "integrated 前缀同样要越过 ASSET skipped 标记"
+    );
+}
+
+// ============================================================ Phase 1A-2：A 事务内标记
+
+/// `append_updates_with_integrated_marks`：update 与 inbox 标记同一事务提交，**不**自己
+/// 推进 integrated 前缀（调用方整批结束后统一推进）。
+#[test]
+fn append_with_integrated_marks_commits_update_and_marks_together() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+
+    let doc = seed_note(&vault, "note-1", "doc-1");
+    doc.insert_scalars(0, "hello").expect("写正文");
+    let current = head(&vault, "doc-1");
+    let base = current.version_vector().expect("解码 head vv");
+    let update = pending(&doc, &base).expect("导出增量");
+    let record = UpdateRecord::new("batch-1", update);
+
+    let head_after = append_updates_with_integrated_marks(
+        &vault,
+        "doc-1",
+        current.head_seq,
+        &record,
+        &LOG_ID,
+        &[1, 2],
+    )
+    .expect("同事务 append + 标记");
+    assert_eq!(head_after.head_seq, 1);
+    assert_eq!(load_head(&vault, "doc-1").expect("head").head_seq, 1);
+    assert_eq!(
+        inbox_states(&vault),
+        vec![
+            (1, "integrated".to_owned()),
+            (2, "integrated".to_owned()),
+            (3, "verified".to_owned())
+        ]
+    );
+    assert_eq!(integrated(&vault), 0, "本 API 不推进前缀");
+    assert_eq!(count_inbox_ready(&vault).unwrap(), 1);
+
+    advance_integrated_prefix(&vault).expect("统一推进前缀");
+    assert_eq!(integrated(&vault), 2, "前缀只到连续 integrated 的末尾");
+}
+
+/// 标记守卫失败（不存在 / 已不是 verified）→ **整笔 A 事务回滚**：update 不落库、
+/// 其它行的标记也不保留，inbox 与 head 完全回到调用前。
+#[test]
+fn append_with_integrated_marks_rolls_back_update_when_a_mark_is_not_verified() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(2, 0)).unwrap(), 2);
+    // seq2 提前 integrated（seq1 仍 verified）：标记 [1,2] 时第二条守卫会失败。
+    mark_integrated(&vault, &LOG_ID, 2).expect("先集成 seq2");
+    let before = inbox_rows(&vault);
+
+    let doc = seed_note(&vault, "note-1", "doc-1");
+    doc.insert_scalars(0, "hello").expect("写正文");
+    let current = head(&vault, "doc-1");
+    let base = current.version_vector().expect("解码 head vv");
+    let update = pending(&doc, &base).expect("导出增量");
+    let record = UpdateRecord::new("batch-1", update);
+
+    let error = append_updates_with_integrated_marks(
+        &vault,
+        "doc-1",
+        current.head_seq,
+        &record,
+        &LOG_ID,
+        &[1, 2],
+    )
+    .expect_err("含非 verified 行必须整笔失败");
+    assert!(
+        matches!(error, StorageError::SyncConflict { .. }),
+        "实际 {error:?}"
+    );
+    assert_eq!(
+        load_head(&vault, "doc-1").expect("head").head_seq,
+        0,
+        "update 必须随标记失败一起回滚"
+    );
+    assert_eq!(inbox_rows(&vault), before, "整批标记回滚");
+    assert_eq!(integrated(&vault), 0);
+
+    // 同一份 update 只标记合法行时成功（证明失败是原子的，不是数据被吃掉了）。
+    let head_after = append_updates_with_integrated_marks(
+        &vault,
+        "doc-1",
+        current.head_seq,
+        &record,
+        &LOG_ID,
+        &[1],
+    )
+    .expect("合法标记成功");
+    assert_eq!(head_after.head_seq, 1);
+    assert_eq!(inbox_rows(&vault)[0].3, "integrated");
+}
+
+// ===================================== 前缀扫描窗口（>4096 个 skipped 标记 / 并发写锁）
+
+/// `skipped_received` 窗口在 4096 条处被 `LIMIT` 截断时必须继续下一窗口。
+///
+/// 回归点：若只给 skipped 窗口加 `LIMIT`、循环条件仍沿用「合并后的 truncated 且
+/// current < last」，这里 skipped 窗口只看到 1..=4096、inbox 窗口里还有更大的 5001，
+/// 于是 `current(4096) < last(5001)` 会提前 return，把第二个窗口里的 4097..=5000
+/// 永久漏掉、`received` 卡死在 4096。
+#[test]
+fn received_prefix_crosses_more_than_one_skipped_window() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    // 1..=4096 正好填满第一个窗口（`LIMIT 4096` 截断）；4097..=5000 在第二个窗口。
+    seed_skipped_markers(&vault, 1..=5000);
+
+    let inserted = store_inbox_verified_batch(&vault, &[row(5001, 0x51, 8)]).expect("批量写");
+    assert_eq!(inserted, 1);
+    assert_eq!(
+        received(&vault),
+        5001,
+        "skipped 窗口被截断后必须继续扫描下一窗口，直到第一个缺口 5002"
+    );
+}
+
+/// 跨窗口扫描后，前缀仍然只推进到**第一个缺口**：第二窗口里 4098 起的标记不能把
+/// 缺掉的 4097 一起算成已消费。
+#[test]
+fn received_prefix_stops_at_gap_across_skipped_windows() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    // 第一窗口 1..=4096（截断），4097 故意缺失，4098..=4999 落在第二窗口。
+    seed_skipped_markers(&vault, 1..=4096);
+    seed_skipped_markers(&vault, 4098..=4999);
+
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &[row(5000, 0x50, 8)]).unwrap(),
+        1
+    );
+    assert_eq!(
+        received(&vault),
+        4096,
+        "即使 4098.. 与 inbox 5000 都已 durable，缺口 4097 也必须卡住前缀"
+    );
+
+    // 补上缺口 → 一次推进到 5000（跨过第二窗口的 skipped 标记与 inbox 行）。
+    mark_skipped_event_received(&vault, &LOG_ID, 4097).expect("补 4097");
+    assert_eq!(received(&vault), 5000);
+}
+
+/// 混合 inbox 行 + skipped 标记 + 缺口：前缀只到第一个缺口；补上后一次跨过。
+#[test]
+fn received_prefix_mixes_inbox_and_skipped_until_first_gap() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+    mark_skipped_event_received(&vault, &LOG_ID, 4).expect("skipped 4");
+    assert_eq!(received(&vault), 4);
+
+    // 6 已 durable，但 5 是缺口：前缀必须停在 4。
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &[row(6, 0x66, 8)]).unwrap(),
+        1
+    );
+    assert_eq!(received(&vault), 4, "缺 5 时跳过 6 也不得推进前缀");
+
+    // 用 skipped 标记补上 5 → 一次推进到 6。
+    mark_skipped_event_received(&vault, &LOG_ID, 5).expect("skipped 5");
+    assert_eq!(received(&vault), 6);
+}
+
+/// 两个来源的窗口**同时**被截断：奇数序号走 inbox、偶数序号走 skipped，前缀要跨越
+/// 8192 之后继续推进到 8200。
+#[test]
+fn received_prefix_advances_while_both_windows_are_truncated() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+
+    // inbox：1,3,...,8199（4100 行 > 窗口 4096）；skipped：2,4,...,8200（4100 个标记）。
+    let inbox: Vec<VerifiedInboxRow> = (0..4100u64)
+        .map(|index| {
+            let seq = 1 + 2 * index;
+            row(seq, u8::try_from(seq % 251).expect("seed 在 u8 内"), 8)
+        })
+        .collect();
+    seed_skipped_markers(&vault, (0..4100u64).map(|index| 2 + 2 * index));
+
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &inbox).unwrap(),
+        inbox.len()
+    );
+    assert_eq!(
+        received(&vault),
+        8200,
+        "两个窗口各自截断在 4096/8192，前缀必须跨窗口继续推进到 8200"
+    );
+}
+
+/// 外部写事务占着写锁时，批量入口必须在 **BEGIN 阶段**整笔失败（SQLITE_BUSY），
+/// 而不是先读到旧快照、按字节比较出 SyncConflict；失败不留半写，锁释放后可重放。
+///
+/// 这是 Immediate 事务可从外部观测到的行为：deferred 的 `BEGIN` 不取写锁，读路径
+/// 会在锁被占时照常完成并先返回 SyncConflict。
+#[test]
+fn batch_under_foreign_write_lock_fails_busy_without_partial_write() {
+    let (dir, vault) = fresh_vault();
+    bind_log(&vault);
+    store_inbox_verified(&vault, &LOG_ID, 1, &[0x11; 32], 1, b"one").expect("预置 seq1");
+    assert_eq!(received(&vault), 1);
+
+    // 本连接不等锁（生产是 5s）：让 BEGIN IMMEDIATE 的失败立刻返回，测试无需 sleep。
+    vault
+        .exec_batch("PRAGMA busy_timeout=0")
+        .expect("busy_timeout=0");
+
+    // 第二个 Vault（= 第二个连接）先占住写锁。
+    let holder = open_vault(&vault_path(&dir));
+    holder
+        .exec_batch("BEGIN IMMEDIATE")
+        .expect("外部连接占写锁");
+    assert_eq!(inbox_rows(&vault).len(), 1, "读快照不受外部写锁影响");
+
+    // 同 seq、不同字节：deferred 会先读到 seq1 并报 SyncConflict；Immediate 在 BEGIN
+    // 就撞上写锁 → SQLITE_BUSY。batch 里再带一条新行 2，确认不会留下半写。
+    let conflicting = vec![
+        VerifiedInboxRow {
+            log_id: LOG_ID,
+            relay_seq: 1,
+            object_id: [0x11; 32],
+            epoch: 1,
+            verified_payload: b"changed".to_vec(),
+        },
+        row(2, 0x22, 8),
+    ];
+    let error = store_inbox_verified_batch(&vault, &conflicting).expect_err("写锁被占必须失败");
+    assert!(
+        matches!(
+            error,
+            StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        ),
+        "并发写事务在场时必须整笔 SQLITE_BUSY，实际 {error:?}"
+    );
+
+    holder.exec_batch("ROLLBACK").expect("释放外部写锁");
+    drop(holder);
+
+    assert_eq!(inbox_rows(&vault).len(), 1, "失败批次不得留下半写（seq2）");
+    assert_eq!(received(&vault), 1, "失败批次不得推进前缀");
+
+    // 锁释放后重放同一批：现在能读到真实冲突，仍然整批回滚。
+    let error = store_inbox_verified_batch(&vault, &conflicting).expect_err("真实冲突");
+    assert!(
+        matches!(error, StorageError::SyncConflict { .. }),
+        "实际 {error:?}"
+    );
+    assert_eq!(inbox_rows(&vault).len(), 1);
+    assert_eq!(received(&vault), 1);
+}
+
+// ================================ incarnation 过滤（restore 迁移 log_id 后的旧行）
+
+/// 当前 incarnation 的 ready `relay_seq`（升序；`take_inbox_ready` 已按 log/seq 排序）。
+fn ready_seqs(vault: &Vault, limit: usize) -> Vec<u64> {
+    take_inbox_ready(vault, limit)
+        .expect("读 ready")
+        .into_iter()
+        .map(|row| row.relay_seq)
+        .collect()
+}
+
+/// 直接写 `meta` 原始字节（模拟 restore 的显式迁移 / 损坏状态，绕过 Vault 校验）。
+fn write_raw_meta(vault: &Vault, key: &str, value: &[u8]) {
+    vault
+        .exec(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            &[Value::Text(key.to_owned()), Value::Blob(value.to_vec())],
+        )
+        .expect("写原始 meta");
+}
+
+/// 直接插入一条**其它 incarnation** 的 verified 行。
+///
+/// 生产入口 `store_inbox_verified*` 都先 `ensure_log_id`，跨代写入会被
+/// `SyncLogMismatch` 拒绝；这种 durable 状态只能由 restore 显式迁移 `sync.log_id`
+/// 后留下，所以测试直接用 SQL 准备，不经过被测试的过滤逻辑。
+fn insert_stale_incarnation_row(vault: &Vault, log_id: &[u8; 16], relay_seq: u64, seed: u8) {
+    vault
+        .exec(
+            "INSERT INTO sync_inbox(log_id,relay_seq,object_id,epoch,state,verified_payload) \
+             VALUES(?1,?2,?3,?4,'verified',?5)",
+            &[
+                Value::Blob(log_id.to_vec()),
+                Value::Integer(i64::try_from(relay_seq).expect("relay_seq 在 i64 内")),
+                Value::Blob(vec![seed; 32]),
+                Value::Integer(1),
+                Value::Blob(vec![seed; 16]),
+            ],
+        )
+        .expect("插入旧 incarnation 的 verified 行");
+}
+
+/// 当前 log A 有 verified 行、库里另有 log B 的 verified 行时：
+/// ready/count 只计 A；B 即使 `relay_seq <= received` 也不计入；received 前缀只按 A 推进。
+#[test]
+fn ready_and_count_only_include_current_log_incarnation() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(2, 0)).unwrap(), 2);
+    assert_eq!(received(&vault), 2);
+
+    // 旧 incarnation B 的 1..=5 仍在库里（restore 迁移 log_id 后旧行不能被静默删除）。
+    for seq in 1..=5u64 {
+        insert_stale_incarnation_row(
+            &vault,
+            &OTHER_LOG_ID,
+            seq,
+            u8::try_from(seq).expect("seq 在 u8 内"),
+        );
+    }
+    // `set_sync_log_id` 的语义未变：生产入口仍拒绝跨代写入（restore 走显式迁移）。
+    assert!(
+        matches!(
+            set_sync_log_id(&vault, &OTHER_LOG_ID),
+            Err(StorageError::SyncLogMismatch { .. })
+        ),
+        "set_sync_log_id 必须继续拒绝跨代变更"
+    );
+
+    // B 的 seq1/seq2 都 <= received(2)，但 ready/count 只能看到 A 的 1/2。
+    assert_eq!(ready_seqs(&vault, 16), vec![1, 2]);
+    assert_eq!(
+        count_inbox_ready(&vault).unwrap(),
+        2,
+        "旧 incarnation 的行即使 relay_seq<=received 也不得计入"
+    );
+
+    // A 的 seq3 落库 → received 只推进到 3，不跨 B 的 1..=5。
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &[row(3, 0x33, 8)]).unwrap(),
+        1
+    );
+    assert_eq!(received(&vault), 3, "received 前缀推进不跨 incarnation");
+    assert_eq!(ready_seqs(&vault, 16), vec![1, 2, 3]);
+    assert_eq!(count_inbox_ready(&vault).unwrap(), 3);
+
+    // 状态变化同样只作用于当前 log：集成 A 的 seq1 后 B 的行仍不 ready、不影响计数。
+    mark_integrated(&vault, &LOG_ID, 1).expect("集成 A seq1");
+    assert_eq!(ready_seqs(&vault, 16), vec![2, 3]);
+    assert_eq!(count_inbox_ready(&vault).unwrap(), 2);
+}
+
+/// `take_inbox_ready_where` 走同一条底层路径：谓词只能看到当前 log 的行。
+#[test]
+fn ready_where_path_filters_other_log_incarnation() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+    for seq in 1..=3u64 {
+        insert_stale_incarnation_row(
+            &vault,
+            &OTHER_LOG_ID,
+            seq,
+            0xb0 + u8::try_from(seq).unwrap_or(0),
+        );
+    }
+
+    // 恒真谓词 + 足够大的 limit：旧实现会把 B 的 3 行也交进来（6 条），现在必须只有 3 条。
+    let mut observed_log_ids = Vec::new();
+    let picked = take_inbox_ready_where(&vault, 16, |row| {
+        observed_log_ids.push(row.log_id);
+        true
+    })
+    .expect("where 路径读 ready");
+    assert_eq!(
+        picked.iter().map(|row| row.relay_seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(
+        observed_log_ids.iter().all(|log_id| *log_id == LOG_ID),
+        "谓词只应看到当前 incarnation 的行，实际 {observed_log_ids:?}"
+    );
+
+    // 谓词本身的过滤仍然生效（不是把 where 语义吞掉）。
+    let picked: Vec<u64> = take_inbox_ready_where(&vault, 16, |row| row.relay_seq != 2)
+        .expect("where 过滤")
+        .into_iter()
+        .map(|row| row.relay_seq)
+        .collect();
+    assert_eq!(picked, vec![1, 3]);
+}
+
+/// `sync.log_id` 缺失 / 长度非法时的语义：
+/// - 缺失 → 空（`take`）/ 0（`count`），即新库旧行为；即使残留其它 log 的行与 received，
+///   也不能回退成"不过滤 log"；
+/// - 长度非法 → 明确 `Corrupt`（与 `sync_cursor_state` 同口径），不静默当作没有 log。
+#[test]
+fn ready_without_log_id_is_empty_and_invalid_length_is_corrupt() {
+    let (_dir, vault) = fresh_vault();
+    // 新库：没有 sync.log_id，也没有 inbox 行 → 空/0（旧实现同样返回空）。
+    assert!(take_inbox_ready(&vault, 8)
+        .expect("无 log 读 ready")
+        .is_empty());
+    assert_eq!(count_inbox_ready(&vault).expect("无 log 计数"), 0);
+
+    // 不一致的持久状态：有遗留 verified 行与 received，却没有 sync.log_id。
+    // 没有当前 incarnation 就没有可匹配的 log，ready 必须为空。
+    insert_stale_incarnation_row(&vault, &OTHER_LOG_ID, 1, 0x5b);
+    write_raw_meta(&vault, META_SYNC_RECEIVED_SEQ, &1u64.to_be_bytes());
+    assert!(
+        take_inbox_ready(&vault, 8)
+            .expect("无 log 读 ready")
+            .is_empty(),
+        "缺 sync.log_id 时不能漏出其它 incarnation 的遗留行"
+    );
+    assert_eq!(count_inbox_ready(&vault).expect("无 log 计数"), 0);
+
+    // 长度不是 16B = 损坏：显式错误，不静默当成"没有 log"。
+    write_raw_meta(&vault, META_SYNC_LOG_ID, b"short");
+    let error = take_inbox_ready(&vault, 8).expect_err("非法 log_id 长度必须报错");
+    assert!(
+        matches!(error, StorageError::Corrupt { .. }),
+        "实际 {error:?}"
+    );
+    let error = count_inbox_ready(&vault).expect_err("非法 log_id 长度必须报错");
+    assert!(
+        matches!(error, StorageError::Corrupt { .. }),
+        "实际 {error:?}"
+    );
+}
+
+#[test]
+fn prune_covered_inbox_requires_integrated_watermark() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    store_inbox_verified_batch(&vault, &rows(3, 0)).expect("写 inbox");
+    assert_eq!(inbox_rows(&vault).len(), 3);
+
+    // integrated=2 < 3：一行都不删。
+    vault
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &2u64.to_be_bytes())
+        .expect("写 integrated");
+    assert_eq!(
+        prune_covered_inbox(&vault, &LOG_ID, 3).expect("prune below watermark"),
+        0,
+        "integrated < S 时绝不能删"
+    );
+    assert_eq!(inbox_rows(&vault).len(), 3);
+
+    // integrated=3：删掉 <=3 的行；别的 incarnation 不受影响。
+    vault
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &3u64.to_be_bytes())
+        .expect("写 integrated");
+    assert_eq!(
+        prune_covered_inbox(&vault, &LOG_ID, 3).expect("prune covered"),
+        3
+    );
+    assert!(inbox_rows(&vault).is_empty());
+
+    // 缺失 integrated 也 fail-closed：不删。
+    vault
+        .exec(
+            "DELETE FROM meta WHERE key=?1",
+            &[Value::Text(META_SYNC_INTEGRATED_SEQ.to_owned())],
+        )
+        .expect("删 integrated");
+    store_inbox_verified_batch(&vault, &rows(1, 3)).expect("再写一条");
+    assert_eq!(
+        prune_covered_inbox(&vault, &LOG_ID, 4).expect("prune without watermark"),
+        0,
+        "没有 integrated 证据时不得删"
+    );
+}
+
+`````
+
+
+## `crates/sync/tests/bootstrap.rs`
+
+`````rust
+//! S7-18：新设备从 relay 全量 bootstrap 的集成测试（FakeRelay + 真 SQLite/Loro）。
+//!
+//! 覆盖评审 0002 P1-4：
+//! - body / structure / asset 各阶段失败或"崩溃"后**不推进水位**、journal 可续跑；
+//! - 水位 CAS 失败不写半套单调值；
+//! - 已有库的 pins/highwater 不被 bootstrap 降低（highwater = max(现有, S)）；
+//! - fallback 只用自己的 S/cursor；
+//! - 实际 VV/frontier 校验由 `bootstrap.rs` 单测覆盖（不只信 manifest 声明）。
+//!
+//! 全程无 sleep：失败点由 `BootstrapFault` 或真实 CAS 冲突制造，收敛点都是显式返回值。
+
+mod support;
+
+use support::*;
+
+use menghunote_storage::{
+    abort_baseline_apply, asset_bytes, baseline_apply_state, baseline_verify_failure,
+    body_doc_meta, create_note_slot, ensure_structure_row, insert_asset, list_all_docs, list_notes,
+    load_body_doc, sync_cursor_state, BaselineApplyStatus, BodyDoc, StructureWriter, Value,
+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
+    STRUCTURE_DOC_ID,
+};
+use menghunote_sync::bootstrap::{
+    self, control_head_hash, BootstrapFault, BootstrapPins, META_BOOTSTRAP_CONTROL_HASH,
+    META_BOOTSTRAP_CONTROL_REV, META_BOOTSTRAP_EPOCH, META_BOOTSTRAP_INSTANCE,
+};
+use menghunote_sync::checkpoint::{CheckpointWriter, SlotSecrets, StorageAssets};
+use menghunote_sync::engine::{EngineIdentity, SyncEngine, RELAY_CURSOR_META};
+use menghunote_sync::genesis;
+use menghunote_sync::keys::RootSecretV1;
+use menghunote_sync::relay::RelayClient as _;
+use menghunote_sync_proto::ObjectType;
+use sha2::{Digest, Sha256};
+
+const STRUCTURED_TEXT: &str = "结构化笔记正文";
+const ASSET_DATA: &[u8] = b"bootstrap real asset";
+
+fn setup() -> (
+    tempfile::TempDir,
+    menghunote_storage::Vault,
+    genesis::GenesisMaterials,
+) {
+    let (dir, vault) = fresh_vault();
+    ensure_structure_row(&vault).expect("structure 行");
+    let materials = genesis::build_materials(
+        VAULT_ID,
+        [0x92; 16],
+        "pw",
+        1_700_000_000,
+        &mut TestRandom::new(0x92_18),
+    )
+    .expect("genesis 材料");
+    (dir, vault, materials)
+}
+
+fn add_note(
+    vault: &menghunote_storage::Vault,
+    note_id: &str,
+    peer: u64,
+    text: &str,
+    message_id: &str,
+    object_id: [u8; 32],
+) {
+    let doc = seed_doc(vault, note_id, peer);
+    create_note_slot(vault, note_id, note_id, note_id, 1_700_000_000).expect("notes 行");
+    doc.insert_scalars(0, text).expect("正文");
+    commit_with_intent(vault, &doc, message_id, object_id, EPOCH);
+}
+
+fn new_relay(materials: &genesis::GenesisMaterials) -> FakeRelay {
+    let mut relay = FakeRelay::new(&[]);
+    relay
+        .certs
+        .insert(materials.device_id, materials.certificate().clone());
+    relay
+}
+
+fn seed_source(
+    source: &menghunote_storage::Vault,
+    relay: &mut FakeRelay,
+    materials: &genesis::GenesisMaterials,
+) {
+    // 真实设备在 genesis 后已有 relay 游标；checkpoint validate 依赖它核对 S 之前的日志。
+    source
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("写 relay 游标");
+    add_note(
+        source,
+        "note-1",
+        materials.peer_id_u64(),
+        "第一行正文",
+        &uuid_like(901),
+        [0xA1; 32],
+    );
+    add_note(
+        source,
+        "note-2",
+        materials.peer_id_u64(),
+        "second note",
+        &uuid_like(902),
+        [0xA2; 32],
+    );
+    // 无 notes 行的墓碑文档（checkpoint 必须导出，bootstrap 必须恢复）。
+    let orphan = seed_doc(source, "orphan-body", materials.peer_id_u64());
+    orphan.insert_scalars(0, "orphan text").expect("墓碑正文");
+    commit_local(source, &orphan);
+    let hash: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+    insert_asset(
+        source,
+        &hash,
+        ASSET_DATA.len() as u64,
+        Some("text/plain"),
+        ASSET_DATA,
+    )
+    .expect("资产");
+
+    let mut writer = CheckpointWriter::new(
+        source,
+        relay,
+        VAULT_ID,
+        materials.device_id,
+        materials.signing_key.clone(),
+        materials.root.clone(),
+        materials.peer_id_u64(),
+    );
+    let secrets = SlotSecrets {
+        password: Some("pw"),
+        recovery_seed: Some(&materials.recovery_seed),
+    };
+    writer
+        .upload_initial_slots(&materials.password_slot, &materials.recovery_slot, &secrets)
+        .expect("槽上传");
+    writer
+        .create_checkpoint(&StorageAssets)
+        .expect("checkpoint 1");
+    writer
+        .create_checkpoint(&StorageAssets)
+        .expect("checkpoint 2");
+}
+
+fn flush_pending_and_checkpoint(
+    source: &menghunote_storage::Vault,
+    relay: &mut FakeRelay,
+    materials: &genesis::GenesisMaterials,
+) {
+    source.set_meta(RELAY_CURSOR_META, b"c0").expect("cursor");
+    source
+        .set_meta(META_SYNC_RECEIVED_SEQ, &[0u8; 8])
+        .expect("received");
+    source
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &[0u8; 8])
+        .expect("integrated");
+    let mut engine = SyncEngine::new(
+        source,
+        relay,
+        EngineIdentity {
+            device_id: materials.device_id,
+            signing_key: materials.signing_key.clone(),
+            peer_id: materials.peer_id_u64(),
+        },
+        materials.root.clone(),
+    );
+    engine.sync_once().expect("flush seed updates");
+    let mut writer = CheckpointWriter::new(
+        source,
+        relay,
+        VAULT_ID,
+        materials.device_id,
+        materials.signing_key.clone(),
+        materials.root.clone(),
+        materials.peer_id_u64(),
+    );
+    writer
+        .create_checkpoint(&StorageAssets)
+        .expect("checkpoint after flush");
+}
+
+/// 造一份"结构文档 + 一条已推到 relay 的正文"的源；返回正文 doc id。
+///
+/// relay head 推到 1 后打两份 checkpoint（S=1），让"水位是否推进"可观察。
+fn seed_structured_source(
+    source: &menghunote_storage::Vault,
+    relay: &mut FakeRelay,
+    materials: &genesis::GenesisMaterials,
+) -> String {
+    let peer = materials.peer_id_u64();
+    source
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("写 relay 游标");
+    source
+        .set_meta(META_SYNC_RECEIVED_SEQ, &[0u8; 8])
+        .expect("received");
+    source
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &[0u8; 8])
+        .expect("integrated");
+
+    let mut writer = StructureWriter::open(source, peer).expect("structure writer");
+    let seed = writer
+        .doc()
+        .create_note("结构标题", 1_700_000_000)
+        .expect("结构笔记");
+    writer.commit("structure").expect("结构提交");
+    let body_doc_id = seed.body_doc_id.clone();
+    let doc = BodyDoc::restore(body_doc_id.clone(), peer, None, &[]).expect("正文 doc");
+    doc.insert_scalars(0, STRUCTURED_TEXT).expect("正文");
+    commit_with_intent(source, &doc, &uuid_like(801), [0xD1; 32], EPOCH);
+
+    let hash: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+    insert_asset(
+        source,
+        &hash,
+        ASSET_DATA.len() as u64,
+        Some("text/plain"),
+        ASSET_DATA,
+    )
+    .expect("资产");
+
+    let mut engine = SyncEngine::new(
+        source,
+        relay,
+        EngineIdentity {
+            device_id: materials.device_id,
+            signing_key: materials.signing_key.clone(),
+            peer_id: peer,
+        },
+        materials.root.clone(),
+    );
+    engine.sync_once().expect("push 正文 update");
+
+    let mut writer = CheckpointWriter::new(
+        source,
+        relay,
+        VAULT_ID,
+        materials.device_id,
+        materials.signing_key.clone(),
+        materials.root.clone(),
+        peer,
+    );
+    let secrets = SlotSecrets {
+        password: Some("pw"),
+        recovery_seed: Some(&materials.recovery_seed),
+    };
+    writer
+        .upload_initial_slots(&materials.password_slot, &materials.recovery_slot, &secrets)
+        .expect("槽上传");
+    writer
+        .create_checkpoint(&StorageAssets)
+        .expect("checkpoint 1");
+    writer
+        .create_checkpoint(&StorageAssets)
+        .expect("checkpoint 2");
+    body_doc_id
+}
+
+fn set_u64_meta(vault: &menghunote_storage::Vault, key: &str, value: u64) {
+    vault
+        .set_meta(key, &value.to_be_bytes())
+        .expect("写 BE64 meta");
+}
+
+fn relay_state_and_control_hash(relay: &mut FakeRelay) -> ([u8; 16], [u8; 32]) {
+    let state = relay.state().expect("relay state");
+    let chain = relay.management_chain().expect("management chain");
+    (state.instance_id, control_head_hash(&state, &chain))
+}
+
+fn assert_no_sync_watermarks(vault: &menghunote_storage::Vault) {
+    assert!(
+        vault
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor meta")
+            .is_none(),
+        "失败路径不得推进 relay 游标"
+    );
+    assert!(
+        vault
+            .get_meta(META_SYNC_RECEIVED_SEQ)
+            .expect("received meta")
+            .is_none(),
+        "失败路径不得推进 received"
+    );
+    assert!(
+        vault
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated meta")
+            .is_none(),
+        "失败路径不得推进 integrated"
+    );
+    assert!(
+        vault
+            .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+            .expect("highwater meta")
+            .is_none(),
+        "失败路径不得推进 highwater"
+    );
+}
+
+fn assert_staging_journal(vault: &menghunote_storage::Vault) -> [u8; 16] {
+    let journal = baseline_apply_state(vault)
+        .expect("journal state")
+        .expect("staging journal 必须保留，供续跑");
+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
+    journal.checkpoint_id
+}
+
+#[test]
+fn bootstrap_restores_all_docs_and_assets() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    assert_eq!(relay.published_checkpoints.len(), 2);
+
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("bootstrap");
+    assert_eq!(
+        report.covered_seq,
+        relay.published_checkpoints[1].covered_seq
+    );
+    assert!(!report.used_fallback);
+    assert!(report.docs.iter().any(|(doc_id, _)| doc_id == "note-1"));
+    assert!(report
+        .docs
+        .iter()
+        .any(|(doc_id, _)| doc_id == "orphan-body"));
+    assert_eq!(report.assets, 1);
+    let note1 = load_body_doc(&target, "note-1", materials.peer_id_u64(), None)
+        .expect("note-1")
+        .0;
+    assert_eq!(note1.text(), "第一行正文");
+    let orphan = load_body_doc(&target, "orphan-body", materials.peer_id_u64(), None)
+        .expect("orphan")
+        .0;
+    assert_eq!(orphan.text(), "orphan text");
+    assert!(body_doc_meta(&target, "note-2").expect("meta").is_some());
+    let asset_hash: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+    let asset = asset_bytes(&target, asset_hash).expect("asset_bytes");
+    assert_eq!(asset.as_deref(), Some(ASSET_DATA));
+    // 水位/cursor 已写入：engine 之后从 S 继续，不会重复导入。
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor meta")
+            .as_deref(),
+        Some(report.cursor.as_bytes())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_RECEIVED_SEQ)
+            .expect("received")
+            .as_deref(),
+        Some(report.covered_seq.to_be_bytes().as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated")
+            .as_deref(),
+        Some(report.covered_seq.to_be_bytes().as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+            .expect("highwater")
+            .as_deref(),
+        Some(report.covered_seq.to_be_bytes().as_slice())
+    );
+    // staging journal 成功后必须清掉。
+    assert!(baseline_apply_state(&target).expect("journal").is_none());
+}
+
+#[test]
+fn structured_source_imports_structure_and_projects_notes() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    let body_doc_id = seed_structured_source(&source, &mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("bootstrap structured");
+    assert_eq!(report.covered_seq, relay.head_seq);
+    assert_eq!(report.cursor, format!("c{}", relay.head_seq));
+    // structure 文档在报告里没有正文文本。
+    assert!(report
+        .docs
+        .iter()
+        .any(|(doc_id, text)| doc_id == STRUCTURE_DOC_ID && text.is_none()));
+    let notes = list_notes(&target).expect("list_notes");
+    assert_eq!(notes.len(), 1, "结构投影必须建出 1 篇笔记");
+    let body = load_body_doc(&target, &body_doc_id, materials.peer_id_u64(), None)
+        .expect("结构化正文")
+        .0;
+    assert_eq!(body.text(), STRUCTURED_TEXT);
+}
+
+#[test]
+fn crash_after_bodies_resumes_without_advancing_watermarks() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    let body_doc_id = seed_structured_source(&source, &mut relay, &materials);
+    let s = relay.head_seq;
+    assert!(s > 0, "本测试要求 baseline S>0 才能区分是否推进水位");
+
+    let (_target_dir, target) = fresh_vault();
+    let error = bootstrap::run_with_fault(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        BootstrapFault::AfterBodies,
+    )
+    .expect_err("注入故障必须失败");
+    assert!(
+        format!("{error}").contains("注入故障"),
+        "错误应来自注入点：{error}"
+    );
+
+    // 正文已经落库（可续跑），但结构/资产/水位都没有。
+    let body = load_body_doc(&target, &body_doc_id, materials.peer_id_u64(), None)
+        .expect("正文已导入")
+        .0;
+    assert_eq!(body.text(), STRUCTURED_TEXT);
+    assert!(list_notes(&target).expect("list_notes").is_empty());
+    assert_no_sync_watermarks(&target);
+    let journal_checkpoint = assert_staging_journal(&target);
+    assert_eq!(
+        journal_checkpoint,
+        relay
+            .published_checkpoints
+            .last()
+            .expect("primary checkpoint")
+            .checkpoint_id
+    );
+
+    // 续跑：同一基线幂等重放，完成后水位才推进。
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("续跑成功");
+    assert_eq!(report.covered_seq, s);
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_RECEIVED_SEQ)
+            .expect("received")
+            .as_deref(),
+        Some(s.to_be_bytes().as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated")
+            .as_deref(),
+        Some(s.to_be_bytes().as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(report.cursor.as_bytes())
+    );
+    assert_eq!(list_notes(&target).expect("list_notes").len(), 1);
+    assert!(baseline_apply_state(&target).expect("journal").is_none());
+}
+
+#[test]
+fn structure_projection_failure_keeps_cursor_and_resumes() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_structured_source(&source, &mut relay, &materials);
+    let s = relay.head_seq;
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run_with_fault(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        BootstrapFault::BeforeStructureProjection,
+    )
+    .expect_err("结构投影前崩溃必须失败");
+
+    // structure 文档已写入，但投影还没发生：notes 仍为空，水位未推进。
+    assert!(
+        body_doc_meta(&target, STRUCTURE_DOC_ID)
+            .expect("structure meta")
+            .is_some(),
+        "structure 文档应已落库"
+    );
+    assert!(list_notes(&target).expect("list_notes").is_empty());
+    assert_no_sync_watermarks(&target);
+    assert_staging_journal(&target);
+
+    // 续跑补齐投影与水位。
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("续跑成功");
+    assert_eq!(report.covered_seq, s);
+    assert_eq!(list_notes(&target).expect("list_notes").len(), 1);
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+            .expect("highwater")
+            .as_deref(),
+        Some(s.to_be_bytes().as_slice())
+    );
+}
+
+#[test]
+fn asset_write_conflict_keeps_cursor_and_resumes_after_fix() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+    let s = relay.head_seq;
+    assert!(s > 0);
+
+    let (_target_dir, target) = fresh_vault();
+    // 预置同 asset_hash、同长度但内容不同的资产行：apply_baseline_assets 必须冲突。
+    let asset_hash: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+    let mut wrong = ASSET_DATA.to_vec();
+    wrong[0] ^= 0xFF;
+    target
+        .exec(
+            "INSERT INTO assets(asset_hash,byte_len,media_type,data,orphan_since) \
+             VALUES(?1,?2,?3,?4,NULL)",
+            &[
+                Value::Blob(asset_hash.to_vec()),
+                Value::Integer(ASSET_DATA.len() as i64),
+                Value::Text("text/plain".to_owned()),
+                Value::Blob(wrong),
+            ],
+        )
+        .expect("预置冲突资产");
+
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("资产写失败必须冒泡，不能用半库换基线");
+    assert!(
+        format!("{error}").contains("资产"),
+        "错误应指向资产冲突：{error}"
+    );
+    assert_no_sync_watermarks(&target);
+    assert_staging_journal(&target);
+    // 已导入的正文仍在（可续跑），冲突资产未被覆盖。
+    assert_eq!(
+        load_body_doc(&target, "note-1", materials.peer_id_u64(), None)
+            .expect("正文已导入")
+            .0
+            .text(),
+        "第一行正文"
+    );
+    let stored = asset_bytes(&target, asset_hash).expect("asset_bytes");
+    assert_ne!(stored.as_deref(), Some(ASSET_DATA));
+
+    // 修掉冲突后同一 journal 续跑成功。
+    target
+        .exec(
+            "DELETE FROM assets WHERE asset_hash=?1",
+            &[Value::Blob(asset_hash.to_vec())],
+        )
+        .expect("删除冲突资产");
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("修复后续跑");
+    assert_eq!(report.covered_seq, s);
+    let stored = asset_bytes(&target, asset_hash).expect("asset_bytes");
+    assert_eq!(stored.as_deref(), Some(ASSET_DATA));
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_RECEIVED_SEQ)
+            .expect("received")
+            .as_deref(),
+        Some(s.to_be_bytes().as_slice())
+    );
+    assert!(baseline_apply_state(&target).expect("journal").is_none());
+}
+
+#[test]
+fn crash_after_assets_resumes_without_duplicate_writes() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_structured_source(&source, &mut relay, &materials);
+    let s = relay.head_seq;
+    let asset_hash: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run_with_fault(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        BootstrapFault::AfterAssets,
+    )
+    .expect_err("资产写完后崩溃必须失败，水位不得推进");
+    // 资产与结构都已落库，但水位仍未写；journal 记录 applied_assets 供续跑。
+    assert_eq!(
+        asset_bytes(&target, asset_hash)
+            .expect("asset_bytes")
+            .as_deref(),
+        Some(ASSET_DATA)
+    );
+    assert_eq!(list_notes(&target).expect("list_notes").len(), 1);
+    assert_no_sync_watermarks(&target);
+    let journal = baseline_apply_state(&target)
+        .expect("journal state")
+        .expect("journal 必须保留");
+    assert_eq!(journal.applied_assets, 1);
+
+    // 续跑：同资产幂等（不重复插入、不再要求不同明文），水位才推进。
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("资产阶段崩溃后续跑");
+    assert_eq!(report.covered_seq, s);
+    assert_eq!(report.assets, 1);
+    assert_eq!(
+        asset_bytes(&target, asset_hash)
+            .expect("asset_bytes")
+            .as_deref(),
+        Some(ASSET_DATA)
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+            .expect("highwater")
+            .as_deref(),
+        Some(s.to_be_bytes().as_slice())
+    );
+    assert!(baseline_apply_state(&target).expect("journal").is_none());
+}
+
+#[test]
+fn verify_failure_keeps_merged_data_and_marks_journal_failed() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    // 目标库已有同一篇正文的本地编辑：bootstrap 必须把它与基线 merge（不是覆盖）。
+    let local_peer = materials.peer_id_u64().wrapping_add(1);
+    let local = seed_doc(&target, "note-1", local_peer);
+    local.insert_scalars(0, "本地优先编辑 ").expect("本地正文");
+    commit_local(&target, &local);
+
+    let error = bootstrap::run_with_fault(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        BootstrapFault::VerifyVvNotCovered,
+    )
+    .expect_err("注入的读回校验失败必须冒泡");
+    assert!(
+        format!("{error}").contains("VV 未覆盖快照"),
+        "错误应来自读回校验：{error}"
+    );
+
+    // 已 merge 的 Loro 数据保留：本地编辑与基线正文都在同一条文档里。
+    let merged = load_body_doc(&target, "note-1", local_peer, None)
+        .expect("merged doc")
+        .0;
+    assert!(
+        merged.text().contains("本地优先编辑") && merged.text().contains("第一行正文"),
+        "失败不得回滚已 merge 的数据，实际={:?}",
+        merged.text()
+    );
+
+    // 水位没有推进；journal 仍是 staging（schema CHECK 只有 staging/completed），
+    // 失败语义由 meta 失败标记承载。
+    assert_no_sync_watermarks(&target);
+    let journal = baseline_apply_state(&target)
+        .expect("journal state")
+        .expect("失败后 journal 必须保留");
+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
+    assert!(journal.applied_docs >= 2, "已应用批次计数应保留");
+    let reason = baseline_verify_failure(&target)
+        .expect("读失败标记")
+        .expect("校验失败必须写失败标记");
+    assert!(
+        reason.contains("VV 未覆盖快照"),
+        "标记应保留失败原因：{reason}"
+    );
+
+    // 未 abort 前 begin 一律拒绝（同 checkpoint 幂等续跑也不行）。
+    let retry = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("失败标记必须阻止 begin 续跑");
+    assert!(
+        format!("{retry}").contains("abort_baseline_apply"),
+        "错误必须提示先 abort：{retry}"
+    );
+
+    // abort 清 journal + 失败标记，但保留已 merge 的 Loro 数据。
+    assert!(abort_baseline_apply(&target).expect("abort"));
+    assert!(baseline_apply_state(&target).expect("state").is_none());
+    assert!(baseline_verify_failure(&target).expect("标记").is_none());
+    let kept = load_body_doc(&target, "note-1", local_peer, None)
+        .expect("abort 后正文")
+        .0;
+    assert!(
+        kept.text().contains("本地优先编辑") && kept.text().contains("第一行正文"),
+        "abort 只清 journal，不得删已 merge 的 Loro 数据，实际={:?}",
+        kept.text()
+    );
+
+    // abort 后可以重新 begin 并成功（失败标记已清）。
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("abort 后重跑");
+    assert_eq!(
+        report.covered_seq,
+        relay.published_checkpoints[1].covered_seq
+    );
+    assert!(report.docs.iter().any(|(doc_id, _)| doc_id == "note-1"));
+    assert!(baseline_apply_state(&target).expect("state").is_none());
+}
+
+#[test]
+fn cursor_cas_conflict_rolls_back_all_watermarks_and_retry_succeeds() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+    let s = relay.head_seq;
+    assert!(s > 0);
+
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run_with_fault(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        BootstrapFault::CursorCasConflict,
+    );
+    assert!(report.is_err(), "游标 CAS 冲突必须失败");
+    // 事务整笔回滚：并发写者留下的游标保留，其余单调值一个都没写。
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(b"fault-cursor".as_slice())
+    );
+    assert!(target
+        .get_meta(META_SYNC_RECEIVED_SEQ)
+        .expect("received")
+        .is_none());
+    assert!(target
+        .get_meta(META_SYNC_INTEGRATED_SEQ)
+        .expect("integrated")
+        .is_none());
+    assert!(target
+        .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+        .expect("highwater")
+        .is_none());
+    assert_staging_journal(&target);
+
+    // 重试：从当前游标 CAS 前进，单调且幂等。
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("重试成功");
+    assert_eq!(report.covered_seq, s);
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(report.cursor.as_bytes())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+            .expect("highwater")
+            .as_deref(),
+        Some(s.to_be_bytes().as_slice())
+    );
+    assert!(baseline_apply_state(&target).expect("journal").is_none());
+}
+
+#[test]
+fn existing_pins_and_highwater_are_not_lowered() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+    // 让 primary 的 manifest 腐坏，强制选 fallback（fallback 的 S=0 < 本地水位 1）。
+    let primary_manifest = relay
+        .published_checkpoints
+        .last()
+        .and_then(|checkpoint| checkpoint.manifest_ref)
+        .expect("primary manifest");
+    relay
+        .parts
+        .get_mut(&(primary_manifest, 0))
+        .expect("primary manifest part")[0] ^= 0x01;
+    let (instance_id, control_hash) = relay_state_and_control_hash(&mut relay);
+
+    let (_target_dir, target) = fresh_vault();
+    // 已有库：一篇本地编辑过的正文 + 已确认的水位/游标/pins。
+    let local_peer = materials.peer_id_u64().wrapping_add(1);
+    let local = seed_doc(&target, "note-1", local_peer);
+    local.insert_scalars(0, "local edit ").expect("本地正文");
+    commit_local(&target, &local);
+    target
+        .set_meta(menghunote_storage::META_SYNC_LOG_ID, &relay.log_id)
+        .expect("log id");
+    target.set_meta(RELAY_CURSOR_META, b"c2").expect("cursor");
+    set_u64_meta(&target, META_SYNC_RECEIVED_SEQ, 2);
+    set_u64_meta(&target, META_SYNC_INTEGRATED_SEQ, 2);
+    set_u64_meta(&target, META_SYNC_CONFIRMED_HIGHWATER, 2);
+    target
+        .set_meta(META_BOOTSTRAP_INSTANCE, &instance_id)
+        .expect("instance pin");
+    set_u64_meta(&target, META_BOOTSTRAP_EPOCH, EPOCH);
+    set_u64_meta(&target, META_BOOTSTRAP_CONTROL_REV, relay.control_rev);
+    target
+        .set_meta(META_BOOTSTRAP_CONTROL_HASH, &control_hash)
+        .expect("control hash pin");
+
+    let report = bootstrap::run(&target, &mut relay, VAULT_ID, local_peer, &materials.root)
+        .expect("已有库 bootstrap 必须成功");
+    assert!(report.used_fallback);
+    assert_eq!(report.covered_seq, 1, "fallback 必须用自己的 S");
+    assert_eq!(report.cursor, "c1");
+
+    // 单调值全部保持原值，绝不被 baseline S 降级。
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(b"c2".as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_RECEIVED_SEQ)
+            .expect("received")
+            .as_deref(),
+        Some(2u64.to_be_bytes().as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated")
+            .as_deref(),
+        Some(2u64.to_be_bytes().as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+            .expect("highwater")
+            .as_deref(),
+        Some(2u64.to_be_bytes().as_slice())
+    );
+    // pins 不变。
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_INSTANCE)
+            .expect("instance pin")
+            .as_deref(),
+        Some(instance_id.as_slice())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_HASH)
+            .expect("control hash pin")
+            .as_deref(),
+        Some(control_hash.as_slice())
+    );
+    // 已有本地编辑按 VV 合并，未被跳过/覆盖。
+    let merged = load_body_doc(&target, "note-1", local_peer, None)
+        .expect("note-1")
+        .0;
+    assert!(
+        merged.text().contains("local edit") && merged.text().contains("第一行正文"),
+        "已有 doc 必须按 VV 合并，实际={:?}",
+        merged.text()
+    );
+}
+
+#[test]
+fn pin_regressions_reject_before_any_write() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let (instance_id, control_hash) = relay_state_and_control_hash(&mut relay);
+    let state = relay.state().expect("state");
+    let correct = BootstrapPins {
+        instance_id: Some(instance_id),
+        log_id: Some(relay.log_id),
+        epoch: Some(EPOCH),
+        control_rev: Some(relay.control_rev),
+        control_hash: Some(control_hash),
+        highwater: Some(0),
+    };
+    let regressions = [
+        (
+            "instance",
+            BootstrapPins {
+                instance_id: Some([0x99; 16]),
+                ..correct
+            },
+        ),
+        (
+            "log_id",
+            BootstrapPins {
+                log_id: Some([0x99; 16]),
+                ..correct
+            },
+        ),
+        (
+            "epoch",
+            BootstrapPins {
+                epoch: Some(EPOCH + 1),
+                ..correct
+            },
+        ),
+        (
+            "control rev",
+            BootstrapPins {
+                control_rev: Some(relay.control_rev + 1),
+                ..correct
+            },
+        ),
+        (
+            "control hash",
+            BootstrapPins {
+                control_hash: Some([0x99; 32]),
+                ..correct
+            },
+        ),
+        (
+            "highwater",
+            BootstrapPins {
+                highwater: Some(state.head_seq + 1),
+                ..correct
+            },
+        ),
+    ];
+    for (name, pins) in regressions {
+        let (_target_dir, target) = fresh_vault();
+        let error = bootstrap::run_with_pins(
+            &target,
+            &mut relay,
+            VAULT_ID,
+            materials.peer_id_u64(),
+            &materials.root,
+            &pins,
+        )
+        .expect_err(&format!("pins {name} 回退必须拒绝"));
+        assert!(!format!("{error}").is_empty());
+        assert!(
+            list_all_docs(&target).expect("list_all_docs").is_empty(),
+            "pins {name} 回退时不得写半库"
+        );
+        assert_no_sync_watermarks(&target);
+        assert!(
+            baseline_apply_state(&target).expect("journal").is_none(),
+            "校验失败不得创建 journal"
+        );
+    }
+
+    // 正确 pins 必须通过，并把 pins 持久化。
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run_with_pins(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        &correct,
+    )
+    .expect("正确 pins 应通过");
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_INSTANCE)
+            .expect("instance pin")
+            .as_deref(),
+        Some(instance_id.as_slice())
+    );
+}
+
+#[test]
+fn control_pin_advances_but_never_rolls_back() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    // 真实 relay 的 `/control` 键 5 必然从 rev1 genesis 起；历史锚按"截断到锚 rev 的
+    // 管理链前缀"复算，空链无法复算视图 → 按 ADR 0013 §3 只能 fail-closed。
+    relay.manager_chain = vec![menghunote_sync::relay::ManagerChainEntry {
+        rev: 1,
+        pubkey: materials.manager.public_key(),
+        transition: b"test-genesis".to_vec(),
+        old_rev: 1,
+        old_signature: None,
+        new_signature: None,
+    }];
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("首次 bootstrap");
+    let first_rev = relay.control_rev;
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_REV)
+            .expect("control rev")
+            .as_deref(),
+        Some(first_rev.to_be_bytes().as_slice())
+    );
+    let first_hash = target
+        .get_meta(META_BOOTSTRAP_CONTROL_HASH)
+        .expect("control hash")
+        .expect("hash pin");
+
+    // control_rev 前进：允许并刷新 pin。
+    relay.control_rev = first_rev + 1;
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("control_rev 前进必须允许");
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_REV)
+            .expect("control rev")
+            .as_deref(),
+        Some((first_rev + 1).to_be_bytes().as_slice())
+    );
+    let second_hash = target
+        .get_meta(META_BOOTSTRAP_CONTROL_HASH)
+        .expect("control hash")
+        .expect("hash pin");
+    assert_ne!(first_hash, second_hash, "rev 前进时控制头摘要必须更新");
+
+    // control_rev 回退：必须 fail-stop，且不改任何本地状态。
+    relay.control_rev = first_rev;
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("control_rev 回退必须拒绝");
+    assert!(!format!("{error}").is_empty());
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_REV)
+            .expect("control rev")
+            .as_deref(),
+        Some((first_rev + 1).to_be_bytes().as_slice())
+    );
+    assert!(load_body_doc(&target, "note-1", materials.peer_id_u64(), None).is_ok());
+}
+
+#[test]
+fn catchup_prepare_writes_nothing_and_integrate_advances_cursor() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let checkpoint = relay.published_checkpoints[1].clone();
+
+    let (_target_dir, target) = fresh_vault();
+    ensure_structure_row(&target).expect("structure 行");
+    // 目标已有本地编辑 + 旧游标/水位：追赶不得丢本地 op，成功后 cursor 必须前移。
+    let local = seed_doc(&target, "local-note", materials.peer_id_u64());
+    create_note_slot(
+        &target,
+        "local-note",
+        "local-note",
+        "local-note",
+        1_700_000_000,
+    )
+    .expect("notes 行");
+    local.insert_scalars(0, "本地未上传").expect("正文");
+    commit_local(&target, &local);
+    target
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("旧 cursor");
+    target
+        .set_meta(META_SYNC_RECEIVED_SEQ, &1u64.to_be_bytes())
+        .expect("旧 received");
+    target
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &1u64.to_be_bytes())
+        .expect("旧 integrated");
+    target
+        .set_meta(menghunote_storage::META_SYNC_LOG_ID, &relay.log_id)
+        .expect("log_id");
+
+    let pins = BootstrapPins::from_vault(&target).expect("pins");
+    let prepared = bootstrap::prepare(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        &pins,
+    )
+    .expect("prepare");
+    assert_eq!(prepared.covered_seq(), checkpoint.covered_seq);
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(b"c0".as_slice()),
+        "prepare 不得写库/推进 cursor"
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated")
+            .as_deref(),
+        Some(1u64.to_be_bytes().as_slice()),
+        "prepare 不得推进 integrated"
+    );
+
+    let expected_cursor = prepared.checkpoint_cursor().to_owned();
+    let report = bootstrap::integrate(
+        &target,
+        materials.peer_id_u64(),
+        &prepared,
+        bootstrap::BootstrapAdvancement::CatchUp,
+        None,
+    )
+    .expect("integrate");
+    assert_eq!(report.covered_seq, checkpoint.covered_seq);
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(expected_cursor.as_bytes()),
+        "CatchUp 成功后 cursor 必须前移到实际选中 checkpoint"
+    );
+    let cursor = sync_cursor_state(&target).expect("cursor state");
+    assert!(cursor.integrated_seq >= checkpoint.covered_seq);
+    let local_text = load_body_doc(&target, "local-note", materials.peer_id_u64(), None)
+        .expect("本地文档")
+        .0
+        .text();
+    assert!(
+        local_text.contains("本地未上传"),
+        "本地未上传 op 不得丢：{local_text}"
+    );
+
+    // S 之后普通 pull：源在 checkpoint 后新增一条，目标用追赶后的 cursor 正常增量拉取。
+    let (source_doc, _) =
+        load_body_doc(&source, "note-1", materials.peer_id_u64(), None).expect("source note");
+    source_doc
+        .insert_scalars(0, "after-catchup ")
+        .expect("source edit");
+    commit_with_intent(&source, &source_doc, &uuid_like(9_777), [0xC7; 32], EPOCH);
+    {
+        let mut engine = SyncEngine::new(
+            &source,
+            &mut relay,
+            EngineIdentity {
+                device_id: materials.device_id,
+                signing_key: materials.signing_key.clone(),
+                peer_id: materials.peer_id_u64(),
+            },
+            materials.root.clone(),
+        );
+        engine.sync_once().expect("source push after catchup");
+    }
+    {
+        let mut engine = SyncEngine::new(
+            &target,
+            &mut relay,
+            EngineIdentity {
+                device_id: materials.device_id,
+                signing_key: materials.signing_key.clone(),
+                peer_id: materials.peer_id_u64(),
+            },
+            materials.root.clone(),
+        );
+        engine.sync_once().expect("target pull after catchup");
+    }
+    let target_note = load_body_doc(&target, "note-1", materials.peer_id_u64(), None)
+        .expect("target note")
+        .0
+        .text();
+    assert!(
+        target_note.contains("after-catchup"),
+        "追赶后必须能从 S 继续普通 pull：{target_note}"
+    );
+}
+
+#[test]
+fn catchup_mandatory_prepare_and_integrate_advances_through_public_wrapper() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let checkpoint = relay.published_checkpoints[1].clone();
+
+    let (_target_dir, target) = fresh_vault();
+    ensure_structure_row(&target).expect("structure 行");
+    target
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("旧 cursor");
+    target
+        .set_meta(META_SYNC_RECEIVED_SEQ, &0u64.to_be_bytes())
+        .expect("旧 received");
+    target
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &0u64.to_be_bytes())
+        .expect("旧 integrated");
+    target
+        .set_meta(menghunote_storage::META_SYNC_LOG_ID, &relay.log_id)
+        .expect("log_id");
+    // 让普通 pull 必然 CursorExpired：本地 received=0，relay floor=1。
+    relay.gc_floor = 1;
+    let pins = BootstrapPins::from_vault(&target).expect("pins");
+    let prepared = menghunote_sync::catchup::prepare(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        &pins,
+        &menghunote_sync::catchup::CatchUpConfig::default(),
+    )
+    .expect("mandatory prepare")
+    .expect("gc_floor > received 必须进入 mandatory");
+    assert_eq!(
+        prepared.decision().mode,
+        menghunote_sync::catchup::CatchUpMode::Mandatory
+    );
+    assert_eq!(prepared.checkpoint_s(), checkpoint.covered_seq);
+    let expected_cursor = prepared.checkpoint_cursor().to_owned();
+    let report = menghunote_sync::catchup::integrate(&target, materials.peer_id_u64(), &prepared)
+        .expect("mandatory integrate");
+    assert_eq!(
+        report.mode,
+        menghunote_sync::catchup::CatchUpMode::Mandatory
+    );
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(expected_cursor.as_bytes())
+    );
+}
+
+#[test]
+fn bootstrap_cursor_pulls_updates_after_s() {
+    let (_dir, source, materials) = setup();
+    let (_target_dir, target) = fresh_vault();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+    let s = relay
+        .published_checkpoints
+        .last()
+        .expect("checkpoint")
+        .covered_seq;
+    assert_eq!(relay.head_seq, s, "checkpoint 之后不应再有日志事件");
+
+    // 源在 checkpoint 之后给已有 note-1 追加 1 条 update 并推到 relay。
+    let (doc, _) = load_body_doc(&source, "note-1", materials.peer_id_u64(), None).expect("note-1");
+    doc.insert_scalars(0, "after checkpoint ").expect("正文");
+    commit_with_intent(&source, &doc, &uuid_like(990), [0xB1; 32], EPOCH);
+    {
+        let mut engine = SyncEngine::new(
+            &source,
+            &mut relay,
+            EngineIdentity {
+                device_id: materials.device_id,
+                signing_key: materials.signing_key.clone(),
+                peer_id: materials.peer_id_u64(),
+            },
+            materials.root.clone(),
+        );
+        let pushed = engine.sync_once().expect("source push after checkpoint");
+        assert_eq!(pushed.push.uploaded, 1);
+    }
+    assert!(relay.head_seq > s);
+
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("bootstrap at S");
+    assert_eq!(report.covered_seq, s);
+    {
+        let mut engine = SyncEngine::new(
+            &target,
+            &mut relay,
+            EngineIdentity {
+                device_id: materials.device_id,
+                signing_key: materials.signing_key.clone(),
+                peer_id: materials.peer_id_u64(),
+            },
+            materials.root.clone(),
+        );
+        let pulled = engine.sync_once().expect("target catch up after S");
+        assert!(pulled.pull.events >= 1, "必须拉到 S 之后的 update");
+    }
+    let (doc, _) = load_body_doc(&target, "note-1", materials.peer_id_u64(), None).expect("note-1");
+    assert!(
+        doc.text().contains("after checkpoint"),
+        "S 之后的 update 必须被 integrate，实际={:?}",
+        doc.text()
+    );
+}
+
+#[test]
+fn bootstrap_is_idempotent_on_second_run() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let (_target_dir, target) = fresh_vault();
+    let first = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("第一次 bootstrap");
+    let second = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("第二次 bootstrap");
+    assert_eq!(first.covered_seq, second.covered_seq);
+    assert_eq!(first.cursor, second.cursor);
+    let (note1, _) =
+        load_body_doc(&target, "note-1", materials.peer_id_u64(), None).expect("note-1");
+    assert_eq!(note1.text(), "第一行正文");
+}
+
+#[test]
+fn fallback_is_used_when_primary_manifest_is_tampered() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+    let fallback = relay
+        .published_checkpoints
+        .get(relay.published_checkpoints.len() - 2)
+        .expect("fallback checkpoint")
+        .clone();
+    let primary = relay
+        .published_checkpoints
+        .last()
+        .and_then(|checkpoint| checkpoint.manifest_ref)
+        .expect("primary manifest");
+    assert_ne!(fallback.covered_seq, relay.head_seq);
+    let bytes = relay.parts.get_mut(&(primary, 0)).expect("manifest part");
+    bytes[0] ^= 0x01;
+
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("fallback");
+    assert!(report.used_fallback);
+    assert_eq!(report.covered_seq, fallback.covered_seq);
+    assert_eq!(report.cursor, format!("c{}", fallback.covered_seq));
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_RECEIVED_SEQ)
+            .expect("received meta"),
+        Some(fallback.covered_seq.to_be_bytes().to_vec())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated meta"),
+        Some(fallback.covered_seq.to_be_bytes().to_vec())
+    );
+    assert!(load_body_doc(&target, "note-1", materials.peer_id_u64(), None).is_ok());
+}
+
+#[test]
+fn fallback_is_used_when_primary_snapshot_is_tampered() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+    let fallback = relay
+        .published_checkpoints
+        .get(relay.published_checkpoints.len() - 2)
+        .expect("fallback checkpoint")
+        .clone();
+    let primary_snapshot = relay
+        .published_checkpoints
+        .last()
+        .and_then(|checkpoint| checkpoint.data_refs.first().copied())
+        .expect("primary snapshot");
+    relay
+        .parts
+        .get_mut(&(primary_snapshot, 0))
+        .expect("snapshot part")[0] ^= 0x01;
+
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("fallback after snapshot tamper");
+    assert!(report.used_fallback);
+    assert_eq!(report.covered_seq, fallback.covered_seq);
+    assert_eq!(report.cursor, format!("c{}", fallback.covered_seq));
+}
+
+#[test]
+fn existing_local_doc_is_merged_not_skipped() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    // 本机 peer 必须与快照生产者不同，否则同 peer 的 op 会被 Loro 当作重复丢弃。
+    let local_peer = materials.peer_id_u64().wrapping_add(1);
+    let local = seed_doc(&target, "note-1", local_peer);
+    local.insert_scalars(0, "local edit ").expect("本地正文");
+    commit_local(&target, &local);
+
+    let report = bootstrap::run(&target, &mut relay, VAULT_ID, local_peer, &materials.root)
+        .expect("bootstrap with existing doc");
+    assert!(!report.used_fallback);
+    let (merged, _) = load_body_doc(&target, "note-1", local_peer, None).expect("note-1");
+    assert!(
+        merged.text().contains("local edit") && merged.text().contains("第一行正文"),
+        "已有 doc 必须按 VV 合并，实际={:?}",
+        merged.text()
+    );
+}
+
+#[test]
+fn tampered_manifest_on_both_baselines_writes_nothing() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    for checkpoint in &relay.published_checkpoints {
+        if let Some(manifest) = checkpoint.manifest_ref {
+            if let Some(bytes) = relay.parts.get_mut(&(manifest, 0)) {
+                bytes[0] ^= 0x01;
+            }
+        }
+    }
+    let (_target_dir, target) = fresh_vault();
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("篡改 manifest 必须失败");
+    assert!(
+        list_all_docs(&target).expect("list_all_docs").is_empty(),
+        "校验失败前不得写半库: {error:?}"
+    );
+    assert!(baseline_apply_state(&target).expect("journal").is_none());
+}
+
+#[test]
+fn tampered_snapshot_is_rejected_without_partial_import() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    // 同时篡改两份基线的第一个 SNAPSHOT 对象，确保 fallback 也失败。
+    for checkpoint in &relay.published_checkpoints {
+        for object_id in &checkpoint.data_refs {
+            if let Some(bytes) = relay.parts.get_mut(&(*object_id, 0)) {
+                bytes[0] ^= 0x01;
+            }
+        }
+    }
+    let (_target_dir, target) = fresh_vault();
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("篡改快照必须失败");
+    assert!(
+        list_all_docs(&target).expect("list_all_docs").is_empty(),
+        "失败不得写半库: {error:?}"
+    );
+}
+
+#[test]
+fn wrong_root_rejects_bootstrap_before_write() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let wrong = RootSecretV1::new(
+        VAULT_ID,
+        EPOCH,
+        menghunote_sync::keys::Secret32::from_array([0x5A; 32]),
+    );
+    let (_target_dir, target) = fresh_vault();
+    assert!(bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &wrong
+    )
+    .is_err());
+    assert!(list_all_docs(&target).expect("list_all_docs").is_empty());
+}
+
+#[test]
+fn bootstrap_body_doc_head_is_one_full_update() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("bootstrap");
+    let rows = menghunote_storage::doc_updates_since(&target, "note-1", 0).expect("updates");
+    assert_eq!(rows.len(), 1, "bootstrap 只写 1 条全量 update");
+    assert_eq!(rows[0].seq, 1);
+    // 不是 snapshot 行：snapshot_seq 必须保持 0（后续优化再补）。
+    let meta = body_doc_meta(&target, "note-1")
+        .expect("meta")
+        .expect("row");
+    assert_eq!(meta.head_seq, 1);
+}
+
+#[test]
+fn empty_baseline_at_zero_is_idempotent() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    source.set_meta(RELAY_CURSOR_META, b"c0").expect("cursor");
+    let mut writer = CheckpointWriter::new(
+        &source,
+        &mut relay,
+        VAULT_ID,
+        materials.device_id,
+        materials.signing_key.clone(),
+        materials.root.clone(),
+        materials.peer_id_u64(),
+    );
+    let secrets = SlotSecrets {
+        password: Some("pw"),
+        recovery_seed: Some(&materials.recovery_seed),
+    };
+    writer
+        .upload_initial_slots(&materials.password_slot, &materials.recovery_slot, &secrets)
+        .expect("槽上传");
+    writer
+        .create_checkpoint(&StorageAssets)
+        .expect("空库 checkpoint 1");
+    writer
+        .create_checkpoint(&StorageAssets)
+        .expect("空库 checkpoint 2");
+    assert_eq!(relay.head_seq, 0);
+
+    let (_target_dir, target) = fresh_vault();
+    let first = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("空基线 bootstrap");
+    assert_eq!(first.covered_seq, 0);
+    assert_eq!(first.cursor, "c0");
+    assert_eq!(
+        sync_cursor_state(&target)
+            .expect("cursor")
+            .confirmed_highwater,
+        Some(0)
+    );
+    assert!(body_doc_meta(&target, STRUCTURE_DOC_ID)
+        .expect("structure meta")
+        .is_some());
+    assert!(list_notes(&target).expect("list_notes").is_empty());
+
+    // S=0 的第二次 bootstrap 必须幂等（游标 c0 -> c0 的 CAS 也要通过）。
+    let second = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("空基线幂等重放");
+    assert_eq!(first, second);
+}
+
+#[test]
+fn cursor_metadata_reflects_written_watermarks() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("bootstrap");
+    let state = sync_cursor_state(&target).expect("cursor state");
+    assert_eq!(state.received_seq, report.covered_seq);
+    assert_eq!(state.integrated_seq, report.covered_seq);
+    assert_eq!(state.confirmed_highwater, Some(report.covered_seq));
+    assert_eq!(state.log_id, Some(relay.log_id));
+}
+
+// ============================================================ 评审 0002 T16/T17 补充
+// primary 的 commit/signature/asset 各阶段腐坏 → 整体切 fallback，且只用 fallback 自己的 S/cursor；
+// 两份都坏 → 失败且零写入/零水位（不能"两坏也 ACK"）。
+
+fn tamper_checkpoint_commit(relay: &mut FakeRelay, index: usize) {
+    let checkpoint = relay
+        .published_checkpoints
+        .get_mut(index)
+        .expect("checkpoint");
+    checkpoint.signed_commit.as_mut().expect("signed commit")[0] ^= 0x01;
+}
+
+fn tamper_checkpoint_signature(relay: &mut FakeRelay, index: usize) {
+    let checkpoint = relay
+        .published_checkpoints
+        .get_mut(index)
+        .expect("checkpoint");
+    checkpoint.signature.as_mut().expect("signature")[0] ^= 0x01;
+}
+
+/// task-122：把已发布基线的 commit 改写成指定的验证修订（保持字段与签名自洽），
+/// 用于证明客户端消费者会显式拒绝旧修订。
+fn rewrite_checkpoint_validation_version(
+    relay: &mut FakeRelay,
+    materials: &genesis::GenesisMaterials,
+    index: usize,
+    version: u16,
+) {
+    let checkpoint = relay
+        .published_checkpoints
+        .get(index)
+        .cloned()
+        .expect("checkpoint");
+    let signed = checkpoint.signed_commit.expect("signed commit");
+    let mut commit =
+        menghunote_sync_proto::CheckpointCommit::decode(&signed).expect("decode commit");
+    commit.validation_version = version;
+    commit.validation_digest = if version == 2 { [0x5A; 32] } else { [0u8; 32] };
+    let signed = commit.encode().expect("encode commit");
+    let signature = materials
+        .signing_key
+        .sign(&menghunote_sync_proto::checkpoint_signing_input(&commit).expect("signing input"));
+    let entry = relay
+        .published_checkpoints
+        .get_mut(index)
+        .expect("published checkpoint");
+    entry.signed_commit = Some(signed);
+    entry.signature = Some(signature);
+}
+
+fn checkpoint_asset_refs(relay: &FakeRelay, index: usize) -> Vec<[u8; 32]> {
+    relay
+        .published_checkpoints
+        .get(index)
+        .expect("checkpoint")
+        .data_refs
+        .iter()
+        .filter(|object_id| {
+            relay
+                .objects
+                .get(*object_id)
+                .is_some_and(|object| object.commit.object_type == ObjectType::Asset)
+        })
+        .copied()
+        .collect()
+}
+
+#[test]
+fn fallback_uses_its_own_lower_s_and_cursor_after_primary_commit_corruption() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+
+    let last = relay.published_checkpoints.len() - 1;
+    let fallback = relay.published_checkpoints[last - 1].clone();
+    let primary = relay.published_checkpoints[last].clone();
+    assert!(
+        fallback.covered_seq < primary.covered_seq,
+        "前置：fallback S 必须低于 primary S（S0<S1），实际 {} vs {}",
+        fallback.covered_seq,
+        primary.covered_seq
+    );
+
+    // commit 字节腐坏：不是"自洽 hash 通过"就能信，必须整体切 fallback。
+    tamper_checkpoint_commit(&mut relay, last);
+
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("commit 腐坏后必须用 fallback");
+    assert!(report.used_fallback);
+    assert_eq!(report.covered_seq, fallback.covered_seq);
+    assert_eq!(
+        report.cursor,
+        format!("c{}", fallback.covered_seq),
+        "cursor 必须用 fallback 自己的 S"
+    );
+    assert_eq!(
+        target.get_meta(META_SYNC_RECEIVED_SEQ).expect("received"),
+        Some(fallback.covered_seq.to_be_bytes().to_vec())
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated"),
+        Some(fallback.covered_seq.to_be_bytes().to_vec())
+    );
+    assert!(target
+        .get_meta(META_SYNC_CONFIRMED_HIGHWATER)
+        .expect("highwater")
+        .is_some());
+    let (note, _) =
+        load_body_doc(&target, "note-1", materials.peer_id_u64(), None).expect("note-1");
+    assert!(note.text().contains("第一行正文"));
+}
+
+#[test]
+fn corrupt_asset_on_primary_falls_back_and_both_corrupt_import_nothing() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    // 在 checkpoint 2 之后再插入一个**只被 primary 引用**的资产，才能单独腐坏 primary。
+    let extra_asset = b"primary-only asset";
+    let extra_hash: [u8; 32] = Sha256::digest(extra_asset).into();
+    insert_asset(
+        &source,
+        &extra_hash,
+        extra_asset.len() as u64,
+        Some("text/plain"),
+        extra_asset,
+    )
+    .expect("primary-only 资产");
+    flush_pending_and_checkpoint(&source, &mut relay, &materials);
+
+    let last = relay.published_checkpoints.len() - 1;
+    let fallback = relay.published_checkpoints[last - 1].clone();
+    let fallback_refs = fallback.data_refs.clone();
+    let primary_only_assets: Vec<[u8; 32]> = checkpoint_asset_refs(&relay, last)
+        .into_iter()
+        .filter(|object_id| !fallback_refs.contains(object_id))
+        .collect();
+    assert!(
+        !primary_only_assets.is_empty(),
+        "前置：primary 必须引用了 fallback 没有的 ASSET 对象"
+    );
+    // 只腐坏 primary 独有的 ASSET 密文：下载/摘要/AEAD 阶段失败 → 整体 fallback。
+    relay
+        .parts
+        .get_mut(&(primary_only_assets[0], 0))
+        .expect("asset part")[0] ^= 0x01;
+
+    let (_target_dir, target) = fresh_vault();
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("asset 腐坏必须用 fallback");
+    assert!(report.used_fallback);
+    assert_eq!(report.covered_seq, fallback.covered_seq);
+    assert_eq!(report.cursor, format!("c{}", fallback.covered_seq));
+    let asset_rows = target
+        .query("SELECT COUNT(*) FROM assets", &[])
+        .expect("asset count");
+    assert_eq!(
+        asset_rows[0][0],
+        Value::Integer(1),
+        "只允许导入 fallback 自己的资产，不得写入 primary 独有资产"
+    );
+    assert!(
+        menghunote_storage::asset_meta_by_hash(&target, &extra_hash)
+            .expect("asset meta")
+            .is_none(),
+        "primary 独有资产不得出现在 fallback 导入结果里"
+    );
+
+    // 两份基线的 ASSET 都腐坏：零写入、零水位，绝不 ACK。
+    let fallback_index = last - 1;
+    for object_id in checkpoint_asset_refs(&relay, fallback_index) {
+        if let Some(part) = relay.parts.get_mut(&(object_id, 0)) {
+            part[0] ^= 0x01;
+        }
+    }
+    let (_second_dir, second_target) = fresh_vault();
+    let error = bootstrap::run(
+        &second_target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("两份 asset 都坏必须失败");
+    assert!(!format!("{error:?}").is_empty());
+    assert!(
+        list_all_docs(&second_target)
+            .expect("list_all_docs")
+            .is_empty(),
+        "失败前不得写半库"
+    );
+    assert!(
+        baseline_apply_state(&second_target)
+            .expect("journal")
+            .is_none(),
+        "失败前不得建 staging journal"
+    );
+    assert_no_sync_watermarks(&second_target);
+}
+
+#[test]
+fn corrupt_signature_on_both_baselines_fails_without_import_or_ack() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+
+    for index in 0..relay.published_checkpoints.len() {
+        tamper_checkpoint_signature(&mut relay, index);
+    }
+
+    let (_target_dir, target) = fresh_vault();
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("两份 checkpoint 签名都坏必须失败");
+    assert!(!format!("{error:?}").is_empty());
+    assert!(list_all_docs(&target).expect("list_all_docs").is_empty());
+    assert!(baseline_apply_state(&target).expect("journal").is_none());
+    assert_no_sync_watermarks(&target);
+}
+
+#[test]
+fn revision_1_baselines_are_rejected_by_client_consumers() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    assert!(relay.published_checkpoints.len() >= 2);
+    for index in 0..relay.published_checkpoints.len() {
+        rewrite_checkpoint_validation_version(&mut relay, &materials, index, 1);
+    }
+
+    let (_target_dir, target) = fresh_vault();
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("修订 1 的签名基线必须被客户端拒绝（不得静默接受旧基线）");
+    assert!(
+        format!("{error:?}").contains("UnsupportedVersion")
+            || format!("{error}").contains("协议版本"),
+        "错误必须指向不支持的验证修订，实际：{error}"
+    );
+    assert!(list_all_docs(&target).expect("list_all_docs").is_empty());
+    assert_no_sync_watermarks(&target);
+}
+
+// ============================================================ 评审 0002 T16/T17 剩余
+// fallback 阶段仍必须真实验证 structure/codec/actual VV；任一基线腐坏即整体回退，
+// 两基线都坏必须零写入、零水位、零 journal、零 ACK。
+
+/// 用真实 root 重加密 manifest 并重签 checkpoint commit（模拟 prepare 产物被篡改）。
+fn install_manifest(
+    relay: &mut FakeRelay,
+    root: &RootSecretV1,
+    materials: &genesis::GenesisMaterials,
+    index: usize,
+    manifest: &menghunote_sync_proto::ManifestV1,
+) {
+    use menghunote_sync_proto::{
+        checkpoint_signing_input, refs_digest_input, CheckpointCommit, ObjectRefV1, ObjectType,
+    };
+    let checkpoint = relay
+        .published_checkpoints
+        .get_mut(index)
+        .expect("published checkpoint")
+        .clone();
+    let manifest_oid = checkpoint.manifest_ref.expect("manifest ref");
+    let plaintext = manifest.encode().expect("manifest encode");
+    let (parts, manifest_digest) = menghunote_sync::upload::encrypt_local_parts(
+        root,
+        ObjectType::Manifest,
+        &manifest_oid,
+        [0x42; 16],
+        materials.device_id,
+        0,
+        0,
+        &plaintext,
+        &[],
+    )
+    .expect("reencrypt manifest");
+    let old = relay
+        .objects
+        .get_mut(&manifest_oid)
+        .expect("manifest object");
+    for (part_no, envelope, _) in &parts {
+        relay
+            .parts
+            .insert((manifest_oid, *part_no), envelope.clone());
+    }
+    old.commit.part_count = parts.len() as u32;
+    old.commit.total_len = plaintext.len() as u64;
+    old.commit.object_digest = manifest_digest;
+    old.commit_bytes = old.commit.encode().expect("manifest commit");
+
+    let refs: Vec<ObjectRefV1> = manifest
+        .docs
+        .iter()
+        .map(|doc| ObjectRefV1 {
+            object_id: doc.snapshot_object_id,
+            object_type: ObjectType::Snapshot,
+            generation: doc.generation,
+            key_epoch: doc.key_epoch,
+            part_count: doc.part_count,
+            total_plain_len: doc.total_plain_len,
+            object_digest: doc.object_digest,
+        })
+        .chain(manifest.assets.iter().map(|asset| ObjectRefV1 {
+            object_id: asset.object_id,
+            object_type: ObjectType::Asset,
+            generation: 0,
+            key_epoch: asset.key_epoch,
+            part_count: asset.part_count,
+            total_plain_len: asset.total_plain_len,
+            object_digest: asset.object_digest,
+        }))
+        .collect();
+    let refs_digest: [u8; 32] =
+        Sha256::digest(refs_digest_input(&refs).expect("refs digest input")).into();
+    let commit = CheckpointCommit {
+        vault_id: VAULT_ID,
+        checkpoint_id: checkpoint.checkpoint_id,
+        epoch: checkpoint.epoch,
+        covered_relay_seq: checkpoint.covered_seq,
+        manifest_object_id: manifest_oid,
+        manifest_digest,
+        refs_digest,
+        producer_device_id: materials.device_id,
+        validation_version: 2,
+        validation_digest: [0x5A; 32],
+    };
+    let signed_commit = commit.encode().expect("checkpoint commit");
+    let signature = materials
+        .signing_key
+        .sign(&checkpoint_signing_input(&commit).expect("checkpoint signing input"));
+    let entry = relay
+        .published_checkpoints
+        .get_mut(index)
+        .expect("published checkpoint");
+    entry.signed_commit = Some(signed_commit);
+    entry.signature = Some(signature);
+}
+
+fn load_manifest(
+    relay: &mut FakeRelay,
+    root: &RootSecretV1,
+    index: usize,
+) -> menghunote_sync_proto::ManifestV1 {
+    let checkpoint = relay.published_checkpoints[index].clone();
+    let manifest_oid = checkpoint.manifest_ref.expect("manifest ref");
+    let commit = relay.objects[&manifest_oid].commit.clone();
+    let (_, bytes) = menghunote_sync::upload::fetch_object(
+        relay,
+        root,
+        ObjectType::Manifest,
+        &manifest_oid,
+        commit.part_count,
+        commit.total_len,
+        &commit.object_digest,
+        &[],
+    )
+    .expect("fetch manifest");
+    menghunote_sync_proto::ManifestV1::decode(&bytes).expect("decode manifest")
+}
+
+/// 重写某个 baseline 的 structure（或第一个 body）快照并同步 manifest/commit。
+fn rewrite_snapshot(
+    relay: &mut FakeRelay,
+    root: &RootSecretV1,
+    materials: &genesis::GenesisMaterials,
+    index: usize,
+    kind: u64,
+    mutate: impl FnOnce(&mut menghunote_sync_proto::SnapshotV1),
+) {
+    use menghunote_sync_proto::{ObjectType, SnapshotV1};
+    let mut manifest = load_manifest(relay, root, index);
+    let doc_index = manifest
+        .docs
+        .iter()
+        .position(|doc| doc.kind == kind)
+        .expect("目标 kind 文档");
+    let doc = manifest.docs[doc_index].clone();
+    let (_, bytes) = menghunote_sync::upload::fetch_object(
+        relay,
+        root,
+        ObjectType::Snapshot,
+        &doc.snapshot_object_id,
+        doc.part_count,
+        doc.total_plain_len,
+        &doc.object_digest,
+        &[],
+    )
+    .expect("fetch snapshot");
+    let mut snapshot = SnapshotV1::decode(&bytes).expect("decode snapshot");
+    mutate(&mut snapshot);
+    let plaintext = snapshot.encode().expect("snapshot encode");
+    let (parts, digest) = menghunote_sync::upload::encrypt_local_parts(
+        root,
+        ObjectType::Snapshot,
+        &doc.snapshot_object_id,
+        [0x43; 16],
+        materials.device_id,
+        doc.generation,
+        0,
+        &plaintext,
+        &[],
+    )
+    .expect("reencrypt snapshot");
+    {
+        let object = relay
+            .objects
+            .get_mut(&doc.snapshot_object_id)
+            .expect("snapshot object");
+        for (part_no, envelope, _) in &parts {
+            relay
+                .parts
+                .insert((doc.snapshot_object_id, *part_no), envelope.clone());
+        }
+        object.commit.part_count = parts.len() as u32;
+        object.commit.total_len = plaintext.len() as u64;
+        object.commit.object_digest = digest;
+        object.commit_bytes = object.commit.encode().expect("snapshot commit");
+    }
+    manifest.docs[doc_index].part_count = parts.len() as u32;
+    manifest.docs[doc_index].total_plain_len = plaintext.len() as u64;
+    manifest.docs[doc_index].object_digest = digest;
+    install_manifest(relay, root, materials, index, &manifest);
+}
+
+fn corrupt_structure_manifest(
+    relay: &mut FakeRelay,
+    root: &RootSecretV1,
+    materials: &genesis::GenesisMaterials,
+    index: usize,
+) {
+    let mut manifest = load_manifest(relay, root, index);
+    manifest.structure_doc_id = "missing-structure".to_owned();
+    install_manifest(relay, root, materials, index, &manifest);
+}
+
+fn corrupt_codec(
+    relay: &mut FakeRelay,
+    root: &RootSecretV1,
+    materials: &genesis::GenesisMaterials,
+    index: usize,
+) {
+    rewrite_snapshot(
+        relay,
+        root,
+        materials,
+        index,
+        menghunote_sync::checkpoint::KIND_STRUCTURE,
+        |snapshot| {
+            snapshot.codec_version = "loro-v0".to_owned();
+        },
+    );
+}
+
+fn corrupt_actual_vv(
+    relay: &mut FakeRelay,
+    root: &RootSecretV1,
+    materials: &genesis::GenesisMaterials,
+    index: usize,
+) {
+    use menghunote_sync::checkpoint::KIND_STRUCTURE;
+    let mut manifest = load_manifest(relay, root, index);
+    let doc = manifest
+        .docs
+        .iter_mut()
+        .find(|doc| doc.kind == KIND_STRUCTURE)
+        .expect("structure doc");
+    let mut vv = loro::VersionVector::decode(&doc.vv).expect("vv");
+    vv.insert(0xDEAD, 7);
+    doc.vv = vv.encode();
+    install_manifest(relay, root, materials, index, &manifest);
+}
+
+fn run_bootstrap_with_target(
+    relay: &mut FakeRelay,
+    materials: &genesis::GenesisMaterials,
+) -> (
+    tempfile::TempDir,
+    menghunote_storage::Vault,
+    Result<menghunote_sync::bootstrap::BootstrapReport, menghunote_sync::SyncError>,
+) {
+    let (dir, target) = fresh_vault();
+    let result = bootstrap::run(
+        &target,
+        relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    );
+    (dir, target, result)
+}
+
+#[test]
+fn fallback_rejects_corrupt_structure_and_both_corrupt_writes_nothing() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_structured_source(&source, &mut relay, &materials);
+    let last = relay.published_checkpoints.len() - 1;
+
+    // 只腐坏 primary 的 structure 声明 → 整体回退 fallback，且只写 fallback 的 S/cursor。
+    corrupt_structure_manifest(&mut relay, &materials.root, &materials, last);
+    let fallback_s = relay.published_checkpoints[last - 1].covered_seq;
+    let (_target_dir, target, result) = run_bootstrap_with_target(&mut relay, &materials);
+    let report = result.expect("structure 腐坏必须回退 fallback");
+    assert!(
+        report.used_fallback,
+        "primary structure 腐坏必须 used_fallback"
+    );
+    assert_eq!(report.covered_seq, fallback_s);
+    assert_eq!(report.cursor, format!("c{fallback_s}"));
+    let notes = list_notes(&target).expect("notes");
+    assert_eq!(notes.len(), 1, "fallback 必须恢复自己的结构笔记");
+    let (body, _) = load_body_doc(
+        &target,
+        notes[0]
+            .body_doc_id
+            .as_deref()
+            .expect("notes 行必须有正文 doc id"),
+        materials.peer_id_u64(),
+        None,
+    )
+    .expect("body");
+    assert_eq!(body.text(), STRUCTURED_TEXT);
+
+    // 两基线 structure 都坏 → 失败且零写入/零水位/零 journal。
+    let acks_before = relay.acks.len();
+    corrupt_structure_manifest(&mut relay, &materials.root, &materials, last - 1);
+    let (_second_dir, second_target, result) = run_bootstrap_with_target(&mut relay, &materials);
+    assert!(result.is_err(), "两基线 structure 都坏必须失败");
+    assert_eq!(relay.acks.len(), acks_before, "失败不得 ACK");
+    assert!(list_all_docs(&second_target).expect("docs").is_empty());
+    assert!(baseline_apply_state(&second_target)
+        .expect("journal")
+        .is_none());
+    assert_no_sync_watermarks(&second_target);
+}
+
+#[test]
+fn fallback_rejects_unreadable_codec_and_both_corrupt_writes_nothing() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_structured_source(&source, &mut relay, &materials);
+    let last = relay.published_checkpoints.len() - 1;
+
+    corrupt_codec(&mut relay, &materials.root, &materials, last);
+    let fallback_s = relay.published_checkpoints[last - 1].covered_seq;
+    let (_target_dir, target, result) = run_bootstrap_with_target(&mut relay, &materials);
+    let report = result.expect("codec 腐坏必须回退 fallback");
+    assert!(report.used_fallback);
+    assert_eq!(report.covered_seq, fallback_s);
+    assert_eq!(report.cursor, format!("c{fallback_s}"));
+    assert_eq!(list_notes(&target).expect("notes").len(), 1);
+
+    let acks_before = relay.acks.len();
+    corrupt_codec(&mut relay, &materials.root, &materials, last - 1);
+    let (_second_dir, second_target, result) = run_bootstrap_with_target(&mut relay, &materials);
+    assert!(result.is_err(), "两基线 codec 都坏必须失败");
+    assert_eq!(relay.acks.len(), acks_before, "失败不得 ACK");
+    assert!(list_all_docs(&second_target).expect("docs").is_empty());
+    assert!(baseline_apply_state(&second_target)
+        .expect("journal")
+        .is_none());
+    assert_no_sync_watermarks(&second_target);
+}
+
+#[test]
+fn fallback_rejects_inflated_actual_vv_and_both_corrupt_writes_nothing() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_structured_source(&source, &mut relay, &materials);
+    let last = relay.published_checkpoints.len() - 1;
+
+    // manifest 宣称的 VV 高于快照真实历史：不能只信声明，必须整体回退。
+    corrupt_actual_vv(&mut relay, &materials.root, &materials, last);
+    let fallback_s = relay.published_checkpoints[last - 1].covered_seq;
+    let (_target_dir, target, result) = run_bootstrap_with_target(&mut relay, &materials);
+    let report = result.expect("actual VV 虚高必须回退 fallback");
+    assert!(report.used_fallback);
+    assert_eq!(report.covered_seq, fallback_s);
+    assert_eq!(report.cursor, format!("c{fallback_s}"));
+    assert_eq!(list_notes(&target).expect("notes").len(), 1);
+
+    let acks_before = relay.acks.len();
+    corrupt_actual_vv(&mut relay, &materials.root, &materials, last - 1);
+    let (_second_dir, second_target, result) = run_bootstrap_with_target(&mut relay, &materials);
+    assert!(result.is_err(), "两基线 actual VV 都虚高必须失败");
+    assert_eq!(relay.acks.len(), acks_before, "失败不得 ACK");
+    assert!(list_all_docs(&second_target).expect("docs").is_empty());
+    assert!(baseline_apply_state(&second_target)
+        .expect("journal")
+        .is_none());
+    assert_no_sync_watermarks(&second_target);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0013 §3：bootstrap 历史 anchor（rev 前进不能丢、不能跳过）
+// ---------------------------------------------------------------------------
+
+/// 第一条 rev2 管理转换（`to_epoch = EPOCH + 1`）：比当前 epoch 更晚，属于"未来"。
+fn future_manager_transition(instance_id: [u8; 16]) -> menghunote_sync::relay::ManagerChainEntry {
+    let transition = menghunote_sync::rotation::ManagerTransitionV1 {
+        vault_id: VAULT_ID,
+        instance_id,
+        rotation_id: [0x0b; 16],
+        from_epoch: EPOCH,
+        to_epoch: EPOCH + 1,
+        old_rev: 1,
+        new_rev: 2,
+        new_pubkey: [0x02; 32],
+        covered_seq: 0,
+    }
+    .encode()
+    .expect("管理转换编码");
+    menghunote_sync::relay::ManagerChainEntry {
+        rev: 2,
+        pubkey: [0x02; 32],
+        transition,
+        old_rev: 1,
+        old_signature: Some([0x03; 64]),
+        new_signature: Some([0x04; 64]),
+    }
+}
+
+/// 首次 bootstrap 用一条 rev1 genesis 管理链（真实 relay 的 `/control` 键 5 必然有它）。
+fn seed_manager_chain(relay: &mut FakeRelay, materials: &genesis::GenesisMaterials) {
+    relay.manager_chain = vec![menghunote_sync::relay::ManagerChainEntry {
+        rev: 1,
+        pubkey: materials.manager.public_key(),
+        transition: b"test-genesis".to_vec(),
+        old_rev: 1,
+        old_signature: None,
+        new_signature: None,
+    }];
+}
+
+#[test]
+fn bootstrap_anchor_is_recomputed_from_the_epoch_history_when_rev_advances() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    seed_manager_chain(&mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("首次 bootstrap");
+    let first_rev = relay.control_rev;
+    let anchor_hash = target
+        .get_meta(META_BOOTSTRAP_CONTROL_HASH)
+        .expect("control hash")
+        .expect("锚必须写入");
+
+    // control_rev 前进 + 管理链多一条"未来 epoch"的转换：旧锚必须按旧 epoch 的链前缀
+    // 复算，而不是拿新 rev / 全链复算（那会算出不同摘要），也不能干脆忽略。
+    relay.control_rev = first_rev + 1;
+    relay
+        .manager_chain
+        .push(future_manager_transition(relay.instance_id));
+    let state = relay.state().expect("state");
+    let chain = relay.management_chain().expect("chain");
+    let full_chain_hash = control_head_hash(&state, &chain);
+    assert_ne!(
+        full_chain_hash.as_slice(),
+        anchor_hash.as_slice(),
+        "新 rev + 全链的摘要必须与旧锚不同（否则这条用例证明不了历史视图被用到）"
+    );
+
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("rev 前进但历史前缀未变时必须允许（按 epoch 截断后的旧视图验证）");
+    // pins 前进到新 rev / 新摘要。
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_REV)
+            .expect("control rev")
+            .as_deref(),
+        Some((first_rev + 1).to_be_bytes().as_slice())
+    );
+}
+
+#[test]
+fn bootstrap_anchor_rejects_a_rewritten_prefix_when_rev_advances() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    seed_manager_chain(&mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("首次 bootstrap");
+    let first_rev = relay.control_rev;
+
+    // rev 前进，但 genesis 那条被换掉（历史前缀被重写）。
+    relay.control_rev = first_rev + 1;
+    relay.manager_chain[0].transition = b"rewritten-genesis".to_vec();
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("旧锚未被新链覆盖必须拒绝，不能当 rev 前进就跳过");
+    assert!(
+        matches!(error, menghunote_sync::SyncError::Equivocation(_)),
+        "{error:?}"
+    );
+    // 失败路径不得改写本地 pin。
+    assert_eq!(
+        target
+            .get_meta(META_BOOTSTRAP_CONTROL_REV)
+            .expect("control rev")
+            .as_deref(),
+        Some(first_rev.to_be_bytes().as_slice())
+    );
+}
+
+#[test]
+fn bootstrap_anchor_same_rev_hash_swap_is_equivocation() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    seed_manager_chain(&mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("首次 bootstrap");
+
+    // 同 rev 换摘要：必须 equivocation（不是"没有锚"、也不是普通 Object 错误）。
+    let mut swapped = target
+        .get_meta(META_BOOTSTRAP_CONTROL_HASH)
+        .expect("control hash")
+        .expect("锚");
+    swapped[0] ^= 0xFF;
+    target
+        .set_meta(META_BOOTSTRAP_CONTROL_HASH, &swapped)
+        .expect("改写摘要");
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("同 rev 换 hash 必须拒绝");
+    assert!(
+        matches!(error, menghunote_sync::SyncError::Equivocation(_)),
+        "{error:?}"
+    );
+}
+
 `````
 
 
 ---
 
-# 附录 C：完整 code diff（`5d01e9e..7583d8a`）
+# 附录 C：Phase 1B diff（`7583d8a..038e92c`）
 
 `````diff
-diff --git a/crates/storage/src/actor.rs b/crates/storage/src/actor.rs
-index 6824e6c..0b4f53a 100644
---- a/crates/storage/src/actor.rs
-+++ b/crates/storage/src/actor.rs
-@@ -263,7 +263,11 @@ impl Vault {
-         self.inner.take_reconcile_required()
-     }
- 
--    /// 读一条 meta（键值 BLOB）；不存在返回 `None`。
-+    /// 读一条 meta（键值 BLOB）；键不存在返回 `None`。
-+    ///
-+    /// 判定与另两个入口共享同一个 helper（`sync_meta::meta_bytes_of`）：**只认 BLOB**，
-+    /// TEXT/INTEGER/REAL 都是 [`StorageError::Corrupt`]，不会静默当成"没有这条 meta"
-+    /// ——否则 `sync.repack_required` / `sync.log_id` 之类持久屏障会被绕过。
-     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-         self.call(|reply| Command::GetMeta {
-             key: key.to_owned(),
-@@ -328,6 +332,10 @@ impl Vault {
-     /// 低层事务命令：多条语句在同一事务里执行，`guards` 不满足则整笔回滚。
-     ///
-     /// 返回每条语句的影响行数（顺序与 `statements` 一致）。
-+    ///
-+    /// 事务以 `BEGIN IMMEDIATE` 显式开启（与批量 inbox 入口共用
-+    /// [`begin_immediate`]）：写锁在事务开始就取，并发写者按 `busy_timeout` 排队，
-+    /// 而不是在第一条语句处撞上"锁升级不走 busy handler"的立即失败。
-     pub fn exec_transaction(
-         &self,
-         statements: &[Statement],
-@@ -433,7 +441,8 @@ fn handle_command(conn: &Connection, command: Command) {
-             let _ = reply.send(exec_transaction(conn, &statements, &guards));
-         }
-         Command::GetMeta { key, reply } => {
--            let _ = reply.send(get_meta(conn, &key));
-+            // 与 sync_bridge / sync_meta 同一个读取 helper（只认 BLOB，其它类型报损坏）。
-+            let _ = reply.send(sync_meta::read_meta_on(conn, &key));
-         }
-         Command::UserVersion { reply } => {
-             let _ = reply.send(migrate::user_version(conn));
-@@ -447,6 +456,30 @@ fn handle_command(conn: &Connection, command: Command) {
-     }
- }
- 
-+/// 在连接上显式开启一个 **Immediate** 写事务（`BEGIN IMMEDIATE`）。
-+///
-+/// 为什么不用 deferred（`conn.unchecked_transaction()` 的默认行为）：
-+///
-+/// - deferred 的 `BEGIN` 只是登记，第一条 SELECT 拿共享锁，等到第一条写语句才尝试把
-+///   共享锁升级成写锁；而 SQLite 的锁升级**不走 busy handler**——此刻若已有别的写事务
-+///   在途，不会用 `busy_timeout` 等待，而是直接返回 `SQLITE_BUSY`，让调用方在"最多等
-+///   5s"的预期之外立刻失败；
-+/// - `BEGIN IMMEDIATE` 在事务开始就取写锁，这一步**照常**受 `busy_timeout` 约束，与
-+///   ADR 0001 §3.9「每 vault 单 writer actor」的模型一致：写事务不该和别的写事务撞在
-+///   升级点上。
-+///
-+/// 两个写事务入口都走这里，论证只写在这一处（避免注释在两个调用点各改一半而漂移）：
-+///
-+/// - [`exec_inbox_batch`]：先读后写，deferred 会在锁升级处失败，且读到的旧快照还会先
-+///   报出误导性的 `SyncConflict`；
-+/// - [`exec_transaction`]：承载 A 事务/资产/repack/finish，调用方习惯把写语句放最前，
-+///   但**没有任何断言**保证这一点（以后多一条只读语句就退化成升级路径），所以同样
-+///   显式 Immediate。
-+fn begin_immediate(conn: &Connection) -> Result<Transaction<'_>, StorageError> {
-+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-+    Ok(tx)
-+}
-+
- /// 批量 inbox 的原子执行。
- ///
- /// 全部动作在 worker 持有独占连接上的**同一个事务**里：
-@@ -463,8 +496,8 @@ fn handle_command(conn: &Connection, command: Command) {
- /// 先读后写的竞态因此被消除：快照与插入属于同一个写事务（SQLite 的单写者锁），
- /// 且一次提交只产生一次 fsync；崩溃/冲突只会留下「什么都没发生」或「行+前缀一起提交」。
- ///
--/// 事务用 **Immediate** 显式开启（而不是 deferred）：本事务先读后写，deferred 的锁升级
--/// 详见下方注释。
-+/// 事务用 [`begin_immediate`] 显式开启（而不是 deferred）：本事务先读后写，deferred
-+/// 的锁升级不走 busy handler，完整论证见该函数。
- fn exec_inbox_batch(
-     conn: &Connection,
-     mut rows: Vec<InboxBatchRow>,
-@@ -495,16 +528,9 @@ fn exec_inbox_batch(
-         });
-     }
- 
--    // 显式 **Immediate** 事务（不是 deferred）：
--    //
--    // 本事务里先读（校验 `sync.log_id`、比对 `[first_seq,last_seq]` 既有行）再写
--    // （插新行、推进 received 前缀）。Deferred 事务的 `BEGIN` 只是登记，第一条 SELECT
--    // 拿共享锁，等到第一条写语句才尝试把共享锁升级成写锁；而 SQLite 的锁升级**不走
--    // busy handler**——此刻若已有别的写事务在途，不会用 `busy_timeout` 等待，而是直接
--    // 返回 `SQLITE_BUSY`，让调用方在"最多等 5s"的预期之外立刻失败。`BEGIN IMMEDIATE`
--    // 在事务开始就取写锁（这一步照常受 `busy_timeout` 约束），与 ADR 0001 §3.9
--    // 「每 vault 单 writer actor」的模型一致：写事务不该和别的写事务撞在升级点上。
--    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-+    // 事务模式与锁升级论证收在 [`begin_immediate`]：本事务先读后写，deferred 会在锁
-+    // 升级处立即 SQLITE_BUSY（见该函数的注释）。
-+    let tx = begin_immediate(conn)?;
-     sync_meta::ensure_log_id_on(&tx, &log_id)?;
- 
-     let first_seq = rows.first().map_or(0, |row| row.relay_seq);
-@@ -613,29 +639,6 @@ fn i64_of(value: u64) -> Result<i64, StorageError> {
-     })
- }
- 
--/// 读一条 meta。
--fn get_meta(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
--    let mut statement = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
--    let mut rows = statement.query([key])?;
--    match rows.next()? {
--        None => Ok(None),
--        Some(row) => match row.get::<usize, Value>(0)? {
--            Value::Blob(blob) => Ok(Some(blob)),
--            Value::Text(text) => Ok(Some(text.into_bytes())),
--            other => Err(StorageError::ManifestShape {
--                column: "meta.value",
--                found: match other {
--                    Value::Null => "NULL",
--                    Value::Integer(_) => "INTEGER",
--                    Value::Real(_) => "REAL",
--                    Value::Text(_) => "TEXT",
--                    Value::Blob(_) => "BLOB",
--                },
--            }),
--        },
--    }
--}
--
- /// 执行单条写语句。
- fn exec(conn: &Connection, sql: &str, params: &[Value]) -> Result<usize, StorageError> {
-     let mut statement = conn.prepare(sql)?;
-@@ -665,8 +668,9 @@ fn exec_transaction(
-     statements: &[Statement],
-     guards: &[AffectedGuard],
- ) -> Result<Vec<usize>, StorageError> {
--    // 连接由工作线程独占，不会有嵌套事务，所以用 &self 版本的 unchecked_transaction
--    let tx = conn.unchecked_transaction()?;
-+    // 连接由工作线程独占，不会有嵌套事务；事务模式与批量 inbox 共用 begin_immediate
-+    // （锁升级论证见该函数），语句顺序/守卫/CAS 语义都不变。
-+    let tx = begin_immediate(conn)?;
- 
-     // 守卫必须在**该语句执行后立刻**校验：否则后续语句可能先撞 UNIQUE/FK，
-     // 把「head 被人推进了」这个真正原因盖掉（CAS 语义要求先于任何写入冲突暴露）。
 diff --git a/crates/storage/src/baseline_apply.rs b/crates/storage/src/baseline_apply.rs
-index b44412d..53fde44 100644
+index 53fde44..0e0da63 100644
 --- a/crates/storage/src/baseline_apply.rs
 +++ b/crates/storage/src/baseline_apply.rs
-@@ -14,11 +14,17 @@
- //!   `sync.remote_known_vv.<doc_id>`（见 [`crate::remote_known`]），跨 journal 保留，
- //!   供后续 tombstone 判定区分「远端已删的已同步文档」与「local-only 文档」。
- //! - `finish` 只做**单调**水位/cursor CAS 与 journal 状态迁移；失败不推进任何 cursor。
-+//! - `begin` 记录本 checkpoint 的**预期参与集合**（覆盖到的 doc 与资产，存于既有 `meta`
-+//!   单行、只本地可见）：`finish` 必须先证明集合里每一项都已 `applied=1`，才允许写任何
-+//!   meta；少跑一批（或跑错集合）返回 [`BaselineApplyFinish::Conflict`]，而不是推进 S
-+//!   之后让 pull 永久跳过 relay 事件。
-+//! - tombstone 的 outbox 判定会在**同一写事务内**用 SQL 重判一次：判定完成后被并发写入的
-+//!   outbox 行只会把 `deleted` 退化为 `kept_local_edit`，绝不误删本地编辑。
- //! - `abort` 只清 staging，不删已导入的 Loro/asset 数据，也不回滚远端已知 VV。
- 
- use std::cell::RefCell;
- use std::collections::{BTreeMap, BTreeSet};
--use std::time::{Instant, SystemTime, UNIX_EPOCH};
-+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
- 
- use loro::VersionVector;
- use rusqlite::types::Value;
-@@ -39,6 +45,21 @@ use crate::Vault;
- pub const BASELINE_MERGE_BATCH: &str = "baseline_merge";
- /// relay 页面 cursor 的 meta 键（与 sync `engine::RELAY_CURSOR_META` 对齐）。
- pub const META_SYNC_RELAY_CURSOR: &str = "sync.relay_cursor";
-+/// [`BaselineExpectation`] 的持久化 meta 键（**只本地可见**；不是 schema/wire）。
-+pub const META_BASELINE_EXPECTED: &str = "sync.baseline_expected";
-+/// 导入后读回校验失败的持久标记（**只本地可见**；不是 schema/wire）。
-+///
-+/// 为什么不是 `baseline_apply.status='failed'`：schema v3 的
-+/// `CHECK(status IN('staging','completed'))` 不允许新值（见
-+/// `crates/storage/src/schema/v3.sql`），加状态需要 DDL/迁移，超出同步硬化 P1 的边界。
-+/// 失败语义改由本 meta 键承载：journal 保持 `staging`（已导入的 Loro/资产数据全部
-+/// 保留，便于诊断/重跑），但 [`begin_baseline_apply`] 见到该键一律拒绝，必须先
-+/// [`abort_baseline_apply`] 清理（abort 同时删除本键）。
-+pub const META_BASELINE_VERIFY_FAILED: &str = "sync.baseline_verify_failed";
-+/// 预期集合编码的魔数（防止误读旧值/损坏值）。
-+const EXPECTED_MAGIC: &[u8] = b"MNBASEEXP1";
-+/// 失败标记编码的魔数（`magic | utf8 reason`，防止把任意 BLOB 误读成失败标记）。
-+const VERIFY_FAILED_MAGIC: &[u8] = b"MNBASEVERIFYFAIL1";
- /// storage 内部构造 BodyDoc 时使用的 peer id（只影响新文档的本地 op id，不影响 import）。
- const BASELINE_PEER_ID: u64 = 1;
- 
-@@ -65,6 +86,12 @@ pub struct BaselineApplyDebugTimings {
-     pub transaction_ns: u64,
-     /// 整个 `apply_baseline_batch`。
-     pub batch_total_ns: u64,
-+    /// 导入后读回校验（sync 的 `verify_imported`）耗时。
-+    ///
-+    /// **只读指标**：不参与任何决策；由 sync 的 bootstrap 调用
-+    /// [`record_baseline_verify_time`] 记录，Phase1B 的 gate_hold 报告可在同一线程
-+    /// 通过 [`baseline_apply_debug_timings`] 或 [`baseline_apply_verify_ms`] 读取。
-+    pub verify_ns: u64,
- }
- 
- /// 基线 apply 的计数（**仅用于基准/诊断**；按线程累计，不持久化）。
-@@ -114,6 +141,26 @@ pub fn baseline_apply_debug_counters() -> BaselineApplyDebugCounters {
-     BASELINE_DEBUG.with(|acc| acc.borrow().counters)
- }
- 
-+/// 记录一次导入后读回校验（sync 的 `verify_imported`）耗时。
-+///
-+/// **只读指标**：不参与任何决策，也不持久化；与其它分段计时一样按线程累计。
-+/// Phase1B 的 gate_hold 报告可在同一线程读取 [`baseline_apply_debug_timings`] 的
-+/// `verify_ns`（或 [`baseline_apply_verify_ms`]）。
-+#[doc(hidden)]
-+pub fn record_baseline_verify_time(elapsed: Duration) {
-+    let elapsed = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-+    BASELINE_DEBUG.with(|acc| {
-+        let mut acc = acc.borrow_mut();
-+        acc.timings.verify_ns = acc.timings.verify_ns.saturating_add(elapsed);
-+    });
-+}
-+
-+/// 当前线程累计的读回校验耗时（毫秒，向下取整；只读指标，不参与决策）。
-+#[doc(hidden)]
-+pub fn baseline_apply_verify_ms() -> u64 {
-+    baseline_apply_debug_timings().verify_ns / 1_000_000
-+}
-+
- fn debug_add_time<F>(field: F, started: Instant)
- where
-     F: FnOnce(&mut BaselineApplyDebugTimings) -> &mut u64,
-@@ -165,7 +212,11 @@ pub struct BaselineApplyState {
-     pub applied_docs: u64,
-     pub applied_assets: u64,
-     pub kept_local_edit: u64,
--    /// staging 状态且没有未完成子步骤时为 true；finish 还要求 cursor CAS 通过。
-+    /// begin 记录的预期文档数；没有记录（旧 journal/损坏）时为 `None`，此时不可 finish。
-+    pub expected_docs: Option<u64>,
-+    /// begin 记录的预期资产数；同上。
-+    pub expected_assets: Option<u64>,
-+    /// staging 且 begin 记录的预期集合已全部 `applied=1` 时为 true；finish 还要求 cursor CAS 通过。
-     pub finishable: bool,
-     /// 所选基线自带的 relay cursor；是否真正写进 `meta` 取决于 finish 的单调判断。
-     pub chosen_cursor: Option<String>,
-@@ -177,10 +228,126 @@ pub enum BaselineApplyFinish {
-     /// 成功推进 cursor；携带 completed 状态。
-     Applied(BaselineApplyState),
-     NotFound,
--    /// begin 记录的水位/游标已被并发改写、S 不符或批次未完成；未修改任何行。
-+    /// begin 记录的水位/游标已被并发改写、S 不符、或预期参与集合未全部应用；
-+    /// 未修改任何行。
-     Conflict,
- }
- 
-+/// `begin_baseline_apply` 记录的**预期参与集合**：本 checkpoint 覆盖的全部文档与资产。
-+///
-+/// 为什么需要：journal 只记录「已应用了多少」，不记录「本来应该应用哪些」。少跑一批
-+/// （进程被杀、调用方漏批、fallback 选错集）时旧实现仍能 finish 并推进 S，随后普通 pull
-+/// 会把这段前缀当成已消费，**永久跳过其中所有 relay 事件**。
-+///
-+/// 集合以单条 [`META_BASELINE_EXPECTED`] `meta` 行持久化（不新增列/表、不参与同步、不是
-+/// wire）；`new` 会排序去重，因此同一集合的不同传入顺序被视为同一份预期。
-+#[derive(Debug, Clone, Default, PartialEq, Eq)]
-+pub struct BaselineExpectation {
-+    docs: Vec<String>,
-+    assets: Vec<[u8; 32]>,
-+}
-+
-+impl BaselineExpectation {
-+    /// 规范化（排序 + 去重）后构造。
-+    pub fn new(
-+        docs: impl IntoIterator<Item = String>,
-+        assets: impl IntoIterator<Item = [u8; 32]>,
-+    ) -> Self {
-+        let mut docs: Vec<String> = docs.into_iter().collect();
-+        docs.sort_unstable();
-+        docs.dedup();
-+        let mut assets: Vec<[u8; 32]> = assets.into_iter().collect();
-+        assets.sort_unstable();
-+        assets.dedup();
-+        Self { docs, assets }
-+    }
-+
-+    /// 预期的文档 id（已排序去重）。
-+    pub fn docs(&self) -> &[String] {
-+        &self.docs
-+    }
-+
-+    /// 预期的资产 object_id（已排序去重）。
-+    pub fn assets(&self) -> &[[u8; 32]] {
-+        &self.assets
-+    }
-+
-+    /// 预期文档数。
-+    pub fn doc_count(&self) -> u64 {
-+        u64::try_from(self.docs.len()).unwrap_or(u64::MAX)
-+    }
-+
-+    /// 预期资产数。
-+    pub fn asset_count(&self) -> u64 {
-+        u64::try_from(self.assets.len()).unwrap_or(u64::MAX)
-+    }
-+
-+    /// 集合是否为空（空集合视为"begin 已显式声明无需应用任何项"）。
-+    pub fn is_empty(&self) -> bool {
-+        self.docs.is_empty() && self.assets.is_empty()
-+    }
-+
-+    /// 编码成单条 `meta` 值：`magic | doc_count | (len,doc)* | asset_count | oid*`（全部 BE）。
-+    fn encode(&self) -> Vec<u8> {
-+        let mut out = Vec::with_capacity(
-+            EXPECTED_MAGIC.len()
-+                + 16
-+                + self.docs.iter().map(|doc| 8 + doc.len()).sum::<usize>()
-+                + self.assets.len() * 32,
-+        );
-+        out.extend_from_slice(EXPECTED_MAGIC);
-+        out.extend_from_slice(&self.doc_count().to_be_bytes());
-+        for doc in &self.docs {
-+            let len = u64::try_from(doc.len()).unwrap_or(u64::MAX);
-+            out.extend_from_slice(&len.to_be_bytes());
-+            out.extend_from_slice(doc.as_bytes());
-+        }
-+        out.extend_from_slice(&self.asset_count().to_be_bytes());
-+        for asset in &self.assets {
-+            out.extend_from_slice(asset);
-+        }
-+        out
-+    }
-+
-+    /// 解码并校验 `encode` 的输出；任何不合法都视为本地 meta 损坏（fail-closed）。
-+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-+        let mut offset = 0usize;
-+        let magic = take_expected_bytes(bytes, &mut offset, EXPECTED_MAGIC.len())?;
-+        if magic != EXPECTED_MAGIC {
-+            return Err(corrupt_expected("魔数不符"));
-+        }
-+        let doc_count = read_expected_u64(bytes, &mut offset)?;
-+        let doc_count =
-+            usize::try_from(doc_count).map_err(|_| corrupt_expected("doc 数超过 usize"))?;
-+        // 损坏数据不得预分配过大内存。
-+        let mut docs = Vec::with_capacity(doc_count.min(64));
-+        for _ in 0..doc_count {
-+            let len = read_expected_u64(bytes, &mut offset)?;
-+            let len = usize::try_from(len).map_err(|_| corrupt_expected("doc 长度超过 usize"))?;
-+            let raw = take_expected_bytes(bytes, &mut offset, len)?;
-+            let doc = std::str::from_utf8(raw)
-+                .map_err(|_| corrupt_expected("doc_id 不是 UTF-8"))?
-+                .to_owned();
-+            docs.push(doc);
-+        }
-+        let asset_count = read_expected_u64(bytes, &mut offset)?;
-+        let asset_count =
-+            usize::try_from(asset_count).map_err(|_| corrupt_expected("资产数超过 usize"))?;
-+        let mut assets = Vec::with_capacity(asset_count.min(64));
-+        for _ in 0..asset_count {
-+            let raw = take_expected_bytes(bytes, &mut offset, 32)?;
-+            let object_id: [u8; 32] = raw
-+                .try_into()
-+                .map_err(|_| corrupt_expected("object_id 长度非法"))?;
-+            assets.push(object_id);
-+        }
-+        if offset != bytes.len() {
-+            return Err(corrupt_expected("尾部有多余字节"));
-+        }
-+        Ok(Self { docs, assets })
-+    }
-+}
-+
- /// 一个已验证的基线资产（HMAC oid 是 relay 对象名；明文 hash 是真实 sha256）。
- #[derive(Debug, Clone, PartialEq, Eq)]
- pub struct BaselineAsset {
-@@ -212,8 +379,14 @@ struct PreparedDoc {
-     baseline_vv: Vec<u8>,
-     expected_head: Option<HeadState>,
-     update: Option<PendingUpdate>,
-+    /// 读到的旧「远端已知 VV」（值 CAS 的期望值；`None` = 读时不存在）。
-+    ///
-+    /// 写入必须走 CAS（P2-5）：本批准备期间，普通 pull 的 A 事务完全可能已经把同一个
-+    /// `sync.remote_known_vv.<doc_id>` 扩大；无条件覆盖会把它退回到本批的并集（丢失
-+    /// 远端已知证据 → tombstone 误判为 local-only，只会保守保留，但证据丢了）。
-+    remote_known_expected: Option<VersionVector>,
-     /// 合并后的远端已知 VV（写入 `sync.remote_known_vv.<doc_id>`）。
--    remote_known: Vec<u8>,
-+    remote_known_merged: VersionVector,
- }
- struct PreparedTombstone {
-     doc_id: String,
-@@ -227,14 +400,81 @@ struct PreparedAsset {
-     statement: Option<Statement>,
- }
- 
--/// 开始一次 baseline apply staging；同参数重复调用幂等，冲突参数返回 SyncConflict。
-+/// 记录「baseline 导入后的读回校验失败」。
-+///
-+/// 只写一条本地 `meta`（BLOB：魔数 + UTF-8 原因），**不改** `baseline_apply.status`
-+/// （schema v3 的 CHECK 只允许 `staging/completed`，新增 `failed` 需要 DDL/迁移）。
-+/// journal 与已导入的 Loro/资产数据原样保留：CRDT merge 幂等，回滚已 merge 的数据会
-+/// 丢掉本地编辑（本地 op 可能已经与基线 ops 合进同一条 update，无法原样拆分）。
-+///
-+/// 契约：标记存在时 [`begin_baseline_apply`] 一律拒绝；必须先 [`abort_baseline_apply`]
-+/// 清理失败 journal（abort 同时删除本标记）。
-+pub fn mark_baseline_verify_failed(vault: &Vault, reason: &str) -> Result<(), StorageError> {
-+    let mut value = Vec::with_capacity(VERIFY_FAILED_MAGIC.len() + reason.len());
-+    value.extend_from_slice(VERIFY_FAILED_MAGIC);
-+    value.extend_from_slice(reason.as_bytes());
-+    vault.set_meta(META_BASELINE_VERIFY_FAILED, &value)
-+}
-+
-+/// 失败标记存在时统一的拒绝错误：必须带原因，并明确唯一清理入口是 abort。
-+fn verify_failed_conflict(reason: &str, action: &str) -> StorageError {
-+    StorageError::SyncConflict {
-+        context: format!(
-+            "baseline 导入的读回校验已失败（{META_BASELINE_VERIFY_FAILED}: {reason}）；\
-+             {action} 已拒绝且零写入，必须先 abort_baseline_apply 清理失败 journal 与标记"
-+        ),
-+    }
-+}
-+
-+/// 读失败标记的原因；没有标记返回 `None`。
-+///
-+/// 标记存在但编码非法（缺魔数/非 UTF-8）返回 [`StorageError::Corrupt`]，不静默当成
-+/// 「没有失败」——那会让 `begin` 放行一份未知状态的 journal。
-+pub fn baseline_verify_failure(vault: &Vault) -> Result<Option<String>, StorageError> {
-+    let Some(bytes) = vault.get_meta(META_BASELINE_VERIFY_FAILED)? else {
-+        return Ok(None);
-+    };
-+    let reason = bytes
-+        .strip_prefix(VERIFY_FAILED_MAGIC)
-+        .ok_or_else(|| StorageError::Corrupt {
-+            context: format!("{META_BASELINE_VERIFY_FAILED} 编码非法（缺魔数）"),
-+        })?;
-+    String::from_utf8(reason.to_vec())
-+        .map(Some)
-+        .map_err(|_| StorageError::Corrupt {
-+            context: format!("{META_BASELINE_VERIFY_FAILED} 原因不是合法 UTF-8"),
-+        })
-+}
-+
-+/// 开始一次 baseline apply staging；同参数（含预期参与集合）重复调用幂等，冲突参数返回
-+/// SyncConflict。
-+///
-+/// `expected` 必须覆盖**本 checkpoint 的全部** docs 与资产：finish 前会拿它逐项核对
-+/// `baseline_apply_docs/applied=1` 与 `baseline_apply_assets/applied=1`（见
-+/// [`BaselineExpectation`]）。同一 checkpoint/S/cursor 但 `expected` 不同 → 冲突，
-+/// 不会静默沿用旧集合。
-+///
-+/// 若存在 [`META_BASELINE_VERIFY_FAILED`] 标记（上一次导入读回校验失败），本函数**拒绝**
-+/// 一切 begin（包括同参数幂等续跑），必须先 [`abort_baseline_apply`]。
- pub fn begin_baseline_apply(
-     vault: &Vault,
-     checkpoint_id: &[u8; 16],
-     baseline_s: u64,
-     source_cursor: &str,
-+    expected: &BaselineExpectation,
- ) -> Result<BaselineApplyState, StorageError> {
-+    // 失败标记优先于幂等/冲突判断：journal 仍是 staging（schema 不允许新 status），
-+    // 但语义上已不可续跑；必须先 abort 清理失败 journal 与标记。
-+    if let Some(reason) = baseline_verify_failure(vault)? {
-+        return Err(StorageError::SyncConflict {
-+            context: format!(
-+                "baseline 导入的读回校验已失败（{META_BASELINE_VERIFY_FAILED}: {reason}）；\
-+                 已 merge 的 Loro/资产数据仍保留，必须先 abort_baseline_apply 清理失败 journal"
-+            ),
-+        });
-+    }
-     let now = now_secs()?;
-+    let expected_bytes = expected.encode();
-     let existing = load_journal(vault)?;
-     if let Some(existing) = &existing {
-         if existing.status == BaselineApplyStatus::Staging
-@@ -242,7 +482,16 @@ pub fn begin_baseline_apply(
-             && existing.baseline_s == baseline_s
-             && existing.source_cursor == source_cursor
-         {
--            return state_from_journal(existing);
-+            // 同参数重入必须幂等（崩溃续跑路径）；但预期集合必须对得上：
-+            // 旧 journal 没有集合记录、或调用方换了集合，都不能静默继续。
-+            let stored = vault.get_meta(META_BASELINE_EXPECTED)?;
-+            if stored.as_deref() != Some(expected_bytes.as_slice()) {
-+                return Err(StorageError::SyncConflict {
-+                    context: "同一 checkpoint 的 baseline apply staging 已有另一份预期参与集合"
-+                        .to_owned(),
-+                });
+@@ -1637,17 +1637,22 @@ fn state_from_journal(
+         Some(expected) => (Some(expected.doc_count()), Some(expected.asset_count())),
+         None => (None, None),
+     };
+-    // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
+-    // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
++    // finishable 是 **O(1) 近似**：只校验 status 与「已应用计数 == 预期计数」。
++    // 逐项 `applied=1`/摘要的精确证明只在 `finish_baseline_apply` 里做：
++    //   - 这样 Phase1B 的 catchup 循环每次 batch 后读 state 不会做 O(N) 查询；
++    //   - 代价是计数相等但底层行损坏时 finishable 可能短暂为 true，finish 会
++    //     `Conflict` 且零写，不会误推进水位。
+     //
+     // 失败标记存在时 journal 仍是 staging（schema v3 的 CHECK 只允许 staging/completed），
+-    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false，否则 UI/续跑逻辑
+-    // 会把"读回校验失败"当成"可以 finish"。标记损坏返回 Corrupt，同样是 fail-closed。
++    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false。
+     let verify_failed = baseline_verify_failure(vault)?.is_some();
+     let finishable = !verify_failed
+         && journal.status == BaselineApplyStatus::Staging
+         && match &expected {
+-            Some(expected) => expected_is_complete(vault, journal, expected)?,
++            Some(expected) => {
++                journal.applied_docs == expected.doc_count()
++                    && journal.applied_assets == expected.asset_count()
 +            }
-+            return state_from_journal(vault, existing);
-         }
-         if existing.status == BaselineApplyStatus::Staging {
-             return Err(StorageError::SyncConflict {
-@@ -256,38 +505,43 @@ pub fn begin_baseline_apply(
- 
-     let mut statements = Vec::new();
-     let mut guards = Vec::new();
--    if existing.is_some() {
--        // completed 的 journal 可以安全替换；旧 journal 子表只属于它。
--        //
--        // 但 `baseline_apply_docs.baseline_vv` 是**跨 journal 仍然有效**的
--        // 「远端已知 VV」证据：必须在删除前落到非破坏性本地 meta 里，
--        // 否则已有设备下一次快照追赶时会把远端已删文档误判成 local-only。
--        //
--        // `DO NOTHING`：已有 meta（普通 pull/integrate 记录的更新的远端已知 VV）
--        // 永远不降级；缺失时才由旧 baseline_vv 补上。
--        statements.push(Statement::new(
--            format!(
--                "INSERT INTO meta(key,value) \
--                 SELECT '{}' || doc_id, baseline_vv FROM baseline_apply_docs WHERE applied=1 \
--                 ON CONFLICT(key) DO NOTHING",
--                remote_known::META_REMOTE_KNOWN_VV_PREFIX
--            ),
--            Vec::new(),
--        ));
--        statements.push(Statement::new(
--            "DELETE FROM baseline_apply_docs",
--            Vec::new(),
--        ));
--        statements.push(Statement::new(
--            "DELETE FROM baseline_apply_tombstones",
--            Vec::new(),
--        ));
--        statements.push(Statement::new(
--            "DELETE FROM baseline_apply_assets",
--            Vec::new(),
--        ));
--        statements.push(Statement::new("DELETE FROM baseline_apply", Vec::new()));
--    }
-+    // 旧 journal 子表的「远端已知 VV」证据回填 + 清理。
-+    //
-+    // `baseline_apply_docs.baseline_vv` 是**跨 journal 仍然有效**的「远端已知 VV」
-+    // 证据：必须在删除前落到非破坏性本地 meta 里，否则已有设备下一次快照追赶时会把
-+    // 远端已删文档误判成 local-only（只会保守保留，但证据丢了）。
-+    //
-+    // **无条件执行**（P2-5）：走到这里只可能是「没有 journal」或「completed journal」
-+    // （staging 同参已幂等早退、异参已 SyncConflict 返回）。completed journal 的
-+    // baseline_vv 要回填；没有 journal 但残留子表（旧版本/异常写留下的孤儿行）也必须
-+    // 先回填再清掉，否则下面无条件 `DELETE` 会把证据静默丢弃。
-+    //
-+    // `DO NOTHING` 是单调断言：已有 meta（普通 pull/integrate 记录的更新的远端已知 VV）
-+    // 永远不降级；缺失时才由旧 baseline_vv 补上。
-+    statements.push(Statement::new(
-+        format!(
-+            "INSERT INTO meta(key,value) \
-+             SELECT '{}' || doc_id, baseline_vv FROM baseline_apply_docs WHERE applied=1 \
-+             ON CONFLICT(key) DO NOTHING",
-+            remote_known::META_REMOTE_KNOWN_VV_PREFIX
-+        ),
-+        Vec::new(),
-+    ));
-+    // 旧 journal 子表只属于旧 journal（completed 或孤儿残留），一律清掉，
-+    // 避免它们被下一轮 `apply_baseline_batch` 当成「已应用」。
-+    statements.push(Statement::new(
-+        "DELETE FROM baseline_apply_docs",
-+        Vec::new(),
-+    ));
-+    statements.push(Statement::new(
-+        "DELETE FROM baseline_apply_tombstones",
-+        Vec::new(),
-+    ));
-+    statements.push(Statement::new(
-+        "DELETE FROM baseline_apply_assets",
-+        Vec::new(),
-+    ));
-+    statements.push(Statement::new("DELETE FROM baseline_apply", Vec::new()));
-     let insert_index = statements.len();
-     statements.push(Statement::new(
-         "INSERT INTO baseline_apply(\
-@@ -309,6 +563,19 @@ pub fn begin_baseline_apply(
-     ));
-     guards.push(AffectedGuard::exactly(insert_index, 1));
- 
-+    // 预期参与集合随 journal 同事务落 meta（replace 语义：completed journal 被替换时
-+    // 旧集合必须一起被覆盖，否则 finish 会拿上一轮的集合核对本轮进度）。
-+    let expected_index = statements.len();
-+    statements.push(Statement::new(
-+        "INSERT INTO meta(key,value) VALUES(?1,?2) \
-+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-+        vec![
-+            Value::Text(META_BASELINE_EXPECTED.to_owned()),
-+            Value::Blob(expected_bytes),
-+        ],
-+    ));
-+    guards.push(AffectedGuard::exactly(expected_index, 1));
-+
-     match vault.exec_transaction(&statements, &guards) {
-         Ok(_) => {}
-         Err(StorageError::GuardFailed { .. }) => {
-@@ -325,20 +592,30 @@ pub fn begin_baseline_apply(
- 
- /// 当前 staging journal 的只读状态；没有 journal 返回 `None`。
- pub fn baseline_apply_state(vault: &Vault) -> Result<Option<BaselineApplyState>, StorageError> {
--    load_journal(vault)?
--        .map(|journal| state_from_journal(&journal))
--        .transpose()
-+    match load_journal(vault)? {
-+        None => Ok(None),
-+        Some(journal) => state_from_journal(vault, &journal).map(Some),
-+    }
- }
- 
- /// 应用一批已验证的快照文档和远端 tombstone。
-+///
-+/// 若存在 [`META_BASELINE_VERIFY_FAILED`] 标记，本函数在**任何解码/写事务之前**返回
-+/// [`StorageError::SyncConflict`]（带原因并提示先 [`abort_baseline_apply`]），零写入。
- pub fn apply_baseline_batch(
-     vault: &Vault,
-     docs: &[(String, Vec<u8>)],
-     tombstones: &[String],
- ) -> Result<BaselineApplyState, StorageError> {
-+    // 失败标记优先于一切：journal 仍是 staging（schema 不允许新 status），但语义上
-+    // 已不可续跑。必须在解码 snapshot / 开写事务之前拒绝，避免继续往失败 journal
-+    // 里追加数据而让 abort 后的重跑更难判断。
-+    if let Some(reason) = baseline_verify_failure(vault)? {
-+        return Err(verify_failed_conflict(&reason, "apply_baseline_batch"));
-+    }
-     let journal = load_active_journal(vault)?;
-     if docs.is_empty() && tombstones.is_empty() {
--        return state_from_journal(&journal);
-+        return state_from_journal(vault, &journal);
-     }
- 
-     let mut seen_docs = BTreeSet::new();
-@@ -484,9 +761,10 @@ pub fn apply_baseline_batch(
-             }
-         }
- 
--        let remote_known = match remote_known::load(vault, doc_id)? {
--            Some(existing) => remote_known::union(&existing, &baseline_vv).encode(),
--            None => baseline_vv.encode(),
-+        let remote_known_expected = remote_known::load(vault, doc_id)?;
-+        let remote_known_merged = match &remote_known_expected {
-+            Some(existing) => remote_known::union(existing, &baseline_vv),
-+            None => baseline_vv.clone(),
+             None => false,
          };
-         prepared_docs.push(PreparedDoc {
-             doc_id: doc_id.clone(),
-@@ -494,7 +772,8 @@ pub fn apply_baseline_batch(
-             baseline_vv: baseline_vv.encode(),
-             expected_head,
-             update,
--            remote_known,
-+            remote_known_expected,
-+            remote_known_merged,
-         });
-         baseline_by_doc.insert(doc_id.clone(), local_extra);
-     }
-@@ -515,6 +794,8 @@ pub fn apply_baseline_batch(
-     let now = now_secs()?;
-     let mut statements = Vec::new();
-     let mut guards = Vec::new();
-+    // 远端已知 VV 的 CAS 守卫下标 → doc_id：GuardFailed 时用它给出明确冲突错误。
-+    let mut remote_known_guards: Vec<(usize, String)> = Vec::new();
-     for prepared in &prepared_docs {
-         let journal_index = statements.len();
-         statements.push(Statement::new(
-@@ -532,17 +813,18 @@ pub fn apply_baseline_batch(
-         guards.push(AffectedGuard::exactly(journal_index, 1));
- 
-         // 跨 journal 保留的「远端已知 VV」：本批快照的 VV 就是远端已见过的 ops。
--        // 与旧值取单调并集（旧值可能来自普通 pull/integrate 的更新远端已知集）。
-+        // 与旧值取单调并集（旧值可能来自普通 pull/integrate 的更新远端已知集），
-+        // 但写入必须是**值 CAS**：只有库中值仍是准备阶段读到的旧值才更新。
-+        // 并发写者（普通 pull 的 A 事务）已经扩大过 → 0 行 → 整批回滚并报明确冲突，
-+        // 由调用方重试；绝不把更大的值覆盖回本批的并集（P2-5）。
-         let remote_index = statements.len();
--        statements.push(Statement::new(
--            "INSERT INTO meta(key,value) VALUES(?1,?2) \
--             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
--            vec![
--                Value::Text(remote_known::meta_key(&prepared.doc_id)),
--                Value::Blob(prepared.remote_known.clone()),
--            ],
-+        statements.push(remote_known::cas_statement(
-+            &prepared.doc_id,
-+            prepared.remote_known_expected.as_ref(),
-+            &prepared.remote_known_merged,
-         ));
-         guards.push(AffectedGuard::exactly(remote_index, 1));
-+        remote_known_guards.push((remote_index, prepared.doc_id.clone()));
- 
-         let Some(update) = &prepared.update else {
-             if prepared.expected_head.is_none() {
-@@ -563,7 +845,14 @@ pub fn apply_baseline_batch(
-         };
- 
-         if let Some(head) = &prepared.expected_head {
--            let seq = head.head_seq.saturating_add(1);
-+            let Some(seq) = head.head_seq.checked_add(1) else {
-+                return Err(StorageError::Corrupt {
-+                    context: format!(
-+                        "baseline 文档 {} 的 head_seq 已到 u64::MAX，无法追加新 seq",
-+                        prepared.doc_id
-+                    ),
-+                });
-+            };
-             let cas_index = statements.len();
-             statements.push(Statement::new(
-                 "UPDATE loro_docs SET head_seq=?2,head_frontier=?3,head_vv=?4 \
-@@ -650,23 +939,42 @@ pub fn apply_baseline_batch(
-     }
- 
-     for tombstone in &prepared_tombstones {
--        if tombstone.action == "deleted" {
--            statements.push(Statement::new(
--                "UPDATE notes SET deleted=1 WHERE body_doc_id=?1",
--                vec![Value::Text(tombstone.doc_id.clone())],
--            ));
--        }
-+        // P1-2（TOCTOU）：`tombstone_can_delete` 在事务外读 outbox，判定完成后本地编辑的
-+        // A 事务完全可能插进一条 `sync_outbox` 行；若仍按旧判定无条件软删，就会把刚编辑
-+        // 的笔记删掉。因此最终 action 必须在**同一个写事务里**用 SQL 重判一次：
-+        // 只允许 `deleted → kept_local_edit` 的降级，绝不允许 `kept → deleted` 升级。
-         let index = statements.len();
-         statements.push(Statement::new(
--            "INSERT INTO baseline_apply_tombstones(doc_id,action,updated_at) VALUES(?1,?2,?3) \
--             ON CONFLICT(doc_id) DO UPDATE SET action=excluded.action,updated_at=excluded.updated_at",
-+            "INSERT INTO baseline_apply_tombstones(doc_id,action,updated_at) \
-+             VALUES(?1, CASE WHEN EXISTS(SELECT 1 FROM sync_outbox WHERE doc_id=?1) \
-+                             THEN 'kept_local_edit' ELSE ?2 END, ?3) \
-+             ON CONFLICT(doc_id) DO UPDATE SET \
-+               action=CASE WHEN EXISTS(SELECT 1 FROM sync_outbox WHERE doc_id=?1) \
-+                           THEN 'kept_local_edit' ELSE excluded.action END, \
-+               updated_at=excluded.updated_at",
-             vec![
-                 Value::Text(tombstone.doc_id.clone()),
-                 Value::Text(tombstone.action.to_owned()),
-                 Value::Integer(now),
-             ],
-         ));
-+        // 这一句永远恰好写入 1 行（INSERT 或 DO UPDATE），是"判定已落库"的守卫：
-+        // 说明事务内重判真的执行了，而不是被别的写入/约束挡掉。
-         guards.push(AffectedGuard::exactly(index, 1));
-+
-+        if tombstone.action == "deleted" {
-+            // 软删与 outbox 判定在同一事务内：只有重判仍为 `deleted`（且此刻没有
-+            // outbox）才置 deleted=1。0 行是合法结果（该文档没有 notes 行，或已降级为
-+            // kept_local_edit），所以这句本身不设 exactly 守卫；守卫语义在上一条。
-+            statements.push(Statement::new(
-+                "UPDATE notes SET deleted=1 \
-+                 WHERE body_doc_id=?1 \
-+                   AND NOT EXISTS(SELECT 1 FROM sync_outbox WHERE doc_id=?1) \
-+                   AND EXISTS(SELECT 1 FROM baseline_apply_tombstones \
-+                              WHERE doc_id=?1 AND action='deleted')",
-+                vec![Value::Text(tombstone.doc_id.clone())],
-+            ));
-+        }
-     }
- 
-     let journal_index = statements.len();
-@@ -684,7 +992,20 @@ pub fn apply_baseline_batch(
-     let transaction_started = Instant::now();
-     match vault.exec_transaction(&statements, &guards) {
-         Ok(_) => {}
--        Err(StorageError::GuardFailed { .. }) => {
-+        Err(StorageError::GuardFailed { statement, .. }) => {
-+            if let Some((_, doc_id)) = remote_known_guards
-+                .iter()
-+                .find(|(index, _)| *index == statement)
-+            {
-+                // 值 CAS 不命中：准备阶段读到的旧值已被普通 pull 的 A 事务改写。
-+                // 整批已回滚（update/head/journal 都没有落库），重跑本批即可读到并集。
-+                return Err(StorageError::SyncConflict {
-+                    context: format!(
-+                        "baseline 文档 {doc_id} 的远端已知 VV 值 CAS 失败：\
-+                         并发写者已改写旧值；整批已回滚，可重试"
-+                    ),
-+                });
-+            }
-             return Err(StorageError::SyncConflict {
-                 context: "baseline batch 期间 journal/doc head 已变化".to_owned(),
-             });
-@@ -703,9 +1024,15 @@ pub fn apply_baseline_assets(
-     vault: &Vault,
-     assets: &[BaselineAsset],
- ) -> Result<BaselineApplyState, StorageError> {
-+    // 与 batch/finish 一致：失败标记存在时，资产批也必须在任何解码/写事务之前
-+    // 拒绝。否则 Phase 1B 的 catchup_integrate 循环调用这批 API 时，会在已判定
-+    // 失败的 journal 上继续写 baseline_apply_assets/计数，破坏"marker = 完全冻结"。
-+    if let Some(reason) = baseline_verify_failure(vault)? {
-+        return Err(verify_failed_conflict(&reason, "apply_baseline_assets"));
-+    }
-     let journal = load_active_journal(vault)?;
-     if assets.is_empty() {
--        return state_from_journal(&journal);
-+        return state_from_journal(vault, &journal);
-     }
- 
-     let mut seen_oid = BTreeSet::new();
-@@ -826,11 +1153,20 @@ pub fn apply_baseline_assets(
- ///
- /// CAS 仍是"begin 时记录、finish 时校验"：任一字段在 finish 前被并发改写即返回
- /// [`BaselineApplyFinish::Conflict`]，整笔事务不写。
-+///
-+/// **完整性前提**（P1-1）：begin 记录在 [`META_BASELINE_EXPECTED`] 的预期参与集合必须
-+/// 全部 `applied=1`。少跑一批（哪怕 status 仍是 staging）返回 Conflict；旧 journal
-+/// 没有集合记录同样 Conflict（拿不到证明就不允许推进 S），绝不明知不完整还写水位。
- pub fn finish_baseline_apply(
-     vault: &Vault,
-     chosen_baseline_s: u64,
-     cursor: &str,
- ) -> Result<BaselineApplyFinish, StorageError> {
-+    // marker 检查必须先于 journal 查询：无 journal 但残留/损坏 marker 时，不能先
-+    // 返回 `NotFound` 把失败状态掩盖掉；abort 是唯一清理入口。
-+    if let Some(reason) = baseline_verify_failure(vault)? {
-+        return Err(verify_failed_conflict(&reason, "finish_baseline_apply"));
-+    }
-     let journal = match load_journal(vault)? {
-         None => return Ok(BaselineApplyFinish::NotFound),
-         Some(journal) => journal,
-@@ -839,6 +1175,14 @@ pub fn finish_baseline_apply(
-         return Ok(BaselineApplyFinish::Conflict);
-     }
- 
-+    // 完整性校验在任何写语句之前：拿不到 begin 的预期集合，或集合未全齐，一律 Conflict。
-+    let Some(expected) = load_expected_set(vault)? else {
-+        return Ok(BaselineApplyFinish::Conflict);
-+    };
-+    if !expected_is_complete(vault, &journal, &expected)? {
-+        return Ok(BaselineApplyFinish::Conflict);
-+    }
-+
-     // finish 前先校验 begin 时记录的旧值；任何一项被并发改写都按 Conflict 处理，不写任何行。
-     let current = sync_cursor_state(vault)?;
-     let current_relay_cursor = vault.get_meta(META_SYNC_RELAY_CURSOR)?;
-@@ -937,13 +1281,21 @@ pub fn finish_baseline_apply(
-     Ok(BaselineApplyFinish::Applied(state))
- }
- 
--/// 只清 staging journal（含子表）；已导入的 Loro update/资产保留。
-+/// 只清 staging journal（含子表、预期参与集合与失败标记）；已导入的 Loro update/资产保留。
-+///
-+/// 没有 staging journal 时仍会清掉可能残留的 [`META_BASELINE_VERIFY_FAILED`]（abort 是
-+/// 失败标记的唯一清理入口），并返回 `false` 表示没有 journal 可中止。
- pub fn abort_baseline_apply(vault: &Vault) -> Result<bool, StorageError> {
--    let Some(journal) = load_journal(vault)? else {
--        return Ok(false);
--    };
--    if journal.status != BaselineApplyStatus::Staging {
--        return Ok(false);
-+    match load_journal(vault)? {
-+        Some(journal) if journal.status == BaselineApplyStatus::Staging => {}
-+        _ => {
-+            // completed journal 的数据不动；只清失败标记（若存在），保持返回 false 的既有语义。
-+            let _cleared = vault.exec(
-+                "DELETE FROM meta WHERE key=?1",
-+                &[Value::Text(META_BASELINE_VERIFY_FAILED.to_owned())],
-+            )?;
-+            return Ok(false);
-+        }
-     }
-     let statements = [
-         Statement::new("DELETE FROM baseline_apply_docs", Vec::new()),
-@@ -953,6 +1305,17 @@ pub fn abort_baseline_apply(vault: &Vault) -> Result<bool, StorageError> {
-             "DELETE FROM baseline_apply WHERE singleton=1 AND status='staging'",
-             Vec::new(),
-         ),
-+        // 预期集合只属于被清掉的 journal；留着会被下一次 begin 的 replace 覆盖，
-+        // 但清掉可以避免"没有 journal 却有预期集合"的中间态被误读。
-+        Statement::new(
-+            "DELETE FROM meta WHERE key=?1",
-+            vec![Value::Text(META_BASELINE_EXPECTED.to_owned())],
-+        ),
-+        // 失败标记随失败 journal 一起清：abort 之后才允许重新 begin。
-+        Statement::new(
-+            "DELETE FROM meta WHERE key=?1",
-+            vec![Value::Text(META_BASELINE_VERIFY_FAILED.to_owned())],
-+        ),
-     ];
-     match vault.exec_transaction(&statements, &[AffectedGuard::exactly(3, 1)]) {
-         Ok(_) => Ok(true),
-@@ -1134,6 +1497,86 @@ fn load_applied_doc_digests(vault: &Vault) -> Result<BTreeMap<String, [u8; 32]>,
-         .collect()
- }
- 
-+/// 读 begin 记录的预期参与集合；缺失返回 `None`（旧 journal/异常，按不可 finish 处理）。
-+fn load_expected_set(vault: &Vault) -> Result<Option<BaselineExpectation>, StorageError> {
-+    match vault.get_meta(META_BASELINE_EXPECTED)? {
-+        None => Ok(None),
-+        Some(bytes) => BaselineExpectation::decode(&bytes).map(Some),
-+    }
-+}
-+
-+/// 预期集合是否已全部 `applied=1`。
-+///
-+/// 先比计数（每批都会更新 `applied_docs/applied_assets`，因此未齐时 O(1) 就能拒绝），
-+/// 计数相等后再逐项确认集合身份：光比数量会放过"漏一篇 + 多跑一篇"的情况。计数相等
-+/// 且预期项全部在已应用集合中 ⇒ 两个集合相等。
-+fn expected_is_complete(
-+    vault: &Vault,
-+    journal: &ApplyJournal,
-+    expected: &BaselineExpectation,
-+) -> Result<bool, StorageError> {
-+    if journal.applied_docs != expected.doc_count()
-+        || journal.applied_assets != expected.asset_count()
-+    {
-+        return Ok(false);
-+    }
-+    if expected.is_empty() {
-+        return Ok(true);
-+    }
-+    let applied_docs: BTreeSet<String> = load_applied_doc_digests(vault)?.into_keys().collect();
-+    let docs_complete = expected
-+        .docs()
-+        .iter()
-+        .all(|doc_id| applied_docs.contains(doc_id));
-+    if !docs_complete {
-+        return Ok(false);
-+    }
-+    let applied_assets = load_applied_asset_ids(vault)?;
-+    Ok(expected
-+        .assets()
-+        .iter()
-+        .all(|object_id| applied_assets.contains(object_id)))
-+}
-+
-+/// 当前 journal 中 `applied=1` 的资产 object_id 集合。
-+fn load_applied_asset_ids(vault: &Vault) -> Result<BTreeSet<[u8; 32]>, StorageError> {
-+    let rows = vault.query(
-+        "SELECT object_id FROM baseline_apply_assets WHERE applied=1",
-+        &[],
-+    )?;
-+    rows.iter()
-+        .map(|row| array32(row, 0, "baseline_apply_assets.object_id"))
-+        .collect()
-+}
-+
-+fn corrupt_expected(reason: &str) -> StorageError {
-+    StorageError::Corrupt {
-+        context: format!("meta {META_BASELINE_EXPECTED} 非法：{reason}"),
-+    }
-+}
-+
-+fn take_expected_bytes<'a>(
-+    bytes: &'a [u8],
-+    offset: &mut usize,
-+    len: usize,
-+) -> Result<&'a [u8], StorageError> {
-+    let end = offset
-+        .checked_add(len)
-+        .ok_or_else(|| corrupt_expected("长度溢出"))?;
-+    let slice = bytes
-+        .get(*offset..end)
-+        .ok_or_else(|| corrupt_expected("长度越界"))?;
-+    *offset = end;
-+    Ok(slice)
-+}
-+
-+fn read_expected_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, StorageError> {
-+    let raw = take_expected_bytes(bytes, offset, 8)?;
-+    let mut value = [0u8; 8];
-+    value.copy_from_slice(raw);
-+    Ok(u64::from_be_bytes(value))
-+}
-+
- fn load_active_journal(vault: &Vault) -> Result<ApplyJournal, StorageError> {
-     let journal = load_journal(vault)?.ok_or_else(|| StorageError::SyncConflict {
-         context: "没有 active baseline apply".to_owned(),
-@@ -1185,7 +1628,28 @@ fn load_journal(vault: &Vault) -> Result<Option<ApplyJournal>, StorageError> {
-     }))
- }
- 
--fn state_from_journal(journal: &ApplyJournal) -> Result<BaselineApplyState, StorageError> {
-+fn state_from_journal(
-+    vault: &Vault,
-+    journal: &ApplyJournal,
-+) -> Result<BaselineApplyState, StorageError> {
-+    let expected = load_expected_set(vault)?;
-+    let (expected_docs, expected_assets) = match &expected {
-+        Some(expected) => (Some(expected.doc_count()), Some(expected.asset_count())),
-+        None => (None, None),
-+    };
-+    // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
-+    // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
-+    //
-+    // 失败标记存在时 journal 仍是 staging（schema v3 的 CHECK 只允许 staging/completed），
-+    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false，否则 UI/续跑逻辑
-+    // 会把"读回校验失败"当成"可以 finish"。标记损坏返回 Corrupt，同样是 fail-closed。
-+    let verify_failed = baseline_verify_failure(vault)?.is_some();
-+    let finishable = !verify_failed
-+        && journal.status == BaselineApplyStatus::Staging
-+        && match &expected {
-+            Some(expected) => expected_is_complete(vault, journal, expected)?,
-+            None => false,
-+        };
      Ok(BaselineApplyState {
-         checkpoint_id: journal.checkpoint_id,
-         baseline_s: journal.baseline_s,
-@@ -1194,7 +1658,9 @@ fn state_from_journal(journal: &ApplyJournal) -> Result<BaselineApplyState, Stor
-         applied_docs: journal.applied_docs,
-         applied_assets: journal.applied_assets,
-         kept_local_edit: journal.kept_local_edit,
--        finishable: journal.status == BaselineApplyStatus::Staging,
-+        expected_docs,
-+        expected_assets,
-+        finishable,
-         chosen_cursor: journal.chosen_cursor.clone(),
-     })
- }
-diff --git a/crates/storage/src/error.rs b/crates/storage/src/error.rs
-index 569c8d1..02c8aaa 100644
---- a/crates/storage/src/error.rs
-+++ b/crates/storage/src/error.rs
-@@ -103,6 +103,34 @@ pub enum StorageError {
-         actual: u64,
-     },
- 
-+    /// 未 ACK journal 的 CAS 基准已过期：head 被别的 writer 推进了。
-+    ///
-+    /// journal 条目的 `PendingUpdate` 是**追加那一刻**按当时 head 导出的字节
-+    /// （`end_frontier` / `end_vv` 都是那次导出的快照），**不可重算**。head 一旦前进，
-+    /// 同一份字节写一万次也只会再得到一次 CAS 冲突 —— 所以这是**终态**错误，
-+    /// 由 [`StorageError::requires_session_rebuild`] 显式标记：
-+    ///
-+    /// - **谁负责重建**：持有 live `BodyDoc` 的会话层（`session::JournalHandle` /
-+    ///   `SessionDriver`）。它必须先把内存文档重放到新 head，再按新 head 重新导出增量，
-+    ///   并用新 `head_seq` 造 sink（见 `crate::journal` 模块头的契约）；
-+    /// - **旧条目**：不会被写入，也**不会**被静默丢弃 —— `JournalWriter::rebuild_sink`
-+    ///   把它们原样交还给调用方；
-+    /// - **重试**：本层自动重试次数为 0，`flush` 之后不再触碰数据库。
-+    #[error(
-+        "文档 {doc_id} 的未 ACK journal 基准已过期（期望 head {expected}，实际 {actual}）：\
-+         {pending} 条已导出增量不可重算，必须重建 session 后重新导出；已禁止重试"
-+    )]
-+    JournalHeadStale {
-+        /// 文档 ID。
-+        doc_id: String,
-+        /// 写入时使用的 CAS 基准（`loro_docs.head_seq`）。
-+        expected: u64,
-+        /// 库里实际看到的 head。
-+        actual: u64,
-+        /// 过期时 journal 里未 durable 的条数。
-+        pending: usize,
-+    },
-+
-     /// 未 ACK journal 已满：必须先 flush 再重试（背压，不允许无界增长）。
-     #[error("未 ACK journal 已满（容量 {capacity} 条），拒绝新写入；请先 flush")]
-     WriteBackpressure {
-@@ -175,3 +203,31 @@ pub enum StorageError {
-         context: String,
-     },
- }
-+
-+impl StorageError {
-+    /// 是否必须**重建 session**（而不是重试）。
-+    ///
-+    /// 目前只有 [`Self::JournalHeadStale`]：那批 `PendingUpdate` 是按旧 head 导出的字节，
-+    /// 没有任何 rebase 可能，原样重试永远不会成功。调用方必须先重建 session、重新导出
-+    /// 增量（见 `crate::journal` 模块头），否则只会把失败换个地方再报一次。
-+    #[must_use]
-+    pub fn requires_session_rebuild(&self) -> bool {
-+        matches!(self, Self::JournalHeadStale { .. })
-+    }
-+
-+    /// 是否值得**原样重试**（只表示"条件变化后可能成功"，不表示"一定要重试"）。
-+    ///
-+    /// - [`Self::HeadConflict`]：store 层 CAS 冲突 —— 重读 head 后重放（sync engine 语义，
-+    ///   与 journal 层的[`Self::JournalHeadStale`]不同：那里的字节可以重新导出）；
-+    /// - [`Self::SnapshotBusy`]：读锁超时 —— 退避后重开快照；
-+    /// - [`Self::WriteBackpressure`]：journal 满 —— 先 flush 再重试。
-+    ///
-+    /// 其余变体一律 `false`：盲目重试只会挂死，或把真正的损坏/配置错误掩盖成"暂时失败"。
-+    #[must_use]
-+    pub fn is_retryable(&self) -> bool {
-+        matches!(
-+            self,
-+            Self::HeadConflict { .. } | Self::SnapshotBusy { .. } | Self::WriteBackpressure { .. }
-+        )
-+    }
-+}
-diff --git a/crates/storage/src/journal.rs b/crates/storage/src/journal.rs
-index 4aea6e6..acadd66 100644
---- a/crates/storage/src/journal.rs
-+++ b/crates/storage/src/journal.rs
-@@ -12,12 +12,63 @@
- //!
- //! 崩溃语义：sink 成功 = 已 durable；未 flush 的条目只在内存里，重启后自然丢掉。
- //! 因此「已 ACK 的不丢、未 ACK 的只丢连续前缀之后」由本模块与 [`crate::store`] 的 A 事务共同保证。
-+//!
-+//! # head 过期：两条恢复路径（P1-3 契约）
-+//!
-+//! journal 条目里的 `PendingUpdate` 是**追加那一刻**按当时 head 导出的字节
-+//! （`end_frontier` / `end_vv` 是那次导出的快照），**不可重算**。如果同一文档的 head
-+//! 被别的 writer 推进（同步引擎 integrate、`SessionDriver` 的 adopt、另一个 Vault
-+//! 进程……），前缀的 CAS 基准（`loro_docs.head_seq`）就永远对不上：`append_updates`
-+//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节按旧基准重试多少次都不会
-+//! 成功**。这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
-+//!
-+//! 本节先写库内契约（[`JournalWriter`]），再写生产 flusher 的实际路径；两者不要混为一谈。
-+//!
-+//! ## 1. `JournalWriter`：冻结 writer，调用方重建 sink / 重新导出
-+//!
-+//! - [`JournalWriter::flush`] 捕获 sink 的 [`StorageError::HeadConflict`]，**不重试**
-+//!   （0 次），立即转成终态错误 [`StorageError::JournalHeadStale`]
-+//!   （`doc_id` / `expected` / `actual` / `pending` 齐全，
-+//!   [`StorageError::requires_session_rebuild`] 为 `true`）。其它错误（磁盘失败等）
-+//!   原样透传 —— 那才是可重试的，journal 原样保留。
-+//! - 进入 stale 之后，`flush` / `flush_all` **不再触碰数据库**，幂等地返回同一个
-+//!   stale 错误；`submit` 也返回 `JournalHeadStale`（writer 已冻结，新条目必须交给
-+//!   重建后的 writer）。因此调用方无论怎么轮询，都不会挂死、也不会刷屏重试。
-+//! - **谁负责重建**：持有 live `BodyDoc` 的调用方，而不是本模块。调用方必须：
-+//!   ① 把 durable journal 重放到**新 head**（`load_body_doc` / `load_head`），让内存
-+//!   文档与库一致；② 用新 head 的 VV 重新导出本地意图（`BodyDoc::pending_update`）——
-+//!   只有这一步得到的字节才能写；③ 用新 `head_seq` 造一个 [`VaultJournalSink`]，
-+//!   调用 [`JournalWriter::rebuild_sink`] 装回去。
-+//! - **未 durable 的旧条目怎么办**：`rebuild_sink` 把它们**原样交还**调用方（返回值）
-+//!   并从 writer 的 journal 里清空。它们**没有被写入、也没有被静默丢弃** —— 调用方
-+//!   必须用 ② 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
-+//!   并在上层报告，不能假装成功。重建后 `durable_seq` 等于新 sink 的 CAS 基准。
-+//!
-+//! ## 2. 生产 `session/flush.rs`：兼容 head 时同字节有界重试（当前接线）
-+//!
-+//! 生产后台 flusher **不经过** [`JournalWriter`]：它直接在后台线程构造
-+//! [`VaultJournalSink`] 并调用 `write_prefix`，因此**不会**调用
-+//! [`JournalWriter::rebuild_sink`]，也不会重新导出增量。它的
-+//! [`StorageError::HeadConflict`] 路径是**同一份字节前缀的有界重试**：
-+//!
-+//! 1. `load_head` 读回当前 `head_seq` 与 VV；
-+//! 2. **仅当新 head 的 ops 全部包含在**未 ACK 前缀最后一条的 `end_vv` 里
-+//!    （`prefix_vv.includes_vv(head_vv)`，即外部推进写的是本会话 live 已知的 op）时，
-+//!    用新 CAS 基准重试**同一份字节前缀一次**；
-+//! 3. 新 head 含本会话未知 ops、head 未前进/回退、VV 为空或解码失败、重试后仍冲突
-+//!    → **fail-closed**：不写库、journal 原样保留，`last_write_error` 明确要求
-+//!    「关闭并重开文档」；后续 flush 立即失败，不再碰数据库。
-+//!
-+//! 两条路径的共同点：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
-+//! 重试同一份旧字节不可能成功）；有界重试只发生在生产 session flusher，且**仅一次**，
-+//! 条件不满足就上报告，不无限重试。生产路径**没有第二 journal**：journal 仍是会话
-+//! 内存里的那一条，重建的只是 sink 的 CAS 基准。
- 
- use std::collections::VecDeque;
- 
- use crate::body_doc::PendingUpdate;
- use crate::error::StorageError;
--use crate::store::UpdateRecord;
-+use crate::store::{OriginMarks, UpdateRecord};
- use crate::sync_bridge::{self, SyncContext, SyncIntent};
- use crate::Vault;
- 
-@@ -161,6 +212,14 @@ impl PendingJournal {
-         }
-         Ok(())
-     }
-+
-+    /// 取走全部未 ACK 条目。
-+    ///
-+    /// **只**供 [`JournalWriter::rebuild_sink`] 在 head 过期后显式交还给调用方使用：
-+    /// 正常路径一律走 [`Self::ack_prefix`]，这里既不写库也不推进任何水位。
-+    fn drain_all(&mut self) -> Vec<JournalEntry> {
-+        self.entries.drain(..).collect()
-+    }
- }
- 
- /// durable 落点（生产实现见 [`VaultJournalSink`]，测试可注入慢盘/失败实现）。
-@@ -168,7 +227,16 @@ pub trait DurableSink {
-     /// 把一段**连续前缀**写 durable；成功返回这段里最后一条的 `seq`。
-     ///
-     /// 实现必须是原子的：要么整段 durable，要么什么都没写（否则会丢已 ACK 数据）。
-+    ///
-+    /// CAS 基准冲突必须返回 [`StorageError::HeadConflict`]（不能自己改基准硬写）：
-+    /// [`JournalWriter`] 据此把 writer 判成 head 过期，而不是无限重试同一份字节。
-     fn write_prefix(&mut self, entries: &[JournalEntry]) -> Result<u64, StorageError>;
-+
-+    /// 当前 sink 使用的 CAS 基准（= 它认为已 durable 的 `head_seq`）。
-+    ///
-+    /// writer 用它给 `durable_seq` 定初值，并在 [`JournalWriter::rebuild_sink`] 之后重新对齐
-+    /// 水位。实现必须返回**真正用于 CAS 的**那个值，否则重建后的水位会骗人。
-+    fn head_seq(&self) -> u64;
- }
- 
- /// 一次 flush 的结果。
-@@ -180,6 +248,28 @@ pub struct FlushReport {
-     pub durable_seq: u64,
- }
- 
-+/// head 过期的终态记录（见模块头契约）。
-+///
-+/// 只要它非空，writer 就冻结：`submit` / `flush` 一律返回同一个
-+/// [`StorageError::JournalHeadStale`]，直到调用方 [`JournalWriter::rebuild_sink`]。
-+#[derive(Debug, Clone, PartialEq, Eq)]
-+struct StaleHead {
-+    doc_id: String,
-+    expected: u64,
-+    actual: u64,
-+}
-+
-+impl StaleHead {
-+    fn to_error(&self, pending: usize) -> StorageError {
-+        StorageError::JournalHeadStale {
-+            doc_id: self.doc_id.clone(),
-+            expected: self.expected,
-+            actual: self.actual,
-+            pending,
-+        }
-+    }
-+}
-+
- /// journal writer：持有 journal 与 sink，串行 flush。
- #[derive(Debug)]
- pub struct JournalWriter<S: DurableSink> {
-@@ -188,29 +278,52 @@ pub struct JournalWriter<S: DurableSink> {
-     max_batch: usize,
-     durable_seq: u64,
-     flushed_entries: u64,
-+    /// 非空 = CAS 基准已过期，writer 已冻结（见模块头契约）。
-+    stale: Option<StaleHead>,
- }
- 
- impl<S: DurableSink> JournalWriter<S> {
-     /// `max_batch` 是一次 flush 最多合并多少条（慢 I/O 时 pending 会堆到这里为止）。
-+    ///
-+    /// `durable_seq` 初值取 sink 的 CAS 基准（[`DurableSink::head_seq`]），
-+    /// 因此空 journal 上 flush 报告的是真实水位，而不是 0。
-     pub fn new(sink: S, capacity: usize, max_batch: usize) -> Self {
-+        let durable_seq = sink.head_seq();
-         Self {
-             journal: PendingJournal::new(capacity),
-             sink,
-             max_batch: max_batch.max(1),
--            durable_seq: 0,
-+            durable_seq,
-             flushed_entries: 0,
-+            stale: None,
-         }
-     }
- 
-     /// 追加一条待落库 update；满了就是背压，调用方必须 flush 后重试。
-+    ///
-+    /// head 过期后拒绝（返回 [`StorageError::JournalHeadStale`]）：writer 已冻结，
-+    /// 新条目必须交给重建后的 writer，否则只会堆在一条永远写不动的前缀后面。
-     pub fn submit(&mut self, entry: JournalEntry) -> Result<u64, StorageError> {
-+        if let Some(stale) = self.stale.as_ref() {
-+            return Err(stale.to_error(self.journal.pending_len()));
-+        }
-         self.journal.append(entry)
-     }
- 
-     /// 把当前前缀合并成一次 sink 写；成功后裁剪 journal 并推进水位。
-     ///
-     /// 失败时 journal **原样保留**（sink 承诺原子），下次重试不会丢已成功部分。
-+    ///
-+    /// 唯一的例外是 CAS 冲突：sink 返回 [`StorageError::HeadConflict`] 时前缀字节已不可
-+    /// 重放，本方法**不重试**（0 次），标记 stale 并返回
-+    /// [`StorageError::JournalHeadStale`] —— 调用方必须按模块头的契约重建 session，
-+    /// 而不是再 flush 一次。
-     pub fn flush(&mut self) -> Result<FlushReport, StorageError> {
-+        // 终态优先：stale 之后连数据库都不碰（有界重试 = 0 次）。
-+        if let Some(stale) = self.stale.as_ref() {
-+            return Err(stale.to_error(self.journal.pending_len()));
-+        }
-+
-         // 先拷出前缀，避免同时借用 journal 与 sink
-         let prefix: Vec<JournalEntry> = self.journal.peek_prefix(self.max_batch).to_vec();
-         if prefix.is_empty() {
-@@ -221,7 +334,27 @@ impl<S: DurableSink> JournalWriter<S> {
-         }
- 
-         let entries = prefix.len();
--        let durable_seq = self.sink.write_prefix(&prefix)?;
-+        let durable_seq = match self.sink.write_prefix(&prefix) {
-+            Ok(seq) => seq,
-+            // CAS 冲突是**终态**：前缀的 end_vv/end_frontier 是按旧 head 导出的快照，
-+            // 重新导出只能由持有 live 文档的会话层做；同一份字节重试不可能成功。
-+            Err(StorageError::HeadConflict {
-+                doc_id,
-+                expected,
-+                actual,
-+            }) => {
-+                let stale = StaleHead {
-+                    doc_id,
-+                    expected,
-+                    actual,
-+                };
-+                let error = stale.to_error(self.journal.pending_len());
-+                self.stale = Some(stale);
-+                return Err(error);
-+            }
-+            // 其它错误（磁盘失败等）原样透传：journal 原样保留，同一前缀可以重试。
-+            Err(error) => return Err(error),
-+        };
-         self.journal.ack_prefix(entries)?;
-         self.durable_seq = durable_seq;
-         self.flushed_entries += entries as u64;
-@@ -233,6 +366,8 @@ impl<S: DurableSink> JournalWriter<S> {
-     }
- 
-     /// flush 直到 journal 空或没有进展（一次性排空，供关闭/手动保存用）。
-+    ///
-+    /// head 过期时第一拍就返回 [`StorageError::JournalHeadStale`]，不会空转。
-     pub fn flush_all(&mut self) -> Result<usize, StorageError> {
-         let mut total = 0;
-         while self.journal.pending_len() > 0 {
-@@ -245,6 +380,35 @@ impl<S: DurableSink> JournalWriter<S> {
-         Ok(total)
-     }
- 
-+    /// writer 是否已进入「head 过期、必须重建」的终态。
-+    pub fn is_stale(&self) -> bool {
-+        self.stale.is_some()
-+    }
-+
-+    /// 重建 sink：head 过期后**唯一**合法的恢复入口（见模块头契约）。
-+    ///
-+    /// 调用方必须先用新 head 重放 live 文档并重新导出本地意图；本方法只负责把 writer
-+    /// 从 stale 拉回可用状态：
-+    ///
-+    /// - 把旧 journal 里未写入的条目**原样交还**（返回值），并从 journal 里清空 ——
-+    ///   它们不写库、也**不被静默丢弃**；调用方要么用重新导出的增量覆盖其内容，
-+    ///   要么显式报告这次丢弃；
-+    /// - `durable_seq` 对齐新 sink 的 CAS 基准（[`DurableSink::head_seq`]）；
-+    /// - 未处于 stale 时拒绝：还有能写的前缀就换 sink，等于把本可落库的条目丢掉。
-+    pub fn rebuild_sink(&mut self, sink: S) -> Result<Vec<JournalEntry>, StorageError> {
-+        if self.stale.is_none() {
-+            return Err(StorageError::Corrupt {
-+                context: "journal 未处于 head 过期状态，拒绝重建 sink（会丢弃仍可写入的条目）"
-+                    .to_owned(),
-+            });
-+        }
-+        let handed_back = self.journal.drain_all();
-+        self.sink = sink;
-+        self.stale = None;
-+        self.durable_seq = self.sink.head_seq();
-+        Ok(handed_back)
-+    }
-+
-     /// 未 ACK 条数。
-     pub fn pending_len(&self) -> usize {
-         self.journal.pending_len()
-@@ -343,7 +507,7 @@ impl DurableSink for VaultJournalSink {
-                 self.head_seq,
-                 &records,
-                 &[],
--                &remote_marks,
-+                OriginMarks::PerRecord(&remote_marks),
-             )?,
-             Some(ctx) => {
-                 // 一 update 一意图（remote 条目为空位）；seq 必须与 A 事务写进
-@@ -374,11 +538,16 @@ impl DurableSink for VaultJournalSink {
-                     self.head_seq,
-                     &records,
-                     &slots,
--                    &remote_marks,
-+                    OriginMarks::PerRecord(&remote_marks),
-                 )?
-             }
-         };
-         self.head_seq = head.head_seq;
-         Ok(head.head_seq)
-     }
-+
-+    /// CAS 基准 = 本 sink 已 durable 的 head_seq（与固有方法 `head_seq` 同一个值）。
-+    fn head_seq(&self) -> u64 {
-+        self.head_seq
-+    }
- }
 diff --git a/crates/storage/src/lib.rs b/crates/storage/src/lib.rs
-index 884e5eb..0baaaf0 100644
+index 0baaaf0..a30a87f 100644
 --- a/crates/storage/src/lib.rs
 +++ b/crates/storage/src/lib.rs
-@@ -70,9 +70,11 @@ pub use asset_store::{
- pub use baseline_apply::{
-     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch,
-     baseline_apply_debug_counters, baseline_apply_debug_timings, baseline_apply_state,
--    begin_baseline_apply, finish_baseline_apply, reset_baseline_apply_debug,
-+    baseline_apply_verify_ms, baseline_verify_failure, begin_baseline_apply, finish_baseline_apply,
-+    mark_baseline_verify_failed, record_baseline_verify_time, reset_baseline_apply_debug,
-     BaselineApplyDebugCounters, BaselineApplyDebugTimings, BaselineApplyFinish, BaselineApplyState,
--    BaselineApplyStatus, BaselineAsset, BASELINE_MERGE_BATCH, META_SYNC_RELAY_CURSOR,
-+    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BASELINE_MERGE_BATCH,
-+    META_BASELINE_EXPECTED, META_BASELINE_VERIFY_FAILED, META_SYNC_RELAY_CURSOR,
+@@ -123,13 +123,14 @@ pub use sync_bridge::{
+     intent_object_id, local_sync_intent, mark_acked, mark_inbox_quarantine, mark_integrated,
+     mark_integrated_batch, mark_sent, mark_skipped_event_received, outbox_parts,
+     outbox_repack_candidates, outbox_row, outbox_rows, pending_encryption, pending_send,
+-    repack_outbox, repack_required, set_confirmed_highwater, set_repack_required, set_sync_log_id,
+-    store_encrypted_parts, store_inbox_verified, store_inbox_verified_batch, sync_cursor_state,
+-    take_inbox_ready, take_inbox_ready_where, update_referenced_by_outbox, OutboxKey,
+-    OutboxRepackCandidate, RepackOutcome, RepackPart, RepackPartSummary, RepackSpec, SyncContext,
+-    SyncCursorState, SyncEncryptedPart, SyncInboxRow, SyncInboxState, SyncIntent, SyncOutboxPart,
+-    SyncOutboxRow, SyncOutboxState, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER,
+-    META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED,
+-    META_SYNC_SKIPPED_RECEIVED_PREFIX, SYNC_INTENT_ID_DOMAIN,
++    prune_covered_inbox, repack_outbox, repack_required, set_confirmed_highwater,
++    set_repack_required, set_sync_log_id, store_encrypted_parts, store_inbox_verified,
++    store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, take_inbox_ready_where,
++    update_referenced_by_outbox, OutboxKey, OutboxRepackCandidate, RepackOutcome, RepackPart,
++    RepackPartSummary, RepackSpec, SyncContext, SyncCursorState, SyncEncryptedPart, SyncInboxRow,
++    SyncInboxState, SyncIntent, SyncOutboxPart, SyncOutboxRow, SyncOutboxState, VerifiedInboxRow,
++    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
++    META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED, META_SYNC_SKIPPED_RECEIVED_PREFIX,
++    SYNC_INTENT_ID_DOMAIN,
  };
- pub use body_doc::{
-     BodyDoc, PendingUpdate, APP_DOC_SCHEMA, BODY_CONTAINER, CODEC_VERSION, MIN_READER,
-diff --git a/crates/storage/src/remote_known.rs b/crates/storage/src/remote_known.rs
-index 467b080..3f9bbf2 100644
---- a/crates/storage/src/remote_known.rs
-+++ b/crates/storage/src/remote_known.rs
-@@ -24,6 +24,17 @@
- //! 本地写入**不会**扩大它——即使已经 ACK 上传也不扩大。这是刻意的保守取舍：
- //! tombstone 判定只会更倾向于 `kept_local_edit`，绝不会把本地未确证同步过的内容删掉。
- //!
-+//! ## 单调性怎么强制（P2-5）
-+//!
-+//! 「只读旧值、在事务外算并集、再无条件覆盖」有两个写者互相覆盖的窗口（普通 pull 的
-+//! A 事务与 baseline apply 批次都可能写同一个键）。因此所有写入都改成**值 CAS**：
-+//!
-+//! - 生成语句时带上读到的旧值 `expected_old`，SQL 是
-+//!   `INSERT ... ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value=?old`；
-+//!   旧值不存在时用 `INSERT ... SELECT ... WHERE NOT EXISTS`；
-+//! - 语句带 `AffectedGuard::exactly(index, 1)`：CAS 不命中就是 0 行 → 整笔事务回滚，
-+//!   调用方拿到明确的冲突错误（重读后重试即收敛到并集），**绝不会写入更小的值**。
-+//!
- //! ## 判定
- //!
- //! `local_vv.sub_iter(remote_known).next().is_none()` 表示本地没有任何远端未知的 op，
-@@ -56,7 +67,7 @@ pub(crate) fn load(vault: &Vault, doc_id: &str) -> Result<Option<VersionVector>,
-     };
-     match row.first() {
-         Some(Value::Blob(bytes)) => Ok(Some(decode(bytes)?)),
--        Some(Value::Null) | None => Ok(None),
-+        // meta 值的统一口径（P2-6）：只认 BLOB；NULL/INTEGER/TEXT 都视为库被改坏。
-         other => Err(StorageError::Corrupt {
-             context: format!("{key} 读回异常：{other:?}"),
-         }),
-@@ -99,18 +110,59 @@ pub(crate) fn added_since(after: &VersionVector, before: &VersionVector) -> Vers
-     added
- }
- 
--/// 纯 SQL 语句：把某篇文档的远端已知 VV 覆盖为 `merged`（调用方负责事务与单调并集）。
--pub(crate) fn upsert_statement(doc_id: &str, merged: &VersionVector) -> Statement {
--    Statement::new(
--        "INSERT INTO meta(key,value) VALUES(?1,?2) \
--         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
--        vec![Value::Text(meta_key(doc_id)), Value::Blob(merged.encode())],
--    )
-+/// 生成一条**值 CAS** upsert 语句（调用方负责把它放进 A 事务，并加
-+/// `AffectedGuard::exactly(语句下标, 1)`）。
-+///
-+/// - `expected = Some(old)`：`INSERT ... ON CONFLICT(key) DO UPDATE ... WHERE meta.value=?old`。
-+///   只有库中值仍是读到的旧值时才写入；被并发写者改过就是 0 行 → 守卫失败 → 整笔回滚；
-+/// - `expected = None`：`INSERT ... SELECT ... WHERE NOT EXISTS`。只有键仍不存在时才插入；
-+///   并发插入过就是 0 行 → 同样回滚。
-+///
-+/// 两种写法都不会用旧并集覆盖（更小的）并发结果，因此值只能单调扩大。
-+pub(crate) fn cas_statement(
-+    doc_id: &str,
-+    expected: Option<&VersionVector>,
-+    merged: &VersionVector,
-+) -> Statement {
-+    assert_monotone(expected, merged);
-+    let key = meta_key(doc_id);
-+    let encoded = merged.encode();
-+    match expected {
-+        Some(old) => Statement::new(
-+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
-+             ON CONFLICT(key) DO UPDATE SET value=excluded.value \
-+             WHERE meta.value=?3",
-+            vec![
-+                Value::Text(key),
-+                Value::Blob(encoded),
-+                Value::Blob(old.encode()),
-+            ],
-+        ),
-+        None => Statement::new(
-+            "INSERT INTO meta(key,value) SELECT ?1,?2 \
-+             WHERE NOT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
-+            vec![Value::Text(key), Value::Blob(encoded)],
-+        ),
-+    }
-+}
-+
-+/// 调试断言：CAS 的目标值必须包含读到的旧值（`old ⊆ merged`）。
-+///
-+/// 生产路径由 [`union`] 构造 merged，这里只是把「只能扩大」的契约钉在生成语句处；
-+/// 一旦将来有人改成直接写入更小的值，debug/test 构建会立刻失败。
-+fn assert_monotone(expected: Option<&VersionVector>, merged: &VersionVector) {
-+    if let Some(old) = expected {
-+        debug_assert!(
-+            old.sub_iter(merged).next().is_none(),
-+            "remote known VV 只能单调扩大：旧值必须是 merged 的子集"
-+        );
-+    }
- }
- 
--/// 在 A 事务**之外**读旧值并返回合并后的 upsert 语句；`added` 为空时返回 `None`。
-+/// 在 A 事务**之外**读旧值并返回合并后的 **CAS** 语句；`added` 为空时返回 `None`。
- ///
--/// 事务内的单调性由「先读后写 + 单写者」保证：所有写都经 Vault actor 串行执行。
-+/// 旧值只作为 CAS 的期望值；若事务执行时值已被并发写者扩大，语句影响 0 行、守卫失败，
-+/// 调用方必须重读（重新调用本函数）后重试。这里**不会**用读到的旧并集覆盖库里的新值。
- pub(crate) fn merge_statement(
-     vault: &Vault,
-     doc_id: &str,
-@@ -119,9 +171,166 @@ pub(crate) fn merge_statement(
-     if added.is_empty() {
-         return Ok(None);
-     }
--    let merged = match load(vault, doc_id)? {
--        Some(existing) => union(&existing, added),
-+    let existing = load(vault, doc_id)?;
-+    let merged = match &existing {
-+        Some(existing) => union(existing, added),
-         None => added.clone(),
-     };
--    Ok(Some(upsert_statement(doc_id, &merged)))
-+    Ok(Some(cas_statement(doc_id, existing.as_ref(), &merged)))
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use std::path::Path;
-+    use std::sync::mpsc;
-+    use std::sync::{Arc, Barrier};
-+    use std::thread;
-+
-+    use super::*;
-+    use crate::actor::AffectedGuard;
-+
-+    /// 临时 vault：目录建在 `target/tmp` 下（AGENTS §6：不用 `%TEMP%`）。
-+    ///
-+    /// lib 单元测试拿不到 `CARGO_TARGET_TMPDIR`（只有集成测试有），所以从
-+    /// `CARGO_MANIFEST_DIR` 拼出同一个位置。
-+    fn fresh_vault(prefix: &str) -> (tempfile::TempDir, Vault) {
-+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-+            .join("../../target/tmp")
-+            .join(format!("remote-known-{prefix}"));
-+        std::fs::create_dir_all(&root).expect("创建 target/tmp 下的测试根目录");
-+        let dir = tempfile::Builder::new()
-+            .prefix("vault-")
-+            .tempdir_in(&root)
-+            .expect("创建临时目录");
-+        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
-+        (dir, vault)
-+    }
-+
-+    fn vv(peer: u64, counter: i32) -> VersionVector {
-+        let mut vv = VersionVector::new();
-+        vv.insert(peer, counter);
-+        vv
-+    }
-+
-+    fn read(vault: &Vault, doc_id: &str) -> Option<VersionVector> {
-+        load(vault, doc_id).expect("读取远端已知 VV")
-+    }
-+
-+    fn exec_cas(
-+        vault: &Vault,
-+        doc_id: &str,
-+        expected: Option<&VersionVector>,
-+        merged: &VersionVector,
-+    ) -> Result<(), StorageError> {
-+        vault
-+            .exec_transaction(
-+                &[cas_statement(doc_id, expected, merged)],
-+                &[AffectedGuard::exactly(0, 1)],
-+            )
-+            .map(|_| ())
-+    }
-+
-+    /// 值 CAS 的三种状态：不存在时插入 → 陈旧期望被拒绝且不缩小 → 读到新值后并集成功。
-+    #[test]
-+    fn cas_statement_rejects_stale_expected_and_never_shrinks() {
-+        let (_dir, vault) = fresh_vault("stale");
-+        let doc_id = "doc-cas";
-+        let a = vv(0xA1, 2);
-+        let b = vv(0xB2, 3);
-+
-+        // 读时不存在：直接插入。
-+        exec_cas(&vault, doc_id, None, &a).expect("首次插入");
-+        assert_eq!(read(&vault, doc_id), Some(a.clone()));
-+
-+        // 另一个写者仍以为「不存在」，拿着旧的 None 来写 B：必须被 CAS 拒绝。
-+        let error = exec_cas(&vault, doc_id, None, &b).expect_err("陈旧期望必须失败");
-+        assert!(
-+            matches!(error, StorageError::GuardFailed { .. }),
-+            "CAS 不命中应当是 GuardFailed（调用方映射成明确冲突），实际 {error:?}"
-+        );
-+        assert_eq!(
-+            read(&vault, doc_id),
-+            Some(a.clone()),
-+            "CAS 失败绝不能把已有的 A 覆盖成只有 B"
-+        );
-+
-+        // 重读后按并集重试：成功且值单调扩大。
-+        let current = read(&vault, doc_id).expect("已存在");
-+        let merged = union(&current, &b);
-+        exec_cas(&vault, doc_id, Some(&current), &merged).expect("并集重试");
-+
-+        // 再拿一个更旧、且值更小的期望来写：必须继续被拒绝，值不得缩小。
-+        let stale = vv(0xA1, 1);
-+        let smaller = vv(0xA1, 1);
-+        let error = exec_cas(&vault, doc_id, Some(&stale), &smaller).expect_err("更小值必须失败");
-+        assert!(matches!(error, StorageError::GuardFailed { .. }));
-+        assert_eq!(
-+            read(&vault, doc_id),
-+            Some(merged),
-+            "失败后必须保持并集，绝不能写入更小的值"
-+        );
-+    }
-+
-+    /// 两路并发写者从**同一旧值**出发写不同 `added`：barrier 对齐后同时 CAS。
-+    ///
-+    /// 结果只能是：恰好一方首次成功、另一方拿到明确的 `GuardFailed`；失败方重读后按
-+    /// 并集重试成功。最终值 = 两方新增的并集（不丢证据、不静默变小）。
-+    #[test]
-+    fn concurrent_writers_from_same_old_converge_to_union() {
-+        let (_dir, vault) = fresh_vault("concurrent");
-+        let doc_id = "doc-concurrent";
-+        let base = vv(0x10, 1);
-+        exec_cas(&vault, doc_id, None, &base).expect("初始值");
-+
-+        let barrier = Arc::new(Barrier::new(2));
-+        let (tx, rx) = mpsc::channel();
-+        let mut handles = Vec::new();
-+        for peer in [0xA1_u64, 0xB2_u64] {
-+            let vault = vault.clone();
-+            let barrier = Arc::clone(&barrier);
-+            let tx = tx.clone();
-+            handles.push(thread::spawn(move || {
-+                let added = vv(peer, 5);
-+                // 两方都在 barrier 之前读到同一个旧值。
-+                let old = load(&vault, doc_id).expect("读旧值").expect("已存在");
-+                let merged = union(&old, &added);
-+                let statement = cas_statement(doc_id, Some(&old), &merged);
-+                barrier.wait();
-+                let first = vault.exec_transaction(&[statement], &[AffectedGuard::exactly(0, 1)]);
-+                // 失败方（陈旧旧值）重读后重试一次：必须成功并收敛到并集。
-+                let (first_failed, retried) = match first {
-+                    Ok(_) => (false, true),
-+                    Err(StorageError::GuardFailed { .. }) => {
-+                        let current = load(&vault, doc_id).expect("重读").expect("已存在");
-+                        let merged = union(&current, &added);
-+                        (
-+                            true,
-+                            exec_cas(&vault, doc_id, Some(&current), &merged).is_ok(),
-+                        )
-+                    }
-+                    Err(other) => panic!("并发 CAS 只允许守卫失败，实际 {other:?}"),
-+                };
-+                tx.send((peer, first_failed, retried)).expect("回传结果");
-+            }));
-+        }
-+        drop(tx);
-+        let results: Vec<(u64, bool, bool)> = rx.iter().take(2).collect();
-+        for handle in handles {
-+            handle.join().expect("写者线程不应 panic");
-+        }
-+        assert_eq!(results.len(), 2, "两路写者都必须有明确结果");
-+        assert_eq!(
-+            results.iter().filter(|(_, failed, _)| *failed).count(),
-+            1,
-+            "同一旧值下只允许一方首次成功，另一方必须拿到明确的 CAS 冲突"
-+        );
-+        for (peer, _, retried) in &results {
-+            assert!(*retried, "peer {peer:#x} 重读重试后必须成功");
-+        }
-+
-+        let final_vv = read(&vault, doc_id).expect("最终值");
-+        let expected = union(&union(&base, &vv(0xA1, 5)), &vv(0xB2, 5));
-+        assert_eq!(final_vv, expected, "最终值必须包含两路 added 的并集");
-+        assert_eq!(final_vv.get(&0x10).copied(), Some(1), "旧前缀不得丢失");
-+    }
- }
-diff --git a/crates/storage/src/session/core.rs b/crates/storage/src/session/core.rs
-index 5f72cd9..366f18d 100644
---- a/crates/storage/src/session/core.rs
-+++ b/crates/storage/src/session/core.rs
-@@ -214,6 +214,22 @@ impl DocumentSession {
-         self.journal.durable_through()
-     }
- 
-+    /// 最近一次 flush 写失败的可读原因（`None` = 没有已知失败）。
-+    ///
-+    /// 不可恢复的失败（head 过期且无法安全自动重建）优先，文案明确提示
-+    /// 「需要重开文档」；否则是最近一次普通写失败（磁盘/SQLite 等，下次写成功后清空）。
-+    ///
-+    /// **只读且稳定**：同一失败可以反复读取，UI 可以在状态栏/关闭报告里直接展示；
-+    /// 不要求调用方先走外部提交闸门（`GateState::Failed` 只有走闸门的路径才看得到）。
-+    pub fn last_write_error(&self) -> Option<String> {
-+        self.journal.last_write_error()
-+    }
-+
-+    /// flush 是否已进入不可恢复状态（只有重开文档能继续）。
-+    pub fn flush_is_unrecoverable(&self) -> bool {
-+        self.journal.is_unrecoverable()
-+    }
-+
-     /// 取走事件队列（Durable / Remote）。
-     pub fn events(&self) -> Vec<SessionEvent> {
-         self.journal.drain_events()
+ pub use tree_view::{list_notes, list_tree, list_tree_sorted, NodeKind, TreeEntry, TreeSort};
 diff --git a/crates/storage/src/session/flush.rs b/crates/storage/src/session/flush.rs
-index be36373..fcb3c10 100644
+index fcb3c10..e6636f5 100644
 --- a/crates/storage/src/session/flush.rs
 +++ b/crates/storage/src/session/flush.rs
-@@ -5,7 +5,14 @@
- //! - `flush()` 只投递一条命令就返回票据，**调用线程绝不碰 SQLite**；
- //! - 后台线程每次取 journal 的**连续前缀**，合并成一次 A 事务写 durable；
- //! - 写成功后先裁剪前缀、推进 durable 水位，再把 [`SessionEvent::Durable`] 推进事件队列；
--//! - 写失败**不裁剪、不 ACK**：同一前缀下次重试，因此「已 ACK 的部分」不会丢。
-+//! - 写失败**不裁剪、不 ACK**：同一前缀下次重试，因此「已 ACK 的部分」不会丢；
-+//! - **head 过期**（[`StorageError::HeadConflict`]）：同一命令内**至多**自动
-+//!   `load_head` + 重建 sink 一次，并用新 CAS 基准重试**同一前缀**一次。只有新 head 的
-+//!   ops 全部落在未 ACK 前缀最后一条的 `end_vv` 里（即外部推进写的是本会话 live 已知的
-+//!   op）才允许重试——否则写入的 `head_vv`/`frontier` 会缺掉外部 ops，下一次
-+//!   `load_body_doc` 的完整性校验直接 `Corrupt`。不满足或重建后仍失败 → **不可恢复**：
-+//!   `last_write_error` 明确提示「需要重开文档」，journal 原样保留，后续 flush 立即失败、
-+//!   不再碰数据库（有界重试，不无限写）。
- 
- use std::collections::VecDeque;
- use std::sync::mpsc::{channel, Receiver, Sender};
-@@ -14,7 +21,7 @@ use std::thread::{self, JoinHandle};
- use std::time::Duration;
- 
- use crate::journal::{DurableSink, JournalEntry, JournalOrigin, PendingJournal, VaultJournalSink};
--use crate::store::HeadState;
-+use crate::store::{load_head, HeadState};
- use crate::sync_bridge::SyncContext;
- use crate::{StorageError, Vault};
- 
-@@ -30,7 +37,7 @@ pub(crate) struct GateProgress {
-     pub(crate) durable_through: LiveRev,
-     /// 已 durable 的 head seq（外部提交的 CAS 基准）。
-     pub(crate) durable_head_seq: u64,
--    /// 最近一次前缀写失败原因（成功写入后清空）。
-+    /// 最近一次前缀写失败原因（成功写入后清空；不可恢复时保留「需要重开文档」提示）。
-     pub(crate) last_write_error: Option<String>,
- }
- 
-@@ -73,6 +80,13 @@ pub(crate) struct PendingState {
-     ///
-     /// 外部提交闸门据此把「还在 Flushing」明确升级成 `Failed`，不静默等一个永远不来的 ACK。
-     pub(crate) last_write_error: Option<String>,
-+    /// 不可恢复的 flush 失败（head 过期且无法安全自动重建）。
-+    ///
-+    /// 一旦置位就**不再自动重试**：后续 flush 命令立即失败、不再碰数据库；journal 原样
-+    /// 保留（未 ACK 的数据不丢也不会被静默丢弃），只有关闭并重开文档才能恢复。
-+    /// 外部提交闸门通过 [`GateProgress::last_write_error`] 把它升级成 `Failed`，UI 可据此
-+    /// 提示重开文档。
-+    pub(crate) unrecoverable: Option<String>,
- }
- 
- /// journal 句柄：会话侧投递命令，后台线程负责写。
-@@ -109,6 +123,7 @@ impl JournalHandle {
-             durable_batch: None,
-             durable_through: LiveRev(0),
-             last_write_error: None,
-+            unrecoverable: None,
-         }));
-         let events: Arc<Mutex<VecDeque<SessionEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
-         let (sender, receiver) = channel::<FlushCommand>();
-@@ -200,6 +215,29 @@ impl JournalHandle {
-         }
-     }
- 
-+    /// 最近一次 flush 写失败的原因（**一次取锁**）。
-+    ///
-+    /// 优先返回 [`PendingState::unrecoverable`]：不可恢复的失败必须让 UI/调用方看到
-+    /// 「需要重开文档」，不能被后到的普通写失败（字段会被覆盖）稀释；没有不可恢复失败时
-+    /// 返回最近一次普通写失败（成功写入后清空）。会话核的
-+    /// [`super::core::DocumentSession::last_write_error`] 与 `CloseReport.flush_error`
-+    /// 都以本方法为唯一来源（闸门走 [`Self::gate_progress`]，读同一份状态的字段）。
-+    pub(crate) fn last_write_error(&self) -> Option<String> {
-+        let guard = lock(&self.state);
-+        guard
-+            .unrecoverable
-+            .clone()
-+            .or_else(|| guard.last_write_error.clone())
+@@ -486,7 +486,10 @@ fn flusher_main(
+         // 否则「手动保存」在无脏数据时永远等不到 ACK。
+         let confirmation = {
+             let guard = lock(&state);
+-            if guard.journal.pending_len() == 0
++            // 不可恢复时即使 pending_len==0（防御性状态，正常路径不可达）也不能补发
++            // 确认票据：那会让等待方误以为 durable 成功。
++            if guard.unrecoverable.is_none()
++                && guard.journal.pending_len() == 0
+                 && emitted_max.is_none_or(|through| through < command.target_live_rev)
+             {
+                 Some((
+@@ -516,13 +519,20 @@ fn flusher_main(
+ ///（`Corrupt`、`Loro`、`LoroEncode`、`Coord`、schema 漂移、通道关闭等）都是永久性
+ /// 本地状态错误，重试不会自愈，必须 fail-closed 到“需要重开文档”。
+ fn is_retryable_write_error(error: &StorageError) -> bool {
+-    matches!(
+-        error,
++    match error {
+         StorageError::Io(_)
+-            | StorageError::Sqlite(_)
+-            | StorageError::SnapshotBusy { .. }
+-            | StorageError::WriteBackpressure { .. }
+-    )
++        | StorageError::SnapshotBusy { .. }
++        | StorageError::WriteBackpressure { .. } => true,
++        // SQLite 错误不能整类重试：ConstraintViolation/ReadOnly/CannotOpen/
++        // DatabaseCorrupt/NotFound/Misuse 等都是永久错误，重试只会无限撞同一面墙。
++        // 只有 BUSY/LOCKED 这类并发等待值得下一次 flush 再试。
++        StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => matches!(
++            code.code,
++            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
++        ),
++        StorageError::Sqlite(_) => false,
++        _ => false,
 +    }
-+
-+    /// 是否已进入不可恢复状态（只有重开文档能继续）。
-+    ///
-+    /// `SessionDriver::close` 用它短路等待：不可恢复时不会再有 DurableAck，继续等满
-+    /// timeout 只会让关闭/切换卡住 UI。
-+    pub(crate) fn is_unrecoverable(&self) -> bool {
-+        lock(&self.state).unrecoverable.is_some()
-+    }
-+
-     /// 外部提交 adopt / end 之后重定 durable 基准（调用方必须已持锁）。
-     ///
-     /// `loro_docs.head_*` 已由外部提交（`engine.integrate`）推进；这里把 flusher 的 CAS
-@@ -305,10 +343,21 @@ fn flusher_main(
-         }
- 
-         let mut emitted_max: Option<LiveRev> = None;
-+        // P1-3：head 过期时同一命令**最多**自动重建 1 次 sink（`load_head` → 新基准 →
-+        // 重试同一前缀一次）；用尽后进入不可恢复状态，不再自动重试。
-+        //
-+        // 粒度是“每条 flush 命令”而不是“每个批次”：一条命令拆成多批时，若第一批
-+        // 重建成功、第二批再遇 HeadConflict，会直接不可恢复。这是保守取舍（慢盘多批
-+        // 场景可能误判），当前不自动扩成每批一次。
-+        let mut auto_rebuilt = false;
-         loop {
-             // 1) 取连续前缀（持锁只做内存操作，绝不在锁内写盘）
-             let (entries, through, count, head_seq) = {
-                 let mut guard = lock(&state);
-+                // 不可恢复：后续 flush 立即失败、绝不再碰数据库（journal 原样保留）。
-+                if guard.unrecoverable.is_some() {
-+                    break;
-+                }
-                 let pending = guard.journal.pending_len();
-                 if pending == 0 {
-                     break;
-@@ -331,12 +380,65 @@ fn flusher_main(
-             }
-             let written = match sink.write_prefix(&entries) {
-                 Ok(seq) => seq,
--                // 不裁剪、不 ACK：同一前缀留着下次重试，已 ACK 部分不受影响。
-+                // 普通写失败（磁盘/SQLite 等）：不裁剪、不 ACK，同一前缀下次重试；
-                 // 同时记录失败原因：外部提交闸门据此把 "Flushing" 明确升级为 Failed。
--                Err(error) => {
-+                //
-+                // `Corrupt` 是永久性本地状态错误（混文档/OriginMarks 长度不匹配/seq 溢出/
-+                // head 快照不可解码等），不能当成瞬时失败无限重试；直接进入不可恢复，
-+                // 让 UI 明确要求重开，而不是每次 flush 都撞同一错误。
-+                Err(error)
-+                    if !matches!(&error, StorageError::HeadConflict { .. })
-+                        && !is_retryable_write_error(&error) =>
-+                {
-+                    let message = reopen_message(
-+                        &doc_id,
-+                        lock(&state).journal.pending_len(),
-+                        format!("前缀写失败（永久性 Corrupt，不再自动重试）：{error}"),
-+                    );
-+                    let mut guard = lock(&state);
-+                    guard.last_write_error = Some(message.clone());
-+                    guard.unrecoverable = Some(message);
-+                    break;
-+                }
-+                Err(error) if !matches!(&error, StorageError::HeadConflict { .. }) => {
-                     lock(&state).last_write_error = Some(error.to_string());
-                     break;
-                 }
-+                // head 已被外部推进：同一份字节按旧 CAS 基准重试永远不会成功。
-+                // 先 `load_head` 拿真实基准、有界重建 sink，再重试**同一前缀**一次。
-+                Err(error) => {
-+                    if auto_rebuilt {
-+                        let message = reopen_message(
-+                            &doc_id,
-+                            lock(&state).journal.pending_len(),
-+                            format!(
-+                                "自动重建后再次 head 冲突（{error}），本命令的 1 次自动重建已用尽"
-+                            ),
-+                        );
-+                        let mut guard = lock(&state);
-+                        guard.last_write_error = Some(message.clone());
-+                        guard.unrecoverable = Some(message);
-+                        break;
-+                    }
-+                    auto_rebuilt = true;
-+                    let pending = lock(&state).journal.pending_len();
-+                    match retry_prefix_after_rebuild(
-+                        &vault, &doc_id, &entries, pending, head_seq, sync,
-+                    ) {
-+                        RebuildOutcome::Written(seq) => seq,
-+                        // 普通写失败：保持既有「同一前缀下次重试」契约，不升级成不可恢复。
-+                        RebuildOutcome::Retryable(message) => {
-+                            lock(&state).last_write_error = Some(message);
-+                            break;
-+                        }
-+                        RebuildOutcome::Unrecoverable(message) => {
-+                            let mut guard = lock(&state);
-+                            guard.last_write_error = Some(message.clone());
-+                            guard.unrecoverable = Some(message);
-+                            break;
-+                        }
-+                    }
-+                }
-             };
- 
-             // 3) durable 之后才裁剪并推进水位
-@@ -407,3 +509,154 @@ fn flusher_main(
-         }
-     }
  }
-+
-+/// 写失败是否可能靠“下一次 flush 再试”自愈。
-+///
-+/// **正向白名单**：只有 IO / SQLite 瞬时错误 / 读快照 BUSY / 背压值得重试；其余
-+///（`Corrupt`、`Loro`、`LoroEncode`、`Coord`、schema 漂移、通道关闭等）都是永久性
-+/// 本地状态错误，重试不会自愈，必须 fail-closed 到“需要重开文档”。
-+fn is_retryable_write_error(error: &StorageError) -> bool {
-+    matches!(
-+        error,
-+        StorageError::Io(_)
-+            | StorageError::Sqlite(_)
-+            | StorageError::SnapshotBusy { .. }
-+            | StorageError::WriteBackpressure { .. }
-+    )
-+}
-+
-+/// head 冲突后自动重建 sink 的结果（P1-3 生产接线）。
-+#[derive(Debug)]
-+enum RebuildOutcome {
-+    /// 重建 sink 后用同一前缀重试成功；值为 durable 后的 `head_seq`。
-+    Written(u64),
-+    /// 不可恢复：必须关闭并重开文档（不再自动重试，也不再写库）。
-+    Unrecoverable(String),
-+    /// 重建后重试遇到普通写失败（磁盘/SQLite 等）：journal 保留，下一次 flush 再试。
-+    Retryable(String),
-+}
-+
-+/// `HeadConflict` 后的有界自动重建：`load_head` → 新 CAS 基准 sink → 重试同一前缀一次。
-+///
-+/// **为什么不是无条件重试**：journal 条目的 `PendingUpdate` 是**追加那一刻**按旧 head
-+/// 导出的字节，写入 durable 的 `loro_docs.head_vv` / `head_frontier` 取自前缀最后一条的
-+/// `end_*` 快照。只有新 head 的 ops 全部包含在该快照的 VV 里（即外部推进写的是本会话
-+/// live 已知的 op）时，原样重试才与本会话 live 一致；否则 head 快照会缺掉外部 ops，
-+/// 下一次 `load_body_doc` 的完整性校验直接 `Corrupt`。后者 fail-closed：保留 journal、
-+/// 提示重开文档，绝不硬写。
-+///
-+/// `durable_base` 是本次写入用的 CAS 基准；新 head 必须严格大于它，回退的基准一律拒绝。
-+fn retry_prefix_after_rebuild(
-+    vault: &Vault,
+ 
+ /// head 冲突后自动重建 sink 的结果（P1-3 生产接线）。
+@@ -536,6 +546,24 @@ enum RebuildOutcome {
+     Retryable(String),
+ }
+ 
++/// 重建后重试失败的分类（独立出来便于单测 `RebuildOutcome::Retryable` 分支）。
++fn rebuild_write_error_outcome(
 +    doc_id: &str,
-+    entries: &[JournalEntry],
 +    pending: usize,
-+    durable_base: u64,
-+    sync: Option<SyncContext>,
++    error: StorageError,
 +) -> RebuildOutcome {
-+    let head = match load_head(vault, doc_id) {
-+        Ok(head) => head,
-+        Err(error) => {
-+            return RebuildOutcome::Unrecoverable(reopen_message(
-+                doc_id,
-+                pending,
-+                format!("读不到当前 head（{error}），无法重建 sink"),
-+            ));
-+        }
-+    };
-+    if head.head_seq <= durable_base {
++    if !is_retryable_write_error(&error) {
 +        return RebuildOutcome::Unrecoverable(reopen_message(
 +            doc_id,
 +            pending,
-+            format!(
-+                "库中 head 没有前进（CAS 基准 {durable_base}，读到 {}）；拒绝用回退的基准重写",
-+                head.head_seq
-+            ),
++            format!("自动重建后重试前缀遇到永久性 Corrupt，不再自动重试：{error}"),
 +        ));
 +    }
-+    // 空前缀在 flusher 里不可达；防御性 fail-closed，不 panic。
-+    let Some(last) = entries.last() else {
-+        return RebuildOutcome::Unrecoverable(reopen_message(
-+            doc_id,
-+            pending,
-+            "未 ACK 前缀为空，无法校验 base".to_owned(),
-+        ));
-+    };
-+    let prefix_vv = match loro::VersionVector::decode(&last.update.end_vv) {
-+        Ok(vv) => vv,
-+        Err(error) => {
-+            return RebuildOutcome::Unrecoverable(reopen_message(
-+                doc_id,
-+                pending,
-+                format!("未 ACK 前缀的 end_vv 解码失败（{error}）"),
-+            ));
-+        }
-+    };
-+    let head_vv = match head.version_vector() {
-+        Ok(vv) => vv,
-+        Err(error) => {
-+            return RebuildOutcome::Unrecoverable(reopen_message(
-+                doc_id,
-+                pending,
-+                format!("新 head 的 VV 解码失败（{error}）"),
-+            ));
-+        }
-+    };
-+    if head_vv.is_empty() {
-+        return RebuildOutcome::Unrecoverable(reopen_message(
-+            doc_id,
-+            pending,
-+            format!(
-+                "新 head（head_seq {}）的 VV 为空，无法证明未 ACK 前缀与新 base 兼容",
-+                head.head_seq
-+            ),
-+        ));
-+    }
-+    if !prefix_vv.includes_vv(&head_vv) {
-+        return RebuildOutcome::Unrecoverable(reopen_message(
-+            doc_id,
-+            pending,
-+            format!(
-+                "库中 head 已推进到 {} 且包含本会话 live 文档未知的并发 ops；\
-+                 原样重试会写坏 head_vv/frontier，已拒绝自动重建",
-+                head.head_seq
-+            ),
-+        ));
-+    }
-+
-+    // 同一个后台 flusher 线程内重建 sink（复用既有 Vault 写连接，不新建 journal/连接）。
-+    let mut sink = VaultJournalSink::new(vault.clone(), doc_id.to_owned(), head.head_seq);
-+    if let Some(sync) = sync {
-+        sink = sink.with_sync_context(sync);
-+    }
-+    match sink.write_prefix(entries) {
-+        Ok(seq) => RebuildOutcome::Written(seq),
-+        Err(StorageError::HeadConflict {
-+            expected, actual, ..
-+        }) => RebuildOutcome::Unrecoverable(reopen_message(
-+            doc_id,
-+            pending,
-+            format!("自动重建后再发生 head 冲突（基准 {expected}，实际 {actual}）"),
-+        )),
-+        Err(error) if !is_retryable_write_error(&error) => {
-+            RebuildOutcome::Unrecoverable(reopen_message(
-+                doc_id,
-+                pending,
-+                format!("自动重建后重试前缀遇到永久性 Corrupt，不再自动重试：{error}"),
-+            ))
-+        }
-+        Err(error) => RebuildOutcome::Retryable(format!(
-+            "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
-+        )),
-+    }
++    RebuildOutcome::Retryable(format!(
++        "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
++    ))
 +}
 +
-+/// 统一的「需要重开文档」失败文案：闸门/UI 只看这一个字符串就必须知道该做什么。
-+fn reopen_message(doc_id: &str, pending: usize, reason: String) -> String {
-+    format!(
-+        "需要重开文档：{doc_id} 的未 ACK journal 无法安全自动重建（{reason}）；\
-+         {pending} 条未 ACK 更新保留在当前会话 journal 中（未写入、未静默丢弃）。\
-+         请关闭并重开该文档，从 durable 前缀重新加载后再继续编辑；\
-+         重开前未 durable 的本地改动不会自动落库"
-+    )
-+}
-diff --git a/crates/storage/src/session/schedule.rs b/crates/storage/src/session/schedule.rs
-index 021ab85..d08054d 100644
---- a/crates/storage/src/session/schedule.rs
-+++ b/crates/storage/src/session/schedule.rs
-@@ -220,6 +220,12 @@ pub struct CloseReport {
-     pub pending_materialize: usize,
-     /// 是否超时（`true` 表示没排空，调用方应保留现场）。
-     pub timed_out: bool,
-+    /// 关闭时仍未解决的 flush 写失败原因（`None` = 没有已知失败）。
-+    ///
-+    /// 取自 [`DocumentSession::last_write_error`]：不可恢复的失败（文案含
-+    /// 「需要重开文档」）优先，否则是最近一次普通写失败。关闭之后会话可能被丢弃，
-+    /// 调用方只能靠这份报告知道「没排空是为什么」，因此它必须随报告一起返回。
-+    pub flush_error: Option<String>,
- }
- 
- /// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
-@@ -468,6 +474,15 @@ impl SessionDriver {
-         self.session.pending_len()
-     }
- 
-+    /// 最近一次 flush 写失败的可读原因（转发会话核的只读快照）。
-+    ///
-+    /// 不可恢复的失败（「需要重开文档」）优先，否则是最新一次普通写失败；`None` = 没失败。
-+    /// UI 不必等 `pump` 或走外部提交闸门就能读到它。
-+    #[must_use]
-+    pub fn last_write_error(&self) -> Option<String> {
-+        self.session.last_write_error()
-+    }
-+
-     /// 下一次固定窗口到期时刻（`None` 表示当前没有等待中的脏数据）。
-     pub fn next_deadline(&self) -> Option<Duration> {
-         self.dirty_since.map(|since| since + self.policy.interval)
-@@ -767,6 +782,11 @@ impl SessionDriver {
- 
-             let durable_ok = durable.is_some() || !needs_flush;
-             let drained = durable_ok && self.materializer.pending() == 0;
-+            // 不可恢复的 flush 不会再有 DurableAck：不要等满 timeout，直接把报告
-+            // （含 flush_error）交给调用方。正常磁盘错误不走这里，仍按原超时收敛。
-+            if self.session.flush_is_unrecoverable() {
-+                break;
-+            }
-             if drained || Instant::now() >= deadline {
-                 // 收尾：把最后一批 B 结果也计入
-                 for event in self.pump() {
-@@ -785,6 +805,8 @@ impl SessionDriver {
-             pending_edits: self.session.pending_len(),
-             pending_materialize: self.materializer.pending(),
-             timed_out: self.session.pending_len() > 0 || self.materializer.pending() > 0,
-+            // 关闭后会话可能被丢弃：没排空的原因必须随报告带走（不可恢复优先）。
-+            flush_error: self.session.last_write_error(),
-         }
-     }
- 
-diff --git a/crates/storage/src/store.rs b/crates/storage/src/store.rs
-index 3e04674..69e1fad 100644
---- a/crates/storage/src/store.rs
-+++ b/crates/storage/src/store.rs
-@@ -392,7 +392,15 @@ pub fn append_updates(
-     expected_head_seq: u64,
-     records: &[UpdateRecord],
- ) -> Result<HeadState, StorageError> {
--    append_updates_inner(vault, doc_id, expected_head_seq, records, &[], &[], &[])
-+    append_updates_inner(
-+        vault,
-+        doc_id,
-+        expected_head_seq,
-+        records,
-+        &[],
-+        &[],
-+        OriginMarks::AllLocal,
-+    )
- }
- 
- /// A 事务：追加**一条**组合 update，并把同一批 remote inbox 行标为 `integrated`。
-@@ -434,25 +442,85 @@ pub fn append_updates_with_integrated_marks(
-         &marks,
-         // engine integrate 的这条组合 update 全部来自远端消息：其 `end_vv - 旧 head_vv`
-         // 就是远端实际带来的 ops，记入「远端已知 VV」（tombstone 判定用）。
--        &[true],
-+        OriginMarks::PerRecord(&[true]),
-     )
- }
- 
-+/// 一次 A 事务里每条 update 的**来源标记**。
-+///
-+/// 这是 P2-8 修掉的类型陷阱：旧接口用 `&[bool]` 表示来源，**空切片 = 全部本地**；
-+/// 而同一次调用的 `slots` 也是切片，**空切片 = 没有任何出站意图**。两个空切片含义
-+/// 相反、类型相同，调用点很容易把「没有意图」写成「全部本地」或反之。这里把来源标记
-+/// 收成枚举，让「空」不再是两种含义：
-+///
-+/// - [`OriginMarks::AllLocal`]：本批记录全部是本地写入，**不**扩大远端已知 VV；
-+/// - [`OriginMarks::PerRecord`]：与 `records` **一一对应**（长度不匹配直接报
-+///   [`StorageError::Corrupt`]），`true` = 该条来自远端消息，其
-+///   `end_vv - 前一条 end_vv` 并入「远端已知 VV」。
-+///
-+/// 本地写入即使已经 ACK 也不会扩大远端已知 VV（tombstone 判定只允许更保守）。
-+#[derive(Debug, Clone, Copy)]
-+pub enum OriginMarks<'a> {
-+    /// 全部记录都是本地写入。
-+    AllLocal,
-+    /// 逐条标记（必须与 records 等长）。
-+    PerRecord(&'a [bool]),
-+}
-+
-+impl<'a> OriginMarks<'a> {
-+    /// 本批是否有远端条目。
-+    fn any_remote(self) -> bool {
-+        match self {
-+            Self::AllLocal => false,
-+            Self::PerRecord(marks) => marks.iter().any(|flag| *flag),
-+        }
-+    }
-+
-+    /// 第 `index` 条是否来自远端（`AllLocal` 恒为 false）。
-+    fn is_remote(self, index: usize) -> bool {
-+        match self {
-+            Self::AllLocal => false,
-+            Self::PerRecord(marks) => marks.get(index).copied().unwrap_or(false),
-+        }
-+    }
-+
-+    /// 校验来源标记与 records 的对应关系。
-+    ///
-+    /// `AllLocal` 不需要长度；`PerRecord` 必须与 records 等长——**空 records 配非空
-+    /// marks、或 records 配空 marks 都会在这里被拒绝**，不会退化成「全部本地」。
-+    fn validate(self, records_len: usize) -> Result<(), StorageError> {
-+        if let Self::PerRecord(marks) = self {
-+            if marks.len() != records_len {
-+                return Err(StorageError::Corrupt {
-+                    context: format!(
-+                        "append_updates: records={records_len} \
-+                         OriginMarks::PerRecord={} 必须一对一",
-+                        marks.len()
-+                    ),
-+                });
-+            }
-+        }
-+        Ok(())
-+    }
-+}
-+
- /// A 事务内同时写出站同步意图（按位置一一对应；`None` = 该条不产生意图）。
+ /// `HeadConflict` 后的有界自动重建：`load_head` → 新 CAS 基准 sink → 重试同一前缀一次。
  ///
- /// 与 [`append_updates_with_sync_intents`] 相比，这里允许"某些 update 没有意图"：
- /// 一次 flush 的前缀可能混本地编辑与 remote 导入，而 remote 导入**绝不能**产生
- /// 出站意图（ADR 0009）。仍然只有**一条** A 事务，失败即整笔回滚。
- ///
--/// `remote_marks` 与 records 一一对应（空切片 = 全部本地）：标为 remote 的记录会在
--/// 同一事务里把 `end_vv - 上一条 end_vv` 并入「远端已知 VV」，供 tombstone 判定。
-+/// 参数语义（P2-8 钉死）：
-+/// - `slots` 空 = 本批**没有任何**出站意图（不是"每条都要一条意图"）；`None` 位 = 该条
-+///   不产生意图；
-+/// - `origin` 见 [`OriginMarks`]：只有远端条目会扩大远端已知 VV，本地条目永远不扩大。
- pub(crate) fn append_updates_with_intent_slots(
-     vault: &Vault,
-     doc_id: &str,
-     expected_head_seq: u64,
-     records: &[UpdateRecord],
-     slots: &[Option<crate::sync_bridge::SyncIntent>],
--    remote_marks: &[bool],
-+    origin: OriginMarks<'_>,
- ) -> Result<HeadState, StorageError> {
-     append_updates_inner(
-         vault,
-@@ -461,7 +529,7 @@ pub(crate) fn append_updates_with_intent_slots(
-         records,
-         slots,
-         &[],
--        remote_marks,
-+        origin,
-     )
- }
- 
-@@ -475,7 +543,7 @@ fn append_updates_inner(
-     records: &[UpdateRecord],
-     slots: &[Option<crate::sync_bridge::SyncIntent>],
-     integrated_marks: IntegratedMarks<'_>,
--    remote_marks: &[bool],
-+    origin: OriginMarks<'_>,
- ) -> Result<HeadState, StorageError> {
-     if records.is_empty() {
-         if !slots.is_empty() {
-@@ -488,6 +556,8 @@ fn append_updates_inner(
-                 context: "空 update 批次不能带 inbox 标记".to_owned(),
-             });
-         }
-+        // `PerRecord` 配空 records 时，非空标记同样算长度不匹配（不会退化成全部本地）。
-+        origin.validate(0)?;
-         return load_head(vault, doc_id);
-     }
-     if !slots.is_empty() && slots.len() != records.len() {
-@@ -499,29 +569,28 @@ fn append_updates_inner(
-             ),
-         });
-     }
--    if !remote_marks.is_empty() && remote_marks.len() != records.len() {
--        return Err(StorageError::Corrupt {
--            context: format!(
--                "append_updates: records={} remote_marks={} 必须一对一",
--                records.len(),
--                remote_marks.len()
--            ),
--        });
--    }
-+    origin.validate(records.len())?;
- 
-     // 远端已知 VV 的增量：只有 remote 条目会扩大它（`after_vv - running_vv`）。
--    let remote_meta = if remote_marks.iter().any(|flag| *flag) {
-+    //
-+    // 这里只算「本批新增了哪些远端 ops」；旧值读取与 CAS 语句在构造语句阶段生成，
-+    // 重试时按最新旧值重算并集，但 `added` 本身不变（head 基准没变）。
-+    let remote_added = if origin.any_remote() {
-         let mut running = load_head_vv_at(vault, doc_id, expected_head_seq)?;
-         let mut known = VersionVector::new();
-         for (index, record) in records.iter().enumerate() {
-             let after = VersionVector::decode(&record.update.end_vv).map_err(StorageError::from)?;
--            if remote_marks.get(index).copied().unwrap_or(false) {
-+            if origin.is_remote(index) {
-                 let added = crate::remote_known::added_since(&after, &running);
-                 known = crate::remote_known::union(&known, &added);
-             }
-             running = after;
-         }
--        crate::remote_known::merge_statement(vault, doc_id, &known)?
-+        if known.is_empty() {
-+            None
-+        } else {
-+            Some(known)
-+        }
-     } else {
-         None
-     };
-@@ -603,11 +672,22 @@ fn append_updates_inner(
-     }
- 
-     // 远端已知 VV 的 meta 写入（与 update/head 同一 A 事务；失败一起回滚）。
--    let remote_guard = remote_meta.as_ref().map(|statement| {
--        let index = statements.len();
--        statements.push(statement.clone());
--        AffectedGuard::exactly(index, 1)
--    });
-+    //
-+    // **值 CAS**：语句里带读到的旧值，只有库中值仍是旧值才会更新（`WHERE meta.value=?old`，
-+    // 旧值不存在时用 `INSERT ... WHERE NOT EXISTS`）。这样两个写者（普通 pull 的 A 事务
-+    // 与 baseline apply 批次）即使都拿着同一份旧并集，后到的那个也不会把先到的扩大值
-+    // 覆盖回更小的并集；CAS 不命中 → 0 行 → 守卫失败 → 整笔回滚后重读重试。
-+    let remote_slot = match &remote_added {
-+        Some(added) => {
-+            let index = statements.len();
-+            statements.push(cas_statement_or_corrupt(
-+                crate::remote_known::merge_statement(vault, doc_id, added)?,
-+                doc_id,
-+            )?);
-+            Some(index)
-+        }
-+        None => None,
-+    };
- 
-     // 同事务标记 inbox 行：每条都要求恰好影响 1 行（不存在 / 已 integrated /
-     // 已 quarantine 都会让整笔 A 事务回滚）。标记语句放在最后，避免它们的守卫先于
-@@ -625,7 +705,9 @@ fn append_updates_inner(
-     }
-     let mut guards = Vec::with_capacity(2 + integrated_marks.len());
-     guards.push(AffectedGuard::exactly(0, 1));
--    guards.extend(remote_guard);
-+    if let Some(index) = remote_slot {
-+        guards.push(AffectedGuard::exactly(index, 1));
-+    }
-     guards.extend(
-         integrated_marks
-             .iter()
-@@ -633,38 +715,80 @@ fn append_updates_inner(
-             .map(|(index, _)| AffectedGuard::exactly(marks_start + index, 1)),
-     );
- 
--    match vault.exec_transaction(&statements, &guards) {
--        Ok(_) => Ok(HeadState {
--            doc_id: doc_id.to_owned(),
--            head_seq,
--            head_frontier: last.end_frontier.clone(),
--            head_vv: last.end_vv.clone(),
--        }),
--        // 第 0 条守卫 = head CAS。
--        Err(StorageError::GuardFailed { statement: 0, .. }) => {
--            let actual = load_head(vault, doc_id)
--                .map(|head| head.head_seq)
--                .unwrap_or(0);
--            Err(StorageError::HeadConflict {
--                doc_id: doc_id.to_owned(),
--                expected: expected_head_seq,
--                actual,
--            })
+ /// **为什么不是无条件重试**：journal 条目的 `PendingUpdate` 是**追加那一刻**按旧 head
+@@ -638,16 +666,7 @@ fn retry_prefix_after_rebuild(
+             pending,
+             format!("自动重建后再发生 head 冲突（基准 {expected}，实际 {actual}）"),
+         )),
+-        Err(error) if !is_retryable_write_error(&error) => {
+-            RebuildOutcome::Unrecoverable(reopen_message(
+-                doc_id,
+-                pending,
+-                format!("自动重建后重试前缀遇到永久性 Corrupt，不再自动重试：{error}"),
+-            ))
 -        }
--        // 标记失败：update 与所有标记一起回滚；调用方必须保持 inbox verified 原样。
--        Err(StorageError::GuardFailed { statement, .. }) if statement >= marks_start => {
--            Err(StorageError::SyncConflict {
--                context: format!(
--                    "inbox 标记 integrated 失败（第 {} 个标记行不存在或当前不是 verified）；\
--                     整笔 A 事务（update+标记）已回滚",
--                    statement - marks_start
--                ),
--            })
-+    // 远端已知 VV 的 CAS 失败是**可重试**的：并发写者只是先扩大了一步，重读旧值后
-+    // 把两边并集再写一次即可。重试期间 head CAS 仍在 index 0：若真的有人推进了 head，
-+    // 依旧按 HeadConflict 返回，不会把「基准过期」误当成 meta 冲突。
-+    const REMOTE_KNOWN_CAS_ATTEMPTS: usize = 4;
-+    let mut attempt = 0usize;
-+    loop {
-+        attempt += 1;
-+        match vault.exec_transaction(&statements, &guards) {
-+            Ok(_) => {
-+                return Ok(HeadState {
-+                    doc_id: doc_id.to_owned(),
-+                    head_seq,
-+                    head_frontier: last.end_frontier.clone(),
-+                    head_vv: last.end_vv.clone(),
-+                });
-+            }
-+            // 第 0 条守卫 = head CAS。
-+            Err(StorageError::GuardFailed { statement: 0, .. }) => {
-+                let actual = load_head(vault, doc_id)
-+                    .map(|head| head.head_seq)
-+                    .unwrap_or(0);
-+                return Err(StorageError::HeadConflict {
-+                    doc_id: doc_id.to_owned(),
-+                    expected: expected_head_seq,
-+                    actual,
-+                });
-+            }
-+            // 远端已知 VV 的值 CAS 不命中：指定下标只有它这一条守卫。
-+            Err(StorageError::GuardFailed { statement, .. }) if remote_slot == Some(statement) => {
-+                let Some(added) = remote_added.as_ref() else {
-+                    return Err(StorageError::Corrupt {
-+                        context: format!("文档 {doc_id} 的远端已知 VV CAS 守卫缺少重算依据"),
-+                    });
-+                };
-+                if attempt >= REMOTE_KNOWN_CAS_ATTEMPTS {
-+                    return Err(StorageError::SyncConflict {
-+                        context: format!(
-+                            "文档 {doc_id} 的远端已知 VV 值 CAS 连续 {attempt} 次被并发写者改写；\
-+                             整笔 A 事务（update+head+meta）已回滚，可重试"
-+                        ),
-+                    });
-+                }
-+                let slot = remote_slot.expect("守卫命中说明 remote_slot 存在");
-+                statements[slot] = cas_statement_or_corrupt(
-+                    crate::remote_known::merge_statement(vault, doc_id, added)?,
-+                    doc_id,
-+                )?;
-+            }
-+            // 标记失败：update 与所有标记一起回滚；调用方必须保持 inbox verified 原样。
-+            Err(StorageError::GuardFailed { statement, .. }) if statement >= marks_start => {
-+                return Err(StorageError::SyncConflict {
-+                    context: format!(
-+                        "inbox 标记 integrated 失败（第 {} 个标记行不存在或当前不是 verified）；\
-+                         整笔 A 事务（update+标记）已回滚",
-+                        statement - marks_start
-+                    ),
-+                });
-+            }
-+            Err(error) => return Err(error),
-         }
--        Err(error) => Err(error),
+-        Err(error) => RebuildOutcome::Retryable(format!(
+-            "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
+-        )),
++        Err(error) => rebuild_write_error_outcome(doc_id, pending, error),
      }
  }
  
-+/// [`crate::remote_known::merge_statement`] 在 `remote_added` 非空时必然返回语句；
-+/// 这里把它转成带文档上下文的损坏错误，避免业务路径 `unwrap`。
-+fn cas_statement_or_corrupt(
-+    statement: Option<Statement>,
-+    doc_id: &str,
-+) -> Result<Statement, StorageError> {
-+    statement.ok_or_else(|| StorageError::Corrupt {
-+        context: format!("文档 {doc_id} 的远端已知 VV 增量非空，但没有生成 CAS 语句"),
-+    })
-+}
-+
- /// 笔记当前的物化水位（供 B 事务与测试读取）。
- #[derive(Debug, Clone, PartialEq, Eq)]
- pub struct BodyState {
-@@ -743,3 +867,242 @@ fn optional_blob(row: &[Value], index: usize) -> Result<Option<Vec<u8>>, Storage
-         }),
-     }
+@@ -660,3 +679,51 @@ fn reopen_message(doc_id: &str, pending: usize, reason: String) -> String {
+          重开前未 durable 的本地改动不会自动落库"
+     )
  }
 +
 +#[cfg(test)]
 +mod tests {
-+    use std::path::Path;
-+
-+    use loro::VersionVector;
-+
 +    use super::*;
-+    use crate::body_doc::BodyDoc;
-+    use crate::remote_known;
 +
-+    /// 临时 vault：目录建在 `target/tmp` 下（AGENTS §6：不用 `%TEMP%`）。
-+    ///
-+    /// lib 单元测试拿不到 `CARGO_TARGET_TMPDIR`（只有集成测试有），所以从
-+    /// `CARGO_MANIFEST_DIR` 拼出同一个位置。
-+    fn fresh_vault(prefix: &str) -> (tempfile::TempDir, Vault) {
-+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-+            .join("../../target/tmp")
-+            .join(format!("store-origin-{prefix}"));
-+        std::fs::create_dir_all(&root).expect("创建 target/tmp 下的测试根目录");
-+        let dir = tempfile::Builder::new()
-+            .prefix("vault-")
-+            .tempdir_in(&root)
-+            .expect("创建临时目录");
-+        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
-+        (dir, vault)
++    fn sqlite_error(code: rusqlite::ErrorCode, extended_code: i32) -> StorageError {
++        StorageError::Sqlite(rusqlite::Error::SqliteFailure(
++            rusqlite::ffi::Error {
++                code,
++                extended_code,
++            },
++            None,
++        ))
 +    }
 +
-+    fn scalar_i64(vault: &Vault, sql: &str) -> i64 {
-+        let rows = vault.query(sql, &[]).expect("查询");
-+        match rows.first().and_then(|row| row.first()) {
-+            Some(Value::Integer(value)) => *value,
-+            other => panic!("期望整数结果，实际 {other:?}"),
-+        }
-+    }
-+
-+    fn local_update(doc: &BodyDoc, base: &VersionVector) -> PendingUpdate {
-+        doc.pending_update(base).expect("导出增量")
-+    }
-+
-+    /// `OriginMarks::AllLocal`（显式类型）不扩大远端已知 VV，也不产生 outbox。
 +    #[test]
-+    fn all_local_origin_does_not_extend_remote_known() {
-+        let (_dir, vault) = fresh_vault("all-local");
-+        create_body_doc(&vault, "doc-local").expect("loro_docs 行");
-+        let doc = BodyDoc::create("doc-local", 0xA1).expect("创建 BodyDoc");
-+        doc.insert_scalars(0, "local").expect("本地编辑");
-+        let update = local_update(&doc, &VersionVector::default());
-+
-+        let head = append_updates_inner(
-+            &vault,
-+            "doc-local",
-+            0,
-+            &[UpdateRecord::new("b0", update)],
-+            &[],
-+            &[],
-+            OriginMarks::AllLocal,
-+        )
-+        .expect("A 事务");
-+
-+        assert_eq!(head.head_seq, 1);
-+        assert!(
-+            remote_known::load(&vault, "doc-local")
-+                .expect("读远端已知")
-+                .is_none(),
-+            "全部本地的批次绝不能创建/扩大远端已知 VV"
-+        );
-+        assert_eq!(
-+            scalar_i64(&vault, "SELECT count(*) FROM sync_outbox"),
-+            0,
-+            "slots 空 = 本批没有任何出站意图"
-+        );
++    fn retryable_write_error_is_a_positive_whitelist() {
++        assert!(is_retryable_write_error(&sqlite_error(
++            rusqlite::ErrorCode::DatabaseBusy,
++            5
++        )));
++        assert!(is_retryable_write_error(&sqlite_error(
++            rusqlite::ErrorCode::DatabaseLocked,
++            6
++        )));
++        assert!(!is_retryable_write_error(&sqlite_error(
++            rusqlite::ErrorCode::ConstraintViolation,
++            1811
++        )));
++        assert!(!is_retryable_write_error(&sqlite_error(
++            rusqlite::ErrorCode::ReadOnly,
++            8
++        )));
++        assert!(!is_retryable_write_error(&StorageError::Corrupt {
++            context: "test".to_owned(),
++        }));
 +    }
 +
-+    /// `PerRecord` 混排：只有 remote 条目的 `after - running` 记入远端已知 VV。
 +    #[test]
-+    fn per_record_origin_only_extends_for_remote_records() {
-+        let (_dir, vault) = fresh_vault("mixed");
-+        create_body_doc(&vault, "doc-mixed").expect("loro_docs 行");
-+
-+        let doc = BodyDoc::create("doc-mixed", 0xA1).expect("创建 BodyDoc");
-+        doc.insert_scalars(0, "local").expect("本地编辑");
-+        let local = local_update(&doc, &VersionVector::default());
-+        let remote_doc = BodyDoc::create("doc-mixed", 0xB2).expect("创建 BodyDoc");
-+        remote_doc.insert_scalars(0, "remote").expect("远端编辑");
-+        doc.import(&remote_doc.export_all_updates().expect("远端 update"))
-+            .expect("本地副本导入远端");
-+        let local_end = VersionVector::decode(&local.end_vv).expect("本地 VV");
-+        let remote = local_update(&doc, &local_end);
-+        let remote_end = VersionVector::decode(&remote.end_vv).expect("远端 VV");
-+        let expected = remote_known::added_since(&remote_end, &local_end);
-+
-+        let head = append_updates_inner(
-+            &vault,
-+            "doc-mixed",
-+            0,
-+            &[
-+                UpdateRecord::new("b0", local),
-+                UpdateRecord::new("b1", remote),
-+            ],
-+            &[],
-+            &[],
-+            OriginMarks::PerRecord(&[false, true]),
-+        )
-+        .expect("A 事务");
-+
-+        assert_eq!(head.head_seq, 2, "两条记录都必须落库");
-+        let known = remote_known::load(&vault, "doc-mixed")
-+            .expect("读远端已知")
-+            .expect("有 remote 条目就必须写 meta");
-+        assert_eq!(
-+            known, expected,
-+            "远端条目带来的 ops 必须记入，且只记入远端那一小段"
-+        );
-+        assert_eq!(
-+            known.get(&0xA1).copied().unwrap_or(0),
-+            0,
-+            "本地条目（哪怕同批先落库）绝不能记入远端已知 VV"
-+        );
-+        assert_eq!(
-+            scalar_i64(&vault, "SELECT count(*) FROM sync_outbox"),
-+            0,
-+            "没有传 slots 就不得写出站意图"
-+        );
-+    }
-+
-+    /// 空 `PerRecord` 不再表示「全部本地」：长度不匹配直接拒绝，且不写任何行。
-+    #[test]
-+    fn per_record_origin_length_mismatch_is_rejected() {
-+        let (_dir, vault) = fresh_vault("mismatch");
-+        create_body_doc(&vault, "doc-mismatch").expect("loro_docs 行");
-+        let doc = BodyDoc::create("doc-mismatch", 0xA1).expect("创建 BodyDoc");
-+        doc.insert_scalars(0, "x").expect("编辑");
-+        let update = local_update(&doc, &VersionVector::default());
-+        let record = UpdateRecord::new("b0", update);
-+
-+        let error = append_updates_inner(
-+            &vault,
-+            "doc-mismatch",
-+            0,
-+            std::slice::from_ref(&record),
-+            &[],
-+            &[],
-+            OriginMarks::PerRecord(&[]),
-+        )
-+        .expect_err("空 PerRecord 配非空 records 必须报错");
-+        assert!(
-+            matches!(error, StorageError::Corrupt { .. }),
-+            "必须是显式损坏/参数错误，实际 {error:?}"
-+        );
-+        assert_eq!(
-+            scalar_i64(&vault, "SELECT count(*) FROM loro_updates"),
-+            0,
-+            "参数错误不得留下半写"
-+        );
-+
-+        let error = append_updates_inner(
-+            &vault,
-+            "doc-mismatch",
-+            0,
-+            &[record],
-+            &[],
-+            &[],
-+            OriginMarks::PerRecord(&[true, false]),
-+        )
-+        .expect_err("标记多于 records 也必须报错");
-+        assert!(matches!(error, StorageError::Corrupt { .. }));
-+    }
-+
-+    /// 值 CAS 不命中（并发写者改了 meta）→ 有界重试后返回明确 SyncConflict，
-+    /// 整笔 A 事务回滚：head/update/outbox/meta 都不留半写，也绝不写入更小值。
-+    ///
-+    /// 注入方式：`loro_updates` 的 BEFORE INSERT 触发器在**同一事务里**把 meta 改成
-+    /// 别的值（模拟「读旧值之后、CAS 之前的并发提交」）；每次重试都会再次命中，
-+    /// 因此有界重试必然耗尽。
-+    #[test]
-+    fn stale_remote_known_cas_fails_closed_and_rolls_back() {
-+        let (_dir, vault) = fresh_vault("cas");
-+        create_body_doc(&vault, "doc-cas").expect("loro_docs 行");
-+        let remote_doc = BodyDoc::create("doc-cas", 0xB2).expect("创建 BodyDoc");
-+        remote_doc.insert_scalars(0, "remote").expect("远端编辑");
-+        let update = local_update(&remote_doc, &VersionVector::default());
-+        vault
-+            .exec(
-+                "CREATE TRIGGER remote_known_race BEFORE INSERT ON loro_updates BEGIN \
-+                   INSERT OR REPLACE INTO meta(key,value) \
-+                   VALUES('sync.remote_known_vv.doc-cas', X'DEADBEEF'); \
-+                 END;",
-+                &[],
-+            )
-+            .expect("安装竞态触发器");
-+
-+        let error = append_updates_inner(
-+            &vault,
-+            "doc-cas",
-+            0,
-+            &[UpdateRecord::new("b0", update)],
-+            &[],
-+            &[],
-+            OriginMarks::PerRecord(&[true]),
-+        )
-+        .expect_err("CAS 必须失败");
-+
-+        match error {
-+            StorageError::SyncConflict { context } => {
-+                assert!(
-+                    context.contains("远端已知 VV"),
-+                    "错误必须点明远端已知 VV CAS：{context}"
-+                );
-+                assert!(context.contains("可重试"), "错误必须说明可重试：{context}");
-+            }
-+            other => panic!("期望 SyncConflict，实际 {other:?}"),
-+        }
-+        assert_eq!(load_head(&vault, "doc-cas").expect("head").head_seq, 0);
-+        assert_eq!(
-+            scalar_i64(&vault, "SELECT count(*) FROM loro_updates"),
-+            0,
-+            "整笔回滚：update 不得落库"
-+        );
-+        assert_eq!(
-+            scalar_i64(&vault, "SELECT count(*) FROM projection_outbox"),
-+            0
-+        );
-+        assert_eq!(
-+            scalar_i64(
-+                &vault,
-+                "SELECT count(*) FROM meta WHERE key='sync.remote_known_vv.doc-cas'"
-+            ),
-+            0,
-+            "触发器写入随整笔回滚，失败后不残留"
-+        );
-+        assert!(
-+            remote_known::load(&vault, "doc-cas")
-+                .expect("读远端已知")
-+                .is_none(),
-+            "失败路径绝不能写入更小/错误的值"
-+        );
++    fn rebuild_write_error_outcome_maps_busy_to_retryable_and_permanent_to_unrecoverable() {
++        let busy = sqlite_error(rusqlite::ErrorCode::DatabaseBusy, 5);
++        let retryable = rebuild_write_error_outcome("doc-1", 2, busy);
++        assert!(matches!(retryable, RebuildOutcome::Retryable(_)));
++        let permanent = sqlite_error(rusqlite::ErrorCode::ConstraintViolation, 1811);
++        let unrecoverable = rebuild_write_error_outcome("doc-1", 2, permanent);
++        assert!(matches!(unrecoverable, RebuildOutcome::Unrecoverable(_)));
 +    }
 +}
+diff --git a/crates/storage/src/session/schedule.rs b/crates/storage/src/session/schedule.rs
+index d08054d..0f7a421 100644
+--- a/crates/storage/src/session/schedule.rs
++++ b/crates/storage/src/session/schedule.rs
+@@ -228,6 +228,19 @@ pub struct CloseReport {
+     pub flush_error: Option<String>,
+ }
+ 
++impl CloseReport {
++    /// 这次关闭是否暴露了需要“重开文档”的不可恢复失败。
++    ///
++    /// 只看 `flush_error` 的统一文案（`reopen_message`）；普通磁盘/SQLite 的瞬时失败
++    /// 也可能带 `flush_error`，但允许下一次再 flush，不应被 UI 当成永久坏状态。
++    #[must_use]
++    pub fn needs_reopen(&self) -> bool {
++        self.flush_error
++            .as_deref()
++            .is_some_and(|message| message.contains("需要重开文档"))
++    }
++}
++
+ /// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct MaterializeJob {
 diff --git a/crates/storage/src/sync_bridge.rs b/crates/storage/src/sync_bridge.rs
-index c9e2b44..a831dea 100644
+index a831dea..fe052ef 100644
 --- a/crates/storage/src/sync_bridge.rs
 +++ b/crates/storage/src/sync_bridge.rs
-@@ -20,7 +20,7 @@ use crate::Vault;
- 
- // 同步 `meta` 键与「连续前缀」的低层实现放在 `sync_meta`（直接跑在 `Connection` 上，
- // 这样批量 inbox 的插入与前缀推进能共用一个事务）；这里保持原有的公开路径。
--use crate::sync_meta::{skipped_received_key, ConsumedPrefix};
-+use crate::sync_meta::{meta_bytes_of, skipped_received_key, ConsumedPrefix};
- pub use crate::sync_meta::{
-     META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
-     META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
-@@ -157,13 +157,16 @@ pub fn local_sync_intent(
- /// 一次 flush 的连续前缀可能**混**本地编辑与远端导入（`JournalOrigin`），而
- /// remote/import/adopt **绝不能**产生出站意图（否则会把刚收到的数据再推回 relay）。
- /// 这里仍是一条 A 事务、按位置一一对应，只是允许某些位置为空。
-+///
-+/// `slots` 空 = 本批没有**任何**出站意图；来源标记用 [`store::OriginMarks`]
-+/// （`AllLocal` / 与 records 等长的 `PerRecord`），**不再用空切片**表示「全部本地」。
- pub(crate) fn append_updates_with_intent_slots(
-     vault: &Vault,
-     doc_id: &str,
-     expected_head_seq: u64,
-     records: &[store::UpdateRecord],
-     slots: &[Option<SyncIntent>],
--    remote_marks: &[bool],
-+    origin: store::OriginMarks<'_>,
- ) -> Result<store::HeadState, StorageError> {
-     if !slots.is_empty() && slots.len() != records.len() {
-         return Err(StorageError::Corrupt {
-@@ -174,22 +177,13 @@ pub(crate) fn append_updates_with_intent_slots(
-             ),
-         });
-     }
--    if !remote_marks.is_empty() && remote_marks.len() != records.len() {
--        return Err(StorageError::Corrupt {
--            context: format!(
--                "append_updates_with_intent_slots: records={} remote_marks={} 必须一对一",
--                records.len(),
--                remote_marks.len()
--            ),
--        });
--    }
-     store::append_updates_with_intent_slots(
-         vault,
-         doc_id,
-         expected_head_seq,
-         records,
-         slots,
--        remote_marks,
-+        origin,
-     )
- }
- 
-@@ -370,7 +364,14 @@ pub fn append_updates_with_sync_intents(
-         });
-     }
-     let slots: Vec<Option<SyncIntent>> = intents.iter().cloned().map(Some).collect();
--    store::append_updates_with_intent_slots(vault, doc_id, expected_head_seq, records, &slots, &[])
-+    store::append_updates_with_intent_slots(
-+        vault,
-+        doc_id,
-+        expected_head_seq,
-+        records,
-+        &slots,
-+        store::OriginMarks::AllLocal,
-+    )
- }
- 
- /// 单独记录一条出站意图（调用方已确认 update 落库）。
-@@ -1089,15 +1090,31 @@ pub fn store_inbox_verified_batch(
- /// 读当前已验证、且落在 durable 连续接收前缀内的 inbox 行。
+@@ -1094,6 +1094,37 @@ pub fn store_inbox_verified_batch(
+ /// `relay_seq <= received_seq`，不在连续前缀内的行保持 durable，等前面的缺口补齐。
+ /// 排序为 `(log_id, relay_seq)`。
  ///
- /// 依赖完整性由 sync 层判断（本 crate 不解析 Loro VV）；这里的 "ready"
--/// 指 cryptographically verified + durable + `relay_seq <= received_seq`，
--/// 不在连续前缀内的行保持 durable，等前面的缺口补齐。排序为 `(log_id, relay_seq)`。
-+/// 指 cryptographically verified + durable + **属于当前 `sync.log_id`** +
-+/// `relay_seq <= received_seq`，不在连续前缀内的行保持 durable，等前面的缺口补齐。
-+/// 排序为 `(log_id, relay_seq)`。
++/// 清理已被 `integrated` 前缀覆盖的 inbox 行（Phase 1B 追赶后）。
 +///
-+/// **incarnation 过滤**（ADR 0006 §5）：`sync_inbox` 的 `log_id` 是写入时那代 relay
-+/// 日志的 incarnation。restore 迁移 `sync.log_id` 后，旧 incarnation 的行仍然 durable
-+/// （不能在迁移时静默删数据），但绝不能进入 ready——`relay_seq` 只在同一 incarnation
-+/// 内有序，跨代比较没有意义。过滤条件里的 `log_id` 由 [`read_current_log_id`] 读出后
-+/// 作为 SQL 参数绑定，不做子查询以便调用方/测试都看到同一个显式值。
++/// **安全边界**：只删除 `relay_seq <= up_to_seq` 且同一 SQL 内证明
++/// `sync.integrated_seq >= up_to_seq` 的行；证明不成立时一行不删。调用方还必须保证
++/// `log_id` 是当前 relay incarnation，且 `up_to_seq` 是实际成功的 checkpoint S。
 +///
-+/// `sync.log_id` 不存在（新库尚未绑定 relay 日志代）时返回空：没有当前 incarnation
-+/// 就没有可匹配的行；新库此时 `received` 也是 0，所以与旧实现（不按 log 过滤）的结果
-+/// 一致，不会把其它 incarnation 的遗留行漏出来。`sync.log_id` 存在但不是 16B →
-+/// [`StorageError::Corrupt`]（与 [`sync_cursor_state`] 同口径），不静默当作"没有 log"。
- pub fn take_inbox_ready(vault: &Vault, limit: usize) -> Result<Vec<SyncInboxRow>, StorageError> {
-+    let Some(log_id) = read_current_log_id(vault)? else {
-+        return Ok(Vec::new());
-+    };
-     let received = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
-     let rows = vault.query(
-         "SELECT log_id,relay_seq,object_id,epoch,state,verified_payload \
--         FROM sync_inbox WHERE state='verified' AND relay_seq<=?1 \
--         ORDER BY log_id,relay_seq LIMIT ?2",
-+         FROM sync_inbox WHERE log_id=?1 AND state='verified' AND relay_seq<=?2 \
-+         ORDER BY log_id,relay_seq LIMIT ?3",
-         &[
++/// 为什么不用先读后删：读 `integrated` 与 DELETE 之间可能被并发推进/回退；
++/// `EXISTS` 子查询把证明和删除放在同一条原子语句里。BLOB 按 8 字节 BE 比较。
++pub fn prune_covered_inbox(
++    vault: &Vault,
++    log_id: &[u8; 16],
++    up_to_seq: u64,
++) -> Result<usize, StorageError> {
++    let up_to = i64_of(up_to_seq)?;
++    let statements = [Statement::new(
++        "DELETE FROM sync_inbox \
++         WHERE log_id=?1 AND relay_seq<=?2 \
++           AND EXISTS (SELECT 1 FROM meta \
++                        WHERE key=?3 AND typeof(value)='blob' AND length(value)=8 \
++                          AND value>=?4)",
++        vec![
 +            Value::Blob(log_id.to_vec()),
-             Value::Integer(i64_of(received)?),
-             Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
-         ],
-@@ -1105,16 +1122,27 @@ pub fn take_inbox_ready(vault: &Vault, limit: usize) -> Result<Vec<SyncInboxRow>
-     rows.iter().map(row_to_inbox).collect()
- }
- 
--/// 统计「已验证、落在 durable 连续接收前缀内、尚未集成」的 inbox 行数。
-+/// 统计「已验证、属于当前 incarnation、落在 durable 连续接收前缀内、尚未集成」的行数。
- ///
- /// 语义（ADR 0012 S2b）：这些行不是"丢失"——它们要么依赖未就绪（deferred），要么被
- /// 批次预算留在本轮之后。调用方用它上报"已接收·待应用 N"，并据此判断"还有没有
- /// 可继续的工作"，而不是循环刷最早的一批。
-+///
-+/// 与 [`take_inbox_ready`] 同口径：只计当前 `sync.log_id` 的行，旧 incarnation 的
-+/// verified 行即使 `relay_seq <= received` 也不计。`sync.log_id` 不存在返回 0
-+/// （没有当前 incarnation 就没有 ready 行）；存在但长度非法 → [`StorageError::Corrupt`]。
- pub fn count_inbox_ready(vault: &Vault) -> Result<u64, StorageError> {
-+    let Some(log_id) = read_current_log_id(vault)? else {
-+        return Ok(0);
-+    };
-     let received = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
-     let rows = vault.query(
--        "SELECT COUNT(*) FROM sync_inbox WHERE state='verified' AND relay_seq<=?1",
--        &[Value::Integer(i64_of(received)?)],
-+        "SELECT COUNT(*) FROM sync_inbox \
-+         WHERE log_id=?1 AND state='verified' AND relay_seq<=?2",
-+        &[
-+            Value::Blob(log_id.to_vec()),
-+            Value::Integer(i64_of(received)?),
++            Value::Integer(up_to),
++            Value::Text(META_SYNC_INTEGRATED_SEQ.to_owned()),
++            Value::Blob(up_to_seq.to_be_bytes().to_vec()),
 +        ],
-     )?;
-     rows.first()
-         .map(|row| u64_of(row, 0, "sync_inbox.count"))
-@@ -1125,6 +1153,8 @@ pub fn count_inbox_ready(vault: &Vault) -> Result<u64, StorageError> {
- }
- 
- /// 带调用方依赖判断的 ready 选择器；不满足的项保持 durable verified。
-+///
-+/// 底层走 [`take_inbox_ready`]，因此同样只选择当前 `sync.log_id` 的行。
- pub fn take_inbox_ready_where(
-     vault: &Vault,
-     limit: usize,
-@@ -1270,13 +1300,22 @@ pub fn sync_cursor_state(vault: &Vault) -> Result<SyncCursorState, StorageError>
-     Ok(SyncCursorState {
-         received_seq: read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0),
-         integrated_seq: read_meta_u64(vault, META_SYNC_INTEGRATED_SEQ)?.unwrap_or(0),
--        log_id: read_meta(vault, META_SYNC_LOG_ID)?
--            .map(|bytes| array16_bytes(bytes, "sync.log_id"))
--            .transpose()?,
-+        log_id: read_current_log_id(vault)?,
-         confirmed_highwater: read_meta_u64(vault, META_SYNC_CONFIRMED_HIGHWATER)?,
-     })
- }
- 
-+/// 读当前 relay 日志 incarnation（`sync.log_id`，BLOB 16B）。
-+///
-+/// - 不存在（新库/尚未绑定）：`Ok(None)`，调用方按"没有当前 incarnation"处理
-+///   （ready 视为空，绝不回退成"不过滤 log"）；
-+/// - 存在但不是 16B：[`StorageError::Corrupt`]，与 [`sync_cursor_state`] 的既有口径一致。
-+fn read_current_log_id(vault: &Vault) -> Result<Option<[u8; 16]>, StorageError> {
-+    read_meta(vault, META_SYNC_LOG_ID)?
-+        .map(|bytes| array16_bytes(bytes, "sync.log_id"))
-+        .transpose()
++    )];
++    let changed = vault.exec_transaction(&statements, &[])?;
++    Ok(changed.first().copied().unwrap_or(0))
 +}
 +
- /// 写入 `sync.log_id`；已有不同值则拒绝（restore 必须显式迁移）。
- pub fn set_sync_log_id(vault: &Vault, log_id: &[u8; 16]) -> Result<(), StorageError> {
-     ensure_log_id(vault, log_id)
-@@ -1333,15 +1372,21 @@ pub fn mark_skipped_event_received(
-     advance_received_prefix(vault)
- }
- 
-+/// 读一条 meta（同步桥经 Vault 命令的读取路径）。
-+///
-+/// 类型判定与 [`Vault::get_meta`] / `sync_meta::read_meta_on` 共用同一个 helper
-+/// [`meta_bytes_of`]：**只认 BLOB**，其它类型是 [`StorageError::Corrupt`]。
-+/// 这里以前把 TEXT 当"缺失"，会让 `sync.log_id` / `sync.repack_required` /
-+/// `sync.received_seq` 这些持久屏障与游标被静默绕过。
- fn read_meta(vault: &Vault, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-     let rows = vault.query(
-         "SELECT value FROM meta WHERE key=?1",
-         &[Value::Text(key.to_owned())],
-     )?;
--    Ok(rows
--        .first()
--        .and_then(|row| row.first())
--        .and_then(blob_value))
-+    let Some(value) = rows.first().and_then(|row| row.first()) else {
-+        return Ok(None);
-+    };
-+    Ok(Some(meta_bytes_of(key, value.clone())?))
- }
- 
- fn read_meta_u64(vault: &Vault, key: &str) -> Result<Option<u64>, StorageError> {
-diff --git a/crates/storage/src/sync_meta.rs b/crates/storage/src/sync_meta.rs
-index 82db021..4ab5086 100644
---- a/crates/storage/src/sync_meta.rs
-+++ b/crates/storage/src/sync_meta.rs
-@@ -71,6 +71,10 @@ impl ConsumedPrefix {
- ///
- /// 与 Vault 版 [`crate::sync_bridge::set_sync_log_id`] 同语义，区别只是直接在给定连接
- /// （或事务）上执行，供批量 inbox 在同一事务里完成校验。
-+///
-+/// 既有值不是 BLOB 时 [`read_meta_on`] 返回 [`StorageError::Corrupt`]，本函数直接传播：
-+/// 损坏的 incarnation 记录**不能**当成"尚未绑定"覆盖掉（那会让旧传代的 inbox 行混进
-+/// 新一代）。
- pub(crate) fn ensure_log_id_on(conn: &Connection, log_id: &[u8; 16]) -> Result<(), StorageError> {
-     match read_meta_on(conn, META_SYNC_LOG_ID)? {
-         Some(existing) => {
-@@ -313,16 +317,58 @@ pub(crate) fn skipped_received_key(log_id: &[u8], relay_seq: u64) -> Result<Stri
-     ))
- }
- 
--fn read_meta_on(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-+/// `meta.value` 的**唯一**解读口径：只认 BLOB，其它 SQLite 类型一律是损坏。
-+///
-+/// 三个读取入口共享本函数，避免"同一份库读出两套结论"漂移：
-+///
-+/// - [`crate::Vault::get_meta`]（actor 线程上的命令）；
-+/// - `sync_bridge::read_meta`（同步桥经 Vault 命令读取）；
-+/// - 本模块的 [`read_meta_on`]（worker 独占连接 / 事务内的批量 inbox 校验）。
-+///
-+/// 为什么不把其它类型「当字节」或「当缺失」：
-+///
-+/// - **当缺失会静默绕过持久屏障**：`sync.repack_required`（轮换后必须重打包）、
-+///   `sync.log_id`（incarnation 绑定）、`sync.received_seq` 这类键"读不到"就等价于
-+///   "没有屏障/没有游标"，把一处损坏放大成绕过安全前置条件；
-+/// - **当字节与 schema 相悖**：`meta.value` 是 `BLOB NOT NULL`（STRICT 表），能读出
-+///   TEXT/INTEGER/REAL 本身就说明库被外部改坏或 schema 漂移，继续按字节解释只会让
-+///   损坏值流入上层语义。
-+///
-+/// 正常写入路径写不出非 BLOB（STRICT 表会直接拒绝），所以这里命中的都是
-+/// "库被外部改坏"的场景：宁可 fail-closed 报损坏，也不猜。
-+pub(crate) fn meta_bytes_of(key: &str, value: Value) -> Result<Vec<u8>, StorageError> {
-+    match value {
-+        Value::Blob(bytes) => Ok(bytes),
-+        other => Err(StorageError::Corrupt {
-+            context: format!(
-+                "meta[{key}] 应为 BLOB，实际 {}（库被外部改坏或 schema 漂移）",
-+                sqlite_type_name(&other)
-+            ),
-+        }),
-+    }
-+}
-+
-+/// SQLite 值的类型名（只用于错误信息）。
-+fn sqlite_type_name(value: &Value) -> &'static str {
-+    match value {
-+        Value::Null => "NULL",
-+        Value::Integer(_) => "INTEGER",
-+        Value::Real(_) => "REAL",
-+        Value::Text(_) => "TEXT",
-+        Value::Blob(_) => "BLOB",
-+    }
-+}
-+
-+/// 在给定连接（或事务）上读一条 meta；键不存在返回 `None`。
-+///
-+/// 类型判定走 [`meta_bytes_of`]：只认 BLOB，其它类型是 [`StorageError::Corrupt`]
-+/// （不再静默当作缺失）。
-+pub(crate) fn read_meta_on(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-     let mut statement = conn.prepare("SELECT value FROM meta WHERE key=?1")?;
-     let mut rows = statement.query([key])?;
-     match rows.next()? {
-         None => Ok(None),
--        // 与旧实现同口径：只认 BLOB；其它类型视为没有该 meta。
--        Some(row) => match row.get::<usize, Value>(0)? {
--            Value::Blob(blob) => Ok(Some(blob)),
--            _ => Ok(None),
--        },
-+        Some(row) => Ok(Some(meta_bytes_of(key, row.get::<usize, Value>(0)?)?)),
-     }
- }
- 
-diff --git a/crates/storage/tests/baseline_apply.rs b/crates/storage/tests/baseline_apply.rs
-index 5aac713..d9f3bf9 100644
---- a/crates/storage/tests/baseline_apply.rs
-+++ b/crates/storage/tests/baseline_apply.rs
-@@ -4,6 +4,7 @@ mod support;
- 
- use std::time::Duration;
- 
-+use loro::VersionVector;
+ /// **incarnation 过滤**（ADR 0006 §5）：`sync_inbox` 的 `log_id` 是写入时那代 relay
+ /// 日志的 incarnation。restore 迁移 `sync.log_id` 后，旧 incarnation 的行仍然 durable
+ /// （不能在迁移时静默删数据），但绝不能进入 ready——`relay_seq` 只在同一 incarnation
+diff --git a/crates/storage/tests/body_doc_detached_oplog.rs b/crates/storage/tests/body_doc_detached_oplog.rs
+index 77996d1..9620bfb 100644
+--- a/crates/storage/tests/body_doc_detached_oplog.rs
++++ b/crates/storage/tests/body_doc_detached_oplog.rs
+@@ -29,15 +29,20 @@ use loro::{ExportMode, LoroDoc, LoroTree, LoroValue, TreeID, VersionVector};
  use support::*;
  
- use menghunote_storage::session::{
-@@ -13,11 +14,14 @@ use menghunote_storage::session::{
  use menghunote_storage::{
-     abort_baseline_apply, append_updates_with_integrated_marks, apply_baseline_assets,
-     apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_state,
--    begin_baseline_apply, create_note_slot, finish_baseline_apply, load_body_doc, load_head,
-+    baseline_verify_failure, begin_baseline_apply, create_note_slot, finish_baseline_apply,
-+    load_body_doc, load_head, load_structure, mark_baseline_verify_failed,
-     reset_baseline_apply_debug, set_sync_log_id, store_inbox_verified_batch, sync_cursor_state,
--    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BodyDoc, SyncContext, UpdateRecord,
--    Value, Vault, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
--    META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
-+    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc,
-+    StorageError, StructureDoc, StructureWriter, SyncContext, UpdateRecord, Value, Vault,
-+    VerifiedInboxRow, BASELINE_MERGE_BATCH, META_BASELINE_VERIFY_FAILED,
-+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
-+    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION, STRUCTURE_DOC_ID,
+-    apply_baseline_batch, begin_baseline_apply, doc_updates_since, finish_baseline_apply,
+-    load_body_doc, BaselineApplyFinish, BaselineExpectation, BodyDoc, StoredLoroUpdate, Vault,
+-    BASELINE_MERGE_BATCH,
++    append_updates, apply_baseline_batch, baseline_apply_debug_counters, begin_baseline_apply,
++    doc_updates_since, finish_baseline_apply, load_body_doc, reset_baseline_apply_debug,
++    BaselineApplyFinish, BaselineExpectation, BodyDoc, PendingUpdate, StoredLoroUpdate,
++    UpdateRecord, Vault, BASELINE_MERGE_BATCH,
  };
- use menghunote_text::UnicodeScalar;
  
-@@ -85,14 +89,89 @@ fn meta_remote_known_count(vault: &Vault, doc_id: &str) -> i64 {
-     )
+ /// 本地设备（attached 侧）。
+ const A_PEER: u64 = PEER_A;
+ /// 远端基线导出方（与本地不同的 peer）。
+ const B_PEER: u64 = PEER_B;
++/// 第三个 peer：只出现在基线快照里、本地从未导入的远端设备（本地未知 peer）。
++const C_PEER: u64 = 3;
++/// 第四个 peer：本地以非因果顺序导入的另一个远端设备。
++const D_PEER: u64 = 4;
+ 
+ // ---------------------------------------------------------------------------
+ // 正文（LoroText）用例的脚手架
+@@ -73,12 +78,36 @@ fn snapshot_vv(snapshot: &[u8]) -> VersionVector {
+ /// VV 的规范表示：`VersionVector::encode` 的字节顺序取决于 import 顺序（不是规范形式），
+ /// 所以按 peer 排序后比较「peer -> counter」集合；语义相等即等价。
+ fn canonical_vv(bytes: &[u8]) -> Vec<(u64, i32)> {
+-    let vv = VersionVector::decode(bytes).expect("VV 可解码");
++    canonical_of_vv(&VersionVector::decode(bytes).expect("VV 可解码"))
++}
++
++/// 同 [`canonical_vv`]，但输入已是解码后的 VV（断言 blob 元信息与文档 VV 用）。
++fn canonical_of_vv(vv: &VersionVector) -> Vec<(u64, i32)> {
+     let mut entries: Vec<(u64, i32)> = vv.iter().map(|(peer, counter)| (*peer, *counter)).collect();
+     entries.sort_unstable();
+     entries
  }
  
-+/// 读某篇文档的远端已知 VV；没有记录返回 `None`。
-+fn meta_remote_known(vault: &Vault, doc_id: &str) -> Option<VersionVector> {
-+    meta_remote_known_bytes(vault, doc_id).map(|bytes| VersionVector::decode(&bytes).expect("解码"))
++/// 单个 peer 的计数（缺失按 0 处理，与 `VersionVector` 语义一致）。
++fn counter_of(vv: &VersionVector, peer: u64) -> i32 {
++    vv.iter()
++        .find(|(candidate, _)| **candidate == peer)
++        .map(|(_, counter)| *counter)
++        .unwrap_or(0)
 +}
 +
-+/// 读某篇文档的远端已知 VV 原始字节（用于断言「不降级」）。
-+fn meta_remote_known_bytes(vault: &Vault, doc_id: &str) -> Option<Vec<u8>> {
-+    let rows = vault
-+        .query(
-+            "SELECT value FROM meta WHERE key=?1",
-+            &[Value::Text(format!("sync.remote_known_vv.{doc_id}"))],
-+        )
-+        .expect("meta 查询");
-+    match rows.first().and_then(|row| row.first()) {
-+        Some(Value::Blob(bytes)) => Some(bytes.clone()),
-+        None => None,
-+        other => panic!("remote_known 值异常：{other:?}"),
-+    }
-+}
-+
-+/// 注入「读旧值之后、CAS 之前 meta 被并发改写」：在 baseline_apply_docs 首次写入时
-+/// 把该文档的远端已知 VV 改成别的字节（同一事务内可见，CAS 必然不命中）。
-+fn install_remote_known_clobber_trigger(vault: &Vault, doc_id: &str) {
-+    let sql = format!(
-+        "CREATE TRIGGER remote_known_cas_race BEFORE INSERT ON baseline_apply_docs \
-+         BEGIN \
-+           INSERT OR REPLACE INTO meta(key,value) \
-+           VALUES('sync.remote_known_vv.{doc_id}', X'DEADBEEF'); \
-+         END;"
-+    );
-+    vault.exec(&sql, &[]).expect("安装竞态触发器");
-+}
-+
- fn snapshot(doc_id: &str, peer: u64, text: &str) -> Vec<u8> {
-     let doc = BodyDoc::create(doc_id, peer).expect("创建基线 LoroDoc");
-     doc.insert_scalars(0, text).expect("写基线正文");
-     doc.export_snapshot().expect("导出基线 snapshot")
- }
- 
--fn begin(vault: &Vault, s: u64, cursor: &str) {
--    begin_baseline_apply(vault, &[7; 16], s, cursor).expect("begin baseline");
-+/// 预期参与集合：只声明文档（本文件里大多数用例没有资产）。
-+fn expectation(docs: &[&str]) -> BaselineExpectation {
-+    BaselineExpectation::new(
-+        docs.iter().map(|doc_id| (*doc_id).to_owned()),
-+        std::iter::empty::<[u8; 32]>(),
-+    )
-+}
-+
-+/// 预期参与集合：文档 + 资产。
-+fn expectation_with_assets(docs: &[&str], assets: &[[u8; 32]]) -> BaselineExpectation {
-+    BaselineExpectation::new(
-+        docs.iter().map(|doc_id| (*doc_id).to_owned()),
-+        assets.iter().copied(),
-+    )
-+}
-+
-+/// begin 一份**空预期集合**的 staging（只关心 cursor/journal 语义的用例）。
-+fn begin(vault: &Vault, s: u64, cursor: &str) -> menghunote_storage::BaselineApplyState {
-+    begin_with(vault, s, cursor, &BaselineExpectation::default())
-+}
-+
-+/// begin 一份显式声明预期参与集合的 staging。
-+fn begin_with(
-+    vault: &Vault,
-+    s: u64,
-+    cursor: &str,
-+    expected: &BaselineExpectation,
-+) -> menghunote_storage::BaselineApplyState {
-+    begin_baseline_apply(vault, &[7; 16], s, cursor, expected).expect("begin baseline")
-+}
-+
-+/// 读某篇文档的 tombstone action（当前 journal）。
-+fn tombstone_action(vault: &Vault, doc_id: &str) -> Option<String> {
-+    let rows = vault
-+        .query(
-+            "SELECT action FROM baseline_apply_tombstones WHERE doc_id=?1",
-+            &[Value::Text(doc_id.to_owned())],
-+        )
-+        .expect("tombstone 查询");
-+    match rows.first().and_then(|row| row.first()) {
-+        Some(Value::Text(value)) => Some(value.clone()),
-+        Some(other) => panic!("tombstone action 异常：{other:?}"),
-+        None => None,
-+    }
- }
- 
- /// 模拟"已有库"的同步水位；`None` 表示 meta 缺省。
-@@ -153,7 +232,7 @@ fn baseline_merge_preserves_local_edit_and_advances_cursor() {
-     let local = local_doc(&vault, "doc-1", "local");
-     let snap = snapshot("doc-1", PEER_B, "remote");
- 
--    begin(&vault, 5, "source-cursor");
-+    begin_with(&vault, 5, "source-cursor", &expectation(&["doc-1"]));
-     assert_eq!(
-         baseline_apply_state(&vault)
-             .expect("state")
-@@ -273,7 +352,7 @@ fn batch_is_resumable_after_reopen_and_idempotent() {
-     let snap_a = snapshot("doc-a", PEER_B, "a-remote");
-     let snap_b = snapshot("doc-b", PEER_B, "b-remote");
- 
--    begin(&vault, 9, "src");
-+    begin_with(&vault, 9, "src", &expectation(&["doc-a", "doc-b"]));
-     apply_baseline_batch(&vault, &[("doc-a".to_owned(), snap_a.clone())], &[]).expect("batch a");
-     let cursor = sync_cursor_state(&vault).expect("cursor before finish");
-     assert_eq!(cursor.received_seq, 0);
-@@ -317,7 +396,7 @@ fn batch_is_resumable_after_reopen_and_idempotent() {
- fn finish_cursor_cas_conflict_does_not_advance() {
-     let (_dir, vault) = fresh_vault();
-     local_doc(&vault, "doc-1", "local");
--    begin(&vault, 4, "src");
-+    begin_with(&vault, 4, "src", &expectation(&["doc-1"]));
-     apply_baseline_batch(
-         &vault,
-         &[("doc-1".to_owned(), snapshot("doc-1", PEER_B, "remote"))],
-@@ -881,7 +960,7 @@ fn replay_same_digest_skips_snapshot_decode() {
- #[test]
- fn tombstone_deletes_previous_baseline_doc_after_begin_clears_staging_tables() {
-     let (_dir, vault) = fresh_vault();
--    begin(&vault, 10, "src1");
-+    begin_with(&vault, 10, "src1", &expectation(&["doc-x"]));
-     apply_baseline_batch(
-         &vault,
-         &[("doc-x".to_owned(), snapshot("doc-x", PEER_B, "remote body"))],
-@@ -1080,3 +1159,1302 @@ fn tombstone_deletes_doc_integrated_through_engine_path() {
-     );
-     assert_eq!(state.kept_local_edit, 0);
- }
-+
-+// ---------------------------------------------------------------------------
-+// P1-1：finish 完整性（begin 记录预期参与集合，finish 前逐项证明）
-+// ---------------------------------------------------------------------------
-+
-+/// 少跑一批就 finish：必须 Conflict 且一行都不写（旧实现会 Applied 并推进 S，
-+/// pull 之后永久跳过这批 relay 事件）。
-+#[test]
-+fn finish_without_all_docs_is_conflict() {
-+    let (_dir, vault) = fresh_vault();
-+    local_doc(&vault, "doc-a", "a-local");
-+    local_doc(&vault, "doc-b", "b-local");
-+    begin_with(&vault, 5, "src", &expectation(&["doc-a", "doc-b"]));
-+
-+    let state = apply_baseline_batch(
-+        &vault,
-+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
-+        &[],
-+    )
-+    .expect("batch a");
-+    assert_eq!(state.applied_docs, 1);
-+    assert_eq!(state.expected_docs, Some(2));
-+    assert!(
-+        !state.finishable,
-+        "预期集合未齐（doc-b 缺失）时不得声称可 finish"
-+    );
-+
-+    assert_eq!(
-+        finish_baseline_apply(&vault, 5, "baseline-cursor").expect("finish"),
-+        BaselineApplyFinish::Conflict,
-+        "预期集合未齐时 finish 必须 Conflict"
-+    );
-+
-+    // 冲突时一行都不写：水位/meta/游标/journal 全部保持 begin 前状态。
-+    let cursor = sync_cursor_state(&vault).expect("cursor");
-+    assert_eq!(cursor.received_seq, 0, "冲突时不得推进 received");
-+    assert_eq!(cursor.integrated_seq, 0, "冲突时不得推进 integrated");
-+    assert_eq!(cursor.confirmed_highwater, None, "冲突时不得写 highwater");
-+    assert_eq!(relay_cursor(&vault), None, "冲突时不得写 relay cursor");
-+    let journal = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal");
-+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
-+    assert_eq!(journal.chosen_cursor, None);
-+    assert_eq!(journal.applied_docs, 1, "冲突不得回滚已提交批次");
-+
-+    // 补齐缺失批次后必须能正常 finish（Conflict 不是永久卡死）。
-+    let state = apply_baseline_batch(
-+        &vault,
-+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
-+        &[],
-+    )
-+    .expect("batch b");
-+    assert!(state.finishable, "两篇都到齐后必须可 finish");
-+    let BaselineApplyFinish::Applied(state) =
-+        finish_baseline_apply(&vault, 5, "baseline-cursor").expect("finish")
-+    else {
-+        panic!("补齐后 finish 必须 Applied");
-+    };
-+    assert_eq!(state.status, BaselineApplyStatus::Completed);
-+    assert_eq!(state.applied_docs, 2);
-+    let cursor = sync_cursor_state(&vault).expect("cursor");
-+    assert_eq!(cursor.received_seq, 5);
-+    assert_eq!(cursor.integrated_seq, 5);
-+    assert_eq!(cursor.confirmed_highwater, Some(5));
-+}
-+
-+/// 全部分批到齐：finish 正常 Applied。
-+#[test]
-+fn finish_after_full_batches_is_applied() {
-+    let (_dir, vault) = fresh_vault();
-+    local_doc(&vault, "doc-a", "a-local");
-+    local_doc(&vault, "doc-b", "b-local");
-+    begin_with(&vault, 9, "src", &expectation(&["doc-a", "doc-b"]));
-+
-+    let first = apply_baseline_batch(
-+        &vault,
-+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
-+        &[],
-+    )
-+    .expect("batch a");
-+    assert_eq!(first.expected_docs, Some(2));
-+    assert!(!first.finishable);
-+
-+    let second = apply_baseline_batch(
-+        &vault,
-+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
-+        &[],
-+    )
-+    .expect("batch b");
-+    assert!(second.finishable);
-+
-+    let BaselineApplyFinish::Applied(state) =
-+        finish_baseline_apply(&vault, 9, "baseline-cursor").expect("finish")
-+    else {
-+        panic!("完整批次 finish 必须 Applied");
-+    };
-+    assert_eq!(state.status, BaselineApplyStatus::Completed);
-+    assert_eq!(state.applied_docs, 2);
-+    assert_eq!(state.expected_docs, Some(2));
-+    assert_eq!(state.expected_assets, Some(0));
-+    assert!(!state.finishable, "completed 后不再是 finishable");
-+    let cursor = sync_cursor_state(&vault).expect("cursor");
-+    assert_eq!(cursor.received_seq, 9);
-+    assert_eq!(cursor.integrated_seq, 9);
-+    assert_eq!(cursor.confirmed_highwater, Some(9));
-+    assert_eq!(
-+        relay_cursor(&vault).as_deref(),
-+        Some(b"baseline-cursor".as_slice())
-+    );
-+}
-+
-+/// begin 同参数重入幂等（含顺序无关的同一集合）；同 checkpoint 换集合必须冲突，
-+/// 且不得清掉已应用进度或预期集合。
-+#[test]
-+fn begin_idempotent_replay_keeps_expected_set() {
-+    let (_dir, vault) = fresh_vault();
-+    local_doc(&vault, "doc-a", "a-local");
-+    local_doc(&vault, "doc-b", "b-local");
-+    begin_with(&vault, 5, "src", &expectation(&["doc-a", "doc-b"]));
-+    apply_baseline_batch(
-+        &vault,
-+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
-+        &[],
-+    )
-+    .expect("batch a");
-+
-+    // 同参数 + 同一集合（顺序不同）：幂等重入，保留进度与集合。
-+    let replayed = begin_with(&vault, 5, "src", &expectation(&["doc-b", "doc-a"]));
-+    assert_eq!(replayed.applied_docs, 1, "重入不得清空已应用批次");
-+    assert_eq!(replayed.expected_docs, Some(2), "重入必须保留预期集合");
-+    assert_eq!(replayed.source_cursor, "src");
-+    assert!(!replayed.finishable);
-+
-+    // 同 checkpoint/S/cursor 但预期集合不同：必须冲突（不能静默沿用新集合）。
-+    let error = begin_baseline_apply(&vault, &[7; 16], 5, "src", &expectation(&["doc-a"]))
-+        .expect_err("同一 checkpoint 换预期集合必须冲突");
-+    assert!(
-+        matches!(error, StorageError::SyncConflict { .. }),
-+        "应当是 SyncConflict，实际 {error:?}"
-+    );
-+    let state = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal");
-+    assert_eq!(state.applied_docs, 1, "冲突不得清空已应用批次");
-+    assert_eq!(state.expected_docs, Some(2), "冲突不得改写预期集合");
-+
-+    // 补齐后仍能 finish。
-+    apply_baseline_batch(
-+        &vault,
-+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
-+        &[],
-+    )
-+    .expect("batch b");
-+    assert!(matches!(
-+        finish_baseline_apply(&vault, 5, "baseline-cursor").expect("finish"),
-+        BaselineApplyFinish::Applied(_)
-+    ));
-+}
-+
-+/// 资产少一批同样必须 Conflict（bootstrap 的资产也只能在全部到齐后 finish）。
-+#[test]
-+fn finish_without_all_assets_is_conflict() {
-+    let (_dir, vault) = fresh_vault();
-+    local_doc(&vault, "doc-1", "local");
-+    let asset_a = BaselineAsset {
-+        object_id: [1; 32],
-+        asset_hash: [11; 32],
-+        byte_len: 3,
-+        media_type: Some("text/plain".to_owned()),
-+        data: b"aaa".to_vec(),
-+    };
-+    let asset_b = BaselineAsset {
-+        object_id: [2; 32],
-+        asset_hash: [12; 32],
-+        byte_len: 4,
-+        media_type: Some("text/plain".to_owned()),
-+        data: b"bbbb".to_vec(),
-+    };
-+    begin_with(
-+        &vault,
-+        4,
-+        "src",
-+        &expectation_with_assets(&["doc-1"], &[[1; 32], [2; 32]]),
-+    );
-+    apply_baseline_batch(
-+        &vault,
-+        &[("doc-1".to_owned(), snapshot("doc-1", PEER_B, "remote"))],
-+        &[],
-+    )
-+    .expect("doc batch");
-+    let state = apply_baseline_assets(&vault, std::slice::from_ref(&asset_a)).expect("asset a");
-+    assert_eq!(state.applied_assets, 1);
-+    assert_eq!(state.expected_assets, Some(2));
-+    assert!(!state.finishable, "资产少一批时不得声称可 finish");
-+
-+    assert_eq!(
-+        finish_baseline_apply(&vault, 4, "baseline-cursor").expect("finish"),
-+        BaselineApplyFinish::Conflict,
-+        "预期资产未齐时 finish 必须 Conflict"
-+    );
-+    // 一行都不写：水位/游标/journal 保持 staging。
-+    let cursor = sync_cursor_state(&vault).expect("cursor");
-+    assert_eq!(cursor.received_seq, 0);
-+    assert_eq!(cursor.integrated_seq, 0);
-+    assert_eq!(cursor.confirmed_highwater, None);
-+    assert_eq!(relay_cursor(&vault), None);
-+    let journal = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal");
-+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
-+    assert_eq!(journal.chosen_cursor, None);
-+    assert_eq!(journal.applied_assets, 1, "冲突不得回滚已应用资产");
-+
-+    let state = apply_baseline_assets(&vault, std::slice::from_ref(&asset_b)).expect("asset b");
-+    assert!(state.finishable);
-+    assert!(matches!(
-+        finish_baseline_apply(&vault, 4, "baseline-cursor").expect("finish"),
-+        BaselineApplyFinish::Applied(_)
-+    ));
-+}
-+
-+// ---------------------------------------------------------------------------
-+// P1：verify 失败标记的 storage 门禁（apply / finish / finishable）
-+// ---------------------------------------------------------------------------
-+
-+/// 失败标记存在时：
-+/// - `apply_baseline_batch` 在任何解码/写事务前拒绝，且零写；
-+/// - `finish_baseline_apply` 返回**带原因**的 `SyncConflict`，不是丢掉原因的 `Ok(Conflict)`；
-+/// - `baseline_apply_state.finishable` 在预期集合已全齐时也必须为 false（status 仍是 staging）；
-+/// - `abort_baseline_apply` 清标记后 `begin` 可重新成功。
-+#[test]
-+fn marker_blocks_apply_and_finish_and_finishable() {
-+    let (_dir, vault) = fresh_vault();
-+    local_doc(&vault, "doc-a", "a-local");
-+    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
-+
-+    // 先真正跑完唯一一批，让预期集合在标记之前**已全齐**（证明 finishable 的变化来自标记）。
-+    let applied = apply_baseline_batch(
-+        &vault,
-+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
-+        &[],
-+    )
-+    .expect("batch a");
-+    assert!(applied.finishable, "标记写入前预期集合已齐，应可 finish");
-+
-+    let head_before = head(&vault, "doc-a");
-+    let cursor_before = sync_cursor_state(&vault).expect("cursor");
-+    let remote_known_before = meta_remote_known_bytes(&vault, "doc-a");
-+    let updates_before = count(&vault, "SELECT count(*) FROM loro_updates", &[]);
-+    let journal_rows_before = count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]);
-+
-+    const REASON: &str = "读回校验失败：snapshot 的 VV 未被本地 VV 覆盖";
-+    mark_baseline_verify_failed(&vault, REASON).expect("写失败标记");
-+    assert_eq!(
-+        baseline_verify_failure(&vault).expect("读标记").as_deref(),
-+        Some(REASON)
-+    );
-+
-+    // 预期集合仍全齐（applied=1/expected=1），但 finishable 必须因标记为 false。
-+    let state = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal 必须保留");
-+    assert_eq!(state.status, BaselineApplyStatus::Staging);
-+    assert_eq!(state.expected_docs, Some(1));
-+    assert_eq!(state.applied_docs, 1);
-+    assert!(
-+        !state.finishable,
-+        "失败标记存在时即使 expected 已全齐也不得 finishable"
-+    );
-+
-+    // 资产批也必须被同一 marker 挡住（M1）：失败 journal 语义上已冻结，不能借
-+    // apply_baseline_assets 继续写 baseline_apply_assets/assets 计数。
-+    let assets_before = count(&vault, "SELECT count(*) FROM assets", &[]);
-+    let apply_assets_before = count(&vault, "SELECT count(*) FROM baseline_apply_assets", &[]);
-+    let asset = BaselineAsset {
-+        object_id: [0x7A; 32],
-+        asset_hash: [0x8B; 32],
-+        byte_len: 5,
-+        media_type: Some("text/plain".to_owned()),
-+        data: b"asset".to_vec(),
-+    };
-+    let asset_error = apply_baseline_assets(&vault, std::slice::from_ref(&asset))
-+        .expect_err("失败标记必须阻止 apply_baseline_assets");
-+    assert!(
-+        matches!(&asset_error, StorageError::SyncConflict { .. }),
-+        "应当是 SyncConflict，实际 {asset_error:?}"
-+    );
-+    let asset_message = format!("{asset_error}");
-+    assert!(
-+        asset_message.contains(REASON),
-+        "资产冲突必须携带原因：{asset_message}"
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM assets", &[]),
-+        assets_before,
-+        "marker 下资产批必须零写"
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM baseline_apply_assets", &[]),
-+        apply_assets_before,
-+        "marker 下不得推进 baseline_apply_assets"
-+    );
-+
-+    // apply：用一篇新文档 doc-b 证明门禁在解码/写事务之前生效（若漏检会落 loro_docs/update）。
-+    let error = apply_baseline_batch(
-+        &vault,
-+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
-+        &[],
-+    )
-+    .expect_err("失败标记必须阻止 apply_baseline_batch");
-+    assert!(
-+        matches!(&error, StorageError::SyncConflict { .. }),
-+        "应当是 SyncConflict，实际 {error:?}"
-+    );
-+    let message = format!("{error}");
-+    assert!(message.contains(REASON), "冲突必须携带失败原因：{message}");
-+    assert!(
-+        message.contains("abort_baseline_apply"),
-+        "冲突必须提示先 abort_baseline_apply：{message}"
-+    );
-+
-+    // 零写：doc-b 没有任何行；doc-a 的 head/远端已知 VV 与全库 update 数不变；
-+    // journal 的已应用集合与预期集合也不变。
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_docs WHERE doc_id='doc-b'",
-+            &[]
-+        ),
-+        0
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-b'",
-+            &[]
-+        ),
-+        0
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
-+        updates_before
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
-+        journal_rows_before
-+    );
-+    assert_eq!(head(&vault, "doc-a").head_seq, head_before.head_seq);
-+    assert_eq!(
-+        meta_remote_known_bytes(&vault, "doc-a"),
-+        remote_known_before
-+    );
-+    let state = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal");
-+    assert_eq!(state.status, BaselineApplyStatus::Staging);
-+    assert_eq!(state.applied_docs, 1);
-+    assert_eq!(state.expected_docs, Some(1));
-+
-+    // finish：必须是**带原因**的 SyncConflict，不能退化成 Ok(Conflict) 把原因丢掉。
-+    let error = finish_baseline_apply(&vault, 5, "baseline-cursor")
-+        .expect_err("失败标记必须阻止 finish_baseline_apply");
-+    assert!(
-+        matches!(&error, StorageError::SyncConflict { .. }),
-+        "应当是 SyncConflict，实际 {error:?}"
-+    );
-+    let message = format!("{error}");
-+    assert!(
-+        message.contains(REASON),
-+        "finish 冲突必须携带失败原因：{message}"
-+    );
-+    assert!(
-+        message.contains("abort_baseline_apply"),
-+        "finish 冲突必须提示先 abort_baseline_apply：{message}"
-+    );
-+
-+    // 零写：水位/cursor/journal 全部保持 begin/上次 apply 后的状态。
-+    let cursor_after = sync_cursor_state(&vault).expect("cursor");
-+    assert_eq!(cursor_after.received_seq, cursor_before.received_seq);
-+    assert_eq!(cursor_after.integrated_seq, cursor_before.integrated_seq);
-+    assert_eq!(
-+        cursor_after.confirmed_highwater,
-+        cursor_before.confirmed_highwater
-+    );
-+    assert_eq!(relay_cursor(&vault), None);
-+    let state = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal");
-+    assert_eq!(state.status, BaselineApplyStatus::Staging);
-+    assert_eq!(state.chosen_cursor, None);
-+    assert_eq!(state.applied_docs, 1);
-+
-+    // abort 清 journal + 标记，已 merge 的正文保留；之后 begin 可重新成功。
-+    assert!(abort_baseline_apply(&vault).expect("abort"));
-+    assert!(
-+        baseline_verify_failure(&vault).expect("读标记").is_none(),
-+        "abort 必须清除失败标记"
-+    );
-+    assert!(baseline_apply_state(&vault).expect("state").is_none());
-+    let merged = load_body_doc(&vault, "doc-a", PEER_A, None)
-+        .expect("abort 后正文")
-+        .0;
-+    assert!(
-+        merged.text().contains("a-local"),
-+        "abort 只清 journal，不得删已 merge 的正文，实际={:?}",
-+        merged.text()
-+    );
-+
-+    let reopened = begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
-+    assert_eq!(reopened.status, BaselineApplyStatus::Staging);
-+    assert_eq!(reopened.applied_docs, 0, "abort 后 begin 应是全新 journal");
-+    assert_eq!(reopened.expected_docs, Some(1));
-+    assert!(
-+        !reopened.finishable,
-+        "新建 staging 尚未应用任何批次，不应 finishable"
-+    );
-+}
-+
-+// ---------------------------------------------------------------------------
-+// P1-2：tombstone 判定与 notes 软删之间的 TOCTOU
-+// ---------------------------------------------------------------------------
-+
-+/// 判定（事务外看到无 outbox）之后、事务执行期间插进一条 outbox：事务内重判必须把
-+/// action 降级为 kept_local_edit，`notes.deleted` 保持 0。
-+#[test]
-+fn finish_without_journal_rejects_residual_marker_before_not_found() {
-+    let (_dir, vault) = fresh_vault();
-+    mark_baseline_verify_failed(&vault, "无 journal 的残留 marker").expect("marker");
-+
-+    let error = finish_baseline_apply(&vault, 5, "c5")
-+        .expect_err("无 journal 但有 marker 时 finish 必须先拒绝 marker");
-+    assert!(
-+        matches!(&error, StorageError::SyncConflict { .. }),
-+        "应当是带原因的 SyncConflict，实际 {error:?}"
-+    );
-+    let message = format!("{error}");
-+    assert!(message.contains("无 journal 的残留 marker"));
-+    assert!(message.contains("abort_baseline_apply"));
-+
-+    // abort 是唯一清理入口；清理后 begin 可重新开始。
-+    assert!(!abort_baseline_apply(&vault).expect("abort"));
-+    assert_eq!(baseline_verify_failure(&vault).expect("read"), None);
-+}
-+
-+#[test]
-+fn abort_without_journal_clears_residual_marker() {
-+    let (_dir, vault) = fresh_vault();
-+    mark_baseline_verify_failed(&vault, "残留 marker").expect("marker");
-+    assert_eq!(
-+        baseline_verify_failure(&vault).expect("read").as_deref(),
-+        Some("残留 marker")
-+    );
-+
-+    // 没有 staging journal 也必须清掉残留 marker：abort 是唯一清理入口。
-+    assert!(!abort_baseline_apply(&vault).expect("abort"));
-+    assert_eq!(baseline_verify_failure(&vault).expect("read"), None);
-+    assert!(baseline_apply_state(&vault).expect("state").is_none());
-+}
-+
-+#[test]
-+fn abort_guard_failure_keeps_marker_for_retry() {
-+    let (_dir, vault) = fresh_vault();
-+    local_doc(&vault, "doc-a", "a-local");
-+    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
-+    mark_baseline_verify_failed(&vault, "保持到重试").expect("marker");
-+
-+    // 模拟 Phase1B 并发化后才会出现的 journal 消失窗口：让第 4 条 DELETE
-+    //（baseline_apply staging 行）影响 0 行，guarded 事务整体回滚。
-+    vault
-+        .exec(
-+            "CREATE TRIGGER skip_baseline_apply_abort BEFORE DELETE ON baseline_apply \
-+             WHEN OLD.singleton = 1 BEGIN SELECT RAISE(IGNORE); END",
-+            &[],
-+        )
-+        .expect("trigger");
-+    assert!(
-+        !abort_baseline_apply(&vault).expect("guard failure -> false"),
-+        "guard 失败必须返回 false"
-+    );
-+    assert_eq!(
-+        baseline_verify_failure(&vault)
-+            .expect("marker survives")
-+            .as_deref(),
-+        Some("保持到重试"),
-+        "guarded 事务回滚时 marker 不能被半清"
-+    );
-+    assert_eq!(
-+        baseline_apply_state(&vault)
-+            .expect("state")
-+            .expect("journal survives")
-+            .status,
-+        BaselineApplyStatus::Staging
-+    );
-+
-+    vault
-+        .exec("DROP TRIGGER skip_baseline_apply_abort", &[])
-+        .expect("drop trigger");
-+    assert!(abort_baseline_apply(&vault).expect("retry abort"));
-+    assert_eq!(baseline_verify_failure(&vault).expect("marker"), None);
-+}
-+
-+// ---------------------------------------------------------------------------
-+// P1-3：损坏的失败标记（非法 BLOB）必须 fail-closed；abort 成功必须真的清掉它
-+// ---------------------------------------------------------------------------
-+
-+/// 直接写入非法 BLOB（`mark_baseline_verify_failed` 永远产生不了这种编码）：
-+/// - `baseline_verify_failure` / `baseline_apply_state` → `StorageError::Corrupt`
-+///   （不能静默当成"没有失败"，否则 begin 会放行未知状态的 journal）；
-+/// - `begin` / `apply` / `finish` 全部拒绝（Corrupt，不是 SyncConflict），且零写；
-+/// - `abort_baseline_apply` 是失败标记的唯一清理入口：返回成功必须**真的**删掉损坏值，
-+///   不能"看起来成功但坏值还在"；没有 journal 时返回 false（不是成功）也必须清掉，
-+///   否则损坏值会永久阻断 begin。
-+#[test]
-+fn corrupt_marker_is_fail_closed_and_abort_does_not_silently_succeed() {
-+    let (_dir, vault) = fresh_vault();
-+    local_doc(&vault, "doc-a", "a-local");
-+    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
-+    let updates_before = count(&vault, "SELECT count(*) FROM loro_updates", &[]);
-+
-+    // 非法编码：缺魔数。直接写 meta，绕过 mark_baseline_verify_failed。
-+    vault
-+        .set_meta(META_BASELINE_VERIFY_FAILED, b"bad")
-+        .expect("写损坏 marker");
-+
-+    // 读：必须 Corrupt（缺魔数），不能退化成 None。
-+    let error = baseline_verify_failure(&vault).expect_err("损坏 marker 必须 Corrupt");
-+    assert!(
-+        matches!(&error, StorageError::Corrupt { .. }),
-+        "应当是 Corrupt，实际 {error:?}"
-+    );
-+    let message = format!("{error}");
-+    assert!(
-+        message.contains(META_BASELINE_VERIFY_FAILED),
-+        "错误必须点明损坏的 meta 键：{message}"
-+    );
-+    assert!(message.contains("魔数"), "错误必须说明缺魔数：{message}");
-+
-+    // begin / apply / finish 三处入口全部拒绝；损坏标记不能被降级成 SyncConflict/None。
-+    let begin_error = begin_baseline_apply(
-+        &vault,
-+        &[9; 16],
-+        6,
-+        "other-cursor",
-+        &expectation(&["doc-a"]),
-+    )
-+    .expect_err("损坏 marker 必须阻止 begin（即使换了基线参数）");
-+    assert!(
-+        matches!(&begin_error, StorageError::Corrupt { .. }),
-+        "begin 应当是 Corrupt，实际 {begin_error:?}"
-+    );
-+    let apply_error = apply_baseline_batch(
-+        &vault,
-+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
-+        &[],
-+    )
-+    .expect_err("损坏 marker 必须阻止 apply_baseline_batch");
-+    assert!(
-+        matches!(&apply_error, StorageError::Corrupt { .. }),
-+        "apply 应当是 Corrupt，实际 {apply_error:?}"
-+    );
-+    let finish_error = finish_baseline_apply(&vault, 5, "baseline-cursor")
-+        .expect_err("损坏 marker 必须阻止 finish_baseline_apply");
-+    assert!(
-+        matches!(&finish_error, StorageError::Corrupt { .. }),
-+        "finish 应当是 Corrupt，实际 {finish_error:?}"
-+    );
-+
-+    // state 读取也必须 Corrupt（不能靠猜算 finishable），journal 与数据保持零写。
-+    let state_error = baseline_apply_state(&vault).expect_err("损坏 marker 下 state 必须 Corrupt");
-+    assert!(
-+        matches!(&state_error, StorageError::Corrupt { .. }),
-+        "state 应当是 Corrupt，实际 {state_error:?}"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM baseline_apply WHERE singleton=1 AND status='staging'",
-+            &[],
-+        ),
-+        1,
-+        "被拒绝的调用不得清掉 staging journal"
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
-+        0,
-+        "apply 被拒时必须零写"
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
-+        updates_before,
-+        "begin/apply/finish 被拒时不得追加 Loro update"
-+    );
-+
-+    // abort（有 staging journal）：返回 true，并且成功必须真的删掉损坏 marker。
-+    assert!(
-+        abort_baseline_apply(&vault).expect("abort 必须成功"),
-+        "有 staging journal 时 abort 必须返回 true"
-+    );
-+    assert_eq!(
-+        baseline_verify_failure(&vault).expect("abort 后必须能读"),
-+        None,
-+        "abort 返回成功却留下损坏 marker = 静默失败"
-+    );
-+    assert!(
-+        baseline_apply_state(&vault).expect("state").is_none(),
-+        "abort 必须清掉 staging journal"
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
-+        updates_before,
-+        "abort 只清 journal，不得删已 merge 的数据"
-+    );
-+
-+    // 没有 staging journal 时 abort 返回 false（不是"成功"），但同样必须清掉损坏值，
-+    // 否则该值会永久阻断后续 begin。
-+    vault
-+        .set_meta(META_BASELINE_VERIFY_FAILED, b"")
-+        .expect("写空 marker（缺魔数）");
-+    assert!(
-+        matches!(
-+            baseline_verify_failure(&vault).expect_err("空 marker 也必须 Corrupt"),
-+            StorageError::Corrupt { .. }
-+        ),
-+        "空 BLOB 同样缺魔数，必须 Corrupt"
-+    );
-+    assert!(
-+        !abort_baseline_apply(&vault).expect("没有 journal 时 abort 返回 false"),
-+        "没有 staging journal 时必须返回 false（调用方不得把 false 当成功）"
-+    );
-+    assert_eq!(
-+        baseline_verify_failure(&vault).expect("abort 后必须能读"),
-+        None,
-+        "false 只表示没有 journal 可中止，损坏 marker 仍必须被清掉"
-+    );
-+
-+    // abort 清掉损坏值后，begin 恢复可用（损坏 marker 不会永久 brick 库）。
-+    let reopened = begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
-+    assert_eq!(reopened.status, BaselineApplyStatus::Staging);
-+    assert_eq!(reopened.applied_docs, 0);
-+}
-+
-+#[test]
-+fn tombstone_outbox_race_between_decision_and_transaction_keeps_note() {
-+    let (_dir, vault) = fresh_vault();
-+    // doc-a：本批要 merge 的基线文档；触发器挂在它的 journal 写入上。
-+    local_doc(&vault, "doc-a", "a-local");
-+
-+    // doc-pull：普通 pull 集成来的文档（远端已知、无 outbox），判定本来会删除它。
-+    seed_note(&vault, "note-pull", "doc-pull");
-+    let mut session =
-+        DocumentSession::open(&vault, "doc-pull", session_options(Some(SYNC_CTX))).expect("会话");
-+    let delta = session
-+        .apply_remote(&remote_update("doc-pull", PEER_B, "pulled body"))
-+        .expect("导入远端")
-+        .expect("应当产生 LiveDelta");
-+    assert_eq!(delta.source, ChangeSource::Remote);
-+    session.flush(FlushReason::Manual);
-+    session
-+        .wait_for_durable(LiveRev(1), Duration::from_secs(5))
-+        .expect("远端导入必须 durable");
-+    drop(session);
-+    assert_eq!(count(&vault, "SELECT count(*) FROM sync_outbox", &[]), 0);
-+    assert_eq!(meta_remote_known_count(&vault, "doc-pull"), 1);
-+
-+    // 注入竞态：docs 批的 journal 写入（先于同批 tombstone 语句）触发一条 outbox 行，
-+    // 模拟"判定完成后本地编辑的 A 事务刚好提交"。
-+    vault
-+        .exec(
-+            "CREATE TRIGGER baseline_race_outbox BEFORE INSERT ON baseline_apply_docs \
-+             WHEN NEW.doc_id='doc-a' BEGIN \
-+               INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,ciphertext) \
-+               VALUES('race-outbox','race','doc-pull',1,1,NULL); \
-+             END;",
-+            &[],
-+        )
-+        .expect("注入竞态触发器");
-+
-+    begin_with(&vault, 7, "src", &expectation(&["doc-a"]));
-+    let state = apply_baseline_batch(
-+        &vault,
-+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
-+        &["doc-pull".to_owned()],
-+    )
-+    .expect("apply with raced tombstone");
-+
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM sync_outbox WHERE doc_id='doc-pull'",
-+            &[],
-+        ),
-+        1,
-+        "触发器必须真的插入了 outbox（证明竞态窗口被覆盖）"
-+    );
-+    assert_eq!(
-+        notes_deleted(&vault, "doc-pull"),
-+        0,
-+        "判定后被并发插入 outbox 的笔记绝不能软删"
-+    );
-+    assert_eq!(
-+        tombstone_action(&vault, "doc-pull").as_deref(),
-+        Some("kept_local_edit"),
-+        "事务内重判必须把 action 降级为 kept_local_edit"
-+    );
-+    assert_eq!(state.kept_local_edit, 1);
-+}
-+
-+// ---------------------------------------------------------------------------
-+// P2-5：远端已知 VV 的单调性（值 CAS）与 begin 回填覆盖面
-+// ---------------------------------------------------------------------------
-+
-+/// completed journal（finish 后 status='completed'、子表保留）在 begin 替换时
-+/// 必须先回填 baseline_vv；这是旧库升级后 tombstone 不误判的关键证据。
-+#[test]
-+fn begin_backfills_remote_known_for_completed_journal() {
-+    let (_dir, vault) = fresh_vault();
-+    begin_with(&vault, 10, "src1", &expectation(&["doc-completed"]));
-+    apply_baseline_batch(
-+        &vault,
-+        &[(
-+            "doc-completed".to_owned(),
-+            snapshot("doc-completed", PEER_B, "remote body"),
-+        )],
-+        &[],
-+    )
-+    .expect("first baseline");
-+    assert!(matches!(
-+        finish_baseline_apply(&vault, 10, "c10").expect("finish"),
-+        BaselineApplyFinish::Applied(_)
-+    ));
-+    let baseline_vv = meta_remote_known(&vault, "doc-completed").expect("已有远端已知 VV");
-+
-+    // 模拟旧版本数据：没有跨 journal 的 meta，只剩 completed journal + 子表。
-+    vault
-+        .exec(
-+            "DELETE FROM meta WHERE key=?1",
-+            &[Value::Text("sync.remote_known_vv.doc-completed".to_owned())],
-+        )
-+        .expect("删 meta");
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM baseline_apply_docs WHERE doc_id='doc-completed'",
-+            &[]
-+        ),
-+        1
-+    );
-+
-+    begin(&vault, 20, "src2");
-+
-+    assert_eq!(
-+        meta_remote_known(&vault, "doc-completed"),
-+        Some(baseline_vv),
-+        "completed journal 的 baseline_vv 必须回填到 meta"
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
-+        0,
-+        "旧 journal 子表必须清掉"
-+    );
-+    let state = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal");
-+    assert_eq!(state.status, BaselineApplyStatus::Staging);
-+    assert_eq!(state.baseline_s, 20);
-+}
-+
-+/// 没有 journal 行、但残留 `baseline_apply_docs`（旧版本/异常写的孤儿行）时，
-+/// begin 也必须先把 `baseline_vv` 回填到 meta，再清掉残留子表。
-+#[test]
-+fn begin_backfills_remote_known_without_journal_but_with_residual_docs() {
-+    let (_dir, vault) = fresh_vault();
-+    begin_with(&vault, 10, "src1", &expectation(&["doc-residual"]));
-+    apply_baseline_batch(
-+        &vault,
-+        &[(
-+            "doc-residual".to_owned(),
-+            snapshot("doc-residual", PEER_B, "remote body"),
-+        )],
-+        &[],
-+    )
-+    .expect("first baseline");
-+    assert!(matches!(
-+        finish_baseline_apply(&vault, 10, "c10").expect("finish"),
-+        BaselineApplyFinish::Applied(_)
-+    ));
-+
-+    // 模拟旧版本/异常写：journal 行丢失，但子表仍在；meta 也缺失。
-+    vault
-+        .exec("DELETE FROM baseline_apply", &[])
-+        .expect("删 journal");
-+    vault
-+        .exec(
-+            "DELETE FROM meta WHERE key=?1",
-+            &[Value::Text("sync.remote_known_vv.doc-residual".to_owned())],
-+        )
-+        .expect("删 meta");
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM baseline_apply_docs WHERE applied=1",
-+            &[]
-+        ),
-+        1,
-+        "前置：残留一行已应用的 baseline_apply_docs"
-+    );
-+
-+    begin(&vault, 20, "src2");
-+
-+    assert_eq!(
-+        meta_remote_known_count(&vault, "doc-residual"),
-+        1,
-+        "没有 journal 的残留 baseline_vv 也必须回填（否则证据会被 DELETE 静默丢弃）"
-+    );
-+    assert_eq!(
-+        meta_remote_known(&vault, "doc-residual"),
-+        Some(
-+            VersionVector::decode(
-+                &meta_remote_known_bytes(&vault, "doc-residual").expect("回填值")
-+            )
-+            .expect("解码")
-+        ),
-+        "回填的是旧 journal 的 baseline VV"
-+    );
-+    assert_eq!(
-+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
-+        0,
-+        "残留子表必须被清掉"
-+    );
-+    let state = baseline_apply_state(&vault)
-+        .expect("state")
-+        .expect("journal");
-+    assert_eq!(state.status, BaselineApplyStatus::Staging);
-+    assert_eq!(state.baseline_s, 20);
-+}
-+
-+/// begin 的回填是单调的：已有 meta（普通 pull/integrate 记录的更新值）绝不被
-+/// 旧 journal 的 baseline_vv 降级（`DO NOTHING`）。
-+#[test]
-+fn begin_backfill_never_downgrades_existing_remote_known() {
-+    let (_dir, vault) = fresh_vault();
-+    begin_with(&vault, 10, "src1", &expectation(&["doc-keep"]));
-+    apply_baseline_batch(
-+        &vault,
-+        &[(
-+            "doc-keep".to_owned(),
-+            snapshot("doc-keep", PEER_B, "baseline body"),
-+        )],
-+        &[],
-+    )
-+    .expect("first baseline");
-+    assert!(matches!(
-+        finish_baseline_apply(&vault, 10, "c10").expect("finish"),
-+        BaselineApplyFinish::Applied(_)
-+    ));
-+
-+    // 已有值比旧 journal 的 baseline VV 更大（模拟后续普通 pull 扩大了它）。
-+    let mut superset = meta_remote_known(&vault, "doc-keep").expect("baseline 后已有值");
-+    superset.insert(0xA1, 9);
-+    vault
-+        .exec(
-+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
-+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-+            &[
-+                Value::Text("sync.remote_known_vv.doc-keep".to_owned()),
-+                Value::Blob(superset.encode()),
-+            ],
-+        )
-+        .expect("写入更大的旧值");
-+    let before = meta_remote_known_bytes(&vault, "doc-keep").expect("旧值");
-+
-+    vault
-+        .exec("DELETE FROM baseline_apply", &[])
-+        .expect("模拟无 journal 的残留子表");
-+    begin(&vault, 20, "src2");
-+
-+    assert_eq!(
-+        meta_remote_known_bytes(&vault, "doc-keep"),
-+        Some(before),
-+        "begin 回填绝不能把已有（更大的）远端已知 VV 降级"
-+    );
-+}
-+
-+/// 新文档（读旧值时不存在）的 CAS：事务内被并发写入抢占 → 明确 SyncConflict，
-+/// 整批回滚，不覆盖任何值。
-+#[test]
-+fn baseline_remote_known_cas_fails_closed_for_new_doc() {
-+    let (_dir, vault) = fresh_vault();
-+    begin_with(&vault, 5, "src", &expectation(&["doc-cas-new"]));
-+    install_remote_known_clobber_trigger(&vault, "doc-cas-new");
-+
-+    let error = apply_baseline_batch(
-+        &vault,
-+        &[(
-+            "doc-cas-new".to_owned(),
-+            snapshot("doc-cas-new", PEER_B, "remote"),
-+        )],
-+        &[],
-+    )
-+    .expect_err("CAS 必须失败");
-+
-+    match &error {
-+        StorageError::SyncConflict { context } => {
-+            assert!(
-+                context.contains("远端已知 VV"),
-+                "错误必须点明远端已知 VV CAS：{context}"
-+            );
-+        }
-+        other => panic!("期望 SyncConflict，实际 {other:?}"),
-+    }
-+    assert_eq!(
-+        meta_remote_known_bytes(&vault, "doc-cas-new"),
-+        None,
-+        "触发器写入的 meta 必须随整批回滚"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_docs WHERE doc_id='doc-cas-new'",
-+            &[]
-+        ),
-+        0,
-+        "整批回滚：文档行不得落库"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-cas-new'",
-+            &[]
-+        ),
-+        0
-+    );
-+}
-+
-+/// 已存在文档（读旧值 `Some`）的 CAS：库中值被并发改写 → 明确 SyncConflict，
-+/// 队头与远端已知 VV 都保持原值（绝不回退到本批并集）。
-+#[test]
-+fn baseline_remote_known_cas_fails_closed_for_existing_doc() {
-+    let (_dir, vault) = fresh_vault();
-+    begin_with(&vault, 5, "src1", &expectation(&["doc-cas-old"]));
-+    apply_baseline_batch(
-+        &vault,
-+        &[(
-+            "doc-cas-old".to_owned(),
-+            snapshot("doc-cas-old", PEER_B, "first"),
-+        )],
-+        &[],
-+    )
-+    .expect("first baseline");
-+    assert!(matches!(
-+        finish_baseline_apply(&vault, 5, "c5").expect("finish"),
-+        BaselineApplyFinish::Applied(_)
-+    ));
-+    let before_known = meta_remote_known_bytes(&vault, "doc-cas-old").expect("已有远端已知 VV");
-+    let before_head = load_head(&vault, "doc-cas-old").expect("head");
-+
-+    begin_with(&vault, 6, "src2", &expectation(&["doc-cas-old"]));
-+    install_remote_known_clobber_trigger(&vault, "doc-cas-old");
-+    let error = apply_baseline_batch(
-+        &vault,
-+        &[(
-+            "doc-cas-old".to_owned(),
-+            snapshot("doc-cas-old", PEER_B, "second"),
-+        )],
-+        &[],
-+    )
-+    .expect_err("陈旧旧值的 CAS 必须失败");
-+
-+    assert!(
-+        matches!(&error, StorageError::SyncConflict { context } if context.contains("doc-cas-old")),
-+        "必须是带文档上下文的 SyncConflict，实际 {error:?}"
-+    );
-+    assert_eq!(
-+        meta_remote_known_bytes(&vault, "doc-cas-old"),
-+        Some(before_known),
-+        "CAS 失败后已有值必须保持原样（不能变小，也不能被本批并集覆盖）"
-+    );
-+    assert_eq!(
-+        load_head(&vault, "doc-cas-old").expect("head").head_seq,
-+        before_head.head_seq,
-+        "整批回滚：head 不得推进"
-+    );
-+}
-+
-+/// 正常路径是单调并集：普通 pull 已记录的远端 ops（本批快照里没有）必须保留。
-+#[test]
-+fn baseline_remote_known_write_unions_with_normal_pull_evidence() {
-+    let (_dir, vault) = fresh_vault();
-+    let mut pulled = VersionVector::new();
-+    pulled.insert(0xA1, 2);
-+    vault
-+        .exec(
-+            "INSERT INTO meta(key,value) VALUES(?1,?2)",
-+            &[
-+                Value::Text("sync.remote_known_vv.doc-union".to_owned()),
-+                Value::Blob(pulled.encode()),
-+            ],
-+        )
-+        .expect("预置普通 pull 的远端已知 VV");
-+
-+    begin_with(&vault, 7, "src", &expectation(&["doc-union"]));
-+    apply_baseline_batch(
-+        &vault,
-+        &[(
-+            "doc-union".to_owned(),
-+            snapshot("doc-union", PEER_B, "remote body"),
-+        )],
-+        &[],
-+    )
-+    .expect("baseline apply");
-+
-+    let known = meta_remote_known(&vault, "doc-union").expect("应用后必须有远端已知 VV");
-+    assert_eq!(
-+        known.get(&0xA1).copied(),
-+        Some(2),
-+        "普通 pull 的旧证据必须保留"
-+    );
-+    assert!(
-+        known.get(&PEER_B).copied().unwrap_or(0) >= 1,
-+        "本批快照的 VV 必须并入"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM meta WHERE key='sync.remote_known_vv.doc-union'",
-+            &[]
-+        ),
-+        1
-+    );
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Phase1B 门禁：结构文档（`doc_id = "structure"`）的 detached local_extra 生产路径
-+// ---------------------------------------------------------------------------
-+
-+/// Phase1B 门禁：本地已有结构树时应用 baseline 结构快照，必须真正走
-+/// **detached local_extra** 分支（`existing_local_extra` 计数），而不是 attached/no-extra
-+/// 或 new-doc 分支；合并后本地与基线的节点都在、父子关系与根节点数不变，本地 op 不丢。
++/// 已编码 VV 里的 peer 集合（升序）。
 +///
-+/// 与正文用例的差别：结构文档的 `loro_docs.kind` 必须是 `'structure'`，读回走
-+/// [`load_structure`]（自带重放 frontier 校验），而不是 `load_body_doc`。
-+#[test]
-+fn structure_doc_local_extra_merges_local_and_baseline_nodes() {
-+    const LOCAL_PEER: u64 = 0x5101_0001;
-+    const BASELINE_PEER: u64 = 0xB0B0_0002;
-+
-+    let (_dir, vault) = fresh_vault();
-+
-+    // 1) 本地结构：一个 folder + 一个 note，并把 note 挂到 folder 下。
-+    let mut writer = StructureWriter::open(&vault, LOCAL_PEER).expect("打开结构写入口");
-+    let local_folder = writer
-+        .doc()
-+        .create_folder("本地文件夹", 1_700_000_000)
-+        .expect("创建本地文件夹");
-+    let local_note = writer
-+        .doc()
-+        .create_note("本地笔记", 1_700_000_001)
-+        .expect("创建本地笔记");
-+    writer
-+        .doc()
-+        .move_node(
-+            &local_note.node_id,
-+            Some(local_folder.as_str()),
-+            1_700_000_002,
-+        )
-+        .expect("把本地笔记挂到本地文件夹下");
-+    writer.commit("local-structure").expect("提交本地结构");
-+
-+    let local_head = head(&vault, STRUCTURE_DOC_ID);
-+    assert_eq!(local_head.head_seq, 1, "本地一次结构提交应产生一条 update");
-+    // 默认 `StructureWriter::open` 不写 outbox：本用例证明 local_extra 由 VV 判定，
-+    // 不依赖任何本地出站意图。
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM sync_outbox WHERE doc_id=?1",
-+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
-+        ),
-+        0,
-+        "StructureWriter::open 默认路径不得写 outbox"
-+    );
-+
-+    // 2) baseline 结构：另一个 peer 的独立树（不同 title / note_id）。
-+    let baseline = StructureDoc::create(BASELINE_PEER).expect("创建基线结构文档");
-+    let baseline_folder = baseline
-+        .create_folder("基线文件夹", 1_700_100_000)
-+        .expect("创建基线文件夹");
-+    let baseline_note = baseline
-+        .create_note("基线笔记", 1_700_100_001)
-+        .expect("创建基线笔记");
-+    baseline
-+        .move_node(
-+            &baseline_note.node_id,
-+            Some(baseline_folder.as_str()),
-+            1_700_100_002,
-+        )
-+        .expect("把基线笔记挂到基线文件夹下");
-+    let baseline_snapshot_bytes = baseline.export_snapshot().expect("导出基线结构快照");
-+    assert_ne!(
-+        local_note.note_id, baseline_note.note_id,
-+        "两侧 note_id 必须可区分"
-+    );
-+
-+    // 3) begin：预期参与集合必须含 "structure"。
-+    let begin_state = begin_with(
-+        &vault,
-+        5,
-+        "structure-cursor",
-+        &expectation(&[STRUCTURE_DOC_ID]),
-+    );
-+    assert_eq!(begin_state.expected_docs, Some(1));
-+    assert_eq!(begin_state.applied_docs, 0);
-+    assert!(!begin_state.finishable, "尚未应用任何批次");
-+
-+    // 4) 应用快照；计数器证明走的是 detached local_extra 分支。
-+    reset_baseline_apply_debug();
-+    apply_baseline_batch(
-+        &vault,
-+        &[(STRUCTURE_DOC_ID.to_owned(), baseline_snapshot_bytes)],
-+        &[],
-+    )
-+    .expect("应用基线结构快照");
-+
-+    let counters = baseline_apply_debug_counters();
-+    assert!(
-+        counters.existing_local_extra >= 1,
-+        "结构文档必须走 local_extra 分支，实际计数 {}",
-+        counters.existing_local_extra
-+    );
-+    assert_eq!(
-+        counters.existing_local_extra, 1,
-+        "本批只有一个结构文档，应恰好命中一次 local_extra"
-+    );
-+    assert_eq!(
-+        counters.existing_no_extra, 0,
-+        "不能落在 attached/no-extra 分支"
-+    );
-+    assert_eq!(counters.new_docs, 0, "结构文档已存在，不能走 new-doc 分支");
-+    assert_eq!(counters.snapshot_imports, 1);
-+    assert_eq!(
-+        counters.snapshot_reimport_bytes, 0,
-+        "不得二次 import 基线快照"
-+    );
-+    assert_eq!(counters.load_body_doc_calls, 1, "只允许一次本地重放");
-+    assert!(counters.local_delta_bytes > 0, "反向导入的本地增量不能为空");
-+    assert_eq!(counters.pending_update_calls, 1);
-+    assert!(counters.pending_update_bytes > 0);
-+
-+    // 5) 读回：本地与基线节点都在，树形状保持，本地 op 没有丢。
-+    let (structure, structure_head) =
-+        load_structure(&vault, LOCAL_PEER).expect("读回结构文档（含 frontier 校验）");
-+    assert_eq!(
-+        structure_head.head_seq,
-+        local_head.head_seq + 1,
-+        "baseline merge 应追加一条 update，而不是覆盖本地 update"
-+    );
-+
-+    let merged = structure.snapshot().expect("结构快照");
-+
-+    let local_note_node = merged
-+        .nodes
-+        .iter()
-+        .find(|node| node.title == "本地笔记")
-+        .expect("合并后缺少本地笔记");
-+    assert_eq!(local_note_node.node_id, local_note.node_id);
-+    assert_eq!(
-+        local_note_node.note_id.as_deref(),
-+        Some(local_note.note_id.as_str())
-+    );
-+    assert_eq!(
-+        local_note_node.body_doc_id.as_deref(),
-+        Some(local_note.body_doc_id.as_str())
-+    );
-+    assert_eq!(
-+        local_note_node.parent.as_deref(),
-+        Some(local_folder.as_str()),
-+        "本地笔记的父子关系不能被基线覆盖"
-+    );
-+    assert!(local_note_node.is_note());
-+    assert!(!local_note_node.deleted);
-+
-+    let local_folder_node = merged
-+        .nodes
-+        .iter()
-+        .find(|node| node.title == "本地文件夹")
-+        .expect("合并后缺少本地文件夹");
-+    assert_eq!(local_folder_node.node_id, local_folder);
-+    assert_eq!(local_folder_node.parent, None, "本地文件夹应仍在根级");
-+    assert!(!local_folder_node.is_note());
-+
-+    let baseline_note_node = merged
-+        .nodes
-+        .iter()
-+        .find(|node| node.title == "基线笔记")
-+        .expect("合并后缺少基线笔记");
-+    assert_eq!(baseline_note_node.node_id, baseline_note.node_id);
-+    assert_eq!(
-+        baseline_note_node.note_id.as_deref(),
-+        Some(baseline_note.note_id.as_str())
-+    );
-+    assert_eq!(
-+        baseline_note_node.parent.as_deref(),
-+        Some(baseline_folder.as_str()),
-+        "基线父子关系必须保留"
-+    );
-+    assert!(baseline_note_node.is_note());
-+
-+    let baseline_folder_node = merged
-+        .nodes
-+        .iter()
-+        .find(|node| node.title == "基线文件夹")
-+        .expect("合并后缺少基线文件夹");
-+    assert_eq!(baseline_folder_node.node_id, baseline_folder);
-+    assert_eq!(baseline_folder_node.parent, None, "基线文件夹应在根级");
-+
-+    // 树形状：两个根（两侧各建一个文件夹），每个根下恰好一个笔记。
-+    let roots: Vec<_> = merged
-+        .nodes
-+        .iter()
-+        .filter(|node| node.parent.is_none())
-+        .collect();
-+    assert_eq!(roots.len(), 2, "合并后应有两个根节点");
-+    assert!(
-+        !merged.nodes.iter().any(|node| node.deleted),
-+        "本用例没有删除事件，合并不得产生 deleted 节点"
-+    );
-+    for root in roots {
-+        let children: Vec<_> = merged
-+            .nodes
-+            .iter()
-+            .filter(|node| node.parent.as_deref() == Some(root.node_id.as_str()))
-+            .collect();
-+        assert_eq!(children.len(), 1, "每个根文件夹下应各有一个笔记");
-+        assert!(children[0].is_note());
-+    }
-+
-+    // 本地 op 仍在库里的独立 update 中，baseline merge 是追加的第二个批次。
-+    let batches: Vec<String> = vault
-+        .query(
-+            "SELECT batch_id FROM loro_updates WHERE doc_id=?1 ORDER BY seq",
-+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
-+        )
-+        .expect("查询结构文档批次")
-+        .into_iter()
-+        .map(|row| match row.into_iter().next() {
-+            Some(Value::Text(value)) => value,
-+            other => panic!("结构批次 batch_id 异常：{other:?}"),
-+        })
-+        .collect();
-+    assert_eq!(batches.len(), 2, "本地一条 + baseline merge 一条");
-+    assert_eq!(batches[0], "local-structure", "本地 op 必须保留");
-+    assert_eq!(batches[1], BASELINE_MERGE_BATCH);
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_docs WHERE doc_id=?1 AND kind='structure'",
-+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
-+        ),
-+        1,
-+        "baseline merge 不得改掉 kind='structure'"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM baseline_apply_docs WHERE doc_id=?1 AND applied=1",
-+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
-+        ),
-+        1,
-+        "journal 必须记录 structure 已应用"
-+    );
-+
-+    // 6) finish：预期集合全齐 → Applied；只动水位/cursor，结构内容不变。
-+    let outcome = finish_baseline_apply(&vault, 5, "chosen-cursor").expect("finish");
-+    let BaselineApplyFinish::Applied(state) = outcome else {
-+        panic!("预期集合全齐时 finish 必须 Applied：{outcome:?}");
-+    };
-+    assert_eq!(state.status, BaselineApplyStatus::Completed);
-+    assert_eq!(state.applied_docs, 1);
-+    assert_eq!(state.expected_docs, Some(1));
-+    assert!(!state.finishable);
-+
-+    let cursor = sync_cursor_state(&vault).expect("cursor");
-+    assert_eq!(cursor.received_seq, 5);
-+    assert_eq!(cursor.integrated_seq, 5);
-+    assert_eq!(cursor.confirmed_highwater, Some(5));
-+
-+    let (after_finish, after_head) =
-+        load_structure(&vault, LOCAL_PEER).expect("finish 后读回结构文档");
-+    assert_eq!(
-+        after_head.head_seq, structure_head.head_seq,
-+        "finish 只推进水位，不得改结构 head"
-+    );
-+    assert_eq!(
-+        after_finish.snapshot().expect("finish 后快照").nodes.len(),
-+        merged.nodes.len(),
-+        "finish 后节点数不变"
-+    );
-+}
-diff --git a/crates/storage/tests/body_doc_detached_oplog.rs b/crates/storage/tests/body_doc_detached_oplog.rs
-new file mode 100644
-index 0000000..77996d1
---- /dev/null
-+++ b/crates/storage/tests/body_doc_detached_oplog.rs
-@@ -0,0 +1,790 @@
-+//! 任务 2 P0：detached oplog 测试矩阵（只加测试，不改生产代码）。
-+//!
-+//! `BodyDoc::import_oplog_only` / `pending_update_from_oplog` 是 `pub(crate)`，生产里唯一
-+//! 调用方是 baseline apply 的 `existing_local_extra` 分支（见
-+//! `crates/storage/src/baseline_apply.rs`）。本文件不放大可见性、不改生产代码，而是驱动
-+//! 该分支真正落库的 `baseline_merge` 行来验证语义：
-+//!
-+//! 1. **detached 路径**：`BodyDoc::restore(基线快照)` → `detach` → `import(本地差集)` →
-+//!    `pending_update_from_oplog(本地 VV)`。产物就是 `loro_updates` 里
-+//!    `batch_id == BASELINE_MERGE_BATCH` 的那一行（payload / end_frontier / end_vv）。
-+//! 2. **attached 参考**：`BodyDoc::restore(基线快照) + import(本地差集)`——同一条本地
-+//!    增量，改成 attached 导入。
-+//! 3. **attached 重放**：`BodyDoc::restore(None, 库里全部 update)` 与生产读取路径
-+//!    `load_body_doc`。
-+//!
-+//! 每个用例都断言：detached 的 `end_frontier` 与 attached 的 frontier 逐字节相等，
-+//! `end_vv` 与 attached 的 VV 语义相等（`VersionVector::encode` 的字节顺序取决于
-+//! import 顺序，不是规范形式，见 [`canonical_vv`]）；三份 attached 结果的**正文逐字节
-+//! 相同**；本地与基线内容不丢、不重复。
-+//!
-+//! LoroTree 用例：`BodyDoc` 只暴露正文 text，`StructureDoc` 不暴露 detach，因此按任务
-+//! 约定用 `loro` 直接构造 `LoroDoc` / `LoroTree`，验证 `import_oplog_only` 依赖的同一条
-+//! CRDT 不变量：detach 后 import 只写 oplog；从 oplog 导出的差集 attached 重放后，
-+//! frontier / VV 与树的可见形状（遍历结果）都与 attached 合并完全一致。
-+
-+mod support;
-+
-+use loro::{ExportMode, LoroDoc, LoroTree, LoroValue, TreeID, VersionVector};
-+use support::*;
-+
-+use menghunote_storage::{
-+    apply_baseline_batch, begin_baseline_apply, doc_updates_since, finish_baseline_apply,
-+    load_body_doc, BaselineApplyFinish, BaselineExpectation, BodyDoc, StoredLoroUpdate, Vault,
-+    BASELINE_MERGE_BATCH,
-+};
-+
-+/// 本地设备（attached 侧）。
-+const A_PEER: u64 = PEER_A;
-+/// 远端基线导出方（与本地不同的 peer）。
-+const B_PEER: u64 = PEER_B;
-+
-+// ---------------------------------------------------------------------------
-+// 正文（LoroText）用例的脚手架
-+// ---------------------------------------------------------------------------
-+
-+/// 在内存里构造一篇正文（不落库），用作「远端基线」。
-+fn memory_doc(doc_id: &str, peer: u64, text: &str) -> BodyDoc {
-+    let doc = BodyDoc::create(doc_id, peer).expect("创建内存文档");
-+    if !text.is_empty() {
-+        doc.insert_scalars(0, text).expect("写远端基线正文");
-+    }
-+    doc
-+}
-+
-+/// begin 一份「只含这一篇文档」的 baseline staging。
-+fn begin_apply(vault: &Vault, doc_id: &str, baseline_s: u64, cursor: &str) {
-+    let expected = BaselineExpectation::new(
-+        std::iter::once(doc_id.to_owned()),
-+        std::iter::empty::<[u8; 32]>(),
-+    );
-+    let checkpoint_id: [u8; 16] = [baseline_s as u8; 16];
-+    begin_baseline_apply(vault, &checkpoint_id, baseline_s, cursor, &expected)
-+        .expect("begin baseline apply");
-+}
-+
-+/// 快照蕴含的 VV（生产 `baseline_vv` 的来源：restore snapshot 后取 vv）。
-+fn snapshot_vv(snapshot: &[u8]) -> VersionVector {
-+    BodyDoc::restore("vv-probe", B_PEER, Some(snapshot), &[])
-+        .expect("基线快照可恢复")
-+        .vv()
-+}
-+
-+/// VV 的规范表示：`VersionVector::encode` 的字节顺序取决于 import 顺序（不是规范形式），
-+/// 所以按 peer 排序后比较「peer -> counter」集合；语义相等即等价。
-+fn canonical_vv(bytes: &[u8]) -> Vec<(u64, i32)> {
++/// 多 peer 用例用它断言 merged oplog VV 覆盖了场景的全部 peer：`oplog_frontiers` 只是
++/// DAG tips，被后续 op 依赖的 peer 会从 tips 里消失，不能当成「peer 全集」。
++fn vv_peers(bytes: &[u8]) -> Vec<u64> {
 +    let vv = VersionVector::decode(bytes).expect("VV 可解码");
-+    let mut entries: Vec<(u64, i32)> = vv.iter().map(|(peer, counter)| (*peer, *counter)).collect();
-+    entries.sort_unstable();
-+    entries
++    let mut peers: Vec<u64> = vv.keys().copied().collect();
++    peers.sort_unstable();
++    peers.dedup();
++    peers
 +}
 +
-+/// `loro_updates` 里 baseline merge 追加的那一行。
-+struct DetachedMerge {
-+    /// payload 由 `pending_update_from_oplog` 导出，end_frontier / end_vv 取 **oplog** 版本。
-+    merged: StoredLoroUpdate,
-+    /// 本地相对基线 VV 的差集（与生产 detached 分支 import 的字节同源）。
-+    local_delta: Vec<u8>,
+ /// `loro_updates` 里 baseline merge 追加的那一行。
+ struct DetachedMerge {
+     /// payload 由 `pending_update_from_oplog` 导出，end_frontier / end_vv 取 **oplog** 版本。
+@@ -88,6 +117,10 @@ struct DetachedMerge {
+ }
+ 
+ /// 驱动生产 `existing_local_extra`（detached）分支，并取回它落库的差集。
++///
++/// 常规两 peer 用例走这个入口：期望合并后的 oplog frontier（DAG tips）恰好是
++/// 本地 + 基线两个 peer。多 peer 边界用例用 [`merge_detached_with_peers`] 显式给出
++/// 该场景期望的 frontier peer 集合，断言不放宽。
+ fn merge_detached(
+     vault: &Vault,
+     doc_id: &str,
+@@ -95,6 +128,33 @@ fn merge_detached(
+     local: &BodyDoc,
+     baseline_s: u64,
+     cursor: &str,
++) -> DetachedMerge {
++    merge_detached_with_peers(
++        vault,
++        doc_id,
++        snapshot,
++        local,
++        baseline_s,
++        cursor,
++        &[A_PEER, B_PEER],
++    )
 +}
 +
-+/// 驱动生产 `existing_local_extra`（detached）分支，并取回它落库的差集。
-+fn merge_detached(
++/// 同 [`merge_detached`]，但合并后 oplog **frontier（DAG tips）** 的 peer 集合由
++/// 调用方给出（升序）。
++///
++/// 注意 frontier 是 DAG tips，不是「peer 全集」：某一 peer 的 op 一旦被后续 op 依赖
++/// （例如基线在未知 peer C 的 op 之后继续写），它就不再是 tip。真正的全量证据是
++/// merged `end_vv`，由各多 peer 用例用 [`vv_peers`] 单独断言，并与
++/// [`assert_detached_matches_attached`] 的 attached VV 逐项相等。
++fn merge_detached_with_peers(
 +    vault: &Vault,
 +    doc_id: &str,
 +    snapshot: &[u8],
 +    local: &BodyDoc,
 +    baseline_s: u64,
 +    cursor: &str,
-+) -> DetachedMerge {
-+    let local_delta = local
-+        .pending_update(&snapshot_vv(snapshot))
-+        .expect("导出本地差集")
-+        .payload;
-+    assert!(
-+        !local_delta.is_empty(),
-+        "本地必须在基线之外还有 op，否则生产走 attached 分支，测不到 detached"
-+    );
-+    begin_apply(vault, doc_id, baseline_s, cursor);
-+    apply_baseline_batch(vault, &[(doc_id.to_owned(), snapshot.to_vec())], &[])
-+        .expect("应用基线快照");
-+    let merged = doc_updates_since(vault, doc_id, 0)
++    expected_peers: &[u64],
+ ) -> DetachedMerge {
+     let local_delta = local
+         .pending_update(&snapshot_vv(snapshot))
+@@ -114,16 +174,16 @@ fn merge_detached(
+         .expect("detached 分支必须落一条 baseline_merge 差集");
+     assert!(!merged.payload.is_empty(), "detached 导出的差集不能为空");
+ 
+-    // 分支守卫：detached 合并后的 oplog frontier 必须同时包含本地与基线两个 peer。
+-    // 若生产误走 attached 分支，这里只会是基线 state 的单 peer frontier。
++    // 分支守卫：detached 合并后的 oplog frontier 必须与场景一致。
++    // 若生产误走 attached 分支，这里只会是基线 state 的 peer 集合。
+     let frontier = loro::Frontiers::decode(&merged.end_frontier).expect("frontier 可解码");
+     let mut peers: Vec<u64> = frontier.iter().map(|id| id.peer).collect();
+     peers.sort_unstable();
+     peers.dedup();
+     assert_eq!(
+-        peers,
+-        vec![A_PEER, B_PEER],
+-        "detached 分支未生效？合并后的 oplog frontier 必须同时包含两个 peer"
++        peers.as_slice(),
++        expected_peers,
++        "detached 分支未生效？合并后的 oplog frontier peer 集合必须与场景一致（实际 {peers:?}）"
+     );
+ 
+     DetachedMerge {
+@@ -132,6 +192,17 @@ fn merge_detached(
+     }
+ }
+ 
++/// `loro_updates` 里 `batch_id == BASELINE_MERGE_BATCH` 的全部行（按 seq 升序）。
++///
++/// 幂等用例用它证明「重放/重复投递不新增、不改写 detached 落库的差集行」。
++fn baseline_merge_rows(vault: &Vault, doc_id: &str) -> Vec<StoredLoroUpdate> {
++    doc_updates_since(vault, doc_id, 0)
 +        .expect("读 loro_updates")
 +        .into_iter()
-+        .rfind(|update| update.batch_id == BASELINE_MERGE_BATCH)
-+        .expect("detached 分支必须落一条 baseline_merge 差集");
-+    assert!(!merged.payload.is_empty(), "detached 导出的差集不能为空");
-+
-+    // 分支守卫：detached 合并后的 oplog frontier 必须同时包含本地与基线两个 peer。
-+    // 若生产误走 attached 分支，这里只会是基线 state 的单 peer frontier。
-+    let frontier = loro::Frontiers::decode(&merged.end_frontier).expect("frontier 可解码");
-+    let mut peers: Vec<u64> = frontier.iter().map(|id| id.peer).collect();
-+    peers.sort_unstable();
-+    peers.dedup();
-+    assert_eq!(
-+        peers,
-+        vec![A_PEER, B_PEER],
-+        "detached 分支未生效？合并后的 oplog frontier 必须同时包含两个 peer"
-+    );
-+
-+    DetachedMerge {
-+        merged,
-+        local_delta,
-+    }
++        .filter(|update| update.batch_id == BASELINE_MERGE_BATCH)
++        .collect()
 +}
 +
-+/// 断言 detached 结果与 attached 路径完全等价，返回合并后的正文。
-+///
-+/// attached 侧有三条证据链，全部要与 detached 的 frontier 逐字节一致、VV 语义一致：
-+/// 1. 基线副本 attached 导入同一条本地差集；
-+/// 2. 库里全部 update 重新 restore（attached 重放）；
-+/// 3. 生产读取入口 `load_body_doc`。
-+fn assert_detached_matches_attached(
-+    vault: &Vault,
-+    doc_id: &str,
-+    snapshot: &[u8],
-+    parts: &DetachedMerge,
-+) -> String {
-+    // 1) attached 参考：基线副本 + attached 导入本地差集。
-+    let attached =
-+        BodyDoc::restore(doc_id, A_PEER, Some(snapshot), &[]).expect("attached 基线副本");
-+    attached
-+        .import(&parts.local_delta)
-+        .expect("attached 导入本地差集");
-+    let attached_text = attached.text();
-+    assert_eq!(
-+        canonical_vv(&attached.vv().encode()),
-+        canonical_vv(&parts.merged.end_vv),
-+        "detached oplog VV 与 attached 合并 VV 不一致"
-+    );
-+    assert_eq!(
-+        attached.frontiers().encode(),
-+        parts.merged.end_frontier,
-+        "detached oplog frontier 与 attached 合并 frontier 不一致"
-+    );
-+
-+    // 2) attached 重放：库里全部 update（本地 update + detached 导出的差集）。
-+    let payloads: Vec<Vec<u8>> = doc_updates_since(vault, doc_id, 0)
-+        .expect("读全部 update")
-+        .into_iter()
-+        .map(|update| update.payload)
-+        .collect();
-+    let replayed = BodyDoc::restore(doc_id, A_PEER, None, &payloads).expect("attached 重放");
-+    assert_eq!(
-+        replayed.text(),
-+        attached_text,
-+        "attached 重放文本与 attached 合并文本不是逐字节相同"
-+    );
-+    assert_eq!(
-+        canonical_vv(&replayed.vv().encode()),
-+        canonical_vv(&parts.merged.end_vv)
-+    );
-+    assert_eq!(replayed.frontiers().encode(), parts.merged.end_frontier);
-+
-+    // 3) 生产读取路径：文本、frontier、VV 必须与 attached 参考完全一致。
-+    let (loaded, head) = load_body_doc(vault, doc_id, A_PEER, None).expect("生产重放");
-+    assert_eq!(loaded.text(), attached_text, "load_body_doc 文本不一致");
-+    assert_eq!(
-+        canonical_vv(&loaded.vv().encode()),
-+        canonical_vv(&parts.merged.end_vv)
-+    );
-+    assert_eq!(loaded.frontiers().encode(), parts.merged.end_frontier);
-+    assert_eq!(
-+        head.head_frontier, parts.merged.end_frontier,
-+        "head_frontier 必须来自 detached 合并后的 oplog frontier"
-+    );
-+    assert_eq!(
-+        canonical_vv(&head.head_vv),
-+        canonical_vv(&parts.merged.end_vv),
-+        "head_vv 必须来自 detached 合并后的 oplog VV"
-+    );
-+
-+    attached_text
-+}
+ /// 断言 detached 结果与 attached 路径完全等价，返回合并后的正文。
+ ///
+ /// attached 侧有三条证据链，全部要与 detached 的 frontier 逐字节一致、VV 语义一致：
+@@ -788,3 +859,656 @@ fn precomposed_vs_decomposed_accent_merges_without_normalization() {
+     assert_ne!(text, "éé", "不得做 NFC 归一化：{text:?}");
+     assert_ne!(text, "e\u{301}e\u{301}", "不得做 NFD 归一化：{text:?}");
+ }
 +
 +// ---------------------------------------------------------------------------
-+// 1. 两个 peer 并发编辑同一 LoroText
++// 5. 边界：基线 VV 里含本地从未导入的 peer
 +// ---------------------------------------------------------------------------
 +
++/// 基线快照里带一个本地从未导入的 peer C（基线 VV 有 C、本地 VV 没有）时，
++/// detached 导出/合并必须被钉死为：
++/// - 不 panic、不把 C 的 op 丢掉（否则本地会永久缺一段远端历史）；
++/// - 本地差集只含本地 peer 的 op——C 已在基线 VV 覆盖范围内，不能重复导出；
++/// - merged 差集恰好是「基线相对本地 VV 的差集」：单独重放等于基线文本（含未知 peer C 的 op），
++///   而不是全量历史、也不是空集。
 +#[test]
-+fn concurrent_two_peer_text_inserts_match_attached_byte_for_byte() {
++fn detached_baseline_vv_with_unimported_peer_keeps_both_sides_once() {
 +    let (_dir, vault) = fresh_vault();
-+    // 本地 peer A：独立文档，与基线完全不共享历史（最纯粹的并发同位置插入）。
++
++    // 本地 peer A：独立文档，从未导入基线（本地 VV 只有 A）。
 +    let local = seed_note(&vault, "note-1", "doc-1");
 +    local.insert_scalars(0, "LOCAL").expect("本地编辑");
 +    commit_now(&vault, &local, "local-batch");
 +
-+    // 远端 peer B：导出基线快照。
-+    let remote = memory_doc("doc-1", B_PEER, "REMOTE");
++    // 基线：peer B 先导入 peer C 的 update（本地从未见过 C），再追加自己的文本。
++    let third = BodyDoc::create("doc-1", C_PEER).expect("第三台设备文档");
++    third.insert_scalars(0, "C").expect("C 的文本");
++    let third_update = third
++        .pending_update(&VersionVector::new())
++        .expect("C 的增量");
++    let remote = BodyDoc::create("doc-1", B_PEER).expect("基线文档");
++    remote
++        .import(&third_update.payload)
++        .expect("基线导入 C 的 op");
++    remote
++        .insert_scalars(remote.scalar_len(), "BASE")
++        .expect("基线文本");
 +    let snapshot = remote.export_snapshot().expect("基线快照");
 +
-+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 5, "cursor-1");
++    let baseline_vv = snapshot_vv(&snapshot);
++    let local_vv = local.vv();
++    assert!(
++        counter_of(&baseline_vv, C_PEER) > 0,
++        "基线 VV 必须含本地从未导入的 peer C：{baseline_vv:?}"
++    );
++    assert_eq!(
++        counter_of(&local_vv, C_PEER),
++        0,
++        "本地 VV 不得含 C peer（否则测不到「本地未知 peer」）"
++    );
++    // 生产分支守卫：本地在基线之外还有 op（A 不在基线 VV 里）。
++    assert!(
++        local_vv.sub_iter(&baseline_vv).next().is_some(),
++        "本地必须相对基线有额外 op，否则生产走 attached 分支"
++    );
++
++    let parts = merge_detached_with_peers(
++        &vault,
++        "doc-1",
++        &snapshot,
++        &local,
++        5,
++        "cursor-1",
++        &[A_PEER, B_PEER],
++    );
++    // detached 合并后的 oplog VV 必须覆盖全部三个 peer（未知 peer C 的 op 不能丢）。
++    assert_eq!(
++        vv_peers(&parts.merged.end_vv),
++        vec![A_PEER, B_PEER, C_PEER],
++        "合并后的 oplog VV 必须含未知 peer C"
++    );
 +    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
 +
++    assert_eq!(
++        text.len(),
++        "LOCAL".len() + "CBASE".len(),
++        "不得有重复或残留字符：{text:?}"
++    );
 +    assert_eq!(
 +        text.matches("LOCAL").count(),
 +        1,
-+        "本地文本必须恰好出现一次：{text:?}"
++        "本地文本必须恰好一次：{text:?}"
 +    );
 +    assert_eq!(
-+        text.matches("REMOTE").count(),
-+        1,
-+        "基线文本必须恰好出现一次：{text:?}"
-+    );
-+    assert!(
-+        text.is_ascii(),
-+        "纯 ASCII 合并后不得引入非 ASCII 字节：{text:?}"
-+    );
-+    assert_eq!(
-+        text.len(),
-+        "LOCAL".len() + "REMOTE".len(),
-+        "字节数必须是两段 ASCII 之和：{text:?}"
-+    );
-+    assert_eq!(text.chars().count(), 11);
-+}
-+
-+#[test]
-+fn local_op_depending_on_baseline_matches_attached_after_detached_merge() {
-+    let (_dir, vault) = fresh_vault();
-+    // 远端：先导出 base，再在本地收不到的情况下追加 -r2（新基线是原来 + 这一笔）。
-+    let remote = memory_doc("doc-1", B_PEER, "base");
-+    let partial = remote.export_snapshot().expect("base 快照");
-+    remote.insert_scalars(4, "-r2").expect("远端第二笔");
-+    let full = remote.export_snapshot().expect("full 快照");
-+
-+    // 本地：先收到 base，再在 base 之上编辑——本地 op 因果依赖基线 op。
-+    let _ = seed_note(&vault, "note-1", "doc-1");
-+    let local = BodyDoc::restore("doc-1", A_PEER, Some(&partial), &[]).expect("本地副本");
-+    local.insert_scalars(4, "-local").expect("本地并发编辑");
-+    commit_now(&vault, &local, "local-batch");
-+
-+    let parts = merge_detached(&vault, "doc-1", &full, &local, 6, "cursor-2");
-+    let text = assert_detached_matches_attached(&vault, "doc-1", &full, &parts);
-+
-+    assert_eq!(
-+        text.matches("-local").count(),
-+        1,
-+        "依赖基线的本地 op 必须恰好一次：{text:?}"
-+    );
-+    assert_eq!(
-+        text.matches("-r2").count(),
-+        1,
-+        "远端并发 op 必须恰好一次：{text:?}"
-+    );
-+    assert_eq!(
-+        text.matches("base").count(),
++        text.matches("CBASE").count(),
 +        1,
 +        "基线文本必须恰好一次：{text:?}"
 +    );
++
++    // 本地差集只含本地 peer 的 op：单独重放就是本地文本，不含 C/B 的历史。
++    let local_delta_alone = BodyDoc::restore(
++        "local-delta-probe",
++        A_PEER,
++        None,
++        std::slice::from_ref(&parts.local_delta),
++    )
++    .expect("本地差集可重放");
 +    assert_eq!(
-+        text.len(),
-+        "base".len() + "-local".len() + "-r2".len(),
-+        "不得有重复或残留字符：{text:?}"
++        local_delta_alone.text(),
++        "LOCAL",
++        "本地差集不得包含基线 op：{local_delta_alone:?}"
++    );
++    assert_eq!(
++        canonical_vv(&local_delta_alone.vv().encode()),
++        canonical_of_vv(&local_vv),
++        "本地差集的 VV 必须等于本地 VV"
++    );
++
++    // merged 差集 = 基线相对本地 VV 的差集：单独重放恰好是基线文本（C 的 op 必须在内）。
++    let merged_alone = BodyDoc::restore(
++        "merged-probe",
++        A_PEER,
++        None,
++        std::slice::from_ref(&parts.merged.payload),
++    )
++    .expect("merged 差集可重放");
++    assert_eq!(
++        merged_alone.text(),
++        "CBASE",
++        "merged 差集必须正好覆盖基线文本：{merged_alone:?}"
++    );
++    assert_eq!(
++        canonical_vv(&merged_alone.vv().encode()),
++        canonical_of_vv(&baseline_vv),
++        "merged 差集的 VV 必须等于基线 VV（未知 peer C 的 op 不能丢）"
 +    );
 +}
 +
 +// ---------------------------------------------------------------------------
-+// 2. LoroTree create / move / delete
++// 6. 边界：`from` 超前于 doc 当前 VV（病态输入）
 +// ---------------------------------------------------------------------------
 +
-+/// 新建一个 LoroDoc（未启用任何容器配置）。
-+fn tree_doc(peer: u64) -> LoroDoc {
-+    let doc = LoroDoc::new();
-+    doc.set_peer_id(peer).expect("设置 peer id");
-+    doc
-+}
-+
-+/// 取树容器并启用 fractional index（与 `StructureDoc::create/restore` 一致）。
-+fn editable_tree(doc: &LoroDoc) -> LoroTree {
-+    let tree = doc.get_tree("tree");
-+    tree.enable_fractional_index(0);
-+    tree
-+}
-+
-+fn set_title(tree: &LoroTree, node: TreeID, title: &str) {
-+    tree.get_meta(node)
-+        .expect("节点 meta 可写")
-+        .insert("title", title)
-+        .expect("写标题");
-+}
-+
-+fn title_of(tree: &LoroTree, node: TreeID) -> String {
-+    let meta = tree.get_meta(node).expect("节点 meta 可读");
-+    match meta.get_deep_value() {
-+        LoroValue::Map(entries) => entries
-+            .get("title")
-+            .and_then(|value| match value {
-+                LoroValue::String(value) => Some(value.to_string()),
-+                _ => None,
-+            })
-+            .unwrap_or_default(),
-+        _ => String::new(),
-+    }
-+}
-+
-+/// 树的可读形状：深度优先的「标题（含缩进）」，根顺序也参与比较。
-+fn shape(doc: &LoroDoc) -> Vec<String> {
-+    let tree = doc.get_tree("tree");
-+    let mut out = Vec::new();
-+    walk_shape(&tree, None, 0, &mut out);
-+    out
-+}
-+
-+fn walk_shape(tree: &LoroTree, parent: Option<TreeID>, depth: usize, out: &mut Vec<String>) {
-+    let Some(children) = tree.children(parent) else {
-+        return;
-+    };
-+    for child in children {
-+        out.push(format!("{}{}", "  ".repeat(depth), title_of(tree, child)));
-+        walk_shape(tree, Some(child), depth + 1, out);
-+    }
-+}
-+
-+/// 节点 ID + 父节点 ID（连同深度），用于断言两副本是同一棵树而不是「同形状」。
-+fn parent_ids(doc: &LoroDoc) -> Vec<String> {
-+    let tree = doc.get_tree("tree");
-+    let mut out = Vec::new();
-+    walk_ids(&tree, None, 0, &mut out);
-+    out
-+}
-+
-+fn walk_ids(tree: &LoroTree, parent: Option<TreeID>, depth: usize, out: &mut Vec<String>) {
-+    let Some(children) = tree.children(parent) else {
-+        return;
-+    };
-+    for child in children {
-+        let parent_label = parent
-+            .map(|parent| parent.to_string())
-+            .unwrap_or_else(|| "<root>".to_owned());
-+        out.push(format!("{parent_label}|{child}|{depth}"));
-+        walk_ids(tree, Some(child), depth + 1, out);
-+    }
-+}
-+
-+/// 在树上跑一遍 detached / attached 三条路径，返回 attached 参考文档。
-+///
-+/// - `snapshot`：本轮要应用的远端基线快照（peer B 导出）；
-+/// - `local_delta`：本地相对该快照 VV 的差集；
-+/// - `local_vv`：本地副本的 oplog VV（detached 导出的基准）；
-+/// - `local_snapshot`：本地副本完整快照（attached 重放的起点）。
-+fn assert_tree_paths_agree(
-+    peer: u64,
-+    snapshot: &[u8],
-+    local_delta: &[u8],
-+    local_vv: &VersionVector,
-+    local_snapshot: &[u8],
-+) -> LoroDoc {
-+    // 1) attached 参考：基线副本 attached 导入同一条本地差集。
-+    let attached = tree_doc(peer);
-+    attached.import(snapshot).expect("attached 基线快照");
-+    attached.import(local_delta).expect("attached 合并本地差集");
-+
-+    // 2) detached：先 detach，只把增量写进 oplog，再从 oplog 导出差集。
-+    let detached = tree_doc(peer);
-+    detached.import(snapshot).expect("detached 基线快照");
-+    editable_tree(&detached);
-+    detached.detach();
-+    assert!(detached.is_detached());
-+    detached.import(local_delta).expect("detached import");
-+    assert!(
-+        detached.is_detached(),
-+        "import 不得把 detached 文档翻回 attached"
-+    );
-+    assert_eq!(
-+        detached.oplog_frontiers().encode(),
-+        attached.state_frontiers().encode(),
-+        "detached 合并 frontier 与 attached 合并 frontier 不一致"
-+    );
-+    assert_eq!(
-+        detached.oplog_frontiers().encode(),
-+        attached.oplog_frontiers().encode(),
-+        "detached oplog frontier 与 attached oplog frontier 不一致"
-+    );
-+    assert_eq!(
-+        canonical_vv(&detached.oplog_vv().encode()),
-+        canonical_vv(&attached.oplog_vv().encode()),
-+        "detached 合并 VV 与 attached 合并 VV 不一致"
-+    );
-+    let delta_from_oplog = detached
-+        .export(ExportMode::updates(local_vv))
-+        .expect("从 detached oplog 导出差集");
-+    assert!(!delta_from_oplog.is_empty(), "本轮 detached 差集必须非空");
-+
-+    // attach 后读取合并后的树状态（生产从不读 detached 状态，这里只做等价性证据）。
-+    detached.attach();
-+    assert!(!detached.is_detached());
-+    assert_eq!(shape(&detached), shape(&attached), "attach 后树形状不一致");
-+    assert_eq!(
-+        parent_ids(&detached),
-+        parent_ids(&attached),
-+        "attach 后树父子关系不一致"
-+    );
-+
-+    // 3) attached 重放：本地副本 + detached 导出的差集（= 库里本地 update + 合并差集）。
-+    let replay = tree_doc(peer);
-+    replay.import(local_snapshot).expect("重放本地副本");
-+    editable_tree(&replay);
-+    replay
-+        .import(&delta_from_oplog)
-+        .expect("重放 detached 差集");
-+    assert_eq!(
-+        replay.state_frontiers().encode(),
-+        attached.state_frontiers().encode(),
-+        "attached 重放 frontier 与 attached 合并不一致"
-+    );
-+    assert_eq!(
-+        canonical_vv(&replay.oplog_vv().encode()),
-+        canonical_vv(&attached.oplog_vv().encode()),
-+        "attached 重放 VV 与 attached 合并不一致"
-+    );
-+    assert_eq!(
-+        shape(&replay),
-+        shape(&attached),
-+        "attached 重放树形状不一致"
-+    );
-+    assert_eq!(
-+        parent_ids(&replay),
-+        parent_ids(&attached),
-+        "attached 重放父子关系不一致"
-+    );
-+
-+    attached
-+}
-+
++/// `from`（基线 VV）对本地 peer 的计数严格超前于本地文档当前 VV 时（病态输入：基线
++/// 声称包含本地还没拿到的 A op），按现有生产 API 的语义钉死：
++/// 不 panic、不报错：`export(updates(from))` 对超前的 from 只导出**未被覆盖**的 op；
++/// 本地差集 = 未被 from 覆盖的 peer 的 op（C/D），绝不把 A 的旧 op 再导出一遍；
++/// 也不退化成空集（C/D 是本地真正多出来的 op）。
++/// 断言用 blob 元信息（partial_start_vv / partial_end_vv）证明导出区间，不靠猜测文本顺序。
 +#[test]
-+fn tree_create_and_move_match_attached_frontier_and_shape() {
-+    // 第一份基线（peer B）：Folder / Note 1、根级 Note 2。
-+    let remote = tree_doc(B_PEER);
-+    let remote_tree = editable_tree(&remote);
-+    let folder = remote_tree.create(None).expect("创建 Folder");
-+    let note1 = remote_tree.create(folder).expect("创建 Note 1");
-+    let note2 = remote_tree.create(None).expect("创建 Note 2");
-+    set_title(&remote_tree, folder, "Folder");
-+    set_title(&remote_tree, note1, "Note 1");
-+    set_title(&remote_tree, note2, "Note 2");
-+    remote.commit();
-+    let first = remote.export(ExportMode::Snapshot).expect("第一份基线");
-+
-+    // 本地（peer A）：在基线上并发 create + move（把 Note 2 重挂到本地新节点下）。
-+    let local = tree_doc(A_PEER);
-+    local.import(&first).expect("本地副本");
-+    let local_tree = editable_tree(&local);
-+    let local_node = local_tree.create(note1).expect("本地新节点");
-+    set_title(&local_tree, local_node, "Local");
-+    local_tree.mov(note2, local_node).expect("本地移动");
-+    local.commit();
-+    let local_snapshot = local.export(ExportMode::Snapshot).expect("本地快照");
-+    let local_vv = local.oplog_vv();
-+
-+    // 远端在本地编辑期间继续前进：新建根节点 Remote（第二轮 frontier 的来源）。
-+    let remote_node = remote_tree.create(None).expect("远端新根");
-+    set_title(&remote_tree, remote_node, "Remote");
-+    remote.commit();
-+    let snapshot = remote.export(ExportMode::Snapshot).expect("第二份基线");
-+    let baseline_vv = remote.oplog_vv();
-+
-+    let local_delta = local
-+        .export(ExportMode::updates(&baseline_vv))
-+        .expect("本地差集");
-+    assert!(!local_delta.is_empty(), "本地差集不能为空");
-+
-+    let attached =
-+        assert_tree_paths_agree(A_PEER, &snapshot, &local_delta, &local_vv, &local_snapshot);
-+
-+    // 可见形状硬断言：Folder > Note 1 > Local > Note 2，远端新根 Remote 在根级末尾。
-+    assert_eq!(
-+        shape(&attached),
-+        vec![
-+            "Folder".to_owned(),
-+            "  Note 1".to_owned(),
-+            "    Local".to_owned(),
-+            "      Note 2".to_owned(),
-+            "Remote".to_owned(),
-+        ]
-+    );
-+}
-+
-+#[test]
-+fn tree_delete_and_reparent_match_attached_frontier_and_shape() {
-+    // 第一份基线（peer B）：Folder / Note 1（本地会删），根级 Note 2、Note 3（本地会重挂）。
-+    let remote = tree_doc(B_PEER);
-+    let remote_tree = editable_tree(&remote);
-+    let folder = remote_tree.create(None).expect("创建 Folder");
-+    let note1 = remote_tree.create(folder).expect("创建 Note 1");
-+    let note2 = remote_tree.create(None).expect("创建 Note 2");
-+    let note3 = remote_tree.create(None).expect("创建 Note 3");
-+    set_title(&remote_tree, folder, "Folder");
-+    set_title(&remote_tree, note1, "Note 1");
-+    set_title(&remote_tree, note2, "Note 2");
-+    set_title(&remote_tree, note3, "Note 3");
-+    remote.commit();
-+    let first = remote.export(ExportMode::Snapshot).expect("第一份基线");
-+
-+    // 本地（peer A）：并发 delete + create + reparent。
-+    let local = tree_doc(A_PEER);
-+    local.import(&first).expect("本地副本");
-+    let local_tree = editable_tree(&local);
-+    local_tree.delete(note1).expect("本地删除 Note 1");
-+    assert!(
-+        local_tree.is_node_deleted(&note1).expect("删除标记可读"),
-+        "本地删除后 Note 1 必须是删除态"
-+    );
-+    let local_node = local_tree.create(note2).expect("本地新节点");
-+    set_title(&local_tree, local_node, "Local");
-+    local_tree.mov(note3, local_node).expect("本地重挂 Note 3");
-+    local.commit();
-+    let local_snapshot = local.export(ExportMode::Snapshot).expect("本地快照");
-+    let local_vv = local.oplog_vv();
-+
-+    // 远端继续：新建根节点 Remote。
-+    let remote_node = remote_tree.create(None).expect("远端新根");
-+    set_title(&remote_tree, remote_node, "Remote");
-+    remote.commit();
-+    let snapshot = remote.export(ExportMode::Snapshot).expect("第二份基线");
-+    let baseline_vv = remote.oplog_vv();
-+
-+    let local_delta = local
-+        .export(ExportMode::updates(&baseline_vv))
-+        .expect("本地差集");
-+    assert!(!local_delta.is_empty(), "本地差集不能为空");
-+
-+    let attached =
-+        assert_tree_paths_agree(A_PEER, &snapshot, &local_delta, &local_vv, &local_snapshot);
-+
-+    // 可见形状硬断言：Note 1 被删（Folder 无子），Note 2 > Local > Note 3，Remote 在根级末尾。
-+    assert_eq!(
-+        shape(&attached),
-+        vec![
-+            "Folder".to_owned(),
-+            "Note 2".to_owned(),
-+            "  Local".to_owned(),
-+            "    Note 3".to_owned(),
-+            "Remote".to_owned(),
-+        ]
-+    );
-+    assert!(
-+        attached
-+            .get_tree("tree")
-+            .is_node_deleted(&note1)
-+            .expect("删除标记可读"),
-+        "合并后 Note 1 必须仍是删除态"
-+    );
-+}
-+
-+// ---------------------------------------------------------------------------
-+// 3. 本地在 baseline 导出之后继续编辑
-+// ---------------------------------------------------------------------------
-+
-+#[test]
-+fn local_edits_after_baseline_export_survive_exactly_once() {
++fn detached_export_from_ahead_of_local_vv_keeps_only_uncovered_ops() {
 +    let (_dir, vault) = fresh_vault();
-+    let remote = memory_doc("doc-1", B_PEER, "Hello world");
-+    let first = remote.export_snapshot().expect("第一份基线");
 +
-+    // 本地在 S0 之后继续写（首尾各一笔），远端也在 S0 之后写（中间一笔）。
-+    let _ = seed_note(&vault, "note-1", "doc-1");
-+    let local = BodyDoc::restore("doc-1", A_PEER, Some(&first), &[]).expect("本地副本");
-+    local.insert_scalars(0, ">> ").expect("本地行首编辑");
-+    local
-+        .insert_scalars(local.scalar_len(), "!")
-+        .expect("本地行尾编辑");
++    // peer A 的两笔历史：基线包含 A 的全量（A:1..4），本地只导入前半（A:1..2）。
++    let a_doc = BodyDoc::create("doc-1", A_PEER).expect("A 文档");
++    a_doc.insert_scalars(0, "A1").expect("A 第一笔");
++    let a_first = a_doc
++        .pending_update(&VersionVector::new())
++        .expect("A 第一笔增量");
++    a_doc.insert_scalars(2, "A2").expect("A 第二笔");
++    let a_all = a_doc
++        .pending_update(&VersionVector::new())
++        .expect("A 全量增量");
++
++    // 本地：A 的前半 + 两个本地真正多出来的 peer（C/D）。
++    let third = BodyDoc::create("doc-1", C_PEER).expect("C 文档");
++    third.insert_scalars(0, "C").expect("C 文本");
++    let third_update = third.pending_update(&VersionVector::new()).expect("C 增量");
++    let fourth = BodyDoc::create("doc-1", D_PEER).expect("D 文档");
++    fourth.insert_scalars(0, "D").expect("D 文本");
++    let fourth_update = fourth
++        .pending_update(&VersionVector::new())
++        .expect("D 增量");
++    let local = seed_note(&vault, "note-1", "doc-1");
++    local.import(&a_first.payload).expect("本地导入 A 前半");
++    local.import(&third_update.payload).expect("本地导入 C");
++    local.import(&fourth_update.payload).expect("本地导入 D");
 +    commit_now(&vault, &local, "local-batch");
 +
-+    remote.insert_scalars(5, " MID").expect("远端第二笔");
-+    let full = remote.export_snapshot().expect("第二份基线");
++    // 基线：导入 A 的全量（对 A 的计数超前本地）再写自己的文本。
++    let remote = BodyDoc::create("doc-1", B_PEER).expect("基线文档");
++    remote.import(&a_all.payload).expect("基线导入 A 全量");
++    remote.insert_scalars(0, "BASE").expect("基线文本");
++    let snapshot = remote.export_snapshot().expect("基线快照");
 +
-+    let parts = merge_detached(&vault, "doc-1", &full, &local, 6, "cursor-2");
-+    let text = assert_detached_matches_attached(&vault, "doc-1", &full, &parts);
++    let baseline_vv = snapshot_vv(&snapshot);
++    let local_vv = local.vv();
++    assert!(
++        counter_of(&baseline_vv, A_PEER) > counter_of(&local_vv, A_PEER),
++        "基线对 A 的计数必须严格超前本地（from 超前）：baseline={baseline_vv:?} local={local_vv:?}"
++    );
++    assert!(
++        local_vv.sub_iter(&baseline_vv).next().is_some(),
++        "本地必须相对基线有额外 op（C/D），否则生产走 attached 分支"
++    );
++
++    let parts = merge_detached_with_peers(
++        &vault,
++        "doc-1",
++        &snapshot,
++        &local,
++        6,
++        "cursor-2",
++        &[B_PEER, C_PEER, D_PEER],
++    );
++    // detached 合并后的 oplog VV 必须覆盖全部四个 peer（A 的基线 op 与本地 C/D 的 op 都在）。
++    assert_eq!(
++        vv_peers(&parts.merged.end_vv),
++        vec![A_PEER, B_PEER, C_PEER, D_PEER],
++        "合并后的 oplog VV 必须含全部四个 peer"
++    );
++    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
 +
 +    assert_eq!(
-+        text, ">> Hello MID world!",
-+        "并发的本地首尾编辑必须保留且只保留一次：{text:?}"
++        text.len(),
++        "BASEA1A2CD".len(),
++        "不得有重复或残留字符：{text:?}"
 +    );
-+    assert_eq!(text.matches(">> ").count(), 1);
-+    assert_eq!(text.matches(" MID").count(), 1);
-+    assert_eq!(text.matches('!').count(), 1);
-+    assert_eq!(text.matches("Hello").count(), 1);
-+    assert_eq!(text.len(), 19);
++    for marker in ["BASE", "A1A2", "C", "D"] {
++        assert_eq!(
++            text.matches(marker).count(),
++            1,
++            "{marker} 必须恰好一次：{text:?}"
++        );
++    }
++
++    // 本地差集：blob 元信息证明只导出 C/D（A 的旧 op 被 from 覆盖，不重复导出）。
++    let delta_meta =
++        LoroDoc::decode_import_blob_meta(&parts.local_delta, true).expect("本地差集元信息");
++    assert_eq!(
++        canonical_of_vv(&delta_meta.partial_start_vv),
++        vec![(C_PEER, 0), (D_PEER, 0)],
++        "本地差集必须从 C/D 的 0 开始（不含 A 的 op）"
++    );
++    assert_eq!(
++        canonical_of_vv(&delta_meta.partial_end_vv),
++        vec![
++            (C_PEER, counter_of(&local_vv, C_PEER)),
++            (D_PEER, counter_of(&local_vv, D_PEER)),
++        ],
++        "本地差集终点必须是 C/D 的本地计数"
++    );
++    // 单独重放：只有 C/D 两个字符（依赖缺失的 op 不会凭空出现）。
++    let local_delta_alone = BodyDoc::restore(
++        "local-delta-probe",
++        A_PEER,
++        None,
++        std::slice::from_ref(&parts.local_delta),
++    )
++    .expect("本地差集可重放");
++    assert_eq!(
++        local_delta_alone.text().chars().count(),
++        2,
++        "本地差集只应含 C/D：{local_delta_alone:?}"
++    );
++    assert_eq!(local_delta_alone.text().matches('C').count(), 1);
++    assert_eq!(local_delta_alone.text().matches('D').count(), 1);
++    assert!(
++        !local_delta_alone.text().contains('A'),
++        "不得把 A 的旧 op 再导出：{local_delta_alone:?}"
++    );
++
++    // merged 差集：起点 = 本地 VV（A:2、B:0），终点 = 基线 VV（A:4、B:4）。
++    let merged_meta =
++        LoroDoc::decode_import_blob_meta(&parts.merged.payload, true).expect("merged 元信息");
++    assert_eq!(
++        canonical_of_vv(&merged_meta.partial_start_vv),
++        vec![(A_PEER, counter_of(&local_vv, A_PEER)), (B_PEER, 0)],
++        "merged 差集必须从本地 VV 起算（超前 from 的语义）"
++    );
++    assert_eq!(
++        canonical_of_vv(&merged_meta.partial_end_vv),
++        vec![
++            (A_PEER, counter_of(&baseline_vv, A_PEER)),
++            (B_PEER, counter_of(&baseline_vv, B_PEER)),
++        ],
++        "merged 差集终点必须是基线 VV"
++    );
++    // 单独重放 merged 差集：A 的后续 op 缺依赖、B 的 op 依赖也未满足 → 不产生可见文本；
++    // 关键是否定断言：绝不能把本地独有的 C/D 再导出一遍。
++    let merged_alone = BodyDoc::restore(
++        "merged-probe",
++        A_PEER,
++        None,
++        std::slice::from_ref(&parts.merged.payload),
++    )
++    .expect("merged 差集可重放");
++    assert_eq!(
++        merged_alone.text(),
++        "",
++        "merged 差集单独重放不得产生文本：{merged_alone:?}"
++    );
 +}
 +
++// ---------------------------------------------------------------------------
++// 7. 边界：同一个 update 重复 import 的幂等性
++// ---------------------------------------------------------------------------
++
++/// 同一个 update 重复 import 的幂等性。两轮 apply 走**不同**的生产分支：
++/// 首轮：本地有 extra → `existing_local_extra`（detached）分支，落一条 baseline_merge；
++/// 次轮：同一 snapshot digest 已应用 → 生产在 detached 之前短路到
++/// `replayed_same_digest` 分支，**不得**再进 detached，也不得新增 baseline_merge、
++/// 推进 head_seq、改 head_vv/head_frontier 或文本。
++/// 另在 Loro 层直接钉住「同一 update 导入两次不产生新 op」（`import_oplog_only` 依赖的
++/// 不变量），并在数据库层钉住「重复投递同一 payload 行经 `load_body_doc` 重放不变」。
 +#[test]
-+fn second_detached_merge_keeps_both_local_writes_once() {
++fn detached_same_update_reimport_is_idempotent() {
 +    let (_dir, vault) = fresh_vault();
 +    let local = seed_note(&vault, "note-1", "doc-1");
-+    local.insert_scalars(0, "-L1").expect("本地第一笔");
-+    commit_now(&vault, &local, "local-round-1");
++    local.insert_scalars(0, "LOCAL").expect("本地编辑");
++    commit_now(&vault, &local, "local-batch");
 +
 +    let remote = memory_doc("doc-1", B_PEER, "BASE");
-+    let first = remote.export_snapshot().expect("第一份基线");
++    let snapshot = remote.export_snapshot().expect("基线快照");
 +
-+    let parts = merge_detached(&vault, "doc-1", &first, &local, 5, "cursor-1");
-+    let first_text = assert_detached_matches_attached(&vault, "doc-1", &first, &parts);
-+    assert_eq!(first_text.matches("-L1").count(), 1);
-+    assert_eq!(first_text.matches("BASE").count(), 1);
-+
-+    // 第一轮 finish；完成后再 begin 第二轮（第二次 checkpoint 追赶）。
-+    let finish = finish_baseline_apply(&vault, 5, "cursor-1").expect("finish 第一轮");
-+    assert!(
-+        matches!(finish, BaselineApplyFinish::Applied(_)),
-+        "第一轮 finish 应成功：{finish:?}"
++    // 首轮：detached 分支（重放计数清零后再调用，断言生产真的进了这个分支）。
++    reset_baseline_apply_debug();
++    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 5, "cursor-1");
++    let first = baseline_apply_debug_counters();
++    assert_eq!(
++        first.existing_local_extra, 1,
++        "首轮必须命中 detached 分支：{first:?}"
++    );
++    assert_eq!(
++        first.replayed_same_digest, 0,
++        "首轮不应走重放分支：{first:?}"
 +    );
 +
-+    // 合并态上继续本地写：生产路径就是重放合并结果再编辑。
-+    let (merged, _head) = load_body_doc(&vault, "doc-1", A_PEER, None).expect("第一轮合并态");
-+    merged
-+        .insert_scalars(merged.scalar_len(), "-L2")
-+        .expect("本地第二笔");
-+    commit_now(&vault, &merged, "local-round-2");
++    let head_before = head(&vault, "doc-1");
++    let rows_before = baseline_merge_rows(&vault, "doc-1");
++    assert_eq!(
++        rows_before.len(),
++        1,
++        "首轮必须恰好落一条 baseline_merge 差集"
++    );
 +
-+    // 远端也继续前进：第二轮 detached 差集必须非空（否则测不到 exported 差集）。
-+    remote.insert_scalars(0, "R2-").expect("远端第二笔");
-+    let second = remote.export_snapshot().expect("第二份基线");
++    // 次轮：同一 snapshot 在同一 staging 再 apply 一次（同一 digest）。
++    apply_baseline_batch(&vault, &[("doc-1".to_owned(), snapshot.clone())], &[])
++        .expect("同一 digest 重放必须成功");
++    let second = baseline_apply_debug_counters();
++    assert_eq!(
++        second.existing_local_extra, 1,
++        "重放不得再进 detached 分支：{second:?}"
++    );
++    assert_eq!(
++        second.replayed_same_digest, 1,
++        "同一 digest 必须走生产既有的 replayed_same_digest 分支：{second:?}"
++    );
 +
-+    let parts = merge_detached(&vault, "doc-1", &second, &merged, 9, "cursor-2");
++    let rows_after = baseline_merge_rows(&vault, "doc-1");
++    assert_eq!(rows_after.len(), 1, "重放不得新增 baseline_merge 行");
++    assert_eq!(
++        rows_after[0].payload, rows_before[0].payload,
++        "重放不得改写差集 payload"
++    );
++    assert_eq!(
++        rows_after[0].end_vv, rows_before[0].end_vv,
++        "重放不得改写差集 VV"
++    );
++    assert_eq!(
++        rows_after[0].end_frontier, rows_before[0].end_frontier,
++        "重放不得改写差集 frontier"
++    );
++
++    let head_after = head(&vault, "doc-1");
++    assert_eq!(
++        head_after.head_seq, head_before.head_seq,
++        "重放不得推进 head_seq"
++    );
++    assert_eq!(
++        head_after.head_vv, head_before.head_vv,
++        "重放不得改 head_vv"
++    );
++    assert_eq!(
++        head_after.head_frontier, head_before.head_frontier,
++        "重放不得改 head_frontier"
++    );
++
++    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
++    assert_eq!(
++        text.len(),
++        "LOCAL".len() + "BASE".len(),
++        "重放不得重复文本：{text:?}"
++    );
++    assert_eq!(text.matches("LOCAL").count(), 1);
++    assert_eq!(text.matches("BASE").count(), 1);
++
++    // Loro 层：同一 update 导入两次不产生新 op（`import_oplog_only` 依赖的不变量）。
++    let once = BodyDoc::restore(
++        "idem-once",
++        A_PEER,
++        None,
++        std::slice::from_ref(&parts.merged.payload),
++    )
++    .expect("单次导入");
++    let twice = BodyDoc::restore(
++        "idem-twice",
++        A_PEER,
++        None,
++        &[parts.merged.payload.clone(), parts.merged.payload.clone()],
++    )
++    .expect("重复导入");
++    assert_eq!(once.text(), twice.text(), "重复 import 不得改文本");
++    assert_eq!(
++        once.vv().encode(),
++        twice.vv().encode(),
++        "重复 import 不得改 VV"
++    );
++    assert_eq!(
++        once.frontiers().encode(),
++        twice.frontiers().encode(),
++        "重复 import 不得改 frontier"
++    );
++
++    // 数据库层：同一 payload 再落一行（模拟 relay 重复投递），生产读取路径必须幂等。
++    let duplicate = UpdateRecord::new(
++        "duplicate-delivery",
++        PendingUpdate {
++            payload: parts.merged.payload.clone(),
++            end_frontier: parts.merged.end_frontier.clone(),
++            end_vv: parts.merged.end_vv.clone(),
++        },
++    );
++    append_updates(&vault, "doc-1", head_after.head_seq, &[duplicate]).expect("重复投递落库");
++    let (loaded, loaded_head) =
++        load_body_doc(&vault, "doc-1", A_PEER, None).expect("重复投递后重放");
++    assert_eq!(loaded.text(), text, "重复投递不得改文本");
++    assert_eq!(
++        canonical_vv(&loaded.vv().encode()),
++        canonical_vv(&parts.merged.end_vv)
++    );
++    assert_eq!(
++        loaded_head.head_vv, parts.merged.end_vv,
++        "重复投递不得改 head_vv"
++    );
++    assert_eq!(loaded_head.head_frontier, parts.merged.end_frontier);
++    assert_eq!(
++        baseline_merge_rows(&vault, "doc-1").len(),
++        1,
++        "重复投递不得新增 baseline_merge 行"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// 8. 边界：多 peer 物理乱序导入
++// ---------------------------------------------------------------------------
++
++/// 多 peer 物理乱序：D 的 update 先于它依赖的 C、C 又先于它依赖的基线 S0 导入本地
++/// （Loro 先把它们挂成 pending，依赖到齐后一次性应用），然后本地再编辑。之后
++/// detached 导出必须与 attached 参考完全一致，且 merged 差集只含新基线 S1 新产生的
++/// B op——不重复导出本地已导入的 A/C/D op。
++#[test]
++fn detached_multi_peer_out_of_order_imports_match_attached() {
++    let (_dir, vault) = fresh_vault();
++
++    // 基线 S0（peer B）。
++    let remote = memory_doc("doc-1", B_PEER, "BASE");
++    let first = remote.export_snapshot().expect("基线 S0");
++    let first_vv = snapshot_vv(&first);
++
++    // C：在 S0 上插入；D：在 S0 + C 上插入（D 的 op 因果依赖 C 的 op）。
++    let third = BodyDoc::restore("doc-1", C_PEER, Some(&first), &[]).expect("C 文档");
++    third.insert_scalars(0, "CCC").expect("C 文本");
++    let third_update = third.pending_update(&first_vv).expect("C 增量");
++    let fourth = BodyDoc::restore("doc-1", D_PEER, Some(&first), &[]).expect("D 文档");
++    fourth.import(&third_update.payload).expect("D 导入 C");
++    fourth.insert_scalars(0, "DDD").expect("D 文本");
++    let fourth_update = fourth.pending_update(&third.vv()).expect("D 增量");
++
++    // 本地 peer A：物理导入顺序 D → C → S0，与因果顺序完全相反。
++    let local = seed_note(&vault, "note-1", "doc-1");
++    local
++        .import(&fourth_update.payload)
++        .expect("本地先导 D（缺依赖）");
++    local
++        .import(&third_update.payload)
++        .expect("本地再导 C（缺基线）");
++    local.import(&first).expect("本地最后导基线 S0");
++    assert_eq!(
++        local.text().matches("BASE").count(),
++        1,
++        "乱序导入后基线文本必须就位：{:?}",
++        local.text()
++    );
++    assert_eq!(
++        local.text().matches("CCC").count(),
++        1,
++        "乱序导入后 C 文本必须就位：{:?}",
++        local.text()
++    );
++    assert_eq!(
++        local.text().matches("DDD").count(),
++        1,
++        "乱序导入后 D 文本必须就位：{:?}",
++        local.text()
++    );
++    local.insert_scalars(0, "AAA").expect("本地编辑");
++    commit_now(&vault, &local, "local-batch");
++
++    // 远端在 S0 之后继续写：新基线 S1 必须带来新 op（否则 merged 差集测不到内容）。
++    remote
++        .insert_scalars(remote.scalar_len(), "NEW")
++        .expect("远端新文本");
++    let second = remote.export_snapshot().expect("基线 S1");
++    let second_vv = snapshot_vv(&second);
++    let local_vv = local.vv();
++    assert!(
++        local_vv.sub_iter(&second_vv).next().is_some(),
++        "本地必须相对新基线有额外 op（A/C/D）"
++    );
++
++    let parts = merge_detached_with_peers(
++        &vault,
++        "doc-1",
++        &second,
++        &local,
++        7,
++        "cursor-3",
++        &[A_PEER, B_PEER],
++    );
++    // detached 合并后的 oplog VV 必须覆盖全部四个 peer（乱序导入的 A/C/D 与基线的 B）。
++    assert_eq!(
++        vv_peers(&parts.merged.end_vv),
++        vec![A_PEER, B_PEER, C_PEER, D_PEER],
++        "合并后的 oplog VV 必须含全部四个 peer"
++    );
 +    let text = assert_detached_matches_attached(&vault, "doc-1", &second, &parts);
 +
 +    assert_eq!(
-+        text.matches("-L1").count(),
-+        1,
-+        "第一笔本地编辑必须恰好一次：{text:?}"
-+    );
-+    assert_eq!(
-+        text.matches("-L2").count(),
-+        1,
-+        "第二笔本地编辑必须恰好一次：{text:?}"
-+    );
-+    assert_eq!(text.matches("BASE").count(), 1);
-+    assert_eq!(text.matches("R2-").count(), 1);
-+    assert!(text.ends_with("-L2"), "本地追加必须仍在末尾：{text:?}");
-+    assert_eq!(
 +        text.len(),
-+        "BASE".len() + "R2-".len() + "-L1".len() + "-L2".len(),
++        "AAADDDCCCBASENEW".len(),
 +        "不得有重复或残留字符：{text:?}"
 +    );
-+}
-+
-+// ---------------------------------------------------------------------------
-+// 4. 边界：空文档 / 单字符 / emoji 与组合字符
-+// ---------------------------------------------------------------------------
-+
-+#[test]
-+fn empty_baseline_text_merges_to_local_text_only() {
-+    let (_dir, vault) = fresh_vault();
-+    // 基线：插入再删除——正文为空，但 oplog 非空，走的是 detached 合并而不是「新文档」分支。
-+    let remote = BodyDoc::create("doc-1", B_PEER).expect("远端基线");
-+    remote.insert_scalars(0, "x").expect("基线插入");
-+    remote.delete_scalars(0, 1).expect("基线删除");
-+    assert_eq!(remote.text(), "");
-+    let snapshot = remote.export_snapshot().expect("基线快照");
-+
-+    let local = seed_note(&vault, "note-1", "doc-1");
-+    local.insert_scalars(0, "local").expect("本地编辑");
-+    commit_now(&vault, &local, "local-batch");
-+
-+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 7, "cursor-3");
-+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
-+
-+    assert_eq!(text, "local", "空基线不得留下任何可见字符：{text:?}");
-+    assert_eq!(text.len(), 5);
-+}
-+
-+#[test]
-+fn local_doc_emptied_by_delete_merges_to_baseline_text() {
-+    let (_dir, vault) = fresh_vault();
-+    let remote = memory_doc("doc-1", B_PEER, "baseline");
-+    let snapshot = remote.export_snapshot().expect("基线快照");
-+
-+    // 本地写过再全部删掉：正文为空但 oplog 非空。
-+    let local = seed_note(&vault, "note-1", "doc-1");
-+    local.insert_scalars(0, "tmp").expect("本地临时文本");
-+    local.delete_scalars(0, 3).expect("本地清空");
-+    assert_eq!(local.text(), "");
-+    commit_now(&vault, &local, "local-batch");
-+
-+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 8, "cursor-4");
-+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
-+
-+    assert_eq!(text, "baseline", "本地清空不得删掉基线字符：{text:?}");
-+    assert_eq!(text.len(), 8);
-+}
-+
-+#[test]
-+fn single_char_docs_keep_both_chars_after_detached_merge() {
-+    let (_dir, vault) = fresh_vault();
-+    let remote = memory_doc("doc-1", B_PEER, "a");
-+    let snapshot = remote.export_snapshot().expect("基线快照");
-+
-+    let local = seed_note(&vault, "note-1", "doc-1");
-+    local.insert_scalars(0, "b").expect("本地单字符");
-+    commit_now(&vault, &local, "local-batch");
-+
-+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 9, "cursor-5");
-+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
-+
-+    assert_eq!(text.len(), 2, "两个单字符必须都在：{text:?}");
-+    assert_eq!(text.chars().count(), 2);
-+    assert_eq!(text.matches('a').count(), 1, "基线字符丢失/重复：{text:?}");
-+    assert_eq!(text.matches('b').count(), 1, "本地字符丢失/重复：{text:?}");
-+}
-+
-+#[test]
-+fn emoji_and_combining_mark_preserved_byte_exact() {
-+    let (_dir, vault) = fresh_vault();
-+    let remote = memory_doc("doc-1", B_PEER, "😀");
-+    let snapshot = remote.export_snapshot().expect("基线快照");
-+
-+    let local = seed_note(&vault, "note-1", "doc-1");
-+    local
-+        .insert_scalars(0, "e\u{301}")
-+        .expect("本地组合字符（e + U+0301）");
-+    commit_now(&vault, &local, "local-batch");
-+
-+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 10, "cursor-6");
-+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
-+
-+    assert_eq!(
-+        text.chars().count(),
-+        3,
-+        "😀 + e + ◌́ = 3 个 scalar：{text:?}"
-+    );
-+    assert_eq!(
-+        text.len(),
-+        4 + 3,
-+        "UTF-8 字节数必须原样保留（😀 4B + e 1B + U+0301 2B）：{text:?}"
-+    );
-+    assert_eq!(text.matches("😀").count(), 1, "emoji 丢失/重复：{text:?}");
-+    assert_eq!(
-+        text.matches("e\u{301}").count(),
-+        1,
-+        "组合字符不得被拆开：{text:?}"
-+    );
-+    assert!(
-+        !text.contains('\u{fffd}'),
-+        "不得出现替换字符（说明按字节截断过）：{text:?}"
-+    );
-+}
-+
-+#[test]
-+fn precomposed_vs_decomposed_accent_merges_without_normalization() {
-+    let (_dir, vault) = fresh_vault();
-+    // 远端用预组合 é（U+00E9，2B），本地用分解 e + U+0301（3B）：同形不同字节。
-+    let remote = memory_doc("doc-1", B_PEER, "é");
-+    let snapshot = remote.export_snapshot().expect("基线快照");
-+
-+    let local = seed_note(&vault, "note-1", "doc-1");
-+    local.insert_scalars(0, "e\u{301}").expect("本地分解形式");
-+    commit_now(&vault, &local, "local-batch");
-+
-+    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 11, "cursor-7");
-+    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
-+
-+    assert_eq!(text.len(), 2 + 3, "两种编码的字节都要保留：{text:?}");
-+    assert_eq!(text.chars().count(), 3);
-+    assert_eq!(text.matches('é').count(), 1, "预组合形式丢失：{text:?}");
-+    assert_eq!(
-+        text.matches("e\u{301}").count(),
-+        1,
-+        "分解形式丢失：{text:?}"
-+    );
-+    assert_ne!(text, "éé", "不得做 NFC 归一化：{text:?}");
-+    assert_ne!(text, "e\u{301}e\u{301}", "不得做 NFD 归一化：{text:?}");
-+}
-diff --git a/crates/storage/tests/exec_transaction_busy.rs b/crates/storage/tests/exec_transaction_busy.rs
-new file mode 100644
-index 0000000..21877f7
---- /dev/null
-+++ b/crates/storage/tests/exec_transaction_busy.rs
-@@ -0,0 +1,170 @@
-+//! P2-7：`exec_transaction` 用 `BEGIN IMMEDIATE` 开启事务（与批量 inbox 共用
-+//! `begin_immediate`）。
-+//!
-+//! 为什么必须是 Immediate：`exec_transaction` 承载 A 事务/资产/repack/finish，调用方
-+//! 习惯把写语句放在最前面，但**没有任何断言**保证这一点；只要事务里出现"先读后写"，
-+//! deferred 的锁升级就不走 `busy_timeout`（SQLite 的锁升级不调用 busy handler），会在
-+//! 预期之外立即 `SQLITE_BUSY`。
-+//!
-+//! 这些用例锁住外部可观测的后果：并发写者占着写锁时整笔事务失败、零半写、锁释放后
-+//! 同一批语句可重放且守卫照旧生效。
-+
-+mod support;
-+
-+use support::*;
-+
-+use menghunote_storage::{AffectedGuard, Statement, StorageError, Value, Vault};
-+
-+/// 断言错误是 `SQLITE_BUSY`（而不是守卫失败 / 约束冲突）。
-+fn assert_busy(error: &StorageError) {
-+    assert!(
-+        matches!(
-+            error,
-+            StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
-+                if code.code == rusqlite::ErrorCode::DatabaseBusy
-+        ),
-+        "并发写事务在场时必须整笔 SQLITE_BUSY，实际 {error:?}"
-+    );
-+}
-+
-+/// 普通 `meta` 键的 BLOB 值（测试断言用）。
-+fn meta_blob(vault: &Vault, key: &str) -> Option<Vec<u8>> {
-+    vault.get_meta(key).expect("读 meta")
-+}
-+
-+/// 外部写事务占着写锁时，`exec_transaction` 必须整笔 `SQLITE_BUSY` 且零半写；
-+/// 释放后同一批语句重放成功，语句顺序与守卫语义都不变。
-+#[test]
-+fn exec_transaction_under_foreign_write_lock_fails_busy_without_partial_write() {
-+    let (dir, vault) = fresh_vault();
-+    vault.set_meta("tx.cas", b"old").expect("预置 CAS 目标行");
-+
-+    // 本连接不等锁（生产是 5s）：让 BEGIN IMMEDIATE 的失败立刻返回，测试无需 sleep。
-+    vault
-+        .exec_batch("PRAGMA busy_timeout=0")
-+        .expect("busy_timeout=0");
-+
-+    // 第二个 Vault（= 第二个连接）先占住写锁。
-+    let holder = open_vault(&vault_path(&dir));
-+    holder
-+        .exec_batch("BEGIN IMMEDIATE")
-+        .expect("外部连接占写锁");
-+
-+    // 第一条插入一行（半写的证据），第二条 CAS 更新既有行（守卫要求恰好 1 行）。
-+    let statements = [
-+        Statement::new(
-+            "INSERT INTO meta(key,value) VALUES(?1,?2)",
-+            vec![
-+                Value::Text("tx.half".to_owned()),
-+                Value::Blob(b"1".to_vec()),
-+            ],
-+        ),
-+        Statement::new(
-+            "UPDATE meta SET value=?2 WHERE key=?1",
-+            vec![
-+                Value::Text("tx.cas".to_owned()),
-+                Value::Blob(b"new".to_vec()),
-+            ],
-+        ),
-+    ];
-+    let guards = [AffectedGuard::exactly(0, 1), AffectedGuard::exactly(1, 1)];
-+
-+    let error = vault
-+        .exec_transaction(&statements, &guards)
-+        .expect_err("写锁被占时必须整笔失败");
-+    assert_busy(&error);
-+
-+    holder.exec_batch("ROLLBACK").expect("释放外部写锁");
-+    drop(holder);
-+
-+    assert_eq!(meta_blob(&vault, "tx.half"), None, "失败事务不得留下半写");
-+    assert_eq!(
-+        meta_blob(&vault, "tx.cas"),
-+        Some(b"old".to_vec()),
-+        "失败事务不得改动 CAS 目标"
-+    );
-+
-+    // 锁释放后同一批重放：整笔提交，每句影响行数与顺序都不变。
-+    let affected = vault
-+        .exec_transaction(&statements, &guards)
-+        .expect("锁释放后应成功");
-+    assert_eq!(affected, vec![1, 1], "语句顺序与每句影响行数必须保持原样");
-+    assert_eq!(meta_blob(&vault, "tx.half"), Some(b"1".to_vec()));
-+    assert_eq!(meta_blob(&vault, "tx.cas"), Some(b"new".to_vec()));
-+}
-+
-+/// `exec_transaction` 在 `BEGIN` 阶段就取写锁（`BEGIN IMMEDIATE`），不是等第一条语句。
-+///
-+/// 有写语句时 deferred 也会在第一条语句撞上同样的 `SQLITE_BUSY`（`busy_timeout=0`），
-+/// 两种事务模式的结果无法区分；**空语句事务**是唯一能从外部观测到的差异：
-+///
-+/// - deferred：`BEGIN` 不碰写锁，`COMMIT` 空事务也成功 → `Ok(vec![])`；
-+/// - Immediate：`BEGIN` 就要写锁 → 占锁期间直接 `SQLITE_BUSY`。
-+///
-+/// 这也解释了为什么上面的"零半写"用例本身不足以证明模式切换。
-+#[test]
-+fn exec_transaction_takes_write_lock_at_begin() {
-+    let (dir, vault) = fresh_vault();
-+    vault
-+        .exec_batch("PRAGMA busy_timeout=0")
-+        .expect("busy_timeout=0");
-+
-+    let holder = open_vault(&vault_path(&dir));
-+    holder
-+        .exec_batch("BEGIN IMMEDIATE")
-+        .expect("外部连接占写锁");
-+
-+    let error = vault
-+        .exec_transaction(&[], &[])
-+        .expect_err("占锁期间 BEGIN IMMEDIATE 必须失败");
-+    assert_busy(&error);
-+
-+    holder.exec_batch("ROLLBACK").expect("释放外部写锁");
-+    drop(holder);
-+
-+    assert_eq!(
-+        vault
-+            .exec_transaction(&[], &[])
-+            .expect("释放后空事务应成功"),
-+        Vec::<usize>::new(),
-+        "空事务返回空的受影响行数列表"
-+    );
-+}
-+
-+/// 占锁期间守卫错误也不该抢先暴露：整笔事务在 `BEGIN` 就失败，不会执行任何语句。
-+#[test]
-+fn exec_transaction_lock_failure_precedes_statement_effects() {
-+    let (dir, vault) = fresh_vault();
-+    vault.set_meta("tx.cas", b"old").expect("预置 CAS 目标行");
-+    vault
-+        .exec_batch("PRAGMA busy_timeout=0")
-+        .expect("busy_timeout=0");
-+
-+    let holder = open_vault(&vault_path(&dir));
-+    holder
-+        .exec_batch("BEGIN IMMEDIATE")
-+        .expect("外部连接占写锁");
-+
-+    // 守卫期望 0 行，但语句实际会影响 1 行：若事务能开始，会先写入再报 GuardFailed。
-+    let statements = [Statement::new(
-+        "UPDATE meta SET value=?2 WHERE key=?1",
-+        vec![
-+            Value::Text("tx.cas".to_owned()),
-+            Value::Blob(b"new".to_vec()),
-+        ],
-+    )];
-+    let guards = [AffectedGuard::exactly(0, 0)];
-+    let error = vault
-+        .exec_transaction(&statements, &guards)
-+        .expect_err("写锁被占时必须整笔失败");
-+    assert_busy(&error);
-+
-+    holder.exec_batch("ROLLBACK").expect("释放外部写锁");
-+    drop(holder);
-+
-+    assert_eq!(
-+        meta_blob(&vault, "tx.cas"),
-+        Some(b"old".to_vec()),
-+        "失败事务不得写入任何字节"
-+    );
-+}
-diff --git a/crates/storage/tests/journal.rs b/crates/storage/tests/journal.rs
-index 2c2d03a..f2dcceb 100644
---- a/crates/storage/tests/journal.rs
-+++ b/crates/storage/tests/journal.rs
-@@ -1,13 +1,21 @@
- //! 未 ACK journal 与背压：连续前缀、durable 后裁剪、慢盘合并、失败不丢已 ACK 部分。
-+//!
-+//! 另覆盖 P1-3 的 head 过期契约（见 `crates/storage/src/journal.rs` 模块头）：
-+//! 外部推进 head 后 flush 必须返回**可识别**的终态错误而不是裸 `HeadConflict` 或挂死；
-+//! 按契约重建 sink 后新条目可正常 durable；旧 journal 未 durable 条目被**显式交还**，
-+//! 既不写库也不静默丢弃。
- 
- mod support;
- 
-+use std::sync::atomic::{AtomicUsize, Ordering};
-+use std::sync::Arc;
-+
- use loro::VersionVector;
- use support::*;
- 
- use menghunote_storage::{
--    load_body_doc, load_head, DurableSink, FlushReport, JournalEntry, JournalOrigin, JournalWriter,
--    StorageError, VaultJournalSink,
-+    append_updates, load_body_doc, load_head, DurableSink, FlushReport, JournalEntry,
-+    JournalOrigin, JournalWriter, StorageError, UpdateRecord, VaultJournalSink,
- };
- 
- /// 可注入慢盘/失败的 sink：记录每次 flush 的批大小，便于断言「合并」。
-@@ -48,6 +56,28 @@ impl DurableSink for ScriptedSink {
-         }
-         Ok(self.seq)
-     }
-+
-+    fn head_seq(&self) -> u64 {
-+        self.seq
-+    }
-+}
-+
-+/// 计数包装：证明 stale 之后 writer **不再**触碰 sink（不重试）。
-+#[derive(Debug)]
-+struct CountingSink {
-+    inner: VaultJournalSink,
-+    attempts: Arc<AtomicUsize>,
-+}
-+
-+impl DurableSink for CountingSink {
-+    fn write_prefix(&mut self, entries: &[JournalEntry]) -> Result<u64, StorageError> {
-+        self.attempts.fetch_add(1, Ordering::SeqCst);
-+        self.inner.write_prefix(entries)
-+    }
-+
-+    fn head_seq(&self) -> u64 {
-+        self.inner.head_seq()
-+    }
- }
- 
- fn entry(tag: &str) -> JournalEntry {
-@@ -282,3 +312,197 @@ fn sink_holds_head_watermark_and_rejects_mixed_docs() {
-     let error = sink.write_prefix(&mixed).expect_err("混文档必须拒绝");
-     assert!(matches!(error, StorageError::Corrupt { .. }));
- }
-+
-+/// P1-3：外部推进 head 后，flush 必须给出**可识别**的终态错误，不重试、不挂死，
-+/// 且旧条目既没写库也没被静默丢掉；按契约重建 sink 后新条目可正常 durable。
-+#[test]
-+fn stale_head_is_terminal_then_rebuild_hands_back_entries_and_new_entries_flush() {
-+    let (_dir, vault) = fresh_vault();
-+    let doc = seed_note(&vault, "note-1", "doc-1");
-+
-+    // 本地编辑：按**空基准**导出，这就是 writer 手里的字节（追加时的 head 快照）。
-+    doc.insert_scalars(0, "甲").expect("编辑");
-+    let local = doc
-+        .pending_update(&VersionVector::default())
-+        .expect("导出本地增量");
-+
-+    // writer 先按 head 0 建好 sink 并提交条目（真实路径同序：sink 先于外部推进）。
-+    let attempts = Arc::new(AtomicUsize::new(0));
-+    let sink = CountingSink {
-+        inner: VaultJournalSink::new(vault.clone(), "doc-1", 0),
-+        attempts: Arc::clone(&attempts),
-+    };
-+    let mut writer = JournalWriter::new(sink, 4, 4);
-+    assert_eq!(writer.durable_seq(), 0, "空 journal 时报告 sink 的真实水位");
-+    writer
-+        .submit(JournalEntry {
-+            doc_id: "doc-1".to_owned(),
-+            batch_id: "stale-batch".to_owned(),
-+            update: local.clone(),
-+            origin: JournalOrigin::Local,
-+        })
-+        .expect("submit");
-+
-+    // 外部 writer（同步引擎 integrate / 另一个 Vault）在同一 doc 上推进 head。
-+    doc.insert_scalars(doc.scalar_len(), "乙").expect("编辑");
-+    let external = doc
-+        .pending_update(&VersionVector::default())
-+        .expect("导出外部增量");
-+    let advanced = append_updates(
-+        &vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", external)],
-+    )
-+    .expect("外部推进 head");
-+    assert_eq!(advanced.head_seq, 1);
-+
-+    // 1) 第一次 flush：终态错误，而不是裸 HeadConflict。
-+    let error = writer.flush().expect_err("head 已被推进，flush 必须失败");
-+    match &error {
-+        StorageError::JournalHeadStale {
-+            doc_id,
-+            expected,
-+            actual,
-+            pending,
-+        } => {
-+            assert_eq!(doc_id, "doc-1");
-+            assert_eq!(*expected, 0, "错误必须带上写入用的 CAS 基准");
-+            assert_eq!(*actual, 1, "错误必须带上库里真实的 head");
-+            assert_eq!(*pending, 1, "错误必须说明有多少条未 durable 条目受影响");
-+        }
-+        other => panic!("期望 JournalHeadStale，实际 {other:?}"),
-+    }
-+    assert!(
-+        !matches!(&error, StorageError::HeadConflict { .. }),
-+        "journal 层不得把裸 HeadConflict 漏给调用方"
-+    );
-+    assert!(
-+        error.requires_session_rebuild(),
-+        "CAS 过期只能靠重建 session"
-+    );
-+    assert!(!error.is_retryable(), "CAS 过期不是可重试错误");
-+    assert_eq!(writer.pending_len(), 1, "失败不得丢条目");
-+    assert_eq!(writer.durable_seq(), 0, "失败不得推进 durable 水位");
-+    assert_eq!(writer.flushed_entries(), 0);
-+    assert!(writer.is_stale());
-+    assert_eq!(
-+        attempts.load(Ordering::SeqCst),
-+        1,
-+        "CAS 冲突只尝试一次，不自动重试"
-+    );
-+
-+    // 2) 再 flush / flush_all：幂等返回同一终态错误，且**不再碰数据库**（不会挂死、不刷屏）。
-+    for _ in 0..2 {
-+        let again = writer.flush().expect_err("stale 必须继续报错");
-+        assert!(
-+            matches!(again, StorageError::JournalHeadStale { pending: 1, .. }),
-+            "实际 {again:?}"
-+        );
++    for marker in ["AAA", "DDD", "CCC", "BASE", "NEW"] {
 +        assert_eq!(
-+            attempts.load(Ordering::SeqCst),
++            text.matches(marker).count(),
 +            1,
-+            "stale 之后不得重试 sink"
++            "{marker} 必须恰好一次：{text:?}"
 +        );
 +    }
-+    assert!(writer.flush_all().is_err(), "排空也必须明确失败");
 +
-+    // 3) stale 期间 submit 被拒绝：writer 已冻结，新条目必须交给重建后的 writer。
-+    let blocked = writer
-+        .submit(JournalEntry::local("doc-1", "later", local.clone()))
-+        .expect_err("stale 时 submit 必须被拒绝");
-+    assert!(
-+        matches!(blocked, StorageError::JournalHeadStale { pending: 1, .. }),
-+        "实际 {blocked:?}"
-+    );
-+    assert_eq!(writer.pending_len(), 1, "被拒的条目不能进 journal");
-+
-+    // 4) 按契约重建 sink（新 head_seq）：旧条目**显式交还**，journal 清空，水位对齐新基准。
-+    let handed_back = writer
-+        .rebuild_sink(CountingSink {
-+            inner: VaultJournalSink::new(vault.clone(), "doc-1", 1),
-+            attempts: Arc::clone(&attempts),
-+        })
-+        .expect("stale 后重建 sink");
-+    assert_eq!(handed_back.len(), 1, "旧条目必须原样交还，不得静默丢弃");
-+    assert_eq!(handed_back[0].batch_id, "stale-batch");
-+    assert_eq!(handed_back[0].update, local);
-+    assert_eq!(writer.pending_len(), 0, "交还后 journal 清空");
-+    assert!(!writer.is_stale());
-+    assert_eq!(writer.durable_seq(), 1, "重建后水位 = 新 sink 的 CAS 基准");
-+
-+    // 旧条目没有被偷偷写进库：库里仍只有外部那一条。
++    // 本地差集：从 0 起算 A/C/D 的 op，且**不含**基线 S0 的 B op（B 已被 from 覆盖）。
++    let delta_meta =
++        LoroDoc::decode_import_blob_meta(&parts.local_delta, true).expect("本地差集元信息");
 +    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[]
-+        ),
-+        1,
-+        "过期条目不得写入 loro_updates"
++        canonical_of_vv(&delta_meta.partial_start_vv),
++        vec![(A_PEER, 0), (C_PEER, 0), (D_PEER, 0)],
++        "本地差集必须从 A/C/D 的 0 起算"
 +    );
-+    let (replayed, _) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("重放");
-+    assert_eq!(replayed.text(), "甲乙", "只有外部那一条落库");
-+
-+    // 5) 重建：用新 head 的 VV 重新导出（会话层的 ③），新条目 flush 成功且水位正确。
-+    let base = advanced.version_vector().expect("解码新 head 的 VV");
-+    doc.insert_scalars(doc.scalar_len(), "丙").expect("编辑");
-+    let fresh = doc.pending_update(&base).expect("按新 head 重新导出增量");
-+    writer
-+        .submit(JournalEntry {
-+            doc_id: "doc-1".to_owned(),
-+            batch_id: "fresh-1".to_owned(),
-+            update: fresh,
-+            origin: JournalOrigin::Local,
-+        })
-+        .expect("重建后可 submit");
-+
-+    let report = writer.flush().expect("重建后的新条目必须能 flush");
 +    assert_eq!(
-+        report,
-+        FlushReport {
-+            entries: 1,
-+            durable_seq: 2
-+        }
-+    );
-+    assert_eq!(writer.durable_seq(), 2);
-+    assert_eq!(writer.flushed_entries(), 1);
-+    assert_eq!(writer.pending_len(), 0);
-+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "重建后只多一次真实写入");
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[]
-+        ),
-+        2
-+    );
-+    assert_eq!(load_head(&vault, "doc-1").expect("head").head_seq, 2);
-+    let (replayed, _) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("重放");
-+    assert_eq!(replayed.text(), "甲乙丙", "重建 + 重导出的内容完整");
-+}
-+
-+/// 未过期时不允许重建 sink：那会把仍可写入的条目丢掉（契约的反向保护）。
-+#[test]
-+fn rebuild_sink_is_rejected_while_not_stale() {
-+    let (_dir, vault) = fresh_vault();
-+    let doc = seed_note(&vault, "note-1", "doc-1");
-+    doc.insert_scalars(0, "甲").expect("编辑");
-+    let update = doc.pending_update(&VersionVector::default()).expect("增量");
-+
-+    let mut writer = JournalWriter::new(VaultJournalSink::new(vault.clone(), "doc-1", 0), 4, 4);
-+    writer
-+        .submit(JournalEntry::local("doc-1", "b1", update))
-+        .expect("submit");
-+    assert!(!writer.is_stale());
-+
-+    let error = writer
-+        .rebuild_sink(VaultJournalSink::new(vault.clone(), "doc-1", 0))
-+        .expect_err("未 stale 时重建必须被拒绝");
-+    assert!(
-+        matches!(error, StorageError::Corrupt { .. }),
-+        "实际 {error:?}"
-+    );
-+    assert_eq!(writer.pending_len(), 1, "拒绝重建不得动 journal");
-+    assert_eq!(writer.flush().expect("正常 flush 仍可用").entries, 1);
-+}
-diff --git a/crates/storage/tests/meta_value_types.rs b/crates/storage/tests/meta_value_types.rs
-new file mode 100644
-index 0000000..aabdc95
---- /dev/null
-+++ b/crates/storage/tests/meta_value_types.rs
-@@ -0,0 +1,283 @@
-+//! P2-6：`meta.value` 的三个读取入口必须只有**一套**语义 —— 只认 BLOB。
-+//!
-+//! | 入口 | 实际代码路径 |
-+//! | --- | --- |
-+//! | [`menghunote_storage::Vault::get_meta`] | actor 线程上的 `GetMeta` 命令 |
-+//! | `sync_bridge::read_meta` | `sync_cursor_state` / `take_inbox_ready` / `set_sync_log_id` 等同步桥读取 |
-+//! | `sync_meta::read_meta_on` | worker 独占连接 / 批量 inbox 事务内的读取 |
-+//!
-+//! 为什么专门测非 BLOB：`meta.value` 是 `BLOB NOT NULL`（`schema/v1.sql` 里的 STRICT
-+//! 表），正常写入路径**写不出** TEXT/INTEGER/REAL。能读出来只可能是"库被外部工具改坏
-+//! 或 schema 漂移"，而旧行为对它有两种互相矛盾的解读：
-+//!
-+//! - `Vault::get_meta` 把 TEXT 当字节返回；
-+//! - `sync_bridge::read_meta` / `sync_meta::read_meta_on` 把 TEXT 当**缺失**。
-+//!
-+//! 后者会静默绕过持久屏障与游标：`sync.log_id` 读不到就当"还没绑定 incarnation"
-+//! （`take_inbox_ready` 静默返回空，`set_sync_log_id` 还会把损坏值覆盖掉，等于悄悄
-+//! 换绑传代），`sync.repack_required` 读不到就当"不需要 repack"。
-+//!
-+//! 测试库用 `PRAGMA writable_schema` 把 `meta` 表改回非 STRICT，从而如实构造出这种
-+//! 损坏状态（STRICT 表拒绝非 BLOB 写入，测试里没有别的办法造出 TEXT）。
-+
-+mod support;
-+
-+use std::path::Path;
-+
-+use support::*;
-+
-+use menghunote_storage::{
-+    advance_integrated_prefix, repack_required, set_repack_required, set_sync_log_id,
-+    sync_cursor_state, take_inbox_ready, StorageError, Value, Vault, META_SYNC_LOG_ID,
-+    META_SYNC_REPACK_REQUIRED,
-+};
-+
-+/// 测试用的合法 relay log incarnation（16B BLOB）。
-+const LOG_ID: [u8; 16] = [0x2f; 16];
-+
-+/// 把测试库的 `meta` 表从 STRICT 改成非 STRICT。
-+///
-+/// 只改 `sqlite_master` 里那条 DDL（去掉唯一的 `STRICT` 后缀），其余列定义逐字保留；
-+/// 之后的连接会按非 STRICT 解析这张表，于是能写入 TEXT/INTEGER/REAL —— 正是"库被外部
-+/// 改坏"的形状。
-+fn relax_meta_table(path: &Path) {
-+    let conn = rusqlite::Connection::open(path).expect("打开原始连接");
-+    conn.execute_batch("PRAGMA writable_schema=ON")
-+        .expect("打开 writable_schema");
-+    let ddl: String = conn
-+        .query_row(
-+            "SELECT sql FROM sqlite_master WHERE name='meta'",
-+            [],
-+            |row| row.get(0),
-+        )
-+        .expect("读 meta 表 DDL");
-+    let relaxed = ddl.replacen(" STRICT", "", 1);
-+    assert_ne!(relaxed, ddl, "meta 表 DDL 应带 STRICT：{ddl}");
-+    conn.execute(
-+        "UPDATE sqlite_master SET sql=?1 WHERE name='meta'",
-+        [relaxed],
-+    )
-+    .expect("改写 meta 表 DDL");
-+    conn.execute_batch("PRAGMA writable_schema=OFF")
-+        .expect("关闭 writable_schema");
-+    drop(conn);
-+}
-+
-+/// 建一个 vault，把 `meta` 表改成非 STRICT 后重新打开。
-+///
-+/// 重新打开走 [`Vault::open`]：`user_version` 已是 `SCHEMA_VERSION`，迁移不会重跑，
-+/// 所以非 STRICT 的 `meta` 表被原样沿用。
-+fn vault_with_typed_meta() -> (tempfile::TempDir, Vault) {
-+    let dir = temp_dir();
-+    let path = vault_path(&dir);
-+    {
-+        let vault = open_vault(&path);
-+        // 先写一版合法 BLOB，确保 schema 与 WAL 都已落盘，再改表结构。
-+        set_sync_log_id(&vault, &LOG_ID).expect("预置合法 BLOB");
-+    }
-+    relax_meta_table(&path);
-+    let vault = open_vault(&path);
-+    (dir, vault)
-+}
-+
-+/// 把一个 meta 键写成指定 SQLite 类型（绕过 Vault 的 BLOB 写入路径）。
-+fn write_typed_meta(vault: &Vault, key: &str, value: Value) {
-+    vault
-+        .exec(
-+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
-+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-+            &[Value::Text(key.to_owned()), value],
-+        )
-+        .expect("写入指定类型的 meta");
-+}
-+
-+/// `meta.value` 的实际 SQLite 类型名（`typeof()`，用于确认构造出的损坏状态）。
-+fn value_type(vault: &Vault, key: &str) -> String {
-+    let rows = vault
-+        .query(
-+            "SELECT typeof(value) FROM meta WHERE key=?1",
-+            &[Value::Text(key.to_owned())],
-+        )
-+        .expect("读 typeof(value)");
-+    match rows.first().and_then(|row| row.first()) {
-+        Some(Value::Text(name)) => name.clone(),
-+        other => panic!("typeof(value) 类型异常：{other:?}"),
-+    }
-+}
-+
-+/// 断言结果是 [`StorageError::Corrupt`]，返回错误上下文（便于继续断言 key 与实际类型）。
-+fn corrupt<T: std::fmt::Debug>(result: Result<T, StorageError>, label: &str) -> String {
-+    match result {
-+        Ok(value) => panic!("{label} 必须报损坏，实际 Ok({value:?})"),
-+        Err(StorageError::Corrupt { context }) => context,
-+        Err(other) => panic!("{label} 必须是 Corrupt，实际 {other:?}"),
-+    }
-+}
-+
-+/// 同一 key 写成 TEXT：三个入口必须给出**同一个**损坏结论。
-+#[test]
-+fn text_meta_is_corrupt_from_all_three_entry_points() {
-+    let (_dir, vault) = vault_with_typed_meta();
-+    write_typed_meta(&vault, META_SYNC_LOG_ID, Value::Text("2f".repeat(16)));
-+    assert_eq!(
-+        value_type(&vault, META_SYNC_LOG_ID),
-+        "text",
-+        "构造出的值必须是 TEXT"
-+    );
-+
-+    // 入口 1：Vault::get_meta（actor 线程）。旧行为把 TEXT 直接当字节返回。
-+    let from_actor = corrupt(vault.get_meta(META_SYNC_LOG_ID), "Vault::get_meta");
-+    // 入口 2：sync_bridge::read_meta（sync_cursor_state 读 sync.log_id）。旧行为当缺失。
-+    let from_bridge = corrupt(sync_cursor_state(&vault), "sync_bridge::read_meta");
-+    // 入口 3：sync_meta::read_meta_on（前缀推进在 worker 连接上读 sync.log_id）。
-+    let from_meta = corrupt(advance_integrated_prefix(&vault), "sync_meta::read_meta_on");
-+
-+    for (label, context) in [
-+        ("Vault::get_meta", &from_actor),
-+        ("sync_bridge::read_meta", &from_bridge),
-+        ("sync_meta::read_meta_on", &from_meta),
-+    ] {
-+        assert!(
-+            context.contains(META_SYNC_LOG_ID),
-+            "{label} 的错误信息必须点名 key：{context}"
-+        );
-+        assert!(
-+            context.contains("TEXT") && context.contains("BLOB"),
-+            "{label} 的错误信息必须同时给出实际类型与期望类型：{context}"
-+        );
-+    }
-+    // 三处共用同一判定函数，连错误文案都不该有差别。
-+    assert_eq!(
-+        from_actor, from_bridge,
-+        "actor 与 sync_bridge 的结论必须一致"
-+    );
-+    assert_eq!(from_actor, from_meta, "actor 与 sync_meta 的结论必须一致");
-+}
-+
-+/// BLOB（包括空 BLOB）继续按原语义读出，前缀推进不受影响。
-+#[test]
-+fn blob_meta_reads_consistently_from_all_three_entry_points() {
-+    let (_dir, vault) = fresh_vault();
-+    set_sync_log_id(&vault, &LOG_ID).expect("写 BLOB sync.log_id");
-+
-+    assert_eq!(
-+        vault.get_meta(META_SYNC_LOG_ID).expect("读 BLOB meta"),
-+        Some(LOG_ID.to_vec()),
-+        "BLOB 必须逐字节读出"
-+    );
-+    let state = sync_cursor_state(&vault).expect("读游标状态");
-+    assert_eq!(
-+        state.log_id,
-+        Some(LOG_ID),
-+        "sync_bridge 必须读到同一个 BLOB"
-+    );
-+    assert_eq!(state.received_seq, 0);
-+    assert_eq!(state.integrated_seq, 0);
-+    assert_eq!(state.confirmed_highwater, None);
-+
-+    advance_integrated_prefix(&vault).expect("BLOB 下前缀推进是合法 no-op");
-+
-+    set_repack_required(&vault, true).expect("写 repack 屏障");
-+    assert!(
-+        repack_required(&vault).expect("读 repack 屏障"),
-+        "BLOB 屏障必须生效"
-+    );
-+    set_repack_required(&vault, false).expect("清 repack 屏障");
-+    assert!(!repack_required(&vault).expect("读 repack 屏障"));
-+}
-+
-+/// 缺失的键在三个入口都是"没有"，不是损坏。
-+#[test]
-+fn missing_meta_reads_as_absent_from_all_three_entry_points() {
-+    let (_dir, vault) = fresh_vault();
-+
-+    assert_eq!(vault.get_meta(META_SYNC_LOG_ID).expect("读缺失 key"), None);
-+    let state = sync_cursor_state(&vault).expect("读游标状态");
-+    assert_eq!(state.log_id, None);
-+    assert_eq!(state.received_seq, 0);
-+    assert_eq!(state.integrated_seq, 0);
-+    assert_eq!(state.confirmed_highwater, None);
-+    advance_integrated_prefix(&vault).expect("缺失时前缀推进是 no-op");
-+    assert!(!repack_required(&vault).expect("缺失屏障读成 false"));
-+    assert_eq!(
-+        vault
-+            .get_meta(META_SYNC_REPACK_REQUIRED)
-+            .expect("读缺失屏障"),
-+        None
++        canonical_of_vv(&delta_meta.partial_end_vv),
++        vec![
++            (A_PEER, counter_of(&local_vv, A_PEER)),
++            (C_PEER, counter_of(&local_vv, C_PEER)),
++            (D_PEER, counter_of(&local_vv, D_PEER)),
++        ],
++        "本地差集终点必须是 A/C/D 的本地计数"
 +    );
 +    assert!(
-+        take_inbox_ready(&vault, 8)
-+            .expect("没有 incarnation 时 ready 为空")
-+            .is_empty(),
-+        "缺失 sync.log_id 时 ready 必须为空（不回退成不过滤 log）"
-+    );
-+}
-+
-+/// 损坏的 `sync.log_id` 不能被当成"还没绑定 incarnation"静默吞掉。
-+///
-+/// 这是 P2-6 的实际风险点：旧行为下 `take_inbox_ready` 会静默返回空（pull 永久卡住），
-+/// `set_sync_log_id` 会把损坏值覆盖成新值（悄悄换绑传代，旧行混进新代）。
-+#[test]
-+fn text_log_id_blocks_ready_and_rebinding_instead_of_silently_passing() {
-+    let (_dir, vault) = vault_with_typed_meta();
-+    write_typed_meta(&vault, META_SYNC_LOG_ID, Value::Text("2f".repeat(16)));
-+
-+    let context = corrupt(take_inbox_ready(&vault, 8), "take_inbox_ready");
-+    assert!(
-+        context.contains(META_SYNC_LOG_ID),
-+        "错误必须点名 sync.log_id：{context}"
-+    );
-+    let context = corrupt(set_sync_log_id(&vault, &LOG_ID), "set_sync_log_id");
-+    assert!(
-+        context.contains(META_SYNC_LOG_ID),
-+        "错误必须点名 sync.log_id：{context}"
++        canonical_of_vv(&delta_meta.partial_end_vv)
++            .iter()
++            .all(|(peer, _)| *peer != B_PEER),
++        "本地差集不得包含基线 S0 的 op（from 已覆盖）"
 +    );
 +
-+    // 损坏值仍在库里：没有被"缺失 → 写入新版"的路径覆盖掉。
-+    assert_eq!(value_type(&vault, META_SYNC_LOG_ID), "text");
-+}
-+
-+/// INTEGER / REAL / TEXT 全部按损坏处理（不是只有 TEXT 特殊）。
-+#[test]
-+fn non_blob_meta_types_are_corrupt() {
-+    let (_dir, vault) = vault_with_typed_meta();
-+    // NULL 造不出来：`meta.value` 是 NOT NULL，非 STRICT 表同样拒绝。
-+    for (value, expected_type) in [
-+        (Value::Integer(7), "INTEGER"),
-+        (Value::Real(1.5), "REAL"),
-+        (Value::Text("7".to_owned()), "TEXT"),
-+    ] {
-+        write_typed_meta(&vault, META_SYNC_LOG_ID, value);
-+        assert_eq!(
-+            value_type(&vault, META_SYNC_LOG_ID),
-+            expected_type.to_lowercase()
-+        );
-+        let context = corrupt(vault.get_meta(META_SYNC_LOG_ID), "Vault::get_meta");
-+        assert!(
-+            context.contains(expected_type),
-+            "错误必须报实际类型 {expected_type}：{context}"
-+        );
-+        let context = corrupt(sync_cursor_state(&vault), "sync_bridge::read_meta");
-+        assert!(
-+            context.contains(expected_type),
-+            "sync_bridge 也必须报实际类型 {expected_type}：{context}"
-+        );
-+    }
-+}
-+
-+/// 屏障键本身：损坏的 `sync.repack_required` 不得读成"不需要 repack"。
-+#[test]
-+fn repack_barrier_is_not_silently_false_when_corrupt() {
-+    let (_dir, vault) = vault_with_typed_meta();
-+    write_typed_meta(
-+        &vault,
-+        META_SYNC_REPACK_REQUIRED,
-+        Value::Text("1".to_owned()),
-+    );
-+
-+    let context = corrupt(repack_required(&vault), "repack_required");
-+    assert!(
-+        context.contains(META_SYNC_REPACK_REQUIRED),
-+        "错误必须点名屏障 key：{context}"
-+    );
-+}
-diff --git a/crates/storage/tests/remote_known.rs b/crates/storage/tests/remote_known.rs
-new file mode 100644
-index 0000000..26b0ad7
---- /dev/null
-+++ b/crates/storage/tests/remote_known.rs
-@@ -0,0 +1,191 @@
-+//! P2-5 / P2-8：远端已知 VV 的单调写入与「来源标记」语义。
-+//!
-+//! 这里只走**公开**入口：`VaultJournalSink`（每次 flush 的 JournalOrigin 决定来源）
-+//! 与 `append_updates`（全部本地）。远端已知 VV 是 `meta` 里的非破坏性本地证据：
-+//!
-+//! - 本地写入（含已 ACK 的本地编辑）**不扩大**它；
-+//! - 只有远端条目把 `end_vv - 上一条 end_vv` 记进去；
-+//! - 没有出站意图的 flush（slots 空）不产生任何 outbox 行。
-+
-+mod support;
-+
-+use support::*;
-+
-+use loro::VersionVector;
-+
-+use menghunote_storage::{
-+    append_updates, create_body_doc, load_head, sync_cursor_state, BodyDoc, DurableSink,
-+    JournalEntry, SyncContext, UpdateRecord, Value, Vault, VaultJournalSink,
-+};
-+
-+const CTX: SyncContext = SyncContext {
-+    peer_id: 0xA1CE_0001,
-+    key_epoch: 1,
-+};
-+
-+fn remote_known(vault: &Vault, doc_id: &str) -> Option<VersionVector> {
-+    let rows = vault
-+        .query(
-+            "SELECT value FROM meta WHERE key=?1",
-+            &[Value::Text(format!("sync.remote_known_vv.{doc_id}"))],
-+        )
-+        .expect("meta 查询");
-+    match rows.first().and_then(|row| row.first()) {
-+        Some(Value::Blob(bytes)) => Some(VersionVector::decode(bytes).expect("解码远端已知 VV")),
-+        None => None,
-+        other => panic!("remote_known 值异常：{other:?}"),
-+    }
-+}
-+
-+fn scalar(vault: &Vault, sql: &str) -> i64 {
-+    let rows = vault.query(sql, &[]).expect("查询");
-+    match rows.first().and_then(|row| row.first()) {
-+        Some(Value::Integer(value)) => *value,
-+        other => panic!("期望整数结果，实际 {other:?}"),
-+    }
-+}
-+
-+/// 本地编辑的 `end_vv`（用于断言「本地写入不扩大远端已知 VV」）。
-+fn vv_of(update: &menghunote_storage::PendingUpdate) -> VersionVector {
-+    VersionVector::decode(&update.end_vv).expect("解码 end_vv")
-+}
-+
-+fn local_entry(doc_id: &str, peer: u64, text: &str) -> (JournalEntry, VersionVector) {
-+    let doc = BodyDoc::create(doc_id, peer).expect("创建 BodyDoc");
-+    doc.insert_scalars(0, text).expect("本地编辑");
-+    let update = doc.pending_update(&VersionVector::default()).expect("导出");
-+    let vv = vv_of(&update);
-+    (JournalEntry::local(doc_id, "local-batch", update), vv)
-+}
-+
-+fn remote_entry(
-+    doc_id: &str,
-+    peer: u64,
-+    base: &VersionVector,
-+    text: &str,
-+) -> (JournalEntry, VersionVector) {
-+    let doc = BodyDoc::create(doc_id, peer).expect("创建 BodyDoc");
-+    doc.insert_scalars(0, text).expect("远端编辑");
-+    let update = doc.pending_update(base).expect("导出远端增量");
-+    let vv = vv_of(&update);
-+    (JournalEntry::remote(doc_id, "remote-batch", update), vv)
-+}
-+
-+/// 纯本地 flush（显式 `OriginMarks::AllLocal` 对应的公开路径）：不创建远端已知 VV。
-+#[test]
-+fn local_append_never_creates_remote_known() {
-+    let (_dir, vault) = fresh_vault();
-+    create_body_doc(&vault, "doc-local").expect("loro_docs 行");
-+    let doc = BodyDoc::create("doc-local", PEER_A).expect("创建 BodyDoc");
-+    doc.insert_scalars(0, "local only").expect("本地编辑");
-+    let current = load_head(&vault, "doc-local").expect("head");
-+    let update = doc
-+        .pending_update(&current.version_vector().expect("head vv"))
-+        .expect("导出");
-+
-+    append_updates(
-+        &vault,
-+        "doc-local",
-+        current.head_seq,
-+        &[UpdateRecord::new("local-batch", update)],
-+    )
-+    .expect("A 事务");
-+
++    // merged 差集：起点 = 本地 VV 的 B 计数（S0 已导入），终点 = 新基线 VV，只含 B 的新 op。
++    let merged_meta =
++        LoroDoc::decode_import_blob_meta(&parts.merged.payload, true).expect("merged 元信息");
 +    assert_eq!(
-+        remote_known(&vault, "doc-local"),
++        canonical_of_vv(&merged_meta.partial_start_vv),
++        vec![(B_PEER, counter_of(&local_vv, B_PEER))],
++        "merged 差集必须从本地 VV 的 B 计数起算"
++    );
++    assert_eq!(
++        canonical_of_vv(&merged_meta.partial_end_vv),
++        vec![(B_PEER, counter_of(&second_vv, B_PEER))],
++        "merged 差集终点必须是新基线 VV"
++    );
++    let merged_alone = BodyDoc::restore(
++        "merged-probe",
++        A_PEER,
 +        None,
-+        "本地写入即使已经进 outbox 也不能扩大远端已知 VV"
-+    );
-+    assert_eq!(scalar(&vault, "SELECT count(*) FROM sync_outbox"), 0);
-+}
-+
-+/// 远端条目（PerRecord 中 `true` 的那条）只把真正的远端增量记入远端已知 VV；
-+/// 同批的本地条目不记入。
-+#[test]
-+fn mixed_flush_extends_remote_known_only_for_remote_entries() {
-+    let (_dir, vault) = fresh_vault();
-+    create_body_doc(&vault, "doc-mixed").expect("loro_docs 行");
-+
-+    let (local, local_vv) = local_entry("doc-mixed", PEER_A, "local");
-+    let (remote, remote_vv) = remote_entry("doc-mixed", PEER_B, &local_vv, "remote");
-+    let expected_remote = {
-+        // 远端记录带来的 ops = remote_vv - local_vv。
-+        let mut added = VersionVector::new();
-+        for span in remote_vv.sub_iter(&local_vv) {
-+            added.insert(span.peer, span.counter.end);
-+        }
-+        added
-+    };
-+
-+    let mut sink = VaultJournalSink::new(vault.clone(), "doc-mixed", 0).with_sync_context(CTX);
-+    let head = sink.write_prefix(&[local, remote]).expect("混合 flush");
-+    assert_eq!(head, 2);
-+
-+    let known = remote_known(&vault, "doc-mixed").expect("有远端条目就必须写");
-+    assert_eq!(known, expected_remote, "只能记入远端那一小段");
-+    assert_eq!(
-+        scalar(&vault, "SELECT count(*) FROM sync_outbox"),
-+        1,
-+        "本地条目产生 1 条意图，远端条目绝不能产生意图"
-+    );
-+    assert_eq!(sync_cursor_state(&vault).expect("cursor").received_seq, 0);
-+}
-+
-+/// 纯远端 flush（`slots` 为空 = 没有出站意图）：扩展远端已知 VV，且不产生 outbox。
-+#[test]
-+fn remote_only_flush_with_empty_slots_has_no_outbox() {
-+    let (_dir, vault) = fresh_vault();
-+    create_body_doc(&vault, "doc-remote").expect("loro_docs 行");
-+    let (remote, remote_vv) =
-+        remote_entry("doc-remote", PEER_B, &VersionVector::default(), "remote");
-+
-+    // 不带 sync context：slots 就是空切片（= 没有任何意图），过去与
-+    // 「remote_marks 空 = 全部本地」共用一个形状；现在来源由 OriginMarks 显式表达。
-+    let mut sink = VaultJournalSink::new(vault.clone(), "doc-remote", 0);
-+    let head = sink.write_prefix(&[remote]).expect("远端 flush");
-+    assert_eq!(head, 1);
-+
-+    assert_eq!(remote_known(&vault, "doc-remote"), Some(remote_vv));
-+    assert_eq!(
-+        scalar(&vault, "SELECT count(*) FROM sync_outbox"),
-+        0,
-+        "slots 空 = 不产生任何出站意图"
++        std::slice::from_ref(&parts.merged.payload),
++    )
++    .expect("merged 差集可重放");
++    assert!(
++        !merged_alone.text().contains("AAA")
++            && !merged_alone.text().contains("CCC")
++            && !merged_alone.text().contains("DDD"),
++        "merged 差集不得把本地 op 再导出一遍：{merged_alone:?}"
 +    );
 +}
 +
-+/// 同一 flush 连续两条远端记录：记入的是整段远端增量（`end - 前一条 end`），
-+/// 不是只记最后一条的绝对 VV。
++// ---------------------------------------------------------------------------
++// 9. 边界：大文档（10,000 scalar / 10,000 op）
++// ---------------------------------------------------------------------------
++
++/// 大文档：基线 10,000 字（100 块 × 100 字，逐块提交 = 大量 op），本地另有编辑。
++/// detached merge 后文本必须与 attached 参考逐字节一致（字符数/字节数精确），
++/// 且 merged 差集单独重放恰好还原基线原文（不含本地文本）。
 +#[test]
-+fn consecutive_remote_entries_record_the_whole_remote_delta() {
++fn detached_large_document_merge_matches_attached() {
 +    let (_dir, vault) = fresh_vault();
-+    create_body_doc(&vault, "doc-remote-2").expect("loro_docs 行");
++    let local = seed_note(&vault, "note-1", "doc-1");
++    local.insert_scalars(0, "LOCAL").expect("本地编辑");
++    commit_now(&vault, &local, "local-batch");
 +
-+    let first_doc = BodyDoc::create("doc-remote-2", PEER_B).expect("创建 BodyDoc");
-+    first_doc.insert_scalars(0, "one").expect("第一次远端编辑");
-+    let first = first_doc
-+        .pending_update(&VersionVector::default())
-+        .expect("第一段");
-+    let first_vv = vv_of(&first);
++    // 基线：100 块 × 100 字 = 10,000 个 scalar（每块一次提交）。
++    let remote = BodyDoc::create("doc-1", B_PEER).expect("基线文档");
++    let chunk = "基".repeat(100);
++    for index in 0..100 {
++        let end = remote.scalar_len();
++        remote.insert_scalars(end, &chunk).expect("基线分块写入");
++        assert_eq!(
++            remote.scalar_len(),
++            (index + 1) * 100,
++            "基线长度必须逐块增长"
++        );
++    }
++    let snapshot = remote.export_snapshot().expect("大文档基线快照");
++    let baseline_vv = snapshot_vv(&snapshot);
++    assert_eq!(
++        counter_of(&baseline_vv, B_PEER),
++        10_000,
++        "基线必须是 10,000 个 op"
++    );
 +
-+    first_doc
-+        .insert_scalars(first_doc.scalar_len(), " two")
-+        .expect("第二次远端编辑");
-+    let second = first_doc.pending_update(&first_vv).expect("第二段");
-+    let end_vv = vv_of(&second);
-+
-+    let mut sink = VaultJournalSink::new(vault.clone(), "doc-remote-2", 0);
-+    sink.write_prefix(&[
-+        JournalEntry::remote("doc-remote-2", "remote-1", first),
-+        JournalEntry::remote("doc-remote-2", "remote-2", second),
-+    ])
-+    .expect("两段远端 flush");
++    let parts = merge_detached(&vault, "doc-1", &snapshot, &local, 12, "cursor-4");
++    let text = assert_detached_matches_attached(&vault, "doc-1", &snapshot, &parts);
 +
 +    assert_eq!(
-+        remote_known(&vault, "doc-remote-2"),
-+        Some(end_vv),
-+        "整段远端增量都必须记入，不能只记最后一条"
++        text.matches('基').count(),
++        10_000,
++        "基线字符必须恰好 10,000 个"
 +    );
-+    // 显式断言两条都写了（来源只有 remote，没有任何本地产物）。
-+    assert_eq!(scalar(&vault, "SELECT count(*) FROM loro_updates"), 2);
-+    assert_eq!(scalar(&vault, "SELECT count(*) FROM sync_outbox"), 0);
++    assert_eq!(text.matches("LOCAL").count(), 1, "本地文本必须恰好一次");
++    assert_eq!(text.chars().count(), 10_005, "scalar 总数必须是 10,000 + 5");
++    assert_eq!(text.len(), 30_005, "UTF-8 字节数必须原样保留（基 3B/字）");
++    assert_eq!(
++        text.replace("LOCAL", ""),
++        "基".repeat(10_000),
++        "除本地前缀外必须与基线逐字节一致"
++    );
++
++    // merged 差集 = 基线相对本地 VV 的差集：单独重放恰好是基线原文（不含 LOCAL）。
++    let merged_alone = BodyDoc::restore(
++        "merged-probe",
++        A_PEER,
++        None,
++        std::slice::from_ref(&parts.merged.payload),
++    )
++    .expect("大差集可重放");
++    assert_eq!(
++        merged_alone.scalar_len(),
++        10_000,
++        "merged 差集必须覆盖全部基线 op"
++    );
++    assert_eq!(
++        merged_alone.text(),
++        "基".repeat(10_000),
++        "merged 差集单独重放必须等于基线原文"
++    );
++    assert_eq!(
++        canonical_vv(&merged_alone.vv().encode()),
++        canonical_of_vv(&baseline_vv),
++        "merged 差集 VV 必须等于基线 VV"
++    );
 +}
 diff --git a/crates/storage/tests/session_flush.rs b/crates/storage/tests/session_flush.rs
-index 2a99366..e4cda3a 100644
+index e4cda3a..907d5c2 100644
 --- a/crates/storage/tests/session_flush.rs
 +++ b/crates/storage/tests/session_flush.rs
-@@ -5,10 +5,15 @@ mod support;
- use std::time::{Duration, Instant};
+@@ -511,6 +511,53 @@ fn flush_reports_unrecoverable_after_bounded_rebuild() {
  
- use menghunote_storage::session::{
--    DocumentSession, EditOutcome, EditRequest, FlushReason, LiveRev, ScalarEdit, SessionEpoch,
-+    DocumentSession, DriverOptions, EditOutcome, EditRequest, ExternalCommitTicket, FlushReason,
-+    GateError, GateState, LiveRev, ManualClock, ScalarEdit, SessionDriver, SessionEpoch,
-     SessionEvent, SessionOptions,
- };
--use menghunote_storage::{load_body_state, materialize_body, BodyDoc, Vault};
-+use menghunote_storage::{
-+    append_updates, intent_message_id, intent_object_id, load_body_doc, load_body_state,
-+    materialize_body, outbox_row, BodyDoc, SyncContext, SyncOutboxState, UpdateRecord, Value,
-+    Vault,
-+};
- use support::*;
- 
- fn options(peer: u64) -> SessionOptions {
-@@ -19,6 +24,24 @@ fn options(peer: u64) -> SessionOptions {
-     }
- }
- 
-+/// 测试用同步上下文：peer 故意不用常量 1，epoch = 1（Phase 1）。
-+///
-+/// 与 `sync_intent.rs` 的 `CTX` 同口径：本地 intent 只依赖
-+/// `SessionOptions { peer_id, sync }`，当前代码路径**不需要**额外的
-+/// epoch/log/relay meta（`local_sync_intent` 是纯函数，`key_epoch` 来自这里）。
-+const SYNC_CTX: SyncContext = SyncContext {
-+    peer_id: 0xA1CE_0001,
-+    key_epoch: 1,
-+};
-+
-+/// 打开「会产生本地出站意图」的会话配置。
-+fn options_with_sync() -> SessionOptions {
-+    SessionOptions {
-+        sync: Some(SYNC_CTX),
-+        ..options(SYNC_CTX.peer_id)
-+    }
-+}
-+
- fn edit(start: usize, end: usize, replacement: &str) -> ScalarEdit {
-     ScalarEdit {
-         start: menghunote_text::UnicodeScalar::new(start),
-@@ -188,16 +211,6 @@ fn unflushed_edits_are_lost_on_reopen_but_durable_prefix_survives() {
-     assert_eq!(session.markdown(), "甲乙");
-     // 两条 update 各自占一个 seq
-     assert_eq!(session.snapshot().durable_head_seq, 2);
--    assert_eq!(
--        vault
--            .query(
--                "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
--                &[]
--            )
--            .expect("count")
--            .len(),
--        1
--    );
-     assert_eq!(
-         count(
-             &vault,
-@@ -249,3 +262,878 @@ fn remote_event_is_pushed_to_the_queue() {
-         .any(|event| matches!(event, SessionEvent::Remote(delta) if delta.to_rev == LiveRev(1))));
-     assert!(session.events().is_empty(), "事件队列是取走语义");
- }
-+
-+/// 把闸门驱到明确的失败态（时间只作为上限，不用 sleep 当收敛判据）。
-+fn drive_gate_to_failure(
-+    session: &mut DocumentSession,
-+    ticket: &ExternalCommitTicket,
-+) -> GateError {
-+    let deadline = Instant::now() + Duration::from_secs(10);
-+    loop {
-+        match session.poll_external_commit(ticket) {
-+            GateState::Failed(error) => return error,
-+            GateState::Flushing | GateState::WaitingIME => std::thread::yield_now(),
-+            other => panic!("闸门没有给出明确失败：{other:?}"),
-+        }
-+        assert!(Instant::now() < deadline, "闸门 10s 内没有给出明确失败");
-+    }
-+}
-+
-+/// 读 flusher 失败原因（闸门是 UI/驱动读取 `last_write_error` 的既有入口）。
-+fn flush_failure_message(session: &mut DocumentSession, ticket: &ExternalCommitTicket) -> String {
-+    match drive_gate_to_failure(session, ticket) {
-+        GateError::FlushFailed { message, .. } => message,
-+        other => panic!("期望 GateError::FlushFailed，实际 {other:?}"),
-+    }
-+}
-+
-+/// 有界等待 flusher 记录失败原因。
-+///
-+/// 普通写失败没有 `DurableAck` 这个收敛点：`last_write_error` 由 flusher 在同一条
-+/// 命令内写完后就不再变化，因此轮询它是有界的显式状态，不是用 sleep 猜收敛。
-+fn wait_for_write_error(session: &DocumentSession, timeout: Duration) -> String {
-+    let deadline = Instant::now() + timeout;
-+    loop {
-+        if let Some(message) = session.last_write_error() {
-+            return message;
-+        }
-+        assert!(
-+            Instant::now() < deadline,
-+            "flush 在 {timeout:?} 内没有记录写失败原因"
-+        );
-+        std::thread::yield_now();
-+    }
-+}
-+
-+/// `sync_outbox` 行数（null 的 intent 不落行，所以也可以当“有没有产生意图”）。
-+fn outbox_count(vault: &Vault) -> i64 {
-+    count(vault, "SELECT count(*) FROM sync_outbox", &[])
-+}
-+
-+/// 测试用 SQLite 触发器：安装后由 `Drop` 兜底删除（panic 安全，正常路径显式 `remove`）。
-+struct SqlTrigger {
-+    vault: Vault,
-+    name: &'static str,
-+}
-+
-+impl SqlTrigger {
-+    fn install(vault: &Vault, name: &'static str, sql: &str) -> Self {
-+        vault.exec_batch(sql).expect("安装故障注入触发器");
-+        Self {
-+            vault: vault.clone(),
-+            name,
-+        }
-+    }
-+
-+    /// 正常路径显式删除；`Drop` 的 `IF EXISTS` 只是 panic 安全网。
-+    fn remove(&self) {
-+        self.vault
-+            .exec_batch(&format!("DROP TRIGGER IF EXISTS {}", self.name))
-+            .expect("删除故障注入触发器");
-+    }
-+}
-+
-+impl Drop for SqlTrigger {
-+    fn drop(&mut self) {
-+        let _ = self
-+            .vault
-+            .exec_batch(&format!("DROP TRIGGER IF EXISTS {}", self.name));
-+    }
-+}
-+
-+/// P1-3 生产接线：head 被外部推进后，flusher 必须在同一个后台线程里
-+/// `load_head` + 重建 sink，并重试**同一前缀**一次；成功后正常裁剪/推进 durable + ACK。
-+///
-+/// 外部推进用「同一份远端 update 已经先落库、会话又把它导入了 live」构造：新 head 的
-+/// ops 全部落在未 ACK 前缀的 `end_vv` 内，因此原样重试不会写坏 `head_vv`/`frontier`
-+/// （下面的完整重放会验证这一点）。
+ /// P1-3 的另一个不可恢复分支：自动重建要读新 head，读不到/解码失败同样必须 fail-closed
+ /// （不尝试写、不无限重试），并明确提示需要重开文档。
++/// 永久性 SQLite 错误（约束/ReadOnly/NotFound 等）也不能整类当成 Retryable；
++/// 只有 BUSY/LOCKED 才值得下一次 flush 再试。
 +#[test]
-+fn flush_recovers_from_head_conflict_by_rebuilding_sink() {
++fn flush_treats_permanent_sqlite_error_as_unrecoverable() {
 +    let (_dir, vault) = fresh_vault();
 +    let _seed = seed_note(&vault, "note-1", "doc-1");
 +    let mut session = open_session(&vault, options(PEER_A));
-+
-+    // 会话先把远端 update 导入 live（journal 里留下同一批 op 的未 ACK 增量）。
-+    let remote = BodyDoc::create("doc-1", PEER_B).expect("远端副本");
-+    remote.insert_scalars(0, "远端").expect("远端编辑");
-+    let remote_bytes = remote.export_all_updates().expect("导出远端 update");
-+    let remote_update = pending(&remote, &loro::VersionVector::default()).expect("远端增量");
-+    session
-+        .apply_remote(&remote_bytes)
-+        .expect("导入远端 update")
-+        .expect("必须有变更");
-+
-+    // 外部 writer（同步引擎 integrate / 另一个 Vault）把同一份 update 先落库：head 0→1。
-+    let advanced = append_updates(
-+        &vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", remote_update)],
-+    )
-+    .expect("外部推进 head");
-+    assert_eq!(advanced.head_seq, 1);
-+    assert_eq!(
-+        session.durable_head_seq(),
-+        0,
-+        "会话的 CAS 基准仍停在打开时的 head 0"
-+    );
-+
-+    // 修复前：这里每次都拿旧 head 0 撞 CAS —— 不写库、不裁剪、不 ACK，下一次还是旧 head。
-+    let ticket = session.flush(FlushReason::Manual);
-+    let ack = session
-+        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
-+        .expect("HeadConflict 后必须自动重建 sink 并发出 DurableAck");
-+    assert_eq!(ack.through_live_rev, LiveRev(1));
-+    assert_eq!(
-+        ack.head_seq, 2,
-+        "重试写在外部那一条之后（同一前缀、新 CAS 基准）"
-+    );
-+    assert_eq!(session.durable_head_seq(), 2);
-+    assert_eq!(session.durable_through(), LiveRev(1));
-+    assert_eq!(session.pending_len(), 0, "成功后必须裁剪前缀");
-+    assert_eq!(session.markdown(), "远端");
-+
-+    // 正文/head 正确：完整重放必须通过 `loro_docs.head_frontier` 的完整性校验。
-+    let (replayed, head) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("重放正文");
-+    assert_eq!(replayed.text(), "远端");
-+    assert_eq!(head.head_seq, 2);
-+    let head_vv = head.version_vector().expect("解码 head vv");
-+    let live_vv = loro::VersionVector::decode(&session.snapshot().live_vv).expect("解码 live vv");
-+    assert_eq!(
-+        head_vv, live_vv,
-+        "durable head 的 ops 必须与本会话 live 一致"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[]
-+        ),
-+        2,
-+        "外部一条 + 自动重建后重试的一条"
-+    );
-+}
-+
-+/// P1-3 反向边界：外部 head 含本会话 live **未知**的并发 ops 时，原样重试会写坏
-+/// `head_vv`/`frontier`（重放完整性校验直接 Corrupt），因此自动重建必须拒绝并进入
-+/// 不可恢复态：`last_write_error` 明确提示「需要重开文档」、journal 原样保留、
-+/// 后续 flush 立即失败且不再写库。
-+#[test]
-+fn flush_reports_unrecoverable_after_bounded_rebuild() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut session = open_session(&vault, options(PEER_A));
-+
 +    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
 +
-+    // 外部 writer 写入本会话完全不知道的并发 ops：head 0→1。
-+    let external = BodyDoc::create("doc-1", PEER_B).expect("外部副本");
-+    external.insert_scalars(0, "远端").expect("外部编辑");
-+    let external_update = pending(&external, &loro::VersionVector::default()).expect("外部增量");
-+    append_updates(
-+        &vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", external_update)],
-+    )
-+    .expect("外部推进 head");
-+
-+    // 闸门必须收敛到 Failed 并带出可执行的原因；修复前只会带出裸 HeadConflict，
-+    // 且同一个失败会永久重复（journal 不裁剪、durable 水位不前进）。
-+    let ticket = session.begin_external_commit().expect("begin");
-+    let message = flush_failure_message(&mut session, &ticket);
-+    assert!(
-+        message.contains("需要重开文档"),
-+        "失败原因必须明确提示重开：{message}"
-+    );
-+    assert!(
-+        message.contains("未知的并发 ops"),
-+        "必须说明为什么不能安全自动重建：{message}"
-+    );
-+
-+    assert_eq!(session.pending_len(), 1, "不可恢复时 journal 必须原样保留");
-+    let rows = || {
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[],
-+        )
-+    };
-+    assert_eq!(rows(), 1, "只有外部那一行落库（旧前缀不得被硬写）");
-+    assert_eq!(head(&vault, "doc-1").head_seq, 1, "库中 head 不得被改写");
-+
-+    // 后续 flush 立即失败：不发 ACK、不再写库（不能无限重试/无限写）。
-+    for _ in 0..3 {
-+        let attempt = session.flush(FlushReason::Manual);
-+        assert!(
-+            session
-+                .wait_for_durable(attempt.target_live_rev, Duration::from_millis(200))
-+                .is_none(),
-+            "不可恢复后不得再发出 DurableAck"
-+        );
-+        assert_eq!(rows(), 1, "不可恢复后不得再写 loro_updates");
-+        assert_eq!(head(&vault, "doc-1").head_seq, 1, "不可恢复后不得推进 head");
-+    }
-+
-+    // 同一个错误仍可被闸门读到（不是一次性的诊断字符串）。
-+    match session.poll_external_commit(&ticket) {
-+        GateState::Failed(GateError::FlushFailed { message: again, .. }) => {
-+            assert_eq!(again, message, "不可恢复状态必须稳定可读");
-+        }
-+        other => panic!("期望持续的 Failed，实际 {other:?}"),
-+    }
-+    assert_eq!(
-+        session.markdown(),
-+        "本地",
-+        "live 保持会话内容，靠关闭并重开文档与库对账"
-+    );
-+
-+    // P1：不可恢复原因必须能被会话**直接**读到（UI/驱动不必先走外部提交闸门），
-+    // 且与闸门看到的是同一个字符串；反复读取与再次 flush 都不得改变它。
-+    let direct = session
-+        .last_write_error()
-+        .expect("不可恢复失败必须能从会话读到");
-+    assert_eq!(direct, message, "会话与闸门必须看到同一个失败原因");
-+    assert!(
-+        direct.contains("需要重开文档"),
-+        "会话读到的原因必须可执行：{direct}"
-+    );
-+    for _ in 0..3 {
-+        session.flush(FlushReason::Manual);
-+        assert_eq!(
-+            session.last_write_error().as_deref(),
-+            Some(message.as_str()),
-+            "多次读取/再次 flush 不得改变不可恢复原因"
-+        );
-+    }
-+    assert_eq!(session.pending_len(), 1, "读取失败原因不得动 journal");
-+}
-+
-+/// P1-3 的另一个不可恢复分支：自动重建要读新 head，读不到/解码失败同样必须 fail-closed
-+/// （不尝试写、不无限重试），并明确提示需要重开文档。
-+/// 永久性 Corrupt 不能被当成“下次再试”的 Retryable：它不会自愈。
-+/// 用 `head_seq = i64::MAX` 构造 `seq = head + 1` 的 `i64_of` 溢出（append_update 返回
-+/// Corrupt），断言 flusher 直接进入不可恢复，而不是每次重试同一永久错误。
-+#[test]
-+fn flush_treats_permanent_corrupt_as_unrecoverable_not_retryable() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
 +    vault
 +        .exec(
-+            "UPDATE loro_docs SET head_seq = ?1 WHERE doc_id = 'doc-1'",
-+            &[Value::Integer(i64::MAX)],
++            "CREATE TRIGGER fail_updates BEFORE INSERT ON loro_updates \
++             BEGIN SELECT RAISE(FAIL, 'permanent sqlite failure'); END",
++            &[],
 +        )
-+        .expect("把 head_seq 推到 i64::MAX");
-+    let mut session = open_session(&vault, options(PEER_A));
-+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
++        .expect("创建永久失败触发器");
 +
 +    let ticket = session.flush(FlushReason::Manual);
 +    assert!(
 +        session
 +            .wait_for_durable(ticket.target_live_rev, Duration::from_secs(1))
 +            .is_none(),
-+        "永久 Corrupt 不得发 DurableAck"
++        "永久 SQLite 错误不得发 DurableAck"
 +    );
 +    let message = session.last_write_error().expect("必须有可读失败原因");
 +    assert!(
-+        message.contains("永久性 Corrupt") || message.contains("需要重开文档"),
-+        "必须明确永久失败/重开：{message}"
++        message.contains("永久性") || message.contains("需要重开文档"),
++        "永久 SQLite 错误必须 fail-closed：{message}"
 +    );
 +    assert_eq!(session.pending_len(), 1, "不可恢复时 journal 必须保留");
-+    // 后续 flush 不再写库/不再发 ACK。
-+    let again = session.flush(FlushReason::Manual);
-+    assert!(session
-+        .wait_for_durable(again.target_live_rev, Duration::from_millis(200))
-+        .is_none());
-+}
++    assert_eq!(head(&vault, "doc-1").head_seq, 0, "整笔事务必须回滚");
 +
-+#[test]
-+fn flush_reports_unrecoverable_when_new_head_is_unreadable() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut session = open_session(&vault, options(PEER_A));
-+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
-+
-+    // 外部推进 head 后把 head_vv 写坏：CAS 冲突后能读到行，但 VV 解码必然失败。
-+    let external = BodyDoc::create("doc-1", PEER_B).expect("外部副本");
-+    external.insert_scalars(0, "远端").expect("外部编辑");
-+    let external_update = pending(&external, &loro::VersionVector::default()).expect("外部增量");
-+    append_updates(
-+        &vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", external_update)],
-+    )
-+    .expect("外部推进 head");
 +    vault
-+        .exec(
-+            "UPDATE loro_docs SET head_vv = x'01' WHERE doc_id = ?1",
-+            &[Value::Text("doc-1".to_owned())],
-+        )
-+        .expect("写坏 head_vv");
-+
-+    let ticket = session.begin_external_commit().expect("begin");
-+    let message = flush_failure_message(&mut session, &ticket);
-+    assert!(
-+        message.contains("需要重开文档"),
-+        "失败原因必须明确提示重开：{message}"
-+    );
-+    assert!(
-+        message.contains("解码失败"),
-+        "必须说明新 head 读不出来：{message}"
-+    );
-+    assert_eq!(session.pending_len(), 1, "不可恢复时 journal 必须原样保留");
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[]
-+        ),
-+        1,
-+        "拒绝重建后不得写旧前缀"
-+    );
-+}
-+
-+/// P2 门禁（Phase 1B 前）：HeadConflict 自动重建 sink 时，必须把同一个 `SyncContext`
-+/// 带进新 sink；本地 intent 的 `seq` 必须按**新** CAS 基准派生（新 head + 1），不能沿用
-+/// 旧 head 算出的 seq，也不能重复/留下孤儿 intent。
-+///
-+/// 场景与 [`flush_recovers_from_head_conflict_by_rebuilding_sink`] 相同：会话先导入远端
-+/// update，外部 writer 再把同一份 update 落库推进 head。区别是 journal 前缀里还有一条
-+/// 本地编辑，因此 flush 会同时写本地/远端两条记录并产生一条本地 intent。
-+#[test]
-+fn flush_rebuild_keeps_sync_intent_seq_at_new_head_plus_one() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut session = open_session(&vault, options_with_sync());
-+
-+    // 本地编辑先入 journal，远端 update 随后导入：一次 flush 的前缀 = [本地, 远端]。
-+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
-+    let remote = BodyDoc::create("doc-1", PEER_B).expect("远端副本");
-+    remote.insert_scalars(0, "远端").expect("远端编辑");
-+    let remote_bytes = remote.export_all_updates().expect("导出远端 update");
-+    let remote_update = pending(&remote, &loro::VersionVector::default()).expect("远端增量");
-+    session
-+        .apply_remote(&remote_bytes)
-+        .expect("导入远端 update")
-+        .expect("必须有变更");
-+
-+    // 外部 writer（同步引擎 integrate 的等价物）先把同一份 update 落库：head 0→1。
-+    let advanced = append_updates(
-+        &vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", remote_update)],
-+    )
-+    .expect("外部推进 head");
-+    assert_eq!(advanced.head_seq, 1);
-+    assert_eq!(
-+        session.durable_head_seq(),
-+        0,
-+        "会话的 CAS 基准仍停在打开时的 head 0"
-+    );
-+
-+    let ticket = session.flush(FlushReason::Manual);
-+    let ack = session
-+        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
-+        .expect("HeadConflict 后必须重建 sink 并发出 DurableAck");
-+    assert_eq!(ack.through_live_rev, LiveRev(2));
-+    assert_eq!(ack.head_seq, 3, "外部一条 + 重试前缀两条");
-+    assert_eq!(session.durable_head_seq(), 3);
-+    assert_eq!(session.durable_through(), LiveRev(2));
-+    assert_eq!(session.pending_len(), 0, "成功后必须裁剪前缀");
-+    assert_eq!(
-+        session.last_write_error(),
-+        None,
-+        "成功写入后必须清空失败原因"
-+    );
-+
-+    // 恰一条本地 intent：远端条目 / 外部条目都不得产生 intent。
-+    assert_eq!(
-+        outbox_count(&vault),
-+        1,
-+        "一次本地编辑只应产生一条 intent（远端/外部条目必须没有）"
-+    );
-+    let expected_seq = advanced.head_seq + 1;
-+    let expected_message = intent_message_id("doc-1", expected_seq, SYNC_CTX);
-+    let row = outbox_row(&vault, &expected_message)
-+        .expect("读 outbox")
-+        .expect("重建后仍必须产生本地 intent（说明 SyncContext 被带进新 sink）");
-+    assert_eq!(row.doc_id, "doc-1");
-+    assert_eq!(
-+        row.seq, expected_seq,
-+        "intent seq 必须按新 CAS 基准派生（新 head {} + 1）",
-+        advanced.head_seq
-+    );
-+    assert_eq!(row.key_epoch, SYNC_CTX.key_epoch);
-+    assert_eq!(row.state, SyncOutboxState::Pending);
-+    assert_eq!(
-+        row.object_id,
-+        Some(intent_object_id(&expected_message, SYNC_CTX)),
-+        "object_id 必须按重建后的 message 派生"
-+    );
-+    assert!(
-+        row.batch_id.starts_with("session-"),
-+        "intent 必须沿用本地 journal 条目的 batch，实际 {:?}",
-+        row.batch_id
-+    );
-+
-+    // 直接查 outbox 列：没有第二张 intent、没有指向外部行的孤儿。
-+    let raw = vault
-+        .query("SELECT doc_id, seq, key_epoch, state FROM sync_outbox", &[])
-+        .expect("查 sync_outbox");
-+    assert_eq!(raw.len(), 1, "不得重复写 intent：{raw:?}");
-+    assert_eq!(raw[0][0], Value::Text("doc-1".to_owned()));
-+    assert_eq!(
-+        raw[0][1],
-+        Value::Integer(i64::try_from(expected_seq).expect("seq")),
-+        "intent 必须指向重试写入的本地 update"
-+    );
-+    assert_eq!(raw[0][2], Value::Integer(1));
-+    assert_eq!(raw[0][3], Value::Text("pending".to_owned()));
-+
-+    // intent 指向的本地行存在且唯一；总行数 = 外部 1 + 本地 1 + 远端 1。
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-1' AND seq=?1",
-+            &[Value::Integer(i64::try_from(expected_seq).expect("seq"))],
-+        ),
-+        1,
-+        "intent 指向的 update 必须存在且唯一"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[],
-+        ),
-+        3,
-+        "外部 + 本地 + 远端各一条，重试不得重复写"
-+    );
-+
-+    // 正文/head 重放一致：重建后的重试没有写坏 head_vv/frontier。
-+    let live_markdown = session.markdown();
-+    assert!(
-+        live_markdown.contains("本地") && live_markdown.contains("远端"),
-+        "live 正文应包含本地与远端内容：{live_markdown:?}"
-+    );
-+    let (replayed, head) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("重放正文");
-+    assert_eq!(replayed.text(), live_markdown);
-+    assert_eq!(head.head_seq, 3);
-+    let head_vv = head.version_vector().expect("解码 head vv");
-+    let live_vv = loro::VersionVector::decode(&session.snapshot().live_vv).expect("解码 live vv");
-+    assert_eq!(
-+        head_vv, live_vv,
-+        "durable head 的 ops 必须与本会话 live 一致"
-+    );
-+}
-+
-+/// P2 门禁：非 `HeadConflict` 的普通写失败（磁盘/SQLite）必须保持「同一前缀下次重试」：
-+/// 不 ACK、不裁剪、不推进 durable/head；`last_write_error` 可读且**不得**升级成不可恢复。
-+/// 移除注入后同一前缀必须能成功落库。
-+#[test]
-+fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut session = open_session(&vault, options_with_sync());
-+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
-+    assert_eq!(session.pending_len(), 1);
-+
-+    // 注入非 HeadConflict 的写失败：A 事务在 INSERT 处被 SQLite ABORT。
-+    let trigger = SqlTrigger::install(
-+        &vault,
-+        "injected_flush_disk_failure",
-+        "CREATE TRIGGER injected_flush_disk_failure BEFORE INSERT ON loro_updates \
-+         BEGIN SELECT RAISE(ABORT, 'injected disk'); END;",
-+    );
-+
-+    let ticket = session.flush(FlushReason::Manual);
-+    let message = wait_for_write_error(&session, Duration::from_secs(10));
-+    assert!(!message.is_empty(), "失败原因必须可读");
-+    assert!(
-+        !message.contains("需要重开文档"),
-+        "普通写失败不得升级成不可恢复：{message}"
-+    );
-+    assert!(
-+        message.contains("injected disk"),
-+        "失败原因必须来自注入的写失败：{message}"
-+    );
-+    assert!(
-+        session
-+            .wait_for_durable(ticket.target_live_rev, Duration::ZERO)
-+            .is_none(),
-+        "普通写失败不得发出 DurableAck"
-+    );
-+
-+    // 前缀原样保留；没有 durable/head/intent 被写。
-+    assert_eq!(session.pending_len(), 1, "失败后必须保留同一前缀");
-+    assert_eq!(session.durable_head_seq(), 0);
-+    assert_eq!(session.durable_through(), LiveRev(0));
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[],
-+        ),
-+        0,
-+        "失败事务不得写 loro_updates"
-+    );
-+    assert_eq!(head(&vault, "doc-1").head_seq, 0, "失败事务不得推进 head");
-+    assert_eq!(outbox_count(&vault), 0, "失败事务不得留下本地 intent");
-+
-+    // DROP 触发器后重试：同一前缀成功，水位/正文/intent 都补齐。
-+    trigger.remove();
-+    let ticket = session.flush(FlushReason::Manual);
-+    let ack = session
-+        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
-+        .expect("注入移除后同一前缀必须可重试成功");
-+    assert_eq!(ack.through_live_rev, LiveRev(1));
-+    assert_eq!(ack.head_seq, 1);
-+    assert_eq!(session.pending_len(), 0);
-+    assert_eq!(session.durable_head_seq(), 1);
-+    assert_eq!(
-+        session.last_write_error(),
-+        None,
-+        "成功写入后必须清空失败原因"
-+    );
-+    assert_eq!(session.markdown(), "本地");
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[],
-+        ),
-+        1
-+    );
-+    assert_eq!(head(&vault, "doc-1").head_seq, 1);
-+    assert_eq!(outbox_count(&vault), 1, "成功后必须补写本地 intent");
-+    let row = outbox_row(&vault, &intent_message_id("doc-1", 1, SYNC_CTX))
-+        .expect("读 intent")
-+        .expect("本地 intent");
-+    assert_eq!(row.seq, 1);
-+
-+    let (replayed, head_state) = load_body_doc(&vault, "doc-1", PEER_A, None).expect("重放");
-+    assert_eq!(replayed.text(), "本地");
-+    assert_eq!(head_state.head_seq, 1);
-+}
-+
-+/// `RebuildOutcome::Retryable` 门禁：head 冲突触发自动重建后，重试**同一前缀**时若遇到
-+/// 非 HeadConflict 写失败（磁盘/SQLite），必须保持「可重试」——不 ACK、不裁剪、不升级成
-+/// 不可恢复；移除注入后下一次 flush 仍能自动重建并成功。
-+///
-+/// 注入点选 `BEFORE INSERT ON loro_updates`：第一次写会在 CAS（第 0 条语句）就因 head
-+/// 过期失败，根本到不了 INSERT，因此触发器只命中「重建后的重试」这一次。
-+#[test]
-+fn flush_rebuild_retryable_write_failure_keeps_prefix_then_recovers() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut session = open_session(&vault, options_with_sync());
-+
-+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
-+    let remote = BodyDoc::create("doc-1", PEER_B).expect("远端副本");
-+    remote.insert_scalars(0, "远端").expect("远端编辑");
-+    let remote_bytes = remote.export_all_updates().expect("导出远端 update");
-+    let remote_update = pending(&remote, &loro::VersionVector::default()).expect("远端增量");
-+    session
-+        .apply_remote(&remote_bytes)
-+        .expect("导入远端 update")
-+        .expect("必须有变更");
-+
-+    // 外部先落同一份 update：head 0→1，让本命令第 1 次写入必然拿到 HeadConflict。
-+    append_updates(
-+        &vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", remote_update)],
-+    )
-+    .expect("外部推进 head");
-+
-+    let trigger = SqlTrigger::install(
-+        &vault,
-+        "injected_rebuild_retry_disk",
-+        "CREATE TRIGGER injected_rebuild_retry_disk BEFORE INSERT ON loro_updates \
-+         BEGIN SELECT RAISE(ABORT, 'injected retry disk'); END;",
-+    );
-+
-+    let ticket = session.flush(FlushReason::Manual);
-+    let message = wait_for_write_error(&session, Duration::from_secs(10));
-+    assert!(
-+        message.contains("自动重建后重试前缀失败"),
-+        "必须走 RebuildOutcome::Retryable：{message}"
-+    );
-+    assert!(
-+        !message.contains("需要重开文档"),
-+        "可重试失败不得升级成不可恢复：{message}"
-+    );
-+    assert!(
-+        session
-+            .wait_for_durable(ticket.target_live_rev, Duration::ZERO)
-+            .is_none(),
-+        "重建后的重试失败不得发出 DurableAck"
-+    );
-+    assert_eq!(session.pending_len(), 2, "同一前缀必须原样保留");
-+    assert_eq!(session.durable_head_seq(), 0);
-+    assert_eq!(outbox_count(&vault), 0, "回滚的写事务不得留下 intent");
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[],
-+        ),
-+        1,
-+        "只有外部那条：重建后的重试整笔回滚"
-+    );
-+    assert_eq!(head(&vault, "doc-1").head_seq, 1);
-+
-+    // 移除注入后下一次 flush：仍从旧 CAS 基准开始，先冲突、再自动重建，这次成功。
-+    trigger.remove();
-+    let ticket = session.flush(FlushReason::Manual);
-+    let ack = session
-+        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
-+        .expect("注入移除后必须收敛到 DurableAck");
-+    assert_eq!(ack.through_live_rev, LiveRev(2));
-+    assert_eq!(ack.head_seq, 3);
-+    assert_eq!(session.pending_len(), 0);
-+    assert_eq!(
-+        session.last_write_error(),
-+        None,
-+        "成功写入后必须清空失败原因"
-+    );
-+    assert_eq!(outbox_count(&vault), 1);
-+    let row = outbox_row(&vault, &intent_message_id("doc-1", 2, SYNC_CTX))
-+        .expect("读 intent")
-+        .expect("重建后的本地 intent");
-+    assert_eq!(row.seq, 2);
-+    assert_eq!(row.key_epoch, SYNC_CTX.key_epoch);
-+}
-+
-+/// 二次冲突门禁：`auto_rebuilt` 用尽后重试仍撞 head 冲突时，必须 fail-closed 进入
-+/// 不可恢复态（提示重开），journal/库原样保留，后续 flush 立即失败不再碰数据库。
-+///
-+/// 注入 `BEFORE UPDATE OF head_seq ON loro_docs ... RAISE(IGNORE)`：第一次写因为 head 已是
-+/// 1（外部推进）而天然 CAS 失败，不触发该触发器；重建后的重试 CAS 命中 `head_seq=1` 时
-+/// 被 `RAISE(IGNORE)` 跳过（0 行），稳定复现「同一命令内第二次 HeadConflict」的交错。
-+/// `head_seq <= CAS 基准` 的回退分支要求第一次写入失败后 head 倒退，公开接口下
-+/// `head_seq` 只前进、无法确定性构造，因此本测试只覆盖“二次冲突”这一支。
-+#[test]
-+fn flush_reports_unrecoverable_on_second_head_conflict() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut session = open_session(&vault, options_with_sync());
-+
-+    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
-+    let remote = BodyDoc::create("doc-1", PEER_B).expect("远端副本");
-+    remote.insert_scalars(0, "远端").expect("远端编辑");
-+    let remote_bytes = remote.export_all_updates().expect("导出远端 update");
-+    let remote_update = pending(&remote, &loro::VersionVector::default()).expect("远端增量");
-+    session
-+        .apply_remote(&remote_bytes)
-+        .expect("导入远端 update")
-+        .expect("必须有变更");
-+
-+    // 外部先落同一份 update：head 0→1（前缀兼容，重建本身是允许的）。
-+    append_updates(
-+        &vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", remote_update)],
-+    )
-+    .expect("外部推进 head");
-+
-+    // 只吞掉重建后重试的 CAS，不改 head：模拟「load_head 之后、重试写入之前 head 又被
-+    // 推进」的交错结果（第二次 CAS 未命中）。
-+    let trigger = SqlTrigger::install(
-+        &vault,
-+        "swallow_second_head_cas",
-+        "CREATE TRIGGER swallow_second_head_cas BEFORE UPDATE OF head_seq ON loro_docs \
-+         BEGIN SELECT RAISE(IGNORE); END;",
-+    );
-+
-+    let ticket = session.flush(FlushReason::Manual);
-+    let message = wait_for_write_error(&session, Duration::from_secs(10));
-+    assert!(
-+        message.contains("自动重建后再发生 head 冲突"),
-+        "必须走二次冲突的不可恢复分支：{message}"
-+    );
-+    assert!(
-+        message.contains("需要重开文档"),
-+        "不可恢复原因必须明确提示重开：{message}"
-+    );
-+    assert!(
-+        session
-+            .wait_for_durable(ticket.target_live_rev, Duration::ZERO)
-+            .is_none(),
-+        "二次冲突不得发出 DurableAck"
-+    );
-+    assert_eq!(session.pending_len(), 2, "不可恢复时 journal 必须原样保留");
-+    assert_eq!(session.durable_head_seq(), 0);
-+    assert_eq!(outbox_count(&vault), 0, "失败事务不得留下 intent");
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[],
-+        ),
-+        1,
-+        "只有外部那条：自动重建的重试也不得写库"
-+    );
-+    assert_eq!(head(&vault, "doc-1").head_seq, 1, "库中 head 不得被改写");
-+
-+    // 移除触发器后再次 flush：不可恢复态必须短路（若真的碰库，这次就会成功）。
-+    trigger.remove();
-+    let attempt = session.flush(FlushReason::Manual);
-+    assert!(
-+        session
-+            .wait_for_durable(attempt.target_live_rev, Duration::ZERO)
-+            .is_none(),
-+        "不可恢复后不得再发出 DurableAck"
-+    );
-+    assert_eq!(
-+        count(
-+            &vault,
-+            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
-+            &[],
-+        ),
-+        1,
-+        "不可恢复后不得再写 loro_updates"
-+    );
-+    assert_eq!(head(&vault, "doc-1").head_seq, 1, "不可恢复后不得推进 head");
-+    assert_eq!(
-+        session.last_write_error().as_deref(),
-+        Some(message.as_str()),
-+        "失败原因必须稳定可读"
-+    );
-+
-+    // 消息里的救济方式（关闭并重开）必须真的可用：重开后从 durable 前缀加载，
-+    // 未 durable 的本地改动不会自动落库（这是文档化语义，不是数据静默丢失）。
-+    drop(session);
-+    let mut reopened = open_session(&vault, options_with_sync());
-+    assert_eq!(reopened.durable_head_seq(), 1);
-+    assert_eq!(reopened.markdown(), "远端", "重开后只保留 durable 前缀");
-+    reopened.apply(request(&reopened, "c2", 0, vec![edit(0, 0, "新")]));
++        .exec("DROP TRIGGER fail_updates", &[])
++        .expect("移除触发器");
++    // 不可恢复后不会自动重试；重开会话才能继续。
++    let mut reopened = open_session(&vault, options(PEER_A));
++    reopened.apply(request(&reopened, "c2", 0, vec![edit(0, 0, "重开")]));
 +    let ticket = reopened.flush(FlushReason::Manual);
-+    let ack = reopened
-+        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
-+        .expect("重开后必须能继续落库");
-+    assert_eq!(ack.head_seq, 2);
-+    assert_eq!(reopened.pending_len(), 0);
 +    assert!(
-+        reopened.markdown().contains('新') && reopened.markdown().contains("远端"),
-+        "重开后的正文必须同时包含 durable 前缀与新编辑：{:?}",
-+        reopened.markdown()
++        reopened
++            .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
++            .is_some(),
++        "重开会话后应恢复"
 +    );
 +}
 +
-+/// 打开一个不启 ticker 的驱动（假时钟）：失败路径的收敛只靠显式 `poll`，不靠真睡。
-+fn open_test_driver(vault: &Vault) -> SessionDriver {
-+    SessionDriver::open_with_clock(
-+        vault,
-+        "doc-1",
-+        DriverOptions {
-+            session: options(PEER_A),
-+            auto_tick: false,
-+            ..DriverOptions::default()
-+        },
-+        Box::new(ManualClock::new()),
-+    )
-+    .expect("打开驱动")
-+}
-+
-+/// 把驱动推进到「不可恢复 flush 失败」，返回闸门读到的失败原因。
-+///
-+/// 构造方式与 [`flush_reports_unrecoverable_after_bounded_rebuild`] 相同：外部 writer 写入
-+/// 本会话 live 未知的并发 ops，自动重建必须拒绝。
-+fn drive_driver_to_unrecoverable(driver: &mut SessionDriver, vault: &Vault) -> String {
-+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "本地")]));
-+
-+    let external = BodyDoc::create("doc-1", PEER_B).expect("外部副本");
-+    external.insert_scalars(0, "远端").expect("外部编辑");
-+    let external_update = pending(&external, &loro::VersionVector::default()).expect("外部增量");
-+    append_updates(
-+        vault,
-+        "doc-1",
-+        0,
-+        &[UpdateRecord::new("external-1", external_update)],
-+    )
-+    .expect("外部推进 head");
-+
-+    let ticket = driver.begin_external_commit().expect("begin");
-+    let deadline = Instant::now() + Duration::from_secs(10);
-+    loop {
-+        match driver.poll_external_commit(&ticket) {
-+            GateState::Failed(GateError::FlushFailed { message, .. }) => return message,
-+            GateState::Flushing | GateState::WaitingIME => std::thread::yield_now(),
-+            other => panic!("闸门没有给出明确失败：{other:?}"),
-+        }
-+        assert!(Instant::now() < deadline, "闸门 10s 内没有给出明确失败");
-+    }
-+}
-+
-+/// P1：不可恢复的 flush 失败必须能通过 `SessionDriver::last_write_error` 直接读到
-+/// （UI 不必先走外部提交闸门），并且没有失败时是 `None`。
-+#[test]
-+fn driver_forwards_unrecoverable_flush_error() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut driver = open_test_driver(&vault);
-+    assert_eq!(
-+        driver.last_write_error(),
-+        None,
-+        "没有失败时驱动必须返回 None"
-+    );
-+
-+    let message = drive_driver_to_unrecoverable(&mut driver, &vault);
-+    let forwarded = driver
-+        .last_write_error()
-+        .expect("驱动必须转发不可恢复的失败原因");
-+    assert_eq!(forwarded, message, "驱动与闸门必须看到同一个原因");
-+    assert!(
-+        forwarded.contains("需要重开文档"),
-+        "驱动读到的原因必须可执行：{forwarded}"
-+    );
-+    assert_eq!(
-+        driver.last_write_error().as_deref(),
-+        Some(forwarded.as_str()),
-+        "多次读取必须稳定"
-+    );
-+}
-+
-+/// P1：`CloseReport.flush_error` 必须带出没排空的原因；报告拿到之后驱动仍可读同一个值。
-+#[test]
-+fn close_report_surfaces_unrecoverable_flush_error() {
-+    let (_dir, vault) = fresh_vault();
-+    let _seed = seed_note(&vault, "note-1", "doc-1");
-+    let mut driver = open_test_driver(&vault);
-+    let message = drive_driver_to_unrecoverable(&mut driver, &vault);
-+
-+    // 不可恢复时 `close` 必然排不空：即使 timeout 5s 也必须立即返回（不挂住 UI）。
-+    let started = Instant::now();
-+    let report = driver.close(Duration::from_secs(5));
-+    assert!(
-+        started.elapsed() < Duration::from_secs(1),
-+        "不可恢复时 close 必须短路，不能等满 timeout：{:?}",
-+        started.elapsed()
-+    );
-+    let close_error = report
-+        .flush_error
-+        .clone()
-+        .expect("CloseReport 必须带出 flush 失败原因");
-+    assert_eq!(close_error, message, "关闭报告与闸门必须一致");
-+    assert!(
-+        close_error.contains("需要重开文档"),
-+        "CloseReport 的原因必须可执行：{close_error}"
-+    );
-+    assert!(report.timed_out, "不可恢复时关闭必然超时：{report:?}");
-+    assert_eq!(report.pending_edits, 1, "未 ACK 条目必须原样保留");
-+    assert!(
-+        report.durable.is_none(),
-+        "不可恢复后不得再发出 DurableAck：{report:?}"
-+    );
-+    // 报告拿走后驱动仍在：同一个原因必须还能读到。
-+    assert_eq!(
-+        driver.last_write_error(),
-+        Some(close_error),
-+        "关闭报告产生后原因仍须可读"
-+    );
-+}
-diff --git a/crates/storage/tests/session_schedule.rs b/crates/storage/tests/session_schedule.rs
-index 20e0673..6419a6e 100644
---- a/crates/storage/tests/session_schedule.rs
-+++ b/crates/storage/tests/session_schedule.rs
-@@ -212,6 +212,7 @@ fn close_drains_pending_edits_and_materializes_body() {
-     assert!(!report.timed_out, "Close 必须排空：{report:?}");
-     assert_eq!(report.pending_edits, 0);
-     assert_eq!(report.pending_materialize, 0);
-+    assert_eq!(report.flush_error, None, "正常关闭不得报 flush 失败");
+ /// 永久性 Corrupt 不能被当成“下次再试”的 Retryable：它不会自愈。
+ /// 用 `head_seq = i64::MAX` 构造 `seq = head + 1` 的 `i64_of` 溢出（append_update 返回
+ /// Corrupt），断言 flusher 直接进入不可恢复，而不是每次重试同一永久错误。
+@@ -734,19 +781,21 @@ fn flush_rebuild_keeps_sync_intent_seq_at_new_head_plus_one() {
+ /// 移除注入后同一前缀必须能成功落库。
+ #[test]
+ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
+-    let (_dir, vault) = fresh_vault();
++    let (dir, vault) = fresh_vault();
+     let _seed = seed_note(&vault, "note-1", "doc-1");
+     let mut session = open_session(&vault, options_with_sync());
+     session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
+     assert_eq!(session.pending_len(), 1);
+ 
+-    // 注入非 HeadConflict 的写失败：A 事务在 INSERT 处被 SQLite ABORT。
+-    let trigger = SqlTrigger::install(
+-        &vault,
+-        "injected_flush_disk_failure",
+-        "CREATE TRIGGER injected_flush_disk_failure BEFORE INSERT ON loro_updates \
+-         BEGIN SELECT RAISE(ABORT, 'injected disk'); END;",
+-    );
++    // 真实瞬时错误：外部连接持有写锁，且本 Vault 关闭 busy 等待，A 事务拿到
++    // SQLITE_BUSY（不是约束/只读/损坏等永久错误）。
++    vault
++        .query("PRAGMA busy_timeout=0", &[])
++        .expect("关闭 busy 等待");
++    let blocker = rusqlite::Connection::open(vault_path(&dir)).expect("打开外部连接");
++    blocker
++        .execute_batch("BEGIN IMMEDIATE")
++        .expect("外部连接占写锁");
+ 
+     let ticket = session.flush(FlushReason::Manual);
+     let message = wait_for_write_error(&session, Duration::from_secs(10));
+@@ -756,8 +805,8 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
+         "普通写失败不得升级成不可恢复：{message}"
+     );
      assert!(
-         report.durable.is_some(),
-         "Close 要等到覆盖最后 live_rev 的 ACK"
+-        message.contains("injected disk"),
+-        "失败原因必须来自注入的写失败：{message}"
++        message.contains("锁") || message.contains("locked") || message.contains("busy"),
++        "失败原因必须来自 BUSY：{message}"
+     );
+     assert!(
+         session
+@@ -766,6 +815,12 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
+         "普通写失败不得发出 DurableAck"
+     );
+ 
++    blocker.execute_batch("ROLLBACK").expect("释放外部写锁");
++    drop(blocker);
++    vault
++        .query("PRAGMA busy_timeout=5000", &[])
++        .expect("恢复 busy 等待");
++
+     // 前缀原样保留；没有 durable/head/intent 被写。
+     assert_eq!(session.pending_len(), 1, "失败后必须保留同一前缀");
+     assert_eq!(session.durable_head_seq(), 0);
+@@ -782,8 +837,7 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
+     assert_eq!(head(&vault, "doc-1").head_seq, 0, "失败事务不得推进 head");
+     assert_eq!(outbox_count(&vault), 0, "失败事务不得留下本地 intent");
+ 
+-    // DROP 触发器后重试：同一前缀成功，水位/正文/intent 都补齐。
+-    trigger.remove();
++    // 锁释放后重试：同一前缀成功，水位/正文/intent 都补齐。
+     let ticket = session.flush(FlushReason::Manual);
+     let ack = session
+         .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
+@@ -825,98 +879,6 @@ fn flush_retryable_write_failure_keeps_prefix_then_recovers() {
+ /// 注入点选 `BEFORE INSERT ON loro_updates`：第一次写会在 CAS（第 0 条语句）就因 head
+ /// 过期失败，根本到不了 INSERT，因此触发器只命中「重建后的重试」这一次。
+ #[test]
+-fn flush_rebuild_retryable_write_failure_keeps_prefix_then_recovers() {
+-    let (_dir, vault) = fresh_vault();
+-    let _seed = seed_note(&vault, "note-1", "doc-1");
+-    let mut session = open_session(&vault, options_with_sync());
+-
+-    session.apply(request(&session, "c1", 0, vec![edit(0, 0, "本地")]));
+-    let remote = BodyDoc::create("doc-1", PEER_B).expect("远端副本");
+-    remote.insert_scalars(0, "远端").expect("远端编辑");
+-    let remote_bytes = remote.export_all_updates().expect("导出远端 update");
+-    let remote_update = pending(&remote, &loro::VersionVector::default()).expect("远端增量");
+-    session
+-        .apply_remote(&remote_bytes)
+-        .expect("导入远端 update")
+-        .expect("必须有变更");
+-
+-    // 外部先落同一份 update：head 0→1，让本命令第 1 次写入必然拿到 HeadConflict。
+-    append_updates(
+-        &vault,
+-        "doc-1",
+-        0,
+-        &[UpdateRecord::new("external-1", remote_update)],
+-    )
+-    .expect("外部推进 head");
+-
+-    let trigger = SqlTrigger::install(
+-        &vault,
+-        "injected_rebuild_retry_disk",
+-        "CREATE TRIGGER injected_rebuild_retry_disk BEFORE INSERT ON loro_updates \
+-         BEGIN SELECT RAISE(ABORT, 'injected retry disk'); END;",
+-    );
+-
+-    let ticket = session.flush(FlushReason::Manual);
+-    let message = wait_for_write_error(&session, Duration::from_secs(10));
+-    assert!(
+-        message.contains("自动重建后重试前缀失败"),
+-        "必须走 RebuildOutcome::Retryable：{message}"
+-    );
+-    assert!(
+-        !message.contains("需要重开文档"),
+-        "可重试失败不得升级成不可恢复：{message}"
+-    );
+-    assert!(
+-        session
+-            .wait_for_durable(ticket.target_live_rev, Duration::ZERO)
+-            .is_none(),
+-        "重建后的重试失败不得发出 DurableAck"
+-    );
+-    assert_eq!(session.pending_len(), 2, "同一前缀必须原样保留");
+-    assert_eq!(session.durable_head_seq(), 0);
+-    assert_eq!(outbox_count(&vault), 0, "回滚的写事务不得留下 intent");
+-    assert_eq!(
+-        count(
+-            &vault,
+-            "SELECT count(*) FROM loro_updates WHERE doc_id = 'doc-1'",
+-            &[],
+-        ),
+-        1,
+-        "只有外部那条：重建后的重试整笔回滚"
+-    );
+-    assert_eq!(head(&vault, "doc-1").head_seq, 1);
+-
+-    // 移除注入后下一次 flush：仍从旧 CAS 基准开始，先冲突、再自动重建，这次成功。
+-    trigger.remove();
+-    let ticket = session.flush(FlushReason::Manual);
+-    let ack = session
+-        .wait_for_durable(ticket.target_live_rev, Duration::from_secs(5))
+-        .expect("注入移除后必须收敛到 DurableAck");
+-    assert_eq!(ack.through_live_rev, LiveRev(2));
+-    assert_eq!(ack.head_seq, 3);
+-    assert_eq!(session.pending_len(), 0);
+-    assert_eq!(
+-        session.last_write_error(),
+-        None,
+-        "成功写入后必须清空失败原因"
+-    );
+-    assert_eq!(outbox_count(&vault), 1);
+-    let row = outbox_row(&vault, &intent_message_id("doc-1", 2, SYNC_CTX))
+-        .expect("读 intent")
+-        .expect("重建后的本地 intent");
+-    assert_eq!(row.seq, 2);
+-    assert_eq!(row.key_epoch, SYNC_CTX.key_epoch);
+-}
+-
+-/// 二次冲突门禁：`auto_rebuilt` 用尽后重试仍撞 head 冲突时，必须 fail-closed 进入
+-/// 不可恢复态（提示重开），journal/库原样保留，后续 flush 立即失败不再碰数据库。
+-///
+-/// 注入 `BEFORE UPDATE OF head_seq ON loro_docs ... RAISE(IGNORE)`：第一次写因为 head 已是
+-/// 1（外部推进）而天然 CAS 失败，不触发该触发器；重建后的重试 CAS 命中 `head_seq=1` 时
+-/// 被 `RAISE(IGNORE)` 跳过（0 行），稳定复现「同一命令内第二次 HeadConflict」的交错。
+-/// `head_seq <= CAS 基准` 的回退分支要求第一次写入失败后 head 倒退，公开接口下
+-/// `head_seq` 只前进、无法确定性构造，因此本测试只覆盖“二次冲突”这一支。
+-#[test]
+ fn flush_reports_unrecoverable_on_second_head_conflict() {
+     let (_dir, vault) = fresh_vault();
+     let _seed = seed_note(&vault, "note-1", "doc-1");
+@@ -1125,6 +1087,10 @@ fn close_report_surfaces_unrecoverable_flush_error() {
+         "CloseReport 的原因必须可执行：{close_error}"
+     );
+     assert!(report.timed_out, "不可恢复时关闭必然超时：{report:?}");
++    assert!(
++        report.needs_reopen(),
++        "不可恢复报告必须被 UI 识别为需要重开"
++    );
+     assert_eq!(report.pending_edits, 1, "未 ACK 条目必须原样保留");
+     assert!(
+         report.durable.is_none(),
+diff --git a/crates/storage/tests/structure_crdt.rs b/crates/storage/tests/structure_crdt.rs
+index 478dbdf..335c0db 100644
+--- a/crates/storage/tests/structure_crdt.rs
++++ b/crates/storage/tests/structure_crdt.rs
+@@ -337,3 +337,23 @@ fn snapshot_is_deterministic_across_replays() {
+         second.snapshot().expect("快照")
+     );
+ }
++
++#[test]
++fn deleted_note_remains_in_snapshot_with_note_identity() {
++    let doc = doc(1);
++    let seed = doc.create_note("删了也不物理移除", 1_000).expect("建笔记");
++    doc.delete_note(&seed.node_id, 2_000).expect("删除笔记");
++
++    // 删除是 grow-only meta 事件，不是 LoroTree::delete；snapshot 仍保留节点与
++    // note/body 身份。baseline verify 因此不会把“本地并发删除”误判成结构缺项。
++    let snapshot = doc.snapshot().expect("树快照");
++    let node = snapshot
++        .nodes
++        .iter()
++        .find(|node| node.node_id == seed.node_id)
++        .expect("删除节点仍在快照");
++    assert!(node.deleted, "有效删除必须反映在 snapshot.deleted");
++    assert!(node.is_note(), "deleted 节点仍有 note/body 身份");
++    assert_eq!(node.note_id.as_deref(), Some(seed.note_id.as_str()));
++    assert_eq!(node.body_doc_id.as_deref(), Some(seed.body_doc_id.as_str()));
++}
 diff --git a/crates/storage/tests/sync_inbox_batch.rs b/crates/storage/tests/sync_inbox_batch.rs
-index 9c04bc9..dc0352f 100644
+index dc0352f..9ecaf46 100644
 --- a/crates/storage/tests/sync_inbox_batch.rs
 +++ b/crates/storage/tests/sync_inbox_batch.rs
-@@ -17,12 +17,15 @@ use menghunote_storage::{
+@@ -15,10 +15,11 @@ use support::*;
+ 
+ use menghunote_storage::{
      advance_integrated_prefix, append_updates_with_integrated_marks, count_inbox_ready, load_head,
-     mark_integrated, mark_integrated_batch, mark_skipped_event_received, set_sync_log_id,
-     store_inbox_verified, store_inbox_verified_batch, sync_cursor_state, take_inbox_ready,
--    StorageError, UpdateRecord, Value, Vault, VerifiedInboxRow, META_SYNC_LOG_ID,
--    META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
-+    take_inbox_ready_where, StorageError, UpdateRecord, Value, Vault, VerifiedInboxRow,
-+    META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
+-    mark_integrated, mark_integrated_batch, mark_skipped_event_received, set_sync_log_id,
+-    store_inbox_verified, store_inbox_verified_batch, sync_cursor_state, take_inbox_ready,
+-    take_inbox_ready_where, StorageError, UpdateRecord, Value, Vault, VerifiedInboxRow,
+-    META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
++    mark_integrated, mark_integrated_batch, mark_skipped_event_received, prune_covered_inbox,
++    set_sync_log_id, store_inbox_verified, store_inbox_verified_batch, sync_cursor_state,
++    take_inbox_ready, take_inbox_ready_where, StorageError, UpdateRecord, Value, Vault,
++    VerifiedInboxRow, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ,
++    META_SYNC_SKIPPED_RECEIVED_PREFIX,
  };
  
  const LOG_ID: [u8; 16] = [0x3a; 16];
- 
-+/// 另一个 incarnation（restore 迁移后当前 `sync.log_id` 可能变成它，旧行仍然 durable）。
-+const OTHER_LOG_ID: [u8; 16] = [0x5b; 16];
-+
- fn bind_log(vault: &Vault) {
-     set_sync_log_id(vault, &LOG_ID).expect("写 sync.log_id");
- }
-@@ -855,3 +858,175 @@ fn batch_under_foreign_write_lock_fails_busy_without_partial_write() {
-     assert_eq!(inbox_rows(&vault).len(), 1);
-     assert_eq!(received(&vault), 1);
+@@ -1030,3 +1031,46 @@ fn ready_without_log_id_is_empty_and_invalid_length_is_corrupt() {
+         "实际 {error:?}"
+     );
  }
 +
-+// ================================ incarnation 过滤（restore 迁移 log_id 后的旧行）
-+
-+/// 当前 incarnation 的 ready `relay_seq`（升序；`take_inbox_ready` 已按 log/seq 排序）。
-+fn ready_seqs(vault: &Vault, limit: usize) -> Vec<u64> {
-+    take_inbox_ready(vault, limit)
-+        .expect("读 ready")
-+        .into_iter()
-+        .map(|row| row.relay_seq)
-+        .collect()
-+}
-+
-+/// 直接写 `meta` 原始字节（模拟 restore 的显式迁移 / 损坏状态，绕过 Vault 校验）。
-+fn write_raw_meta(vault: &Vault, key: &str, value: &[u8]) {
-+    vault
-+        .exec(
-+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
-+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-+            &[Value::Text(key.to_owned()), Value::Blob(value.to_vec())],
-+        )
-+        .expect("写原始 meta");
-+}
-+
-+/// 直接插入一条**其它 incarnation** 的 verified 行。
-+///
-+/// 生产入口 `store_inbox_verified*` 都先 `ensure_log_id`，跨代写入会被
-+/// `SyncLogMismatch` 拒绝；这种 durable 状态只能由 restore 显式迁移 `sync.log_id`
-+/// 后留下，所以测试直接用 SQL 准备，不经过被测试的过滤逻辑。
-+fn insert_stale_incarnation_row(vault: &Vault, log_id: &[u8; 16], relay_seq: u64, seed: u8) {
-+    vault
-+        .exec(
-+            "INSERT INTO sync_inbox(log_id,relay_seq,object_id,epoch,state,verified_payload) \
-+             VALUES(?1,?2,?3,?4,'verified',?5)",
-+            &[
-+                Value::Blob(log_id.to_vec()),
-+                Value::Integer(i64::try_from(relay_seq).expect("relay_seq 在 i64 内")),
-+                Value::Blob(vec![seed; 32]),
-+                Value::Integer(1),
-+                Value::Blob(vec![seed; 16]),
-+            ],
-+        )
-+        .expect("插入旧 incarnation 的 verified 行");
-+}
-+
-+/// 当前 log A 有 verified 行、库里另有 log B 的 verified 行时：
-+/// ready/count 只计 A；B 即使 `relay_seq <= received` 也不计入；received 前缀只按 A 推进。
 +#[test]
-+fn ready_and_count_only_include_current_log_incarnation() {
++fn prune_covered_inbox_requires_integrated_watermark() {
 +    let (_dir, vault) = fresh_vault();
 +    bind_log(&vault);
-+    assert_eq!(store_inbox_verified_batch(&vault, &rows(2, 0)).unwrap(), 2);
-+    assert_eq!(received(&vault), 2);
++    store_inbox_verified_batch(&vault, &rows(3, 0)).expect("写 inbox");
++    assert_eq!(inbox_rows(&vault).len(), 3);
 +
-+    // 旧 incarnation B 的 1..=5 仍在库里（restore 迁移 log_id 后旧行不能被静默删除）。
-+    for seq in 1..=5u64 {
-+        insert_stale_incarnation_row(
-+            &vault,
-+            &OTHER_LOG_ID,
-+            seq,
-+            u8::try_from(seq).expect("seq 在 u8 内"),
-+        );
-+    }
-+    // `set_sync_log_id` 的语义未变：生产入口仍拒绝跨代写入（restore 走显式迁移）。
-+    assert!(
-+        matches!(
-+            set_sync_log_id(&vault, &OTHER_LOG_ID),
-+            Err(StorageError::SyncLogMismatch { .. })
-+        ),
-+        "set_sync_log_id 必须继续拒绝跨代变更"
-+    );
-+
-+    // B 的 seq1/seq2 都 <= received(2)，但 ready/count 只能看到 A 的 1/2。
-+    assert_eq!(ready_seqs(&vault, 16), vec![1, 2]);
++    // integrated=2 < 3：一行都不删。
++    vault
++        .set_meta(META_SYNC_INTEGRATED_SEQ, &2u64.to_be_bytes())
++        .expect("写 integrated");
 +    assert_eq!(
-+        count_inbox_ready(&vault).unwrap(),
-+        2,
-+        "旧 incarnation 的行即使 relay_seq<=received 也不得计入"
++        prune_covered_inbox(&vault, &LOG_ID, 3).expect("prune below watermark"),
++        0,
++        "integrated < S 时绝不能删"
 +    );
++    assert_eq!(inbox_rows(&vault).len(), 3);
 +
-+    // A 的 seq3 落库 → received 只推进到 3，不跨 B 的 1..=5。
++    // integrated=3：删掉 <=3 的行；别的 incarnation 不受影响。
++    vault
++        .set_meta(META_SYNC_INTEGRATED_SEQ, &3u64.to_be_bytes())
++        .expect("写 integrated");
 +    assert_eq!(
-+        store_inbox_verified_batch(&vault, &[row(3, 0x33, 8)]).unwrap(),
-+        1
++        prune_covered_inbox(&vault, &LOG_ID, 3).expect("prune covered"),
++        3
 +    );
-+    assert_eq!(received(&vault), 3, "received 前缀推进不跨 incarnation");
-+    assert_eq!(ready_seqs(&vault, 16), vec![1, 2, 3]);
-+    assert_eq!(count_inbox_ready(&vault).unwrap(), 3);
++    assert!(inbox_rows(&vault).is_empty());
 +
-+    // 状态变化同样只作用于当前 log：集成 A 的 seq1 后 B 的行仍不 ready、不影响计数。
-+    mark_integrated(&vault, &LOG_ID, 1).expect("集成 A seq1");
-+    assert_eq!(ready_seqs(&vault, 16), vec![2, 3]);
-+    assert_eq!(count_inbox_ready(&vault).unwrap(), 2);
-+}
-+
-+/// `take_inbox_ready_where` 走同一条底层路径：谓词只能看到当前 log 的行。
-+#[test]
-+fn ready_where_path_filters_other_log_incarnation() {
-+    let (_dir, vault) = fresh_vault();
-+    bind_log(&vault);
-+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
-+    for seq in 1..=3u64 {
-+        insert_stale_incarnation_row(
-+            &vault,
-+            &OTHER_LOG_ID,
-+            seq,
-+            0xb0 + u8::try_from(seq).unwrap_or(0),
-+        );
-+    }
-+
-+    // 恒真谓词 + 足够大的 limit：旧实现会把 B 的 3 行也交进来（6 条），现在必须只有 3 条。
-+    let mut observed_log_ids = Vec::new();
-+    let picked = take_inbox_ready_where(&vault, 16, |row| {
-+        observed_log_ids.push(row.log_id);
-+        true
-+    })
-+    .expect("where 路径读 ready");
++    // 缺失 integrated 也 fail-closed：不删。
++    vault
++        .exec(
++            "DELETE FROM meta WHERE key=?1",
++            &[Value::Text(META_SYNC_INTEGRATED_SEQ.to_owned())],
++        )
++        .expect("删 integrated");
++    store_inbox_verified_batch(&vault, &rows(1, 3)).expect("再写一条");
 +    assert_eq!(
-+        picked.iter().map(|row| row.relay_seq).collect::<Vec<_>>(),
-+        vec![1, 2, 3]
-+    );
-+    assert!(
-+        observed_log_ids.iter().all(|log_id| *log_id == LOG_ID),
-+        "谓词只应看到当前 incarnation 的行，实际 {observed_log_ids:?}"
-+    );
-+
-+    // 谓词本身的过滤仍然生效（不是把 where 语义吞掉）。
-+    let picked: Vec<u64> = take_inbox_ready_where(&vault, 16, |row| row.relay_seq != 2)
-+        .expect("where 过滤")
-+        .into_iter()
-+        .map(|row| row.relay_seq)
-+        .collect();
-+    assert_eq!(picked, vec![1, 3]);
-+}
-+
-+/// `sync.log_id` 缺失 / 长度非法时的语义：
-+/// - 缺失 → 空（`take`）/ 0（`count`），即新库旧行为；即使残留其它 log 的行与 received，
-+///   也不能回退成"不过滤 log"；
-+/// - 长度非法 → 明确 `Corrupt`（与 `sync_cursor_state` 同口径），不静默当作没有 log。
-+#[test]
-+fn ready_without_log_id_is_empty_and_invalid_length_is_corrupt() {
-+    let (_dir, vault) = fresh_vault();
-+    // 新库：没有 sync.log_id，也没有 inbox 行 → 空/0（旧实现同样返回空）。
-+    assert!(take_inbox_ready(&vault, 8)
-+        .expect("无 log 读 ready")
-+        .is_empty());
-+    assert_eq!(count_inbox_ready(&vault).expect("无 log 计数"), 0);
-+
-+    // 不一致的持久状态：有遗留 verified 行与 received，却没有 sync.log_id。
-+    // 没有当前 incarnation 就没有可匹配的 log，ready 必须为空。
-+    insert_stale_incarnation_row(&vault, &OTHER_LOG_ID, 1, 0x5b);
-+    write_raw_meta(&vault, META_SYNC_RECEIVED_SEQ, &1u64.to_be_bytes());
-+    assert!(
-+        take_inbox_ready(&vault, 8)
-+            .expect("无 log 读 ready")
-+            .is_empty(),
-+        "缺 sync.log_id 时不能漏出其它 incarnation 的遗留行"
-+    );
-+    assert_eq!(count_inbox_ready(&vault).expect("无 log 计数"), 0);
-+
-+    // 长度不是 16B = 损坏：显式错误，不静默当成"没有 log"。
-+    write_raw_meta(&vault, META_SYNC_LOG_ID, b"short");
-+    let error = take_inbox_ready(&vault, 8).expect_err("非法 log_id 长度必须报错");
-+    assert!(
-+        matches!(error, StorageError::Corrupt { .. }),
-+        "实际 {error:?}"
-+    );
-+    let error = count_inbox_ready(&vault).expect_err("非法 log_id 长度必须报错");
-+    assert!(
-+        matches!(error, StorageError::Corrupt { .. }),
-+        "实际 {error:?}"
++        prune_covered_inbox(&vault, &LOG_ID, 4).expect("prune without watermark"),
++        0,
++        "没有 integrated 证据时不得删"
 +    );
 +}
-diff --git a/crates/storage/tests/sync_intent.rs b/crates/storage/tests/sync_intent.rs
-index 2242567..7a7a4f1 100644
---- a/crates/storage/tests/sync_intent.rs
-+++ b/crates/storage/tests/sync_intent.rs
-@@ -25,9 +25,9 @@ use menghunote_storage::session::{
- use menghunote_storage::{
-     append_updates, apply_baseline_batch, begin_baseline_apply, enqueue_sync_intent,
-     finish_baseline_apply, intent_message_id, intent_object_id, load_body_doc, load_head,
--    local_sync_intent, outbox_row, pending_encryption, BodyDoc, DurableSink, JournalEntry,
--    JournalOrigin, StorageError, StructureWriter, SyncContext, SyncIntent, SyncOutboxState,
--    UpdateRecord, Value, Vault, VaultJournalSink, STRUCTURE_DOC_ID,
-+    local_sync_intent, outbox_row, pending_encryption, BaselineExpectation, BodyDoc, DurableSink,
-+    JournalEntry, JournalOrigin, StorageError, StructureWriter, SyncContext, SyncIntent,
-+    SyncOutboxState, UpdateRecord, Value, Vault, VaultJournalSink, STRUCTURE_DOC_ID,
- };
- use menghunote_text::UnicodeScalar;
- 
-@@ -504,7 +504,17 @@ fn remote_import_and_adopt_never_produce_intents() {
-         doc.insert_scalars(0, "基线").expect("写基线");
-         doc.export_snapshot().expect("导出 snapshot")
-     };
--    begin_baseline_apply(&vault3, &[7; 16], 3, "cursor-1").expect("begin");
-+    begin_baseline_apply(
-+        &vault3,
-+        &[7; 16],
-+        3,
-+        "cursor-1",
-+        &BaselineExpectation::new(
-+            std::iter::once("doc-1".to_owned()),
-+            std::iter::empty::<[u8; 32]>(),
-+        ),
-+    )
-+    .expect("begin");
-     apply_baseline_batch(&vault3, &[("doc-1".to_owned(), baseline)], &[]).expect("apply");
-     let _ = finish_baseline_apply(&vault3, 3, "cursor-2").expect("finish");
-     assert_eq!(outbox_count(&vault3), 0, "adopt/baseline 绝不能产生 intent");
 diff --git a/crates/sync/src/bootstrap.rs b/crates/sync/src/bootstrap.rs
-index 4dc768c..b0261ce 100644
+index b0261ce..3d663cc 100644
 --- a/crates/sync/src/bootstrap.rs
 +++ b/crates/sync/src/bootstrap.rs
-@@ -5,10 +5,20 @@
- //!
- //! **可恢复导入（P1-4）**：docs/structure/assets 的写入全部经过 storage 的
- //! `baseline_apply` staging journal（`begin_baseline_apply` / `apply_baseline_batch` /
--//! `apply_baseline_assets`）。任一步失败都**不**清 journal、**不**推进任何水位；
--//! 下一次调用按同一份基线幂等续跑。只有全部实际导入并通过读回校验后，才在**一个**
-+//! `apply_baseline_assets`）。下载/写入阶段任一步失败都**不**清 journal、**不**推进任何
-+//! 水位；下一次调用按同一份基线幂等续跑。只有全部实际导入并通过读回校验后，才在**一个**
- //! SQLite 事务里推进 `cursor/received/integrated/confirmed_highwater`（CAS）。
- //!
-+//! **读回校验失败（同步硬化 P1）**：`verify_imported` 失败时**不回滚**已 merge 的
-+//! Loro/资产数据（CRDT merge 幂等；回滚会丢本地编辑），而是写一条只本地可见的
-+//! `sync.baseline_verify_failed` 失败标记（storage `mark_baseline_verify_failed`）。
-+//! journal 仍是 `staging`（schema 的 status CHECK 只允许 `staging/completed`，见
-+//! `docs/notes/sync-hardening-20261121.md` §8），但下一次 `begin_baseline_apply` 会拒绝，
-+//! 必须先 `abort_baseline_apply` 清理（abort 同时删标记，已导入数据保留）。
-+//!
-+//! **闸外编辑**：verify 不与编辑互斥，判定用「导出点 VV ⊆ 当前 VV」而不是相等；只有
-+//! 本地没有快照之外的 op 时才逐字节比较正文（见 [`check_imported_doc`]）。
-+//!
- //! **水位单调（P1-4）**：bootstrap 允许作用在已有库上，但禁止降低任何单调值：
- //! `received/integrated/highwater` 取 `max(现有, baseline S)`；已有进度时保留现有 relay
- //! 游标（不把已经消费过的位置回退）；`instance/log_id/epoch/control rev+hash` 只允许
-@@ -36,6 +46,7 @@
- //! `instance/log_id/epoch/control_rev/highwater` 的回退。
+@@ -202,6 +202,7 @@ pub enum BootstrapFault {
+ /// 故障注入伪造的 peer id（只在校验失败测试路径出现；不影响真实数据）。
+ const VERIFY_FAULT_PEER: u64 = 0x0BAD_5EED;
  
- use std::collections::{BTreeMap, BTreeSet};
-+use std::time::Instant;
- 
- use loro::VersionVector;
- use sha2::{Digest, Sha256};
-@@ -53,8 +64,9 @@ use crate::rotation::ManagerTransitionV1;
- use crate::upload::fetch_object;
- use menghunote_storage::{
-     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, asset_bytes,
--    baseline_apply_state, begin_baseline_apply, load_body_doc, load_structure, sync_cursor_state,
--    AffectedGuard, BaselineApplyStatus, BaselineAsset, BodyDoc, Statement, StructureDoc,
-+    baseline_apply_state, begin_baseline_apply, load_body_doc, load_structure,
-+    mark_baseline_verify_failed, record_baseline_verify_time, sync_cursor_state, AffectedGuard,
-+    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc, Statement, StructureDoc,
-     StructureWriter, Value, Vault, APP_DOC_SCHEMA, CODEC_VERSION, META_SYNC_CONFIRMED_HIGHWATER,
-     META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, MIN_READER,
-     STRUCTURE_DOC_ID,
-@@ -182,8 +194,14 @@ pub enum BootstrapFault {
-     /// 水位事务读取当前状态之后、提交之前，模拟另一个写者改写了 relay 游标，
-     /// 迫使 CAS 失败（整笔事务回滚）。
-     CursorCasConflict,
-+    /// 读回校验阶段注入一次「本地 VV 未覆盖快照」失败：用于验证失败标记、
-+    /// `begin` 拒绝续跑与 `abort` 清理路径（不改数据库里的真实数据）。
-+    VerifyVvNotCovered,
- }
- 
-+/// 故障注入伪造的 peer id（只在校验失败测试路径出现；不影响真实数据）。
-+const VERIFY_FAULT_PEER: u64 = 0x0BAD_5EED;
-+
++#[derive(Debug)]
  struct VerifiedDoc {
      doc_id: String,
      kind: u64,
-@@ -356,6 +374,19 @@ fn verify_bootstrap_anchor(
-     Ok(())
+@@ -211,6 +212,7 @@ struct VerifiedDoc {
+     text: Option<String>,
  }
  
-+/// 本地 pin 的**结构**校验：`control_hash` 与 `control_rev` 必须成对。
-+///
-+/// 只有 hash 没有 rev 是本地损坏（无法按 rev 选择同 rev/历史锚视图）；必须在
-+/// `validate_remote` 与 `finalize` 两条路径都检查，不能只在前者检查。
-+fn validate_pin_shape(pins: &BootstrapPins) -> Result<(), SyncError> {
-+    if pins.control_hash.is_some() && pins.control_rev.is_none() {
-+        return Err(SyncError::LocalCorrupt(
-+            "bootstrap pins 有 control_hash 但缺 control_rev",
-+        ));
-+    }
-+    Ok(())
++#[derive(Debug)]
+ struct VerifiedAsset {
+     object_id: [u8; 32],
+     real_sha256: [u8; 32],
+@@ -220,6 +222,7 @@ struct VerifiedAsset {
+ }
+ 
+ /// 选中的基线：manifest/docs/assets + 基线本身 + 结构语义。
++#[derive(Debug)]
+ struct SelectedBaseline {
+     checkpoint: BootstrapCheckpoint,
+     used_fallback: bool,
+@@ -229,6 +232,193 @@ struct SelectedBaseline {
+     structure_notes: BTreeMap<String, String>,
+ }
+ 
++/// bootstrap 写库阶段对游标/水位的推进策略。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum BootstrapAdvancement {
++    /// 新设备/普通 bootstrap：只允许前进，已有进度时保留旧游标（max 语义）。
++    MaxOnly,
++    /// Phase 1B 追赶：成功导入并证明 `integrated >= S` 后，把 relay cursor 前移到
++    /// 实际选中 checkpoint 的 cursor（S 覆盖已消费前缀）。
++    CatchUp,
 +}
 +
- /// relay 侧与本地 pins 的写前校验：任何不满足都必须在写库前失败。
- fn validate_remote(
++/// `catchup_prepare` 的结果：网络阶段已完成、**尚未写本地库**的基线。
++///
++/// 生命周期只到 `catchup_integrate`；内含快照/资产明文，不能持久化到磁盘/日志。
++#[derive(Debug)]
++pub struct PreparedBootstrap {
++    selected: SelectedBaseline,
++    state: RelayState,
++    chain: Vec<ManagerChainEntry>,
++    control_hash: [u8; 32],
++    pins: BootstrapPins,
++}
++
++impl PreparedBootstrap {
++    /// 实际选中的 checkpoint 覆盖水位 S（fallback 时是 fallback 的 S）。
++    #[must_use]
++    pub fn covered_seq(&self) -> u64 {
++        self.selected.checkpoint.covered_seq
++    }
++
++    /// 实际选中的 checkpoint 游标（fallback 时是 fallback 的 cursor）。
++    #[must_use]
++    pub fn checkpoint_cursor(&self) -> &str {
++        &self.selected.checkpoint.cursor
++    }
++
++    /// 是否使用了 fallback。
++    #[must_use]
++    pub fn used_fallback(&self) -> bool {
++        self.selected.used_fallback
++    }
++
++    /// 已选中的文档/资产数量（用于决策/报告，不暴露明文）。
++    #[must_use]
++    pub fn doc_count(&self) -> usize {
++        self.selected.docs.len()
++    }
++
++    /// 已选中的资产数量。
++    #[must_use]
++    pub fn asset_count(&self) -> usize {
++        self.selected.assets.len()
++    }
++
++    /// 已选中的文档 id（用于追赶后物化/报告；不含明文）。
++    #[must_use]
++    pub fn doc_ids(&self) -> Vec<String> {
++        self.selected
++            .docs
++            .iter()
++            .map(|doc| doc.doc_id.clone())
++            .collect()
++    }
++
++    /// 当前 relay log incarnation（追赶后清理 inbox 必须绑定它）。
++    #[must_use]
++    pub fn log_id(&self) -> [u8; 16] {
++        self.state.log_id
++    }
++
++    /// 快照明文字节估算（文档 Loro snapshot + 资产字节）；调用方按密文上限再乘
++    /// 安全系数，不能把它当成精确的 wire 字节数。
++    #[must_use]
++    pub fn estimated_snapshot_bytes(&self) -> u64 {
++        let docs = self
++            .selected
++            .docs
++            .iter()
++            .map(|doc| u64::try_from(doc.snapshot.loro_snapshot_bytes.len()).unwrap_or(u64::MAX))
++            .fold(0u64, u64::saturating_add);
++        let assets = self
++            .selected
++            .assets
++            .iter()
++            .map(|asset| asset.byte_len)
++            .fold(0u64, u64::saturating_add);
++        docs.saturating_add(assets)
++    }
++}
++
++/// 只下载 manifest 的预检结果（不下载 snapshot/asset，不写库）。
++///
++/// Phase 1B 机会性追赶先用它读实际选中 checkpoint 的 S / 明文字节估算；避免为了
++/// 一个十几 MB 的快照先下载整份数据再回退。
++#[derive(Debug)]
++pub struct BootstrapProbe {
++    checkpoint: BootstrapCheckpoint,
++    used_fallback: bool,
++    estimated_plain_bytes: u64,
++}
++
++impl BootstrapProbe {
++    /// 实际选中 checkpoint 的 S。
++    #[must_use]
++    pub fn covered_seq(&self) -> u64 {
++        self.checkpoint.covered_seq
++    }
++
++    /// 实际选中 checkpoint 的 cursor。
++    #[must_use]
++    pub fn checkpoint_cursor(&self) -> &str {
++        &self.checkpoint.cursor
++    }
++
++    /// 是否使用 fallback。
++    #[must_use]
++    pub fn used_fallback(&self) -> bool {
++        self.used_fallback
++    }
++
++    /// manifest 声明的明文字节（文档 + 资产）；不是 wire 密文字节。
++    #[must_use]
++    pub fn estimated_plain_bytes(&self) -> u64 {
++        self.estimated_plain_bytes
++    }
++}
++
++/// 只拉 manifest 的预检；选择逻辑与 `prepare` 相同，但不下载 snapshot/asset。
++pub fn probe<C: RelayClient>(
++    client: &mut C,
++    vault_id: [u8; 16],
++    root: &RootSecretV1,
++    pins: &BootstrapPins,
++) -> Result<BootstrapProbe, SyncError> {
++    if root.vault_id != vault_id {
++        return Err(SyncError::Object("bootstrap root 与 vault 不符"));
++    }
++    let bundle = client.bootstrap()?;
++    let state = client.state()?;
++    let chain = client.management_chain()?;
++    let control_hash = control_head_hash(&state, &chain);
++    validate_remote(vault_id, root, pins, &bundle, &state, &chain, &control_hash)?;
++
++    let mut last_error: Option<SyncError> = None;
++    for (checkpoint, used_fallback) in [
++        (bundle.primary.clone(), false),
++        (bundle.fallback.clone(), true),
++    ] {
++        let result = (|| {
++            if checkpoint.epoch != state.epoch || checkpoint.epoch != bundle.epoch {
++                return Err(SyncError::Object("bootstrap 基线 epoch 与 relay 不一致"));
++            }
++            if checkpoint.covered_seq > bundle.head_seq || checkpoint.covered_seq > state.head_seq {
++                return Err(SyncError::Object("bootstrap 基线 S 超过 relay head"));
++            }
++            if checkpoint.covered_seq < bundle.gc_floor || checkpoint.covered_seq < state.gc_floor {
++                return Err(SyncError::Object("bootstrap 基线 S 低于 relay GC floor"));
++            }
++            if checkpoint.cursor.is_empty() {
++                return Err(SyncError::Object("bootstrap 基线缺 relay 游标"));
++            }
++            let (manifest, digest) = fetch_manifest(client, root, &checkpoint)?;
++            verify_checkpoint_commit(client, &checkpoint, &manifest, &digest)?;
++            verify_manifest(&manifest, vault_id, &checkpoint, state.epoch)?;
++            let docs = manifest
++                .docs
++                .iter()
++                .map(|doc| doc.total_plain_len)
++                .fold(0u64, u64::saturating_add);
++            let assets = manifest
++                .assets
++                .iter()
++                .map(|asset| asset.byte_len)
++                .fold(0u64, u64::saturating_add);
++            Ok(BootstrapProbe {
++                checkpoint,
++                used_fallback,
++                estimated_plain_bytes: docs.saturating_add(assets),
++            })
++        })();
++        match result {
++            Ok(probe) => return Ok(probe),
++            Err(error) => last_error = Some(error),
++        }
++    }
++    Err(last_error.expect("bootstrap 至少尝试过一个基线"))
++}
++
+ /// 用已解出的 root 执行数据 bootstrap；本地 pins 从本库 meta 读取。
+ pub fn run<C: RelayClient>(
+     vault: &Vault,
+@@ -267,15 +457,17 @@ pub fn run_with_fault<C: RelayClient>(
+     run_inner(vault, client, vault_id, peer_id, root, &pins, Some(fault))
+ }
+ 
+-fn run_inner<C: RelayClient>(
++/// 网络准备阶段：选 checkpoint、下载/解密/验签/校验，**不写本地库**。
++///
++/// Phase 1B 的 `catchup_prepare` 直接复用它；不持写闸。
++pub fn prepare<C: RelayClient>(
+     vault: &Vault,
+     client: &mut C,
      vault_id: [u8; 16],
-@@ -366,6 +397,7 @@ fn validate_remote(
+     peer_id: u64,
+     root: &RootSecretV1,
+     pins: &BootstrapPins,
+-    fault: Option<BootstrapFault>,
+-) -> Result<BootstrapReport, SyncError> {
++) -> Result<PreparedBootstrap, SyncError> {
+     if root.vault_id != vault_id {
+         return Err(SyncError::Object("bootstrap root 与 vault 不符"));
+     }
+@@ -294,6 +486,7 @@ fn run_inner<C: RelayClient>(
+         (bundle.fallback.clone(), true),
+     ] {
+         match load_baseline(
++            vault,
+             client,
+             root,
+             vault_id,
+@@ -313,12 +506,41 @@ fn run_inner<C: RelayClient>(
+         }
+     }
+     let selected = selected.ok_or_else(|| last_error.expect("bootstrap 至少尝试过一个基线"))?;
++    Ok(PreparedBootstrap {
++        selected,
++        state,
++        chain,
++        control_hash,
++        pins: *pins,
++    })
++}
++
++/// 写库阶段：复用 `baseline_apply` 的 staging journal 与实际导入/读回校验/水位 CAS。
++///
++/// 调用方必须持有外部提交写闸；网络已在 [`prepare`] 完成。
++pub fn integrate(
++    vault: &Vault,
++    peer_id: u64,
++    prepared: &PreparedBootstrap,
++    advancement: BootstrapAdvancement,
++    fault: Option<BootstrapFault>,
++) -> Result<BootstrapReport, SyncError> {
++    let selected = &prepared.selected;
+ 
+     // 实际导入（staging journal 可续跑）；失败时 journal 保留，下一次按同一基线续跑。
+-    let report_docs = apply_selected(vault, peer_id, &selected, fault)?;
++    let report_docs = apply_selected(vault, peer_id, selected, fault)?;
+ 
+     // 全部实际写入 + 读回校验通过后，才在一个事务里推进水位（max 语义 + CAS）。
+-    finalize(vault, &selected, &state, &chain, &control_hash, pins, fault)?;
++    finalize(
++        vault,
++        selected,
++        &prepared.state,
++        &prepared.chain,
++        &prepared.control_hash,
++        &prepared.pins,
++        advancement,
++        fault,
++    )?;
+ 
+     // 成功后才清 staging journal；若这里失败，重试会幂等重放并再次清理。
+     let _cleared = abort_baseline_apply(vault)?;
+@@ -329,11 +551,30 @@ fn run_inner<C: RelayClient>(
+         used_fallback: selected.used_fallback,
+         docs: report_docs,
+         assets: selected.assets.len(),
+-        cursor: selected.checkpoint.cursor,
++        cursor: selected.checkpoint.cursor.clone(),
+         signed_checkpoint: true,
+     })
+ }
+ 
++fn run_inner<C: RelayClient>(
++    vault: &Vault,
++    client: &mut C,
++    vault_id: [u8; 16],
++    peer_id: u64,
++    root: &RootSecretV1,
++    pins: &BootstrapPins,
++    fault: Option<BootstrapFault>,
++) -> Result<BootstrapReport, SyncError> {
++    let prepared = prepare(vault, client, vault_id, peer_id, root, pins)?;
++    integrate(
++        vault,
++        peer_id,
++        &prepared,
++        BootstrapAdvancement::MaxOnly,
++        fault,
++    )
++}
++
+ /// 校验本地 durable bootstrap 锚（ADR 0013 §3；`validate_remote`/`finalize` 共用）。
+ ///
+ /// 两类视图必须分开，**不能**把旧 hash 挂到 `max(rev)` 上比较：
+@@ -578,7 +819,9 @@ fn push_optional_signature(input: &mut Vec<u8>, signature: Option<[u8; 64]>) {
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn load_baseline<C: RelayClient>(
++    vault: &Vault,
+     client: &mut C,
+     root: &RootSecretV1,
+     vault_id: [u8; 16],
+@@ -607,7 +850,7 @@ fn load_baseline<C: RelayClient>(
+     verify_manifest(&manifest, vault_id, checkpoint, state.epoch)?;
+     let docs = download_docs(client, root, peer_id, &manifest)?;
+     let structure_notes = verify_structure_semantics(&docs, peer_id)?;
+-    let assets = download_assets(client, root, &manifest)?;
++    let assets = download_assets(vault, client, root, &manifest)?;
+     Ok(SelectedBaseline {
+         checkpoint: checkpoint.clone(),
+         used_fallback: false,
+@@ -944,12 +1187,28 @@ fn verify_structure_semantics(
+ }
+ 
+ fn download_assets<C: RelayClient>(
++    vault: &Vault,
+     client: &mut C,
+     root: &RootSecretV1,
+     manifest: &ManifestV1,
+ ) -> Result<Vec<VerifiedAsset>, SyncError> {
+     let mut assets = Vec::with_capacity(manifest.assets.len());
+     for manifest_asset in &manifest.assets {
++        // 已有同 hash/长度的本地资产不重复下载；只拉缺失的（plan §8.2）。
++        if let Some(local) = menghunote_storage::asset_bytes(vault, manifest_asset.real_sha256)? {
++            if u64::try_from(local.len()).ok() == Some(manifest_asset.byte_len)
++                && <[u8; 32]>::from(Sha256::digest(&local)) == manifest_asset.real_sha256
++            {
++                assets.push(VerifiedAsset {
++                    object_id: manifest_asset.object_id,
++                    real_sha256: manifest_asset.real_sha256,
++                    byte_len: manifest_asset.byte_len,
++                    media_type: manifest_asset.media_type.clone(),
++                    data: local,
++                });
++                continue;
++            }
++        }
+         let expected = crate::checkpoint::asset_object_id(
+             root,
+             &manifest_asset.real_sha256,
+@@ -1161,9 +1420,9 @@ fn apply_selected(
+                 // 不能把原始 verify 错误替换成 marker 写错误：调用方需要根因；同时
+                 // 明确 marker 未持久化意味着 journal 仍可续跑，必须先 abort。
+                 return Err(SyncError::Storage(
+-                    menghunote_storage::StorageError::Corrupt {
++                    menghunote_storage::StorageError::SyncConflict {
+                         context: format!(
+-                            "baseline 读回校验失败：{error}；另外写失败标记也失败（{mark_error}），                             journal 仍可续跑，必须先 abort_baseline_apply"
++                            "baseline 读回校验失败：{error}；另外写失败标记也失败（{mark_error}），journal 仍可续跑，必须先 abort_baseline_apply"
+                         ),
+                     },
+                 ));
+@@ -1279,6 +1538,7 @@ fn verify_imported(
+ /// 只允许前进：`received/integrated = max(现有, S)`、`highwater = max(现有, pin, S)`；
+ /// 已有进度时保留现有 relay 游标（不把已消费的位置回退）。`instance/log_id/epoch/
+ /// control_rev/control_hash` 只允许前进或不变。任何一项回退都在**写事务之前**硬失败。
++#[allow(clippy::too_many_arguments)]
+ fn finalize(
+     vault: &Vault,
+     selected: &SelectedBaseline,
+@@ -1286,6 +1546,7 @@ fn finalize(
      chain: &[ManagerChainEntry],
      control_hash: &[u8; 32],
+     pins: &BootstrapPins,
++    advancement: BootstrapAdvancement,
+     fault: Option<BootstrapFault>,
  ) -> Result<(), SyncError> {
-+    validate_pin_shape(pins)?;
-     if state.vault_id != vault_id {
-         return Err(SyncError::RelayWire(
-             "bootstrap state.vault_id 与本地不一致",
-@@ -1052,8 +1084,15 @@ fn apply_selected(
-     let checkpoint_id = selected.checkpoint.checkpoint_id;
-     let baseline_s = selected.checkpoint.covered_seq;
-     let source_cursor = format!("{JOURNAL_SOURCE_PREFIX}{}", selected.checkpoint.cursor);
-+    // 完整性基准：本 checkpoint 覆盖的全部文档与资产都必须出现在 apply 批里。
-+    // 集合由 begin 记录，任何"少导入一批"的续跑都不会被误当成完整
-+    // （rotation 的 finish 会直接 Conflict；bootstrap 的 finalize 另有逐项读回校验）。
-+    let expected = BaselineExpectation::new(
-+        selected.docs.iter().map(|doc| doc.doc_id.clone()),
-+        selected.assets.iter().map(|asset| asset.object_id),
-+    );
-     reconcile_journal(vault, &checkpoint_id, baseline_s, &source_cursor)?;
--    begin_baseline_apply(vault, &checkpoint_id, baseline_s, &source_cursor)?;
-+    begin_baseline_apply(vault, &checkpoint_id, baseline_s, &source_cursor, &expected)?;
- 
-     // body → structure → asset（structure 投影依赖正文行已存在；与旧实现的顺序一致）。
-     let bodies: Vec<&VerifiedDoc> = selected
-@@ -1109,7 +1148,55 @@ fn apply_selected(
-         return Err(injected_fault());
+     let s = selected.checkpoint.covered_seq;
+@@ -1357,10 +1618,26 @@ fn finalize(
+         return Err(SyncError::LocalCorrupt("本地已有同步水位但缺 relay 游标"));
      }
+     // 已有进度时保留现有游标：baseline 的 cursor 只用于"从零开始"的设备，避免回退。
+-    let write_cursor = !has_progress;
++    // Phase 1B 追赶例外：导入并读回校验成功后，S 已覆盖旧前缀，允许前移到 checkpoint
++    // cursor（最终仍由后续 `advance_cursor` 条件约束，不能因低 S 回退）。
++    let write_cursor = !has_progress || advancement == BootstrapAdvancement::CatchUp;
  
--    verify_imported(vault, peer_id, selected)
-+    // 读回校验的耗时只作诊断指标（不参与决策）；失败也要记录。
-+    let verify_started = Instant::now();
-+    let verified = verify_imported(vault, peer_id, selected, fault);
-+    record_baseline_verify_time(verify_started.elapsed());
-+    match verified {
-+        Ok(report) => Ok(report),
-+        Err(error) => {
-+            // 不回滚已 merge 的 Loro/资产，也不改 journal.status（schema CHECK 只有
-+            // staging/completed）：只写失败标记，让下一次 begin 拒绝续跑，直到 abort。
-+            if let Err(mark_error) = mark_baseline_verify_failed(vault, &error.to_string()) {
-+                // 不能把原始 verify 错误替换成 marker 写错误：调用方需要根因；同时
-+                // 明确 marker 未持久化意味着 journal 仍可续跑，必须先 abort。
-+                return Err(SyncError::Storage(
-+                    menghunote_storage::StorageError::Corrupt {
-+                        context: format!(
-+                            "baseline 读回校验失败：{error}；另外写失败标记也失败（{mark_error}），                             journal 仍可续跑，必须先 abort_baseline_apply"
-+                        ),
-+                    },
-+                ));
-+            }
-+            Err(error)
+     let mut statements = Vec::new();
+     let mut guards = Vec::new();
++    // 已有进度时不改写 cursor，但仍要 CAS 自写回一次：若并发写者在读完
++    // current_cursor 之后改写了 sync.relay_cursor，这里必须 Conflict，而不是静默
++    // 放过一个已经变化的游标。
++    if !write_cursor {
++        if let Some(cursor) = current_cursor.as_deref() {
++            push_meta_cas_bytes(
++                &mut statements,
++                &mut guards,
++                RELAY_CURSOR_META,
++                Some(cursor),
++                cursor,
++            );
 +        }
 +    }
-+}
-+
-+/// 单篇文档的读回校验：导出点 VV ⊆ 当前本地 VV，且仅在无本地 extra 时比较正文。
-+///
-+/// - 方向固定为「快照/导出点 VV 必须被本地 VV 覆盖」：`actual_vv.sub_iter(local_vv)`
-+///   为空才通过；**不要求相等**。导出点之后本地新增的 op 是合法编辑（verify 不与编辑
-+///   互斥），相等比较会把它误判成失败；
-+/// - 只有 `local_vv ⊆ actual_vv`（本地没有快照之外的 op）时，Loro 才保证本地正文等于
-+///   快照正文，此时才做逐字节比较；有本地 extra 时正文必然已被合并改写，比较必然误报。
-+fn check_imported_doc(
-+    actual_vv: &VersionVector,
-+    local_vv: &VersionVector,
-+    expected_text: Option<&str>,
-+    actual_text: &str,
-+) -> Result<(), &'static str> {
-+    if actual_vv.sub_iter(local_vv).next().is_some() {
-+        return Err("bootstrap 导入后本地 VV 未覆盖快照");
-+    }
-+    if local_vv.sub_iter(actual_vv).next().is_none() {
-+        if let Some(expected) = expected_text {
-+            if expected != actual_text {
-+                return Err("bootstrap 后正文与快照不一致");
-+            }
-+        }
-+    }
-+    Ok(())
+     if cursor_state.log_id.is_none() {
+         push_meta_insert_absent(
+             &mut statements,
+@@ -1570,7 +1847,7 @@ fn read_meta_array<const N: usize>(vault: &Vault, key: &str) -> Result<Option<[u
+         Some(bytes) => bytes
+             .try_into()
+             .map(Some)
+-            .map_err(|_| SyncError::Object("bootstrap 本地 pin 长度非法")),
++            .map_err(|_| SyncError::LocalCorrupt("bootstrap 本地 pin 长度非法")),
+     }
  }
  
- /// 读回校验：本地 VV 必须覆盖快照、正文/结构投影/资产必须与快照一致。
-@@ -1117,27 +1204,38 @@ fn verify_imported(
-     vault: &Vault,
-     peer_id: u64,
-     selected: &SelectedBaseline,
-+    fault: Option<BootstrapFault>,
- ) -> Result<Vec<(String, Option<String>)>, SyncError> {
-     let mut body_texts: BTreeMap<String, String> = BTreeMap::new();
--    for doc in selected.docs.iter().filter(|doc| doc.kind == KIND_BODY) {
-+    for (index, doc) in selected
-+        .docs
-+        .iter()
-+        .filter(|doc| doc.kind == KIND_BODY)
-+        .enumerate()
-+    {
-         let (body, head) = load_body_doc(vault, &doc.doc_id, peer_id, None)?;
-         let local_vv = head.version_vector()?;
--        if doc.actual_vv.sub_iter(&local_vv).next().is_some() {
--            return Err(SyncError::Object("bootstrap 导入后本地 VV 未覆盖快照"));
--        }
-+        // 测试故障注入：伪造一个「导出点有、本地没有」的 op，制造真实的 VV 未覆盖失败。
-+        let actual_vv = if fault == Some(BootstrapFault::VerifyVvNotCovered) && index == 0 {
-+            let mut mismatched = doc.actual_vv.clone();
-+            mismatched.insert(VERIFY_FAULT_PEER, 1);
-+            mismatched
-+        } else {
-+            doc.actual_vv.clone()
-+        };
-         let text = body.text();
--        // 本地没有快照之外的 op 时，正文必须与快照逐字节一致（合并过的正文由 Loro 保证）。
--        if local_vv.sub_iter(&doc.actual_vv).next().is_none() {
--            if let Some(expected) = &doc.text {
--                if expected != &text {
--                    return Err(SyncError::Object("bootstrap 后正文与快照不一致"));
--                }
--            }
-+        if let Err(reason) = check_imported_doc(&actual_vv, &local_vv, doc.text.as_deref(), &text) {
-+            return Err(SyncError::Object(reason));
-         }
-         body_texts.insert(doc.doc_id.clone(), text);
-     }
- 
-     // 结构重放一致性 + 基线声明的每篇笔记都已投影且正文存在。
-+    //
-+    // `StructureSnapshot` 是**全量节点**（including deleted），删除是 grow-only meta
-+    // 事件而不是 LoroTree::delete；因此本地并发删除基线笔记不会让这里缺项，也不会
-+    // 误写失败 marker。verify 只要求“基线声明的 note/body 仍存在”，不把 deleted 当作
-+    // 结构缺失；这是当前产品语义（删笔记不删正文，恢复仍可用）。
-     let (structure, _head) = load_structure(vault, peer_id)?;
-     let merged = structure.snapshot()?;
-     let merged_notes: BTreeMap<&str, &str> = merged
-@@ -1203,6 +1301,7 @@ fn finalize(
-         }
-     }
-     let stored = BootstrapPins::from_vault(vault)?;
-+    validate_pin_shape(&stored)?;
-     if let Some(instance) = stored.instance_id {
-         if instance != state.instance_id {
-             return Err(SyncError::Object("bootstrap 不允许更换 relay instance"));
-@@ -1230,6 +1329,13 @@ fn finalize(
-             ));
-         }
-     }
-+    if let Some(highwater) = stored.highwater {
-+        if highwater > state.head_seq {
-+            return Err(SyncError::Paused(
-+                crate::relay::PauseReason::RollbackDetected,
-+            ));
-+        }
-+    }
- 
-     let current_cursor = vault.get_meta(RELAY_CURSOR_META)?;
-     let raw_received = vault.get_meta(META_SYNC_RECEIVED_SEQ)?;
-@@ -1478,6 +1584,10 @@ fn read_meta_u64(vault: &Vault, key: &str) -> Result<Option<u64>, SyncError> {
- #[cfg(test)]
- mod tests {
-     use super::*;
-+    use menghunote_storage::{
-+        append_updates, baseline_verify_failure, create_body_doc, load_head, StorageError,
-+        UpdateRecord,
-+    };
- 
-     fn manifest(key_epoch: u64, total_plain_len: u64) -> ManifestV1 {
-         ManifestV1 {
-@@ -1507,6 +1617,20 @@ mod tests {
+@@ -1617,6 +1894,19 @@ mod tests {
          Sha256::digest(refs_digest_input(&manifest_refs(value)).expect("refs")).into()
      }
  
 +    #[test]
-+    fn pin_shape_rejects_hash_without_rev_on_both_paths() {
-+        let pins = BootstrapPins {
-+            control_hash: Some([0x42; 32]),
-+            control_rev: None,
-+            ..BootstrapPins::default()
-+        };
-+        let error = validate_pin_shape(&pins).expect_err("hash 无 rev 必须拒绝");
++    fn read_meta_array_rejects_wrong_length_as_local_corrupt() {
++        let (_dir, vault) = fresh_vault();
++        vault
++            .set_meta(META_BOOTSTRAP_EPOCH, b"short")
++            .expect("写坏 pin");
++        let error = BootstrapPins::from_vault(&vault).expect_err("短 pin 必须拒绝");
 +        assert!(
 +            matches!(error, SyncError::LocalCorrupt(_)),
-+            "应当是 LocalCorrupt，实际 {error:?}"
++            "pin 长度非法必须是 LocalCorrupt，实际 {error:?}"
 +        );
 +    }
 +
      #[test]
-     fn manifest_key_epoch_or_total_len_tamper_changes_refs_digest() {
-         let base = digest(&manifest(1, 100));
-@@ -1599,6 +1723,42 @@ mod tests {
-         );
-     }
- 
-+    #[test]
-+    fn verify_accepts_concurrent_local_edits_after_export() {
-+        // 导出点（快照）VV：peer 7 有 2 个 op、peer 8 有 1 个。
-+        let mut exported_vv = VersionVector::new();
-+        exported_vv.insert(7, 2);
-+        exported_vv.insert(8, 1);
+     fn pin_shape_rejects_hash_without_rev_on_both_paths() {
+         let pins = BootstrapPins {
+diff --git a/crates/sync/src/catchup.rs b/crates/sync/src/catchup.rs
+new file mode 100644
+index 0000000..2b23a0b
+--- /dev/null
++++ b/crates/sync/src/catchup.rs
+@@ -0,0 +1,364 @@
++//! Phase 1B：checkpoint 快速追赶（双模式 + prepare/integrate 拆分）。
++//!
++//! 约束见 `docs/notes/sync-fast-catchup-plan.md` §9：
++//! - **Mandatory**：`gc_floor > received_seq`，普通 pull 必然 `CursorExpired`；不受
++//!   机会性快照上限拦截，失败进入明确 `Paused`，禁止回退普通 pull。
++//! - **Opportunistic**：`S - received_seq >= N_min` 且快照密文估算不超过 16 MiB；
++//!   任一不满足走普通聚合 pull。
++//! - 网络/下载/验签在 [`prepare`]（不持写闸）；写库/水位/游标在 [`integrate`]（调用方
++//!   持外部提交闸）。本模块不碰 wire/schema。
 +
-+        // 导出点之后本地继续编辑：当前 VV 严格包含导出点，但不相等。
-+        let mut local_vv = exported_vv.clone();
-+        local_vv.insert(9, 1);
-+        assert_ne!(local_vv, exported_vv);
-+        check_imported_doc(
-+            &exported_vv,
-+            &local_vv,
-+            Some("导出点正文"),
-+            "导出点正文 + 本地新编辑",
-+        )
-+        .expect("导出点 VV ⊆ 当前 VV 时必须接受并发本地编辑（不要求相等）");
++use menghunote_storage::{sync_cursor_state, Vault};
 +
-+        // 没有本地 extra（VV 相等）时才逐字节比较正文：不一致必须失败。
-+        assert!(
-+            check_imported_doc(&exported_vv, &exported_vv, Some("期望正文"), "实际正文").is_err(),
-+            "无本地 extra 时正文不一致必须失败"
-+        );
-+        check_imported_doc(&exported_vv, &exported_vv, Some("同一正文"), "同一正文")
-+            .expect("无本地 extra 且正文一致必须通过");
++use crate::bootstrap::{self, BootstrapPins, PreparedBootstrap};
++use crate::error::SyncError;
++use crate::relay::{RelayClient, RelayState};
 +
-+        // 当前 VV 缺少导出点里的 op：方向不能反（不是相等/双向比较）。
-+        let mut missing_vv = VersionVector::new();
-+        missing_vv.insert(7, 2);
-+        assert!(
-+            check_imported_doc(&exported_vv, &missing_vv, Some("正文"), "正文").is_err(),
-+            "导出点 VV 未被本地覆盖时必须失败"
-+        );
-+    }
++/// 机会性追赶的最小事件差（plan §9.1）。
++pub const DEFAULT_N_MIN: u64 = 25_000;
++/// 机会性追赶的快照密文硬上限（plan §9.1）。
++pub const DEFAULT_OPPORTUNISTIC_MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
++/// 明文快照 → 密文的保守安全系数（信封/分片/编码开销）。
++const SNAPSHOT_CIPHERTEXT_FACTOR: u64 = 2;
 +
-     #[test]
-     fn full_history_is_mandatory() {
-         let (loro, vv, frontier) = document();
-@@ -1706,4 +1866,165 @@ mod tests {
-         };
-         assert_ne!(control_head_hash(&state, &[entry]), base);
-     }
++/// 追赶模式。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum CatchUpMode {
++    /// 游标已过期，必须用 checkpoint 才能继续。
++    Mandatory,
++    /// 落后足够多且快照成本可接受，主动追赶。
++    Opportunistic,
++}
 +
-+    /// 单测用的临时 vault：lib 单测没有编译期 `CARGO_TARGET_TMPDIR`，回退到仓库 `target/tmp`。
-+    fn fresh_vault() -> (tempfile::TempDir, Vault) {
-+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
-+            .map(std::path::PathBuf::from)
-+            .unwrap_or_else(|| {
-+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")
-+            });
-+        std::fs::create_dir_all(&base).expect("创建 target/tmp");
-+        let dir = tempfile::Builder::new()
-+            .prefix("bootstrap-gate-")
-+            .tempdir_in(&base)
-+            .expect("创建临时目录");
-+        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开 vault");
-+        (dir, vault)
-+    }
++/// 追赶阈值。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct CatchUpConfig {
++    /// 机会性追赶的最小事件差。
++    pub n_min: u64,
++    /// 机会性追赶允许的快照密文字节上限。
++    pub opportunistic_max_snapshot_bytes: u64,
++}
 +
-+    /// 基线 staging 的预期参与集合（本文件两个用例都只声明文档）。
-+    fn expectation(docs: &[&str]) -> BaselineExpectation {
-+        BaselineExpectation::new(
-+            docs.iter().map(|doc_id| (*doc_id).to_owned()),
-+            std::iter::empty::<[u8; 32]>(),
-+        )
-+    }
-+
-+    /// 生成一份基线快照（另一个 peer 的空文档，只含给定正文）。
-+    fn baseline_snapshot(doc_id: &str, peer_id: u64, text: &str) -> Vec<u8> {
-+        let doc = BodyDoc::create(doc_id, peer_id).expect("创建基线 LoroDoc");
-+        doc.insert_scalars(0, text).expect("写基线正文");
-+        doc.export_snapshot().expect("导出基线 snapshot")
-+    }
-+
-+    /// 在本地先提交一条正文 update（证明 abort 不会丢本地已 merge 的 op）。
-+    fn seed_local_body(vault: &Vault, doc_id: &str, peer_id: u64, text: &str) {
-+        create_body_doc(vault, doc_id).expect("建 loro_docs 行");
-+        let doc = BodyDoc::create(doc_id, peer_id).expect("创建本地 BodyDoc");
-+        doc.insert_scalars(0, text).expect("写本地正文");
-+        let head = load_head(vault, doc_id).expect("读本地 head");
-+        let base = head.version_vector().expect("解码 head_vv");
-+        let update = doc.pending_update(&base).expect("导出本地增量");
-+        append_updates(
-+            vault,
-+            doc_id,
-+            head.head_seq,
-+            &[UpdateRecord::new("local-merge", update)],
-+        )
-+        .expect("提交本地增量");
-+    }
-+
-+    #[test]
-+    fn reconcile_journal_auto_aborts_bootstrap_staging_and_clears_marker() {
-+        let (_dir, vault) = fresh_vault();
-+        // 本地先有一份正文；随后 baseline 批次与它 merge（staging 里已有 merged 数据）。
-+        seed_local_body(&vault, "doc-merged", 0xA11CE, "local-merged|");
-+        begin_baseline_apply(
-+            &vault,
-+            &[1; 16],
-+            10,
-+            "bootstrap:relay-cursor-10",
-+            &expectation(&["doc-merged"]),
-+        )
-+        .expect("begin bootstrap staging");
-+        let applied = apply_baseline_batch(
-+            &vault,
-+            &[(
-+                "doc-merged".to_owned(),
-+                baseline_snapshot("doc-merged", 0xB0B, "baseline-merged"),
-+            )],
-+            &[],
-+        )
-+        .expect("merge baseline snapshot");
-+        assert_eq!(applied.applied_docs, 1, "前置条件：基线批次已 merge");
-+        mark_baseline_verify_failed(&vault, "读回校验失败：注入").expect("写失败标记");
-+        assert!(
-+            baseline_apply_state(&vault).expect("state").is_some(),
-+            "前置条件：staging journal 必须存在"
-+        );
-+
-+        // 换新基线（checkpoint / S / source 全不同）：bootstrap staging 必须 auto-abort。
-+        reconcile_journal(&vault, &[2; 16], 20, "bootstrap:relay-cursor-20")
-+            .expect("bootstrap 换基线应 auto-abort 旧 staging");
-+
-+        assert!(
-+            baseline_apply_state(&vault).expect("state").is_none(),
-+            "auto-abort 后 staging journal 必须清除"
-+        );
-+        assert_eq!(
-+            baseline_verify_failure(&vault).expect("读失败标记"),
-+            None,
-+            "auto-abort 必须同时清除 verify 失败标记"
-+        );
-+        // 已 merge 的 Loro 数据保留（abort 只清 journal，不回滚 CRDT merge）。
-+        let (merged, _) =
-+            load_body_doc(&vault, "doc-merged", 0xA11CE, None).expect("读回 merged 文档");
-+        let merged_text = merged.text();
-+        assert!(
-+            merged_text.contains("local-merged"),
-+            "auto-abort 不得丢本地已 merge 的 op，实际={merged_text:?}"
-+        );
-+        assert!(
-+            merged_text.contains("baseline-merged"),
-+            "auto-abort 不得回滚已 merge 的基线数据，实际={merged_text:?}"
-+        );
-+        // 新基线可以直接 begin（旧 journal/marker 不会挡住续跑）。
-+        let reopened = begin_baseline_apply(
-+            &vault,
-+            &[2; 16],
-+            20,
-+            "bootstrap:relay-cursor-20",
-+            &expectation(&["doc-merged"]),
-+        )
-+        .expect("auto-abort 后必须能以新基线重新 begin");
-+        assert_eq!(reopened.status, BaselineApplyStatus::Staging);
-+        assert_eq!(reopened.applied_docs, 0, "新基线应是全新 journal");
-+    }
-+
-+    #[test]
-+    fn reconcile_journal_refuses_rotation_staging_without_abort() {
-+        // 轮换的 baseline apply 传空 source（rotation_apply.rs）；非 bootstrap 前缀同样拒绝。
-+        for source_cursor in ["", "rotation:custom"] {
-+            let (_dir, vault) = fresh_vault();
-+            begin_baseline_apply(
-+                &vault,
-+                &[3; 16],
-+                5,
-+                source_cursor,
-+                &expectation(&["doc-rotation"]),
-+            )
-+            .expect("begin rotation staging");
-+            mark_baseline_verify_failed(&vault, "轮换中的失败标记").expect("写失败标记");
-+
-+            let error = reconcile_journal(&vault, &[4; 16], 9, "bootstrap:relay-cursor-9")
-+                .expect_err("不得 auto-abort 非 bootstrap 的 staging");
-+            match &error {
-+                SyncError::Storage(StorageError::SyncConflict { context }) => {
-+                    assert!(
-+                        context.contains("非 bootstrap"),
-+                        "错误必须点明拒绝原因，实际：{context}"
-+                    );
-+                }
-+                other => panic!("应当拒绝为 SyncConflict，实际 {other:?}"),
-+            }
-+
-+            // journal 与失败标记都必须原样保留：绝不能被误当成 bootstrap 的 staging 清掉。
-+            let state = baseline_apply_state(&vault)
-+                .expect("state")
-+                .expect("轮换 journal 必须保留");
-+            assert_eq!(state.status, BaselineApplyStatus::Staging);
-+            assert_eq!(state.checkpoint_id, [3; 16]);
-+            assert_eq!(state.baseline_s, 5);
-+            assert_eq!(state.source_cursor, source_cursor);
-+            assert!(!state.finishable, "失败标记存在时不得 finishable");
-+            assert_eq!(
-+                baseline_verify_failure(&vault)
-+                    .expect("读失败标记")
-+                    .as_deref(),
-+                Some("轮换中的失败标记"),
-+                "拒绝 auto-abort 时绝不能误清失败标记"
-+            );
++impl Default for CatchUpConfig {
++    fn default() -> Self {
++        Self {
++            n_min: DEFAULT_N_MIN,
++            opportunistic_max_snapshot_bytes: DEFAULT_OPPORTUNISTIC_MAX_SNAPSHOT_BYTES,
 +        }
 +    }
++}
++
++/// 一次追赶决策（只读，不含明文）。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct CatchUpDecision {
++    /// 强制或机会性。
++    pub mode: CatchUpMode,
++    /// 实际选中 checkpoint 的覆盖水位 S。
++    pub checkpoint_s: u64,
++    /// `S - received_seq`（饱和）。
++    pub gap_events: u64,
++    /// 快照明文字节估算（已乘安全系数）。
++    pub estimated_snapshot_bytes: u64,
++}
++
++/// 是否值得进入网络准备（避免正常近端同步无条件下载整份快照）。
++///
++/// 强制条件用 `gc_floor > received`；机会性先用 `head_seq - received` 做上界，
++/// 真正的 `S - received` 与快照上限在 [`prepare`] 拿到实际 checkpoint 后再判。
++#[must_use]
++pub fn should_attempt(state: &RelayState, local_received_seq: u64, config: &CatchUpConfig) -> bool {
++    state.gc_floor > local_received_seq
++        || state.head_seq.saturating_sub(local_received_seq) >= config.n_min
++}
++
++/// 决策：只依赖 relay state / 本地 received / 实际选中 checkpoint S / 快照估算。
++///
++/// 强制模式不受快照上限拦截；机会性必须同时满足事件差和快照上限。
++#[must_use]
++pub fn decide(
++    state: &RelayState,
++    local_received_seq: u64,
++    checkpoint_s: u64,
++    estimated_snapshot_bytes: u64,
++    config: &CatchUpConfig,
++) -> Option<CatchUpDecision> {
++    let gap_events = checkpoint_s.saturating_sub(local_received_seq);
++    if state.gc_floor > local_received_seq {
++        return Some(CatchUpDecision {
++            mode: CatchUpMode::Mandatory,
++            checkpoint_s,
++            gap_events,
++            estimated_snapshot_bytes,
++        });
++    }
++    if gap_events >= config.n_min
++        && estimated_snapshot_bytes <= config.opportunistic_max_snapshot_bytes
++    {
++        return Some(CatchUpDecision {
++            mode: CatchUpMode::Opportunistic,
++            checkpoint_s,
++            gap_events,
++            estimated_snapshot_bytes,
++        });
++    }
++    None
++}
++
++/// 已下载/校验、尚未写库的追赶候选。
++#[derive(Debug)]
++pub struct CatchUpPrepared {
++    prepared: PreparedBootstrap,
++    decision: CatchUpDecision,
++}
++
++impl CatchUpPrepared {
++    /// 决策。
++    #[must_use]
++    pub fn decision(&self) -> CatchUpDecision {
++        self.decision
++    }
++
++    /// 实际选中 checkpoint 的 S。
++    #[must_use]
++    pub fn checkpoint_s(&self) -> u64 {
++        self.prepared.covered_seq()
++    }
++
++    /// 实际选中 checkpoint 的 cursor。
++    #[must_use]
++    pub fn checkpoint_cursor(&self) -> &str {
++        self.prepared.checkpoint_cursor()
++    }
++
++    /// 是否使用 fallback。
++    #[must_use]
++    pub fn used_fallback(&self) -> bool {
++        self.prepared.used_fallback()
++    }
++
++    /// 已选中文档数。
++    #[must_use]
++    pub fn doc_count(&self) -> usize {
++        self.prepared.doc_count()
++    }
++
++    /// 已选中资产数。
++    #[must_use]
++    pub fn asset_count(&self) -> usize {
++        self.prepared.asset_count()
++    }
++}
++
++/// 追赶写库报告（不含明文）。
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CatchUpReport {
++    /// 模式。
++    pub mode: CatchUpMode,
++    /// 实际选中 checkpoint 的 S。
++    pub checkpoint_s: u64,
++    /// 是否使用 fallback。
++    pub used_fallback: bool,
++    /// 导入文档 id（用于追赶后物化；不含明文）。
++    pub docs: Vec<String>,
++    /// 导入资产数。
++    pub assets: usize,
++    /// 清理的 inbox 行数（仅在 integrated>=S 后）。
++    pub pruned_inbox: usize,
++    /// 写闸内耗时（毫秒）；只记录，不自动中止。
++    pub gate_hold_ms: u64,
++}
++
++/// 网络准备：选 checkpoint、下载/验签/校验，**不写本地库**。
++///
++/// 返回 `None` 表示不需要追赶（普通 pull 更便宜）；调用方应继续普通 pull。
++pub fn prepare<C: RelayClient>(
++    vault: &Vault,
++    client: &mut C,
++    vault_id: [u8; 16],
++    peer_id: u64,
++    root: &crate::keys::RootSecretV1,
++    pins: &BootstrapPins,
++    config: &CatchUpConfig,
++) -> Result<Option<CatchUpPrepared>, SyncError> {
++    let local = sync_cursor_state(vault)?;
++    let state = client.state()?;
++    if state.vault_id != vault_id {
++        return Err(SyncError::RelayWire("state.vault_id 与本地不一致"));
++    }
++    if let Some(log_id) = local.log_id {
++        if log_id != state.log_id {
++            return Err(SyncError::Paused(crate::relay::PauseReason::LogIdChanged));
++        }
++    }
++    if state.epoch != root.key_epoch {
++        return Err(SyncError::Paused(crate::relay::PauseReason::EpochMismatch));
++    }
++
++    // 1) 只拉 manifest 预检：先在真正下载快照之前用实际选中 checkpoint 的 S/明文字节
++    //    判断机会性是否值得；不满足直接回普通 pull，不浪费带宽。
++    let probe = match bootstrap::probe(client, vault_id, root, pins) {
++        Ok(probe) => probe,
++        Err(error) => {
++            if state.gc_floor > local.received_seq {
++                eprintln!("[sync] mandatory catchup probe failed: {error}");
++                return Err(SyncError::Paused(crate::relay::PauseReason::CatchupFailed));
++            }
++            eprintln!("[sync] opportunistic catchup probe failed, fallback to pull: {error}");
++            return Ok(None);
++        }
++    };
++    let probe_estimated = probe
++        .estimated_plain_bytes()
++        .saturating_mul(SNAPSHOT_CIPHERTEXT_FACTOR);
++    if decide(
++        &state,
++        local.received_seq,
++        probe.covered_seq(),
++        probe_estimated,
++        config,
++    )
++    .is_none()
++    {
++        return Ok(None);
++    }
++
++    // 2) 预检通过后才下载 snapshot/缺失资产。fallback 可能和预检不同，实际 S/字节
++    //    必须在下载完成后再判一次；mandatory 仍不受机会性上限拦截。
++    let prepared = match bootstrap::prepare(vault, client, vault_id, peer_id, root, pins) {
++        Ok(prepared) => prepared,
++        Err(error) => {
++            if state.gc_floor > local.received_seq {
++                eprintln!("[sync] mandatory catchup prepare failed: {error}");
++                return Err(SyncError::Paused(crate::relay::PauseReason::CatchupFailed));
++            }
++            eprintln!("[sync] opportunistic catchup prepare failed, fallback to pull: {error}");
++            return Ok(None);
++        }
++    };
++    let actual_estimated = prepared
++        .estimated_snapshot_bytes()
++        .saturating_mul(SNAPSHOT_CIPHERTEXT_FACTOR);
++    let Some(actual_decision) = decide(
++        &state,
++        local.received_seq,
++        prepared.covered_seq(),
++        actual_estimated,
++        config,
++    ) else {
++        // 预检主基线可接受，实际 fallback 超限：丢弃已下载快照，走普通 pull。
++        return Ok(None);
++    };
++    Ok(Some(CatchUpPrepared {
++        prepared,
++        decision: actual_decision,
++    }))
++}
++
++/// 写库：baseline_apply → finish/游标 CAS → 清理已覆盖 inbox。
++///
++/// 调用方必须持有外部提交写闸；网络已在 [`prepare`] 完成。
++pub fn integrate(
++    vault: &Vault,
++    peer_id: u64,
++    prepared: &CatchUpPrepared,
++) -> Result<CatchUpReport, SyncError> {
++    let started = std::time::Instant::now();
++    let report = bootstrap::integrate(
++        vault,
++        peer_id,
++        &prepared.prepared,
++        bootstrap::BootstrapAdvancement::CatchUp,
++        None,
++    )?;
++    let cursor = sync_cursor_state(vault)?;
++    if cursor.integrated_seq < report.covered_seq {
++        return Err(SyncError::LocalCorrupt(
++            "catchup integrate 返回成功但 integrated_seq 未覆盖 checkpoint S",
++        ));
++    }
++    let pruned = menghunote_storage::prune_covered_inbox(
++        vault,
++        &prepared.prepared.log_id(),
++        report.covered_seq,
++    )?;
++    let gate_hold_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
++    if gate_hold_ms > 3_000 {
++        eprintln!("[sync] catchup gate_hold_ms={gate_hold_ms} 超过 3s 预算（只记录，未自动中止）");
++    }
++    Ok(CatchUpReport {
++        mode: prepared.decision.mode,
++        checkpoint_s: report.covered_seq,
++        used_fallback: report.used_fallback,
++        docs: report.docs.into_iter().map(|(doc_id, _)| doc_id).collect(),
++        assets: report.assets,
++        pruned_inbox: pruned,
++        gate_hold_ms,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn state(head_seq: u64, gc_floor: u64) -> RelayState {
++        RelayState {
++            vault_id: [1; 16],
++            log_id: [2; 16],
++            instance_id: [3; 16],
++            epoch: 1,
++            control_rev: 0,
++            auth_rev: 0,
++            head_seq,
++            gc_floor,
++            current_rotation_id: None,
++        }
++    }
++
++    #[test]
++    fn mandatory_wins_even_when_snapshot_exceeds_opportunistic_cap() {
++        let decision = decide(
++            &state(100_000, 11_000),
++            10_000,
++            90_000,
++            u64::MAX,
++            &CatchUpConfig::default(),
++        )
++        .expect("过期游标必须强制追赶");
++        assert_eq!(decision.mode, CatchUpMode::Mandatory);
++        assert_eq!(decision.gap_events, 80_000);
++    }
++
++    #[test]
++    fn opportunistic_requires_n_min_and_snapshot_cap() {
++        let config = CatchUpConfig::default();
++        let below_min = decide(&state(100_000, 0), 99_000, 99_000, 1, &config);
++        assert!(below_min.is_none(), "事件差不足不得机会性追赶");
++
++        let ok = decide(
++            &state(100_000, 0),
++            70_000,
++            95_000,
++            16 * 1024 * 1024,
++            &config,
++        )
++        .expect("25k 且快照正好 16MiB 应允许");
++        assert_eq!(ok.mode, CatchUpMode::Opportunistic);
++
++        let too_big = decide(
++            &state(100_000, 0),
++            70_000,
++            95_000,
++            16 * 1024 * 1024 + 1,
++            &config,
++        );
++        assert!(too_big.is_none(), "超过机会性快照上限必须回退普通 pull");
++    }
++
++    #[test]
++    fn should_attempt_only_for_expired_or_large_gap() {
++        let config = CatchUpConfig::default();
++        assert!(should_attempt(&state(100_000, 0), 75_000, &config));
++        assert!(!should_attempt(&state(100_000, 0), 90_000, &config));
++        assert!(should_attempt(&state(100_000, 20_000), 10_000, &config));
++    }
++}
+diff --git a/crates/sync/src/dev_local.rs b/crates/sync/src/dev_local.rs
+index dfe97b5..98a75ec 100644
+--- a/crates/sync/src/dev_local.rs
++++ b/crates/sync/src/dev_local.rs
+@@ -210,7 +210,7 @@ pub struct RevokedDevice {
  }
-diff --git a/crates/sync/src/engine.rs b/crates/sync/src/engine.rs
-index 67ebbc8..75fcadd 100644
---- a/crates/sync/src/engine.rs
-+++ b/crates/sync/src/engine.rs
-@@ -170,7 +170,10 @@ pub struct PushReport {
- /// - relay 上对象已完整（例如 checkpoint/轮换/另一台设备传过）时按确定性密文逐片
- ///   校验后只做提交/落标记，不重传分片；分片缺失时只补缺失片（已 durable 的片不重传）。
- /// - 对象被其它 reservation 持有时整条资产**延后**（`deferred`），不阻塞正文/结构同步，
--///   下一轮再试；网络/单资产损坏计入 `failed`，同样不阻塞本轮。
-+///   下一轮再试；relay/对象校验失败计入 `failed`，同样不阻塞本轮。
-+/// - **本地库损坏**（[`SyncError::LocalCorrupt`]，例如字节长度/哈希与元数据不一致）不是
-+///   可重试的网络失败：继续扫完其余健康资产后，把首个损坏原样上抛，见
-+///   [`SyncEngine::upload_pending_assets`]。
- #[derive(Debug, Clone, Default, PartialEq, Eq)]
- pub struct AssetSyncReport {
-     /// 被正文引用、有明文的资产数（本轮扫描口径）。
-@@ -187,7 +190,10 @@ pub struct AssetSyncReport {
-     pub reused_existing: usize,
-     /// 被其它 reservation 持有、需下一轮再试的资产数。
-     pub deferred: usize,
--    /// 单资产失败数（网络/校验失败；不阻塞正文同步，下一轮重试）。
-+    /// 单资产 relay/对象校验失败数（不阻塞正文同步，下一轮重试）。
-+    ///
-+    /// **本地库损坏不计入这里**：`LocalCorrupt` 每轮重试都不会自愈，会掩盖真正的
-+    /// "需要本地修复"状态，因此整轮上抛而不是伪装成可重试失败。
-     pub failed: usize,
-     /// 元数据不可用或空数据而跳过的资产数（不上传空资产）。
-     pub skipped_invalid: usize,
-@@ -1091,12 +1097,19 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
-     /// 阶段 2b：**增量上传被正文引用的本地资产**（正文推送之后、拉取之前）。
-     ///
-     /// 顺序是刻意的（ADR 0012 的两阶段路径也复用本方法）：
--    /// - 正文/结构更新先 `push`，资产后置；单条资产失败只计入
-+    /// - 正文/结构更新先 `push`，资产后置；单条资产 relay/对象校验失败只计入
-     ///   [`AssetSyncReport::failed`]，**不阻塞**本轮正文交付；
-     /// - 资产在 `pull` 之前完成，远端设备下一次 pull 就能同时拿到正文与 ASSET 事件；
-     /// - 已有 durable 标记的资产不读字节、不发请求；relay 上已完整的对象只校验+提交，
-     ///   被其它 reservation 持有的对象延后（`deferred`），下一轮重试。
-     ///
-+    /// **本地库损坏上抛**：`upload_one_asset` 发现本地字节长度/哈希与元数据不一致、
-+    /// 或确定性分片事实与元数据不符时返回 [`SyncError::LocalCorrupt`]。这类错误每轮
-+    /// 重试都不可能自愈，必须让调用方看到（否则就是"永远重试成功、永不报错"）。
-+    /// 处理方式是**继续扫完其余资产**（健康资产照常上传/落标记），最后把第一个本地
-+    /// 损坏原样上抛；[`SyncError::Paused`]（全局暂停）与 [`SyncError::Storage`]
-+    /// （本地库读写失败）仍**立即**上抛，语义不变。
-+    ///
-     /// 只处理 `asset_refs` 引用得到的资产：历史孤儿不重传（`orphans_skipped` 如实上报）。
-     pub fn upload_pending_assets(&mut self) -> Result<AssetSyncReport, SyncError> {
-         if self.rotation_frozen {
-@@ -1106,6 +1119,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
-             orphans_skipped: count_unreferenced_assets(self.vault)?,
-             ..AssetSyncReport::default()
-         };
-+        let mut first_local_corrupt: Option<SyncError> = None;
-         let assets = list_referenced_assets(self.vault)?;
-         report.referenced = assets.len();
-         for meta in assets {
-@@ -1149,9 +1163,20 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
-                 Err(error) if matches!(error, SyncError::Paused(_) | SyncError::Storage(_)) => {
-                     return Err(error)
-                 }
-+                // 本地库损坏不是网络失败：先继续上传其余健康资产（不让单个损坏拖住
-+                // 整库），最后统一上抛。计成 `failed` 会让它每轮"重试成功"、永不报错。
-+                Err(error) if matches!(error, SyncError::LocalCorrupt(_)) => {
-+                    if first_local_corrupt.is_none() {
-+                        first_local_corrupt = Some(error);
-+                    }
+ 
+ /// 两阶段同步 **Prepare** 阶段的报告（encrypt/push/pull；不含 integrate/ack）。
+-#[derive(Debug, Clone, Default, PartialEq, Eq)]
++#[derive(Debug, Default)]
+ pub struct PrepareReport {
+     /// 本轮新加密的本地意图数。
+     pub encrypted: usize,
+@@ -218,8 +218,10 @@ pub struct PrepareReport {
+     pub push: PushReport,
+     /// 增量资产上传结果（正文 push 之后、pull 之前）。
+     pub assets: AssetSyncReport,
+-    /// 拉取结果（游标已 durable 推进）。
++    /// 拉取结果（游标已 durable 推进）；切换为 checkpoint 追赶时为默认值。
+     pub pull: PullReport,
++    /// Phase 1B：已准备好、等待持闸的追赶候选；`None` = 本轮走普通聚合 pull。
++    pub catchup: Option<crate::catchup::CatchUpPrepared>,
+ }
+ 
+ /// 两阶段同步 **Integrate** 阶段的报告。
+@@ -235,6 +237,8 @@ pub struct IntegratePhaseReport {
+     pub materialized: usize,
+     /// 物化失败篇数（失败只记日志，不影响已 durable 的 CRDT 集成结论）。
+     pub materialize_failed: usize,
++    /// Phase 1B：本轮是否执行了 checkpoint 追赶。
++    pub catchup: Option<crate::catchup::CatchUpReport>,
+ }
+ 
+ /// 两阶段同步 **Finish** 阶段的报告（push tail + ack）。
+@@ -704,6 +708,30 @@ impl DevLocal {
+         // pull 必须有游标：B 由 bootstrap 落库，A 由 genesis 落库；旧 relay 两者都没有时
+         // 用 `GET /state` 键 14 兜底（绝不把"缺失"当成 0 号游标硬编）。
+         ensure_cursor(&mut client, vault)?;
++        // Phase 1B：完整 sync_once 也先尝试 checkpoint 追赶；失败不回退普通 pull
++        // （Mandatory 时普通 pull 只会再次 CursorExpired）。追赶在调用方的
++        // `before_integrate` 守卫之后写入，语义与普通 integrate 相同。
++        let pins = crate::bootstrap::BootstrapPins::from_vault(vault)?;
++        let catchup_config = crate::catchup::CatchUpConfig::default();
++        let local = menghunote_storage::sync_cursor_state(vault)?;
++        let state = client.state()?;
++        if crate::catchup::should_attempt(&state, local.received_seq, &catchup_config) {
++            let prepared = crate::catchup::prepare(
++                vault,
++                &mut client,
++                root.vault_id,
++                identity.loro_peer_id(),
++                &root,
++                &pins,
++                &catchup_config,
++            )?;
++            if let Some(prepared) = prepared {
++                if let Some(guard) = options.before_integrate.as_mut() {
++                    guard()?;
 +                }
-+                // 其余（relay/传输/对象校验）沿用既有语义：单资产失败，下一轮重试。
-                 Err(_) => report.failed += 1,
++                crate::catchup::integrate(vault, identity.loro_peer_id(), &prepared)?;
++            }
++        }
+         let engine_identity = EngineIdentity {
+             device_id: identity.device_id,
+             signing_key,
+@@ -743,6 +771,29 @@ impl DevLocal {
+         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+         let mut client = context.open(vault, identity)?.into_client();
+         ensure_cursor(&mut client, vault)?;
++        // Phase 1B：网络阶段先决策/下载 checkpoint；不写库、不持闸。
++        // 若决策为 None，继续普通 push + pull（快照可能已下载但未写，属于保守的
++        // 机会性误判；Mandatory 命中时必须跳过普通 pull，否则会立即 CursorExpired）。
++        let pins = crate::bootstrap::BootstrapPins::from_vault(vault)?;
++        let catchup_config = crate::catchup::CatchUpConfig::default();
++        // 近端同步不下载快照：只有强制过期或落后上界达到 N_min 才进入 prepare。
++        let catchup = {
++            let local = menghunote_storage::sync_cursor_state(vault)?;
++            let state = client.state()?;
++            if crate::catchup::should_attempt(&state, local.received_seq, &catchup_config) {
++                crate::catchup::prepare(
++                    vault,
++                    &mut client,
++                    root.vault_id,
++                    identity.loro_peer_id(),
++                    &root,
++                    &pins,
++                    &catchup_config,
++                )?
++            } else {
++                None
++            }
++        };
+         let engine_identity = EngineIdentity {
+             device_id: identity.device_id,
+             signing_key,
+@@ -755,12 +806,17 @@ impl DevLocal {
+         // ADR 0012 两阶段路径的资产上传点：与完整 `sync_once` 同一阶段（正文之后、
+         // pull 之前），保证自动同步（S3）也会增量上传新资产。
+         let assets = engine.upload_pending_assets()?;
+-        let pull = engine.pull()?;
++        let pull = if catchup.is_some() {
++            PullReport::default()
++        } else {
++            engine.pull()?
++        };
+         Ok(PrepareReport {
+             encrypted,
+             push,
+             assets,
+             pull,
++            catchup,
+         })
+     }
+ 
+@@ -796,6 +852,30 @@ impl DevLocal {
+         )
+     }
+ 
++    /// 同 [`Self::sync_integrate`]，但携带 Prepare 阶段准备好的 checkpoint 追赶候选。
++    ///
++    /// 追赶写入/水位/游标在持闸段完成；`integrated >= S` 后清理已覆盖 inbox。
++    pub fn sync_integrate_with_catchup<T: RelayTarget + ?Sized>(
++        target: &T,
++        vault: &Vault,
++        identity: &LocalIdentityV1,
++        transport: Option<TransportTimeouts>,
++        expect_head: Option<(&str, u64)>,
++        watch_doc: &str,
++        catchup: Option<&crate::catchup::CatchUpPrepared>,
++    ) -> Result<IntegratePhaseReport, SyncError> {
++        Self::sync_integrate_with_config_and_catchup(
++            target,
++            vault,
++            identity,
++            transport,
++            expect_head,
++            watch_doc,
++            IntegrateConfig::default(),
++            catchup,
++        )
++    }
++
+     /// 同 [`Self::sync_integrate`]，但显式指定集成批次预算（测试/诊断用）。
+     #[allow(clippy::too_many_arguments)]
+     pub fn sync_integrate_with_config<T: RelayTarget + ?Sized>(
+@@ -806,6 +886,30 @@ impl DevLocal {
+         expect_head: Option<(&str, u64)>,
+         watch_doc: &str,
+         integrate_config: IntegrateConfig,
++    ) -> Result<IntegratePhaseReport, SyncError> {
++        Self::sync_integrate_with_config_and_catchup(
++            target,
++            vault,
++            identity,
++            transport,
++            expect_head,
++            watch_doc,
++            integrate_config,
++            None,
++        )
++    }
++
++    /// 同 [`Self::sync_integrate_with_config`]，可附加 checkpoint 追赶。
++    #[allow(clippy::too_many_arguments)]
++    pub fn sync_integrate_with_config_and_catchup<T: RelayTarget + ?Sized>(
++        target: &T,
++        vault: &Vault,
++        identity: &LocalIdentityV1,
++        transport: Option<TransportTimeouts>,
++        expect_head: Option<(&str, u64)>,
++        watch_doc: &str,
++        integrate_config: IntegrateConfig,
++        catchup: Option<&crate::catchup::CatchUpPrepared>,
+     ) -> Result<IntegratePhaseReport, SyncError> {
+         // Integrate 前复核授权基准（ADR 0012 S2b）：head 被推进 = 授权已失效，
+         // 一律不 append；inbox/outbox 原样保留，调用方可按新授权重试。
+@@ -816,12 +920,25 @@ impl DevLocal {
              }
          }
-+        if let Some(error) = first_local_corrupt {
-+            return Err(error);
+         let before = load_head(vault, watch_doc)?.head_seq;
++        let peer_id = identity.loro_peer_id();
++        let catchup_report = match catchup {
++            Some(prepared) => match crate::catchup::integrate(vault, peer_id, prepared) {
++                Ok(report) => Some(report),
++                Err(error) => {
++                    if prepared.decision().mode == crate::catchup::CatchUpMode::Mandatory {
++                        eprintln!("[sync] mandatory catchup integrate failed: {error}");
++                        return Err(SyncError::Paused(crate::relay::PauseReason::CatchupFailed));
++                    }
++                    return Err(error);
++                }
++            },
++            None => None,
++        };
+         let context = target.relay_context(transport)?;
+         let root = root_of(identity);
+         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+         let mut client = context.open(vault, identity)?.into_client();
+         ensure_cursor(&mut client, vault)?;
+-        let peer_id = identity.loro_peer_id();
+         let engine_identity = EngineIdentity {
+             device_id: identity.device_id,
+             signing_key,
+@@ -833,16 +950,25 @@ impl DevLocal {
+         // changed heads（正文）触发一次**现有接口**的物化：B 事务写 `notes.body_md`
+         // 并发布 `BodyMaterialized` 事件（索引器据此增量更新）。结构投影的事件由
+         // `StructureWriter::commit` 自己发布（`StructureProjected`）。
++        let mut changed_heads = outcome.changed_heads;
++        if let Some(report) = &catchup_report {
++            for doc_id in &report.docs {
++                if !changed_heads.iter().any(|head| head == doc_id) {
++                    changed_heads.push(doc_id.clone());
++                }
++            }
 +        }
-         Ok(report)
+         let (materialized, materialize_failed) =
+-            materialize_changed_bodies(vault, peer_id, &outcome.changed_heads);
++            materialize_changed_bodies(vault, peer_id, &changed_heads);
+         let after = load_head(vault, watch_doc)?.head_seq;
+         let watch_doc_changed = after != before;
+         Ok(IntegratePhaseReport {
+             integrate: outcome.report,
+-            changed_heads: outcome.changed_heads,
++            changed_heads,
+             watch_doc_changed,
+             materialized,
+             materialize_failed,
++            catchup: catchup_report,
+         })
      }
  
-diff --git a/crates/sync/src/rotation_apply.rs b/crates/sync/src/rotation_apply.rs
-index 9dabfdb..b47ce45 100644
---- a/crates/sync/src/rotation_apply.rs
-+++ b/crates/sync/src/rotation_apply.rs
-@@ -28,7 +28,7 @@ use crate::{DeviceId, ObjectId, VaultId};
- use menghunote_storage::{
-     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, baseline_apply_state,
-     begin_baseline_apply, finish_baseline_apply, repack_required, BaselineApplyFinish,
--    BaselineApplyState, BaselineApplyStatus, BaselineAsset,
-+    BaselineApplyState, BaselineApplyStatus, BaselineAsset, BaselineExpectation,
- };
- use menghunote_sync_proto::{
-     activation_t_signing_input, checkpoint_signing_input, grant_package_digest, ActivationCommitV1,
-@@ -307,7 +307,19 @@ pub fn apply_verified_baseline(
-     payload: &BaselinePayload,
-     baseline_cursor: &str,
- ) -> Result<BaselineApplyState, SyncError> {
--    begin_baseline_apply(vault, &payload.checkpoint_id, payload.baseline_s, "")?;
-+    // 完整性基准：候选 checkpoint 覆盖的 docs/资产必须全部写进 journal，少一批就
-+    // finish 不了（不会推进 cursor）。
-+    let expected = BaselineExpectation::new(
-+        payload.docs.iter().map(|(doc_id, _)| doc_id.clone()),
-+        payload.assets.iter().map(|asset| asset.object_id),
-+    );
-+    begin_baseline_apply(
-+        vault,
-+        &payload.checkpoint_id,
-+        payload.baseline_s,
-+        "",
-+        &expected,
-+    )?;
-     let result = (|| {
-         for chunk in payload.docs.chunks(64) {
-             apply_baseline_batch(vault, chunk, &[])?;
-diff --git a/crates/sync/tests/asset_sync.rs b/crates/sync/tests/asset_sync.rs
-index 5eea795..0f43745 100644
---- a/crates/sync/tests/asset_sync.rs
-+++ b/crates/sync/tests/asset_sync.rs
-@@ -3,7 +3,8 @@
- //! 覆盖 attachment-insert 缺口：A 插入并引用新资产后，普通 `sync_once`（非发布基线）
- //! 就应把 ASSET 对象增量上传，B 能取到与 A 一致的字节；第二个同步轮次不重传；
- //! 多片资产传到一半失败后从缺失片续传；checkpoint 已上传的对象被普通同步直接复用/标记；
--//! 被维护 reservation 持有的对象延后（ID_CONFLICT 不阻塞正文）。
-+//! 被维护 reservation 持有的对象延后（ID_CONFLICT 不阻塞正文）；本地字节与元数据 hash
-+//! 不一致时必须上抛 `LocalCorrupt`（不能伪装成可重试失败）。
- 
- mod support;
- 
-@@ -16,6 +17,7 @@ use menghunote_storage::{
- };
- use menghunote_sync::checkpoint::asset_object_id;
- use menghunote_sync::engine::{EngineIdentity, SyncEngine};
-+use menghunote_sync::SyncError;
- use menghunote_sync_proto::{cap_plain, part_count_for, ObjectType};
- 
- const ASSET_MEDIA: &str = "text/plain";
-@@ -401,7 +403,7 @@ fn missing_media_or_data_skips_asset_without_upload() {
- }
- 
- #[test]
--fn asset_hash_mismatch_is_failed_without_uploading_wrong_bytes() {
-+fn asset_hash_mismatch_raises_local_corrupt_without_uploading_wrong_bytes() {
-     ensure_test_identity_wrap();
-     let (_dir, vault) = fresh_vault();
-     let device = Device::new(0x91);
-@@ -431,12 +433,18 @@ fn asset_hash_mismatch_is_failed_without_uploading_wrong_bytes() {
-     link_asset_ref(&vault, "note-tamper", &claimed, 0, 1).expect("link");
-     seed_pull_state(&vault, &relay);
- 
--    let report = {
-+    // P2-9：本地库损坏不是可重试的网络失败，必须**上抛**让调用方看到；原实现把它
-+    // 计入 `failed` 后继续，于是每轮都"重试成功"、永不报错。
-+    let error = {
-         let mut sync = engine(&vault, &mut relay, &device);
--        sync.sync_once().expect("正文同步不得被坏资产阻塞")
-+        sync.sync_once()
-+            .expect_err("本地资产 hash 与字节不一致必须上抛 LocalCorrupt")
-     };
--    assert_eq!(report.assets.failed, 1);
--    assert_eq!(report.assets.uploaded, 0);
-+    assert!(
-+        matches!(error, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
-+        "实际：{error:?}"
-+    );
-+    // 整轮报错也不能把错误字节传给 relay、不能落 durable 标记。
-     assert!(relay.put_history.is_empty());
-     assert!(marker_rows(&vault).is_empty());
- }
+diff --git a/crates/sync/src/lib.rs b/crates/sync/src/lib.rs
+index cf6ee25..6d8a4ec 100644
+--- a/crates/sync/src/lib.rs
++++ b/crates/sync/src/lib.rs
+@@ -31,6 +31,7 @@ pub mod approval_v1;
+ pub(crate) mod asset_sync;
+ pub mod base64url;
+ pub mod bootstrap;
++pub mod catchup;
+ pub mod cbor;
+ pub mod checkpoint;
+ pub mod control_pin;
+diff --git a/crates/sync/src/relay.rs b/crates/sync/src/relay.rs
+index 78fb80b..462dc81 100644
+--- a/crates/sync/src/relay.rs
++++ b/crates/sync/src/relay.rs
+@@ -27,6 +27,8 @@ pub enum PauseReason {
+     CursorExpired,
+     /// 日志里出现本任务范围外的事件（asset/checkpoint/control），不能静默跳过。
+     UnsupportedEvent,
++    /// 游标已过期且 checkpoint 快速追赶失败；不得回退普通 pull（会立即再次过期）。
++    CatchupFailed,
+     /// 事件缺少 ObjectCommit 签名（真实 relay 还没在 log 事件里带签名）。
+     MissingSignature,
+     /// 轮换阶段 A–C 已冻结：禁止再 push/encrypt（A 事务编辑仍可继续）。
+@@ -47,6 +49,7 @@ impl core::fmt::Display for PauseReason {
+             Self::EpochMismatch => "relay epoch 与本地根不匹配",
+             Self::CursorExpired => "游标前缀已被 GC",
+             Self::UnsupportedEvent => "日志含本任务范围外的事件类型",
++            Self::CatchupFailed => "checkpoint 快速追赶失败（游标已过期，等待重试）",
+             Self::MissingSignature => "日志事件缺少 ObjectCommit 签名",
+             Self::RotationFrozen => "轮换已冻结，禁止 push/encrypt",
+             Self::RelayHistoryRewritten => {
 diff --git a/crates/sync/tests/bootstrap.rs b/crates/sync/tests/bootstrap.rs
-index 655d4a3..18069c4 100644
+index 18069c4..2f50da3 100644
 --- a/crates/sync/tests/bootstrap.rs
 +++ b/crates/sync/tests/bootstrap.rs
-@@ -14,10 +14,11 @@ mod support;
- use support::*;
- 
- use menghunote_storage::{
--    asset_bytes, baseline_apply_state, body_doc_meta, create_note_slot, ensure_structure_row,
--    insert_asset, list_all_docs, list_notes, load_body_doc, sync_cursor_state, BaselineApplyStatus,
--    BodyDoc, StructureWriter, Value, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
--    META_SYNC_RECEIVED_SEQ, STRUCTURE_DOC_ID,
-+    abort_baseline_apply, asset_bytes, baseline_apply_state, baseline_verify_failure,
-+    body_doc_meta, create_note_slot, ensure_structure_row, insert_asset, list_all_docs, list_notes,
-+    load_body_doc, sync_cursor_state, BaselineApplyStatus, BodyDoc, StructureWriter, Value,
-+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
-+    STRUCTURE_DOC_ID,
- };
- use menghunote_sync::bootstrap::{
-     self, control_head_hash, BootstrapFault, BootstrapPins, META_BOOTSTRAP_CONTROL_HASH,
-@@ -667,6 +668,103 @@ fn crash_after_assets_resumes_without_duplicate_writes() {
-     assert!(baseline_apply_state(&target).expect("journal").is_none());
+@@ -1118,6 +1118,196 @@ fn control_pin_advances_but_never_rolls_back() {
+     assert!(load_body_doc(&target, "note-1", materials.peer_id_u64(), None).is_ok());
  }
  
 +#[test]
-+fn verify_failure_keeps_merged_data_and_marks_journal_failed() {
++fn catchup_prepare_writes_nothing_and_integrate_advances_cursor() {
 +    let (_dir, source, materials) = setup();
 +    let mut relay = new_relay(&materials);
 +    seed_source(&source, &mut relay, &materials);
++    let checkpoint = relay.published_checkpoints[1].clone();
 +
 +    let (_target_dir, target) = fresh_vault();
-+    // 目标库已有同一篇正文的本地编辑：bootstrap 必须把它与基线 merge（不是覆盖）。
-+    let local_peer = materials.peer_id_u64().wrapping_add(1);
-+    let local = seed_doc(&target, "note-1", local_peer);
-+    local.insert_scalars(0, "本地优先编辑 ").expect("本地正文");
++    ensure_structure_row(&target).expect("structure 行");
++    // 目标已有本地编辑 + 旧游标/水位：追赶不得丢本地 op，成功后 cursor 必须前移。
++    let local = seed_doc(&target, "local-note", materials.peer_id_u64());
++    create_note_slot(
++        &target,
++        "local-note",
++        "local-note",
++        "local-note",
++        1_700_000_000,
++    )
++    .expect("notes 行");
++    local.insert_scalars(0, "本地未上传").expect("正文");
 +    commit_local(&target, &local);
++    target
++        .set_meta(RELAY_CURSOR_META, b"c0")
++        .expect("旧 cursor");
++    target
++        .set_meta(META_SYNC_RECEIVED_SEQ, &1u64.to_be_bytes())
++        .expect("旧 received");
++    target
++        .set_meta(META_SYNC_INTEGRATED_SEQ, &1u64.to_be_bytes())
++        .expect("旧 integrated");
++    target
++        .set_meta(menghunote_storage::META_SYNC_LOG_ID, &relay.log_id)
++        .expect("log_id");
 +
-+    let error = bootstrap::run_with_fault(
++    let pins = BootstrapPins::from_vault(&target).expect("pins");
++    let prepared = bootstrap::prepare(
 +        &target,
 +        &mut relay,
 +        VAULT_ID,
 +        materials.peer_id_u64(),
 +        &materials.root,
-+        BootstrapFault::VerifyVvNotCovered,
++        &pins,
 +    )
-+    .expect_err("注入的读回校验失败必须冒泡");
-+    assert!(
-+        format!("{error}").contains("VV 未覆盖快照"),
-+        "错误应来自读回校验：{error}"
-+    );
-+
-+    // 已 merge 的 Loro 数据保留：本地编辑与基线正文都在同一条文档里。
-+    let merged = load_body_doc(&target, "note-1", local_peer, None)
-+        .expect("merged doc")
-+        .0;
-+    assert!(
-+        merged.text().contains("本地优先编辑") && merged.text().contains("第一行正文"),
-+        "失败不得回滚已 merge 的数据，实际={:?}",
-+        merged.text()
-+    );
-+
-+    // 水位没有推进；journal 仍是 staging（schema CHECK 只有 staging/completed），
-+    // 失败语义由 meta 失败标记承载。
-+    assert_no_sync_watermarks(&target);
-+    let journal = baseline_apply_state(&target)
-+        .expect("journal state")
-+        .expect("失败后 journal 必须保留");
-+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
-+    assert!(journal.applied_docs >= 2, "已应用批次计数应保留");
-+    let reason = baseline_verify_failure(&target)
-+        .expect("读失败标记")
-+        .expect("校验失败必须写失败标记");
-+    assert!(
-+        reason.contains("VV 未覆盖快照"),
-+        "标记应保留失败原因：{reason}"
-+    );
-+
-+    // 未 abort 前 begin 一律拒绝（同 checkpoint 幂等续跑也不行）。
-+    let retry = bootstrap::run(
-+        &target,
-+        &mut relay,
-+        VAULT_ID,
-+        materials.peer_id_u64(),
-+        &materials.root,
-+    )
-+    .expect_err("失败标记必须阻止 begin 续跑");
-+    assert!(
-+        format!("{retry}").contains("abort_baseline_apply"),
-+        "错误必须提示先 abort：{retry}"
-+    );
-+
-+    // abort 清 journal + 失败标记，但保留已 merge 的 Loro 数据。
-+    assert!(abort_baseline_apply(&target).expect("abort"));
-+    assert!(baseline_apply_state(&target).expect("state").is_none());
-+    assert!(baseline_verify_failure(&target).expect("标记").is_none());
-+    let kept = load_body_doc(&target, "note-1", local_peer, None)
-+        .expect("abort 后正文")
-+        .0;
-+    assert!(
-+        kept.text().contains("本地优先编辑") && kept.text().contains("第一行正文"),
-+        "abort 只清 journal，不得删已 merge 的 Loro 数据，实际={:?}",
-+        kept.text()
-+    );
-+
-+    // abort 后可以重新 begin 并成功（失败标记已清）。
-+    let report = bootstrap::run(
-+        &target,
-+        &mut relay,
-+        VAULT_ID,
-+        materials.peer_id_u64(),
-+        &materials.root,
-+    )
-+    .expect("abort 后重跑");
++    .expect("prepare");
++    assert_eq!(prepared.covered_seq(), checkpoint.covered_seq);
 +    assert_eq!(
-+        report.covered_seq,
-+        relay.published_checkpoints[1].covered_seq
++        target
++            .get_meta(RELAY_CURSOR_META)
++            .expect("cursor")
++            .as_deref(),
++        Some(b"c0".as_slice()),
++        "prepare 不得写库/推进 cursor"
 +    );
-+    assert!(report.docs.iter().any(|(doc_id, _)| doc_id == "note-1"));
-+    assert!(baseline_apply_state(&target).expect("state").is_none());
++    assert_eq!(
++        target
++            .get_meta(META_SYNC_INTEGRATED_SEQ)
++            .expect("integrated")
++            .as_deref(),
++        Some(1u64.to_be_bytes().as_slice()),
++        "prepare 不得推进 integrated"
++    );
++
++    let expected_cursor = prepared.checkpoint_cursor().to_owned();
++    let report = bootstrap::integrate(
++        &target,
++        materials.peer_id_u64(),
++        &prepared,
++        bootstrap::BootstrapAdvancement::CatchUp,
++        None,
++    )
++    .expect("integrate");
++    assert_eq!(report.covered_seq, checkpoint.covered_seq);
++    assert_eq!(
++        target
++            .get_meta(RELAY_CURSOR_META)
++            .expect("cursor")
++            .as_deref(),
++        Some(expected_cursor.as_bytes()),
++        "CatchUp 成功后 cursor 必须前移到实际选中 checkpoint"
++    );
++    let cursor = sync_cursor_state(&target).expect("cursor state");
++    assert!(cursor.integrated_seq >= checkpoint.covered_seq);
++    let local_text = load_body_doc(&target, "local-note", materials.peer_id_u64(), None)
++        .expect("本地文档")
++        .0
++        .text();
++    assert!(
++        local_text.contains("本地未上传"),
++        "本地未上传 op 不得丢：{local_text}"
++    );
++
++    // S 之后普通 pull：源在 checkpoint 后新增一条，目标用追赶后的 cursor 正常增量拉取。
++    let (source_doc, _) =
++        load_body_doc(&source, "note-1", materials.peer_id_u64(), None).expect("source note");
++    source_doc
++        .insert_scalars(0, "after-catchup ")
++        .expect("source edit");
++    commit_with_intent(&source, &source_doc, &uuid_like(9_777), [0xC7; 32], EPOCH);
++    {
++        let mut engine = SyncEngine::new(
++            &source,
++            &mut relay,
++            EngineIdentity {
++                device_id: materials.device_id,
++                signing_key: materials.signing_key.clone(),
++                peer_id: materials.peer_id_u64(),
++            },
++            materials.root.clone(),
++        );
++        engine.sync_once().expect("source push after catchup");
++    }
++    {
++        let mut engine = SyncEngine::new(
++            &target,
++            &mut relay,
++            EngineIdentity {
++                device_id: materials.device_id,
++                signing_key: materials.signing_key.clone(),
++                peer_id: materials.peer_id_u64(),
++            },
++            materials.root.clone(),
++        );
++        engine.sync_once().expect("target pull after catchup");
++    }
++    let target_note = load_body_doc(&target, "note-1", materials.peer_id_u64(), None)
++        .expect("target note")
++        .0
++        .text();
++    assert!(
++        target_note.contains("after-catchup"),
++        "追赶后必须能从 S 继续普通 pull：{target_note}"
++    );
++}
++
++#[test]
++fn catchup_mandatory_prepare_and_integrate_advances_through_public_wrapper() {
++    let (_dir, source, materials) = setup();
++    let mut relay = new_relay(&materials);
++    seed_source(&source, &mut relay, &materials);
++    let checkpoint = relay.published_checkpoints[1].clone();
++
++    let (_target_dir, target) = fresh_vault();
++    ensure_structure_row(&target).expect("structure 行");
++    target
++        .set_meta(RELAY_CURSOR_META, b"c0")
++        .expect("旧 cursor");
++    target
++        .set_meta(META_SYNC_RECEIVED_SEQ, &0u64.to_be_bytes())
++        .expect("旧 received");
++    target
++        .set_meta(META_SYNC_INTEGRATED_SEQ, &0u64.to_be_bytes())
++        .expect("旧 integrated");
++    target
++        .set_meta(menghunote_storage::META_SYNC_LOG_ID, &relay.log_id)
++        .expect("log_id");
++    // 让普通 pull 必然 CursorExpired：本地 received=0，relay floor=1。
++    relay.gc_floor = 1;
++    let pins = BootstrapPins::from_vault(&target).expect("pins");
++    let prepared = menghunote_sync::catchup::prepare(
++        &target,
++        &mut relay,
++        VAULT_ID,
++        materials.peer_id_u64(),
++        &materials.root,
++        &pins,
++        &menghunote_sync::catchup::CatchUpConfig::default(),
++    )
++    .expect("mandatory prepare")
++    .expect("gc_floor > received 必须进入 mandatory");
++    assert_eq!(
++        prepared.decision().mode,
++        menghunote_sync::catchup::CatchUpMode::Mandatory
++    );
++    assert_eq!(prepared.checkpoint_s(), checkpoint.covered_seq);
++    let expected_cursor = prepared.checkpoint_cursor().to_owned();
++    let report = menghunote_sync::catchup::integrate(&target, materials.peer_id_u64(), &prepared)
++        .expect("mandatory integrate");
++    assert_eq!(
++        report.mode,
++        menghunote_sync::catchup::CatchUpMode::Mandatory
++    );
++    assert_eq!(
++        target
++            .get_meta(RELAY_CURSOR_META)
++            .expect("cursor")
++            .as_deref(),
++        Some(expected_cursor.as_bytes())
++    );
 +}
 +
  #[test]
- fn cursor_cas_conflict_rolls_back_all_watermarks_and_retry_succeeds() {
+ fn bootstrap_cursor_pulls_updates_after_s() {
      let (_dir, source, materials) = setup();
-diff --git a/crates/sync/tests/engine.rs b/crates/sync/tests/engine.rs
-index 922a57f..bd40809 100644
---- a/crates/sync/tests/engine.rs
-+++ b/crates/sync/tests/engine.rs
-@@ -11,10 +11,11 @@ mod support;
- use support::*;
- 
- use menghunote_storage::{
--    append_updates, count_inbox_ready, load_body_doc, load_head, outbox_parts, outbox_row,
--    store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, BodyDoc, StorageError,
--    SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow, APP_DOC_SCHEMA, CODEC_VERSION,
--    META_SYNC_LOG_ID, MIN_READER,
-+    append_updates, asset_bytes, asset_content_hash, count_inbox_ready, create_note_slot,
-+    insert_asset, link_asset_ref, load_body_doc, load_head, outbox_parts, outbox_row,
-+    replace_asset_refs, store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, BodyDoc,
-+    StorageError, SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow, APP_DOC_SCHEMA,
-+    CODEC_VERSION, META_SYNC_LOG_ID, MIN_READER,
- };
- use menghunote_sync::engine::{
-     EngineConfig, EngineIdentity, IntegrateConfig, SyncEngine, RELAY_CURSOR_META,
-@@ -2207,6 +2208,206 @@ fn pull_pauses_on_lagging_asset_event_epoch_before_download() {
-     );
- }
- 
-+// ============================================================ P2-9：本地资产损坏
-+//
-+// `upload_one_asset` 在**本地字节与元数据不一致**时返回 `LocalCorrupt`。原实现把它
-+// 和网络失败一样 `report.failed += 1` 后继续，于是每轮都"重试成功"、永不报错。
-+// 约定：本地库损坏不是可重试失败——扫完其余资产后**上抛**；健康资产仍要完整上传。
-+
-+const ASSET_MEDIA: &str = "text/plain";
-+
-+/// 建一篇资产测试用的 note（`loro_docs` 行 + `notes` 行；`asset_refs` 的外键要求）。
-+fn seed_asset_note(vault: &Vault, note_id: &str, peer_id: u64) {
-+    seed_doc(vault, note_id, peer_id);
-+    create_note_slot(vault, note_id, note_id, note_id, 1_700_000_000).expect("notes 行");
-+}
-+
-+/// 用 storage **公开 API** 构造"元数据 hash 与本地字节不一致"的损坏资产。
-+///
-+/// 路径：`replace_asset_refs` 先按引用建 `data IS NULL` 的元数据占位（`byte_len`/
-+/// `media_type` 也是 NULL），再用 `insert_asset` 的"补全占位明文"分支写入**另一份
-+/// 字节**——该分支只校验长度、不重算内容哈希。这正是真实损坏（外部写坏/恢复错
-+/// 字节）在库里的形态，且不需要测试直接改 SQL。
-+fn seed_corrupt_asset(vault: &Vault, note_id: &str, declared: [u8; 32], actual: &[u8]) {
-+    replace_asset_refs(vault, note_id, 1, &[(declared, 0)]).expect("元数据占位 + 引用");
-+    insert_asset(
-+        vault,
-+        &declared,
-+        actual.len() as u64,
-+        Some(ASSET_MEDIA),
-+        actual,
-+    )
-+    .expect("按占位补全明文");
-+}
-+
-+/// 健康资产：元数据与字节自洽，并被 `asset_refs` 引用（可被增量上传）。
-+fn seed_healthy_asset(vault: &Vault, note_id: &str, data: &[u8]) -> [u8; 32] {
-+    let hash = asset_content_hash(data);
-+    insert_asset(vault, &hash, data.len() as u64, Some(ASSET_MEDIA), data).expect("insert_asset");
-+    link_asset_ref(vault, note_id, &hash, 0, 1).expect("link_asset_ref");
-+    hash
-+}
-+
-+/// durable "已上传"标记（`sync.asset_uploaded.<hex object_id>`）的键列表。
-+fn asset_marker_keys(vault: &Vault) -> Vec<String> {
-+    vault
-+        .query(
-+            "SELECT key FROM meta WHERE substr(key,1,?1)=?2 ORDER BY key",
-+            &[
-+                menghunote_storage::Value::Integer("sync.asset_uploaded.".len() as i64),
-+                menghunote_storage::Value::Text("sync.asset_uploaded.".to_owned()),
-+            ],
-+        )
-+        .expect("读 asset 标记")
-+        .iter()
-+        .map(|row| match row.first() {
-+            Some(menghunote_storage::Value::Text(key)) => key.clone(),
-+            _ => panic!("asset 标记 key 类型非法"),
-+        })
-+        .collect()
-+}
-+
-+/// 本地损坏（hash 与字节不一致）必须**上抛**，不能被计入 `failed` 后静默继续。
-+#[test]
-+fn corrupt_local_asset_raises_instead_of_counting_retryable_failure() {
-+    ensure_test_identity_wrap();
-+    let (_dir, vault) = fresh_vault();
-+    let device = Device::new(0x7c);
-+    let mut relay = FakeRelay::new(&[&device]);
-+    seed_asset_note(&vault, "note-corrupt", device.identity.peer_id);
-+
-+    // 元数据声明的是 `expected-bytes-A` 的哈希，库里实际存的是 `tampered-bytes-A`
-+    // （同长、不同内容），`insert_asset` 的占位补全路径不会拦住它。
-+    let declared = asset_content_hash(b"expected-bytes-A");
-+    let actual = b"tampered-bytes-A";
-+    seed_corrupt_asset(&vault, "note-corrupt", declared, actual);
-+    assert_eq!(
-+        asset_bytes(&vault, declared).expect("读本地资产"),
-+        Some(actual.to_vec()),
-+        "夹具前提：本地确实存着与元数据 hash 不一致的字节"
-+    );
-+    assert_ne!(asset_content_hash(actual), declared, "夹具必须是损坏的");
-+
-+    let error = {
-+        let mut sync = engine(&vault, &mut relay, &device);
-+        sync.upload_pending_assets()
-+            .expect_err("本地库损坏必须上抛，不能计入 failed 后静默继续")
-+    };
-+    assert!(
-+        matches!(error, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
-+        "必须原样上抛 LocalCorrupt（不是可重试网络失败）：{error:?}"
-+    );
-+    assert!(relay.put_history.is_empty(), "损坏资产不得上传任何分片");
-+    assert!(relay.objects.is_empty(), "损坏资产不得提交对象");
-+    assert!(
-+        asset_marker_keys(&vault).is_empty(),
-+        "损坏资产不得落 durable 标记"
-+    );
-+}
-+
-+/// 单个损坏资产不得阻止其余健康资产上传（扫描完再上抛），且下一轮不得静默"重试成功"。
-+#[test]
-+fn corrupt_asset_does_not_block_healthy_upload_but_still_raises() {
-+    ensure_test_identity_wrap();
-+    let (_dir, vault) = fresh_vault();
-+    let device = Device::new(0x7d);
-+    let mut relay = FakeRelay::new(&[&device]);
-+
-+    // 健康资产放在**后面**：`list_referenced_assets` 按 hash 升序，4ba7… < d6cc…，
-+    // 损坏资产先被扫到——若实现改成 fail-fast，这条用例就会丢掉健康资产。
-+    seed_asset_note(&vault, "note-corrupt", device.identity.peer_id);
-+    seed_asset_note(&vault, "note-mixed", device.identity.peer_id);
-+    let declared = asset_content_hash(b"expected-bytes-A");
-+    seed_corrupt_asset(&vault, "note-corrupt", declared, b"tampered-bytes-A");
-+    let healthy_data = b"healthy asset bytes";
-+    let healthy = seed_healthy_asset(&vault, "note-mixed", healthy_data);
-+    assert!(
-+        declared < healthy,
-+        "夹具顺序前提：损坏资产必须先于健康资产被扫描"
-+    );
-+
-+    let error = {
-+        let mut sync = engine(&vault, &mut relay, &device);
-+        sync.upload_pending_assets()
-+            .expect_err("存在本地损坏时整轮必须报错")
-+    };
-+    assert!(
-+        matches!(error, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
-+        "必须原样上抛 LocalCorrupt：{error:?}"
-+    );
-+
-+    // 健康资产仍然完整上传：分片 + 对象提交 + durable 标记。
-+    let healthy_object = menghunote_sync::checkpoint::asset_object_id(
-+        &device.root,
-+        &healthy,
-+        healthy_data.len() as u64,
-+        ASSET_MEDIA,
-+    )
-+    .expect("健康资产 object_id");
-+    assert!(
-+        relay.parts.contains_key(&(healthy_object, 0)),
-+        "健康资产分片必须已上传（不能被单个损坏拦住）"
-+    );
-+    assert_eq!(
-+        relay
-+            .objects
-+            .get(&healthy_object)
-+            .map(|object| object.commit.object_type),
-+        Some(ObjectType::Asset),
-+        "健康资产必须完成对象提交"
-+    );
-+    let markers = asset_marker_keys(&vault);
-+    assert_eq!(markers.len(), 1, "只有健康资产落 durable 标记");
-+    assert!(
-+        markers[0].ends_with(&menghunote_sync::ids::hex_of(&healthy_object)),
-+        "标记必须属于健康资产"
-+    );
-+
-+    // 下一轮：健康资产命中标记（不重传、不再探测 relay），损坏资产仍如实上抛。
-+    let puts = relay.put_history.len();
-+    let gets = relay.part_gets.len();
-+    let again = {
-+        let mut sync = engine(&vault, &mut relay, &device);
-+        sync.upload_pending_assets()
-+            .expect_err("损坏仍在，下一轮必须继续报错")
-+    };
-+    assert!(
-+        matches!(again, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
-+        "下一轮仍必须是 LocalCorrupt：{again:?}"
-+    );
-+    assert_eq!(
-+        relay.put_history.len(),
-+        puts,
-+        "健康资产命中标记后不得重传分片"
-+    );
-+    assert_eq!(
-+        relay.part_gets.len(),
-+        gets,
-+        "健康资产命中标记后不得再探测 relay"
-+    );
-+}
-+
-+/// 正常路径不受影响：健康的被引用资产仍计入 `uploaded`。
-+#[test]
-+fn healthy_referenced_asset_is_still_counted_as_uploaded() {
-+    ensure_test_identity_wrap();
-+    let (_dir, vault) = fresh_vault();
-+    let device = Device::new(0x7e);
-+    let mut relay = FakeRelay::new(&[&device]);
-+    seed_asset_note(&vault, "note-healthy", device.identity.peer_id);
-+    seed_healthy_asset(&vault, "note-healthy", b"healthy asset bytes");
-+
-+    let report = {
-+        let mut sync = engine(&vault, &mut relay, &device);
-+        sync.upload_pending_assets().expect("健康资产必须正常上传")
-+    };
-+    assert_eq!(report.referenced, 1);
-+    assert_eq!(report.uploaded, 1, "正常资产仍必须计入 uploaded");
-+    assert_eq!(report.failed, 0, "不得莫名计成失败");
-+    assert_eq!(report.skipped_invalid, 0);
-+    assert_eq!(asset_marker_keys(&vault).len(), 1);
-+}
-+
- // ============================================================ Phase 0：指标 + 批量 inbox
- // 只加**只读**度量与默认关闭的实验开关；不改变追赶策略、不动 relay/wire/schema。
- 
 diff --git a/crates/sync/tests/phase1a_release.rs b/crates/sync/tests/phase1a_release.rs
-index 975e6af..c445663 100644
+index c445663..d73fa91 100644
 --- a/crates/sync/tests/phase1a_release.rs
 +++ b/crates/sync/tests/phase1a_release.rs
-@@ -12,6 +12,17 @@
- //! 不涉及 relay / checkpoint 签名 / 真实下载：`S` 与 cursor 是自造的合法值；
- //! 每次都用 fresh vault，结束后 journal 一律 `completed`，不会给下一次留 staging。
+@@ -18,6 +18,10 @@
+ //! 只打印页数/墙钟，不 assert 时间。1M 档 = 4096 页，是生产
+ //! `COVERAGE_SCAN_MAX_PAGES` 的上限，只跑 1 次（常规档 3 次取中位数）。
  //!
-+//! 第二个探针 [`checkpoint_validate_scan_cost`] 测 **checkpoint validate 的 coverage
-+//! 日志扫描 O(S) 成本**：FakeRelay 构造 S = 1k / 5k / 25k / 1M 条混合日志（85.7% UPDATE +
-+//! 14.3% ASSET），走真实 `CheckpointWriter::prepare → validate`（不复制 scan 实现），
-+//! 只打印页数/墙钟，不 assert 时间。1M 档 = 4096 页，是生产
-+//! `COVERAGE_SCAN_MAX_PAGES` 的上限，只跑 1 次（常规档 3 次取中位数）。
++//! 同一上限还有一个**常规测试** [`coverage_scan_rejects_more_than_max_pages`]：覆盖日志
++//! 4097 页时 validate 必须以「页数超过上限」失败，不能静默截断/当成完整覆盖
++//! （FakeRelay 日志 + 真实 `CheckpointWriter::validate`，不跑网络）。
 +//!
-+//! 第三个探针 [`large_doc_per_page_replay_cost`]（M3 标定）测 **一篇 1 MiB 大正文的
-+//! per-page replay 成本**：每次 aggregate 页都会为每个 touched doc 全量
-+//! `load_body_doc`；该探针连续重放 5 次并打印 raw/中位数，另测 snapshot 导出/恢复与
-+//! 全量 `pending_update` 作参考。同样只打印、不 assert 时间。
-+//!
- //! ```bash
- //! cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --nocapture
- //! ```
-@@ -20,16 +31,30 @@ mod support;
- 
- use std::time::Instant;
- 
--use support::{commit_local, fresh_vault, seed_doc};
-+use support::{
-+    commit_local, commit_with_intent, fresh_vault, publish_real_asset, seed_doc, uuid_like,
-+    FakeRelay, TestRandom, EPOCH, VAULT_ID,
-+};
- 
- use menghunote_storage::{
-     apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_debug_timings,
--    baseline_apply_state, begin_baseline_apply, finish_baseline_apply, load_body_doc,
--    reset_baseline_apply_debug, sync_cursor_state, BaselineApplyDebugCounters,
--    BaselineApplyDebugTimings, BaselineApplyFinish, BaselineApplyStatus, BodyDoc, Value, Vault,
--    BASELINE_MERGE_BATCH, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
-+    baseline_apply_state, begin_baseline_apply, create_note_slot, ensure_structure_row,
-+    finish_baseline_apply, load_body_doc, reset_baseline_apply_debug, sync_cursor_state,
-+    BaselineApplyDebugCounters, BaselineApplyDebugTimings, BaselineApplyFinish,
-+    BaselineApplyStatus, BaselineExpectation, BodyDoc, Value, Vault, BASELINE_MERGE_BATCH,
-+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
-     META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR,
+ //! 第三个探针 [`large_doc_per_page_replay_cost`]（M3 标定）测 **一篇 1 MiB 大正文的
+ //! per-page replay 成本**：每次 aggregate 页都会为每个 touched doc 全量
+ //! `load_body_doc`；该探针连续重放 5 次并打印 raw/中位数，另测 snapshot 导出/恢复与
+@@ -50,8 +54,8 @@ use menghunote_sync::engine::RELAY_CURSOR_META;
+ use menghunote_sync::genesis;
+ use menghunote_sync::relay::{
+     BootstrapBundle, BootstrapLease, CheckpointLease, CheckpointPublish, CheckpointRef,
+-    ObjectSubmission, PublishedCheckpoint, RelayClient, RelayLogKind, RelayLogPage, RelayState,
+-    SlotRecord, SlotUpload, UpdateOutcome, UpdateSubmission,
++    ObjectSubmission, PublishedCheckpoint, RelayClient, RelayLogEvent, RelayLogKind, RelayLogPage,
++    RelayState, SlotRecord, SlotUpload, UpdateOutcome, UpdateSubmission,
  };
-+use menghunote_sync::checkpoint::{CheckpointWriter, EmptyAssets, PreparedCheckpoint};
-+use menghunote_sync::engine::RELAY_CURSOR_META;
-+use menghunote_sync::genesis;
-+use menghunote_sync::relay::{
-+    BootstrapBundle, BootstrapLease, CheckpointLease, CheckpointPublish, CheckpointRef,
-+    ObjectSubmission, PublishedCheckpoint, RelayClient, RelayLogKind, RelayLogPage, RelayState,
-+    SlotRecord, SlotUpload, UpdateOutcome, UpdateSubmission,
-+};
-+use menghunote_sync::{DeviceId, ObjectId, SyncError};
-+use menghunote_sync_proto::DeviceCertV1;
- 
- /// 基线文档数（真实信任链里 docs 数量更多；这里固定 20 便于两档总量均分）。
- const DOCS: usize = 20;
-@@ -216,11 +241,17 @@ fn run_probe(label: &'static str, target_bytes: usize) -> ProbeStats {
-     // 3) 持闸段：begin → apply 各批 → finish。
-     reset_baseline_apply_debug();
-     let begin_started = Instant::now();
--    let begin_state =
--        begin_baseline_apply(&vault, &[0x51; 16], BASELINE_S, "c0-source").expect("begin baseline");
-+    let expected =
-+        BaselineExpectation::new(doc_ids.iter().cloned(), std::iter::empty::<[u8; 32]>());
-+    let begin_state = begin_baseline_apply(&vault, &[0x51; 16], BASELINE_S, "c0-source", &expected)
-+        .expect("begin baseline");
-     let begin_ms = begin_started.elapsed().as_millis();
-     assert_eq!(begin_state.status, BaselineApplyStatus::Staging);
--    assert!(begin_state.finishable);
-+    assert_eq!(begin_state.expected_docs, Some(DOCS as u64));
-+    assert!(
-+        !begin_state.finishable,
-+        "begin 时预期 docs 尚未应用，finishable 必须为 false"
-+    );
- 
-     let entries: Vec<(String, Vec<u8>)> = doc_ids
-         .iter()
-@@ -427,3 +458,605 @@ fn phase1a_baseline_apply_gate_hold() {
-         print_probe(&stats);
+ use menghunote_sync::{DeviceId, ObjectId, SyncError};
+ use menghunote_sync_proto::DeviceCertV1;
+@@ -957,6 +961,304 @@ fn checkpoint_validate_scan_cost() {
      }
  }
-+
-+// ============================================================ checkpoint validate 覆盖日志扫描成本
+ 
++// ============================================================ coverage 扫描页数上限（常规测试）
 +//
-+// 任务 4 P1：只测真实 `CheckpointWriter::validate` 里 coverage 日志扫描的 O(S) 成本，
-+// 不改生产 `scan_coverage_log`，也不复制它的实现。S 条日志是合成的（FakeRelay）：
-+// `1..=S-1` 落在本地 integrated 连续前缀（生产代码信任的"已消费"不变量），尾部第 S 条
-+// 是真实 ASSET（prepare 落 pending receipt，validate 必须下载实证）；前缀里按 1/7
-+// 混入 ASSET 事件（≈14.3%，任务要求的 10–20%）。
++// 生产 `scan_coverage_log` 的循环上界是 `COVERAGE_SCAN_MAX_PAGES = 4096` 页
++// （`crates/sync/src/checkpoint.rs` 私有常量；每页 `COVERAGE_SCAN_PAGE_LIMIT = 256` 条）。
++// 覆盖日志一旦超过 4096 页，扫描必须**失败**，不能把"没扫完"当成"已证明覆盖到 S"。
 +//
-+// 口径：
-+// - `pages` = validate 期间真实 `RelayClient::log` 调用次数（应从 c0 扫到 S，S/256 页）。
-+// - `scan_ms` = 第一次 log 开始到最后一次 log 返回的墙钟跨度（含页间逐事件核对；
-+//   不含最后一页返回之后的 256 条 visitor，误差上界 = 一页）。
-+// - `validate_ms` = 整个 validate 墙钟（含 manifest/快照读回、尾部 ASSET 实证）。
-+// 只打印不 assert 时间；硬断言只校验覆盖到了 S、尾部 ASSET 被真实验证、页数符合 S/256。
++// 构造：S = 4096 × 256 + 1 = 1_048_577 条日志（4096 个满页 + 1 条尾页）。本地
++// integrated 前缀 = S-1（1..=S-1 已消费），唯一缺口是第 S 条，持久游标是 c0，
++// 于是 validate 必须从 c0 连续扫到 S：需要 4097 页，而第 4096 页结束时只到 S-1。
++//
++// prepare 侧：`try_record_coverage_receipt` 在"本地没有 relay 游标"时直接返回（不写
++// pending receipt），所以夹具在 prepare 前**不写** `sync.relay_cursor`，prepare 成功
++// 之后才写 c0。否则 prepare 会先撞同一上限，测到的就不是 validate 的守卫。
++//
++// 页请求次数必须正好是 4096（= `COVERAGE_SCAN_MAX_PAGES`）：守卫按**页数**生效，
++// 与每页事件数无关；这也是"上限是 4096 页"的可执行证据（生产错误文案本身不带数字）。
 +
-+/// 探针档位（事件总数 S）。
-+///
-+/// 最后一档 `1_048_576 = 4096 × 256` 正好对应生产 `COVERAGE_SCAN_MAX_PAGES = 4096`
-+/// 的页数上限（`crates/sync/src/checkpoint.rs`，私有常量）；这一档只跑 1 次，
-+/// 避免 3 × 百万事件（FakeRelay 的逐页扫描本身还有 O(S²/256) 的夹具 artifact）。
-+const SCAN_COST_S: [usize; 4] = [1_000, 5_000, 25_000, SCAN_COST_MAX_S];
-+/// 4096 页上限对应的事件总数。
-+const SCAN_COST_MAX_S: usize = 1_048_576;
-+/// 常规档位重复次数（取中位数）。
-+const SCAN_COST_RUNS: usize = 3;
-+/// 上限档位重复次数（只跑 1 次，不取中位数）。
-+const SCAN_COST_MAX_RUNS: usize = 1;
-+/// 生产 `COVERAGE_SCAN_PAGE_LIMIT`（`crates/sync/src/checkpoint.rs` 私有常量 = 256）。
-+/// 只用于校验探针确实按 S/256 页扫完整段；若生产改页大小，这里应同步更新。
-+const SCAN_COST_PAGE_LIMIT: usize = 256;
-+/// ASSET 事件间隔（每 7 条一条 → 14.3%）。
-+const SCAN_COST_ASSET_EVERY: usize = 7;
-+/// 探针正文文档 id（与 coverage 无关，只给 prepare 提供可导出的本地快照）。
-+const SCAN_COST_NOTE_ID: &str = "scan-cost-note";
++/// 生产 `COVERAGE_SCAN_MAX_PAGES`（私有常量）。生产上限改动时这里必须同步。
++const PAGE_LIMIT_MAX_PAGES: u64 = 4096;
++/// 覆盖日志事件总数：4096 个满页（每页 `SCAN_COST_PAGE_LIMIT` 条）+ 1 条尾页 = 4097 页。
++const PAGE_LIMIT_S: usize = (PAGE_LIMIT_MAX_PAGES as usize) * SCAN_COST_PAGE_LIMIT + 1;
++/// 夹具正文文档 id（与 coverage 无关，只给 prepare 提供可导出的本地快照）。
++const PAGE_LIMIT_NOTE_ID: &str = "coverage-page-limit-note";
 +
-+/// 计数/计时包装：所有方法委托给 FakeRelay；只额外统计 `log()`（真实 coverage scan
-+/// 发起的页请求）与 `part()`（manifest/snapshot/ASSET 读回）的调用次数与墙钟。
-+///
-+/// 这是**探针侧 instrumentation**，不是 scan 实现的拷贝：validate 仍走生产
-+/// `CheckpointWriter::validate` → `scan_coverage_log`，wrapper 只是它调用的客户端。
-+struct CountingRelay {
++/// `log()` 的 O(page) 实现：FakeRelay 的 `log` 每页都全量扫描 `self.log`
++/// （O(S²/256) 夹具 artifact，1M 事件下不可接受）；真实 relay 分页是索引查找。
++/// 其余方法全部委托给 FakeRelay，事件仍来自同一个 `log`。
++struct PageIndexRelay {
 +    inner: FakeRelay,
 +    log_calls: u64,
-+    log_busy_ns: u128,
-+    scan_first: Option<Instant>,
-+    scan_last: Option<Instant>,
-+    part_calls: u64,
-+    part_busy_ns: u128,
 +}
 +
-+impl CountingRelay {
++impl PageIndexRelay {
 +    fn new(inner: FakeRelay) -> Self {
 +        Self {
 +            inner,
 +            log_calls: 0,
-+            log_busy_ns: 0,
-+            scan_first: None,
-+            scan_last: None,
-+            part_calls: 0,
-+            part_busy_ns: 0,
 +        }
-+    }
-+
-+    fn reset_counters(&mut self) {
-+        self.log_calls = 0;
-+        self.log_busy_ns = 0;
-+        self.scan_first = None;
-+        self.scan_last = None;
-+        self.part_calls = 0;
-+        self.part_busy_ns = 0;
-+    }
-+
-+    /// 第一次到最后一次 `log()` 返回的墙钟跨度（页扫描口径）。
-+    fn scan_span_ms(&self) -> f64 {
-+        match (self.scan_first, self.scan_last) {
-+            (Some(first), Some(last)) => last.duration_since(first).as_secs_f64() * 1e3,
-+            _ => 0.0,
-+        }
-+    }
-+
-+    /// 仅 `log()` 内部（FakeRelay 取页/克隆事件）的墙钟合计。
-+    fn log_busy_ms(&self) -> f64 {
-+        self.log_busy_ns as f64 / 1e6
-+    }
-+
-+    /// `part()` 读回墙钟合计（manifest/snapshot/ASSET）。
-+    fn part_busy_ms(&self) -> f64 {
-+        self.part_busy_ns as f64 / 1e6
 +    }
 +}
 +
-+impl RelayClient for CountingRelay {
++impl RelayClient for PageIndexRelay {
 +    fn state(&mut self) -> Result<RelayState, SyncError> {
 +        self.inner.state()
 +    }
 +
 +    fn log(&mut self, cursor: Option<&str>, limit: u32) -> Result<RelayLogPage, SyncError> {
-+        if self.scan_first.is_none() {
-+            self.scan_first = Some(Instant::now());
-+        }
-+        let started = Instant::now();
-+        let result = self.inner.log(cursor, limit);
-+        self.log_busy_ns += started.elapsed().as_nanos();
 +        self.log_calls += 1;
-+        self.scan_last = Some(Instant::now());
-+        result
++        let after = cursor
++            .ok_or(SyncError::RelayWire("缺少游标"))?
++            .strip_prefix('c')
++            .and_then(|value| value.parse::<u64>().ok())
++            .ok_or(SyncError::RelayWire("游标格式非法"))?;
++        let start = self
++            .inner
++            .log
++            .partition_point(|event| event.relay_seq <= after);
++        let end = start
++            .saturating_add(usize::try_from(limit).expect("页大小溢出 usize"))
++            .min(self.inner.log.len());
++        let events = self.inner.log[start..end].to_vec();
++        let last = events.last().map_or(after, |event| event.relay_seq);
++        Ok(RelayLogPage {
++            events,
++            next_cursor: self.inner.cursor_for(last),
++            through_seq: last,
++            query_head: self.inner.head_seq,
++            epoch: self.inner.epoch,
++            gc_floor: self.inner.gc_floor,
++        })
 +    }
 +
 +    fn part(&mut self, object_id: &ObjectId, part_no: u32) -> Result<Vec<u8>, SyncError> {
-+        let started = Instant::now();
-+        let result = self.inner.part(object_id, part_no);
-+        self.part_busy_ns += started.elapsed().as_nanos();
-+        self.part_calls += 1;
-+        result
++        self.inner.part(object_id, part_no)
 +    }
 +
 +    fn put_part(
@@ -18580,36 +21351,25 @@ index 975e6af..c445663 100644
 +    }
 +}
 +
-+/// 一次性夹具：真实 SQLite vault + 合成 S 条日志 + 已 prepare 的 checkpoint。
-+struct ScanCostFixture {
++/// 一次性夹具：真实 SQLite vault + S 条合成日志 + 已 prepare 的 checkpoint。
++struct PageLimitFixture {
 +    _dir: tempfile::TempDir,
 +    vault: Vault,
 +    materials: genesis::GenesisMaterials,
-+    relay: CountingRelay,
++    relay: PageIndexRelay,
 +    prepared: PreparedCheckpoint,
-+    asset_events: usize,
-+    update_events: usize,
-+    prepare_pages: u64,
-+    prepare_scan_ms: f64,
-+    prepare_log_ms: f64,
 +}
 +
-+fn build_scan_cost_fixture(total_events: usize) -> ScanCostFixture {
-+    assert!(
-+        total_events > 1,
-+        "S 至少需要一条前缀 UPDATE 与一条尾部 ASSET"
-+    );
++fn build_page_limit_fixture() -> PageLimitFixture {
++    let total = u64::try_from(PAGE_LIMIT_S).expect("S 溢出 u64");
 +    let (dir, vault) = fresh_vault();
 +    ensure_structure_row(&vault).expect("structure 行");
-+    vault
-+        .set_meta(RELAY_CURSOR_META, b"c0")
-+        .expect("写 relay 游标");
 +    let materials = genesis::build_materials(
 +        VAULT_ID,
-+        [0x44; 16],
++        [0x45; 16],
 +        "pw",
 +        1_700_000_000,
-+        &mut TestRandom::new(0x88_14),
++        &mut TestRandom::new(0x88_15),
 +    )
 +    .expect("genesis 材料");
 +    let mut relay = FakeRelay::new(&[]);
@@ -18621,62 +21381,46 @@ index 975e6af..c445663 100644
 +        .expect("写 log_id");
 +
 +    // 一篇真实正文：prepare 需要可导出的本地快照/head VV（与 coverage 无关）。
-+    let doc = seed_doc(&vault, SCAN_COST_NOTE_ID, materials.peer_id_u64());
++    let doc = seed_doc(&vault, PAGE_LIMIT_NOTE_ID, materials.peer_id_u64());
 +    create_note_slot(
 +        &vault,
-+        SCAN_COST_NOTE_ID,
-+        SCAN_COST_NOTE_ID,
-+        SCAN_COST_NOTE_ID,
++        PAGE_LIMIT_NOTE_ID,
++        PAGE_LIMIT_NOTE_ID,
++        PAGE_LIMIT_NOTE_ID,
 +        1_700_000_000,
 +    )
 +    .expect("notes 行");
-+    doc.insert_scalars(0, "checkpoint coverage scan cost probe")
++    doc.insert_scalars(0, "checkpoint coverage scan page limit")
 +        .expect("正文");
-+    commit_with_intent(&vault, &doc, &uuid_like(9_001), [0x91; 32], EPOCH);
++    commit_with_intent(&vault, &doc, &uuid_like(9_101), [0x92; 32], EPOCH);
 +
-+    // 1..S-1 按 1/7 混入 ASSET；第 S 条是真 ASSET。前 S-1 条都属于本地
-+    // integrated 连续前缀（只借生产代码信任的"已消费"不变量，不读资产），
-+    // 唯一缺口是尾部 ASSET → prepare 落 pending receipt，validate 必须下载实证。
-+    let mut asset_events = 0usize;
-+    for seq in 1..total_events {
-+        if seq % SCAN_COST_ASSET_EVERY == 0 {
-+            relay.publish_event(RelayLogKind::Asset, [0x2a; 32]);
-+            asset_events += 1;
-+        } else {
-+            relay.publish_event(RelayLogKind::Update, [0x15; 32]);
-+        }
++    // S 条 UPDATE 日志。扫描只核对序号/epoch/游标连续性；缺口在 S 之前一律被
++    // visitor 跳过，事件负载不参与判定，因此不物化 32B 的 `event` 控制夹具内存。
++    relay.log.reserve(PAGE_LIMIT_S);
++    for seq in 1..=total {
++        relay.log.push(RelayLogEvent {
++            relay_seq: seq,
++            kind: RelayLogKind::Update,
++            object_id: Some([0x15; 32]),
++            epoch: EPOCH,
++            event: Vec::new(),
++            signature: None,
++        });
 +    }
-+    let (_, tail_seq) = publish_real_asset(
-+        &mut relay,
-+        VAULT_ID,
-+        materials.device_id,
-+        &materials.signing_key,
-+        &materials.root,
-+        b"coverage scan cost tail asset",
-+        "text/plain",
-+    );
-+    assert_eq!(
-+        tail_seq,
-+        u64::try_from(total_events).expect("S 溢出 u64"),
-+        "尾部 ASSET 必须恰为第 S 条日志"
-+    );
-+    asset_events += 1;
-+    let update_events = total_events - asset_events;
-+    assert!(
-+        (update_events) > 0,
-+        "混合日志必须至少有一条 UPDATE（实际 S={total_events}）"
-+    );
++    relay.head_seq = total;
 +
-+    let prefix = u64::try_from(total_events - 1).expect("S 溢出 u64");
++    // 本地已消费 1..=S-1：唯一缺口是第 S 条（prepare 因此不写 receipt）。
++    let consumed = total - 1;
 +    vault
-+        .set_meta(META_SYNC_INTEGRATED_SEQ, &prefix.to_be_bytes())
++        .set_meta(META_SYNC_INTEGRATED_SEQ, &consumed.to_be_bytes())
 +        .expect("写 integrated 前缀");
 +    vault
-+        .set_meta(META_SYNC_RECEIVED_SEQ, &prefix.to_be_bytes())
++        .set_meta(META_SYNC_RECEIVED_SEQ, &consumed.to_be_bytes())
 +        .expect("写 received 前缀");
 +
-+    // 从这里开始的页请求才算探针成本（prepare 的 pending receipt 扫描也是 O(S)）。
-+    let mut relay = CountingRelay::new(relay);
++    // prepare 前**不**写 relay 游标：`try_record_coverage_receipt` 会跳过 pending
++    // receipt 记录（否则 prepare 自己就会先撞 4096 页上限，测不到 validate 的守卫）。
++    let mut relay = PageIndexRelay::new(relay);
 +    let prepared = {
 +        let mut writer = CheckpointWriter::new(
 +            &vault,
@@ -18690,301 +21434,68 @@ index 975e6af..c445663 100644
 +        writer.prepare(&EmptyAssets).expect("prepare")
 +    };
 +    assert_eq!(
-+        prepared.report.covered_seq,
-+        u64::try_from(total_events).expect("S 溢出 u64")
++        prepared.report.covered_seq, total,
++        "S 必须等于日志条数（relay head）"
 +    );
 +    assert_eq!(
-+        relay.log_calls,
-+        u64::try_from(total_events.div_ceil(SCAN_COST_PAGE_LIMIT)).expect("页数溢出 u64"),
-+        "prepare 的 receipt 扫描应从 c0 扫满 S/256 页"
++        relay.log_calls, 0,
++        "prepare 不应扫描 coverage 日志（夹具在 prepare 前不写游标）"
 +    );
-+    let prepare_pages = relay.log_calls;
-+    let prepare_scan_ms = relay.scan_span_ms();
-+    let prepare_log_ms = relay.log_busy_ms();
-+    relay.reset_counters();
 +
-+    ScanCostFixture {
++    // validate 的扫描起点：持久游标 c0（1..=S 全在游标之后）。
++    vault
++        .set_meta(RELAY_CURSOR_META, b"c0")
++        .expect("写 relay 游标");
++
++    PageLimitFixture {
 +        _dir: dir,
 +        vault,
 +        materials,
 +        relay,
 +        prepared,
-+        asset_events,
-+        update_events,
-+        prepare_pages,
-+        prepare_scan_ms,
-+        prepare_log_ms,
 +    }
-+}
-+
-+fn median_ms(values: &[f64]) -> f64 {
-+    let mut sorted = values.to_vec();
-+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("时间不能是 NaN"));
-+    sorted[sorted.len() / 2]
-+}
-+
-+/// 该档位的 validate 重复次数：4096 页上限档只跑 1 次，其余 3 次取中位数。
-+fn scan_cost_runs(total_events: usize) -> usize {
-+    if total_events >= SCAN_COST_MAX_S {
-+        SCAN_COST_MAX_RUNS
-+    } else {
-+        SCAN_COST_RUNS
-+    }
-+}
-+
-+/// 进程峰值常驻内存（Linux `/proc/self/status` 的 `VmHWM`，MiB）。
-+///
-+/// 只用于给 4096 页档的夹具内存占用一个量级参考，不参与断言；其它平台返回 `None`。
-+fn peak_resident_mib() -> Option<f64> {
-+    #[cfg(target_os = "linux")]
-+    {
-+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-+        let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
-+        let kib: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
-+        Some(kib / 1024.0)
-+    }
-+    #[cfg(not(target_os = "linux"))]
-+    {
-+        None
-+    }
-+}
-+
-+fn run_scan_cost(total_events: usize) {
-+    let runs = scan_cost_runs(total_events);
-+    let setup_started = Instant::now();
-+    let mut fixture = build_scan_cost_fixture(total_events);
-+    let setup_ms = setup_started.elapsed().as_secs_f64() * 1e3;
-+    let peak_rss = peak_resident_mib().map_or_else(|| "n/a".to_owned(), |mib| format!("{mib:.1}"));
-+    let asset_pct = fixture.asset_events as f64 * 100.0 / total_events as f64;
-+    eprintln!(
-+        "[phase1a] scan_cost setup S={total_events} asset_events={} update_events={} \
-+         asset_pct={asset_pct:.1} prepare_pages={} prepare_scan_ms={:.3} prepare_log_ms={:.3} \
-+         setup_ms={setup_ms:.3} runs={runs} peak_rss_mib={peak_rss}",
-+        fixture.asset_events,
-+        fixture.update_events,
-+        fixture.prepare_pages,
-+        fixture.prepare_scan_ms,
-+        fixture.prepare_log_ms,
-+    );
-+
-+    let mut pages = 0u64;
-+    let mut part_calls = 0u64;
-+    let mut raw_scan = Vec::with_capacity(runs);
-+    let mut raw_validate = Vec::with_capacity(runs);
-+    let mut raw_log = Vec::with_capacity(runs);
-+    let mut raw_part = Vec::with_capacity(runs);
-+    for run in 0..runs {
-+        fixture.relay.reset_counters();
-+        let started = Instant::now();
-+        let baseline = {
-+            let mut writer = CheckpointWriter::new(
-+                &fixture.vault,
-+                &mut fixture.relay,
-+                VAULT_ID,
-+                fixture.materials.device_id,
-+                fixture.materials.signing_key.clone(),
-+                fixture.materials.root.clone(),
-+                fixture.materials.peer_id_u64(),
-+            );
-+            writer.validate(&fixture.prepared).expect("validate")
-+        };
-+        let validate_ms = started.elapsed().as_secs_f64() * 1e3;
-+        assert_eq!(
-+            baseline.covered_seq(),
-+            u64::try_from(total_events).expect("S 溢出 u64")
-+        );
-+        assert_eq!(
-+            baseline.coverage_verified_candidates(),
-+            1,
-+            "尾部 ASSET 必须被真实下载验证（receipt 路径）"
-+        );
-+        assert_eq!(baseline.coverage_durable_assets(), 0);
-+
-+        let run_pages = fixture.relay.log_calls;
-+        let scan_ms = fixture.relay.scan_span_ms();
-+        let log_ms = fixture.relay.log_busy_ms();
-+        let run_parts = fixture.relay.part_calls;
-+        let part_ms = fixture.relay.part_busy_ms();
-+        assert_eq!(
-+            run_pages,
-+            u64::try_from(total_events.div_ceil(SCAN_COST_PAGE_LIMIT)).expect("页数溢出 u64"),
-+            "validate 的 coverage scan 应从 c0 扫满 S/256 页"
-+        );
-+        assert!(run_parts >= 1, "validate 至少读回 manifest/快照/尾部 ASSET");
-+        pages = run_pages;
-+        part_calls = run_parts;
-+        eprintln!(
-+            "[phase1a] scan_cost S={total_events} run={run} pages={run_pages} \
-+             scan_ms={scan_ms:.3} log_ms={log_ms:.3} validate_ms={validate_ms:.3} \
-+             part_calls={run_parts} part_ms={part_ms:.3}",
-+        );
-+        raw_scan.push(scan_ms);
-+        raw_validate.push(validate_ms);
-+        raw_log.push(log_ms);
-+        raw_part.push(part_ms);
-+    }
-+
-+    let scan_median = median_ms(&raw_scan);
-+    let validate_median = median_ms(&raw_validate);
-+    let log_median = median_ms(&raw_log);
-+    eprintln!(
-+        "[phase1a] scan_cost S={total_events} pages={pages} scan_ms={scan_median:.3} \
-+         log_ms={log_median:.3} validate_ms={validate_median:.3} runs={runs} \
-+         raw_scan_ms={raw_scan:?} raw_log_ms={raw_log:?} raw_validate_ms={raw_validate:?} \
-+         part_calls={part_calls} part_ms_raw={raw_part:?}"
-+    );
 +}
 +
 +#[test]
-+#[ignore = "manual benchmark"]
-+fn fragmented_doc_per_page_replay_cost() {
-+    // 同一篇 1 MiB 正文，拆成 256 条 4 KiB update：模拟真实库中“大文档 + 多批增量”
-+    // 的形状，验证 per-page `load_body_doc` 的成本是否被单条大 op 低估。
-+    const FRAG_CHUNKS: usize = 256;
-+    const FRAG_CHUNK_CHARS: usize = 4096;
-+    const DOC_ID: &str = "large-doc-frag";
-+    let (_dir, vault) = fresh_vault();
-+    let doc = seed_doc(&vault, DOC_ID, LOCAL_PEER);
-+    for index in 0..FRAG_CHUNKS {
-+        let chunk = pseudo_text(0xF00D_0000 + index as u64, FRAG_CHUNK_CHARS);
-+        let at = doc.scalar_len();
-+        doc.insert_scalars(at, &chunk).expect("追加分片");
-+        commit_local(&vault, &doc);
-+    }
-+    assert_eq!(doc.scalar_len(), FRAG_CHUNKS * FRAG_CHUNK_CHARS);
-+    let update_rows = count(
-+        &vault,
-+        &format!("SELECT count(*) FROM loro_updates WHERE doc_id='{DOC_ID}'"),
-+    );
-+    assert_eq!(update_rows, FRAG_CHUNKS as i64, "必须有 256 条 update");
-+
-+    let mut replay_ms = Vec::with_capacity(LARGE_DOC_REPLAY_RUNS);
-+    for run in 0..LARGE_DOC_REPLAY_RUNS {
-+        let started = Instant::now();
-+        let (loaded, head) =
-+            load_body_doc(&vault, DOC_ID, LOCAL_PEER, None).expect("完整重放分片大文档");
-+        let ms = started.elapsed().as_secs_f64() * 1e3;
-+        assert_eq!(loaded.scalar_len(), FRAG_CHUNKS * FRAG_CHUNK_CHARS);
-+        assert_eq!(head.head_seq, FRAG_CHUNKS as u64);
-+        replay_ms.push(ms);
-+        eprintln!("[phase1a] frag_doc_replay run={run} replay_ms={ms:.3}");
-+    }
-+    eprintln!(
-+        "[phase1a] frag_doc_replay doc_mib=1.000 update_rows={update_rows}          chunks={FRAG_CHUNKS} chunk_bytes={FRAG_CHUNK_CHARS}          replay_ms_raw={replay_ms:?} replay_ms_median={:.3}",
-+        median_ms(&replay_ms),
-+    );
-+}
-+
-+#[test]
-+#[ignore = "manual benchmark"]
-+fn checkpoint_validate_scan_cost() {
-+    for total_events in SCAN_COST_S {
-+        run_scan_cost(total_events);
-+    }
-+}
-+
-+// ============================================================ M3 大文档 per-page replay 成本
-+//
-+// M3 标定：aggregate 每页（每批 pull）会为每个 **touched doc** 全量 `load_body_doc`
-+// （快照 + 该 doc 全部 `loro_updates` 重放）。§8.3.2 的 20 篇 × 107 KiB 夹具没有覆盖
-+// “单篇 1 MiB”这个形状；本探针造一篇确定性 1 MiB ASCII 正文（单条 insert op、
-+// 单条 `loro_updates` 行），连续 5 次 `load_body_doc`，打印 raw + 中位数（首轮含
-+// 冷页缓存，另给去掉首轮的 warm 中位数）；再各测一次 `pending_update(空 VV)` /
-+// `export_snapshot` / 从 snapshot `BodyDoc::restore` 作为旁路参考。只打印，
-+// 不 assert 时间。
-+//
-+// 注意：实测该形状的纯 replay ≈2 ms，远低于 §10.4 由 verify 折算的 ~2 s/篇；
-+// 后者含 baseline merge 的 attached import 成本，不是本探针的纯 replay 口径。
-+
-+/// 大文档正文 id。
-+const LARGE_DOC_ID: &str = "large-doc";
-+/// 1 MiB 正文（ASCII：Loro scalar 数 == UTF-8 字节数）。
-+const LARGE_DOC_CHARS: usize = 1024 * 1024;
-+/// 完整重放次数（每次都是新的 `load_body_doc`，不共享 BodyDoc）。
-+const LARGE_DOC_REPLAY_RUNS: usize = 5;
-+
-+#[test]
-+#[ignore = "manual benchmark"]
-+fn large_doc_per_page_replay_cost() {
-+    let (_dir, vault) = fresh_vault();
-+    let doc = seed_doc(&vault, LARGE_DOC_ID, LOCAL_PEER);
-+    let text = pseudo_text(0x1a2b_3c4d_5e6f_7081, LARGE_DOC_CHARS);
++fn coverage_scan_rejects_more_than_max_pages() {
++    let mut fixture = build_page_limit_fixture();
++    let error = {
++        let mut writer = CheckpointWriter::new(
++            &fixture.vault,
++            &mut fixture.relay,
++            VAULT_ID,
++            fixture.materials.device_id,
++            fixture.materials.signing_key.clone(),
++            fixture.materials.root.clone(),
++            fixture.materials.peer_id_u64(),
++        );
++        writer
++            .validate(&fixture.prepared)
++            .expect_err("超过 4096 页必须失败，不能静默截断/当成完整覆盖")
++    };
++    // 守卫按页数生效：正好 4096 次页请求（= COVERAGE_SCAN_MAX_PAGES），
++    // 第 4096 页结束时 through_seq = S-1 < S，循环耗尽后必须报错。
 +    assert_eq!(
-+        text.len(),
-+        LARGE_DOC_CHARS,
-+        "ASCII 正文的字节数必须正好 1 MiB"
++        fixture.relay.log_calls, PAGE_LIMIT_MAX_PAGES,
++        "coverage scan 必须正好用满 {PAGE_LIMIT_MAX_PAGES} 页上限（页大小 {SCAN_COST_PAGE_LIMIT}）"
 +    );
-+    doc.insert_scalars(0, &text).expect("写 1 MiB 正文");
-+    let head_seq = commit_local(&vault, &doc);
-+    let update_rows = count(
-+        &vault,
-+        &format!("SELECT count(*) FROM loro_updates WHERE doc_id='{LARGE_DOC_ID}'"),
-+    );
-+    assert_eq!(update_rows, 1, "per-page replay 要的是单条大文本 op 的形状");
-+    let payload_rows = vault
-+        .query(
-+            &format!("SELECT length(payload) FROM loro_updates WHERE doc_id='{LARGE_DOC_ID}'"),
-+            &[],
-+        )
-+        .expect("查询 update payload 长度");
-+    let payload_bytes = match payload_rows.first().and_then(|row| row.first()) {
-+        Some(Value::Integer(bytes)) => *bytes,
-+        other => panic!("payload 长度结果异常：{other:?}"),
-+    };
-+    assert!(payload_bytes > 0, "update payload 不能为空");
-+
-+    // 5 次完整重放：每次都是一次新的 SQLite 读取 + snapshot/update import。
-+    let mut replay_ms = Vec::with_capacity(LARGE_DOC_REPLAY_RUNS);
-+    let mut last_loaded: Option<BodyDoc> = None;
-+    for run in 0..LARGE_DOC_REPLAY_RUNS {
-+        let started = Instant::now();
-+        let (loaded, head) =
-+            load_body_doc(&vault, LARGE_DOC_ID, LOCAL_PEER, None).expect("完整重放大文档");
-+        let ms = started.elapsed().as_secs_f64() * 1e3;
-+        assert_eq!(loaded.scalar_len(), LARGE_DOC_CHARS);
-+        assert_eq!(loaded.byte_len(), LARGE_DOC_CHARS);
-+        assert_eq!(head.head_seq, head_seq, "重放 head 必须与提交时一致");
-+        replay_ms.push(ms);
-+        last_loaded = Some(loaded);
-+        eprintln!("[phase1a] large_doc_replay run={run} replay_ms={ms:.3}");
++    match error {
++        SyncError::Object(message) => {
++            assert!(
++                message.contains("页数超过上限"),
++                "错误文案必须指出页数超限：{message}"
++            );
++            assert!(
++                message.contains("未证明覆盖到 S"),
++                "错误文案必须说明覆盖未证明：{message}"
++            );
++        }
++        other => panic!("期望 SyncError::Object（页数超限），实际 {other:?}"),
 +    }
-+    let loaded = last_loaded.expect("至少重放一次");
-+    let replay_median = median_ms(&replay_ms);
-+    let warm_median = if replay_ms.len() > 1 {
-+        median_ms(&replay_ms[1..])
-+    } else {
-+        replay_median
-+    };
-+
-+    // 参考项：不代表 per-page replay，只给出 snapshot / 全量 update 路径的量级。
-+    let pending_started = Instant::now();
-+    let pending = loaded
-+        .pending_update(&loro::VersionVector::default())
-+        .expect("全量 pending_update");
-+    let pending_ms = pending_started.elapsed().as_secs_f64() * 1e3;
-+    let snapshot_started = Instant::now();
-+    let snapshot = loaded.export_snapshot().expect("导出 1 MiB 快照");
-+    let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1e3;
-+    let restore_started = Instant::now();
-+    let restored =
-+        BodyDoc::restore(LARGE_DOC_ID, LOCAL_PEER, Some(&snapshot), &[]).expect("从快照 restore");
-+    let restore_ms = restore_started.elapsed().as_secs_f64() * 1e3;
-+    assert_eq!(restored.scalar_len(), LARGE_DOC_CHARS);
-+
-+    eprintln!(
-+        "[phase1a] large_doc_replay doc_mib={:.3} text_bytes={LARGE_DOC_CHARS} \
-+         loro_payload_bytes={payload_bytes} update_rows={update_rows} \
-+         replay_runs={LARGE_DOC_REPLAY_RUNS} replay_ms_raw={replay_ms:?} \
-+         replay_ms_median={replay_median:.3} replay_ms_warm_median={warm_median:.3}",
-+        LARGE_DOC_CHARS as f64 / (1024.0 * 1024.0),
-+    );
-+    eprintln!(
-+        "[phase1a] large_doc_replay_ref pending_update_ms={pending_ms:.3} \
-+         pending_bytes={} export_snapshot_ms={snapshot_ms:.3} snapshot_bytes={} \
-+         restore_from_snapshot_ms={restore_ms:.3}",
-+        pending.payload.len(),
-+        snapshot.len(),
-+    );
 +}
++
+ // ============================================================ M3 大文档 per-page replay 成本
+ //
+ // M3 标定：aggregate 每页（每批 pull）会为每个 **touched doc** 全量 `load_body_doc`
 
 `````

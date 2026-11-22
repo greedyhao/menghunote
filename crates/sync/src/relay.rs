@@ -27,6 +27,8 @@ pub enum PauseReason {
     CursorExpired,
     /// 日志里出现本任务范围外的事件（asset/checkpoint/control），不能静默跳过。
     UnsupportedEvent,
+    /// 游标已过期且 checkpoint 快速追赶失败；不得回退普通 pull（会立即再次过期）。
+    CatchupFailed,
     /// 事件缺少 ObjectCommit 签名（真实 relay 还没在 log 事件里带签名）。
     MissingSignature,
     /// 轮换阶段 A–C 已冻结：禁止再 push/encrypt（A 事务编辑仍可继续）。
@@ -47,6 +49,7 @@ impl core::fmt::Display for PauseReason {
             Self::EpochMismatch => "relay epoch 与本地根不匹配",
             Self::CursorExpired => "游标前缀已被 GC",
             Self::UnsupportedEvent => "日志含本任务范围外的事件类型",
+            Self::CatchupFailed => "checkpoint 快速追赶失败（游标已过期，等待重试）",
             Self::MissingSignature => "日志事件缺少 ObjectCommit 签名",
             Self::RotationFrozen => "轮换已冻结，禁止 push/encrypt",
             Self::RelayHistoryRewritten => {

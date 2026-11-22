@@ -210,7 +210,7 @@ pub struct RevokedDevice {
 }
 
 /// 两阶段同步 **Prepare** 阶段的报告（encrypt/push/pull；不含 integrate/ack）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct PrepareReport {
     /// 本轮新加密的本地意图数。
     pub encrypted: usize,
@@ -218,8 +218,10 @@ pub struct PrepareReport {
     pub push: PushReport,
     /// 增量资产上传结果（正文 push 之后、pull 之前）。
     pub assets: AssetSyncReport,
-    /// 拉取结果（游标已 durable 推进）。
+    /// 拉取结果（游标已 durable 推进）；切换为 checkpoint 追赶时为默认值。
     pub pull: PullReport,
+    /// Phase 1B：已准备好、等待持闸的追赶候选；`None` = 本轮走普通聚合 pull。
+    pub catchup: Option<crate::catchup::CatchUpPrepared>,
 }
 
 /// 两阶段同步 **Integrate** 阶段的报告。
@@ -235,6 +237,8 @@ pub struct IntegratePhaseReport {
     pub materialized: usize,
     /// 物化失败篇数（失败只记日志，不影响已 durable 的 CRDT 集成结论）。
     pub materialize_failed: usize,
+    /// Phase 1B：本轮是否执行了 checkpoint 追赶。
+    pub catchup: Option<crate::catchup::CatchUpReport>,
 }
 
 /// 两阶段同步 **Finish** 阶段的报告（push tail + ack）。
@@ -704,6 +708,30 @@ impl DevLocal {
         // pull 必须有游标：B 由 bootstrap 落库，A 由 genesis 落库；旧 relay 两者都没有时
         // 用 `GET /state` 键 14 兜底（绝不把"缺失"当成 0 号游标硬编）。
         ensure_cursor(&mut client, vault)?;
+        // Phase 1B：完整 sync_once 也先尝试 checkpoint 追赶；失败不回退普通 pull
+        // （Mandatory 时普通 pull 只会再次 CursorExpired）。追赶在调用方的
+        // `before_integrate` 守卫之后写入，语义与普通 integrate 相同。
+        let pins = crate::bootstrap::BootstrapPins::from_vault(vault)?;
+        let catchup_config = crate::catchup::CatchUpConfig::default();
+        let local = menghunote_storage::sync_cursor_state(vault)?;
+        let state = client.state()?;
+        if crate::catchup::should_attempt(&state, local.received_seq, &catchup_config) {
+            let prepared = crate::catchup::prepare(
+                vault,
+                &mut client,
+                root.vault_id,
+                identity.loro_peer_id(),
+                &root,
+                &pins,
+                &catchup_config,
+            )?;
+            if let Some(prepared) = prepared {
+                if let Some(guard) = options.before_integrate.as_mut() {
+                    guard()?;
+                }
+                crate::catchup::integrate(vault, identity.loro_peer_id(), &prepared)?;
+            }
+        }
         let engine_identity = EngineIdentity {
             device_id: identity.device_id,
             signing_key,
@@ -743,6 +771,29 @@ impl DevLocal {
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
         let mut client = context.open(vault, identity)?.into_client();
         ensure_cursor(&mut client, vault)?;
+        // Phase 1B：网络阶段先决策/下载 checkpoint；不写库、不持闸。
+        // 若决策为 None，继续普通 push + pull（快照可能已下载但未写，属于保守的
+        // 机会性误判；Mandatory 命中时必须跳过普通 pull，否则会立即 CursorExpired）。
+        let pins = crate::bootstrap::BootstrapPins::from_vault(vault)?;
+        let catchup_config = crate::catchup::CatchUpConfig::default();
+        // 近端同步不下载快照：只有强制过期或落后上界达到 N_min 才进入 prepare。
+        let catchup = {
+            let local = menghunote_storage::sync_cursor_state(vault)?;
+            let state = client.state()?;
+            if crate::catchup::should_attempt(&state, local.received_seq, &catchup_config) {
+                crate::catchup::prepare(
+                    vault,
+                    &mut client,
+                    root.vault_id,
+                    identity.loro_peer_id(),
+                    &root,
+                    &pins,
+                    &catchup_config,
+                )?
+            } else {
+                None
+            }
+        };
         let engine_identity = EngineIdentity {
             device_id: identity.device_id,
             signing_key,
@@ -755,12 +806,17 @@ impl DevLocal {
         // ADR 0012 两阶段路径的资产上传点：与完整 `sync_once` 同一阶段（正文之后、
         // pull 之前），保证自动同步（S3）也会增量上传新资产。
         let assets = engine.upload_pending_assets()?;
-        let pull = engine.pull()?;
+        let pull = if catchup.is_some() {
+            PullReport::default()
+        } else {
+            engine.pull()?
+        };
         Ok(PrepareReport {
             encrypted,
             push,
             assets,
             pull,
+            catchup,
         })
     }
 
@@ -796,6 +852,30 @@ impl DevLocal {
         )
     }
 
+    /// 同 [`Self::sync_integrate`]，但携带 Prepare 阶段准备好的 checkpoint 追赶候选。
+    ///
+    /// 追赶写入/水位/游标在持闸段完成；`integrated >= S` 后清理已覆盖 inbox。
+    pub fn sync_integrate_with_catchup<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+        expect_head: Option<(&str, u64)>,
+        watch_doc: &str,
+        catchup: Option<&crate::catchup::CatchUpPrepared>,
+    ) -> Result<IntegratePhaseReport, SyncError> {
+        Self::sync_integrate_with_config_and_catchup(
+            target,
+            vault,
+            identity,
+            transport,
+            expect_head,
+            watch_doc,
+            IntegrateConfig::default(),
+            catchup,
+        )
+    }
+
     /// 同 [`Self::sync_integrate`]，但显式指定集成批次预算（测试/诊断用）。
     #[allow(clippy::too_many_arguments)]
     pub fn sync_integrate_with_config<T: RelayTarget + ?Sized>(
@@ -807,6 +887,30 @@ impl DevLocal {
         watch_doc: &str,
         integrate_config: IntegrateConfig,
     ) -> Result<IntegratePhaseReport, SyncError> {
+        Self::sync_integrate_with_config_and_catchup(
+            target,
+            vault,
+            identity,
+            transport,
+            expect_head,
+            watch_doc,
+            integrate_config,
+            None,
+        )
+    }
+
+    /// 同 [`Self::sync_integrate_with_config`]，可附加 checkpoint 追赶。
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_integrate_with_config_and_catchup<T: RelayTarget + ?Sized>(
+        target: &T,
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+        transport: Option<TransportTimeouts>,
+        expect_head: Option<(&str, u64)>,
+        watch_doc: &str,
+        integrate_config: IntegrateConfig,
+        catchup: Option<&crate::catchup::CatchUpPrepared>,
+    ) -> Result<IntegratePhaseReport, SyncError> {
         // Integrate 前复核授权基准（ADR 0012 S2b）：head 被推进 = 授权已失效，
         // 一律不 append；inbox/outbox 原样保留，调用方可按新授权重试。
         if let Some((doc_id, expected)) = expect_head {
@@ -816,12 +920,25 @@ impl DevLocal {
             }
         }
         let before = load_head(vault, watch_doc)?.head_seq;
+        let peer_id = identity.loro_peer_id();
+        let catchup_report = match catchup {
+            Some(prepared) => match crate::catchup::integrate(vault, peer_id, prepared) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    if prepared.decision().mode == crate::catchup::CatchUpMode::Mandatory {
+                        eprintln!("[sync] mandatory catchup integrate failed: {error}");
+                        return Err(SyncError::Paused(crate::relay::PauseReason::CatchupFailed));
+                    }
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         let context = target.relay_context(transport)?;
         let root = root_of(identity);
         let signing_key = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
         let mut client = context.open(vault, identity)?.into_client();
         ensure_cursor(&mut client, vault)?;
-        let peer_id = identity.loro_peer_id();
         let engine_identity = EngineIdentity {
             device_id: identity.device_id,
             signing_key,
@@ -833,16 +950,25 @@ impl DevLocal {
         // changed heads（正文）触发一次**现有接口**的物化：B 事务写 `notes.body_md`
         // 并发布 `BodyMaterialized` 事件（索引器据此增量更新）。结构投影的事件由
         // `StructureWriter::commit` 自己发布（`StructureProjected`）。
+        let mut changed_heads = outcome.changed_heads;
+        if let Some(report) = &catchup_report {
+            for doc_id in &report.docs {
+                if !changed_heads.iter().any(|head| head == doc_id) {
+                    changed_heads.push(doc_id.clone());
+                }
+            }
+        }
         let (materialized, materialize_failed) =
-            materialize_changed_bodies(vault, peer_id, &outcome.changed_heads);
+            materialize_changed_bodies(vault, peer_id, &changed_heads);
         let after = load_head(vault, watch_doc)?.head_seq;
         let watch_doc_changed = after != before;
         Ok(IntegratePhaseReport {
             integrate: outcome.report,
-            changed_heads: outcome.changed_heads,
+            changed_heads,
             watch_doc_changed,
             materialized,
             materialize_failed,
+            catchup: catchup_report,
         })
     }
 

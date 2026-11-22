@@ -1,5 +1,9 @@
 # 同步 Phase 0 评审索引（历史快照）
 
+> **2026-11-22 更新**：Phase 1B MVP 已实现（bootstrap prepare/integrate、CatchUpMode、
+> catchup、prune、两阶段/sync_once 接入）；本文以下“Phase 1B 未实现”是当时评审上下文，
+> 现状见 [`sync-fast-catchup-plan.md`](sync-fast-catchup-plan.md) §11。
+
 > **已过期，仅作历史对照。** 最新评审材料见
 > [`sync-review-packet-20261121.md`](sync-review-packet-20261121.md) 与
 > [`sync-phase1a-review-index.md`](sync-phase1a-review-index.md)。

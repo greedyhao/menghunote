@@ -91,13 +91,13 @@ cargo test -p menghunote-storage                    274 passed / 0 failed (1 ign
 cargo test -p menghunote-sync                       634 passed / 0 failed (3 ignored manual)
 cargo test -p menghunote-app                        740 passed / 0 failed
 cargo test -p menghunote-app --features dev-sync    891 passed / 0 failed
-cargo test --workspace                             2926 passed / 0 failed
-cargo test --workspace --features menghunote-app/dev-sync 3077 passed / 0 failed
+cargo test --workspace                             2932 passed / 0 failed
+cargo test --workspace --features menghunote-app/dev-sync 3083 passed / 0 failed
 ```
 
 > **最终复跑（2026-11-21 评审收尾）**：review 后新增 P1 门禁/访问器/资产批测试，当前计数
-> workspace **2926 / 0**、`--features menghunote-app/dev-sync` **3077 / 0**；
-> storage **309** / sync **641** / app **740**。
+> workspace **2932 / 0**、`--features menghunote-app/dev-sync` **3083 / 0**；
+> storage **310** / sync **646** / app **740**。
 > 上面的 2926 / 3077 是本文件收尾时点的批次；同轮后续新增测试已计入
 > 按批次引用，不要把增量当成回归。scan 探针的批次口径：最终 release 复跑
 > **0.428 / 4.039 ms** 与 `sync-phase0-metrics.md` §8.7.4 的初次 3-run
@@ -121,7 +121,8 @@ cargo test --workspace --features menghunote-app/dev-sync 3077 passed / 0 failed
 
 基线：`7a1a8e9`（在 §1/§2 的 P1/P2 修复之上）。只改 `storage::baseline_apply` 与
 `sync::bootstrap` 的本地语义；**没有** relay / sync-proto wire / DDL / 迁移 / checkpoint /
-游标连续推进改动，也**没有**实现 Phase1B。
+游标连续推进改动。**Phase1B 当时未实现；2026-11-22 已单独实现 MVP，见
+`sync-fast-catchup-plan.md` §11。**
 
 ### 8.1 失败不回滚已 merge 的 Loro 数据
 
@@ -246,7 +247,9 @@ cargo test -p menghunote-sync --test bootstrap \
 
 - 未新增/修改任何 DDL、迁移、`baseline_apply.status` 取值；
 - 未改 relay、`sync-proto` wire/schema、checkpoint 签名/验证、游标连续推进；
-- 未实现 Phase1B（gate_hold 报告、更强的批次/finish 门禁等）；
+- 当时未实现 Phase1B（gate_hold 报告、更强的批次/finish 门禁等）；**Phase1B MVP
+  已在 2026-11-22 实现，见 `sync-fast-catchup-plan.md` §11；gate_hold 硬中止、manifest
+  预检、时间成本交叉仍待。**
 - 未 commit。
 
 
@@ -386,3 +389,15 @@ cargo test -p menghunote-sync --test bootstrap \
     - 不再把真实 RTT 当本地可测项；机会性追赶启用前必须真实 relay 标定。
     - 仍未补：`finalize` cursor CAS 的并发注入用例、`unrecoverable && pending_len==0` 的
       专门测试、Rebuild Retryable 的完整路径集成、UI 真机观感验证。
+
+
+15. **Phase 1B MVP（2026-11-22，独立于本硬化清单）**：
+    - `bootstrap::prepare` 不写库、`bootstrap::integrate` 写库；`BootstrapAdvancement::CatchUp`
+      在 `integrated>=S` 后前移 cursor。
+    - `catchup` 模块：Mandatory（gc_floor>received，不受 16MiB 上限）与 Opportunistic
+      （S-received>=25k 且快照估算<=16MiB）；失败强制 `Paused(CatchupFailed)`，不回退普通 pull。
+    - `prune_covered_inbox` 只在 `integrated>=S` 的同一 SQL 证明下删除；两阶段
+      `sync_prepare/sync_integrate_with_catchup` 与完整 `sync_once` 已接入。
+    - 测试：catchup 决策 3、bootstrap prepare 零写/integrate cursor+本地 op、inbox watermark。
+    - 已知限制：机会性未做 manifest 预检（可能先下载后丢弃）、无 1.5× 时间成本交叉、
+      `gate_hold_ms` 未硬中止、真实 RTT 未标定、UI 未单独显示追赶阶段。

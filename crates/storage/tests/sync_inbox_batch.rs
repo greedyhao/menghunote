@@ -15,10 +15,11 @@ use support::*;
 
 use menghunote_storage::{
     advance_integrated_prefix, append_updates_with_integrated_marks, count_inbox_ready, load_head,
-    mark_integrated, mark_integrated_batch, mark_skipped_event_received, set_sync_log_id,
-    store_inbox_verified, store_inbox_verified_batch, sync_cursor_state, take_inbox_ready,
-    take_inbox_ready_where, StorageError, UpdateRecord, Value, Vault, VerifiedInboxRow,
-    META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
+    mark_integrated, mark_integrated_batch, mark_skipped_event_received, prune_covered_inbox,
+    set_sync_log_id, store_inbox_verified, store_inbox_verified_batch, sync_cursor_state,
+    take_inbox_ready, take_inbox_ready_where, StorageError, UpdateRecord, Value, Vault,
+    VerifiedInboxRow, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ,
+    META_SYNC_SKIPPED_RECEIVED_PREFIX,
 };
 
 const LOG_ID: [u8; 16] = [0x3a; 16];
@@ -1028,5 +1029,48 @@ fn ready_without_log_id_is_empty_and_invalid_length_is_corrupt() {
     assert!(
         matches!(error, StorageError::Corrupt { .. }),
         "实际 {error:?}"
+    );
+}
+
+#[test]
+fn prune_covered_inbox_requires_integrated_watermark() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    store_inbox_verified_batch(&vault, &rows(3, 0)).expect("写 inbox");
+    assert_eq!(inbox_rows(&vault).len(), 3);
+
+    // integrated=2 < 3：一行都不删。
+    vault
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &2u64.to_be_bytes())
+        .expect("写 integrated");
+    assert_eq!(
+        prune_covered_inbox(&vault, &LOG_ID, 3).expect("prune below watermark"),
+        0,
+        "integrated < S 时绝不能删"
+    );
+    assert_eq!(inbox_rows(&vault).len(), 3);
+
+    // integrated=3：删掉 <=3 的行；别的 incarnation 不受影响。
+    vault
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &3u64.to_be_bytes())
+        .expect("写 integrated");
+    assert_eq!(
+        prune_covered_inbox(&vault, &LOG_ID, 3).expect("prune covered"),
+        3
+    );
+    assert!(inbox_rows(&vault).is_empty());
+
+    // 缺失 integrated 也 fail-closed：不删。
+    vault
+        .exec(
+            "DELETE FROM meta WHERE key=?1",
+            &[Value::Text(META_SYNC_INTEGRATED_SEQ.to_owned())],
+        )
+        .expect("删 integrated");
+    store_inbox_verified_batch(&vault, &rows(1, 3)).expect("再写一条");
+    assert_eq!(
+        prune_covered_inbox(&vault, &LOG_ID, 4).expect("prune without watermark"),
+        0,
+        "没有 integrated 证据时不得删"
     );
 }

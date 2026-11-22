@@ -1553,14 +1553,36 @@ impl DevLocalRunner {
             menghunote_sync::random::array::<8>(&mut menghunote_sync::random::OsRandom)
                 .map_err(|error| format!("生成授权代际失败：{error}"))?,
         );
-        let prepare_summary = format!(
-            "推送 {} / 拉取 {}（UPDATE {} B / ASSET {} B / 拉取 {} ms；已落盘待应用 {ready}，等待持闸授权）",
-            prepare.push.acked,
-            prepare.pull.stored,
-            prepare.pull.update_bytes,
-            prepare.pull.asset_bytes,
-            prepare.pull.elapsed_ms
-        );
+        let catchup_note = prepare
+            .catchup
+            .as_ref()
+            .map(|catchup| {
+                format!(
+                    "；checkpoint 追赶 S={}{}，等待持闸写入",
+                    catchup.checkpoint_s(),
+                    if catchup.used_fallback() {
+                        "（fallback）"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .unwrap_or_default();
+        let prepare_summary = if prepare.catchup.is_some() {
+            format!(
+                "推送 {} / 已准备 checkpoint{}；等待持闸授权",
+                prepare.push.acked, catchup_note
+            )
+        } else {
+            format!(
+                "推送 {} / 拉取 {}（UPDATE {} B / ASSET {} B / 拉取 {} ms；已落盘待应用 {ready}，等待持闸授权）",
+                prepare.push.acked,
+                prepare.pull.stored,
+                prepare.pull.update_bytes,
+                prepare.pull.asset_bytes,
+                prepare.pull.elapsed_ms
+            )
+        };
         events(Event::Progress {
             op_id,
             phase: Phase::Pulling,
@@ -1615,13 +1637,14 @@ impl DevLocalRunner {
         let integrated = {
             let vault = self.open_vault()?;
             let identity = self.load_identity()?;
-            DevLocal::sync_integrate(
+            DevLocal::sync_integrate_with_catchup(
                 &context,
                 &vault,
                 identity,
                 None,
                 Some((gate.doc_id.as_str(), gate.durable_head_seq)),
                 &gate.doc_id,
+                prepare.catchup.as_ref(),
             )
             .map_err(|error| match error {
                 SyncError::CancelledBeforeIntegrate => format!(

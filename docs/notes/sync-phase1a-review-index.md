@@ -1,5 +1,9 @@
 # 同步 Phase 1A 评审索引（给高级模型）
 
+> **2026-11-22 更新**：Phase 1B MVP 已实现（bootstrap prepare/integrate、CatchUpMode、
+> catchup、prune、两阶段/sync_once 接入）；本文以下“Phase 1B 未实现”是当时评审上下文，
+> 现状见 [`sync-fast-catchup-plan.md`](sync-fast-catchup-plan.md) §11。
+
 > 当前评审对象：**Phase 0 度量 + Phase 1A（批量 inbox 原子化、按文档聚合 integrate、baseline 优化、Release 标定）**。
 > 完整评审包（架构/代码地图/问题清单）见
 > [`sync-review-packet-20261121.md`](sync-review-packet-20261121.md)。

@@ -1119,6 +1119,196 @@ fn control_pin_advances_but_never_rolls_back() {
 }
 
 #[test]
+fn catchup_prepare_writes_nothing_and_integrate_advances_cursor() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let checkpoint = relay.published_checkpoints[1].clone();
+
+    let (_target_dir, target) = fresh_vault();
+    ensure_structure_row(&target).expect("structure 行");
+    // 目标已有本地编辑 + 旧游标/水位：追赶不得丢本地 op，成功后 cursor 必须前移。
+    let local = seed_doc(&target, "local-note", materials.peer_id_u64());
+    create_note_slot(
+        &target,
+        "local-note",
+        "local-note",
+        "local-note",
+        1_700_000_000,
+    )
+    .expect("notes 行");
+    local.insert_scalars(0, "本地未上传").expect("正文");
+    commit_local(&target, &local);
+    target
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("旧 cursor");
+    target
+        .set_meta(META_SYNC_RECEIVED_SEQ, &1u64.to_be_bytes())
+        .expect("旧 received");
+    target
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &1u64.to_be_bytes())
+        .expect("旧 integrated");
+    target
+        .set_meta(menghunote_storage::META_SYNC_LOG_ID, &relay.log_id)
+        .expect("log_id");
+
+    let pins = BootstrapPins::from_vault(&target).expect("pins");
+    let prepared = bootstrap::prepare(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        &pins,
+    )
+    .expect("prepare");
+    assert_eq!(prepared.covered_seq(), checkpoint.covered_seq);
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(b"c0".as_slice()),
+        "prepare 不得写库/推进 cursor"
+    );
+    assert_eq!(
+        target
+            .get_meta(META_SYNC_INTEGRATED_SEQ)
+            .expect("integrated")
+            .as_deref(),
+        Some(1u64.to_be_bytes().as_slice()),
+        "prepare 不得推进 integrated"
+    );
+
+    let expected_cursor = prepared.checkpoint_cursor().to_owned();
+    let report = bootstrap::integrate(
+        &target,
+        materials.peer_id_u64(),
+        &prepared,
+        bootstrap::BootstrapAdvancement::CatchUp,
+        None,
+    )
+    .expect("integrate");
+    assert_eq!(report.covered_seq, checkpoint.covered_seq);
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(expected_cursor.as_bytes()),
+        "CatchUp 成功后 cursor 必须前移到实际选中 checkpoint"
+    );
+    let cursor = sync_cursor_state(&target).expect("cursor state");
+    assert!(cursor.integrated_seq >= checkpoint.covered_seq);
+    let local_text = load_body_doc(&target, "local-note", materials.peer_id_u64(), None)
+        .expect("本地文档")
+        .0
+        .text();
+    assert!(
+        local_text.contains("本地未上传"),
+        "本地未上传 op 不得丢：{local_text}"
+    );
+
+    // S 之后普通 pull：源在 checkpoint 后新增一条，目标用追赶后的 cursor 正常增量拉取。
+    let (source_doc, _) =
+        load_body_doc(&source, "note-1", materials.peer_id_u64(), None).expect("source note");
+    source_doc
+        .insert_scalars(0, "after-catchup ")
+        .expect("source edit");
+    commit_with_intent(&source, &source_doc, &uuid_like(9_777), [0xC7; 32], EPOCH);
+    {
+        let mut engine = SyncEngine::new(
+            &source,
+            &mut relay,
+            EngineIdentity {
+                device_id: materials.device_id,
+                signing_key: materials.signing_key.clone(),
+                peer_id: materials.peer_id_u64(),
+            },
+            materials.root.clone(),
+        );
+        engine.sync_once().expect("source push after catchup");
+    }
+    {
+        let mut engine = SyncEngine::new(
+            &target,
+            &mut relay,
+            EngineIdentity {
+                device_id: materials.device_id,
+                signing_key: materials.signing_key.clone(),
+                peer_id: materials.peer_id_u64(),
+            },
+            materials.root.clone(),
+        );
+        engine.sync_once().expect("target pull after catchup");
+    }
+    let target_note = load_body_doc(&target, "note-1", materials.peer_id_u64(), None)
+        .expect("target note")
+        .0
+        .text();
+    assert!(
+        target_note.contains("after-catchup"),
+        "追赶后必须能从 S 继续普通 pull：{target_note}"
+    );
+}
+
+#[test]
+fn catchup_mandatory_prepare_and_integrate_advances_through_public_wrapper() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    let checkpoint = relay.published_checkpoints[1].clone();
+
+    let (_target_dir, target) = fresh_vault();
+    ensure_structure_row(&target).expect("structure 行");
+    target
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("旧 cursor");
+    target
+        .set_meta(META_SYNC_RECEIVED_SEQ, &0u64.to_be_bytes())
+        .expect("旧 received");
+    target
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &0u64.to_be_bytes())
+        .expect("旧 integrated");
+    target
+        .set_meta(menghunote_storage::META_SYNC_LOG_ID, &relay.log_id)
+        .expect("log_id");
+    // 让普通 pull 必然 CursorExpired：本地 received=0，relay floor=1。
+    relay.gc_floor = 1;
+    let pins = BootstrapPins::from_vault(&target).expect("pins");
+    let prepared = menghunote_sync::catchup::prepare(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        &pins,
+        &menghunote_sync::catchup::CatchUpConfig::default(),
+    )
+    .expect("mandatory prepare")
+    .expect("gc_floor > received 必须进入 mandatory");
+    assert_eq!(
+        prepared.decision().mode,
+        menghunote_sync::catchup::CatchUpMode::Mandatory
+    );
+    assert_eq!(prepared.checkpoint_s(), checkpoint.covered_seq);
+    let expected_cursor = prepared.checkpoint_cursor().to_owned();
+    let report = menghunote_sync::catchup::integrate(&target, materials.peer_id_u64(), &prepared)
+        .expect("mandatory integrate");
+    assert_eq!(
+        report.mode,
+        menghunote_sync::catchup::CatchUpMode::Mandatory
+    );
+    assert_eq!(
+        target
+            .get_meta(RELAY_CURSOR_META)
+            .expect("cursor")
+            .as_deref(),
+        Some(expected_cursor.as_bytes())
+    );
+}
+
+#[test]
 fn bootstrap_cursor_pulls_updates_after_s() {
     let (_dir, source, materials) = setup();
     let (_target_dir, target) = fresh_vault();

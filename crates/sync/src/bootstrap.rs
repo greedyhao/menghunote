@@ -202,6 +202,7 @@ pub enum BootstrapFault {
 /// 故障注入伪造的 peer id（只在校验失败测试路径出现；不影响真实数据）。
 const VERIFY_FAULT_PEER: u64 = 0x0BAD_5EED;
 
+#[derive(Debug)]
 struct VerifiedDoc {
     doc_id: String,
     kind: u64,
@@ -211,6 +212,7 @@ struct VerifiedDoc {
     text: Option<String>,
 }
 
+#[derive(Debug)]
 struct VerifiedAsset {
     object_id: [u8; 32],
     real_sha256: [u8; 32],
@@ -220,6 +222,7 @@ struct VerifiedAsset {
 }
 
 /// 选中的基线：manifest/docs/assets + 基线本身 + 结构语义。
+#[derive(Debug)]
 struct SelectedBaseline {
     checkpoint: BootstrapCheckpoint,
     used_fallback: bool,
@@ -227,6 +230,193 @@ struct SelectedBaseline {
     assets: Vec<VerifiedAsset>,
     /// structure 快照声明的 `note_id -> body_doc_id`（用于导入后的结构投影校验）。
     structure_notes: BTreeMap<String, String>,
+}
+
+/// bootstrap 写库阶段对游标/水位的推进策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapAdvancement {
+    /// 新设备/普通 bootstrap：只允许前进，已有进度时保留旧游标（max 语义）。
+    MaxOnly,
+    /// Phase 1B 追赶：成功导入并证明 `integrated >= S` 后，把 relay cursor 前移到
+    /// 实际选中 checkpoint 的 cursor（S 覆盖已消费前缀）。
+    CatchUp,
+}
+
+/// `catchup_prepare` 的结果：网络阶段已完成、**尚未写本地库**的基线。
+///
+/// 生命周期只到 `catchup_integrate`；内含快照/资产明文，不能持久化到磁盘/日志。
+#[derive(Debug)]
+pub struct PreparedBootstrap {
+    selected: SelectedBaseline,
+    state: RelayState,
+    chain: Vec<ManagerChainEntry>,
+    control_hash: [u8; 32],
+    pins: BootstrapPins,
+}
+
+impl PreparedBootstrap {
+    /// 实际选中的 checkpoint 覆盖水位 S（fallback 时是 fallback 的 S）。
+    #[must_use]
+    pub fn covered_seq(&self) -> u64 {
+        self.selected.checkpoint.covered_seq
+    }
+
+    /// 实际选中的 checkpoint 游标（fallback 时是 fallback 的 cursor）。
+    #[must_use]
+    pub fn checkpoint_cursor(&self) -> &str {
+        &self.selected.checkpoint.cursor
+    }
+
+    /// 是否使用了 fallback。
+    #[must_use]
+    pub fn used_fallback(&self) -> bool {
+        self.selected.used_fallback
+    }
+
+    /// 已选中的文档/资产数量（用于决策/报告，不暴露明文）。
+    #[must_use]
+    pub fn doc_count(&self) -> usize {
+        self.selected.docs.len()
+    }
+
+    /// 已选中的资产数量。
+    #[must_use]
+    pub fn asset_count(&self) -> usize {
+        self.selected.assets.len()
+    }
+
+    /// 已选中的文档 id（用于追赶后物化/报告；不含明文）。
+    #[must_use]
+    pub fn doc_ids(&self) -> Vec<String> {
+        self.selected
+            .docs
+            .iter()
+            .map(|doc| doc.doc_id.clone())
+            .collect()
+    }
+
+    /// 当前 relay log incarnation（追赶后清理 inbox 必须绑定它）。
+    #[must_use]
+    pub fn log_id(&self) -> [u8; 16] {
+        self.state.log_id
+    }
+
+    /// 快照明文字节估算（文档 Loro snapshot + 资产字节）；调用方按密文上限再乘
+    /// 安全系数，不能把它当成精确的 wire 字节数。
+    #[must_use]
+    pub fn estimated_snapshot_bytes(&self) -> u64 {
+        let docs = self
+            .selected
+            .docs
+            .iter()
+            .map(|doc| u64::try_from(doc.snapshot.loro_snapshot_bytes.len()).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add);
+        let assets = self
+            .selected
+            .assets
+            .iter()
+            .map(|asset| asset.byte_len)
+            .fold(0u64, u64::saturating_add);
+        docs.saturating_add(assets)
+    }
+}
+
+/// 只下载 manifest 的预检结果（不下载 snapshot/asset，不写库）。
+///
+/// Phase 1B 机会性追赶先用它读实际选中 checkpoint 的 S / 明文字节估算；避免为了
+/// 一个十几 MB 的快照先下载整份数据再回退。
+#[derive(Debug)]
+pub struct BootstrapProbe {
+    checkpoint: BootstrapCheckpoint,
+    used_fallback: bool,
+    estimated_plain_bytes: u64,
+}
+
+impl BootstrapProbe {
+    /// 实际选中 checkpoint 的 S。
+    #[must_use]
+    pub fn covered_seq(&self) -> u64 {
+        self.checkpoint.covered_seq
+    }
+
+    /// 实际选中 checkpoint 的 cursor。
+    #[must_use]
+    pub fn checkpoint_cursor(&self) -> &str {
+        &self.checkpoint.cursor
+    }
+
+    /// 是否使用 fallback。
+    #[must_use]
+    pub fn used_fallback(&self) -> bool {
+        self.used_fallback
+    }
+
+    /// manifest 声明的明文字节（文档 + 资产）；不是 wire 密文字节。
+    #[must_use]
+    pub fn estimated_plain_bytes(&self) -> u64 {
+        self.estimated_plain_bytes
+    }
+}
+
+/// 只拉 manifest 的预检；选择逻辑与 `prepare` 相同，但不下载 snapshot/asset。
+pub fn probe<C: RelayClient>(
+    client: &mut C,
+    vault_id: [u8; 16],
+    root: &RootSecretV1,
+    pins: &BootstrapPins,
+) -> Result<BootstrapProbe, SyncError> {
+    if root.vault_id != vault_id {
+        return Err(SyncError::Object("bootstrap root 与 vault 不符"));
+    }
+    let bundle = client.bootstrap()?;
+    let state = client.state()?;
+    let chain = client.management_chain()?;
+    let control_hash = control_head_hash(&state, &chain);
+    validate_remote(vault_id, root, pins, &bundle, &state, &chain, &control_hash)?;
+
+    let mut last_error: Option<SyncError> = None;
+    for (checkpoint, used_fallback) in [
+        (bundle.primary.clone(), false),
+        (bundle.fallback.clone(), true),
+    ] {
+        let result = (|| {
+            if checkpoint.epoch != state.epoch || checkpoint.epoch != bundle.epoch {
+                return Err(SyncError::Object("bootstrap 基线 epoch 与 relay 不一致"));
+            }
+            if checkpoint.covered_seq > bundle.head_seq || checkpoint.covered_seq > state.head_seq {
+                return Err(SyncError::Object("bootstrap 基线 S 超过 relay head"));
+            }
+            if checkpoint.covered_seq < bundle.gc_floor || checkpoint.covered_seq < state.gc_floor {
+                return Err(SyncError::Object("bootstrap 基线 S 低于 relay GC floor"));
+            }
+            if checkpoint.cursor.is_empty() {
+                return Err(SyncError::Object("bootstrap 基线缺 relay 游标"));
+            }
+            let (manifest, digest) = fetch_manifest(client, root, &checkpoint)?;
+            verify_checkpoint_commit(client, &checkpoint, &manifest, &digest)?;
+            verify_manifest(&manifest, vault_id, &checkpoint, state.epoch)?;
+            let docs = manifest
+                .docs
+                .iter()
+                .map(|doc| doc.total_plain_len)
+                .fold(0u64, u64::saturating_add);
+            let assets = manifest
+                .assets
+                .iter()
+                .map(|asset| asset.byte_len)
+                .fold(0u64, u64::saturating_add);
+            Ok(BootstrapProbe {
+                checkpoint,
+                used_fallback,
+                estimated_plain_bytes: docs.saturating_add(assets),
+            })
+        })();
+        match result {
+            Ok(probe) => return Ok(probe),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("bootstrap 至少尝试过一个基线"))
 }
 
 /// 用已解出的 root 执行数据 bootstrap；本地 pins 从本库 meta 读取。
@@ -267,15 +457,17 @@ pub fn run_with_fault<C: RelayClient>(
     run_inner(vault, client, vault_id, peer_id, root, &pins, Some(fault))
 }
 
-fn run_inner<C: RelayClient>(
+/// 网络准备阶段：选 checkpoint、下载/解密/验签/校验，**不写本地库**。
+///
+/// Phase 1B 的 `catchup_prepare` 直接复用它；不持写闸。
+pub fn prepare<C: RelayClient>(
     vault: &Vault,
     client: &mut C,
     vault_id: [u8; 16],
     peer_id: u64,
     root: &RootSecretV1,
     pins: &BootstrapPins,
-    fault: Option<BootstrapFault>,
-) -> Result<BootstrapReport, SyncError> {
+) -> Result<PreparedBootstrap, SyncError> {
     if root.vault_id != vault_id {
         return Err(SyncError::Object("bootstrap root 与 vault 不符"));
     }
@@ -294,6 +486,7 @@ fn run_inner<C: RelayClient>(
         (bundle.fallback.clone(), true),
     ] {
         match load_baseline(
+            vault,
             client,
             root,
             vault_id,
@@ -313,12 +506,41 @@ fn run_inner<C: RelayClient>(
         }
     }
     let selected = selected.ok_or_else(|| last_error.expect("bootstrap 至少尝试过一个基线"))?;
+    Ok(PreparedBootstrap {
+        selected,
+        state,
+        chain,
+        control_hash,
+        pins: *pins,
+    })
+}
+
+/// 写库阶段：复用 `baseline_apply` 的 staging journal 与实际导入/读回校验/水位 CAS。
+///
+/// 调用方必须持有外部提交写闸；网络已在 [`prepare`] 完成。
+pub fn integrate(
+    vault: &Vault,
+    peer_id: u64,
+    prepared: &PreparedBootstrap,
+    advancement: BootstrapAdvancement,
+    fault: Option<BootstrapFault>,
+) -> Result<BootstrapReport, SyncError> {
+    let selected = &prepared.selected;
 
     // 实际导入（staging journal 可续跑）；失败时 journal 保留，下一次按同一基线续跑。
-    let report_docs = apply_selected(vault, peer_id, &selected, fault)?;
+    let report_docs = apply_selected(vault, peer_id, selected, fault)?;
 
     // 全部实际写入 + 读回校验通过后，才在一个事务里推进水位（max 语义 + CAS）。
-    finalize(vault, &selected, &state, &chain, &control_hash, pins, fault)?;
+    finalize(
+        vault,
+        selected,
+        &prepared.state,
+        &prepared.chain,
+        &prepared.control_hash,
+        &prepared.pins,
+        advancement,
+        fault,
+    )?;
 
     // 成功后才清 staging journal；若这里失败，重试会幂等重放并再次清理。
     let _cleared = abort_baseline_apply(vault)?;
@@ -329,9 +551,28 @@ fn run_inner<C: RelayClient>(
         used_fallback: selected.used_fallback,
         docs: report_docs,
         assets: selected.assets.len(),
-        cursor: selected.checkpoint.cursor,
+        cursor: selected.checkpoint.cursor.clone(),
         signed_checkpoint: true,
     })
+}
+
+fn run_inner<C: RelayClient>(
+    vault: &Vault,
+    client: &mut C,
+    vault_id: [u8; 16],
+    peer_id: u64,
+    root: &RootSecretV1,
+    pins: &BootstrapPins,
+    fault: Option<BootstrapFault>,
+) -> Result<BootstrapReport, SyncError> {
+    let prepared = prepare(vault, client, vault_id, peer_id, root, pins)?;
+    integrate(
+        vault,
+        peer_id,
+        &prepared,
+        BootstrapAdvancement::MaxOnly,
+        fault,
+    )
 }
 
 /// 校验本地 durable bootstrap 锚（ADR 0013 §3；`validate_remote`/`finalize` 共用）。
@@ -578,7 +819,9 @@ fn push_optional_signature(input: &mut Vec<u8>, signature: Option<[u8; 64]>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_baseline<C: RelayClient>(
+    vault: &Vault,
     client: &mut C,
     root: &RootSecretV1,
     vault_id: [u8; 16],
@@ -607,7 +850,7 @@ fn load_baseline<C: RelayClient>(
     verify_manifest(&manifest, vault_id, checkpoint, state.epoch)?;
     let docs = download_docs(client, root, peer_id, &manifest)?;
     let structure_notes = verify_structure_semantics(&docs, peer_id)?;
-    let assets = download_assets(client, root, &manifest)?;
+    let assets = download_assets(vault, client, root, &manifest)?;
     Ok(SelectedBaseline {
         checkpoint: checkpoint.clone(),
         used_fallback: false,
@@ -944,12 +1187,28 @@ fn verify_structure_semantics(
 }
 
 fn download_assets<C: RelayClient>(
+    vault: &Vault,
     client: &mut C,
     root: &RootSecretV1,
     manifest: &ManifestV1,
 ) -> Result<Vec<VerifiedAsset>, SyncError> {
     let mut assets = Vec::with_capacity(manifest.assets.len());
     for manifest_asset in &manifest.assets {
+        // 已有同 hash/长度的本地资产不重复下载；只拉缺失的（plan §8.2）。
+        if let Some(local) = menghunote_storage::asset_bytes(vault, manifest_asset.real_sha256)? {
+            if u64::try_from(local.len()).ok() == Some(manifest_asset.byte_len)
+                && <[u8; 32]>::from(Sha256::digest(&local)) == manifest_asset.real_sha256
+            {
+                assets.push(VerifiedAsset {
+                    object_id: manifest_asset.object_id,
+                    real_sha256: manifest_asset.real_sha256,
+                    byte_len: manifest_asset.byte_len,
+                    media_type: manifest_asset.media_type.clone(),
+                    data: local,
+                });
+                continue;
+            }
+        }
         let expected = crate::checkpoint::asset_object_id(
             root,
             &manifest_asset.real_sha256,
@@ -1279,6 +1538,7 @@ fn verify_imported(
 /// 只允许前进：`received/integrated = max(现有, S)`、`highwater = max(现有, pin, S)`；
 /// 已有进度时保留现有 relay 游标（不把已消费的位置回退）。`instance/log_id/epoch/
 /// control_rev/control_hash` 只允许前进或不变。任何一项回退都在**写事务之前**硬失败。
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     vault: &Vault,
     selected: &SelectedBaseline,
@@ -1286,6 +1546,7 @@ fn finalize(
     chain: &[ManagerChainEntry],
     control_hash: &[u8; 32],
     pins: &BootstrapPins,
+    advancement: BootstrapAdvancement,
     fault: Option<BootstrapFault>,
 ) -> Result<(), SyncError> {
     let s = selected.checkpoint.covered_seq;
@@ -1357,7 +1618,9 @@ fn finalize(
         return Err(SyncError::LocalCorrupt("本地已有同步水位但缺 relay 游标"));
     }
     // 已有进度时保留现有游标：baseline 的 cursor 只用于"从零开始"的设备，避免回退。
-    let write_cursor = !has_progress;
+    // Phase 1B 追赶例外：导入并读回校验成功后，S 已覆盖旧前缀，允许前移到 checkpoint
+    // cursor（最终仍由后续 `advance_cursor` 条件约束，不能因低 S 回退）。
+    let write_cursor = !has_progress || advancement == BootstrapAdvancement::CatchUp;
 
     let mut statements = Vec::new();
     let mut guards = Vec::new();

@@ -31,6 +31,7 @@ pub mod approval_v1;
 pub(crate) mod asset_sync;
 pub mod base64url;
 pub mod bootstrap;
+pub mod catchup;
 pub mod cbor;
 pub mod checkpoint;
 pub mod control_pin;

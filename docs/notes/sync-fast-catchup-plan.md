@@ -1,6 +1,6 @@
 # 同步快速追赶（历史链压缩）计划
 
-> 2026-11-20。针对“两台设备差异大时同步慢”的方案评估；**本文件只是计划，未改代码/wire**。
+> 2026-11-20 计划；2026-11-22 已实现 Phase 1B MVP（见 §11），未改 relay wire/schema。
 > 关联：ADR 0006（同步 v1）、ADR 0012（自动同步两阶段）、ADR 0013（生产 relay）。
 
 ## 1. 结论先行
@@ -192,8 +192,8 @@ epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当�
 
 ## 9. Phase 1A/1B 架构评审修订（2026-11-21）
 
-> 本节是**权威约束**；§6 的“500 条”初值已被本节取代。Phase 1B 代码尚未开始，
-> 需先完成 Stage 1（Phase 1A）的 release 标定并确认后再实现。
+> 本节是**权威约束**；§6 的“500 条”初值已被本节取代。Phase 1B MVP 已于
+> 2026-11-22 实现（见 §11）；阈值/标定结论仍以本节为准。
 
 ### 9.1 双模式触发与双向成本模型
 
@@ -317,3 +317,50 @@ epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当�
 5. **阈值与预算不动。** §9.1 的 3 s 持闸预算、16 MiB 机会性硬上限、`N_min =
    25 000`、2.0×/1.5× 成本交叉全部保留；Phase 1B **未实现**，上述数字只用于
    评审与后续设计。
+
+
+---
+
+## 11. Phase 1B MVP 实现（2026-11-22）
+
+### 已实现
+
+- **`bootstrap::prepare` / `bootstrap::integrate` 拆分**：prepare 只做
+  `/bootstrap` 选择/下载/解密/验签/校验，不写本地库；integrate 才走
+  `baseline_apply`/`finalize`/abort。`run` 仍等价于 `prepare + integrate`。
+- **`BootstrapAdvancement::CatchUp`**：成功导入并证明 `integrated >= S` 后允许把
+  relay cursor 前移到实际选中 checkpoint 的 cursor；`MaxOnly` 仍是新设备 bootstrap 的
+  原有 max 语义。
+- **`catchup` 模块**：
+  - `CatchUpMode::{Mandatory, Opportunistic}`、`CatchUpConfig`（`N_min=25_000`、
+    16 MiB 机会性上限）、`decide`、`should_attempt`；
+  - `prepare`（不持闸）与 `integrate`（调用方持闸）；integrate 后调用
+    `prune_covered_inbox`，只在 `integrated >= S` 时删除已覆盖行。
+- **两阶段接入**：`DevLocal::sync_prepare` 在强制过期或落后上界 ≥ `N_min` 时先准备
+  catchup，命中后跳过普通 pull；`DevLocal::sync_integrate_with_catchup` 在持闸段
+  执行追赶，并返回 `IntegratePhaseReport.catchup`；app worker 已携带
+  `PrepareReport.catchup`。
+- **完整 `sync_once`**：同样先尝试 catchup，再走普通 push/pull/integrate；强制追赶失败
+  映射为 `Paused(CatchupFailed)`，不回退普通 pull。
+- **缺失资产**：`load_baseline` 接收 vault；本地已有同 hash/长度/SHA256 的资产不再
+  从 relay 下载，仍纳入 verify/apply。
+- **机会性失败回退**：prepare 阶段失败时尚未写库，返回 `None` 让普通聚合 pull 继续；
+  Mandatory 失败仍 `Paused(CatchupFailed)`。
+- **S 之后普通 pull**：追赶测试追加“源端 checkpoint 后 push、目标端普通 pull”回归。
+- **测试**：`catchup` 决策单测、`bootstrap` prepare 不写库 + integrate 前移 cursor +
+  保留本地 op + 缺失资产、`prune_covered_inbox` watermark 门禁。
+
+### MVP 的已知限制
+
+1. **机会性已先做 manifest 预检**（`bootstrap::probe`）：只下载 manifest 读实际选中
+   checkpoint 的 S/明文字节，满足阈值才进入完整 snapshot 下载；下载后仍会用实际
+   fallback 的 S/字节复核一次，超限丢弃并回退普通 pull。
+2. **成本交叉只做了事件差 + 16 MiB 快照上限**，没有 §9.1 的 1.5× 时间交叉；
+   16 MiB 的 `verify_imported` 仍可能超过 3 s 持闸预算（见 §10）。
+3. **`gate_hold_ms` 只记录在报告/日志，未作为硬中止条件**；超 3 s 不会自动无损回退。
+4. **强制失败只映射 `Paused(CatchupFailed)`**，没有独立指数退避状态机；依赖 app 的
+   自动同步冷却。
+5. **快照/资产全量下载**；未做增量/文档级快照（wire v2）。
+6. **真实 relay RTT/TLS 未标定**；机会性追赶默认仍只由 `N_min`/16 MiB 控制，
+   生产启用前必须补真实标定（按用户要求本轮不测）。
+7. **UI 未单独显示“快速追赶”阶段**；报告字段已有，但面板仍按普通 prepare 文案。

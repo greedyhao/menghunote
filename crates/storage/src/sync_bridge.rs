@@ -1094,6 +1094,37 @@ pub fn store_inbox_verified_batch(
 /// `relay_seq <= received_seq`，不在连续前缀内的行保持 durable，等前面的缺口补齐。
 /// 排序为 `(log_id, relay_seq)`。
 ///
+/// 清理已被 `integrated` 前缀覆盖的 inbox 行（Phase 1B 追赶后）。
+///
+/// **安全边界**：只删除 `relay_seq <= up_to_seq` 且同一 SQL 内证明
+/// `sync.integrated_seq >= up_to_seq` 的行；证明不成立时一行不删。调用方还必须保证
+/// `log_id` 是当前 relay incarnation，且 `up_to_seq` 是实际成功的 checkpoint S。
+///
+/// 为什么不用先读后删：读 `integrated` 与 DELETE 之间可能被并发推进/回退；
+/// `EXISTS` 子查询把证明和删除放在同一条原子语句里。BLOB 按 8 字节 BE 比较。
+pub fn prune_covered_inbox(
+    vault: &Vault,
+    log_id: &[u8; 16],
+    up_to_seq: u64,
+) -> Result<usize, StorageError> {
+    let up_to = i64_of(up_to_seq)?;
+    let statements = [Statement::new(
+        "DELETE FROM sync_inbox \
+         WHERE log_id=?1 AND relay_seq<=?2 \
+           AND EXISTS (SELECT 1 FROM meta \
+                        WHERE key=?3 AND typeof(value)='blob' AND length(value)=8 \
+                          AND value>=?4)",
+        vec![
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(up_to),
+            Value::Text(META_SYNC_INTEGRATED_SEQ.to_owned()),
+            Value::Blob(up_to_seq.to_be_bytes().to_vec()),
+        ],
+    )];
+    let changed = vault.exec_transaction(&statements, &[])?;
+    Ok(changed.first().copied().unwrap_or(0))
+}
+
 /// **incarnation 过滤**（ADR 0006 §5）：`sync_inbox` 的 `log_id` 是写入时那代 relay
 /// 日志的 incarnation。restore 迁移 `sync.log_id` 后，旧 incarnation 的行仍然 durable
 /// （不能在迁移时静默删数据），但绝不能进入 ready——`relay_seq` 只在同一 incarnation

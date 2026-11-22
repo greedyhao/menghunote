@@ -1,12 +1,16 @@
 # 同步评审：入口
 
 > **1M 上下文请用 [`sync-review-1m.md`](sync-review-1m.md)**：
-> 约 **299.4 万字符 / 80–100 万 token**，代码截止 **`7583d8a`**；核心实现最前，含完整
-> sync 核心模块、storage/测试/文档/完整 diff；已包含 M3/M4、marker/Corrupt/pin/close 修复。
+> **316.2 万字符 / 99 section**，代码截止 **`038e92c`**；核心实现最前，含完整 sync
+> 核心模块、storage/测试/文档/完整 diff；已包含 Phase 1B MVP、M3/M4、marker/Corrupt/pin/close。
 
 > **272K 上下文请直接用 [`sync-review-272k.md`](sync-review-272k.md)**：
-> 约 **67.8 万字符 / 20–25 万 token**，代码截止 **`7583d8a`**；包含 M4 门禁、M3 标定、
-> 第三轮 P1 修补、关键测试、完整 diff 和提示词。
+> **73.8 万字符**，代码截止 **`038e92c`**；包含 Phase 1B 核心/文档/关键测试/Phase 1B diff
+> 和提示词；完整历史 diff 在 1M 稿。
+
+> **Phase 1B 状态（2026-11-22）**：MVP 已实现（Mandatory/Opportunistic、prepare/integrate、
+> manifest 预检、缺失资产、游标前进、S 后 pull、prune）；仍有 1.5× 时间交叉、gate_hold
+> 硬中止、Mandatory 退避、Opportunistic integrate 回退、UI 追赶阶段、真实 RTT 未做。
 
 > 下面的 **6 片是 review 前（代码 `1bededa`）的历史完整版**，不含 marker 门禁/
 > 错误可读修复；除非需要旧快照或更大上下文，否则不要用于当前评审。

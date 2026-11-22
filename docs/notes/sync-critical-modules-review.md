@@ -1,5 +1,9 @@
 # 同步 Phase 1A 关键模块评审（单文件版）
 
+> **2026-11-22 更新**：Phase 1B MVP 已实现（bootstrap prepare/integrate、CatchUpMode、
+> catchup、prune、两阶段/sync_once 接入）；本文以下“Phase 1B 未实现”是当时评审上下文，
+> 现状见 [`sync-fast-catchup-plan.md`](sync-fast-catchup-plan.md) §11。
+
 > **用途**：只上传这一份，评审 Phase 1A 的 6 个关键模块与 Phase 1B 阈值，不用再带
 > 多个代码文件。代码基线 `5d01e9e`；Phase 1B **未实现**。
 > 需要逐行看完整代码时，用文中 `路径:行号` 回仓库取即可。
