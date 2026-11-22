@@ -12,8 +12,8 @@ use gpui::{
 };
 use menghunote_app::shell::AppShell;
 use menghunote_storage::{
-    append_updates, list_tree, load_body_doc, materialize_body, StructureWriter, UpdateRecord,
-    Vault,
+    append_updates, list_tree_sorted, load_body_doc, materialize_body, StructureWriter, TreeSort,
+    UpdateRecord, Vault,
 };
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
@@ -120,7 +120,7 @@ fn shell_notice(cx: &mut gpui::VisualTestContext, host: &Entity<ShellHost>) -> O
 }
 
 fn tree_row(vault: &Vault, title: &str) -> usize {
-    list_tree(vault)
+    list_tree_sorted(vault, TreeSort::NameAsc)
         .expect("读取结构树失败")
         .iter()
         .position(|entry| entry.title == title)
@@ -251,11 +251,12 @@ async fn renaming_active_target_rewrites_sources_and_switching_still_works(
     let source = seed_note(&vault, "来源", "[[目标|别名]] 与 [[目标#标题]]");
     let (host, cx) = open_shell(cx, vault.clone());
 
+    // 启动时打开的是排序后的第一篇笔记（「来源」<「目标」），先把活动文档切到目标。
+    click_tree_row(cx, tree_row(&vault, "目标"));
     let target_view = active_view(cx, &host);
     assert_eq!(view_text(cx, &target_view), "目标正文");
 
     // 用 F2 重命名选中行（走产品里的真实入口；避免右键菜单 150ms 手势余波）。
-    click_tree_row(cx, tree_row(&vault, "目标"));
     let pane = cx.debug_bounds("editor-pane").expect("编辑器面板");
     cx.simulate_click(pane.center(), gpui::Modifiers::default());
     cx.run_until_parked();

@@ -74,6 +74,55 @@ pub fn sidebar_backlinks_empty() -> String {
     t(msg::sidebar::BACKLINKS_EMPTY)
 }
 
+// ---- 最左侧图标栏（ribbon）/ 侧栏排序 ----
+
+/// ribbon「今日日记」。
+#[must_use]
+pub fn sidebar_ribbon_daily() -> String {
+    t(msg::sidebar::RIBBON_DAILY)
+}
+
+/// ribbon「从模板新建」。
+#[must_use]
+pub fn sidebar_ribbon_template() -> String {
+    t(msg::sidebar::RIBBON_TEMPLATE)
+}
+
+/// ribbon「图谱」。
+#[must_use]
+pub fn sidebar_ribbon_graph() -> String {
+    t(msg::sidebar::RIBBON_GRAPH)
+}
+
+/// ribbon「搜索（Ctrl+K）」。
+#[must_use]
+pub fn sidebar_ribbon_search() -> String {
+    t(msg::sidebar::RIBBON_SEARCH)
+}
+
+/// 侧栏排序按钮文字「排序」。
+#[must_use]
+pub fn sidebar_sort_title() -> String {
+    t(msg::sidebar::SORT_TITLE)
+}
+
+/// 排序键展示名（菜单项与测试共用同一份文案）。
+///
+/// 参数是存储层的稳定短名（[`menghunote_storage::TreeSort::as_str`]），未知值原样返回，
+/// 保证"加了排序键却没加翻译"不会 panic。
+#[must_use]
+pub fn sidebar_sort_label(key: &str) -> String {
+    match key {
+        "name_asc" => t(msg::sidebar::SORT_NAME_ASC),
+        "name_desc" => t(msg::sidebar::SORT_NAME_DESC),
+        "updated_newest" => t(msg::sidebar::SORT_UPDATED_NEWEST),
+        "updated_oldest" => t(msg::sidebar::SORT_UPDATED_OLDEST),
+        "created_newest" => t(msg::sidebar::SORT_CREATED_NEWEST),
+        "created_oldest" => t(msg::sidebar::SORT_CREATED_OLDEST),
+        other => other.to_owned(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 状态栏
 // ---------------------------------------------------------------------------
@@ -146,34 +195,16 @@ pub fn settings_sync_title() -> String {
     t(msg::settings::SYNC_TITLE)
 }
 
-/// AppRoot 设置页标题「同步设置（DEV ONLY）」。
+/// 产品构建里同步面板的中性标题「同步面板」（**不含 DEV 标注**）。
 #[must_use]
-pub fn settings_sync_dev_title() -> String {
-    t(msg::settings::SYNC_DEV_TITLE)
+pub fn settings_sync_panel_title() -> String {
+    t(msg::settings::SYNC_PANEL_TITLE)
 }
 
-/// 同步面板已展开标题。
+/// 同步分类里没有可用面板时的说明。
 #[must_use]
-pub fn settings_sync_panel_expanded() -> String {
-    t(msg::settings::SYNC_PANEL_EXPANDED)
-}
-
-/// 同步面板默认收起标题。
-#[must_use]
-pub fn settings_sync_panel_collapsed() -> String {
-    t(msg::settings::SYNC_PANEL_COLLAPSED)
-}
-
-/// 设置页「展开」。
-#[must_use]
-pub fn settings_expand() -> String {
-    t(msg::settings::EXPAND)
-}
-
-/// 设置页「收起」。
-#[must_use]
-pub fn settings_collapse() -> String {
-    t(msg::settings::COLLAPSE)
+pub fn settings_sync_unavailable() -> String {
+    t(msg::settings::SYNC_UNAVAILABLE)
 }
 
 /// 设置页「关闭」。
@@ -260,7 +291,8 @@ pub fn settings_remote_tls_consent_required() -> String {
     t(msg::settings::REMOTE_TLS_CONSENT_REQUIRED)
 }
 
-/// 同步设置页顶部的 DEV ONLY 提示条。
+/// 开发警示条（`DEV ONLY · 开发同步…`）：**只在 `dev-sync` 构建渲染**
+///（AppRoot 各页顶部；产品构建不挂这个节点）。
 #[must_use]
 pub fn settings_sync_dev_banner() -> String {
     t(msg::settings::SYNC_DEV_BANNER)
@@ -344,6 +376,498 @@ pub fn settings_vault_path(path: &str) -> String {
     t_with(msg::settings::VAULT_PATH, &[("path", path)])
 }
 
+// ---------------------------------------------------------------------------
+// 模板插件（第一方，ADR 0020 扩展：正文/路径不翻译）
+// ---------------------------------------------------------------------------
+
+/// 侧栏「从模板新建…」。
+#[must_use]
+pub fn sidebar_new_from_template() -> String {
+    t(msg::templates::NEW_FROM_TEMPLATE)
+}
+
+/// 编辑器右键菜单「插入 → 模板…」。
+#[must_use]
+pub fn editor_menu_template() -> String {
+    t(msg::templates::INSERT_MENU)
+}
+
+/// 设置页「模板」区标题。
+#[must_use]
+pub fn templates_title() -> String {
+    t(msg::templates::TITLE)
+}
+
+/// 设置页「模板」区提示（普通笔记/本机设置）。
+#[must_use]
+pub fn templates_hint() -> String {
+    t(msg::templates::HINT)
+}
+
+/// 「启用模板」。
+#[must_use]
+pub fn templates_enabled() -> String {
+    t(msg::templates::ENABLED)
+}
+
+/// 「已停用」。
+#[must_use]
+pub fn templates_disabled() -> String {
+    t(msg::templates::DISABLED)
+}
+
+/// 模板插件未启用时的提示。
+#[must_use]
+pub fn templates_disabled_hint() -> String {
+    t(msg::templates::DISABLED_HINT)
+}
+
+/// 「模板文件夹」字段名。
+#[must_use]
+pub fn templates_folder_label() -> String {
+    t(msg::templates::FOLDER_LABEL)
+}
+
+/// 「日期格式」字段名。
+#[must_use]
+pub fn templates_date_format_label() -> String {
+    t(msg::templates::DATE_FORMAT_LABEL)
+}
+
+/// 「时间格式」字段名。
+#[must_use]
+pub fn templates_time_format_label() -> String {
+    t(msg::templates::TIME_FORMAT_LABEL)
+}
+
+/// 日期/时间示例行。
+#[must_use]
+pub fn templates_example(example: &str) -> String {
+    t_with(msg::templates::EXAMPLE, &[("example", example)])
+}
+
+/// 模板设置已保存。
+#[must_use]
+pub fn templates_saved() -> String {
+    t(msg::templates::SAVED)
+}
+
+/// 字段为空/无效，未保存。
+#[must_use]
+pub fn templates_rejected() -> String {
+    t(msg::templates::REJECTED)
+}
+
+/// 选择器标题「插入模板」。
+#[must_use]
+pub fn templates_picker_title_insert() -> String {
+    t(msg::templates::PICKER_TITLE_INSERT)
+}
+
+/// 选择器标题「从模板新建」。
+#[must_use]
+pub fn templates_picker_title_new() -> String {
+    t(msg::templates::PICKER_TITLE_NEW)
+}
+
+/// 选择器操作提示（↑/↓/Enter/Esc）。
+#[must_use]
+pub fn templates_picker_hint() -> String {
+    t(msg::templates::PICKER_HINT)
+}
+
+/// 选择器搜索框标签。
+#[must_use]
+pub fn templates_picker_search() -> String {
+    t(msg::templates::PICKER_SEARCH)
+}
+
+/// 空态：模板文件夹不存在。
+#[must_use]
+pub fn templates_empty_missing(folder: &str) -> String {
+    t_with(msg::templates::EMPTY_MISSING, &[("folder", folder)])
+}
+
+/// 空态：模板文件夹为空。
+#[must_use]
+pub fn templates_empty_folder(folder: &str) -> String {
+    t_with(msg::templates::EMPTY_FOLDER, &[("folder", folder)])
+}
+
+/// 空态：没有匹配项。
+#[must_use]
+pub fn templates_empty_no_match() -> String {
+    t(msg::templates::EMPTY_NO_MATCH)
+}
+
+/// 空态：未配置模板文件夹。
+#[must_use]
+pub fn templates_empty_no_folder() -> String {
+    t(msg::templates::EMPTY_NO_FOLDER)
+}
+
+/// 空态：没有打开的笔记（不能插入）。
+#[must_use]
+pub fn templates_empty_no_note() -> String {
+    t(msg::templates::EMPTY_NO_NOTE)
+}
+
+/// 已插入模板（`name` 是相对路径）。
+#[must_use]
+pub fn templates_inserted(name: &str) -> String {
+    t_with(msg::templates::INSERTED, &[("name", name)])
+}
+
+/// 已从模板新建（`title` 是新标题）。
+#[must_use]
+pub fn templates_created(title: &str) -> String {
+    t_with(msg::templates::CREATED, &[("title", title)])
+}
+
+/// 新建成功但正文写入失败。
+#[must_use]
+pub fn templates_created_insert_failed(title: &str) -> String {
+    t_with(msg::templates::CREATED_INSERT_FAILED, &[("title", title)])
+}
+
+/// 当前无法插入模板。
+#[must_use]
+pub fn templates_insert_failed() -> String {
+    t(msg::templates::INSERT_FAILED)
+}
+
+/// 模板正文为空，未插入。
+#[must_use]
+pub fn templates_empty_body() -> String {
+    t(msg::templates::EMPTY_BODY)
+}
+
+/// 从模板新建失败（结构写入被拒绝/出错）。
+#[must_use]
+pub fn templates_write_failed() -> String {
+    t(msg::templates::WRITE_FAILED)
+}
+
+/// 读取模板正文失败（`reason` 是错误原文，不翻译）。
+#[must_use]
+pub fn templates_read_failed(reason: &str) -> String {
+    t_with(msg::templates::READ_FAILED, &[("reason", reason)])
+}
+
+// ---------------------------------------------------------------------------
+// 日记插件（第一方）
+// ---------------------------------------------------------------------------
+
+/// 侧栏「今日日记」。
+#[must_use]
+pub fn sidebar_daily_note() -> String {
+    t(msg::daily_notes::OPEN_TODAY)
+}
+
+/// 设置页「日记」区标题。
+#[must_use]
+pub fn daily_notes_title() -> String {
+    t(msg::daily_notes::TITLE)
+}
+
+/// 设置页「日记」区提示。
+#[must_use]
+pub fn daily_notes_hint() -> String {
+    t(msg::daily_notes::HINT)
+}
+
+/// 「启用日记」。
+#[must_use]
+pub fn daily_notes_enabled() -> String {
+    t(msg::daily_notes::ENABLED)
+}
+
+/// 「已停用」。
+#[must_use]
+pub fn daily_notes_disabled() -> String {
+    t(msg::daily_notes::DISABLED)
+}
+
+/// 日记插件未启用时的提示。
+#[must_use]
+pub fn daily_notes_disabled_hint() -> String {
+    t(msg::daily_notes::DISABLED_HINT)
+}
+
+/// 「日记文件夹」字段名。
+#[must_use]
+pub fn daily_notes_folder_label() -> String {
+    t(msg::daily_notes::FOLDER_LABEL)
+}
+
+/// 「日期格式」字段名。
+#[must_use]
+pub fn daily_notes_date_format_label() -> String {
+    t(msg::daily_notes::DATE_FORMAT_LABEL)
+}
+
+/// 「日记模板路径」字段名。
+#[must_use]
+pub fn daily_notes_template_label() -> String {
+    t(msg::daily_notes::TEMPLATE_LABEL)
+}
+
+/// 模板路径提示（可空/任意普通笔记）。
+#[must_use]
+pub fn daily_notes_template_hint() -> String {
+    t(msg::daily_notes::TEMPLATE_HINT)
+}
+
+/// 今天路径示例。
+#[must_use]
+pub fn daily_notes_example(path: &str) -> String {
+    t_with(msg::daily_notes::EXAMPLE, &[("path", path)])
+}
+
+/// 日记设置已保存。
+#[must_use]
+pub fn daily_notes_saved() -> String {
+    t(msg::daily_notes::SAVED)
+}
+
+/// 字段为空/无效，未保存。
+#[must_use]
+pub fn daily_notes_rejected() -> String {
+    t(msg::daily_notes::REJECTED)
+}
+
+/// 已打开今日日记（`path` 是完整路径）。
+#[must_use]
+pub fn daily_notes_opened(path: &str) -> String {
+    t_with(msg::daily_notes::OPENED, &[("path", path)])
+}
+
+/// 已创建今日日记。
+#[must_use]
+pub fn daily_notes_created(path: &str) -> String {
+    t_with(msg::daily_notes::CREATED, &[("path", path)])
+}
+
+/// 创建今日日记失败（`reason` 不翻译）。
+#[must_use]
+pub fn daily_notes_create_failed(reason: &str) -> String {
+    t_with(msg::daily_notes::CREATE_FAILED, &[("reason", reason)])
+}
+
+/// 日记模板丢失（已创建空日记）。
+#[must_use]
+pub fn daily_notes_template_missing(path: &str) -> String {
+    t_with(msg::daily_notes::TEMPLATE_MISSING, &[("path", path)])
+}
+
+/// 日期格式没有产出有效笔记名。
+#[must_use]
+pub fn daily_notes_invalid_path() -> String {
+    t(msg::daily_notes::INVALID_PATH)
+}
+
+/// 日记结构写入被拒绝/出错（通用原因，具体见 stderr）。
+#[must_use]
+pub fn daily_notes_write_failed() -> String {
+    t(msg::daily_notes::WRITE_FAILED)
+}
+
+// ---------------------------------------------------------------------------
+// 仅本地使用（不同步）：产品入口 + dev-sync 开发入口 + 主界面提示/错误页
+// ---------------------------------------------------------------------------
+
+/// Welcome 本地区块标题「没有同步需求？」。
+#[must_use]
+pub fn local_welcome_title() -> String {
+    t(msg::local::WELCOME_TITLE)
+}
+
+/// Welcome：本地库说明（不联网、不创建同步实例、不参与同步）。
+#[must_use]
+pub fn local_welcome_hint() -> String {
+    t(msg::local::WELCOME_HINT)
+}
+
+/// Welcome：本地库实际路径（`{path}` 是公开路径，不经过翻译）。
+#[must_use]
+pub fn local_path_hint(path: &str) -> String {
+    t_with(msg::local::PATH_HINT, &[("path", path)])
+}
+
+/// **产品构建**入口文案「仅本地使用（不同步）」。
+#[must_use]
+pub fn local_action() -> String {
+    t(msg::local::ACTION)
+}
+
+/// **dev-sync 构建**开发入口文案「继续本地（DEV ONLY，无同步）」。
+#[must_use]
+pub fn local_dev_action() -> String {
+    t(msg::local::DEV_ACTION)
+}
+
+/// dev-sync 开发入口说明（打开默认 dev vault；仅供开发）。
+#[must_use]
+pub fn local_dev_hint() -> String {
+    t(msg::local::DEV_HINT)
+}
+
+/// 主界面提示「本地模式：不同步」。
+#[must_use]
+pub fn local_mode_notice() -> String {
+    t(msg::local::MODE_NOTICE)
+}
+
+/// 产品构建打开本地库失败的 Error 页标题。
+#[must_use]
+pub fn local_open_failed_title() -> String {
+    t(msg::local::OPEN_FAILED_TITLE)
+}
+
+/// dev-sync 构建打开 dev vault 失败的 Error 页标题（保留开发措辞）。
+#[must_use]
+pub fn local_dev_open_failed_title() -> String {
+    t(msg::local::DEV_OPEN_FAILED_TITLE)
+}
+
+/// Error 页公开字段标签「目录」。
+#[must_use]
+pub fn local_dir_label() -> String {
+    t(msg::local::DIR_LABEL)
+}
+
+// ---------------------------------------------------------------------------
+// 设置页左侧分类导航 / 关于（AppRoot 产品设置）
+// ---------------------------------------------------------------------------
+
+/// 设置导航标题「设置」。
+#[must_use]
+pub fn settings_nav_title() -> String {
+    t(msg::settings::NAV_TITLE)
+}
+
+/// 导航项「外观」。
+#[must_use]
+pub fn settings_nav_appearance() -> String {
+    t(msg::settings::NAV_APPEARANCE)
+}
+
+/// 导航项「语言」。
+#[must_use]
+pub fn settings_nav_language() -> String {
+    t(msg::settings::NAV_LANGUAGE)
+}
+
+/// 导航项「模板」。
+#[must_use]
+pub fn settings_nav_templates() -> String {
+    t(msg::settings::NAV_TEMPLATES)
+}
+
+/// 导航项「日记」。
+#[must_use]
+pub fn settings_nav_daily_notes() -> String {
+    t(msg::settings::NAV_DAILY_NOTES)
+}
+
+/// 导航项「同步」。
+#[must_use]
+pub fn settings_nav_sync() -> String {
+    t(msg::settings::NAV_SYNC)
+}
+
+/// 导航项「实例」。
+#[must_use]
+pub fn settings_nav_instances() -> String {
+    t(msg::settings::NAV_INSTANCES)
+}
+
+/// 导航项「Relay」。
+#[must_use]
+pub fn settings_nav_relay() -> String {
+    t(msg::settings::NAV_RELAY)
+}
+
+/// 导航项「安全」。
+#[must_use]
+pub fn settings_nav_security() -> String {
+    t(msg::settings::NAV_SECURITY)
+}
+
+/// 导航项「插件」（固定分类；只列第一方核心插件）。
+#[must_use]
+pub fn settings_nav_plugins() -> String {
+    t(msg::settings::NAV_PLUGINS)
+}
+
+/// 导航项「关于」。
+#[must_use]
+pub fn settings_nav_about() -> String {
+    t(msg::settings::NAV_ABOUT)
+}
+
+// ---- 「插件」分类：第一方核心插件总开关 ----
+
+/// 「插件」分类标题（核心插件）。
+#[must_use]
+pub fn settings_plugins_title() -> String {
+    t(msg::settings::PLUGINS_TITLE)
+}
+
+/// 「插件」分类说明（关闭后立即隐藏分类与侧栏入口；本机偏好）。
+#[must_use]
+pub fn settings_plugins_hint() -> String {
+    t(msg::settings::PLUGINS_HINT)
+}
+
+/// 模板插件说明。
+#[must_use]
+pub fn settings_plugins_templates_description() -> String {
+    t(msg::settings::PLUGINS_TEMPLATES_DESCRIPTION)
+}
+
+/// 日记插件说明。
+#[must_use]
+pub fn settings_plugins_daily_notes_description() -> String {
+    t(msg::settings::PLUGINS_DAILY_NOTES_DESCRIPTION)
+}
+
+/// 插件开关状态「已启用」。
+#[must_use]
+pub fn settings_plugins_enabled() -> String {
+    t(msg::settings::PLUGINS_ENABLED)
+}
+
+/// 插件开关状态「已停用」。
+#[must_use]
+pub fn settings_plugins_disabled() -> String {
+    t(msg::settings::PLUGINS_DISABLED)
+}
+
+/// 「关于」区标题。
+#[must_use]
+pub fn settings_about_title() -> String {
+    t(msg::settings::ABOUT_TITLE)
+}
+
+/// 「关于」区版本行（`{version}` = Cargo 包版本）。
+#[must_use]
+pub fn settings_about_version(version: &str) -> String {
+    t_with(msg::settings::ABOUT_VERSION, &[("version", version)])
+}
+
+/// 「关于」区构建行（`{build}` = 编译期 feature 列表）。
+#[must_use]
+pub fn settings_about_build(build: &str) -> String {
+    t_with(msg::settings::ABOUT_BUILD, &[("build", build)])
+}
+
+/// 「关于」区说明（只读、不改行为）。
+#[must_use]
+pub fn settings_about_hint() -> String {
+    t(msg::settings::ABOUT_HINT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +909,116 @@ mod tests {
     }
 
     #[test]
+    fn notes_plugin_labels_follow_the_global_locale() {
+        let guard = lock_for_test();
+
+        guard.reset(Locale::ZhCn);
+        assert_eq!(sidebar_new_from_template(), "从模板新建…");
+        assert_eq!(sidebar_daily_note(), "今日日记");
+        assert_eq!(settings_nav_plugins(), "插件");
+        assert_eq!(settings_plugins_title(), "核心插件");
+        assert_eq!(settings_plugins_enabled(), "已启用");
+        assert_eq!(settings_plugins_disabled(), "已停用");
+        assert_eq!(
+            settings_sync_unavailable(),
+            "当前没有打开的实例：同步面板只对已打开的实例可用。"
+        );
+        assert_eq!(editor_menu_template(), "模板…");
+        assert_eq!(templates_title(), "模板");
+        assert_eq!(templates_enabled(), "启用模板");
+        assert_eq!(templates_disabled(), "已停用");
+        assert_eq!(
+            templates_example("2026-11-18 08:14"),
+            "示例：2026-11-18 08:14（当前设置）"
+        );
+        assert_eq!(
+            templates_empty_missing("模板"),
+            "模板文件夹「模板」不存在（不会自动创建）"
+        );
+        assert_eq!(templates_empty_no_match(), "没有匹配的模板");
+        assert_eq!(templates_inserted("日记模板"), "已插入模板「日记模板」");
+        assert_eq!(templates_created("周记 2"), "已从模板新建「周记 2」");
+        assert_eq!(templates_read_failed("io"), "读取模板正文失败：io");
+        assert_eq!(daily_notes_title(), "日记");
+        assert_eq!(daily_notes_enabled(), "启用日记");
+        assert_eq!(daily_notes_disabled(), "已停用");
+        assert_eq!(
+            daily_notes_example("日记/2026-11-18"),
+            "今天的日记：日记/2026-11-18"
+        );
+        assert_eq!(
+            daily_notes_created("日记/2026-11-18"),
+            "已创建今日日记「日记/2026-11-18」"
+        );
+        assert_eq!(
+            daily_notes_template_missing("模板/日记模板"),
+            "日记模板「模板/日记模板」不存在：已创建空日记（可在设置页修正路径）"
+        );
+
+        guard.reset(Locale::En);
+        assert_eq!(sidebar_new_from_template(), "New from template…");
+        assert_eq!(sidebar_daily_note(), "Today");
+        assert_eq!(settings_nav_plugins(), "Plugins");
+        assert_eq!(settings_plugins_title(), "Core plugins");
+        assert_eq!(settings_plugins_enabled(), "Enabled");
+        assert_eq!(settings_plugins_disabled(), "Disabled");
+        assert_eq!(editor_menu_template(), "Template…");
+        assert_eq!(templates_title(), "Templates");
+        assert_eq!(templates_enabled(), "Templates enabled");
+        assert_eq!(templates_disabled(), "Disabled");
+        assert_eq!(
+            templates_example("2026-11-18 08:14"),
+            "Example: 2026-11-18 08:14 (current settings)"
+        );
+        assert_eq!(
+            templates_empty_missing("Templates"),
+            "Template folder \"Templates\" does not exist (never created automatically)"
+        );
+        assert_eq!(templates_empty_no_match(), "No matching templates");
+        assert_eq!(templates_inserted("Weekly"), "Inserted template \"Weekly\"");
+        assert_eq!(
+            templates_created("Weekly 2"),
+            "Created \"Weekly 2\" from a template"
+        );
+        assert_eq!(daily_notes_title(), "Daily notes");
+        assert_eq!(daily_notes_enabled(), "Daily notes enabled");
+        assert_eq!(daily_notes_disabled(), "Disabled");
+        assert_eq!(
+            daily_notes_example("Daily/2026-11-18"),
+            "Today's daily note: Daily/2026-11-18"
+        );
+    }
+
+    #[test]
+    fn local_only_labels_follow_the_global_locale() {
+        let guard = lock_for_test();
+
+        guard.reset(Locale::ZhCn);
+        assert_eq!(local_action(), "仅本地使用（不同步）");
+        assert_eq!(local_dev_action(), "继续本地（DEV ONLY，无同步）");
+        assert_eq!(local_mode_notice(), "本地模式：不同步");
+        assert_eq!(local_open_failed_title(), "无法打开本地笔记库");
+        assert_eq!(local_dir_label(), "目录");
+        assert_eq!(local_welcome_title(), "没有同步需求？");
+        assert_eq!(
+            local_path_hint("/data/menghunote/local/vault.sqlite3"),
+            "本地库：/data/menghunote/local/vault.sqlite3"
+        );
+
+        guard.reset(Locale::En);
+        assert_eq!(local_action(), "Use locally only (no sync)");
+        assert_eq!(local_dev_action(), "Continue locally (DEV ONLY, no sync)");
+        assert_eq!(local_mode_notice(), "Local mode: not synced");
+        assert_eq!(local_open_failed_title(), "Unable to open the local vault");
+        assert_eq!(local_dir_label(), "Directory");
+        assert_eq!(local_welcome_title(), "Don't need sync?");
+        assert_eq!(
+            local_path_hint("/data/menghunote/local/vault.sqlite3"),
+            "Local vault: /data/menghunote/local/vault.sqlite3"
+        );
+    }
+
+    #[test]
     fn backlink_labels_use_english_plural_forms() {
         let guard = lock_for_test();
 
@@ -413,6 +1047,7 @@ mod tests {
         assert_eq!(settings_vault_path("/tmp/a.db"), "库文件：/tmp/a.db");
         assert_eq!(settings_vault_id("v1"), "vault_id：v1");
         assert_eq!(settings_sync_title(), "设置 · 同步");
+        assert_eq!(settings_sync_panel_title(), "同步面板");
         assert_eq!(settings_save(), "保存模式/relay（重启后生效）");
 
         guard.reset(Locale::En);
@@ -423,6 +1058,7 @@ mod tests {
         assert_eq!(settings_vault_path("/tmp/a.db"), "Vault file: /tmp/a.db");
         assert_eq!(settings_vault_id("v1"), "vault_id: v1");
         assert_eq!(settings_sync_title(), "Settings · Sync");
+        assert_eq!(settings_sync_panel_title(), "Sync panel");
         assert_eq!(
             settings_save(),
             "Save mode/relay (takes effect after restart)"

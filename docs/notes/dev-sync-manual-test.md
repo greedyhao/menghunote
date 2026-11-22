@@ -123,7 +123,8 @@ B 无法 join；**切片 4c-4 之前**发布基线还要关窗口跑 CLI，手�
 
 ## 1. 前置
 
-- 仓库根目录执行；分支/HEAD 带 `--features dev-sync`（默认构建**不含**同步面板）。
+- 仓库根目录执行；分支/HEAD 带 `--features dev-sync`（默认构建含产品 `sync-ui`，但
+  **不含** `local_dev` / `--dev-sync*` / V2 管理；本演示必须用 `dev-sync` 构建）。
 - 两个实例各自一个**尚不存在**的库路径：`.../a/vault.sqlite3`、`.../b/vault.sqlite3`；
   身份文件 `dev-identity.bin` 落在同目录（Create/Join 只接受全新路径）。
 - Linux 首次运行会初始化用户主钥（ADR 0008，`$XDG_DATA_HOME/menghunote/local-identity/key-v1.bin`）；
@@ -608,7 +609,8 @@ durable），最多等**约 2s**；拿不到空闲就 **defer**：释放闸门�
 > **已知边界**：自动同步是 dev-only 功能；Windows 真机的输入法/失焦降频仍需人工复核
 > （headless 用 debug 钩子模拟组合）。轮换（`key_epoch`）已由面板按钮接入（§2.11），但
 > **自动同步不触发轮换/apply**（轮换期间自动轮暂停）；metadata 事件认证/对账
-> （task-121…124）仍是后续。
+> （task-122…124）仍是后续。轮换期写下的 ASSET 与普通 checkpoint 的 reservation
+> 复用已由 task-121 在 relay 侧幂等化（同字节 200 duplicate，不改 wire）。
 
 ## 远程模式、安全指纹与 SecurityPaused（ADR 0013 S3a，2026-11-13）
 

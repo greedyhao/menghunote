@@ -254,6 +254,7 @@ menghunote/
 │  ├─ ui/         # 可复用视图与主题（后补）
 │  ├─ editor/     # 编辑器纯模型：Rope 镜像、选择、ProjectionMap、IME 输入文档（不含 GPUI）
 │  ├─ i18n/       # 纯 i18n：Locale/消息 id/静态 catalog/t·t_with·t_count（零外部依赖、无 GPUI）
+│  ├─ plugin-api/ # 纯插件 manifest/host 契约：PluginId/Manifest/Capability/HostServices（serde + i18n，无 GPUI/storage/sync）
 │  ├─ text/       # 唯一坐标/单位原语：SourceByte/UnicodeScalar/InputUtf16/DisplayByte、SourceRange、CoordError
 │  ├─ core/       # 领域模型（后补，暂未落地）
 │  └─ storage/    # SQLite/CRDT/物化/同步 + session（EditorDocumentPort 的串行 reducer）
@@ -264,7 +265,8 @@ menghunote/
 ```
 
 **依赖方向（ADR 0003 + ADR 0006 + ADR 0020，禁止成环，含 dev-dependency）**：
-`app → editor/storage/text/gpui/sync/i18n`；
+`app → editor/storage/text/gpui/sync/i18n`（`app` 可依赖 `plugin-api`；P2 注册表尚未消费它）；
+`plugin-api` **不依赖** GPUI/storage/sync/relay/editor（仅 `serde` + 纯 `i18n`，无 IO/加载器）；
 `i18n` **不依赖** GPUI/storage/sync/editor（纯 Rust、零外部依赖）；
 `editor → storage/text`；`storage → text/loro/rusqlite`；
 `sync → storage + sync-proto`；`relay → sync-proto`；`sync-proto` 纯类型（serde，无 IO/crypto/Loro/SQLite）；
@@ -282,7 +284,7 @@ menghunote/
 
 ```bash
 cargo build -p menghunote-app     # ✅ 冷构建约 3m50s
-cargo run   -p menghunote-app     # 开一个空窗口
+cargo run   -p menghunote-app     # 默认 sync-ui → AppRoot 同步向导（Welcome/Create/Join）
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test  --all
@@ -295,6 +297,21 @@ cargo test  --all
 > **处理方式**：对该条构建命令单独申请 `danger-full-access` 审批即可，无需改动任何配置或代理。
 > 若不明原因又出现网络类报错，先跑 `python -c "import urllib.request; print(urllib.request.urlopen('https://index.crates.io/config.json', timeout=15).status)"`
 > 区分"网络不通"与"沙箱阻挡 TLS"。
+
+**同步 UI 的 feature 矩阵（2026-11-18，P1 同步产品化）**：
+
+```bash
+cargo build -p menghunote-app                  # 默认 = sync-ui → AppRoot 同步向导（Welcome/Create/Join）
+cargo test  -p menghunote-app                  # 默认（sync-ui）测试
+cargo test  -p menghunote-app --features dev-sync    # dev：local_dev / --dev-sync* CLI / 测试 setup / V2 管理
+cargo test  -p menghunote-app --no-default-features  # 旧默认：纯 dev vault（无同步 UI）
+```
+
+- `sync-ui` 是 **default feature**，产品构建只需要它；`sync` 只提供协议/能力、不含 UI；
+- `dev-sync` = `sync-ui` + `local_dev` 许可 + dev CLI/setup + localhost relay 门禁 +
+  V2 管理实验入口。**产品构建不得启用 `dev-sync`**；
+- 默认构建仍必须 `mode_allowed(LocalDev) == false`（链接/表单入口也会明确拒绝）；
+- 细节与 cfg 分类见 [`docs/notes/sync-product-p1.md`](docs/notes/sync-product-p1.md)。
 
 Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 
@@ -356,7 +373,11 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **`v0.4-sync` 已由 GPT 复审 APPROVE（原锚点 `61d8de4`；整理前 `321f732`，无必修项）并打 annotated tag**；2026-11-13 前移至 `d16f6fe`（旧锚点 `v0.4-sync-backup-20261113` → `738f3f0`）；非生产，仅 localhost 开发验收。
 > **Windows 实机已由用户于 2026-11-13 在 `5538344` 包上实测通过**（产品代码与 `v0.4-sync` tag 树一致；命令/计数未逐条留档，复跑命令见 0007 §5）。
 > v0.4 **只支持修复后新建的 vault/身份**，旧开发 vault 失效（旧签名 checkpoint 无法仅靠本地版本拒绝隔离）。
-> 后置：`task-121`（relay reservation 复用）、`task-122`（`validation_version=2`/receipt HMAC/GC 版本门禁）、`task-123`（默认删凭证吊销 + 轮换 opt-in）、`task-124`（metadata 事件认证对账/续读）。
+> 后置：`task-122`（`validation_version=2`/receipt HMAC/GC 版本门禁）、`task-123`（默认删凭证吊销 + 轮换 opt-in）、`task-124`（metadata 事件认证对账/续读）。
+> `task-121`（relay reservation 复用）**已完成**（2026-11-18）：同字节跨 reservation
+> （rotation/checkpoint/普通）`PUT parts` 幂等复用、对象只存一份且不重复计费；不同字节
+> 仍 `PART_CONFLICT`，补缺失分片仍要求同一预算来源；**wire/错误码/schema 未变**。
+> 详见 [`docs/notes/task-121-relay-reservation-reuse.md`](docs/notes/task-121-relay-reservation-reuse.md)。
 > Linux 开发适配见 ADR 0008（0600 裸主钥，安全弱于 DPAPI，不宣称等价）。
 > **dev-only 同步 UI（ADR 0009）Phase 1 已完成**：真实 AppShell 内面板 + 持闸 SyncOnce +
 > 活动文档 adopt；面板「发布基线」、设备列表/「移除设备（不轮换）」已接通。
@@ -400,7 +421,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 373 / sync 613 / app `--features dev-sync` **620** / 默认 **374** / i18n **16** / storage 195 / editor 287 / markdown 45。
+> 测试：relay 376 / sync 614 / app 默认 **522** / `--features dev-sync` **677** / `--no-default-features` **406** / i18n **16** / plugin-api **24** / storage **201** / editor 287 / markdown 45。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
@@ -464,8 +485,19 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > 失败回退源码、工具条「编辑源码/重新渲染」；无新增依赖。**光标/选区在 block 内时
 > 保持完整源码可编辑、不投影 Object，布局回落到普通 fenced code 行高（不再出现
 > “大光标”）；**非空选区跨过 block 时仍保持 Object 并正常渲染**，拖选不会突然
-> 切源码/变长；空 Mermaid 永远显示源码、不出现“等待渲染”占位。** 暗色/导出/子进程
-> 超时隔离仍待 M3。
+> 切源码/变长；空 Mermaid 永远显示源码、不出现“等待渲染”占位。**
+> **Mermaid M3a（2026-11-18，暗色 + CJK 回退）**：`render_svg_for_preview(source,
+> ThemeId)` 用 merman 内置主题编译器绑定 `RenderRequest::with_theme`——
+> 浅色 `ThemePreset::EditorLight`、深色 `EditorDark`；`MermaidService` 的 `Job`/
+> `RenderFn` 携带 `ThemeId`，worker 按 key 的主题渲染（不读全局状态），浅/深色
+> key 各渲染一次、切主题旧 key 失效、切回命中缓存。编译预设前把
+> `Microsoft YaHei` / `Noto Sans CJK SC` 插入 SVG 字体栈（通用族仍在最后；
+> 不引入字体文件/依赖）；真实中文标签在 headless 深色 AppShell 下占位 → Ready，
+> 真实 `SvgRenderer` 光栅化有文字墨迹（对照空标签 0 像素）。浅色侧 `A-->B` 的
+> 自然尺寸由 168×156 → 168×162（EditorLight 排版），headless 几何断言已同步。
+> 测试：app 默认 **380** / `--features dev-sync` **626**；mermaid 单测 16、
+> mermaid_preview 12、headless_mermaid 5 + headless_mermaid_theme 1；fmt/clippy 干净。
+> **导出 / 子进程超时隔离仍待 M3 后续；Windows 真机字体回退观感未验。**
 > **反引号补全（2026-11-17）**：普通输入自动配对、成对中间跳过、行首 ``` 自动补
 > fenced block；表格/代码块/HTML/IME 组合中不触发，一次按键一个撤销组。
 > **资产 GC dry-run（2026-11-17）**：storage 只读扫描候选，保护根=正文引用/历史版本/
@@ -610,3 +642,185 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   `headless_language` 3、`headless_language_ui` 1、`language_settings`/`ui_text`
   单测 8）；fmt/clippy 干净。已知限制：不订阅 OS 语言切换（需重启/重选跟随系统）；
   未迁移页面在英文界面仍显示中文。
+- **插件契约 + 第一方模块注册表（ADR 0020 P2，2026-11-18）**：
+  新增纯 crate `crates/plugin-api`（`menghunote-plugin-api`；运行时仅 `serde` +
+  纯 `menghunote-i18n`，零 GPUI/storage/sync）：`PluginId`（小写字母/数字/`.`/`-`，
+  1–64，首尾非分隔符）、`PluginVersion`（`major.minor.patch`）、`ApiVersion`（`u16`，
+  当前只支持 `1`）、`PluginManifest`（id/name/version/api_version/locales/
+  capabilities/commands/panels/settings）与 collect-all `validate`；8 个 capability
+  （snake_case；未知能力 serde 拒绝）；`HostServices` + notes read/write、settings、
+  notifications 最小 object-safe trait（host 自有类型，不暴露 SQLite/密钥/GPUI）。
+  **不实现加载器/运行时/安装/命令执行/授权 UI/签名**；manifest 校验失败必须
+  拒绝加载（未来加载器的契约，本切片无加载路径）。
+  `crates/app/src/modules.rs` 只读注册表固定顺序 `Sync → Mermaid → ImportExport →
+  Graph`；Sync `compiled` 仅 `dev-sync`（**P1 后改为跟随 `sync-ui`，见下条**），Mermaid/
+  ImportExport/Graph 总是编入且无 feature gate；`enabled` 本切片恒等于 `compiled`，
+  无运行时开关/设置页 UI，未新增 Cargo feature 裁剪。
+  测试：plugin-api **24**（17 单测 + 7 JSON 集成）；app 默认 **384** /
+  `--features dev-sync` **630**（各 +4 `modules` 单测；P2 前 380/626）；
+  fmt/clippy 干净。已知限制：manifest/API schema 未冻结；`locales` 跟随 i18n
+  当前 `zh-CN`/`en`；Network/Filesystem/Clipboard/Commands 只声明无接口。
+
+- **同步产品化 P1（2026-11-18，`sync-ui` 拆出并设为默认）**：
+  `crates/app/Cargo.toml` 新增 `sync-ui = ["sync", "dep:serde", "dep:serde_json",
+  "dep:zeroize"]`，`dev-sync = ["sync-ui"]`，`default = ["sync-ui"]`；
+  `onboarding`/`dev_sync` 模块从 `dev-sync` 改为 `sync-ui` 门禁，`main.rs` 默认
+  进入 `AppRoot`（产品 Welcome/Create/Join），显式 `--dev-sync*` 仍只在 `dev-sync`。
+  `local_dev` 许可、dev CLI/setup、localhost relay 门禁、V2 管理区仍保留在 `dev-sync`；
+  默认构建 `mode_allowed(LocalDev)=false`，创建链接/提交创建/邀请兑换三处 UI 明确拒绝。
+  测试：app 默认 **497** / `--features dev-sync` **655** / `--no-default-features` **406**
+  （旧默认不变）；新增 `tests/sync_ui_product.rs` 3 个 headless；fmt/clippy 干净。
+  数据目录/迁移与 UI 去 DEV 标注**已由 P2 完成**（见下条）；TLS/DPAPI 真机仍后置；
+  详见 [`docs/notes/sync-product-p1.md`](docs/notes/sync-product-p1.md)。
+- **模板 / 日记：两个第一方核心插件（2026-11-18）**：
+  **模板就是普通笔记**——不建独立表、不隐藏文件夹、不做保留名、不做搜索/图谱过滤；
+  模板文件夹是可配置的普通目录（默认 `模板`，支持多级），其子树下任意笔记都是模板；
+  日记模板可以是任意普通笔记（精确路径，不要求和模板文件夹一致）。
+  占位符：`{{date}}`/`{{time}}`/`{{title}}` + `{{date:FORMAT}}`/`{{time:FORMAT}}`
+  （token `YYYY YY MM M DD D HH H mm m ss s`，本地时间，最长匹配；未知占位符原样保留，
+  不 panic）；不做日期偏移/脚本/正则。日记模板复用同一引擎，默认格式取模板插件设置。
+  入口与行为：编辑器右键「插入 → 模板…」→ 覆盖层选择器（自绘 IME 搜索框、输入过滤、
+  ↑/↓、Enter、点击、Esc），选中后把渲染后的正文插入 caret（**有选区则替换**，一次
+  `EditRequest`/一个撤销组，走现有 `insert_text`；模板笔记不移动、不复制资产）；
+  侧栏第二动作行「从模板新建…」（默认模板标题、**只在根级去重**、不覆盖、
+  创建后打开）与「今日日记」：按 `folder + date_format` 计算路径（`/` 生成子目录，
+  标题 = 最后一段），已存在直接打开，不存在时**一条结构提交**创建缺少的目录+笔记，
+  模板丢失非阻塞提示 + 空日记；插件关闭时入口整行隐藏。
+  设置：只写本机 `templates.json` / `daily-notes.json`（原子写、损坏回退、不同步、
+  不写正文）；AppRoot 设置页卡片**末尾**追加「模板」「日记」两区（不挪动既有同步/
+  实例/relay 控件位置；`settings-templates*` / `settings-daily-notes*` 固定 selector；
+  自绘 IME 字段 Enter 保存、Esc 放弃；显示日期/时间示例），AppShell 的 dev-sync 设置页
+  同样追加。新增 `templates.*` / `daily_notes.*` 中英文案（渲染/测试统一走 `ui_text`）。
+  不改 sync/relay/storage/schema/wire；`chrono = 0.4`（`clock`）显式加入 app，lock 里仍是
+  **0.4.45**（只多一条 `menghunote-app → chrono` 依赖边）。
+  测试：app 默认 **497** / `--features dev-sync` **655** / `--no-default-features` **406**；
+  i18n **16**；
+  新增 `headless_templates` 7、`headless_notes_plugins_ui` 2（`sync-ui` 产品构建）、
+  `templates` 单测 7、`daily_notes` 单测 7、`ui_text` 1；fmt/clippy 干净。
+  已知限制：路径精确/大小写敏感；日记模板路径手填（未接选择器）；无相对日期/日历/
+  周期笔记；设置字段不做失焦自动保存；设置不参与多设备同步。详见
+  [`docs/notes/templates-daily-notes.md`](docs/notes/templates-daily-notes.md)。
+
+- **UI 重构：设置分类导航 / 最左侧图标栏 / 侧栏排序（2026-11-18，Obsidian 风格）**：
+  **设置页（产品 AppRoot）** 从一张长卡片拆成「左侧分类导航 + 右侧只渲染当前分类」：
+  `appearance`（默认）/ `language` / `templates` / `daily_notes` / `sync` / `instances` /
+  `relay` / `security` / `about`；固定 selector `settings-nav` / `settings-nav-<section>` /
+  `settings-section-<section>`，旧 `settings-theme-*` / `settings-language-*` /
+  `settings-templates*` / `settings-daily-notes*` 在对应分类打开时仍存在；保存/关闭/错误/提示
+  固定在底栏（任何分类可达）；分类只记本次会话（不持久化）；覆盖层限高 + 滚轮隔离保持，
+  内容区独立滚动、左导航固定。`SettingsSection` + `render_settings` 的 section 分派在
+  `onboarding/app_root.rs`；**AppShell 的 dev-sync 设置页不拆**（行为不变）。
+  **最左侧图标栏（ribbon）**：侧栏左边 44px（`RIBBON_WIDTH`），只放快捷操作
+  `ribbon-daily` / `ribbon-template` / `ribbon-graph` / `ribbon-search`，复用
+  `open_daily_note` / `open_template_picker(NewNote)` / `open_graph` / `open_search`；
+  **设置不在 ribbon**（仍在侧栏底部 `app-root-settings`，AppRoot 的绝对定位按 `RIBBON_WIDTH`
+  右移）。原第二行文字按钮（「从模板新建…」「今日日记」）移除，旧 selector 作为兼容别名
+  挂在外层包装（同一按钮）。图标是 `crates/app/assets/icons/*.svg`（lucide）+
+  `include_bytes!` + `gpui::svg().data()` + 主题 token 着色，**不新增依赖边**（不引
+  `gpui_component`），hover 背景/手形 + 自绘 tooltip。
+  **侧栏排序**：`list_tree`（rank 顺序，同步/导出用）语义不变；新增
+  `list_tree_sorted(vault, TreeSort)`：**每个层级目录永远在笔记前**，同组按
+  `name_asc`（默认）/ `name_desc` / `updated_newest|oldest` / `created_newest|oldest`；
+  `TreeEntry` 增加 `created_at` / `updated_at`（`notes` 表 join，目录为 `None`）；
+  中文按码点、大小写不敏感 + 原串 + node_id 兜底。侧栏标题行「排序」按钮 `sidebar-sort`
+  + 菜单 `sidebar-sort-menu` / `sidebar-sort-<key>`（当前项 ✓、点空白关闭）；切换只重建树，
+  按 node_id 保住折叠/选中/打开笔记。本机 `sidebar.json`（`MENGHUNOTE_SIDEBAR_PATH` 可覆盖，
+  原子写、损坏回退默认、不同步、不写正文；读盘收敛在产品根视图 `AppRoot::new`
+  （`AppShell` 构造期不读盘，保证 headless 测试的默认顺序不随本机残留文件变化））。
+  测试：`tree_view` +6（目录优先/六键/大小写中文/时间戳/父子连续/删除/键往返）、
+  `headless_sidebar_sort` 8（ribbon 布局与动作复用、排序菜单、六键写盘、折叠/选中保持、
+  偏好往返与损坏回退、启动读盘）、`onboarding_ui` +1（设置导航 9 分类/只渲染当前分类/
+  旧 selector/内容区限高/会话记忆）；既有测试按新展示顺序更新（demo 树 0 目录 / 1 目录内
+  笔记 / 2 根级笔记），窄窗口表格测试窗口 +44px（ribbon 宽度）。
+  实测：app 默认 **505** / `--features dev-sync` **664** / storage **201** / i18n **16**；
+  fmt/clippy 干净。设置页输入框只在**聚焦**时绘制选区（`set_text` 全选不再让未聚焦
+  字段看起来像整页被选中）。详情见
+  [`docs/notes/ui-refactor-settings-ribbon-sort.md`](docs/notes/ui-refactor-settings-ribbon-sort.md)。
+
+- **设置页插件总开关 / 分界线 / 同步直显（2026-11-18，Obsidian 风格续）**：
+  产品 `AppRoot` 设置页左栏改为「固定分类（外观/语言/同步/实例/Relay/安全/插件/关于）→
+  `settings-nav-divider`（1px 主题线，不可点）→ 已启用的插件分类（模板/日记）」。
+  新增固定分类 `plugins`（`settings-nav-plugins` / `settings-section-plugins`）：参考
+  Obsidian「核心插件」页，只列**有运行时开关**的模板/日记（`settings-plugin-templates*` /
+  `settings-plugin-daily_notes*`），开关直接读写 `templates.json` / `daily-notes.json` 的
+  `enabled`（无第二份状态、不改 JSON 格式）；关闭后左栏分类立即消失，停在被关闭的插件
+  分类时自动回退到「插件」页，ribbon 入口继续按同一份 `enabled` 隐藏。同步分类删除
+  「展开/收起」状态与标题行，选中即渲染面板；`settings-toggle-sync` 保留为同步内容容器，
+  内部 `dev-sync-*` selector 不变。`SettingsSection` 新增 `Plugins` 并区分
+  `FIXED` / `PLUGIN_SECTIONS`（`ALL` 更新为 10 项）；新文案走 `ui_text` + `settings.plugins.*`
+  中英文。测试：app 默认 **509** / `--features dev-sync` **668** / i18n **16**；
+  新增 `headless_notes_plugins_ui` 2（插件页开关/写盘/重启读盘/回退）与
+  `app_root` 分类分组单测 1（`FIXED`/`PLUGIN_SECTIONS`/`ALL` 关系）；插件行改为
+  Obsidian 式「标题 + 说明 + 右侧胶囊开关」（不再有按钮文字/「已启用」重复行），
+  开关轨道开=accent、关=灰，`-state` 仅作开关锚点。设置字段首次打开不再预选
+  （`RenameInput::new_at_end`，光标在末尾；点击字段时才全选），避免「整页被选中」观感。
+  fmt/clippy 干净。
+  详情见 [`docs/notes/ui-refactor-settings-ribbon-sort.md`](docs/notes/ui-refactor-settings-ribbon-sort.md)。
+
+- **同步产品化 P2 / A 组第一切片（2026-11-18，数据目录产品化 + 旧数据保守迁移 + 去 DEV 标注）**：
+  **数据目录产品化**：默认同步目录 `menghunote-dev` → **`menghunote`**，公开配置
+  `dev-sync.json` → **`sync.json`**（Windows `%LOCALAPPDATA%\menghunote\sync.json`、
+  Linux `$XDG_CONFIG_HOME/menghunote/sync.json` + `$XDG_DATA_HOME/menghunote/instances/`）；
+  `ProfileLayout::new` 显式路径语义不变，`env` 注入（HOME/XDG/LOCALAPPDATA）仍可用于测试；
+  实例目录里 `vault.sqlite3` / `dev-identity.bin` **本轮不改名**。
+  **旧数据保守迁移**：`AppRoot::boot` 调 `ProfileLayout::migrate_legacy_profile()`——
+  新 `sync.json` 不存在、旧 `menghunote-dev/dev-sync.json` 存在时，把**同一份公开实例
+  列表**原子写到新配置（v1 只在内存升 v2；新增 `ProfileStore::read_with_origin` /
+  `read_only`，旧文件不回写）；`vault_path` 原样保留（**不移动/不复制** instances、
+  身份、库），旧目录/旧配置**不删不改**；新配置存在 → 一律以新配置为准（幂等，重复启动
+  逐字节不变）；旧配置损坏/版本不支持 → 不重建不覆盖，`AppRoot` 进 **GUI Error 页**
+  （`旧同步配置无法迁移` + 旧路径 + 可重试），不再无提示退出/白屏；产品构建里的旧
+  `local_dev` 因 `parse_for_build`/`mode_allowed` 不适用 → **只跳过迁移**、不写新配置、
+  **不悄悄改** `remote_tls`，旧文件保留，产品正常进 Welcome。
+  **去 DEV 标注（产品 `sync-ui` 构建）**：`AppRoot` 各页顶部 `DEV ONLY · 开发同步…`
+  横幅 `banner_text` 改为 `Option<Div>`（产品 `None`，不挂节点；`dev-sync` 保留，
+  selector `app-root-dev-banner`）；同步面板固定行（`dev_sync/panel.rs::header_line`）
+  产品构建改中性「同步面板」（新 key `settings.sync.panel_title`，selector
+  `dev-sync-header`），`dev-sync` 保留 `DEV ONLY / 非生产 / localhost` 红字；Welcome
+  旧「继续本地（DEV ONLY，无同步）」的 `allow_local_vault = cfg!(feature = "dev-sync")`
+  在 A 组第二切片被反转：产品构建改显示「仅本地使用」（见下条）；`main.rs` 向导启动日志删掉
+  `DEV ONLY / localhost`；动态 relay 地址（127.0.0.1 等）照实显示；删除无调用的
+  `settings.sync.dev_title`，`settings.sync.dev_banner` 仍供 `dev-sync` 使用。
+  `--dev-sync*` CLI / localhost setup / V2 管理 / 轮换实验入口继续只在 `dev-sync`；
+  TLS/relay 协议/schema/wire/身份文件均未动。
+  测试：app 默认 **518** / `--features dev-sync` **675** / `--no-default-features`
+  **构建通过**（406 计数未变）/ i18n **16**；新增 layout 单测 5（显式布局不迁移、
+  复制公开列表且库/身份不动、新配置优先、坏旧配置不重建、产品跳过旧 local_dev）+
+  `dev-sync` 额外 1（v1 旧文件不回写）+ panel 单测 1；`sync_ui_product` 3 → **6**
+  （启动迁移 + 坏旧配置 GUI Error 页 + 旧 local_dev 正常进 Welcome），
+  `onboarding_ui` +1（dev 构建保留横幅/本地入口）。表单输入（向导/设置 relay）预填
+  改为光标在末尾、不预选；鼠标点击折叠选区到末尾，避免「打开即全选、点击取消不了」。
+  fmt/clippy 干净。已知限制：迁移只在 `AppRoot` 启动引导执行；并发首次启动的
+  rename 覆盖窗口未加文件锁；身份/库文件改名仍后置；创建表单既有
+  「开发同步」同意文案与 `remote_tls` 的「DEV 状态」提示不在本切片、未改。
+  详见 [`docs/notes/sync-product-p2.md`](docs/notes/sync-product-p2.md)。
+
+- **同步产品化 A 组第二切片：产品「仅本地使用（不同步）」入口（2026-11-18）**：
+  产品默认构建（`sync-ui`，无 `dev-sync`）的 Welcome 新增 **`app-root-local`**
+  「仅本地使用（不同步）」：不联网、不建同步实例、不写 `sync.json`/身份文件，
+  一条本地笔记路径即刻可用。**文案按构建区分**（`AppRoot::local_entry_label()` 是渲染与
+  测试唯一来源）：产品「仅本地使用（不同步）」，`dev-sync` 保留旧
+  「继续本地（DEV ONLY，无同步）」（同一 selector；旧 dev 行为/演示树不变）。
+  `AppRootOptions::discover` 两种构建都 `allow_local_vault = true`；
+  `for_test`/显式构造仍默认关闭（既有 Welcome 测试契约不变），要测时显式打开。
+  **本地库路径**：`ProfileLayout` 数据根（`instances/` 上一级）下
+  **`local/vault.sqlite3`** ——Windows `%LOCALAPPDATA%\menghunote\local\vault.sqlite3`、
+  Linux `$XDG_DATA_HOME/menghunote/local/vault.sqlite3`；新增
+  `ProfileLayout::data_root/local_dir/local_vault_path` 与 `onboarding::LOCAL_DIR_NAME`，
+  `dev_vault::open_local_vault_at` = `open_vault_at_with_peer_opts(path, 1, false)`
+  （**不播种 demo**、已有库直接复用、目录不存在时创建、不覆盖）。
+  **打开后**：`AppShell::new`（无同步面板/worker/自动同步）+ Main 顶部固定提示条
+  `app-root-local-mode`「本地模式：不同步」；不出现 `sync-status`/`dev-sync-panel`/
+  `app-root-dev-banner`；设置/侧栏/编辑器/模板/日记照常。打不开本地库 →
+  `set_error` 进 GUI Error 页（`local.open_failed_title`，不静默退出、不覆盖坏库）。
+  **数据安全**：不写 `sync.json`、不建 `instances/`、不写 `dev-identity.bin`、
+  不取实例目录锁（不影响同步实例锁；本地模式本轮不加新锁）。
+  i18n：新增 `local.*` 10 条消息 + 中英 catalog（`ui_text::local_*`），渲染无新中文字面量。
+  测试：app 默认 **518 → 522** / `--features dev-sync` **675 → 677** / i18n **16**；
+  新增产品 headless 2（点击入口→Main/库创建/无 sync.json/无身份/无 demo/再次启动复用；
+  坏库→Error 页），`sync_ui_product` 旧「产品不得出现 app-root-local」断言反转为必现，
+  `onboarding_ui` dev 入口文案断言、layout 单测 2、`ui_text` 中英单测 1；
+  fmt/clippy 干净。已知限制：本地库无新增进程锁（并发打开依赖 SQLite `busy_timeout`）；
+  本地库不登记、不参与同步、无「转同步实例」导入；重启不自动进本地 Main（无配置记录，
+  需再点入口）；旧 dev vault 不搬迁；UI 像素/DPI/IME 与 Windows 真机未验。
+  详见 [`docs/notes/sync-product-a2.md`](docs/notes/sync-product-a2.md)。

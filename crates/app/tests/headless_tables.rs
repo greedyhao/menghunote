@@ -416,7 +416,8 @@ async fn narrow_window_keeps_table_geometry_and_does_not_panic(cx: &mut TestAppC
     let view = active_view(&host, cx);
 
     // 把窗口压窄到侧栏 + 很窄的编辑区：列宽会退化到最小列宽，绘制由内容遮罩裁剪。
-    cx.simulate_resize(size(px(300.0), px(600.0)));
+    // 300 → 344：多出的 44px 是最左侧图标栏（ribbon），编辑区宽度仍等于旧基线的 80。
+    cx.simulate_resize(size(px(344.0), px(600.0)));
     cx.run_until_parked();
     let pane = cx
         .debug_bounds("editor-pane")

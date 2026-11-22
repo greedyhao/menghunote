@@ -44,8 +44,8 @@ use menghunote_app::editor::view::EditorView;
 use menghunote_app::shell::AppShell;
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
-    append_updates_with_sync_intents, list_tree, load_body_doc, local_sync_intent,
-    store_inbox_verified, SyncContext, UpdateRecord, Vault,
+    append_updates_with_sync_intents, list_tree_sorted, load_body_doc, local_sync_intent,
+    store_inbox_verified, SyncContext, TreeSort, UpdateRecord, Vault,
 };
 use menghunote_sync::dev_local::DevLocal;
 use menghunote_sync::identity::LocalIdentityV1;
@@ -544,7 +544,8 @@ fn establish_pair(prefix: &str) -> Pair {
     let dev_b = dev_vault::open_vault_at_with_peer(&b_path, b_peer).expect("B 打开实例库失败");
     assert!(!dev_b.seeded, "B 的树来自基线，不得再播种");
 
-    let entry = list_tree(&dev_a.vault)
+    // `AppShell` 打开的是**侧栏展示顺序**（目录优先 + A-Z）的第一篇笔记。
+    let entry = list_tree_sorted(&dev_a.vault, TreeSort::NameAsc)
         .expect("读 A 结构树失败")
         .into_iter()
         .find(|entry| entry.is_note())

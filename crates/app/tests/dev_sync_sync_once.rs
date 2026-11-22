@@ -51,9 +51,9 @@ use menghunote_app::editor::view::EditorView;
 use menghunote_app::shell::AppShell;
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
-    append_updates_with_sync_intents, list_tree, load_body_doc, load_head, local_sync_intent,
-    sync_cursor_state, take_inbox_ready, BodyDoc, HeadState, StructureWriter, SyncContext,
-    UpdateRecord, Vault,
+    append_updates_with_sync_intents, list_tree, list_tree_sorted, load_body_doc, load_head,
+    local_sync_intent, sync_cursor_state, take_inbox_ready, BodyDoc, HeadState, StructureWriter,
+    SyncContext, TreeEntry, TreeSort, UpdateRecord, Vault,
 };
 use menghunote_sync::dev_local::DevLocal;
 use menghunote_sync::identity::LocalIdentityV1;
@@ -190,8 +190,9 @@ fn establish_pair(prefix: &str) -> Pair {
     let dev_b = dev_vault::open_vault_at_with_peer(&b_path, b_peer).expect("B 打开实例库失败");
     assert!(!dev_b.seeded, "B 的树来自基线，不得再播种");
 
-    // 两边打开同一篇：先序第一篇笔记（结构投影顺序相同）。
-    let entry = list_tree(&dev_a.vault)
+    // 两边打开同一篇：**侧栏展示顺序**（目录优先 + A-Z）的第一篇笔记。
+    // 不变量：`AppShell::new` 就是按这个顺序 `position(is_note)` 打开第一篇。
+    let entry = list_tree_sorted(&dev_a.vault, TreeSort::NameAsc)
         .expect("读 A 结构树失败")
         .into_iter()
         .find(|entry| entry.is_note())
@@ -618,7 +619,7 @@ async fn attachment_asset_bytes_and_link_reach_the_other_shell(cx: &mut TestAppC
     ensure_test_user_key();
     let pair = establish_pair("attachment-asset");
     let relay_url = pair.relay.base_url().to_owned();
-    let note_id = list_tree(&pair.a_vault)
+    let note_id = list_tree_sorted(&pair.a_vault, TreeSort::NameAsc)
         .expect("读 A 结构树失败")
         .into_iter()
         .find(|entry| entry.is_note())
@@ -1967,16 +1968,22 @@ async fn prepare_allows_typing_and_switching_then_adopts_into_the_current_docume
     let pair = establish_pair("two-phase-switch");
     let relay_url = pair.relay.base_url().to_owned();
 
-    // A：改"目录里的第二篇"并推到 relay（B 的 Prepare 会把它拉成 durable inbox）。
+    // A：改"根级演示笔记"并推到 relay（B 启动在目录内那篇，切换目标才是这一篇）。
     let tree_a = list_tree(&pair.a_vault).expect("读 A 树");
-    let second_index = tree_index_of(&tree_a, menghunote_app::dev_vault::DEMO_SECOND_TITLE);
-    let second_doc = tree_a[second_index]
+    let target_doc_index = tree_index_of(&tree_a, menghunote_app::dev_vault::DEMO_TITLE);
+    let target_doc = tree_a[target_doc_index]
         .body_doc_id
         .clone()
-        .expect("第二篇必须有 body doc");
+        .expect("根级演示笔记必须有 body doc");
+    // 侧栏（目录优先 + A-Z）里这篇的行下标：0=目录 / 1=目录内笔记 / 2=根级笔记。
+    let target_index = list_tree_sorted(&pair.a_vault, TreeSort::NameAsc)
+        .expect("读 A 树")
+        .iter()
+        .position(|entry| entry.title == menghunote_app::dev_vault::DEMO_TITLE && entry.is_note())
+        .expect("侧栏必须有根级演示笔记行");
     append_body(
         &pair.a_vault,
-        &second_doc,
+        &target_doc,
         pair.a_identity.loro_peer_id(),
         pair.a_identity.current_epoch,
         "远端第二篇文字\n",
@@ -2032,18 +2039,18 @@ async fn prepare_allows_typing_and_switching_then_adopts_into_the_current_docume
     );
 
     // 网络阶段可以切换文档（Switching 是真实 UI 点击，不是直接调用私有方法）。
-    let second_row_selector: &'static str =
-        Box::leak(format!("tree-row-{second_index}").into_boxed_str());
-    let second_row = cx
-        .debug_bounds(second_row_selector)
-        .expect("侧栏第二篇行必须存在");
-    cx.simulate_click(second_row.center(), Modifiers::default());
+    let target_row_selector: &'static str =
+        Box::leak(format!("tree-row-{target_index}").into_boxed_str());
+    let target_row = cx
+        .debug_bounds(target_row_selector)
+        .expect("侧栏切换目标行必须存在");
+    cx.simulate_click(target_row.center(), Modifiers::default());
     cx.run_until_parked();
     let view_now = active_view(&mut cx, &host).expect("切换后必须有活动视图");
     let doc_now = read_shell(&mut cx, &host, |_shell, app| {
         view_now.read(app).dev_sync_doc_id().to_owned()
     });
-    assert_eq!(doc_now, second_doc, "Prepare 期间必须允许切到第二篇");
+    assert_eq!(doc_now, target_doc, "Prepare 期间必须允许切到第二篇");
     assert!(
         !current_text(&mut cx, &host).contains("during-prepare"),
         "切换后不再显示上一篇的正文"
@@ -2057,7 +2064,7 @@ async fn prepare_allows_typing_and_switching_then_adopts_into_the_current_docume
     assert!(report.is_ok(), "两阶段同步必须成功：{report:?}");
     assert_eq!(
         report.doc_id.as_deref(),
-        Some(second_doc.as_str()),
+        Some(target_doc.as_str()),
         "NeedGate 必须按切换后的活动文档持闸：{report:?}"
     );
     assert!(report.dispatched_under_gate, "GrantGate 之后才算持闸派发");
@@ -2690,16 +2697,17 @@ async fn inactive_documents_replay_from_the_durable_journal_after_sync(cx: &mut 
     let a_peer = pair.a_identity.loro_peer_id();
     let a_epoch = pair.a_identity.current_epoch;
 
-    let tree_a = list_tree(&pair.a_vault).expect("读 A 树失败");
+    // 活动文档 = **侧栏展示顺序**第一篇（目录内那篇）；第二篇 = 根级演示笔记。
+    let tree_a = list_tree_sorted(&pair.a_vault, TreeSort::NameAsc).expect("读 A 树失败");
     let first_index = tree_a
         .iter()
-        .position(|entry| entry.title == dev_vault::DEMO_TITLE && entry.is_note())
+        .position(TreeEntry::is_note)
         .expect("A 树必须有第一篇");
     let first_doc = tree_a[first_index]
         .body_doc_id
         .clone()
         .expect("第一篇必须有 body doc");
-    let second_index = tree_index_of(&tree_a, dev_vault::DEMO_SECOND_TITLE);
+    let second_index = tree_index_of(&tree_a, dev_vault::DEMO_TITLE);
     let second_doc = tree_a[second_index]
         .body_doc_id
         .clone()
@@ -2775,7 +2783,11 @@ async fn inactive_documents_replay_from_the_durable_journal_after_sync(cx: &mut 
     );
 
     // 切走再切回：旧 session 不得返回旧内容。
-    let first_row = cx.debug_bounds("tree-row-0").expect("第一篇行必须存在");
+    let first_row_selector: &'static str =
+        Box::leak(format!("tree-row-{first_index}").into_boxed_str());
+    let first_row = cx
+        .debug_bounds(first_row_selector)
+        .expect("第一篇行必须存在");
     cx.simulate_click(first_row.center(), Modifiers::default());
     cx.run_until_parked();
     let second_row = cx.debug_bounds("tree-row-2").expect("第二篇行必须存在");

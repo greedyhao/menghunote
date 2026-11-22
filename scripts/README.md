@@ -25,7 +25,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ui_smoke.ps1 -Scenar
 
 1. `Stop-Process -Name menghunote-app -Force` —— **旧实例会占住 exe**，不杀就会
    `cargo build` 报「拒绝访问 (os error 5)」，脚本若继续跑就是拿旧二进制断言（踩过）。
-2. `cargo build -p menghunote-app` 并检查**退出码**，非 0 立即失败退出。
+2. `cargo build -p menghunote-app --no-default-features`（旧 dev vault 入口；默认
+   `sync-ui` 构建会进 AppRoot 同步向导，不适合编辑器冒烟）并检查**退出码**，非 0 立即失败退出。
 3. 启动应用（stderr 落到 `target/tmp/ui-smoke.log.err`）。
 4. **轮询**日志里的「首帧就绪」标记（50ms 一次，最多 15s）——不再固定 sleep 几秒。
 5. 用**真实鼠标事件**（`SetCursorPos` + `mouse_event`）点击：`PostMessage` 注入在这台

@@ -5,24 +5,31 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# dev-only 同步面板（ADR 0009 Phase 1 / 切片 1）。
-# **默认关闭**：默认构建不引入 `menghunote-sync`（它带 rustls/Argon2/hpke 等依赖树），
-# 面板与 worker 的代码也全部 `#[cfg(feature = "dev-sync")]`，默认产物零行为变化。
-# 运行时还有第二道门禁（`--dev-sync` / `MENGHUNOTE_DEV_SYNC=1` + localhost relay），
-# 见 `crates/app/src/dev_sync/gate.rs`。
-# `serde_json`/`serde`：公开配置 `dev-sync.json` 的读写（ADR 0011）。只在 feature 下
-# 引入；两者在 workspace 依赖图里早已存在（relay/sync-proto 用），不是新的重依赖。
-# `zeroize`：Create 的 setup secret 与一次性恢复码用 `Zeroizing` 缓冲（ADR 0011 要求）。
+# P1（同步产品化）：同步 UI 与 dev 专用权限拆成两个 feature。
 #
-# ADR 0013 §1：新增公共 `sync` feature（默认关闭）；`dev-sync` 包含它并额外开放
-# `local_dev`（`sync_gate::mode_allowed`）。正式包只启 `sync`，不把 dev-relay/开发
-# 明文路径拉进正常依赖图（dev-relay 本来就在 dev-dependencies）。
+# - `sync`：只表示"协议/能力"（`menghunote-sync` 依赖 + `sync_gate`），**不**提供
+#   任何 UI（onboarding/dev_sync 模块都不编译）。`sync-ui` 隐含它。
+# - `sync-ui`：产品同步 UI（`onboarding` + `dev_sync` 面板/设置/状态），公开配置
+#   JSON 读写（serde/serde_json）与恢复码清零（zeroize）也在这里。**是默认 feature**：
+#   `cargo run -p menghunote-app` 默认进入 `AppRoot` 同步向导，而不是直接开 dev vault。
+# - `dev-sync`：在 `sync-ui` 之上额外开放 **dev 专用**能力：`local_dev` 模式
+#   （`sync_gate::mode_allowed`）、`--dev-sync*` CLI/测试 setup、localhost relay 门禁、
+#   V2 管理实验 UI。正式/产品构建不得启用它。
+#
+# 三段式而不是两个 feature 的原因：`sync-ui` 里有大量模块（面板/设置/自动同步）与
+# `local_dev` 无关；历史上它们被 `dev-sync` 一并门禁，导致产品构建拿不到同步 UI。
+# 本切片只拆编译门禁，不改协议/schema/网络行为。
+default = ["sync-ui"]
 sync = ["dep:menghunote-sync"]
-dev-sync = ["sync", "dep:serde", "dep:serde_json", "dep:zeroize"]
+sync-ui = ["sync", "dep:serde", "dep:serde_json", "dep:zeroize"]
+dev-sync = ["sync-ui"]
 
 [dependencies]
 # 应用层错误汇总（库层用 thiserror，见 AGENTS.md §4）
 anyhow = "1"
+# 模板/日记的本地时间：chrono 0.4.45 早在 lockfile 里（gpui 的传递依赖），这里显式声明
+# 并只开 `clock`（本地时区 + `Local::now`）。不引入新版本、不加构建脚本、不改 lock。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 依赖基线见 AGENTS.md §1 / ADR 0004：gpui-kit 是 gpui-pre 的门面（含 gpui-base/gpui-component）。
 # **精确 pin**：升级必须整体对齐（kit/pre/base/component 版本互相约束），不能单边升。
 # 用依赖别名把 lib 名固定成 `gpui`，代码里 `use gpui::*` 与 `gpui::platform::` 保持不变。
@@ -34,11 +41,11 @@ menghunote-i18n = { path = "../i18n" }
 # 检索（S4-2b）：UI 只拿类型（Hit/SearchStatus），真正的 IndexManager 在后台线程里
 menghunote-search = { path = "../search" }
 menghunote-storage = { path = "../storage" }
-# 同步（ADR 0009）：**可选依赖**，只有 `dev-sync` feature 打开才进依赖图。
+# 同步（ADR 0009）：**可选依赖**，只有 `sync` / `sync-ui` / `dev-sync` feature 打开才进依赖图。
 # 切片 1 只用它做 relay URL 策略校验与传输超时配置（`StdTcpTransport`），
 # 不做任何真实 Create/Join/SyncOnce（那是切片 4）。
 menghunote-sync = { path = "../sync", optional = true }
-# 公开配置（ADR 0011）：只有 `dev-sync` feature 才需要序列化 JSON。
+# 公开配置（ADR 0011）：`sync-ui`（及 `dev-sync`）需要序列化 JSON；只开 `sync` 不需要。
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 # 秘密缓冲（setup secret / 恢复码）：drop 时清零，ADR 0011「缓冲用 Zeroizing」。

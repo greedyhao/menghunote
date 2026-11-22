@@ -323,6 +323,8 @@ mod tests {
             kind,
             sibling_rank: 0,
             depth: 0,
+            created_at: None,
+            updated_at: None,
         };
         let tree = vec![
             entry("f1", "示例目录", NodeKind::Folder, None),
@@ -374,6 +376,8 @@ mod tests {
             kind: NodeKind::Note,
             sibling_rank: 0,
             depth: 0,
+            created_at: None,
+            updated_at: None,
         }];
         let results = plan_export(&tree, &HashMap::new());
         assert_eq!(results.len(), 1);

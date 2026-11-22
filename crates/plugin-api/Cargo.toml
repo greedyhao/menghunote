@@ -1,0 +1,19 @@
+[package]
+name = "menghunote-plugin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ADR 0020 P2：插件 manifest 与 host 服务契约的**纯 crate**。
+# 只依赖 serde（workspace 已在使用，lockfile 里已有 1.0.x）与纯 i18n crate；
+# 不依赖 GPUI/storage/sync/relay/editor，不做 IO、不实现加载器/运行时。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# 复用 host 支持的 locale 集合，避免 plugin-api 自带第二套语言解析。
+# `menghunote-i18n` 是零外部依赖的纯 crate（ADR 0020 P1），不会把 GPUI 拉进来。
+menghunote-i18n = { path = "../i18n" }
+
+[dev-dependencies]
+# manifest JSON 反序列化测试；serde_json 已在 workspace lockfile（app 的 dev-sync
+# 可选依赖与 dev-relay 用），不是新版本、不是新的重依赖。
+serde_json = "1"

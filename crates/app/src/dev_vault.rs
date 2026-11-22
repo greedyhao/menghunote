@@ -3,6 +3,10 @@
 //! 位置：`target/tmp/menghunote-dev/vault.sqlite3`（可用 [`VAULT_ENV`] 覆盖），
 //! 遵守 AGENTS §6「不要用 `%TEMP%`」。
 //!
+//! 产品的「仅本地使用（不同步）」不走这里：它用
+//! [`open_local_vault_at`] 打开 `<数据根>/local/vault.sqlite3`（**不播种 demo**、
+//! 不写身份/同步配置），路径由 `ProfileLayout::local_vault_path()` 给出。
+//!
 //! ## 切片 7b：播种改走**结构 CRDT → 投影**这条生产路径
 //!
 //! 之前是直接 `create_body_doc` + `create_note_slot` 写 SQL 行（没有结构树）。
@@ -109,6 +113,21 @@ pub fn open_vault_at_with_peer_opts(
         path: path.to_path_buf(),
         seeded,
     })
+}
+
+/// 打开（必要时创建）**本地（不同步）笔记库**：`<数据根>/local/vault.sqlite3`。
+///
+/// 与 [`open_dev_vault`] 的区别（A 组第二切片）：
+///
+/// - **不播种任何 demo 笔记**：空库就是空库，笔记由用户自己建；
+/// - 不联网、不建同步实例、不写身份文件/`sync.json`（调用方只给路径）；
+/// - 目录不存在时创建；已有库直接复用（`Vault::open`，内容不重置）。
+///
+/// 路径由 [`crate::onboarding::ProfileLayout::local_vault_path`] 给出；这里只负责
+/// "打开/创建"。peer 仍用 [`DEV_PEER_ID`]（与无身份的产品本地路径一致，只影响
+/// 本次新增的 op）。
+pub fn open_local_vault_at(path: &Path) -> anyhow::Result<DevVault> {
+    open_vault_at_with_peer_opts(path, DEV_PEER_ID, false)
 }
 
 /// dev vault 的默认路径（可用 [`VAULT_ENV`] 覆盖）。

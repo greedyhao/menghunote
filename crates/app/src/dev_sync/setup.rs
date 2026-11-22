@@ -59,6 +59,7 @@ use menghunote_sync::VaultId;
 
 use super::gate::{DevSyncConfig, CREATE_FLAG, ENABLE_FLAG, INFO_FLAG, JOIN_FLAG, PUBLISH_FLAG};
 use super::identity::{ensure_instance_vault_ready, DevIdentityStore};
+use super::INSTANCE_LABEL;
 
 /// Create 模式的一次性 setup secret（genesis 用；**不得**放进 argv）。
 pub const SETUP_SECRET_ENV: &str = "MENGHUNOTE_DEV_SETUP_SECRET";
@@ -66,9 +67,6 @@ pub const SETUP_SECRET_ENV: &str = "MENGHUNOTE_DEV_SETUP_SECRET";
 pub const VAULT_ID_ENV: &str = "MENGHUNOTE_DEV_VAULT_ID";
 /// Join 模式的恢复码（`mnrec1...`；**不得**放进 argv/日志）。
 pub const RECOVERY_CODE_ENV: &str = "MENGHUNOTE_DEV_RECOVERY_CODE";
-
-/// Create 写进本机 meta 的实例标签（非 wire，仅本机展示；Join 不导入）。
-pub(crate) const INSTANCE_LABEL: &str = "menghunote dev-sync 实例";
 
 /// 启动生命周期错误：app 层统一用 `anyhow` 汇总，底层 `SyncError`/io 错误链保留在
 /// `Display` 的 `{:#}` 输出里（`main` 就是这样打印的）。

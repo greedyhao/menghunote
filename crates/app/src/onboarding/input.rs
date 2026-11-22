@@ -16,7 +16,7 @@
 //! | `Tab` / `Shift+Tab` | ✅ | 走 `window.focus_next/prev` |
 //! | IME 组合（preedit） | ⚠️ 非秘密字段同搜索框；**秘密字段不向平台报告正文** | 见下 |
 //! | `Ctrl+C` / `Ctrl+X` | ❌ 明确不做 | 秘密字段**禁止**复制；普通字段 v1 也没接剪贴板写出 |
-//! | 鼠标点击定位 caret | ❌ 不做 | 键盘是主路径（与搜索框一致） |
+//! | 鼠标点击 | ✅ 只折叠选区到末尾 | 不做按 x 精确定位；避免"全选后点一下仍全选" |
 //!
 //! ## 秘密字段（`secret = true`）
 //!
@@ -126,9 +126,18 @@ impl FormInput {
         self.state.text()
     }
 
-    /// 直接设置文本（测试/预填用；会清空组合并全选）。
+    /// 直接设置文本（测试/预填用；会清空组合，光标放在末尾、**不预选**）。
+    ///
+    /// 设置页/向导第一次打开时字段会自动聚焦；若这里全选，用户会看到整段蓝底，
+    /// 而且旧实现点击输入框也不折叠选区，只能按方向键才能取消。
     pub fn set_text(&mut self, text: &str) {
-        self.state = RenameState::selecting_all(text);
+        self.state = RenameState::at_end(text);
+    }
+
+    /// 点击输入框时折叠选区到末尾（不按 x 精确定位 caret）。
+    pub fn collapse_selection_to_end(&mut self) {
+        let text = self.state.text().to_owned();
+        self.state = RenameState::at_end(text);
     }
 
     /// 清空文本（秘密字段提交后调用）。
@@ -369,6 +378,8 @@ impl Render for FormInput {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|input, _event: &MouseDownEvent, window, cx| {
+                    // 先折叠选区：否则 Ctrl+A 后点一下仍然全选，只能靠方向键取消。
+                    input.collapse_selection_to_end();
                     if input.click_to_focus {
                         input.focus(window, cx);
                     }
@@ -495,7 +506,9 @@ impl Element for FormInputElement {
 
         // 选区底色先画、文字后画。
         let selection = state.selected_byte_range();
-        if !empty && state.marked_utf16().is_none() && selection.start != selection.end {
+        // 只有**获得焦点**的输入框才画选区。`set_text` 会全选（方便点击后直接替换），
+        // 但未聚焦时若仍画蓝底，设置页/向导里会看起来“所有文字都被选中”。
+        if focused && !empty && state.marked_utf16().is_none() && selection.start != selection.end {
             let start_x = shaped.x_for_index(selection.start);
             let end_x = shaped.x_for_index(selection.end);
             window.paint_quad(gpui::fill(

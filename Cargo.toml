@@ -8,6 +8,8 @@ members = [
     "crates/text",
     # ADR 0020 P1：纯 i18n 基础设施（无 GPUI/无外部依赖）。
     "crates/i18n",
+    # ADR 0020 P2：纯插件 manifest/host 服务契约（无 GPUI/storage/sync/加载器）。
+    "crates/plugin-api",
     "crates/search",
     "crates/sync-proto",
     "crates/sync",

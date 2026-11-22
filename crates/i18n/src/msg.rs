@@ -11,6 +11,9 @@
 //! | `sidebar.*` | 侧栏与反向链接面板固定文案 |
 //! | `editor.menu.*` | 编辑器右键菜单固定文案 |
 //! | `status.*` | 底栏固定提示 |
+//! | `templates.*` | 模板插件（第一方）：侧栏/菜单/选择器/设置页固定文案 |
+//! | `daily_notes.*` | 日记插件（第一方）：侧栏/设置页/提示固定文案 |
+//! | `local.*` | 「仅本地使用（不同步）」入口：Welcome 文案、主界面提示、错误页 |
 //! | `plugin.<plugin_id>.*` | **后置**：第三方插件命名空间（插件 API 冻结后再定） |
 //!
 //! [`ALL`] 由宏一并生成，供 catalog 一致性测试断言"常量集合 == 两个语言的
@@ -34,6 +37,30 @@ macro_rules! define_messages {
 
 define_messages! {
     settings {
+        NAV_TITLE = "settings.nav.title";
+        NAV_APPEARANCE = "settings.nav.appearance";
+        NAV_LANGUAGE = "settings.nav.language";
+        NAV_TEMPLATES = "settings.nav.templates";
+        NAV_DAILY_NOTES = "settings.nav.daily_notes";
+        NAV_SYNC = "settings.nav.sync";
+        NAV_INSTANCES = "settings.nav.instances";
+        NAV_RELAY = "settings.nav.relay";
+        NAV_SECURITY = "settings.nav.security";
+        NAV_PLUGINS = "settings.nav.plugins";
+        NAV_ABOUT = "settings.nav.about";
+
+        PLUGINS_TITLE = "settings.plugins.title";
+        PLUGINS_HINT = "settings.plugins.hint";
+        PLUGINS_TEMPLATES_DESCRIPTION = "settings.plugins.templates.description";
+        PLUGINS_DAILY_NOTES_DESCRIPTION = "settings.plugins.daily_notes.description";
+        PLUGINS_ENABLED = "settings.plugins.enabled";
+        PLUGINS_DISABLED = "settings.plugins.disabled";
+
+        ABOUT_TITLE = "settings.about.title";
+        ABOUT_VERSION = "settings.about.version";
+        ABOUT_BUILD = "settings.about.build";
+        ABOUT_HINT = "settings.about.hint";
+
         APPEARANCE_TITLE = "settings.appearance.title";
         APPEARANCE_HINT = "settings.appearance.hint";
         APPEARANCE_LIGHT = "settings.appearance.light";
@@ -50,13 +77,10 @@ define_messages! {
         LANGUAGE_CURRENT_SYSTEM = "settings.language.current_system";
 
         SYNC_TITLE = "settings.sync.title";
-        SYNC_DEV_TITLE = "settings.sync.dev_title";
+        SYNC_PANEL_TITLE = "settings.sync.panel_title";
         SYNC_DEV_BANNER = "settings.sync.dev_banner";
-        SYNC_PANEL_EXPANDED = "settings.sync.panel_expanded";
-        SYNC_PANEL_COLLAPSED = "settings.sync.panel_collapsed";
+        SYNC_UNAVAILABLE = "settings.sync.unavailable";
 
-        EXPAND = "settings.expand";
-        COLLAPSE = "settings.collapse";
         CLOSE = "settings.close";
         SAVE = "settings.save";
         CLOSE_WITHOUT_SAVE = "settings.close_without_save";
@@ -97,6 +121,17 @@ define_messages! {
         BACKLINKS_ONE = "sidebar.backlinks.one";
         BACKLINKS_OTHER = "sidebar.backlinks.other";
         BACKLINKS_EMPTY = "sidebar.backlinks_empty";
+        SORT_TITLE = "sidebar.sort.title";
+        SORT_NAME_ASC = "sidebar.sort.name_asc";
+        SORT_NAME_DESC = "sidebar.sort.name_desc";
+        SORT_UPDATED_NEWEST = "sidebar.sort.updated_newest";
+        SORT_UPDATED_OLDEST = "sidebar.sort.updated_oldest";
+        SORT_CREATED_NEWEST = "sidebar.sort.created_newest";
+        SORT_CREATED_OLDEST = "sidebar.sort.created_oldest";
+        RIBBON_DAILY = "sidebar.ribbon.daily";
+        RIBBON_TEMPLATE = "sidebar.ribbon.template";
+        RIBBON_GRAPH = "sidebar.ribbon.graph";
+        RIBBON_SEARCH = "sidebar.ribbon.search";
     }
 
     editor_menu {
@@ -112,6 +147,76 @@ define_messages! {
         BACKLINKS_OTHER = "status.backlinks.other";
         SYNC = "status.sync";
         SYNC_ATTENTION = "status.sync_attention";
+    }
+
+    templates {
+        TITLE = "templates.title";
+        HINT = "templates.hint";
+        ENABLED = "templates.enabled";
+        DISABLED = "templates.disabled";
+        DISABLED_HINT = "templates.disabled_hint";
+        FOLDER_LABEL = "templates.folder_label";
+        DATE_FORMAT_LABEL = "templates.date_format_label";
+        TIME_FORMAT_LABEL = "templates.time_format_label";
+        EXAMPLE = "templates.example";
+        SAVED = "templates.saved";
+        REJECTED = "templates.rejected";
+        INSERT_MENU = "templates.insert_menu";
+        NEW_FROM_TEMPLATE = "templates.new_from_template";
+        PICKER_TITLE_INSERT = "templates.picker_title_insert";
+        PICKER_TITLE_NEW = "templates.picker_title_new";
+        PICKER_HINT = "templates.picker_hint";
+        PICKER_SEARCH = "templates.picker_search";
+        EMPTY_MISSING = "templates.empty_missing";
+        EMPTY_FOLDER = "templates.empty_folder";
+        EMPTY_NO_MATCH = "templates.empty_no_match";
+        EMPTY_NO_FOLDER = "templates.empty_no_folder";
+        EMPTY_NO_NOTE = "templates.empty_no_note";
+        INSERTED = "templates.inserted";
+        CREATED = "templates.created";
+        INSERT_FAILED = "templates.insert_failed";
+        EMPTY_BODY = "templates.empty_body";
+        CREATED_INSERT_FAILED = "templates.created_insert_failed";
+        WRITE_FAILED = "templates.write_failed";
+        READ_FAILED = "templates.read_failed";
+    }
+
+    daily_notes {
+        TITLE = "daily_notes.title";
+        HINT = "daily_notes.hint";
+        ENABLED = "daily_notes.enabled";
+        DISABLED = "daily_notes.disabled";
+        DISABLED_HINT = "daily_notes.disabled_hint";
+        FOLDER_LABEL = "daily_notes.folder_label";
+        DATE_FORMAT_LABEL = "daily_notes.date_format_label";
+        TEMPLATE_LABEL = "daily_notes.template_label";
+        TEMPLATE_HINT = "daily_notes.template_hint";
+        EXAMPLE = "daily_notes.example";
+        SAVED = "daily_notes.saved";
+        REJECTED = "daily_notes.rejected";
+        OPEN_TODAY = "daily_notes.open_today";
+        OPENED = "daily_notes.opened";
+        CREATED = "daily_notes.created";
+        CREATE_FAILED = "daily_notes.create_failed";
+        TEMPLATE_MISSING = "daily_notes.template_missing";
+        INVALID_PATH = "daily_notes.invalid_path";
+        WRITE_FAILED = "daily_notes.write_failed";
+    }
+
+    // 仅本地使用（不同步）：产品入口 + dev-sync 开发入口 + 主界面提示/错误页。
+    // `*_dev_*` 只在 `dev-sync` 构建出现（旧「继续本地（DEV ONLY）」行为），
+    // 产品构建用的是不带 `dev` 的一组。
+    local {
+        WELCOME_TITLE = "local.welcome_title";
+        WELCOME_HINT = "local.welcome_hint";
+        PATH_HINT = "local.path_hint";
+        ACTION = "local.action";
+        MODE_NOTICE = "local.mode_notice";
+        OPEN_FAILED_TITLE = "local.open_failed_title";
+        DIR_LABEL = "local.dir_label";
+        DEV_ACTION = "local.dev_action";
+        DEV_HINT = "local.dev_hint";
+        DEV_OPEN_FAILED_TITLE = "local.dev_open_failed_title";
     }
 }
 
@@ -132,6 +237,9 @@ mod tests {
                     "sidebar.",
                     "editor.menu.",
                     "status.",
+                    "templates.",
+                    "daily_notes.",
+                    "local.",
                     "plugin."
                 ]
                 .iter()
@@ -154,5 +262,8 @@ mod tests {
         assert!(ALL.contains(&sidebar::NOTES));
         assert!(ALL.contains(&editor_menu::TABLE));
         assert!(ALL.contains(&status::SYNC));
+        assert!(ALL.contains(&templates::TITLE));
+        assert!(ALL.contains(&daily_notes::TITLE));
+        assert!(ALL.contains(&local::MODE_NOTICE));
     }
 }

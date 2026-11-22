@@ -1,8 +1,8 @@
 //! Mermaid 渲染底座（M1）：源码 → SVG 字符串。
 //!
-//! 本模块只提供**纯渲染**能力，不接编辑器、不做 fenced code 识别/缓存/预览/主题，
-//! 也不开后台线程或子进程。M2（编辑器里的 Object Block、源码切换、缓存）后续再接线；
-//! 在那之前调用方只有 [`render_svg`] 一个入口。
+//! 本模块只提供**纯渲染**能力，不接编辑器、不做 fenced code 识别/缓存/预览，
+//! 也不开后台线程或子进程：M2 的编辑器 Object Block 用 [`render_svg_for_preview`]，
+//! 缓存/线程在 `editor::mermaid_preview`；M3a 起预览入口接收当前 [`ThemeId`]。
 //!
 //! ## 依赖与特性（为什么是这些）
 //!
@@ -40,11 +40,44 @@
 //!
 //! 本模块只做形状校验，不做内容加工：不执行 HTML、不内联脚本、不改写 SVG 内容；
 //! SVG 里的脚本/外链由后续的显示层与导出层决定（M3）。
+//!
+//! ## 预览主题（M3a）
+//!
+//! [`render_svg_for_preview`] 用 merman 的**内置主题编译器**给整条渲染管线绑定
+//! 一个编译好的 [`DiagramTheme`]（`RenderRequest::with_theme`），不再依赖 Mermaid
+//! 默认调色板：
+//!
+//! | app 主题 | merman preset | 作用 |
+//! | --- | --- | --- |
+//! | [`ThemeId::LIGHT`] | `ThemePreset::EditorLight` | 浅色画布/深色文字，接近原默认外观 |
+//! | [`ThemeId::DARK`] | `ThemePreset::EditorDark` | 深色画布/浅色文字 |
+//!
+//! 主题按 preset 编译一次并缓存（`DiagramTheme` 内部是 `Arc`，clone 只加引用），
+//! 编译失败按 [`MermaidError::Render`] 回退（调用方仍显示源码）。
+//!
+//! ### CJK 字体回退
+//!
+//! merman 的确定性文本度量不读系统字体，CJK 标签的**排版**是确定性的；真正画字
+//! 由显示层（GPUI `SvgRenderer`/`usvg`）按 `font-family` 链解析。内置 preset 的
+//! 字体栈是 `Inter, ui-sans-serif, system-ui, sans-serif`，在部分 Windows 字体配置下
+//! `Inter` 缺失、`system-ui` 不含 CJK 时会出现方框/缺字。因此编译预览主题前把
+//! [`CJK_FONT_FALLBACKS`] 插到通用族 `sans-serif` 之前（**只改 SVG 的字体栈声明，
+//! 不引入字体文件/新依赖**）；Windows 真机的字体回退观感仍需人工确认。
+//!
+//! 浅色输出与 M1/M2 的“无主题”输出不是字节级相同（默认调色板 → EditorLight），
+//! 这是有意的：单元测试钉住浅/深色画布与文字对比度，避免暗色不可读的回归。
 
 use std::any::Any;
+use std::sync::OnceLock;
 
+use merman::diagram_theme::{
+    DiagramTheme, DiagramThemeCompiler, ThemeDesignTokenValueV1, ThemePreset, ThemeRecipeV1,
+    ThemeValueV1,
+};
 use merman::svg::{RenderResourcePolicy, SvgPipeline};
 use merman::{OperationControl, RenderRequest, Renderer, SvgEnvironment, SvgRequest};
+
+use crate::theme::ThemeId;
 
 /// Mermaid 源码的字节上限（256 KiB）。
 ///
@@ -59,6 +92,19 @@ pub const MAX_MERMAID_SVG_BYTES: usize = 8 * 1024 * 1024;
 
 /// merman 里 “序列化后的 SVG 字节数” 上限的稳定 id。
 const MAX_SVG_BYTES_LIMIT_ID: &str = "max_svg_bytes";
+
+/// CJK 字体回退族（插到通用族 `sans-serif` 之前）。
+///
+/// 只写进 SVG 的 `font-family` 栈，**不携带**任何字体文件/依赖：字体是否可用由显示层
+/// （GPUI `SvgRenderer`/`usvg` 的系统字体库）决定，缺失时仍回退到系统默认字体。
+/// Windows 用微软雅黑；Linux/CI 用 Noto Sans CJK SC（发行版常装）。
+pub const CJK_FONT_FALLBACKS: [&str; 2] = ["Microsoft YaHei", "Noto Sans CJK SC"];
+
+/// 浅色预览主题（`ThemePreset::EditorLight`，编译一次后缓存）。
+static LIGHT_PREVIEW_THEME: OnceLock<Result<DiagramTheme, String>> = OnceLock::new();
+
+/// 深色预览主题（`ThemePreset::EditorDark`，编译一次后缓存）。
+static DARK_PREVIEW_THEME: OnceLock<Result<DiagramTheme, String>> = OnceLock::new();
 
 /// 超限的是哪一侧的预算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,10 +195,10 @@ impl std::error::Error for MermaidError {}
 /// 上面这段不编成 doctest：本机 app crate 的 doctest 链接缺 `zed_font_kit` rlib
 /// （环境限制），同一路径已由模块内 `flowchart_renders_svg` 单测覆盖。
 pub fn render_svg(source: &str) -> Result<String, MermaidError> {
-    render_svg_with_pipeline(source, None)
+    render_svg_with_pipeline(source, None, None)
 }
 
-/// 预览用渲染：在 [`render_svg`] 之上启用 merman 的 `ResvgSafe` SVG 管线。
+/// 预览用渲染：在 [`render_svg`] 之上启用 merman 的 `ResvgSafe` SVG 管线并绑定主题。
 ///
 /// Mermaid 12 默认把标签放在 `<foreignObject>` 里的 HTML（浏览器能画，`usvg`/`resvg`
 /// 会直接忽略），所以 **M2 的编辑器预览**不能直接拿 Parity SVG 去光栅化。`ResvgSafe`
@@ -160,16 +206,23 @@ pub fn render_svg(source: &str) -> Result<String, MermaidError> {
 /// 其余行为与 [`render_svg`] 完全一致（同样的输入/输出上限、`catch_unwind`、SVG
 /// 形状校验与确定性环境）。
 ///
-/// 这是 M2 新增的**独立入口**：没有改 [`render_svg`] 的语义（Parity SVG 仍供浏览器/
-/// 未来导出使用），也不做暗色主题（M3）。
-pub fn render_svg_for_preview(source: &str) -> Result<String, MermaidError> {
-    render_svg_with_pipeline(source, Some(SvgPipeline::resvg_safe()))
+/// `theme` 是**当前 app 主题**（ADR 0021）：浅色 → [`ThemePreset::EditorLight`]，
+/// 深色 → [`ThemePreset::EditorDark`]。主题走 `RenderRequest::with_theme`，对整条
+/// 解析→布局→SVG 管线生效；主题编译/绑定失败按 [`MermaidError::Render`] 回退。
+/// 编译好的预设会按主题缓存（模块内 `LIGHT_PREVIEW_THEME` / `DARK_PREVIEW_THEME`），
+/// 字体栈额外插入 [`CJK_FONT_FALLBACKS`] 以改善 CJK 标签的显示层回退。
+///
+/// [`ThemePreset::EditorLight`]: merman::diagram_theme::ThemePreset::EditorLight
+/// [`ThemePreset::EditorDark`]: merman::diagram_theme::ThemePreset::EditorDark
+pub fn render_svg_for_preview(source: &str, theme: ThemeId) -> Result<String, MermaidError> {
+    render_svg_with_pipeline(source, Some(SvgPipeline::resvg_safe()), Some(theme))
 }
 
 /// [`render_svg`] / [`render_svg_for_preview`] 的公共实现。
 fn render_svg_with_pipeline(
     source: &str,
     pipeline: Option<SvgPipeline>,
+    theme: Option<ThemeId>,
 ) -> Result<String, MermaidError> {
     if source.trim().is_empty() {
         return Err(MermaidError::Empty);
@@ -192,6 +245,10 @@ fn render_svg_with_pipeline(
             ..SvgRequest::default()
         },
     );
+    let request = match theme {
+        Some(theme) => request.with_theme(preview_diagram_theme(theme)?),
+        None => request,
+    };
 
     // 解析/布局/序列化都是第三方代码；恶意或病态输入仍可能触发 panic，
     // 这里统一兜住，避免把编辑器进程带走。
@@ -203,6 +260,71 @@ fn render_svg_with_pipeline(
         )),
         Err(error) => Err(MermaidError::Render(error.to_string())),
     }
+}
+
+/// 取（并缓存）预览主题：浅色 → `EditorLight`，深色 → `EditorDark`。
+///
+/// 缓存的是 `Result`：主题编译是确定性的，失败后不必每次重试。
+fn preview_diagram_theme(theme: ThemeId) -> Result<DiagramTheme, MermaidError> {
+    let (slot, preset) = if theme == ThemeId::DARK {
+        (&DARK_PREVIEW_THEME, ThemePreset::EditorDark)
+    } else {
+        (&LIGHT_PREVIEW_THEME, ThemePreset::EditorLight)
+    };
+    match slot.get_or_init(|| compile_preview_theme(preset)) {
+        Ok(theme) => Ok(theme.clone()),
+        Err(reason) => Err(MermaidError::Render(format!(
+            "无法编译 Mermaid 预览主题 {}：{reason}",
+            theme.as_str()
+        ))),
+    }
+}
+
+/// 编译内置 preset，并把 CJK 回退族插进字体栈。
+fn compile_preview_theme(preset: ThemePreset) -> Result<DiagramTheme, String> {
+    let compiler = DiagramThemeCompiler::new();
+    let recipe = compiler
+        .export_preset(preset)
+        .map_err(|error| error.to_string())?;
+    let recipe = with_cjk_font_fallback(recipe);
+    compiler
+        .compile_recipe(recipe)
+        .map_err(|error| error.to_string())
+}
+
+/// 在 preset 的默认字体栈里补上 [`CJK_FONT_FALLBACKS`]（幂等）。
+///
+/// 内置 `EditorLight`/`EditorDark` 用共享 token `body-font` 保存默认字体栈，
+/// `typography.default.font_stack` 只是引用它；所以改 token 就覆盖了整张图的
+/// `font-family` 声明。其它形状（完整规格 / 无关 token）原样返回——不猜、不改。
+fn with_cjk_font_fallback(mut recipe: ThemeRecipeV1) -> ThemeRecipeV1 {
+    let ThemeRecipeV1::Design { design } = &mut recipe else {
+        return recipe;
+    };
+    let Some(token) = design.tokens.get_mut("body-font") else {
+        return recipe;
+    };
+    let ThemeDesignTokenValueV1::FontStack(ThemeValueV1::Literal(families)) = &mut token.value
+    else {
+        return recipe;
+    };
+    // 通用族保持在最后：先插入到 `sans-serif` 之前，没有通用族时追加。
+    let insert_at = families
+        .iter()
+        .position(|family| family.eq_ignore_ascii_case("sans-serif"))
+        .unwrap_or(families.len());
+    let mut inserted = 0usize;
+    for family in CJK_FONT_FALLBACKS {
+        if families
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(family))
+        {
+            continue;
+        }
+        families.insert(insert_at + inserted, family.to_owned());
+        inserted += 1;
+    }
+    recipe
 }
 
 /// 构造带输出上限的确定性 SVG 环境。
@@ -296,6 +418,156 @@ mod tests {
         render_svg(source)
     }
 
+    /// 取 `needle` 之后第一个 `fill="#rrggbb"` 的 RGB（主题回归测试辅助）。
+    fn fill_after(svg: &str, needle: &str) -> (u8, u8, u8) {
+        let rest = &svg[svg.find(needle).expect("定位标记") + needle.len()..];
+        let start = rest.find("fill=\"#").expect("fill 颜色") + "fill=\"#".len();
+        let hex = &rest[start..start + 6];
+        let channel =
+            |offset: usize| u8::from_str_radix(&hex[offset..offset + 2], 16).expect("十六进制颜色");
+        (channel(0), channel(2), channel(4))
+    }
+
+    /// WCAG 2.x 相对亮度（sRGB）。
+    fn relative_luminance((red, green, blue): (u8, u8, u8)) -> f32 {
+        fn channel(value: u8) -> f32 {
+            let value = f32::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+    }
+
+    /// WCAG 对比度（1.0–21.0）。
+    fn contrast_ratio(foreground: (u8, u8, u8), background: (u8, u8, u8)) -> f32 {
+        let (lighter, darker) = {
+            let a = relative_luminance(foreground);
+            let b = relative_luminance(background);
+            if a >= b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// SVG 里根 `font-family` 声明的完整值（到 `;` 为止）。
+    fn root_font_stack(svg: &str) -> &str {
+        let root = svg.find("#merman{font-family:").expect("#merman 根样式");
+        let value = &svg[root + "#merman{font-family:".len()..];
+        &value[..value.find(';').expect("font-family 以分号结束")]
+    }
+
+    /// 浅/深色主题必须是不同的画布与文字色，且文本对比度可读。
+    #[test]
+    fn preview_light_and_dark_palettes_differ_with_readable_contrast() {
+        let source = "flowchart TD\n  开始[开始] --> 结束[结束]\n";
+        let light = render_svg_for_preview(source, ThemeId::LIGHT).expect("浅色 SVG");
+        let dark = render_svg_for_preview(source, ThemeId::DARK).expect("深色 SVG");
+        assert_ne!(light, dark, "同一源码的浅/深色 SVG 必须不同");
+
+        let light_canvas = fill_after(&light, "data-merman-theme-canvas=\"base\"");
+        let dark_canvas = fill_after(&dark, "data-merman-theme-canvas=\"base\"");
+        let light_text = fill_after(&light, "<text");
+        let dark_text = fill_after(&dark, "<text");
+        assert_ne!(light_canvas, dark_canvas, "画布颜色必须随主题变化");
+        assert_ne!(light_text, dark_text, "文字颜色必须随主题变化");
+        assert!(
+            relative_luminance(dark_canvas) < relative_luminance(light_canvas),
+            "深色画布必须比浅色画布暗：{dark_canvas:?} vs {light_canvas:?}"
+        );
+        assert!(
+            relative_luminance(light_text) < relative_luminance(light_canvas),
+            "浅色主题必须是深色文字/浅色画布"
+        );
+        assert!(
+            relative_luminance(dark_text) > relative_luminance(dark_canvas),
+            "深色主题必须是浅色文字/深色画布"
+        );
+        assert!(
+            relative_luminance(dark_canvas) < 0.05,
+            "深色画布亮度应很低：{dark_canvas:?}"
+        );
+        assert!(
+            relative_luminance(light_canvas) > 0.9,
+            "浅色画布亮度应很高：{light_canvas:?}"
+        );
+        // 浅色外观的回归锚点：EditorLight 的画布必须与应用浅色编辑器底色一致
+        // （避免升级 merman 预设后白色画布变成别的浅色而“无故改变现有外观”）。
+        let editor_bg = crate::theme::theme_for(ThemeId::LIGHT).editor_bg;
+        let expected_editor_bg = (
+            (editor_bg.r * 255.0).round() as u8,
+            (editor_bg.g * 255.0).round() as u8,
+            (editor_bg.b * 255.0).round() as u8,
+        );
+        assert_eq!(
+            light_canvas, expected_editor_bg,
+            "浅色 SVG 画布必须与应用浅色编辑器底色一致"
+        );
+
+        let light_ratio = contrast_ratio(light_text, light_canvas);
+        let dark_ratio = contrast_ratio(dark_text, dark_canvas);
+        assert!(
+            light_ratio >= 4.5,
+            "浅色文本/画布对比度 {light_ratio:.2} 低于 WCAG AA 4.5"
+        );
+        assert!(
+            dark_ratio >= 4.5,
+            "深色文本/画布对比度 {dark_ratio:.2} 低于 WCAG AA 4.5"
+        );
+    }
+
+    /// 字号栈必须包含 CJK 回退族，并把通用族留在最后。
+    #[test]
+    fn preview_font_stack_includes_cjk_fallbacks() {
+        for theme in [ThemeId::LIGHT, ThemeId::DARK] {
+            let svg = render_svg_for_preview("flowchart TD\nA-->B\n", theme).expect("SVG");
+            let stack = root_font_stack(&svg);
+            for family in [
+                "system-ui",
+                "Microsoft YaHei",
+                "Noto Sans CJK SC",
+                "sans-serif",
+            ] {
+                assert!(stack.contains(family), "字体栈缺少 {family}：{stack}");
+            }
+            let generic = stack.rfind("sans-serif").expect("通用族");
+            let noto = stack.find("Noto Sans CJK SC").expect("Noto 回退");
+            let yahei = stack.find("Microsoft YaHei").expect("雅黑回退");
+            assert!(
+                noto < generic && yahei < generic,
+                "通用族必须在最后：{stack}"
+            );
+        }
+    }
+
+    /// 真实中文标签经 ResvgSafe 管线后仍是 SVG `<text>`（不是 foreignObject）。
+    #[test]
+    fn preview_renders_cjk_labels_as_svg_text() {
+        let source = "flowchart TD\n  开始[开始] --> 结束[结束]\n";
+        for theme in [ThemeId::LIGHT, ThemeId::DARK] {
+            let svg = render_svg_for_preview(source, theme).expect("中文标签必须渲染");
+            assert!(svg.starts_with("<svg"));
+            assert!(svg.contains("</svg>"));
+            assert!(
+                !svg.contains("<foreignObject"),
+                "ResvgSafe 不得保留 foreignObject"
+            );
+            let text_nodes = svg.matches("<text").count();
+            assert!(text_nodes >= 2, "两个中文标签都应是 SVG text：{text_nodes}");
+            assert!(svg.contains("开始"), "缺少标签「开始」");
+            assert!(svg.contains("结束"), "缺少标签「结束」");
+        }
+        // 同一主题重复渲染必须字节级稳定（缓存 key 只用主题/源码/宽度）。
+        let first = render_svg_for_preview(source, ThemeId::DARK).expect("第一次");
+        let second = render_svg_for_preview(source, ThemeId::DARK).expect("第二次");
+        assert_eq!(first, second);
+    }
+
     #[test]
     fn flowchart_renders_svg() {
         let svg = render("flowchart TD\nA-->B").expect("简单流程图必须渲染成功");
@@ -318,7 +590,7 @@ mod tests {
     fn preview_pipeline_projects_html_labels_to_svg_text() {
         let source = "flowchart TD\nA[开始] --> B[结束]\n";
         let parity = render_svg(source).expect("Parity SVG");
-        let preview = render_svg_for_preview(source).expect("ResvgSafe SVG");
+        let preview = render_svg_for_preview(source, ThemeId::LIGHT).expect("ResvgSafe SVG");
         // Parity 保持 Mermaid 默认的 HTML 标签（浏览器能画，usvg 会忽略）。
         assert!(
             parity.contains("<foreignObject"),
@@ -335,20 +607,23 @@ mod tests {
         assert!(preview.contains("</svg>"));
         assert_eq!(
             preview,
-            render_svg_for_preview(source).expect("第二次渲染"),
+            render_svg_for_preview(source, ThemeId::LIGHT).expect("第二次渲染"),
             "同一输入必须字节级一致"
         );
     }
 
     #[test]
     fn preview_pipeline_reports_the_same_failures() {
-        assert_eq!(render_svg_for_preview(""), Err(MermaidError::Empty));
+        assert_eq!(
+            render_svg_for_preview("", ThemeId::LIGHT),
+            Err(MermaidError::Empty)
+        );
         assert!(matches!(
-            render_svg_for_preview("这不是 Mermaid"),
+            render_svg_for_preview("这不是 Mermaid", ThemeId::LIGHT),
             Err(MermaidError::Render(_))
         ));
         assert!(matches!(
-            render_svg_for_preview("flowchart TD\nA[未闭合"),
+            render_svg_for_preview("flowchart TD\nA[未闭合", ThemeId::LIGHT),
             Err(MermaidError::Render(_))
         ));
     }

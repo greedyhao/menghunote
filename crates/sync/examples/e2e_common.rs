@@ -18,9 +18,7 @@ use menghunote_storage::{
 };
 use menghunote_sync::api_version::{RelayApi, RelayApiVersion};
 use menghunote_sync::bootstrap::{self, BootstrapReport};
-use menghunote_sync::checkpoint::{
-    CheckpointReport, CheckpointWriter, EmptyAssets, SlotSecrets, StorageAssets,
-};
+use menghunote_sync::checkpoint::{CheckpointReport, CheckpointWriter, SlotSecrets, StorageAssets};
 use menghunote_sync::device::{DeviceHpkeKey, DeviceSigningKey, ManagementKey};
 use menghunote_sync::engine::{EngineIdentity, SyncEngine, RELAY_CURSOR_META};
 use menghunote_sync::genesis;
@@ -626,12 +624,11 @@ pub fn identity_hex(identity: &LocalIdentityV1) -> (String, String) {
 /// `published_at DESC` 取 active epoch 最新两份 published，因此激活 pair 会退居 older，
 /// 最终被 7 天后的 GC prune（只清 refs、保留签名骨架）。
 ///
-/// **资产源用 [`EmptyAssets`]（不是 `StorageAssets`）**：轮换把资产重加密进新 epoch 时，
-/// 该 ASSET 对象是用**轮换 reservation** 落库的；随后普通 checkpoint 用**checkpoint
-/// reservation** 重传同一 object_id，relay `objects::put_part` 的"预算来源必须一致"
-/// 规则会返回 409 ID_CONFLICT（`crates/relay/src/objects.rs:495-501`）。这是 relay 当前
-/// 的限制（不在本任务改生产代码），所以普通 pair 只覆盖文档快照；
-/// 资产覆盖仍由激活 pair 的候选基线承担。e2e 里要断言的链/高度/pair/prune 事实不受影响。
+/// 资产源用 [`StorageAssets`]：轮换把资产重加密进新 epoch 时，该 ASSET 对象挂在
+/// **rotation reservation** 上；随后普通 checkpoint 用 **checkpoint reservation**
+/// 重传同一 `object_id`/同字节，relay 现在按 task-121 的幂等语义回 200 duplicate
+/// （对象只存一份、不重复计费），不会再 409 ID_CONFLICT。这条 e2e 因此也覆盖
+/// "轮换后普通 pair 引用同一批资产"的真实路径。
 pub fn publish_ordinary_pair(
     vault: &Vault,
     client: &mut HttpRelayClient<StdTcpTransport>,
@@ -674,8 +671,8 @@ pub fn publish_ordinary_pair(
         root,
         peer_id,
     );
-    let first = writer.create_checkpoint(&EmptyAssets)?;
-    let second = writer.create_checkpoint(&EmptyAssets)?;
+    let first = writer.create_checkpoint(&StorageAssets)?;
+    let second = writer.create_checkpoint(&StorageAssets)?;
     println!(
         "[two-device] A ordinary checkpoints epoch={} first={} S={} second={} S={}",
         first.epoch,

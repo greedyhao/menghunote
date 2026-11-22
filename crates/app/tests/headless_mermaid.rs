@@ -12,6 +12,8 @@
 //! 6. 非普通段落上下文（列表里的 mermaid）保持普通代码块源码。
 //!
 //! 像素级外观（DPI/字体）仍必须真机验证；这里证明投影/状态机/事务/几何链路。
+//! M3a 的暗色主题 + CJK 字体链路单独放在 `headless_mermaid_theme.rs`（它会改全局主题，
+//! 与这里的缓存 key 测试并行会互相干扰）。
 
 use std::path::Path;
 use std::time::Duration;
@@ -418,7 +420,7 @@ async fn mermaid_object_renders_selects_edits_and_rerenders(cx: &mut TestAppCont
     assert!(snapshots[0].size.is_some(), "就绪后必须有逻辑尺寸");
     assert!(!snapshots[0].editing_source);
 
-    // 3) 几何：成功块按 SVG 自然尺寸（168×156）绘制，失败块是占位高度。
+    // 3) 几何：成功块按 SVG 自然尺寸（EditorLight 预设为 168×162）绘制，失败块是占位高度。
     let rects = cx.update(|_window, app| view.read(app).object_rects());
     assert_eq!(rects.len(), 2, "两个对象行都必须可见：{rects:?}");
     let (valid_line, valid_rect) = rects[0];
@@ -429,7 +431,7 @@ async fn mermaid_object_renders_selects_edits_and_rerenders(cx: &mut TestAppCont
         valid_rect.size
     );
     assert!(
-        (valid_rect.size.height.as_f32() - 156.0).abs() < 1.0,
+        (valid_rect.size.height.as_f32() - 162.0).abs() < 1.0,
         "按 SVG viewBox 等比：{:?}",
         valid_rect.size
     );

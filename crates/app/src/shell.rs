@@ -18,34 +18,38 @@
 //! 只在**启动**与**切换完成后**读 `list_tree`。任务 7a 已明确：投影表在 `commit`
 //! 之前读不到结构改动——轮询解决不了这个边界，等同步事件再接。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, point, px, AnyElement, App, Context, Entity, FocusHandle, FontWeight, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, SharedString,
-    Size, Window,
+    canvas, div, point, px, svg, AnyElement, App, Context, Entity, FocusHandle, FontWeight,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
+    SharedString, Size, Window,
 };
 use menghunote_editor::EditorController;
 use menghunote_storage::rename_links::{
     link_sources_for_note, rewrite_link_sources, RenameLinkOptions, DEFAULT_REWRITE_TIMEOUT,
 };
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 use menghunote_storage::session::{
     prepare_committed_delta, AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease,
     ExternalCommitTicket, GateError, GateState, PreparedCommittedDelta,
 };
 use menghunote_storage::session::{DriverOptions, SessionDriver};
 use menghunote_storage::{
-    list_backlinks, list_tree, Backlink, StructureWriter, SyncContext, TreeEntry, Vault,
+    list_backlinks, list_tree_sorted, Backlink, StructureWriter, SyncContext, TreeEntry, TreeSort,
+    Vault,
 };
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 use menghunote_storage::{load_head, STRUCTURE_DOC_ID};
 
 use crate::editor::view::EditorEvent;
 // 图谱（G1/G2）：模型/视口数学全在 `graph` 模块，这里只做覆盖层与交互。
 // `hint_line` / `scroll_zoom_factor` / `GraphLod` / `arrow_head` 都是纯函数，
 // UI 与测试共用同一份口径。
+use crate::daily_notes;
 use crate::graph::{
     arrow_head, hint_line, node_offscreen, scroll_zoom_factor, GraphLimits, GraphLod, GraphModel,
     GraphOptions, GraphScope, GraphSearch, GraphViewport, DEFAULT_LOCAL_DEPTH, GHOST_RADIUS_SCALE,
@@ -53,6 +57,7 @@ use crate::graph::{
 };
 use crate::search_input::{SearchInput, SearchInputEvent};
 use crate::sidebar_rename::{RenameEvent, RenameInput};
+use crate::templates::{self, TemplatePicker, TemplatePickerEvent, TemplatePickerPurpose};
 
 /// 新建笔记的默认标题（与现有标题重名时自动加序号）。
 const DEFAULT_NOTE_TITLE: &str = "未命名笔记";
@@ -111,6 +116,15 @@ use crate::editor::view::EditorView;
 
 /// 侧栏宽度（逻辑像素）。固定宽度：7b 不做可拖拽分栏。
 const SIDEBAR_WIDTH: f32 = 220.0;
+/// 最左侧图标栏（Obsidian ribbon 风格）宽度（逻辑像素）。
+///
+/// `pub` 是因为 `AppRoot` 的「⚙ 设置」是**绝对定位**在侧栏底部：它要跳过这条
+/// 图标栏，才不会压住 ribbon 按钮（见 `onboarding::app_root` 的 Main 分支）。
+pub const RIBBON_WIDTH: f32 = 44.0;
+/// ribbon 图标边长（逻辑像素）。
+const RIBBON_ICON_SIZE: f32 = 18.0;
+/// ribbon 按钮边长（正方形点击区；比图标大，方便鼠标命中）。
+const RIBBON_BUTTON_SIZE: f32 = 30.0;
 /// 每一级缩进（逻辑像素）。
 const INDENT_PER_DEPTH: f32 = 16.0;
 /// 行高（与状态栏字号 12 搭配）。
@@ -118,7 +132,7 @@ const ROW_HEIGHT: f32 = 24.0;
 /// 切换文档时旧 driver 的有界排空上限（ADR 0002 §9：`close` 必须有界）。
 const SWITCH_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 /// dev-sync 的转发接口在「没有打开任何笔记」时用的明确失败文案（切片 3b）。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 const NO_ACTIVE_DOC: &str = "dev-sync：当前没有打开的笔记，闸门/adopt 无处转发";
 
 // ---- 图谱覆盖层（G1）----
@@ -130,16 +144,6 @@ const GRAPH_NODE_BOX_WIDTH: f32 = 116.0;
 const GRAPH_HEADER_HEIGHT: f32 = 40.0;
 /// 滚轮 `Lines` 增量换算成像素时用的行高（与编辑器行高量级一致）。
 const GRAPH_SCROLL_LINE_HEIGHT: f32 = 20.0;
-/// 侧栏「图谱」入口的底部留白（像素）。
-///
-/// dev-sync 构建里 `AppRoot` 的「⚙ 设置」是绝对定位（`bottom: 30`、高约 24），
-/// 这段留白把「图谱」顶到它正上方，两个入口不重叠；默认构建没有那个按钮，
-/// 留一点内边距贴底即可。
-#[cfg(feature = "dev-sync")]
-const GRAPH_ENTRY_BOTTOM_GAP: f32 = 40.0;
-/// 默认构建（没有 `AppRoot` 设置按钮）的底部留白。
-#[cfg(not(feature = "dev-sync"))]
-const GRAPH_ENTRY_BOTTOM_GAP: f32 = 8.0;
 /// 图谱过滤条高度（逻辑像素；工具条下面一行）。
 const GRAPH_FILTER_HEIGHT: f32 = 32.0;
 /// 图谱搜索框宽度（逻辑像素）。
@@ -148,6 +152,364 @@ const GRAPH_SEARCH_WIDTH: f32 = 168.0;
 const MAX_FOLDER_CHIPS: usize = 8;
 /// 过滤条最多显示几个标签 chips。
 const MAX_TAG_CHIPS: usize = 6;
+
+// ---------------------------------------------------------------------------
+// 最左侧图标栏（ribbon）的内嵌图标
+// ---------------------------------------------------------------------------
+
+/// 内嵌的 lucide SVG（24×24 viewBox，`stroke="currentColor"`）。
+///
+/// 为什么用 `gpui::svg().data(include_bytes!(...))` 而不引 `gpui_component::Icon`：
+/// `Svg` 已经支持直接画裸字节，颜色走 `text_color`（即主题 token），既不需要
+/// `gpui-component` 的全局 `Theme` 初始化，也**不新增任何依赖边**。
+mod icons {
+    /// 今日日记（lucide `calendar`）。
+    pub const CALENDAR: &[u8] = include_bytes!("../assets/icons/calendar.svg");
+    /// 从模板新建（lucide `layout-template`）。
+    pub const TEMPLATE: &[u8] = include_bytes!("../assets/icons/layout-template.svg");
+    /// 图谱（lucide `network`）。
+    pub const GRAPH: &[u8] = include_bytes!("../assets/icons/network.svg");
+    /// 搜索（lucide `search`）。
+    pub const SEARCH: &[u8] = include_bytes!("../assets/icons/search.svg");
+    /// 排序（lucide `arrow-up-down`）。
+    pub const SORT: &[u8] = include_bytes!("../assets/icons/arrow-up-down.svg");
+}
+
+/// 画一个内嵌 SVG 图标：固定尺寸 + 主题色（`Svg` 的绘制色就是 `text_color`）。
+fn icon(bytes: &'static [u8], size: f32, color: gpui::Rgba) -> impl IntoElement {
+    svg()
+        .data(bytes)
+        .flex_shrink_0()
+        .size(px(size))
+        .text_color(color)
+}
+
+/// ribbon 图标的悬停提示（纯展示，不参与主布局）。
+struct RibbonTooltip {
+    label: SharedString,
+}
+
+impl Render for RibbonTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme::input_border())
+            .bg(theme::menu_bg())
+            .text_size(px(11.0))
+            .text_color(theme::text_color())
+            .shadow_lg()
+            .child(self.label.clone())
+    }
+}
+
+/// ribbon 里的一个图标按钮。
+///
+/// `legacy_selector` 是**兼容别名**：旧侧栏文字按钮的固定 selector 挂在外层包装上，
+/// 既有 headless 测试继续用同一 selector 点击同一个动作；视觉上只有一个按钮。
+fn ribbon_button<F>(
+    legacy_selector: Option<&'static str>,
+    selector: &'static str,
+    icon_bytes: &'static [u8],
+    label: String,
+    cx: &mut Context<AppShell>,
+    on_click: F,
+) -> AnyElement
+where
+    F: Fn(&mut AppShell, &mut Window, &mut Context<AppShell>) + 'static,
+{
+    let tooltip_label: SharedString = label.into();
+    let button = div()
+        .id(selector)
+        .debug_selector(move || selector.to_string())
+        .size(px(RIBBON_BUTTON_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+        .tooltip(move |_window, cx| {
+            let label = tooltip_label.clone();
+            cx.new(|_| RibbonTooltip { label }).into()
+        })
+        .child(icon(icon_bytes, RIBBON_ICON_SIZE, theme::status_bar_text()))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |shell, _event: &MouseDownEvent, window, cx| {
+                on_click(shell, window, cx);
+                cx.stop_propagation();
+            }),
+        );
+    match legacy_selector {
+        Some(legacy) => div()
+            .id(SharedString::from(legacy))
+            .debug_selector(move || legacy.to_string())
+            .child(button)
+            .into_any_element(),
+        None => button.into_any_element(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 侧栏排序偏好（本机 `sidebar.json`；不同步、不写正文）
+// ---------------------------------------------------------------------------
+//
+// 与 `theme.json` / `language.json` 同一套纪律：
+//
+// - **只存排序键**，不存任何正文/密钥；原子写（临时文件 → rename）；
+// - 文件缺失/损坏/未知版本/未知排序键 → 回退默认（文件名 A-Z，文件夹优先），
+//   不报错、不阻塞启动；
+// - 路径：`MENGHUNOTE_SIDEBAR_PATH`（测试/便携覆盖）→ 平台配置目录
+//   `menghunote/sidebar.json`；
+// - **不同步**：不进 vault、不进 sync outbox。
+
+/// 侧栏偏好当前版本。
+pub const SIDEBAR_PREFERENCES_VERSION: u32 = 1;
+/// 偏好文件名（平台配置目录下）。
+pub const SIDEBAR_FILE_NAME: &str = "sidebar.json";
+/// 测试/便携用的路径覆盖环境变量。
+pub const SIDEBAR_PATH_ENV: &str = "MENGHUNOTE_SIDEBAR_PATH";
+
+/// 本机侧栏偏好（当前只有一个排序键）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SidebarPreferences {
+    /// 侧栏排序键。
+    pub sort: TreeSort,
+}
+
+impl SidebarPreferences {
+    /// 从 JSON 文本解析；损坏/未知版本/未知排序键一律回退默认。
+    ///
+    /// 手写解析（默认构建不把 `serde_json` 拉进依赖）：格式只有一个字段，
+    /// 容忍未知字段与空白，不执行任何代码。
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        let Some(version) = json_number_field(text, "version") else {
+            return Self::default();
+        };
+        if version != i64::from(SIDEBAR_PREFERENCES_VERSION) {
+            return Self::default();
+        }
+        Self {
+            sort: json_string_field(text, "sort")
+                .and_then(|raw| TreeSort::parse(&raw))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 序列化为稳定 JSON（写入前先落临时文件再 rename）。
+    #[must_use]
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\n  \"version\": {SIDEBAR_PREFERENCES_VERSION},\n  \"sort\": \"{}\"\n}}\n",
+            self.sort.as_str()
+        )
+    }
+}
+
+/// 平台配置目录下的侧栏偏好文件路径；解析不到（没有 HOME/LOCALAPPDATA）时返回 `None`。
+#[must_use]
+pub fn sidebar_settings_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(SIDEBAR_PATH_ENV) {
+        return Some(PathBuf::from(path));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA").map(|base| {
+            PathBuf::from(base)
+                .join("menghunote")
+                .join(SIDEBAR_FILE_NAME)
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library/Application Support/menghunote")
+                .join(SIDEBAR_FILE_NAME)
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        Some(base.join("menghunote").join(SIDEBAR_FILE_NAME))
+    }
+}
+
+/// 读取偏好；文件不存在/不可读/损坏都回退默认（**不**报错、不阻塞启动）。
+#[must_use]
+pub fn load_sidebar_preferences(path: &Path) -> SidebarPreferences {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return SidebarPreferences::default();
+    };
+    SidebarPreferences::parse(&text)
+}
+
+/// 原子写入偏好：同目录临时文件 → rename；失败时旧文件原样保留。
+pub fn save_sidebar_preferences(
+    path: &Path,
+    preferences: SidebarPreferences,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = preferences.to_json();
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, text.as_bytes())?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Windows 上目标存在时 rename 可能失败：退化为直接覆盖写。
+            let result = std::fs::write(path, text.as_bytes());
+            let _ = std::fs::remove_file(&temp);
+            result
+        }
+    }
+}
+
+/// 进程级侧栏偏好（当前排序 + 写盘目标；不含正文/密钥）。
+struct SidebarPreferenceState {
+    sort: TreeSort,
+    store_path: Option<PathBuf>,
+    loaded: bool,
+}
+
+static SIDEBAR_PREFERENCES: RwLock<SidebarPreferenceState> = RwLock::new(SidebarPreferenceState {
+    sort: TreeSort::NameAsc,
+    store_path: None,
+    loaded: false,
+});
+
+fn read_sidebar_preferences() -> RwLockReadGuard<'static, SidebarPreferenceState> {
+    SIDEBAR_PREFERENCES
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn write_sidebar_preferences() -> RwLockWriteGuard<'static, SidebarPreferenceState> {
+    SIDEBAR_PREFERENCES
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// 当前侧栏排序偏好（**不读盘**；默认 `name_asc`）。
+///
+/// 为什么不在这里懒加载：`AppShell` 也被大量 headless 测试直接构造，若构造期读
+/// 用户真实配置目录，本机留着一份 `sidebar.json` 就会让"默认顺序"的断言随机器变化。
+/// 磁盘加载收敛在**产品根视图** [`crate::onboarding::AppRoot::new`] 的
+/// [`init_sidebar_sort_from_disk`]（与 `theme.json` / `language.json` 在 `main.rs`
+/// 初始化的纪律一致），测试用 [`init_sidebar_sort_from_path`] 显式指定文件。
+#[must_use]
+pub fn sidebar_sort() -> TreeSort {
+    read_sidebar_preferences().sort
+}
+
+/// 从平台配置目录加载排序偏好（产品入口调一次；缺失/损坏回退默认）。
+pub fn init_sidebar_sort_from_disk() {
+    let Some(path) = sidebar_settings_path() else {
+        return;
+    };
+    init_sidebar_sort_from_path(path);
+}
+
+/// 记住排序并写盘（写失败只记日志：当前会话仍然生效，下次启动回退旧值）。
+pub fn remember_sidebar_sort(sort: TreeSort) {
+    let path = {
+        let mut state = write_sidebar_preferences();
+        state.sort = sort;
+        // 没经过 `init_from_path` 时（例如 dev 模式直接构造 `AppShell`）用默认路径，
+        // 保证"改了排序就一定写盘"，不需要启动期初始化。
+        if state.store_path.is_none() {
+            state.store_path = sidebar_settings_path();
+        }
+        state.store_path.clone()
+    };
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(error) = save_sidebar_preferences(&path, SidebarPreferences { sort }) {
+        eprintln!("[menghunote] 保存侧栏排序偏好失败：{error}");
+    }
+}
+
+/// 从**显式路径**加载偏好（测试/便携入口；生产走 [`sidebar_sort`] 的懒加载）。
+#[doc(hidden)]
+pub fn init_sidebar_sort_from_path(path: PathBuf) {
+    let preferences = load_sidebar_preferences(&path);
+    let mut state = write_sidebar_preferences();
+    state.sort = preferences.sort;
+    state.store_path = Some(path);
+    state.loaded = true;
+}
+
+/// 侧栏偏好测试锁：排序与写盘目标都是进程级状态，改它们的测试必须串行。
+static SIDEBAR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 侧栏偏好测试守卫：`reset` 固定默认排序并把持久化目标指向给定路径；
+/// `Drop` 清空持久化目标并复位默认排序。
+pub struct SidebarTestGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl SidebarTestGuard {
+    /// 复位到默认排序（文件名 A-Z），并设置偏好文件路径。
+    pub fn reset(&self, store_path: Option<PathBuf>) {
+        let mut state = write_sidebar_preferences();
+        state.sort = TreeSort::NameAsc;
+        state.store_path = store_path;
+        state.loaded = true;
+    }
+}
+
+impl Drop for SidebarTestGuard {
+    fn drop(&mut self) {
+        let mut state = write_sidebar_preferences();
+        state.sort = TreeSort::NameAsc;
+        state.store_path = None;
+        state.loaded = true;
+    }
+}
+
+/// 串行化侧栏偏好测试并自动复位（只给 `crates/app/tests/**` 与 crate 内测试用）。
+#[doc(hidden)]
+#[must_use]
+pub fn lock_sidebar_for_test() -> SidebarTestGuard {
+    let lock = SIDEBAR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    SidebarTestGuard { _lock: lock }
+}
+
+/// 读一个 JSON 数字字段（`"key": 123`）；找不到/不是数字返回 `None`。
+fn json_number_field(text: &str, key: &str) -> Option<i64> {
+    let rest = field_after_key(text, key)?;
+    let digits: String = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '-')
+        .collect();
+    digits.parse().ok()
+}
+
+/// 读一个 JSON 字符串字段（`"key": "value"`）；不处理转义（写盘只有 ASCII 短名）。
+fn json_string_field(text: &str, key: &str) -> Option<String> {
+    let rest = field_after_key(text, key)?;
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_owned())
+}
+
+/// 定位 `"key"` 之后、冒号之后的第一个非空白位置。
+fn field_after_key<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\"");
+    let start = text.find(&pattern)? + pattern.len();
+    let colon = text[start..].find(':')?;
+    Some(text[start + colon + 1..].trim_start())
+}
 
 /// 当前打开的笔记。
 /// 正在编辑的行。
@@ -252,6 +614,10 @@ pub struct AppShell {
     notice: Option<String>,
     /// 已折叠的目录 `node_id`（默认全部展开；**不持久化**，v1 只存内存）。
     collapsed: HashSet<String>,
+    /// 侧栏排序键（本机偏好；构造时取 [`sidebar_sort`]，切换后写 `sidebar.json`）。
+    sidebar_sort: TreeSort,
+    /// 侧栏排序菜单是否打开（`false` = 关闭）。
+    sort_menu: bool,
     /// 当前**选中**的节点（与"已打开的笔记"是两件事：选中可以是目录）。
     selected_node_id: Option<String>,
     /// 右键行弹出的菜单；`None` = 没有菜单。
@@ -295,71 +661,85 @@ pub struct AppShell {
     appearance_subscription: Option<gpui::Subscription>,
     /// dev-only 同步面板（ADR 0009 Phase 1 / 切片 1）。
     ///
-    /// **只有** `--features dev-sync` + 运行时门禁通过时才存在；默认构建里这个字段
-    /// 连类型都不存在（模块被 cfg 掉），因此结构体布局/渲染分支零变化。
-    #[cfg(feature = "dev-sync")]
+    /// 只在 `sync-ui`（默认 feature）下存在；`AppShell::new` 等纯 dev vault 入口里是
+    /// `None`（整块不渲染）。`--no-default-features` 构建里连类型都不存在。
+    #[cfg(feature = "sync-ui")]
     dev_sync: Option<Entity<crate::dev_sync::DevSyncPanel>>,
     /// V2 管理面板（ADR 0016 S4d1c；设置页里的「管理」区）。
     ///
     /// 只有 `dev-sync` + 真实 dev-local 服务（有 `dev-identity.bin` 路径）时才创建；
-    /// 默认构建/注入 fake runner 的测试里是 `None`（不渲染管理区）。
+    /// 产品 `sync-ui` 构建/注入 fake runner 的测试里是 `None`（不渲染管理区）。
     #[cfg(feature = "dev-sync")]
     management: Option<Entity<crate::dev_sync::ManagementPanel>>,
     /// 设置页里的「管理」区是否展开（默认收起，避免设置页默认触发网络刷新）。
     #[cfg(feature = "dev-sync")]
     management_open: bool,
-    /// dev-sync 设置页是否打开（默认关闭；面板只在设置页里渲染）。
-    #[cfg(feature = "dev-sync")]
+    /// 同步设置页是否打开（默认关闭；面板只在设置页里渲染）。
+    #[cfg(feature = "sync-ui")]
     settings_open: bool,
     /// 设置页焦点（Esc 关闭用）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     settings_focus: FocusHandle,
     /// 面板事件订阅（切片 4c-2）：「同步」按钮只发出 `SyncRequested`，由本视图持闸后派发。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_subscription: Option<gpui::Subscription>,
     /// 在途的持闸同步（ADR 0009 切片 4c-2）；`None` = 没有同步在跑。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_sync: Option<crate::dev_sync::ActiveSyncOnce>,
     /// 已收到「同步」按钮请求、还没在 `dev_sync_pump` 里消费（事件回调里不重入面板）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_requested: bool,
     /// 已收到「发布基线」按钮请求、还没在 `dev_sync_pump` 里消费（切片 4c-4）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_publish_requested: bool,
     /// 已收到「轮换密钥」确认请求、还没在 `dev_sync_pump` 里消费（切片 6b）。
     ///
     /// 事件只带"用户确认了"，真正的恢复码/revoke 列表留在面板里，由泵取走
     /// （[`crate::dev_sync::DevSyncPanel::take_rotate_request`]）——秘密不进事件/日志。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_rotate_requested: bool,
     /// 已收到「应用轮换」确认请求、还没在 `dev_sync_pump` 里消费（切片 6b）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_apply_requested: bool,
     /// 最近一次持闸同步的报告（面板文案 + 测试断言）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_last_report: Option<crate::dev_sync::SyncOnceReport>,
     /// 自动同步接线（ADR 0012 S3）：纯调度器 + 状态投影 + 注入的单调时钟。
     ///
     /// `None` = dev-sync 未启用（默认构建/未挂面板）：零自动行为。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_auto: Option<crate::dev_sync::AutoSync>,
     /// 当前这一轮的来源（自动/手动）。收尾时交给 [`crate::dev_sync::AutoSync`] 记账：
     /// 自动轮进退避/续批，手动轮清退避但不参与自动续批。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_round_origin: Option<crate::dev_sync::OpOrigin>,
     /// 本轮自动同步是因为"等不到输入法空闲"主动 defer 的（不算失败、不计退避）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_auto_deferred: bool,
     /// 已观测到的活动文档本地编辑代数（自动同步的 debounce 触发源）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_auto_edit_seq: u64,
     /// 上一次打印/观察到的同步阶段（只用于诊断日志，避免每帧重复）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     dev_sync_last_stage: Option<crate::dev_sync::SyncOnceStage>,
     /// 粘贴/拖放导入的失败原因（`import-error` 行；校验失败/持闸/落库失败都写这里）。
     import_error: Option<String>,
     /// 粘贴/拖放导入的成功提示（`import-notice` 行）。
     import_notice: Option<String>,
+    /// 模板选择器（`None` = 关闭）；覆盖层实体自绘搜索/列表/键盘。
+    template_picker: Option<Entity<TemplatePicker>>,
+    /// 选择器事件订阅（关闭时 drop = 取消订阅）。
+    template_picker_events: Option<gpui::Subscription>,
+    /// 关闭选择器后下一帧把焦点还给编辑器（事件回调里拿不到 `&mut Window`）。
+    pending_focus_editor: bool,
+    /// 「插入 → 模板…」在事件回调里置位，下一帧 render 里真正创建选择器。
+    pending_template_picker: Option<TemplatePickerPurpose>,
+    /// 设置页「模板」区（首次打开设置页时懒创建；`None` = 还没打开过）。
+    #[cfg(feature = "sync-ui")]
+    templates_settings: Option<Entity<crate::templates::TemplatesSettingsPanel>>,
+    /// 设置页「日记」区（同上）。
+    #[cfg(feature = "sync-ui")]
+    daily_notes_settings: Option<Entity<crate::daily_notes::DailyNotesSettingsPanel>>,
 }
 
 /// 右键行弹出的上下文菜单。
@@ -954,6 +1334,26 @@ impl AppShell {
         self.active.as_ref().map(|active| active.note_id.as_str())
     }
 
+    /// 侧栏当前展示顺序的标题（先序 DFS；headless 断言"文件夹优先 + 排序键"用）。
+    ///
+    /// 只读投影，不触发任何 IO；`tree-row-<i>` 的下标就是这里的下标。
+    #[must_use]
+    pub fn sidebar_titles(&self) -> Vec<&str> {
+        self.tree.iter().map(|entry| entry.title.as_str()).collect()
+    }
+
+    /// 侧栏当前排序键（测试/诊断用）。
+    #[must_use]
+    pub const fn sidebar_sort_key(&self) -> TreeSort {
+        self.sidebar_sort
+    }
+
+    /// 排序菜单是否打开（测试/诊断用）。
+    #[must_use]
+    pub const fn sort_menu_open(&self) -> bool {
+        self.sort_menu
+    }
+
     /// 图谱节点标题（按模型顺序；headless 断言排序/数量用）。
     #[must_use]
     pub fn graph_node_titles(&self) -> Vec<&str> {
@@ -1023,6 +1423,8 @@ impl AppShell {
             backlinks_open: false,
             notice: None,
             collapsed: HashSet::new(),
+            sidebar_sort: sidebar_sort(),
+            sort_menu: false,
             selected_node_id: None,
             menu: None,
             menu_delete_armed: false,
@@ -1042,42 +1444,50 @@ impl AppShell {
             activation_observed: false,
             activation_subscription: None,
             appearance_subscription: None,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync: None,
             #[cfg(feature = "dev-sync")]
             management: None,
             #[cfg(feature = "dev-sync")]
             management_open: false,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             settings_open: false,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             settings_focus: cx.focus_handle(),
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_subscription: None,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_sync: None,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_requested: false,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_publish_requested: false,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_rotate_requested: false,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_apply_requested: false,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_last_report: None,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_auto: None,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_round_origin: None,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_auto_deferred: false,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_auto_edit_seq: 0,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             dev_sync_last_stage: None,
             import_error: None,
             import_notice: None,
+            template_picker: None,
+            template_picker_events: None,
+            pending_focus_editor: false,
+            pending_template_picker: None,
+            #[cfg(feature = "sync-ui")]
+            templates_settings: None,
+            #[cfg(feature = "sync-ui")]
+            daily_notes_settings: None,
         };
         shell.refresh_tree();
         if let Some(index) = shell.tree.iter().position(TreeEntry::is_note) {
@@ -1101,7 +1511,7 @@ impl AppShell {
     /// 为什么不默认开在 [`Self::new_with_dev_sync`]：那条入口同时被大量 headless 测试
     /// 使用（它们靠显式 `dev_sync_pump`/`dev_sync_auto_tick` 收敛，不该有后台 ticker
     /// 在真实时间里偷偷启动同步）。生产入口（`main.rs` / `AppRoot` 的 Main）走这一条。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn new_with_dev_sync_with_autosync(
         vault: Vault,
         vault_label: String,
@@ -1125,10 +1535,10 @@ impl AppShell {
         Self::new_with_dev_sync_service_auto(vault, vault_label, sync, service, Some(auto), cx)
     }
 
-    /// dev-only 面板 + worker（**不**启用自动同步 ticker）：headless 测试与确定性复现用。
+    /// 同步面板 + worker（**不**启用自动同步 ticker）：headless 测试与确定性复现用。
     ///
     /// 生产 Main 请用 [`Self::new_with_dev_sync_with_autosync`]。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn new_with_dev_sync(
         vault: Vault,
         vault_label: String,
@@ -1164,7 +1574,7 @@ impl AppShell {
     /// 生产路径不用它；测试用它注入 `ControlledRunner`（ADR 0012 S2a 的阶段/超时/
     /// 授权竞争），从而在真实 `AppShell` 上验证"网络阶段不冻结、Held 只覆盖
     /// integrate+adopt"这些**窗口**行为，而不是只测纯状态机。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn new_with_dev_sync_service(
         vault: Vault,
         vault_label: String,
@@ -1186,7 +1596,7 @@ impl AppShell {
     ///
     /// 测试用 `AutoSyncConfig::no_ticker()` + 手动时钟（`OperationClock`），再显式
     /// [`Self::dev_sync_auto_tick`]；生产走 [`Self::new_with_dev_sync`] 的系统时钟 + ticker。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn new_with_dev_sync_service_auto(
         vault: Vault,
         vault_label: String,
@@ -1195,35 +1605,39 @@ impl AppShell {
         auto: Option<crate::dev_sync::AutoSync>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_dev_sync_service_auto_and_management(
-            vault,
-            vault_label,
-            sync,
-            service,
-            auto,
-            None,
-            cx,
-        )
+        // dev-sync 构建保留旧行为：真实服务有库路径时自动构造 V2 管理面板；
+        // 产品 sync-ui 构建不编译管理面板，直接走不含管理区的实现。
+        #[cfg(feature = "dev-sync")]
+        {
+            Self::new_with_dev_sync_service_auto_and_management(
+                vault,
+                vault_label,
+                sync,
+                service,
+                auto,
+                None,
+                cx,
+            )
+        }
+        #[cfg(not(feature = "dev-sync"))]
+        {
+            Self::new_with_dev_sync_service_auto_impl(vault, vault_label, sync, service, auto, cx)
+        }
     }
 
-    /// 与 [`Self::new_with_dev_sync_service_auto`] 相同，但允许注入**管理执行体**
-    /// （ADR 0016 S4d1c）。
+    /// 同步面板 + 自动同步接线（不含 V2 管理面板）。
     ///
-    /// 生产路径传 `None`：若同步服务带真实库路径，就用 [`crate::dev_sync::RealManagementRunner`]
-    /// 构造管理面板（身份解封/网络都在管理 worker 线程里）。测试传脚本化 runner，
-    /// 在真实 `AppShell` + 设置页里验证管理区交互（不发真实网络请求）。
-    #[cfg(feature = "dev-sync")]
-    pub fn new_with_dev_sync_service_auto_and_management(
+    /// `sync-ui` 的产品入口与 headless 测试共用；管理面板只在 `dev-sync` 构建的
+    /// [`Self::new_with_dev_sync_service_auto_and_management`] 里附加。
+    #[cfg(feature = "sync-ui")]
+    fn new_with_dev_sync_service_auto_impl(
         vault: Vault,
         vault_label: String,
         sync: SyncContext,
         service: std::sync::Arc<crate::dev_sync::service::SyncService>,
         auto: Option<crate::dev_sync::AutoSync>,
-        management: Option<Box<dyn crate::dev_sync::ManagementRunner>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // 管理面板与同步面板共享同一个 `Vault` 句柄（`Vault` 是 `Clone + Send + Sync`）。
-        let management_vault = vault.clone();
         let mut shell =
             Self::new_with_peer_and_sync(vault, vault_label, sync.peer_id, Some(sync), cx);
         let panel =
@@ -1262,22 +1676,6 @@ impl AppShell {
         });
         shell.dev_sync = Some(panel);
         shell.dev_sync_subscription = Some(subscription);
-        // ADR 0016 S4d1c：管理面板（设置页里的「管理」区）。执行体优先用调用方注入的
-        // （测试），否则只在真实 dev-local 服务（有库路径）时构造；默认构建/无路径 = None。
-        let management_service = management
-            .map(crate::dev_sync::ManagementService::new)
-            .or_else(|| {
-                let path = service.vault_path()?;
-                let runner = crate::dev_sync::RealManagementRunner::new(
-                    crate::dev_sync::ManagementRunConfig::from_service(service.config()),
-                    management_vault,
-                    path.to_path_buf(),
-                );
-                Some(crate::dev_sync::ManagementService::new(Box::new(runner)))
-            });
-        shell.management = management_service.map(|service| {
-            cx.new(|cx| crate::dev_sync::ManagementPanel::with_service(service, cx))
-        });
         // ADR 0012 S3：启动合并一次（只有 durable outbox/inbox 有待办才排队）。
         // 真正的派发在第一拍（生产 ticker 40ms；测试显式 `dev_sync_auto_tick`），
         // 避免在构造期重入同步状态机。
@@ -1296,11 +1694,52 @@ impl AppShell {
         shell
     }
 
-    /// dev-only：关窗时**只请求停止 + 查一次关闭门禁**，不 join、不等网络（ADR 0009）。
+    /// 与 [`Self::new_with_dev_sync_service_auto`] 相同，但允许注入**管理执行体**
+    /// （ADR 0016 S4d1c）。
+    ///
+    /// 生产路径传 `None`：若同步服务带真实库路径，就用 [`crate::dev_sync::RealManagementRunner`]
+    /// 构造管理面板（身份解封/网络都在管理 worker 线程里）。测试传脚本化 runner，
+    /// 在真实 `AppShell` + 设置页里验证管理区交互（不发真实网络请求）。
+    ///
+    /// **只在 `dev-sync` 构建**：V2 管理是 dev-only 实验（P1 不产品化）。
+    #[cfg(feature = "dev-sync")]
+    pub fn new_with_dev_sync_service_auto_and_management(
+        vault: Vault,
+        vault_label: String,
+        sync: SyncContext,
+        service: std::sync::Arc<crate::dev_sync::service::SyncService>,
+        auto: Option<crate::dev_sync::AutoSync>,
+        management: Option<Box<dyn crate::dev_sync::ManagementRunner>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // 管理面板与同步面板共享同一个 `Vault` 句柄（`Vault` 是 `Clone + Send + Sync`）。
+        let management_vault = vault.clone();
+        // ADR 0016 S4d1c：管理面板（设置页里的「管理」区）。执行体优先用调用方注入的
+        // （测试），否则只在真实 dev-local 服务（有库路径）时构造；无路径 = None。
+        let management_service = management
+            .map(crate::dev_sync::ManagementService::new)
+            .or_else(|| {
+                let path = service.vault_path()?;
+                let runner = crate::dev_sync::RealManagementRunner::new(
+                    crate::dev_sync::ManagementRunConfig::from_service(service.config()),
+                    management_vault,
+                    path.to_path_buf(),
+                );
+                Some(crate::dev_sync::ManagementService::new(Box::new(runner)))
+            });
+        let mut shell =
+            Self::new_with_dev_sync_service_auto_impl(vault, vault_label, sync, service, auto, cx);
+        shell.management = management_service.map(|service| {
+            cx.new(|cx| crate::dev_sync::ManagementPanel::with_service(service, cx))
+        });
+        shell
+    }
+
+    /// 同步：关窗时**只请求停止 + 查一次关闭门禁**，不 join、不等网络（ADR 0009）。
     ///
     /// 在途操作还在跑时门禁是 `Pending`——这是**预期**的：worker 在后台线程里自己退出，
     /// 关窗不能被同步网络拖住。面板/测试要等明确收敛点时用 `poll_close`（票据）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     fn shutdown_dev_sync(&mut self, cx: &mut Context<Self>) {
         // ADR 0012 S3：关窗/切库先停调度器（不再自动启动），再请求 worker 停止；
         // 二者都**不** join、不等网络（S1/S2 的安全收尾语义不变）。
@@ -1308,6 +1747,7 @@ impl AppShell {
             auto.stop();
         }
         // ADR 0016 S4d1c：管理 worker 同样只请求停止（在途命令跑完后退出），不 join。
+        #[cfg(feature = "dev-sync")]
         if let Some(panel) = &self.management {
             panel.read(cx).service().request_stop();
         }
@@ -1394,6 +1834,356 @@ impl AppShell {
         self.refresh_tree();
         self.selected_node_id = Some(node_id);
         self.notice = None;
+        cx.notify();
+    }
+
+    // ---- 模板 / 日记（第一方核心插件；模板就是普通笔记）----
+
+    /// 当前活动笔记的标题（`{{title}}` 与「从模板新建」的默认标题来源）。
+    fn active_title(&self) -> String {
+        let Some(active) = &self.active else {
+            return String::new();
+        };
+        self.tree
+            .iter()
+            .find(|entry| entry.node_id == active.node_id)
+            .map(|entry| entry.title.clone())
+            .unwrap_or_default()
+    }
+
+    /// 树里所有**目录**的「完整路径 → 节点 ID」（建日记目录时复用已有目录）。
+    fn folder_ids(&self) -> HashMap<String, String> {
+        let paths = templates::node_paths(&self.tree);
+        self.tree
+            .iter()
+            .filter(|entry| entry.is_folder())
+            .filter_map(|entry| {
+                let path = paths.get(&entry.node_id)?;
+                Some((path.clone(), entry.node_id.clone()))
+            })
+            .collect()
+    }
+
+    /// 展开某个节点的所有祖先目录（新建/打开日记时别让笔记藏在折叠目录里）。
+    fn unfold_ancestors(&mut self, node_id: &str) {
+        let mut current = self
+            .tree
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .and_then(|entry| entry.parent_id.clone());
+        let mut guard = 0usize;
+        while let Some(parent) = current {
+            self.collapsed.remove(&parent);
+            guard += 1;
+            if guard > self.tree.len() {
+                break;
+            }
+            current = self
+                .tree
+                .iter()
+                .find(|entry| entry.node_id == parent)
+                .and_then(|entry| entry.parent_id.clone());
+        }
+    }
+
+    /// 按节点 ID 打开笔记（模板/日记创建后使用）；返回是否找到并打开。
+    fn open_node_by_id(&mut self, node_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.tree.iter().position(|entry| entry.node_id == node_id) else {
+            return false;
+        };
+        self.unfold_ancestors(node_id);
+        self.selected_node_id = Some(node_id.to_owned());
+        self.open_entry(index, cx);
+        true
+    }
+
+    /// 把一段**已渲染**的模板正文插入当前 caret（有选区则替换；一次 `EditRequest`）。
+    fn insert_into_active(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(active) = self.active.as_ref() else {
+            return false;
+        };
+        let view = active.view.clone();
+        view.update(cx, |view, cx| view.insert_template_text(text, cx))
+    }
+
+    /// 打开模板选择器（`purpose` 决定插入/新建）。
+    ///
+    /// 模板发现只读当前树快照：**不创建文件夹**、不隐藏任何笔记。
+    fn open_template_picker(
+        &mut self,
+        purpose: TemplatePickerPurpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preferences = templates::preferences();
+        if !preferences.enabled {
+            self.notice = Some(crate::ui_text::templates_disabled_hint());
+            cx.notify();
+            return;
+        }
+        if purpose == TemplatePickerPurpose::Insert && self.active.is_none() {
+            self.notice = Some(crate::ui_text::templates_empty_no_note());
+            cx.notify();
+            return;
+        }
+        // 已有选择器（理论上不会同时开两个）：直接替换，**不要**把焦点还给编辑器
+        // （否则新选择器的搜索框会被抢焦点）。
+        self.template_picker = None;
+        self.template_picker_events = None;
+        self.pending_focus_editor = false;
+        let list = templates::collect_templates(&self.tree, &preferences.folder);
+        let picker = cx.new(|cx| TemplatePicker::new(list, purpose, cx));
+        let events = cx.subscribe(
+            &picker,
+            |shell, _picker, event: &TemplatePickerEvent, cx| match *event {
+                TemplatePickerEvent::Picked { index } => shell.on_template_picked(index, cx),
+                TemplatePickerEvent::Closed => shell.close_template_picker(cx),
+            },
+        );
+        picker.update(cx, |picker, cx| picker.focus(window, cx));
+        eprintln!(
+            "[menghunote] 打开模板选择器（{}，模板文件夹「{}」）",
+            if purpose == TemplatePickerPurpose::Insert {
+                "插入"
+            } else {
+                "从模板新建"
+            },
+            preferences.folder
+        );
+        self.template_picker = Some(picker);
+        self.template_picker_events = Some(events);
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 关闭模板选择器并把焦点还给编辑器。
+    fn close_template_picker(&mut self, cx: &mut Context<Self>) {
+        if self.template_picker.take().is_none() {
+            return;
+        }
+        self.template_picker_events = None;
+        self.pending_focus_editor = true;
+        cx.notify();
+    }
+
+    /// 选择器选中：按用途插入当前 caret 或新建笔记。
+    fn on_template_picked(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(picker) = self.template_picker.clone() else {
+            return;
+        };
+        let (purpose, item) = {
+            let state = picker.read(cx);
+            (state.purpose(), state.list().items.get(index).cloned())
+        };
+        let Some(item) = item else {
+            self.close_template_picker(cx);
+            return;
+        };
+        self.close_template_picker(cx);
+        match purpose {
+            TemplatePickerPurpose::Insert => self.insert_template_item(&item, cx),
+            TemplatePickerPurpose::NewNote => self.create_note_from_template(&item, cx),
+        }
+        self.pending_focus_editor = true;
+        cx.notify();
+    }
+
+    /// 插入模板到当前 caret（模板笔记本身原样保留，不移动、不复制资产）。
+    fn insert_template_item(&mut self, item: &templates::TemplateItem, cx: &mut Context<Self>) {
+        if self.active.is_none() {
+            self.notice = Some(crate::ui_text::templates_empty_no_note());
+            return;
+        }
+        let body = match templates::read_template_body(&self.vault, item) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!(
+                    "[menghunote] 读取模板「{}」失败：{error}",
+                    item.relative_path
+                );
+                self.notice = Some(crate::ui_text::templates_read_failed(&error));
+                return;
+            }
+        };
+        let title = self.active_title();
+        let parts = templates::DateTimeParts::now();
+        let rendered = templates::render_placeholders(
+            &body,
+            &parts,
+            &title,
+            templates::preferences().placeholder_formats(),
+        );
+        if rendered.is_empty() {
+            self.notice = Some(crate::ui_text::templates_empty_body());
+            return;
+        }
+        if self.insert_into_active(&rendered, cx) {
+            self.notice = Some(crate::ui_text::templates_inserted(&item.relative_path));
+        } else {
+            self.notice = Some(crate::ui_text::templates_insert_failed());
+        }
+    }
+
+    /// 从模板新建笔记：标题默认模板标题（重名自动加序号，**不覆盖**已有笔记）。
+    fn create_note_from_template(
+        &mut self,
+        item: &templates::TemplateItem,
+        cx: &mut Context<Self>,
+    ) {
+        let body = match templates::read_template_body(&self.vault, item) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!(
+                    "[menghunote] 读取模板「{}」失败：{error}",
+                    item.relative_path
+                );
+                self.notice = Some(crate::ui_text::templates_read_failed(&error));
+                return;
+            }
+        };
+        // 只在**根级**去重：模板笔记自己也在树里（通常叫同一个名字），全局去重会让
+        // 每次「从模板新建」都多出「 2」；storage 允许同名笔记，且这里永远新建节点，
+        // 不会覆盖任何已有笔记。
+        let title = unique_root_title(&item.title, &self.tree);
+        let parts = templates::DateTimeParts::now();
+        let rendered = templates::render_placeholders(
+            &body,
+            &parts,
+            &title,
+            templates::preferences().placeholder_formats(),
+        );
+        let Some(node_id) = self.write_structure("从模板新建", |writer| {
+            let seed = writer.doc().create_note(&title, now_millis())?;
+            Ok(seed.node_id)
+        }) else {
+            self.notice = Some(crate::ui_text::templates_write_failed());
+            return;
+        };
+        self.refresh_tree();
+        if !self.open_node_by_id(&node_id, cx) {
+            self.notice = Some(crate::ui_text::templates_write_failed());
+            return;
+        }
+        // 空模板 = 只创建空笔记；非空则必须真的写进正文，否则明确提示（不静默）。
+        if rendered.is_empty() || self.insert_into_active(&rendered, cx) {
+            self.notice = Some(crate::ui_text::templates_created(&title));
+        } else {
+            self.notice = Some(crate::ui_text::templates_created_insert_failed(&title));
+        }
+    }
+
+    /// 侧栏「今日日记」：已存在就打开，否则创建目录 + 笔记（有模板就替换占位符）。
+    ///
+    /// 模板丢失是**非阻塞**提示：仍然创建空日记（用户可以在设置页修正路径）。
+    fn open_daily_note(&mut self, cx: &mut Context<Self>) {
+        let preferences = daily_notes::preferences();
+        if !preferences.enabled {
+            self.notice = Some(crate::ui_text::daily_notes_disabled_hint());
+            cx.notify();
+            return;
+        }
+        let parts = templates::DateTimeParts::now();
+        let path = match daily_notes::note_path(&preferences, &parts) {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(error.message());
+                cx.notify();
+                return;
+            }
+        };
+        // 1) 已存在同路径笔记 → 直接打开（不覆盖、不重复创建）。
+        if let Some(index) = templates::note_index_by_path(&self.tree, &path.full) {
+            let node_id = self.tree[index].node_id.clone();
+            self.open_node_by_id(&node_id, cx);
+            self.notice = Some(crate::ui_text::daily_notes_opened(&path.full));
+            cx.notify();
+            return;
+        }
+        // 2) 模板正文（可丢失：非阻塞，创建空日记）。
+        let template = daily_notes::resolve_template(&self.tree, &preferences);
+        let mut template_missing =
+            template.is_none() && !preferences.normalized_template().is_empty();
+        let body = match &template {
+            Some(template) => match templates::read_body_source(&self.vault, &template.body_doc_id)
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    eprintln!(
+                        "[menghunote] 读取日记模板「{}」失败：{error}（创建空日记）",
+                        template.title
+                    );
+                    template_missing = true;
+                    String::new()
+                }
+            },
+            None => String::new(),
+        };
+        let rendered = templates::render_placeholders(
+            &body,
+            &parts,
+            &path.title,
+            templates::preferences().placeholder_formats(),
+        );
+        // 3) 目录快照 + 一条结构提交里创建缺少的目录/笔记。
+        let existing_folders = self.folder_ids();
+        let segments = path.segments.clone();
+        let title = path.title.clone();
+        let Some(node_id) = self.write_structure("创建今日日记", |writer| {
+            let mut parent: Option<String> = None;
+            let mut accumulated = String::new();
+            let folder_segments = segments.len().saturating_sub(1);
+            for segment in segments.iter().take(folder_segments) {
+                accumulated = if accumulated.is_empty() {
+                    segment.clone()
+                } else {
+                    format!("{accumulated}/{segment}")
+                };
+                let folder_id = match existing_folders.get(&accumulated) {
+                    Some(node_id) => node_id.clone(),
+                    None => {
+                        let created = writer.doc().create_folder(segment, now_millis())?;
+                        if let Some(parent_id) = &parent {
+                            writer
+                                .doc()
+                                .move_node(&created, Some(parent_id), now_millis())?;
+                        }
+                        created
+                    }
+                };
+                parent = Some(folder_id);
+            }
+            let seed = writer.doc().create_note(&title, now_millis())?;
+            if let Some(parent_id) = &parent {
+                writer
+                    .doc()
+                    .move_node(&seed.node_id, Some(parent_id), now_millis())?;
+            }
+            Ok(seed.node_id)
+        }) else {
+            self.notice = Some(crate::ui_text::daily_notes_create_failed(
+                &crate::ui_text::daily_notes_write_failed(),
+            ));
+            cx.notify();
+            return;
+        };
+        self.refresh_tree();
+        if !self.open_node_by_id(&node_id, cx) {
+            self.notice = Some(crate::ui_text::daily_notes_create_failed(
+                &crate::ui_text::daily_notes_write_failed(),
+            ));
+            cx.notify();
+            return;
+        }
+        if !rendered.is_empty() && !self.insert_into_active(&rendered, cx) {
+            self.notice = Some(crate::ui_text::templates_insert_failed());
+            cx.notify();
+            return;
+        }
+        self.notice = Some(if template_missing {
+            crate::ui_text::daily_notes_template_missing(&preferences.normalized_template())
+        } else {
+            crate::ui_text::daily_notes_created(&path.full)
+        });
         cx.notify();
     }
 
@@ -1897,7 +2687,7 @@ impl AppShell {
 
         // 切片 6b：删掉的若是当前打开的笔记，`active` 已经清空——面板的轮换/apply
         // 前置条件必须跟着变（否则按钮还显示可用，点了才被拒）。
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         self.dev_sync_push_active_document(cx);
         let deleted = self
             .write_structure("删除笔记", |writer| {
@@ -1932,7 +2722,7 @@ impl AppShell {
         action: &str,
         op: impl FnOnce(&StructureWriter) -> Result<String, menghunote_storage::StorageError>,
     ) -> Option<String> {
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         if self.dev_sync_sync.is_some() {
             eprintln!("[menghunote] {action}被拒绝：dev-sync 同步进行中（结构写入已冻结）");
             self.notice = Some("同步进行中，稍后再改结构".to_owned());
@@ -1964,9 +2754,12 @@ impl AppShell {
         Some(node_id)
     }
 
-    /// 重新读取结构树（只在启动 / 切换完成后调用）。
+    /// 重新读取结构树（只在启动 / 切换完成后 / 排序切换后调用）。
+    ///
+    /// 读的是**展示顺序**（[`list_tree_sorted`]）：每个层级目录在前、组内按当前
+    /// 排序键。`list_tree` 的 rank 语义不被侧栏使用（同步/导出仍读它）。
     fn refresh_tree(&mut self) {
-        match list_tree(&self.vault) {
+        match list_tree_sorted(&self.vault, self.sidebar_sort) {
             Ok(tree) => {
                 eprintln!(
                     "[menghunote] 侧栏树：{} 项（笔记 {} / 目录 {}）",
@@ -1981,6 +2774,135 @@ impl AppShell {
                 self.notice = Some("读取笔记树失败（详见 stderr）".to_owned());
             }
         }
+    }
+
+    /// 打开/关闭侧栏排序菜单（点「排序」按钮；Esc 关闭走 [`Self::close_sort_menu`]）。
+    fn toggle_sort_menu(&mut self, cx: &mut Context<Self>) {
+        self.sort_menu = !self.sort_menu;
+        cx.notify();
+    }
+
+    /// 关闭排序菜单（点空白 / 选中一项 / Esc）。
+    fn close_sort_menu(&mut self, cx: &mut Context<Self>) {
+        if self.sort_menu {
+            self.sort_menu = false;
+            cx.notify();
+        }
+    }
+
+    /// 应用侧栏排序：写本机偏好（`sidebar.json`）+ 重建树。
+    ///
+    /// 重排只改变 `self.tree` 的**下标**：折叠集合、选中节点、已打开笔记都按
+    /// `node_id` 保存，所以不会丢选中/折叠状态；打开索引在重排后重新按 node_id 定位。
+    fn set_sidebar_sort(&mut self, sort: TreeSort, cx: &mut Context<Self>) {
+        self.sort_menu = false;
+        if self.sidebar_sort != sort {
+            self.sidebar_sort = sort;
+            remember_sidebar_sort(sort);
+            self.refresh_tree();
+            eprintln!("[menghunote] 侧栏排序 → {}", sort.as_str());
+        }
+        cx.notify();
+    }
+
+    /// 侧栏排序菜单（根层绝对定位）：6 个排序键 + 当前项勾选。
+    ///
+    /// 位置固定在侧栏顶部下方（ribbon 右侧）：菜单不依赖按钮的实时 bounds，
+    /// 窗口缩放/滚动都不会让它跑偏。
+    fn render_sort_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.sort_menu {
+            return None;
+        }
+        let mut items = div().w_full().flex().flex_col().gap_1();
+        for sort in TreeSort::ALL {
+            let selected = sort == self.sidebar_sort;
+            let selector: &'static str = match sort {
+                TreeSort::NameAsc => "sidebar-sort-name_asc",
+                TreeSort::NameDesc => "sidebar-sort-name_desc",
+                TreeSort::UpdatedNewest => "sidebar-sort-updated_newest",
+                TreeSort::UpdatedOldest => "sidebar-sort-updated_oldest",
+                TreeSort::CreatedNewest => "sidebar-sort-created_newest",
+                TreeSort::CreatedOldest => "sidebar-sort-created_oldest",
+            };
+            let label = crate::ui_text::sidebar_sort_label(sort.as_str());
+            items = items.child(
+                div()
+                    .id(selector)
+                    .debug_selector(move || selector.to_string())
+                    .w_full()
+                    .h(px(24.0))
+                    .px_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(if selected {
+                        theme::link_color()
+                    } else {
+                        theme::text_color()
+                    })
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(SharedString::from(if selected { "✓" } else { " " }))
+                    .child(SharedString::from(label))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.set_sidebar_sort(sort, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .id("sidebar-sort-backdrop")
+                .absolute()
+                .inset_0()
+                .child(
+                    div()
+                        .id("sidebar-sort-menu")
+                        .debug_selector(|| "sidebar-sort-menu".to_string())
+                        .absolute()
+                        .left(px(RIBBON_WIDTH + 46.0))
+                        .top(px(30.0))
+                        .w(px(176.0))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_1()
+                        .bg(theme::menu_bg())
+                        .border_1()
+                        .border_color(theme::sidebar_border())
+                        .rounded_md()
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_size(px(10.0))
+                                .text_color(theme::status_bar_text())
+                                .child(SharedString::from(crate::ui_text::sidebar_sort_title())),
+                        )
+                        .child(items)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                        shell.close_sort_menu(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .into_any_element(),
+        )
     }
 
     /// wiki 链接点击：按“路径精确 > 标题（大小写不敏感）> 最短路径”解析并打开。
@@ -2160,7 +3082,7 @@ impl AppShell {
         // 行，新会话会拿过期 head 基准；持闸路径 moreover 握着租约）。ADR 0012 S2a：
         // **网络阶段（Prepare）不冻结切换**——此时还没有闸门、也没有 integrate。
         // 目录折叠不受影响（上面已经提前返回）：它只改内存里的展开状态。
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         if let Some(sync) = &self.dev_sync_sync {
             if sync.blocks_document_switch() {
                 let kind = if sync.is_no_session() {
@@ -2245,6 +3167,11 @@ impl AppShell {
                 shell.pending_search = true;
                 cx.notify();
             }
+            EditorEvent::TemplatePickerRequested => {
+                // 同上：选择器是宿主覆盖层（需要 `&mut Window` 聚焦搜索框）。
+                shell.pending_template_picker = Some(TemplatePickerPurpose::Insert);
+                cx.notify();
+            }
             // 粘贴/拖放导入的结果：只写提示行（正文/引用的成败已在编辑器侧处理完）。
             EditorEvent::ImportReported(report) => shell.on_import_reported(report, cx),
         });
@@ -2293,7 +3220,7 @@ impl AppShell {
         self.refresh_backlinks();
         self.backlinks_open = false;
         // ADR 0012 S3：编辑代数按视图计（新视图从 0 开始），观测基准一起复位。
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         {
             self.dev_sync_auto_edit_seq = 0;
         }
@@ -2302,7 +3229,7 @@ impl AppShell {
         self.refresh_tree();
         self.refresh_wiki_resolution(cx);
         // 切片 6b：活动文档变了（轮换/apply 的前置条件）。
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         self.dev_sync_push_active_document(cx);
         cx.notify();
     }
@@ -2379,7 +3306,7 @@ impl AppShell {
 
     pub fn close_all(&mut self, cx: &mut Context<Self>) {
         // dev-only 同步面板：先请求停止（非阻塞，GUI 不 join）。
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         self.shutdown_dev_sync(cx);
         let Some(active) = self.active.take() else {
             return;
@@ -2400,27 +3327,44 @@ impl AppShell {
     ///
     /// 打开 AppShell 内的同步设置页（测试/程序入口；生产统一入口在 AppRoot 设置页）。
     /// 默认构建没有面板时是 no-op。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dev_sync.is_none() {
             return;
         }
+        self.ensure_notes_plugin_settings(cx);
         self.settings_open = true;
         self.settings_focus.focus(window, cx);
         cx.notify();
     }
 
+    /// 设置页里的「模板」「日记」区（第一方插件）：首次打开设置页时懒创建。
+    ///
+    /// 懒创建的原因：面板各持有若干 IME 输入框实体，主界面不需要它们；设置页关闭后
+    /// 保留实体（下次打开时输入框里的草稿仍在），不重建编辑器、不写正文。
+    #[cfg(feature = "sync-ui")]
+    fn ensure_notes_plugin_settings(&mut self, cx: &mut Context<Self>) {
+        if self.templates_settings.is_none() {
+            self.templates_settings = Some(cx.new(crate::templates::TemplatesSettingsPanel::new));
+        }
+        if self.daily_notes_settings.is_none() {
+            self.daily_notes_settings =
+                Some(cx.new(crate::daily_notes::DailyNotesSettingsPanel::new));
+        }
+    }
+
     /// 测试/无窗口入口：只置位，不抢焦点。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn open_settings_headless(&mut self, cx: &mut Context<Self>) {
         if self.dev_sync.is_some() {
+            self.ensure_notes_plugin_settings(cx);
             self.settings_open = true;
             cx.notify();
         }
     }
 
     /// 关闭同步设置页。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
         if self.settings_open {
             self.settings_open = false;
@@ -2429,7 +3373,7 @@ impl AppShell {
     }
 
     /// 设置页是否打开（测试/诊断用）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     #[must_use]
     pub const fn settings_open(&self) -> bool {
         self.settings_open
@@ -2452,13 +3396,13 @@ impl AppShell {
 
     /// 只做投屏：状态由 [`crate::dev_sync::AutoSync`] 决定（`sync-status` / `sync-status-error`
     /// 两个固定 selector）。每轮成功不弹 toast、不抢焦点；"需要处理"才多一行。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     fn dev_sync_status_projection(&self) -> Option<(String, Option<String>)> {
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         let projection: Option<(String, Option<String>)> = self
             .dev_sync_status_line()
             .map(|line| (line, self.dev_sync_status_error_line()));
-        #[cfg(not(feature = "dev-sync"))]
+        #[cfg(not(feature = "sync-ui"))]
         let projection: Option<(String, Option<String>)> = None;
         projection
     }
@@ -2598,6 +3542,74 @@ impl AppShell {
         self.open_entry(tree_index, cx);
     }
 
+    /// 最左侧图标栏（Obsidian ribbon 风格）：窄条、纯图标、hover 高亮。
+    ///
+    /// 只放**快捷操作**：今日日记 / 从模板新建 / 图谱 / 搜索。
+    /// **设置不在 ribbon 里**：它仍然是侧栏底部的「⚙ 设置」（`AppRoot` 的
+    /// `app-root-settings` / `AppShell` 状态栏同步入口），避免两套设置入口。
+    ///
+    /// 旧文本按钮的 selector（`sidebar-daily-note` / `sidebar-new-from-template` /
+    /// `sidebar-graph`）作为**兼容别名**挂在外层包装上：既有 headless 测试点的是
+    /// 同一个动作、同一个位置，视觉上只有 ribbon 一个按钮。
+    fn render_ribbon(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // 第一方插件开关：关闭时隐藏对应图标（设置页仍可开启；不写正文/不同步）。
+        let templates_enabled = templates::preferences().enabled;
+        let daily_notes_enabled = daily_notes::preferences().enabled;
+        let mut ribbon = div()
+            .id("ribbon")
+            .debug_selector(|| "ribbon".to_string())
+            .w(px(RIBBON_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .py_2()
+            .bg(theme::sidebar_bg())
+            .border_r(px(1.0))
+            .border_color(theme::sidebar_border());
+        if daily_notes_enabled {
+            ribbon = ribbon.child(ribbon_button(
+                Some("sidebar-daily-note"),
+                "ribbon-daily",
+                icons::CALENDAR,
+                crate::ui_text::sidebar_ribbon_daily(),
+                cx,
+                |shell, _window, cx| shell.open_daily_note(cx),
+            ));
+        }
+        if templates_enabled {
+            ribbon = ribbon.child(ribbon_button(
+                Some("sidebar-new-from-template"),
+                "ribbon-template",
+                icons::TEMPLATE,
+                crate::ui_text::sidebar_ribbon_template(),
+                cx,
+                |shell, window, cx| {
+                    shell.open_template_picker(TemplatePickerPurpose::NewNote, window, cx);
+                },
+            ));
+        }
+        ribbon
+            .child(ribbon_button(
+                Some("sidebar-graph"),
+                "ribbon-graph",
+                icons::GRAPH,
+                crate::ui_text::sidebar_ribbon_graph(),
+                cx,
+                |shell, window, cx| shell.open_graph(window, cx),
+            ))
+            .child(ribbon_button(
+                None,
+                "ribbon-search",
+                icons::SEARCH,
+                crate::ui_text::sidebar_ribbon_search(),
+                cx,
+                |shell, window, cx| shell.open_search(window, cx),
+            ))
+    }
+
     /// 侧栏面板。
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let note_count = self.tree.iter().filter(|entry| entry.is_note()).count();
@@ -2735,7 +3747,45 @@ impl AppShell {
                     .text_size(px(12.0))
                     .text_color(theme::status_bar_text())
                     .child(SharedString::from(crate::ui_text::sidebar_notes()))
-                    .child(SharedString::from(format!("{note_count}"))),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(SharedString::from(format!("{note_count}")))
+                            // 排序入口：图标 + 文字（文字让"这里能排序"可发现；图标表明是排序）。
+                            .child(
+                                div()
+                                    .id("sidebar-sort")
+                                    .debug_selector(|| "sidebar-sort".to_string())
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1()
+                                    .h(px(20.0))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_color(theme::status_bar_text())
+                                    .hover(|style| {
+                                        style
+                                            .bg(theme::sidebar_selected_bg())
+                                            .text_color(theme::text_color())
+                                    })
+                                    .child(icon(icons::SORT, 12.0, theme::status_bar_text()))
+                                    .child(SharedString::from(crate::ui_text::sidebar_sort_title()))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            |shell, _event: &MouseDownEvent, _window, cx| {
+                                                shell.toggle_sort_menu(cx);
+                                                cx.stop_propagation();
+                                            },
+                                        ),
+                                    ),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -2858,35 +3908,6 @@ impl AppShell {
                         .child(SharedString::from(notice)),
                 )
             })
-            // 图谱入口：侧栏底部（「⚙ 设置」正上方，见 `GRAPH_ENTRY_BOTTOM_GAP`）。
-            // 用 `on_mouse_down` 而不是 up：与侧栏其它动作行一致，真实右键/快速点击
-            // 都不会因为"上一次 mouse move 的命中链"不满足而被静默跳过。
-            .child(
-                div().w_full().px_2().pb(px(GRAPH_ENTRY_BOTTOM_GAP)).child(
-                    div()
-                        .id("sidebar-graph")
-                        // 测试元数据（只读断言用）：侧栏图谱入口。
-                        .debug_selector(|| "sidebar-graph".to_string())
-                        .h(px(22.0))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .border(px(1.0))
-                        .border_color(theme::sidebar_border())
-                        .text_size(px(12.0))
-                        .text_color(theme::text_color())
-                        .cursor_pointer()
-                        .child(SharedString::from(crate::ui_text::sidebar_graph()))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
-                                shell.open_graph(window, cx);
-                            }),
-                        ),
-                ),
-            )
     }
 
     /// 右键菜单（根层绝对定位）：透明遮罩负责"点外面关闭"，面板负责菜单项。
@@ -3775,7 +4796,7 @@ impl AppShell {
                     ),
             );
         }
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         {
             // dev-sync 未启用时整块不存在。
             right = right.when_some(self.dev_sync_status_projection(), |this, (line, error)| {
@@ -3830,8 +4851,8 @@ impl AppShell {
 
     /// 设置页里的「管理」区（ADR 0016 S4d1c）。
     ///
-    /// 默认收起；展开时挂载面板并触发一次刷新。没有管理面板时整块不渲染（默认构建/
-    /// 注入 fake service 且没有真实库路径的测试）。
+    /// 默认收起；展开时挂载面板并触发一次刷新。没有管理面板时整块不渲染（产品
+    /// `sync-ui` 构建/注入 fake service 且没有真实库路径的测试）。
     #[cfg(feature = "dev-sync")]
     fn render_management_section(&self, cx: &mut Context<Self>) -> AnyElement {
         if !crate::dev_sync::experimental_v2_ui() {
@@ -3888,8 +4909,22 @@ impl AppShell {
             .into_any_element()
     }
 
+    /// V2 管理区只存在于 `dev-sync` 构建；`sync-ui` 产品构建返回 `None`。
+    #[cfg(feature = "sync-ui")]
+    fn management_section_if_enabled(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        #[cfg(feature = "dev-sync")]
+        {
+            Some(self.render_management_section(cx))
+        }
+        #[cfg(not(feature = "dev-sync"))]
+        {
+            let _ = cx;
+            None
+        }
+    }
+
     /// 同步设置页：遮罩 + 居中卡片；面板实体只在打开时挂载。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     fn render_settings(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.settings_open {
             return None;
@@ -3955,7 +4990,9 @@ impl AppShell {
                     ),
             )
             .child(div().p_2().child(panel))
-            .child(self.render_management_section(cx))
+            .when_some(self.management_section_if_enabled(cx), |this, section| {
+                this.child(section)
+            })
             // ADR 0021 P2：外观（浅色/深色/跟随系统）。放在最下面，避免把既有
             // 同步/设备/轮换按钮顶出设置页可视区（headless 真机都按可见 bounds 点击）。
             .child(
@@ -3965,7 +5002,14 @@ impl AppShell {
                     .border_t_1()
                     .border_color(theme::sidebar_border())
                     .child(crate::language_settings::appearance_and_language_row()),
-            );
+            )
+            // 第一方插件设置：模板 / 日记（本机 JSON，不同步、不写正文）。
+            .when_some(self.templates_settings.clone(), |this, panel| {
+                this.child(panel)
+            })
+            .when_some(self.daily_notes_settings.clone(), |this, panel| {
+                this.child(panel)
+            });
         Some(
             div()
                 .id("settings-overlay")
@@ -4037,7 +5081,7 @@ impl AppShell {
 /// - `begin` → [`GateError::Storage`]（没有会话就没有闸门，明确失败而不是静默 no-op）；
 /// - `poll` → [`GateState::Stale`]（"票据从未登记"的既有语义）；
 /// - `adopt` → [`AdoptError::Storage`]；`end`/`cancel` → [`GateError::Storage`]。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 impl AppShell {
     /// 当前活动文档的编辑器视图（`None` = 没有打开的笔记）。
     ///
@@ -4203,19 +5247,22 @@ impl AppShell {
         self.dev_sync.clone()
     }
 
-    /// V2 管理面板（ADR 0016 S4d1c；`None` = 默认构建或没有真实库路径）。
+    /// V2 管理面板（ADR 0016 S4d1c；`None` = 产品构建或没有真实库路径）。
+    #[cfg(feature = "dev-sync")]
     #[must_use]
     pub fn management_panel(&self) -> Option<Entity<crate::dev_sync::ManagementPanel>> {
         self.management.clone()
     }
 
     /// 设置页里的「管理」区是否展开。
+    #[cfg(feature = "dev-sync")]
     #[must_use]
     pub const fn management_open(&self) -> bool {
         self.management_open
     }
 
     /// 展开/收起设置页里的「管理」区；展开时触发一次刷新（不重复触发）。
+    #[cfg(feature = "dev-sync")]
     pub fn toggle_management(&mut self, cx: &mut Context<Self>) {
         if self.management.is_none() {
             return;
@@ -4322,7 +5369,7 @@ impl AppShell {
     /// 读取本实例 durable `sync.control_pin`（设置页安全指纹的唯一来源；**只读**）。
     ///
     /// `Ok(None)` = 从未建立（未建立信任），`Err` = 损坏/绑定不符（**不是**没有 pin）。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     pub fn dev_sync_control_pin(
         &self,
         vault_id: [u8; 16],
@@ -7111,7 +8158,7 @@ fn asset_hash_bytes(hash: &str) -> Option<[u8; 32]> {
 ///
 /// 两条路径共用：持闸路径填 `doc_id`/`changes`/`dispatched_under_gate`；无会话路径
 /// `no_session = true`、`doc_id = None`、`changes = 0`（没有视图可交付）。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 #[derive(Debug, Default)]
 struct ReportParts {
     /// 本次持闸任务的种类（同步 / 发布基线；无会话同步恒为 `SyncOnce`）。
@@ -7136,7 +8183,7 @@ struct ReportParts {
     rotation: Option<crate::dev_sync::RotationFacts>,
 }
 
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 impl ReportParts {
     /// 派生面板 notice 并产出最终报告。
     ///
@@ -7216,7 +8263,7 @@ impl ReportParts {
 }
 
 /// 轮换成功的面板文案（epoch / checkpoint 短 id / 恢复码是否补发）。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 fn rotation_notice(facts: Option<&crate::dev_sync::RotationFacts>) -> String {
     let Some(facts) = facts else {
         return "轮换完成（缺少公开事实）".to_owned();
@@ -7244,7 +8291,7 @@ fn rotation_notice(facts: Option<&crate::dev_sync::RotationFacts>) -> String {
 }
 
 /// apply 成功的面板文案（epoch / checkpoint 短 id；幂等 AlreadyCurrent 单独措辞）。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 fn apply_epoch_notice(facts: Option<&crate::dev_sync::RotationFacts>) -> String {
     let Some(facts) = facts else {
         return "已应用新 epoch（缺少公开事实）".to_owned();
@@ -7266,7 +8313,7 @@ fn apply_epoch_notice(facts: Option<&crate::dev_sync::RotationFacts>) -> String 
 }
 
 /// 持闸同步的终态（worker 回执；`Ok` 带 worker 摘要，`Failed` 带明确原因）。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 #[derive(Debug, Clone)]
 enum SyncOnceFinish {
     /// worker 正常完成。
@@ -7299,7 +8346,7 @@ impl Render for AppShell {
             self.activation_subscription =
                 Some(cx.observe_window_activation(window, |shell, window, cx| {
                     // ADR 0012 S3：失焦降到 60s；重新聚焦时若有 durable 待办合并一次探测。
-                    #[cfg(feature = "dev-sync")]
+                    #[cfg(feature = "sync-ui")]
                     shell.dev_sync_auto_on_activation(window.is_window_active(), cx);
                     if window.is_window_active() || shell.menu.is_none() {
                         return;
@@ -7337,7 +8384,21 @@ impl Render for AppShell {
             self.pending_search = false;
             self.open_search(window, cx);
         }
+        // 右键菜单「插入 → 模板…」：编辑器只发事件，覆盖层由宿主创建（需要窗口聚焦）。
+        if let Some(purpose) = self.pending_template_picker.take() {
+            self.open_template_picker(purpose, window, cx);
+        }
+        // 选择器关闭后把焦点还给编辑器（下一帧，等实体真正卸下）。
+        if std::mem::take(&mut self.pending_focus_editor) {
+            if let Some(active) = &self.active {
+                let view = active.view.clone();
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |_view, cx| cx.focus_self(window));
+                });
+            }
+        }
 
+        let ribbon = self.render_ribbon(cx);
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main(cx);
         let content = div()
@@ -7345,6 +8406,7 @@ impl Render for AppShell {
             .flex_row()
             .flex_1()
             .min_h(px(0.0))
+            .child(ribbon)
             .child(sidebar)
             .child(main);
         let status_bar = self.render_status_bar(cx);
@@ -7352,9 +8414,13 @@ impl Render for AppShell {
         let search = self.search.clone();
         // 菜单渲染在**根层**：侧栏是 `overflow_y_scroll`，放里面会被裁掉。
         let popup = self.render_menu(window, cx);
+        // 模板选择器：覆盖层，盖在编辑器上；没有打开时是 `None`（零布局）。
+        let template_picker = self.template_picker.clone();
         // 图谱覆盖层：全屏、盖在编辑器上（不挤压编辑器，也不卸载它）。
         let graph = self.render_graph(window, cx);
-        #[cfg(feature = "dev-sync")]
+        // 侧栏排序菜单：根层绝对定位（侧栏是 `overflow_y_scroll`，放里面会被裁掉）。
+        let sort_menu = self.render_sort_menu(cx);
+        #[cfg(feature = "sync-ui")]
         let settings = self.render_settings(cx);
         let root = div()
             .relative()
@@ -7392,11 +8458,14 @@ impl Render for AppShell {
             )
             .child(content)
             .child(status_bar)
+            .when_some(sort_menu, |this, menu| this.child(menu))
             .when_some(popup, |this, popup| this.child(popup))
             .when_some(search, |this, search| this.child(search));
         // 同步设置页：只在打开时挂载面板（默认主界面不显示覆盖层）。
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         let root = root.when_some(settings, |this, settings| this.child(settings));
+        // 模板选择器在设置页之上、图谱之下（二者不会同时打开）。
+        let root = root.when_some(template_picker, |this, picker| this.child(picker));
         // 图谱在最上层：覆盖层打开时抢焦点，搜索/菜单/设置不可能同时被操作。
         root.when_some(graph, |this, graph| this.child(graph))
     }
@@ -7611,6 +8680,28 @@ fn unique_title(base: &str, tree: &[TreeEntry]) -> String {
     base.to_owned()
 }
 
+/// 根级笔记的去重标题（`X`、`X 2`、`X 3`……）。
+///
+/// 与 [`unique_title`] 的区别：只看**根级笔记**。模板笔记通常与目标标题同名（且在
+/// 模板文件夹里），全局去重会让每次「从模板新建」都变成「X 2」。
+#[must_use]
+fn unique_root_title(base: &str, tree: &[TreeEntry]) -> String {
+    let exists = |candidate: &str| {
+        tree.iter()
+            .any(|entry| entry.is_note() && entry.parent_id.is_none() && entry.title == candidate)
+    };
+    if !exists(base) {
+        return base.to_owned();
+    }
+    for suffix in 2..1000 {
+        let candidate = format!("{base} {suffix}");
+        if !exists(&candidate) {
+            return candidate;
+        }
+    }
+    base.to_owned()
+}
+
 /// 当前时间戳（毫秒，i64）：结构文档的 `created_at` / `edited_at` 用。
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -7673,6 +8764,8 @@ mod tests {
             },
             sibling_rank: 0,
             depth,
+            created_at: None,
+            updated_at: None,
         }
     }
 

@@ -8,8 +8,11 @@
 > **Mermaid M1 渲染底座已完成（2026-11-17）**：`merman =0.10.0` + 纯
 > `render_svg` + 资源上限/panic 兜底/SVG 校验 + 11 个单测。
 > **M2（fenced mermaid Object 预览/源码切换/后台缓存/工具条）也已完成（2026-11-17）**：
-> `FencedMermaidBlock` + `ObjectKind::Mermaid` + `SvgRenderer` 光栅化 + LRU 缓存；
-> 暗色主题/导出/子进程隔离仍是 M3。详见 ADR 0019 §15/§18 与本文件 §2。
+> `FencedMermaidBlock` + `ObjectKind::Mermaid` + `SvgRenderer` 光栅化 + LRU 缓存。
+> **M3a（暗色 SVG + CJK 字体回退）已完成（2026-11-18）**：`render_svg_for_preview`
+> 接收 `ThemeId`，浅色 `EditorLight` / 深色 `EditorDark`，worker 按 key 的主题渲染，
+> SVG 字体栈补 `Microsoft YaHei` / `Noto Sans CJK SC`；**导出 / 子进程隔离仍待**
+> （M3 后续）。详见 ADR 0019 §15/§18（§18.8 = M3a）与本文件 §2。
 
 ## 1. 外部链接打开（含 Zotero）
 
@@ -108,11 +111,23 @@
   时显示「等待光标移出后渲染…」，不请求；缓存不受影响）+ **反引号补全**（成对/跳过/
   行首三反引号围栏，一次撤销）。**SVG 文字拖选/复制文字明确不做**（光栅图无 DOM 文本，
   用户决定先不做）。详见 ADR 0019 §18.7。
-- 限制：缓存是 per-view（切换笔记会重新渲染）；系统字体/暗色/CJK/导出/子进程隔离是 M3。
+- 限制：缓存是 per-view（切换笔记会重新渲染）；暗色/CJK 已在 M3a 完成；
+  导出/子进程隔离仍在 M3 后续。
 
-### M3（未做）
+### M3a（已完成，2026-11-18）
 
-- 暗色主题、CJK 字体、SVG 导出/HTML/PDF 导出、缓存失效；
+- **暗色主题**：`render_svg_for_preview(source, ThemeId)`；浅色 = merman
+  `ThemePreset::EditorLight`，深色 = `EditorDark`，经
+  `RenderRequest::with_theme` 绑定整条管线；浅/深色绘制路径、对比度、缓存失效
+  均有单测/headless 断言。
+- **CJK 字体回退**：编译预设前把 `Microsoft YaHei` / `Noto Sans CJK SC` 插入
+  `font-family` 栈（通用族保持最后），不引入字体文件/新依赖；真实中文标签在
+  headless 深色 AppShell 下占位 → Ready，真实 `SvgRenderer` 光栅化有文字墨迹。
+- 限制：Windows 真机字体回退观感仍需人工确认；缓存仍 per-view。
+
+### M3（后续，仍待做）
+
+- SVG/HTML/PDF 导出、缓存失效策略；
 - 独立 helper 子进程 + 超时/资源限制（比 `catch_unwind` 更稳的隔离）；
 - 黄金图/样本回归（Merman 对齐 Mermaid 12.3 ≠ 逐像素一致）。
 
@@ -125,7 +140,7 @@
   成熟度/对齐度不如 Merman；未采用。
 - 风险（仍成立）：不可信输入可能 panic/超时/OOM，M1 已做输入/输出上限 +
   `catch_unwind`，M2 用 merman `ResvgSafe` 清理 rasterization hazard，仍保留
-  “源码回退”；暗色主题/CJK/导出/子进程隔离留给 M3。
+  “源码回退”；暗色主题/CJK 已在 M3a 完成，导出/子进程隔离留给 M3 后续。
 
 
 ## 优先级
@@ -135,3 +150,6 @@
 
 **2026-11-17 更新**：外部链接基础打开与 Mermaid M1/M2 均已落地；
 下一步是 Mermaid M3（暗色/CJK/导出/子进程隔离）与外部链接的 Ctrl+单击/右键/Zotero。
+
+**2026-11-18 更新**：Mermaid M3a（暗色主题 + CJK 字体回退）已完成；
+**导出与子进程隔离仍待**，外部链接的 Ctrl+单击/右键/Zotero 已在 2026-11-17 完成。

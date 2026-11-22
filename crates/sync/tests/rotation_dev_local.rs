@@ -22,11 +22,13 @@ use std::path::{Path, PathBuf};
 
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
-    append_updates_with_sync_intents, load_body_doc, local_sync_intent, outbox_parts, outbox_row,
+    append_updates_with_sync_intents, asset_bytes, asset_content_hash, insert_asset,
+    link_asset_ref, list_tree, load_body_doc, local_sync_intent, outbox_parts, outbox_row,
     outbox_rows, repack_required, sync_cursor_state, BodyDoc, HeadState, StructureWriter,
-    SyncContext, SyncOutboxRow, SyncOutboxState, UpdateRecord, Vault,
+    SyncContext, SyncOutboxRow, SyncOutboxState, UpdateRecord, Value, Vault,
 };
 use menghunote_sync::api_version::RelayApiVersion;
+use menghunote_sync::checkpoint::{asset_object_id, CheckpointWriter, StorageAssets};
 use menghunote_sync::dev_local::{
     ApplyOutcome, CreatedVault, DevLocal, JoinedVault, RotationOutcome,
 };
@@ -177,6 +179,57 @@ fn outbox_messages(vault: &Vault) -> Vec<SyncOutboxRow> {
     );
     rows.extend(outbox_rows(vault, SyncOutboxState::Sent, 100).expect("读 sent outbox 失败"));
     rows
+}
+
+/// `list_tree` 里某个正文文档对应的 note_id（`asset_refs.note_id` 用的键）。
+fn note_id_for_body(vault: &Vault, doc_id: &str) -> String {
+    list_tree(vault)
+        .expect("读结构树失败")
+        .into_iter()
+        .find(|entry| entry.body_doc_id.as_deref() == Some(doc_id))
+        .and_then(|entry| entry.note_id)
+        .expect("结构树必须有该正文的 note 节点")
+}
+
+/// 在正文里插入一份真实资产（等价于 app 的 attachment-insert 写库部分）。
+fn insert_referenced_asset(vault: &Vault, note_id: &str, data: &[u8]) -> [u8; 32] {
+    let hash = asset_content_hash(data);
+    insert_asset(vault, &hash, data.len() as u64, Some("text/plain"), data).expect("insert_asset");
+    link_asset_ref(vault, note_id, &hash, 0, 1).expect("link_asset_ref");
+    hash
+}
+
+/// 清空本机 "资产已上传" durable 标记：模拟另一台设备（或标记丢失）在轮换后发布
+/// 普通 checkpoint —— 它不知道 relay 上已有同 object_id 的确定性密文，会真正重传。
+fn clear_asset_markers(vault: &Vault) {
+    const PREFIX: &str = "sync.asset_uploaded.";
+    vault
+        .exec(
+            "DELETE FROM meta WHERE substr(key,1,?1)=?2",
+            &[
+                Value::Integer(PREFIX.len() as i64),
+                Value::Text(PREFIX.to_owned()),
+            ],
+        )
+        .expect("清 asset marker");
+}
+
+/// 本机 "资产已上传" durable 标记数量。
+fn asset_marker_count(vault: &Vault) -> i64 {
+    const PREFIX: &str = "sync.asset_uploaded.";
+    let rows = vault
+        .query(
+            "SELECT COUNT(*) FROM meta WHERE substr(key,1,?1)=?2",
+            &[
+                Value::Integer(PREFIX.len() as i64),
+                Value::Text(PREFIX.to_owned()),
+            ],
+        )
+        .expect("读 asset marker");
+    match rows.first().and_then(|row| row.first()) {
+        Some(Value::Integer(count)) => *count,
+        other => panic!("COUNT(*) 必须是整数，实际 {other:?}"),
+    }
 }
 
 fn test_client(
@@ -1156,5 +1209,140 @@ fn recovery_code_decides_whether_new_devices_can_join_after_rotation() {
         !d_path.exists(),
         "Join 失败不得留下半初始化库：{}",
         d_path.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// task-121：轮换期写入的 ASSET 可被普通 checkpoint 的 reservation 幂等复用
+// ---------------------------------------------------------------------------
+
+/// 轮换把资产重加密进新 epoch 时，ASSET 对象挂在 **rotation reservation** 上；
+/// 激活之后普通 checkpoint 用 **checkpoint reservation** 重传同一 `object_id`/同字节，
+/// 必须幂等成功（200 duplicate），不再 `409 ID_CONFLICT`；新 checkpoint 仍引用同一对象。
+#[test]
+fn rotated_asset_is_reused_by_an_ordinary_checkpoint() {
+    let mut fixture = establish("asset-rotation-reuse");
+    let relay = fixture.relay.base_url().to_owned();
+    let note_id = note_id_for_body(&fixture.a.vault, &fixture.note.doc_id);
+    let data = b"rotation reencrypted attachment bytes".to_vec();
+    let hash = insert_referenced_asset(&fixture.a.vault, &note_id, &data);
+
+    // 1) 轮换前普通同步：资产以普通预算上传并 complete，从而进入 freeze 集合。
+    let before = DevLocal::sync_once(&relay, &fixture.a.vault, &fixture.a.identity)
+        .expect("A 轮换前同步失败");
+    assert_eq!(before.assets.uploaded, 1, "轮换前资产必须已上传");
+    assert_eq!(before.assets.failed, 0);
+    assert!(
+        asset_marker_count(&fixture.a.vault) >= 1,
+        "普通同步成功后必须落 durable 已上传标记"
+    );
+    // ASSET 事件不写 inbox，只推进 received；再来一条正文 update 并同步，才能让
+    // integrated 连续前缀越过它（rotate 的 integrate_to_S 要求 integrated 到 S）。
+    append_body(
+        &fixture.a.vault,
+        &fixture.note.doc_id,
+        fixture.a.identity.loro_peer_id(),
+        1,
+        "A 轮换前的普通同步行\n",
+    );
+    DevLocal::sync_once(&relay, &fixture.a.vault, &fixture.a.identity)
+        .expect("A 资产后的正文同步失败");
+
+    // 2) 轮换：旧根解密 → 新根重加密 → 候选基线用 rotation reservation 落库。
+    let rotation = rotate_empty_revoke(&mut fixture);
+    assert_eq!(rotation.to_epoch, 2);
+
+    // 3) B apply：拿到新 epoch 的资产字节；B 上没有 "已上传" 标记。
+    let applied = apply_b(&mut fixture);
+    assert!(matches!(applied, ApplyOutcome::Applied { to_epoch: 2, .. }));
+    assert_eq!(
+        asset_marker_count(&fixture.b.vault),
+        0,
+        "B 通过基线 apply 拿到字节，但不应有 sync.asset_uploaded 标记"
+    );
+    assert_eq!(
+        asset_bytes(&fixture.b.vault, hash).expect("读 B 资产"),
+        Some(data.clone()),
+        "B 必须通过轮换基线拿到新 epoch 的资产字节"
+    );
+
+    let new_root = RootSecretV1::new(
+        fixture.a.vault_id,
+        2,
+        fixture.a.identity.current_root.clone(),
+    );
+    let object_id = asset_object_id(&new_root, &hash, data.len() as u64, "text/plain")
+        .expect("asset object id");
+
+    // 4) 清掉 A 的 durable 标记，强制普通 checkpoint 真正重传该资产的确定性密文
+    //    （等价于另一台设备/标记丢失的客户端）。
+    clear_asset_markers(&fixture.a.vault);
+    assert_eq!(asset_marker_count(&fixture.a.vault), 0);
+
+    let published = {
+        let mut client = test_client(
+            &relay,
+            &fixture.a.vault_id,
+            fixture.a.identity.device_id,
+            &fixture.a.identity.ed25519_seed,
+            fixture.a.identity.pinned_manager,
+        );
+        let mut writer = CheckpointWriter::new(
+            &fixture.a.vault,
+            &mut client,
+            fixture.a.vault_id,
+            fixture.a.identity.device_id,
+            DeviceSigningKey::from_seed(fixture.a.identity.ed25519_seed.clone()),
+            new_root.clone(),
+            fixture.a.identity.loro_peer_id(),
+        );
+        writer
+            .create_checkpoint(&StorageAssets)
+            .expect("轮换后普通 checkpoint 重传同一资产不得 409")
+    };
+    assert!(published.validated);
+    assert_eq!(published.epoch, 2);
+    assert_eq!(
+        asset_marker_count(&fixture.a.vault),
+        1,
+        "checkpoint 复用/重传成功后必须重新落 durable 标记"
+    );
+    let asset = published
+        .assets
+        .iter()
+        .find(|asset| asset.real_sha256 == hash)
+        .expect("新 checkpoint 必须引用该资产");
+    assert_eq!(
+        asset.object.object_id, object_id,
+        "新 checkpoint 必须引用轮换期写入的同一个 object_id"
+    );
+
+    // 5) wire 语义直测：另取一份 checkpoint 的维护 reservation，用它对同一
+    //    object_id/同字节再做 PUT —— 必须成功；不同字节仍然冲突。
+    let mut client = test_client(
+        &relay,
+        &fixture.a.vault_id,
+        fixture.a.identity.device_id,
+        &fixture.a.identity.ed25519_seed,
+        fixture.a.identity.pinned_manager,
+    );
+    let lease = client
+        .create_checkpoint(1024 * 1024, None)
+        .expect("申请新的 checkpoint reservation 失败");
+    let part = client
+        .part(&object_id, 0)
+        .expect("读回轮换期写入的资产分片失败");
+    client
+        .put_part_with_reservation(&object_id, 0, &part, Some(&lease.reservation_id))
+        .expect("同字节跨 reservation 重放必须成功（不得 409 ID_CONFLICT）");
+    let mut tampered = part.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xFF;
+    let error = client
+        .put_part_with_reservation(&object_id, 0, &tampered, Some(&lease.reservation_id))
+        .expect_err("不同字节必须冲突");
+    assert!(
+        matches!(&error, SyncError::RelayApi { code, .. } if code == "PART_CONFLICT"),
+        "期望 PART_CONFLICT，实际 {error:?}"
     );
 }

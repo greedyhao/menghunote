@@ -70,8 +70,11 @@ sudo apt install libxkbcommon-dev libxkbcommon-x11-dev
 
 | selector | 挂在哪个元素 | 用途 |
 | --- | --- | --- |
+| `ribbon` | 最左侧图标栏容器（宽 44px，在侧栏**左边**） | 存在/宽度/位置 |
+| `ribbon-daily` / `ribbon-template` / `ribbon-graph` / `ribbon-search` | ribbon 的四个快捷操作（今日日记/从模板新建/图谱/搜索） | 拿按钮 bounds 去点击 |
 | `sidebar` | 侧栏容器（`render_sidebar` 根 div） | 侧栏存在/宽度 |
-| `tree-row-<先序下标>` | 每个结构树行（下标 = `list_tree` 的下标，**不是**显示行号） | 拿行 bounds 去点击 |
+| `sidebar-sort` / `sidebar-sort-menu` / `sidebar-sort-<key>` | 排序按钮 / 弹出菜单 / 6 个排序项（`name_asc` 等） | 切排序、断言菜单开合 |
+| `tree-row-<先序下标>` | 每个结构树行（下标 = **`list_tree_sorted` 的展示顺序**：目录优先 + 当前排序键，**不是**显示行号，也不是 `list_tree` 的 rank 顺序） | 拿行 bounds 去点击 |
 | `tree-row-<先序下标>-selected` | 该行的标题子 div（`selected` = 当前打开的笔记） | 断言"切到了哪一篇" |
 | `editor-pane` | 右侧编辑器面板包装 div（空态也有） | 编辑区存在 |
 | `editor-current-doc` | `EditorView` 渲染根（一帧只有一个） | 有打开中的文档 |
@@ -194,13 +197,28 @@ happens-before，之后 `poll()` 必然拿到 worker 已发出的全部事件）
 | 测试 | 断言 |
 | --- | --- |
 | `app_shell_paints_headless` | 空临时库播种成功（`seeded == true`）；`add_window_view` 后恰好 1 个窗口；`app-shell-host` 的 `debug_bounds` 为 `Some` 且宽高 > 0（实测 1920×1080） |
-| `dev_vault_tree_and_first_note_are_loaded` | `list_tree` 恰好 3 项且标题/顺序/深度与播种常量一致（根级笔记 / 示例目录 / depth=1 的第二篇）；根级笔记的 `body_doc_id` 经 `load_body_doc` 重放后正文非空且包含演示标题（5602 scalars）；同一 `ShellHost` 再建窗口画一帧不 panic、bounds 非零 |
-| `click_tree_row_switches_note` | 启动态 `tree-row-0-selected` 有值、`tree-row-2-selected` 无值；`simulate_click` 点 `tree-row-2` 中心（demo 树：0 笔记 / 1 目录 / 2 目录内笔记）后 `tree-row-2-selected` 出现、`tree-row-0-selected` 消失、`editor-current-doc` 仍在；存储侧 `load_body_doc` 确认第二篇正文包含 `DEMO_SECOND_TITLE` |
+| `dev_vault_tree_and_first_note_are_loaded` | `list_tree` 恰好 3 项且 rank 顺序/深度与播种常量一致（根级笔记 / 示例目录 / depth=1 的第二篇）；根级笔记的 `body_doc_id` 经 `load_body_doc` 重放后正文非空且包含演示标题（5602 scalars）；同一 `ShellHost` 再建窗口画一帧不 panic、bounds 非零 |
+| `click_tree_row_switches_note` | 启动态 `tree-row-1-selected` 有值（**侧栏展示顺序**：0 目录 / 1 目录内笔记 / 2 根级笔记；启动打开排序后的第一**笔记**）、`tree-row-2-selected` 无值；`simulate_click` 点 `tree-row-2` 中心（根级演示笔记）后 `tree-row-2-selected` 出现、`tree-row-1-selected` 消失、`editor-current-doc` 仍在；存储侧 `load_body_doc` 确认该篇正文包含 `DEMO_TITLE` |
 | `ctrl_k_opens_search_and_escape_closes` | 启动时 `search-overlay` 为 `None`；`simulate_keystrokes("ctrl-k")`（真实按键 → 编辑器 `on_key_down` → 宿主建浮层）后 `search-overlay` / `search-input` / `search-results` 都有非零 bounds；`simulate_keystrokes("escape")` 后 `search-overlay` 回到 `None`、编辑器仍在。**不断言搜索结果**（后台真实索引） |
-| `right_click_folder_row_opens_menu_and_escape_closes` | 启动时 `context-menu` 为 `None`；`simulate_mouse_down(..., MouseButton::Right, ...)` 打 `tree-row-1`（目录行）后 `context-menu` 出现；`escape` 后回到 `None`（菜单面板自己 `track_focus` 接 `Esc`） |
-| `folder_click_collapses_and_expands_children` | 启动态 `tree-row-2` 有非零 bounds；点 `tree-row-1`（目录）中心后 `tree-row-2` 的 bounds **消失**、目录行仍在、`tree-row-0-selected` 与 `editor-current-doc` 都不变（折叠不切文档）；再点一次后 `tree-row-2` 回来且 bounds 非零。折叠态只存在内存（`AppShell::collapsed`），所以只能靠 bounds 有无来断言 |
-| `context_menu_new_note_item_creates_note` | 右键 `tree-row-1` 后三个菜单项都画出 `menu-item-0/1/2`；点 `menu-item-1`（新建笔记）中心 → 菜单关闭；`list_tree` 从 3 项变 4 项、新节点 `parent_id == 目录 node_id` 且 `depth == 1`；UI 上 `tree-row-3` 出现并带 `-selected`（新建后自动打开），第一篇的 `-selected` 消失 |
+| `right_click_folder_row_opens_menu_and_escape_closes` | 启动时 `context-menu` 为 `None`；`simulate_mouse_down(..., MouseButton::Right, ...)` 打 `tree-row-0`（目录行）后 `context-menu` 出现；`escape` 后回到 `None`（菜单面板自己 `track_focus` 接 `Esc`） |
+| `folder_click_collapses_and_expands_children` | 启动态 `tree-row-1`（目录内笔记）有非零 bounds；点 `tree-row-0`（目录）中心后 `tree-row-1` 的 bounds **消失**、目录行仍在、`editor-current-doc` 不变（折叠不切文档；活动笔记在折叠目录里时它的行被隐藏是预期）；再点一次后 `tree-row-1` 回来且 bounds 非零。折叠态只存在内存（`AppShell::collapsed`），所以只能靠 bounds 有无来断言 |
+| `context_menu_new_note_item_creates_note` | 右键 `tree-row-0`（目录）后三个菜单项都画出 `menu-item-0/1/2`；点 `menu-item-1`（新建笔记）中心 → 菜单关闭；树从 3 项变 4 项、新节点 `parent_id == 目录 node_id` 且 `depth == 1`；侧栏展示顺序下新笔记（`未命名笔记`）排在目录子项第一位 → `tree-row-1` 出现并带 `-selected`（新建后自动打开），旧的第一篇 `-selected` 消失 |
 | `editor_keystroke_inserts_character_and_persists` | 点 `editor-pane` 中心聚焦 → `simulate_keystrokes("a")`（`KeyDown` 不被消费 → gpui 把 `key_char` 交给聚焦元素的 `EntityInputHandler::replace_text_in_range`）→ `AppShell::close_all` 做有界排空（durable flush）→ `load_body_doc` 重放：正文**恰好**多一个 `'a'`（公共前缀/后缀核对，证明是行内插入而非 append），`head_seq` 推进（durable 版本变化） |
+
+## 新增覆盖（2026-11-18：ribbon / 侧栏排序 / 设置页导航）
+
+| 测试文件 | 条数 | 断言 |
+| --- | --- | --- |
+| `headless_sidebar_sort.rs` | 8 | ribbon 在侧栏左侧（宽 `RIBBON_WIDTH`）、无设置按钮、旧 selector 是同一按钮的别名；ribbon 四键复用既有动作；默认目录优先 + A-Z；排序菜单 6 项 + 点空白关闭；六种键重排 + 写盘；重排保持折叠/打开笔记；偏好往返 + 损坏回退；启动读盘 + 损坏回退 |
+| `onboarding_ui.rs`（`--features dev-sync`） | +1 | `settings_nav_switches_sections_and_keeps_old_selectors`：8 个固定分类 + `settings-nav-divider` + 2 个插件分类的顺序断言、默认「外观」、只渲染当前分类、旧 selector 在对应分类仍存在、同步分类直接渲染面板、内容区不超过面板高度、会话内记住上次分类 |
+
+设置页固定 selector：`settings-nav` / `settings-nav-<section>` / `settings-section-<section>`
+（固定 section = `appearance` / `language` / `sync` / `instances` / `relay` / `security` /
+`plugins` / `about`；插件 section = `templates` / `daily_notes`，只在启用时存在）、
+`settings-nav-divider`（固定项后、插件项前的 1px 分界线）、
+`settings-plugin-<id>[-toggle|-state]`（插件总开关页）；`settings-save` / `settings-cancel` /
+`settings-error` / `settings-notice` 固定在底栏（任何分类都可见）。详见
+[`ui-refactor-settings-ribbon-sort.md`](ui-refactor-settings-ribbon-sort.md)。
 
 ## 后续计划
 

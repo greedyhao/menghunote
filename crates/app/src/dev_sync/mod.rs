@@ -1,11 +1,17 @@
-//! dev-only 同步面板 + 串行 worker（ADR 0009 Phase 1 / 切片 1）。
+//! 同步面板 + 串行 worker（ADR 0009 Phase 1 / 切片 1；P1 起产品 `sync-ui` 也编译）。
 //!
-//! ## 只在 feature 下存在
+//! ## feature 边界（P1：同步产品化）
 //!
-//! 整个模块由 `crates/app/Cargo.toml` 的 `dev-sync` feature 门禁（`dep:menghunote-sync`）。
-//! 默认构建里它**不存在**：`lib.rs` 是 `#[cfg(feature = "dev-sync")] pub mod dev_sync;`，
-//! `AppShell` 的结构体字段、渲染分支、`main.rs` 的门禁解析也全部 cfg 掉——默认产物
-//! 零行为变化、不引入 sync 依赖树。
+//! 整个模块由 `crates/app/Cargo.toml` 的 `sync-ui` feature（**默认**）门禁；
+//! `sync` 只提供协议/能力，不带 UI。`sync-ui` 里仍然区分两层：
+//!
+//! - **产品同步 UI**（`panel`/`service`/`gate`/`identity`/`state`/`sync_once`/
+//!   `scheduler`/`autosync`）：产品构建可编译，只允许 `remote_tls`；
+//! - **dev 专用**（`setup`/`cli`/`management`）：只在 `dev-sync` 下编译——`--dev-sync*`
+//!   CLI、`local_dev` 启动生命周期、V2 管理实验入口。
+//!
+//! `--no-default-features`/只开 `sync` 时整个模块不存在，`AppShell` 的结构体字段与
+//! 渲染分支也全部 cfg 掉——纯开发入口 `run_default_window()` 行为不变。
 //!
 //! ## 四块职责（互不越界）
 //!
@@ -62,13 +68,19 @@
 //! 查询/发布路径，完整两实例步骤见 `docs/notes/dev-sync-manual-test.md`。
 
 pub mod autosync;
+/// dev CLI 交付（`--dev-sync-info`/`--dev-sync-publish`）；只在 dev 构建编译。
+#[cfg(feature = "dev-sync")]
 pub mod cli;
 pub mod gate;
 pub mod identity;
+/// V2 管理面板/执行体（ADR 0016）；开发实验，只在 dev 构建编译。
+#[cfg(feature = "dev-sync")]
 pub mod management;
 pub mod panel;
 pub mod scheduler;
 pub mod service;
+/// dev 专用启动生命周期（`--dev-sync-create/join`）；只在 dev 构建编译。
+#[cfg(feature = "dev-sync")]
 pub mod setup;
 pub mod state;
 pub mod sync_once;
@@ -77,9 +89,13 @@ pub use autosync::{
     classify_failure, classify_sync_error, durable_backlog, hhmm_utc, AutoSync, AutoSyncConfig,
     Backlog, FailureClass, OpOrigin, RoundOutcome, SecurityCategory, StatusState, SyncStatus,
 };
+#[cfg(feature = "dev-sync")]
 pub use cli::{create_handoff_block, info_block, inspect, publish_baseline, publish_block};
-pub use gate::{DevSyncConfig, Gate, GateError};
+pub use gate::DevSyncConfig;
+#[cfg(feature = "dev-sync")]
+pub use gate::{Gate, GateError};
 pub use identity::{ensure_instance_vault_ready, DevIdentityStore};
+#[cfg(feature = "dev-sync")]
 pub use management::{
     approval_view, build_snapshot, format_data_rights, format_fingerprint_128,
     format_fingerprint_256, format_scopes, format_unix_utc, key_fingerprint,
@@ -101,6 +117,7 @@ pub use service::{
     DevLocalRunner, OperationClock, ServiceConfig, SyncControl, SyncRunner, SyncService,
     SystemOperationClock, TransportTimeouts, UnimplementedRunner,
 };
+#[cfg(feature = "dev-sync")]
 pub use setup::{CliMode, SetupMode, SetupOutcome, SetupSecrets};
 pub use state::{
     short_device_id, Busy, BusyReason, CloseState, Command, CommandKind, DevSyncState, Event,
@@ -112,10 +129,17 @@ pub use sync_once::{
     SyncOnceTarget, SYNC_PUMP_INTERVAL,
 };
 
+/// Create 写进本机 meta 的实例标签（非 wire，仅本机展示；Join 不导入）。
+///
+/// 放在 `mod.rs`（`sync-ui`）而不是 `setup`（`dev-sync`）里：产品 `onboarding::create`
+/// 也要写同一个标签，不能因为拆 feature 变成两套字面量。
+pub(crate) const INSTANCE_LABEL: &str = "menghunote dev-sync 实例";
+
 /// 实验性 V2 管理 UI 是否展示（默认关闭）。
 ///
 /// 个人用户只需要 V1 的设备列表/邀请/移除；V2 的 cap/双签/审批是高风险多管理员场景，
 /// 不应出现在正常设置页。需要验证 S4d1c 时显式设置 `MENGHUNOTE_EXPERIMENTAL_V2=1`。
+#[cfg(feature = "dev-sync")]
 pub(crate) fn experimental_v2_ui() -> bool {
     std::env::var_os("MENGHUNOTE_EXPERIMENTAL_V2").is_some()
 }

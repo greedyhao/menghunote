@@ -9,6 +9,8 @@
 //!   明文总长 / 密文摘要。写入时机是 relay 已 `Accepted`（或幂等 `Duplicate`）之后，
 //!   因此它表示"本机确实把这份确定性密文交给 relay 并完成了对象提交"。
 //! - relay 探测：分片不存在（NOT_FOUND）与 reservation 冲突（ID_CONFLICT）的语义判定。
+//!   同字节跨 reservation 的重放已由 relay 幂等接受（task-121）；`ID_CONFLICT` 只剩
+//!   "对象只写了一半、缺失片属于别的预算来源"这类失败恢复与旧 relay 兼容路径。
 //!
 //! **为什么用 `meta` 而不是 `assets` 加列**：标记是同步侧的本机事实，存进 `meta`
 //! 不需要提升 `PRAGMA user_version`；v0.4 旧库可直接打开，旧程序也只会忽略这些键
@@ -123,7 +125,9 @@ pub(crate) fn is_not_found(error: &SyncError) -> bool {
     matches!(error, SyncError::RelayApi { code, .. } if code == "NOT_FOUND")
 }
 
-/// relay 是否用 `ID_CONFLICT` 拒绝（同一 object_id 的预算来源/上下文不符）。
+/// relay 是否用 `ID_CONFLICT` 拒绝（补缺失分片时上下文/预算来源不符）。
+///
+/// 同字节重放不再走这里：relay 对逐字节相同的分片与 reservation 无关（task-121）。
 pub(crate) fn is_id_conflict(error: &SyncError) -> bool {
     matches!(error, SyncError::RelayApi { code, .. } if code == "ID_CONFLICT")
 }

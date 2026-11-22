@@ -1,7 +1,9 @@
 # ADR 0020 — i18n 与插件边界（方向提案）
 
 > 状态：**提议**（2026-11-17，用户方向；未冻结实现）。
-> P1 i18n 基础设施 + 首批 UI 文案迁移已实施（2026-11-18，见 §9）；插件 API/加载器仍未开始。
+> P1 i18n 基础设施 + 首批 UI 文案迁移已实施（2026-11-18，见 §9）；
+> P2 第一方模块注册表 + 插件 manifest/host 契约已实施（2026-11-18，见 §10）；
+> **插件加载器/运行时/第三方 UI 仍未开始**，插件 API 未冻结。
 > 关联：ADR 0003（模块边界）、ADR 0006（sync v1）、ADR 0009/0011（同步 UI/初始化）、
 > ADR 0019（Markdown/Object/资产）。
 >
@@ -296,3 +298,196 @@ worker/配置/解析器返回的错误原文、公开 id、fingerprint 值、URL
 - 静态 catalog 每次 `t` 返回 `String`（多数固定文案每帧一次小分配）；对话框/
   长列表全量迁移前若出现性能问题，再评估 `Cow<'static, str>`/预编译表。
 - 未迁移文案在英文界面仍显示中文（见 §9.5），这是分页面推进的预期中间态。
+
+
+---
+
+## 10. 实施记录（P2，2026-11-18）
+
+> 本节记录 **第一方模块化 + 插件 manifest/host 契约** 的最小切片。
+> **不加载第三方运行时**：没有安装/加载/卸载、命令执行、权限授权 UI、
+> WASM/独立进程选择；§7/§8 的其余开放项仍然有效。
+
+### 10.1 切片范围与依赖边界
+
+- 新增纯 crate `crates/plugin-api`（Cargo 包名 `menghunote-plugin-api`）：
+  运行时只依赖 `serde` 与纯 crate `menghunote-i18n`；`serde_json` 只在
+  `[dev-dependencies]`（JSON 契约测试），不在运行时依赖里。
+- 不依赖 GPUI/storage/sync/relay/editor；不读磁盘、不读环境变量、不做 IO。
+- `crates/app/src/modules.rs` 新增只读第一方模块注册表。`app` 本切片**没有**
+  依赖 `plugin-api`：注册表只投影 Cargo feature 事实，不消费 manifest。
+  依赖方向仍然只允许 `app → plugin-api`，反向禁止。
+- 未改 sync/relay/storage/schema/wire/主题值；未新增 Cargo feature 裁剪。
+  默认构建与 `dev-sync` 构建都必须全绿（见 §10.7）。
+
+### 10.2 id 与版本方案
+
+| 类型 | 规则 | 失败表现 |
+| --- | --- | --- |
+| `PluginId` | ASCII 小写字母/数字/`.`/`-`；1–64 字节；非空；首尾不能是分隔符；本切片**不**额外禁止连续分隔符 | `PluginIdError`（空/超长/非法字符/首分隔/尾分隔）；`validate` 汇总为 `InvalidPluginId` |
+| `PluginVersion` | `major.minor.patch` 三段 `u32`；只允许 ASCII 数字；无前导零；不支持预发布/构建元数据 | `PluginVersionError`；JSON 反序列化直接失败 |
+| `ApiVersion` | 单个 `u16`；host 支持集合**精确**为 `[1]` | `api_version=2` → `UnsupportedApiVersion` |
+
+选型理由：插件版本是给人看的语义化版本，三段足够表达破坏性变更/特性/修复，
+且不必引入 `semver` crate；host API 用**代**（generation）而不是区间，先在
+插件 API 冻结前把“当前只支持 1”写成可测试事实。JSON 里 `version` 是字符串
+`"1.2.3"`，`api_version` 是整数 `1`。
+
+### 10.3 Manifest 字段与校验
+
+`PluginManifest` 是纯数据；完整 JSON 形状见
+`crates/plugin-api/src/lib.rs` 的 crate 文档。字段表：
+
+| 字段 | JSON 类型 | 必需 | 默认 | 校验/说明 |
+| --- | --- | --- | --- | --- |
+| `id` | string | 是 | — | `PluginId` 规则 |
+| `name` | string | 是 | — | trim 后非空 |
+| `version` | string | 是 | — | `major.minor.patch` |
+| `api_version` | integer | 是 | — | 必须在 `SUPPORTED_API_VERSIONS`（当前 `[1]`） |
+| `locales` | string[] | 否 | `[]` | 复用 `menghunote-i18n::Locale`；解析后不得重复；未知语言拒绝 |
+| `capabilities` | string[] | 否 | `[]` | 见 §10.4；未知能力 serde 拒绝、重复拒绝 |
+| `commands` | `CommandSpec[]` | 否 | `[]` | id/title 非空；id 同集合唯一 |
+| `panels` | `PanelSpec[]` | 否 | `[]` | id/title/slot 非空；id 同集合唯一 |
+| `settings` | `SettingSpec[]` | 否 | `[]` | id 非空且唯一；default 类型必须匹配 type |
+
+spec 字段保持最小，**不冻结** UI schema：
+
+- `CommandSpec { id, title, description? }`：参数、快捷键、命令执行方式后置。
+- `PanelSpec { id, title, slot }`：`slot` 是 host 定义的不透明字符串，不是
+  布局 DSL；host 不认识时由未来加载器拒绝/忽略。
+- `SettingSpec { id, type, default, scope }`：
+  - `type` 为 `bool` / `integer` / `text`（JSON 字段名是 `type`）；
+  - `default` 用原生 JSON 值（`SettingValue` 为 untagged bool/int/text）；
+  - `scope` 为 `user` / `vault`；host 决定持久化位置，本切片不实现存储，
+    也不承诺同步语义。
+
+未知 **manifest 字段**被容忍（向前兼容），但未知 capability/type/scope 会被
+serde 拒绝。`locales` 与 `capabilities` 重复、spec id 重复、空必需字段等由
+`PluginManifest::validate` 收集；它返回全部错误，不短路、不 panic。
+
+**拒绝加载规则（未来）**：反序列化失败或 `validate` 返回任何错误时，加载器
+必须拒绝加载整个插件；不得部分加载、不得忽略未知能力/未知类型、不得降级
+为“无能力运行”。本切片**没有加载器**，因此该规则目前只是契约与测试事实。
+
+### 10.4 能力表
+
+| capability | JSON 拼写 | 含义 | 本切片 host 接口 |
+| --- | --- | --- | --- |
+| `NotesRead` | `notes_read` | 列表/读取笔记快照 | `NotesReadService` |
+| `NotesWrite` | `notes_write` | 创建/更新笔记正文 | `NotesWriteService` |
+| `Network` | `network` | 网络请求（预留） | **无**（未开放） |
+| `Filesystem` | `filesystem` | 用户选择的文件读写（预留） | **无**（未开放） |
+| `Clipboard` | `clipboard` | 剪贴板读写（预留） | **无**（未开放） |
+| `Notifications` | `notifications` | 用户通知 | `NotificationService` |
+| `Settings` | `settings` | 插件自己的设置读写 | `SettingsService` |
+| `Commands` | `commands` | 注册命令（预留） | **无**；只有 manifest 声明 |
+
+能力是**声明**，不是授权结果。安装/首次使用授权、敏感能力单独授权、签名/
+来源校验与审计全部后置；本切片没有授权 UI。`Network`/`Filesystem`/
+`Clipboard`/`Commands` 只保留名字与语义，未定义接口、未实现任何能力。
+
+### 10.5 Host 服务契约
+
+`crates/plugin-api/src/host.rs` 只定义 host 自有类型与 object-safe trait：
+
+| 类型 | 用途 |
+| --- | --- |
+| `NoteId` | 不透明笔记标识，插件只能原样传回 |
+| `NoteSummary` / `NoteSnapshot` | 列表项 / id+标题+Markdown 正文快照 |
+| `Notification` / `NotificationLevel` | 通知内容与级别 |
+| `HostError` | 不透明可读错误（不暴露 SQLite/网络/密钥原文） |
+
+trait：`NotesReadService`（list/read）、`NotesWriteService`（create/update）、
+`SettingsService`（get/set）、`NotificationService`（notify）。`HostServices`
+是 host 侧“完整实现”的**标记 trait**，仅用于静态约束；未来加载器应按
+manifest capability 构造只实现相应子 trait 的 host 对象，**不要**把
+`&dyn HostServices` 交给插件。
+
+边界：不暴露 SQLite/密钥/GPUI 类型；不把 storage/sync 类型放进签名；不实现
+真实 Vault/编辑器接线；不选择 WASM 还是独立进程（§8 问题 2 仍开放）。本切片
+没有任何运行时路径导入这些 trait。
+
+### 10.6 第一方模块清单
+
+`crates/app/src/modules.rs` 的只读注册表固定顺序如下（顺序是契约，不是
+字母序）：
+
+| id | 模块 | `compiled` | feature gate | `enabled` |
+| --- | --- | --- | --- | --- |
+| `sync` | Sync | 仅 `--features dev-sync` | `dev-sync` | 同 `compiled` |
+| `mermaid` | Mermaid | **总是**编入 | 无 | `true` |
+| `import-export` | Import / Export | **总是**编入 | 无 | `true` |
+| `graph` | Graph | **总是**编入 | 无 | `true` |
+
+事实说明：
+
+- Sync 的用户可见模块（UI/worker）只在 `dev-sync` 下编译；单独的 `sync`
+  feature 只提供构建期 relay 能力闸（`sync_gate`），不构成可用同步模块，
+  因此注册表把 `dev-sync` 作为 Sync 的唯一门禁。
+- Mermaid / ImportExport / Graph 当前**没有**可关闭的 Cargo feature；注册表
+  如实写 `compiled=true`，不伪造“可裁剪”状态，也没有新增裁剪 feature。
+- `enabled` 在本切片恒等于 `compiled`：没有运行时开关、没有设置项、没有
+  持久化配置。将来若做开关，必须在设置层实现，不能直接改只读描述符。
+- **没有 UI**：设置页未新增“模块（实验）”列表，现有布局未改；本切片也没有
+  任何 UI/平台行为需要真机验证。文案字段只是注册表元数据，不承诺最终 UI
+  文案（设置页展示应走 i18n message id）。
+
+### 10.7 验证矩阵（2026-11-18）
+
+```bash
+cargo fmt --all -- --check
+cargo clippy -p menghunote-plugin-api -p menghunote-app --all-targets \
+  --features dev-sync -- -D warnings
+cargo test -p menghunote-plugin-api
+cargo test -p menghunote-app
+cargo test -p menghunote-app --features dev-sync
+```
+
+结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test -p menghunote-plugin-api` | **24 passed**（17 单测 + 7 JSON 集成；另有 0 doc-test） |
+| `cargo test -p menghunote-app`（默认） | **384 passed**（P2 前 380；新增 4 个 `modules` 单测） |
+| `cargo test -p menghunote-app --features dev-sync` | **630 passed**（P2 前 626；新增 4 个 `modules` 单测） |
+| `cargo fmt --all -- --check` | 干净 |
+| `cargo clippy ... -- -D warnings` | 干净 |
+
+`modules` 的四个测试分别锁定：固定顺序 + id 唯一 + 元数据非空；Sync 在默认
+构建 `compiled=false` / `dev-sync` 构建 `true`；Mermaid/ImportExport/Graph
+总是编入且无 feature gate；按 id 查询与注册表一致。plugin-api 的 JSON 测试
+覆盖完整 manifest、可选字段默认、缺必需字段、未知 capability/type/scope、
+重复 locale/capability、`api_version=2` 与序列化往返。
+
+本切片不读写临时文件，未使用 `sleep` 或 `CARGO_TARGET_TMPDIR`。
+
+### 10.8 明确未做
+
+- **加载器与生命周期**：安装/加载/卸载/启用/禁用、配置变更、崩溃隔离。
+- **运行时选择与实现**：WASM/独立进程、IPC、资源上限、宿主调度。
+- **第三方 UI 与命令执行**：命令注册 API、声明式面板/设置页渲染、原始
+  GPUI Element 暴露（仍拒绝）。
+- **权限与信任**：授权 UI、安装确认、敏感能力单独授权、审计、签名/来源
+  校验、插件仓库/更新。
+- **插件 i18n 装载**：`plugin.<plugin_id>.*` 命名空间仍只在 i18n P1 文档里
+  预留，没有 catalog 合并或运行时装载。
+- **设置页“模块（实验）”只读列表**：未做；现有布局零改动。
+- **Cargo feature 裁剪**：未给 Mermaid/ImportExport/Graph 新增可关闭 feature。
+- **同步迁移**：同步协议/schema/密钥/checkpoint 仍在 Host，不因 P2 改变。
+- **Host 服务实现**：未接真实 Vault/编辑器/通知；只有 trait 与纯类型。
+
+### 10.9 已知限制与后续
+
+- manifest/API schema **未冻结**；版本拼写、能力集合与 spec 字段在 P3 前
+  仍可能调整，届时必须同步更新本页与测试。
+- `PluginVersion` 当前不接受预发布/构建元数据；若插件生态需要，先扩展解析
+  与测试，再更新校验。
+- `locales` 与 host 支持集合绑定（当前只有 `zh-CN`/`en`）；新增语言应先更新
+  `menghunote-i18n`，plugin-api 自动跟随。
+- `HostServices` 只覆盖 notes/settings/notifications 四类能力；其它能力没有
+  接口。任何人都不能据此宣称“网络/文件/剪贴板插件”已可用。
+- `enabled` 是占位事实（等于 `compiled`）；运行时开关、持久化与设置页 UI
+  后置。
+- §8 问题 1（i18n 格式）、2（WASM/进程）、3（UI schema 粒度）、4（Sync 是否
+  默认编入）、5（签名/信任）**均未因 P2 关闭**。P2 只固定了当前可验证的最小
+  契约，不承诺插件生态的兼容性。

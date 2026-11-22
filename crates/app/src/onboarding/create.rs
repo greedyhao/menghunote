@@ -355,7 +355,7 @@ fn run_create(
     events: &mpsc::Sender<CreateEvent>,
 ) -> Result<CreateOutcome, Failure> {
     let _ = events.send(CreateEvent::Progress(CreateStage::Genesis));
-    let label = crate::dev_sync::setup::INSTANCE_LABEL;
+    let label = crate::dev_sync::INSTANCE_LABEL;
     let store = crate::dev_sync::DevIdentityStore;
     // 先按链接模式构造 context（非法 URL/模式在**建库之前**失败；测试可注入自签根）。
     let context = match RelayContext::from_mode(relay_mode, relay_url, DEFAULT_TRANSPORT_TIMEOUTS)

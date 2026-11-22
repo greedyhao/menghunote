@@ -76,7 +76,7 @@ $buildWatch = [System.Diagnostics.Stopwatch]::StartNew()
 # 这里临时放宽，只用退出码判定成败。
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-& cargo build -p menghunote-app 2>&1 | Out-Null
+& cargo build -p menghunote-app --no-default-features 2>&1 | Out-Null
 $buildExit = $LASTEXITCODE
 $ErrorActionPreference = $prevEap
 $buildWatch.Stop()

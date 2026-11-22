@@ -22,7 +22,7 @@ use menghunote_app::dev_vault::{
     self, DevVault, DEMO_FOLDER_TITLE, DEMO_SECOND_TITLE, DEMO_TITLE, DEV_PEER_ID,
 };
 use menghunote_app::shell::AppShell;
-use menghunote_storage::{list_tree, load_body_doc};
+use menghunote_storage::{list_tree, list_tree_sorted, load_body_doc, TreeSort};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 /// 窗口根视图：只是把 `AppShell` 包一层并给一个 `debug_selector`。
@@ -162,20 +162,23 @@ async fn dev_vault_tree_and_first_note_are_loaded(cx: &mut TestAppContext) {
 // → `run_until_parked()`（唯一收敛点）→ 再查 selector 断言状态变化。**不 sleep**。
 // ---------------------------------------------------------------------------
 
-/// 结构树先序下标：0 = 根级演示笔记，1 = 示例目录，2 = 目录里的第二篇。
+/// 侧栏（**目录优先 + 文件名 A-Z**）先序下标：
+/// 0 = 示例目录，1 = 目录里的第二篇，2 = 根级演示笔记。
 ///
+/// 为什么不是 rank 顺序：侧栏从「侧栏排序」切片起读 `list_tree_sorted`（每个层级
+/// 目录在前、组内按当前排序键）；`list_tree` 的 rank 语义用于同步/导出，不再是展示顺序。
 /// 点击用**树下标**而不是"第 N 行"：目录折叠时行号会跳，树下标才是稳定的。
-const ROW_FIRST_NOTE: usize = 0;
-const ROW_FOLDER: usize = 1;
-const ROW_SECOND_NOTE: usize = 2;
+const ROW_FOLDER: usize = 0;
+const ROW_SECOND_NOTE: usize = 1;
+const ROW_FIRST_NOTE: usize = 2;
 
 /// 启动时打开第一篇；点 `tree-row-2` 后必须切到第二篇（选中标记随 `active` 走）。
 #[gpui::test]
 async fn click_tree_row_switches_note(cx: &mut TestAppContext) {
     let (_dir, dev) = open_temp_dev_vault();
     assert!(dev.seeded, "空临时库必须播种演示树");
-    let tree = list_tree(&dev.vault).expect("读取结构树失败");
-    // 点击测试依赖 demo 树的形状：0 = 根级笔记、1 = 目录、2 = 目录里的第二篇。
+    let tree = list_tree_sorted(&dev.vault, TreeSort::NameAsc).expect("读取结构树失败");
+    // 点击测试依赖 demo 树的形状：0 = 目录、1 = 目录里的第二篇、2 = 根级笔记。
     assert_eq!(
         (
             tree[ROW_FIRST_NOTE].title.as_str(),
@@ -183,12 +186,12 @@ async fn click_tree_row_switches_note(cx: &mut TestAppContext) {
             tree[ROW_SECOND_NOTE].title.as_str(),
         ),
         (DEMO_TITLE, true, DEMO_SECOND_TITLE),
-        "demo 树必须是「笔记 / 目录 / 目录内笔记」三行"
+        "demo 树必须是「目录 / 目录内笔记 / 根级笔记」三行（目录优先 + A-Z）"
     );
-    let second_doc_id = tree[ROW_SECOND_NOTE]
+    let root_doc_id = tree[ROW_FIRST_NOTE]
         .body_doc_id
         .clone()
-        .expect("第二篇笔记必须带 body_doc_id");
+        .expect("根级演示笔记必须带 body_doc_id");
 
     let vault = dev.vault.clone();
     let (_host, cx) = cx.add_window_view(move |_, cx| {
@@ -197,7 +200,7 @@ async fn click_tree_row_switches_note(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    // 启动态：第一篇是当前打开笔记（行 0 带 -selected），编辑器在，行 2 还没选中。
+    // 启动态：排序后的第一**笔记**（目录内那篇，行 1）是当前打开笔记，行 2 还没选中。
     assert!(
         cx.debug_bounds("editor-current-doc").is_some(),
         "启动后必须有打开中的文档视图"
@@ -207,12 +210,12 @@ async fn click_tree_row_switches_note(cx: &mut TestAppContext) {
         "右侧编辑器面板必须画出 selector=editor-pane"
     );
     assert!(
-        cx.debug_bounds("tree-row-0-selected").is_some(),
-        "启动时第一篇应带 tree-row-0-selected"
+        cx.debug_bounds("tree-row-1-selected").is_some(),
+        "启动时第一篇（目录内那篇，行 1）应带 tree-row-1-selected"
     );
     assert!(
         cx.debug_bounds("tree-row-2-selected").is_none(),
-        "启动时第二篇还没有选中标记"
+        "启动时根级笔记还没有选中标记"
     );
 
     // 侧栏行是可点的：拿真实 bounds 的中心点击（不是猜坐标）。
@@ -234,14 +237,14 @@ async fn click_tree_row_switches_note(cx: &mut TestAppContext) {
     cx.simulate_click(row.center(), Modifiers::default());
     cx.run_until_parked();
 
-    // 切换后：行 2 变蓝（-selected），行 0 摘掉标记，编辑器仍在（新文档的 EditorView）。
+    // 切换后：行 2 变蓝（-selected），行 1 摘掉标记，编辑器仍在（新文档的 EditorView）。
     assert!(
         cx.debug_bounds("tree-row-2-selected").is_some(),
-        "点击 tree-row-2 后应选中第二篇（tree-row-2-selected 未出现）"
+        "点击 tree-row-2 后应选中根级演示笔记（tree-row-2-selected 未出现）"
     );
     assert!(
-        cx.debug_bounds("tree-row-0-selected").is_none(),
-        "切换后第一篇不应再带 tree-row-0-selected"
+        cx.debug_bounds("tree-row-1-selected").is_none(),
+        "切换后原来那篇不应再带 tree-row-1-selected"
     );
     assert!(
         cx.debug_bounds("editor-current-doc").is_some(),
@@ -251,15 +254,15 @@ async fn click_tree_row_switches_note(cx: &mut TestAppContext) {
     // 存储侧确认"第二篇"是真实笔记（正文非空且是它的内容）。
     // 断言切换本身靠上面的选中标记（由 `AppShell::active.node_id` 驱动）。
     let (body, _head) =
-        load_body_doc(&dev.vault, &second_doc_id, DEV_PEER_ID, None).expect("重放第二篇正文失败");
+        load_body_doc(&dev.vault, &root_doc_id, DEV_PEER_ID, None).expect("重放根级笔记正文失败");
     let text = body.text();
     assert!(
-        text.contains(DEMO_SECOND_TITLE),
-        "第二篇正文应包含标题 {DEMO_SECOND_TITLE:?}，实际前 80 字符：{:?}",
+        text.contains(DEMO_TITLE),
+        "根级演示笔记正文应包含标题 {DEMO_TITLE:?}，实际前 80 字符：{:?}",
         text.chars().take(80).collect::<String>()
     );
     println!(
-        "[headless-ui] 点击切换完成：row={row:?} second_doc={second_doc_id} body scalars={}",
+        "[headless-ui] 点击切换完成：row={row:?} root_doc={root_doc_id} body scalars={}",
         text.chars().count()
     );
 }
@@ -335,8 +338,8 @@ async fn right_click_folder_row_opens_menu_and_escape_closes(cx: &mut TestAppCon
     );
 
     let folder = cx
-        .debug_bounds("tree-row-1")
-        .expect("tree-row-1 必须是目录行（demo 树：0 笔记 / 1 目录 / 2 笔记）");
+        .debug_bounds("tree-row-0")
+        .expect("tree-row-0 必须是目录行（demo 树：0 目录 / 1 目录内笔记 / 2 根级笔记）");
     cx.simulate_mouse_down(folder.center(), MouseButton::Right, Modifiers::default());
     cx.run_until_parked();
 
@@ -361,7 +364,7 @@ async fn right_click_folder_row_opens_menu_and_escape_closes(cx: &mut TestAppCon
 
 /// 点目录行 = 折叠/展开（目录没有正文，点击不切换文档）。
 ///
-/// demo 树：0 根级笔记 / 1 目录 / 2 目录内笔记。折叠是**内存状态**
+/// demo 树（侧栏排序后）：0 目录 / 1 目录内笔记 / 2 根级笔记。折叠是**内存状态**
 /// （`AppShell::collapsed`，重启回到全展开），UI 上的唯一投影就是
 /// `visible_rows()` 少画哪些 `tree-row-N`——因此断言只能用 bounds 的有无，
 /// 不能靠"行的高度变了"这类像素事实。
@@ -369,7 +372,7 @@ async fn right_click_folder_row_opens_menu_and_escape_closes(cx: &mut TestAppCon
 async fn folder_click_collapses_and_expands_children(cx: &mut TestAppContext) {
     let (_dir, dev) = open_temp_dev_vault();
     assert!(dev.seeded, "空临时库必须播种演示树");
-    let tree = list_tree(&dev.vault).expect("读取结构树失败");
+    let tree = list_tree_sorted(&dev.vault, TreeSort::NameAsc).expect("读取结构树失败");
     assert_eq!(
         (
             tree[ROW_FIRST_NOTE].title.as_str(),
@@ -377,7 +380,7 @@ async fn folder_click_collapses_and_expands_children(cx: &mut TestAppContext) {
             tree[ROW_SECOND_NOTE].depth,
         ),
         (DEMO_TITLE, true, 1),
-        "demo 树必须是「根级笔记 / 目录 / depth=1 的子笔记」"
+        "demo 树必须是「目录 / 目录内笔记 / 根级笔记」（目录优先 + A-Z）"
     );
 
     let vault = dev.vault.clone();
@@ -387,41 +390,42 @@ async fn folder_click_collapses_and_expands_children(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    // 前置态：子节点默认展开（有 bounds），第一篇是当前文档。
+    // 前置态：子节点默认展开（有 bounds），第一篇（行 2）是当前文档。
     let child = cx
-        .debug_bounds("tree-row-2")
-        .expect("启动时目录子行 tree-row-2 应可见（默认全展开）");
+        .debug_bounds("tree-row-1")
+        .expect("启动时目录子行 tree-row-1 应可见（默认全展开）");
     assert!(
         child.size.width.as_f32() > 0.0 && child.size.height.as_f32() > 0.0,
         "展开态子行必须有非零尺寸：{child:?}"
     );
     assert!(
-        cx.debug_bounds("tree-row-0-selected").is_some(),
-        "启动时第一篇应带 tree-row-0-selected"
+        cx.debug_bounds("tree-row-1-selected").is_some(),
+        "启动时第一篇（目录内那篇）应带 tree-row-1-selected"
     );
     let folder = cx
-        .debug_bounds("tree-row-1")
-        .expect("tree-row-1 必须是目录行");
+        .debug_bounds("tree-row-0")
+        .expect("tree-row-0 必须是目录行");
 
     // 第一次点击 → 折叠：子行 bounds 消失，目录行与当前文档都保持。
     cx.simulate_click(folder.center(), Modifiers::default());
     cx.run_until_parked();
 
     assert!(
-        cx.debug_bounds("tree-row-2").is_none(),
-        "点击目录行后子行 tree-row-2 必须从布局中消失（折叠没生效？）"
+        cx.debug_bounds("tree-row-1").is_none(),
+        "点击目录行后子行 tree-row-1 必须从布局中消失（折叠没生效？）"
     );
     assert!(
-        cx.debug_bounds("tree-row-1").is_some(),
+        cx.debug_bounds("tree-row-0").is_some(),
         "折叠后目录行本身必须还在"
     );
     assert!(
-        cx.debug_bounds("tree-row-1-selected").is_none(),
+        cx.debug_bounds("tree-row-0-selected").is_none(),
         "目录折叠不改「已打开的笔记」标记（-selected 只随 active 走）"
     );
+    // 当前文档在**被折叠的目录里**：它的行被藏起来（Obsidian 同样如此），但文档本身不关。
     assert!(
-        cx.debug_bounds("tree-row-0-selected").is_some(),
-        "折叠目录不能误切换当前文档（第一篇仍应带 -selected）"
+        cx.debug_bounds("tree-row-2-selected").is_none(),
+        "折叠目录不能把别的行标成已打开"
     );
     assert!(
         cx.debug_bounds("editor-current-doc").is_some(),
@@ -429,20 +433,20 @@ async fn folder_click_collapses_and_expands_children(cx: &mut TestAppContext) {
     );
 
     // 第二次点击 → 展开：子行回来，且仍是真实布局（非零 bounds）。
-    let folder = cx.debug_bounds("tree-row-1").expect("折叠后目录行仍应可点");
+    let folder = cx.debug_bounds("tree-row-0").expect("折叠后目录行仍应可点");
     cx.simulate_click(folder.center(), Modifiers::default());
     cx.run_until_parked();
 
     let child = cx
-        .debug_bounds("tree-row-2")
+        .debug_bounds("tree-row-1")
         .expect("再次点击目录行后子行必须恢复（展开没生效？）");
     assert!(
         child.size.width.as_f32() > 0.0 && child.size.height.as_f32() > 0.0,
         "展开后子行必须占真实尺寸：{child:?}"
     );
     assert!(
-        cx.debug_bounds("tree-row-0-selected").is_some(),
-        "展开同样不能切换当前文档"
+        cx.debug_bounds("tree-row-1-selected").is_some(),
+        "展开同样不能切换当前文档（行 1 重新可见并保留 -selected）"
     );
     println!("[headless-ui] 目录折叠/展开通过，folder={folder:?} child={child:?}");
 }
@@ -457,10 +461,10 @@ async fn folder_click_collapses_and_expands_children(cx: &mut TestAppContext) {
 async fn context_menu_new_note_item_creates_note(cx: &mut TestAppContext) {
     let (_dir, dev) = open_temp_dev_vault();
     assert!(dev.seeded, "空临时库必须播种演示树");
-    let before = list_tree(&dev.vault).expect("读取结构树失败");
+    let before = list_tree_sorted(&dev.vault, TreeSort::NameAsc).expect("读取结构树失败");
     assert_eq!(before.len(), 3, "demo 树必须恰好 3 个节点");
     let folder_node_id = before[ROW_FOLDER].node_id.clone();
-    assert!(before[ROW_FOLDER].is_folder(), "row 1 必须是目录");
+    assert!(before[ROW_FOLDER].is_folder(), "row 0 必须是目录");
 
     let vault = dev.vault.clone();
     let (_host, cx) = cx.add_window_view(move |_, cx| {
@@ -471,8 +475,8 @@ async fn context_menu_new_note_item_creates_note(cx: &mut TestAppContext) {
 
     // 1) 右键目录行 → 菜单出现，且三个菜单项都画出真实 bounds。
     let folder = cx
-        .debug_bounds("tree-row-1")
-        .expect("tree-row-1 必须是目录行");
+        .debug_bounds("tree-row-0")
+        .expect("tree-row-0 必须是目录行");
     cx.simulate_mouse_down(folder.center(), MouseButton::Right, Modifiers::default());
     cx.run_until_parked();
 
@@ -508,10 +512,14 @@ async fn context_menu_new_note_item_creates_note(cx: &mut TestAppContext) {
         cx.debug_bounds("context-menu").is_none(),
         "点了菜单项后菜单必须关闭"
     );
-    let after = list_tree(&dev.vault).expect("读取结构树失败");
+    let after = list_tree_sorted(&dev.vault, TreeSort::NameAsc).expect("读取结构树失败");
     assert_eq!(after.len(), 4, "「新建笔记」必须让树从 3 项变 4 项");
-    let created = &after[3];
-    assert!(created.is_note(), "新增的第 4 项必须是笔记");
+    let created = &after[ROW_FOLDER + 1];
+    assert!(created.is_note(), "目录的第一行必须是笔记");
+    assert_eq!(
+        created.title, "未命名笔记",
+        "新建笔记的默认标题（「未」U+672A 排在「目」U+76EE 之前）"
+    );
     assert_eq!(
         created.parent_id.as_deref(),
         Some(folder_node_id.as_str()),
@@ -519,19 +527,19 @@ async fn context_menu_new_note_item_creates_note(cx: &mut TestAppContext) {
     );
     assert_eq!(created.depth, 1, "目录里的新笔记 depth 必须是 1");
 
-    // 新笔记的节点落在先序下标 3（目录的最后一个子节点），UI 上必须看得见；
-    // 且 `create_note` 会顺手打开它，所以选中标记也在这一行。
+    // 目录优先 + A-Z：新笔记（未命名笔记）排在「目录里的第二篇」之前 → 先序下标 1。
+    // `create_note` 会顺手打开它，所以选中标记也在这一行。
     assert!(
-        cx.debug_bounds("tree-row-3").is_some(),
-        "新笔记必须画出 tree-row-3"
+        cx.debug_bounds("tree-row-1").is_some(),
+        "新笔记必须画出 tree-row-1"
     );
     assert!(
-        cx.debug_bounds("tree-row-3-selected").is_some(),
-        "新建后应自动打开新笔记（tree-row-3-selected）"
+        cx.debug_bounds("tree-row-1-selected").is_some(),
+        "新建后应自动打开新笔记（tree-row-1-selected）"
     );
     assert!(
-        cx.debug_bounds("tree-row-0-selected").is_none(),
-        "打开新笔记后第一篇不应再带 -selected"
+        cx.debug_bounds("tree-row-2-selected").is_none(),
+        "打开新笔记后旧的第一篇不应再带 -selected"
     );
     assert!(
         cx.debug_bounds("editor-current-doc").is_some(),
@@ -561,11 +569,13 @@ async fn context_menu_new_note_item_creates_note(cx: &mut TestAppContext) {
 async fn editor_keystroke_inserts_character_and_persists(cx: &mut TestAppContext) {
     let (_dir, dev) = open_temp_dev_vault();
     assert!(dev.seeded, "空临时库必须播种演示树");
-    let tree = list_tree(&dev.vault).expect("读取结构树失败");
+    let tree = list_tree_sorted(&dev.vault, TreeSort::NameAsc).expect("读取结构树失败");
+    // 用**根级演示笔记**（正文 > 100 字符，打字有判别力）；它在侧栏排序后是最后一行，
+    // 测试里显式点开它，避免依赖"启动时打开哪一篇"的顺序细节。
     let doc_id = tree[ROW_FIRST_NOTE]
         .body_doc_id
         .clone()
-        .expect("根级笔记必须带 body_doc_id");
+        .expect("根级演示笔记必须带 body_doc_id");
     let (before, before_head) =
         load_body_doc(&dev.vault, &doc_id, DEV_PEER_ID, None).expect("重放第一篇正文失败");
     let before_text: Vec<char> = before.text().chars().collect();
@@ -580,6 +590,13 @@ async fn editor_keystroke_inserts_character_and_persists(cx: &mut TestAppContext
         let shell = cx.new(|cx| AppShell::new(vault, "headless-ui-typing".to_owned(), cx));
         ShellHost { shell }
     });
+    cx.run_until_parked();
+
+    // 先点开根级演示笔记（行 2）再打字：不依赖启动时打开的是哪一篇。
+    let root_row = cx
+        .debug_bounds("tree-row-2")
+        .expect("tree-row-2 必须是根级演示笔记");
+    cx.simulate_click(root_row.center(), Modifiers::default());
     cx.run_until_parked();
 
     // 先点正文：把焦点落在编辑器上（首帧的 defer 焦点之外再显式点一次，

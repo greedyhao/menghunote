@@ -8,7 +8,9 @@ use gpui::{
 };
 use menghunote_app::shell::AppShell;
 use menghunote_editor::SourceByte;
-use menghunote_storage::{append_updates, load_body_doc, StructureWriter, UpdateRecord, Vault};
+use menghunote_storage::{
+    append_updates, list_tree_sorted, load_body_doc, StructureWriter, TreeSort, UpdateRecord, Vault,
+};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 struct ShellHost {
@@ -67,6 +69,23 @@ fn open_shell(
     });
     cx.run_until_parked();
     (host, cx)
+}
+
+/// 侧栏（目录优先 + 文件名 A-Z）里标题对应的先序下标。
+fn tree_row(vault: &Vault, title: &str) -> usize {
+    list_tree_sorted(vault, TreeSort::NameAsc)
+        .expect("读取结构树失败")
+        .iter()
+        .position(|entry| entry.title == title)
+        .unwrap_or_else(|| panic!("结构树里找不到「{title}」"))
+}
+
+/// 点侧栏某一行（真实鼠标事件；启动时打开的是排序后的第一篇，不一定是要测的那篇）。
+fn click_tree_row(cx: &mut gpui::VisualTestContext, index: usize) {
+    let selector: &'static str = Box::leak(format!("tree-row-{index}").into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("树行必须有 selector");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
 }
 
 fn active_view(
@@ -220,7 +239,10 @@ async fn backlinks_panel_lists_source_and_opens_it(cx: &mut TestAppContext) {
         )
         .expect("插入反向链接");
 
-    let (host, cx) = open_shell(cx, vault);
+    let (host, cx) = open_shell(cx, vault.clone());
+    // 启动时打开的是排序后的第一篇笔记（「来源」U+6765 排在「目标」U+76EE 之前），
+    // 所以显式点开「目标」再断言。
+    click_tree_row(cx, tree_row(&vault, "目标"));
     let target_view = active_view(cx, &host);
     assert_eq!(view_text(cx, &target_view), "目标正文");
     let toggle = cx

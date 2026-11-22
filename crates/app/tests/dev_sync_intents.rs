@@ -26,8 +26,8 @@ use menghunote_app::dev_sync::DevIdentityStore;
 use menghunote_app::dev_vault;
 use menghunote_app::shell::AppShell;
 use menghunote_storage::{
-    append_updates, intent_message_id, list_tree, load_head, pending_encryption, SyncContext,
-    UpdateRecord, Value, Vault, STRUCTURE_DOC_ID,
+    append_updates, intent_message_id, list_tree, list_tree_sorted, load_head, pending_encryption,
+    SyncContext, UpdateRecord, Value, Vault, STRUCTURE_DOC_ID,
 };
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
@@ -89,10 +89,12 @@ async fn app_shell_typing_flushes_intents_with_identity_peer_and_epoch(cx: &mut 
     let sync = SyncContext::new(peer, identity.current_epoch);
 
     let dev = dev_vault::open_vault_at_with_peer(&vault_path, peer).expect("打开实例库");
-    let first_doc = list_tree(&dev.vault)
+    // `AppShell` 打开的是**侧栏展示顺序**（目录优先 + A-Z）的第一篇笔记。
+    let first_doc = list_tree_sorted(&dev.vault, menghunote_storage::TreeSort::NameAsc)
         .expect("读结构树")
-        .first()
-        .and_then(|entry| entry.body_doc_id.clone())
+        .into_iter()
+        .find(|entry| entry.is_note())
+        .and_then(|entry| entry.body_doc_id)
         .expect("第一篇笔记必须有 body_doc_id");
     assert!(
         pending_encryption(&dev.vault, 10)
@@ -248,9 +250,10 @@ async fn structure_writes_produce_structure_intents(cx: &mut TestAppContext) {
     );
 
     // 右键目录行 →「新建笔记」（create_note + move_node 在同一个 commit 里）。
+    // 侧栏是「目录优先 + 文件名 A-Z」：demo 树里的目录在**第一行**。
     let folder = cx
-        .debug_bounds("tree-row-1")
-        .expect("tree-row-1 必须是目录行");
+        .debug_bounds("tree-row-0")
+        .expect("tree-row-0 必须是目录行");
     cx.simulate_mouse_down(
         folder.center(),
         gpui::MouseButton::Right,

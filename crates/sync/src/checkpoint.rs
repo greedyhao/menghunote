@@ -68,8 +68,8 @@ pub struct AssetMeta {
 
 /// checkpoint 的资产来源。
 ///
-/// storage 的 `assets` 表目前没有公共只读 API（task-89 在补）；在它落地前，真实路径用
-/// [`EmptyAssets`]（assets=[] 是当前 storage 的真实状态），测试用 [`StaticAssets`]。
+/// 真实路径用 [`StorageAssets`]（`list_assets` 只读元数据 + 逐条 `asset_bytes`）；
+/// 测试/示例可用 [`StaticAssets`]；[`EmptyAssets`] 只用于明确验证"无资产基线"的路径。
 pub trait AssetSource {
     /// 列出资产元数据（不加载 data）。
     fn list(&self, vault: &menghunote_storage::Vault) -> Result<Vec<AssetMeta>, SyncError>;
@@ -81,7 +81,7 @@ pub trait AssetSource {
     ) -> Result<Vec<u8>, SyncError>;
 }
 
-/// 空资产源：当前 storage 没有资产读取 API 时的真实路径。
+/// 空资产源：只用于明确验证"无资产基线"的路径（真实路径用 [`StorageAssets`]）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmptyAssets;
 
@@ -1727,13 +1727,16 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
 
     /// 上传/复用一个 ASSET 对象（checkpoint 路径）。
     ///
-    /// relay 的 reservation 规则是"同一对象的全部分片必须来自同一预算来源"，所以：
+    /// relay 对**同字节**重放是幂等的（task-121：逐字节相同的分片与 reservation 无关，
+    /// 对象只存一份、不重复计费），对**补缺失分片**仍要求"同一对象的全部分片来自同一
+    /// 预算来源"。所以：
     /// - relay 上**没有**该对象 → 用自己的维护 reservation 上传全部缺失分片；
-    /// - relay 上**已有完整对象**（普通同步/上一份 checkpoint/轮换传过）→ 只按确定性
-    ///   密文逐片校验 + 提交（幂等），不再上传、不碰 reservation；
-    /// - relay 上**部分分片** → 先按自己的 reservation 补齐（同一 lease 的重试）；若
-    ///   返回 `ID_CONFLICT`（对象已由普通预算/别的 reservation 建立），再按普通预算
-    ///   补齐——分片内容确定性相同，relay 对同字节幂等，不会混拼两份密文。
+    /// - relay 上**已有同一片**（普通同步/上一份 checkpoint/轮换传过）→ 直接按维护
+    ///   reservation 重放，relay 回 200 duplicate；不需要预先 GET；
+    /// - relay 上**部分分片**且对象属于另一个预算来源（例如轮换传了一半、rotation
+    ///   reservation 已失效）→ 首次 PUT 返回 `ID_CONFLICT`，再按确定性密文逐片读回
+    ///   校验 + 提交；缺失片仍按对象既有预算来源补齐（普通预算对象才允许普通 PUT）。
+    ///   分片内容确定性相同，不会混拼两份密文。
     fn sync_asset_object(
         &mut self,
         object_id: &ObjectId,
@@ -1742,9 +1745,10 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         reservation: &[u8; 16],
     ) -> Result<UploadedObject, SyncError> {
         // 先按维护预算直接上传（PUT 对同字节幂等，重复片不重复计费）：
-        // - 全新对象 / 同一 lease 的中断续传：一次成功，不做任何 GET（validate 的
-        //   "refs 资产只读回一次"依赖 prepare 不预先探测）；
-        // - 对象已由普通预算/上一份 checkpoint 建立：relay 报 ID_CONFLICT，再走复用探测。
+        // - 全新对象 / 同一 lease 的中断续传 / 轮换期已由 rotation reservation 写好的
+        //   完整对象：一次成功，不做任何 GET（validate 的 "refs 资产只读回一次"依赖
+        //   prepare 不预先探测）；同字节跨 reservation 的幂等复用见 task-121；
+        // - 对象只写了一半、且已有分片属于别的预算来源：relay 报 ID_CONFLICT，再走复用探测。
         let mut saw_conflict = false;
         for (part_no, envelope, _) in &encrypted.parts {
             match self.client.put_part_with_reservation(

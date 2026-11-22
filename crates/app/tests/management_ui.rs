@@ -1267,6 +1267,12 @@ async fn app_root_settings_exposes_management_section(cx: &mut TestAppContext) {
     cx.run_until_parked();
     root.update(cx, |root, cx| root.open_settings(cx));
     cx.run_until_parked();
+    // 管理区在「安全」分类里（设置页左侧导航切换，右侧只渲染当前分类）。
+    let nav = cx
+        .debug_bounds("settings-nav-security")
+        .expect("设置页必须有「安全」导航项");
+    cx.simulate_click(nav.center(), Modifiers::default());
+    cx.run_until_parked();
     assert!(
         cx.debug_bounds("settings-toggle-management").is_some(),
         "真实 AppRoot 设置页必须有「管理」入口"

@@ -118,4 +118,4 @@ pub use sync_bridge::{
     META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED,
     META_SYNC_SKIPPED_RECEIVED_PREFIX, SYNC_INTENT_ID_DOMAIN,
 };
-pub use tree_view::{list_notes, list_tree, NodeKind, TreeEntry};
+pub use tree_view::{list_notes, list_tree, list_tree_sorted, NodeKind, TreeEntry, TreeSort};

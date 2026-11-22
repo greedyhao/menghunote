@@ -55,6 +55,7 @@ use std::time::{Duration, Instant};
 use gpui::{AssetSource, RenderImage, SvgRenderer};
 
 use crate::mermaid::{render_svg_for_preview, MermaidError};
+use crate::theme::ThemeId;
 
 /// M1 固定使用的 merman 版本；进缓存 key，升级渲染器时旧条目自然失效。
 ///
@@ -147,6 +148,12 @@ impl MermaidCacheKey {
     #[must_use]
     pub const fn theme(self) -> &'static str {
         self.theme
+    }
+
+    /// 解析后的主题 id（worker 按它选择 SVG 主题；只认识内置浅/深色）。
+    #[must_use]
+    pub fn theme_id(self) -> ThemeId {
+        ThemeId::parse(self.theme).unwrap_or(ThemeId::LIGHT)
     }
 }
 
@@ -336,12 +343,16 @@ enum Job {
     Render {
         key: MermaidCacheKey,
         source: String,
+        /// 由 `key.theme_id()` 解析：worker 不读全局主题，避免 request 与渲染线程不一致。
+        theme: ThemeId,
     },
     Shutdown,
 }
 
 /// 渲染函数（生产 = M1 的 [`render_svg_for_preview`]；测试可注入 fake）。
-type RenderFn = dyn Fn(&str) -> Result<String, MermaidError> + Send + Sync + 'static;
+///
+/// 第二个参数是主题：后台 worker 只按任务携带的主题渲染，不依赖主线程的全局状态。
+type RenderFn = dyn Fn(&str, ThemeId) -> Result<String, MermaidError> + Send + Sync + 'static;
 
 /// Mermaid 预览服务：一个后台渲染线程 + LRU 缓存（`Clone` 共享同一 worker）。
 #[derive(Clone)]
@@ -452,6 +463,7 @@ impl MermaidService {
         let job = Job::Render {
             key,
             source: source.to_owned(),
+            theme: key.theme_id(),
         };
         if self.inner.tx.send(job).is_err() {
             let mut inner = Inner::lock(&self.inner.shared);
@@ -555,10 +567,10 @@ fn worker_loop(
     // SvgRenderer 不是 Send：它只在 worker 线程内构造/使用，不跨线程移动。
     let renderer = SvgRenderer::new(asset_source);
     while let Ok(job) = rx.recv() {
-        let Job::Render { key, source } = job else {
+        let Job::Render { key, source, theme } = job else {
             break;
         };
-        let slot = render_slot(&renderer, render.as_ref(), key, &source);
+        let slot = render_slot(&renderer, render.as_ref(), key, theme, &source);
         let mut inner = Inner::lock(&shared);
         inner.inflight.remove(&key);
         inner.renders = inner.renders.saturating_add(1);
@@ -574,9 +586,10 @@ fn render_slot(
     renderer: &SvgRenderer,
     render: &RenderFn,
     key: MermaidCacheKey,
+    theme: ThemeId,
     source: &str,
 ) -> CacheSlot {
-    let svg = match std::panic::catch_unwind(AssertUnwindSafe(|| render(source))) {
+    let svg = match std::panic::catch_unwind(AssertUnwindSafe(|| render(source, theme))) {
         Ok(Ok(svg)) => svg,
         Ok(Err(error)) => return CacheSlot::Failed(MermaidPreviewError::Render(error.to_string())),
         Err(payload) => {
@@ -825,11 +838,14 @@ mod tests {
     /// 一个最小的合法 SVG（无文字，避免测试依赖系统字体）。
     const TINY_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><rect x=\"0\" y=\"0\" width=\"100\" height=\"50\" fill=\"#abc\"/></svg>";
 
+    /// 深色版最小 SVG：只为区分“worker 用了哪个主题”。
+    const DARK_TINY_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><rect x=\"0\" y=\"0\" width=\"100\" height=\"50\" fill=\"#102030\"/></svg>";
+
     fn blocked_renderer(
         gate: Arc<(Mutex<bool>, Condvar)>,
         calls: Arc<AtomicUsize>,
     ) -> Arc<RenderFn> {
-        Arc::new(move |_source: &str| {
+        Arc::new(move |_source: &str, _theme: ThemeId| {
             calls.fetch_add(1, Ordering::SeqCst);
             let (lock, wake) = &*gate;
             let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -889,6 +905,12 @@ mod tests {
             MermaidCacheKey::new_for_theme(source, 700.0, ThemeId::DARK).theme(),
             "dark"
         );
+        // worker 直接按 key 的主题渲染：不需要读全局状态。
+        assert_eq!(base.theme_id(), ThemeId::LIGHT);
+        assert_eq!(
+            MermaidCacheKey::new_for_theme(source, 700.0, ThemeId::DARK).theme_id(),
+            ThemeId::DARK
+        );
     }
 
     #[test]
@@ -931,6 +953,34 @@ mod tests {
         assert_eq!(image.byte_len, 200 * 100 * 4);
     }
 
+    /// M3a：真实 GPUI `SvgRenderer`（resvg/usvg）把深色 CJK 标签光栅化成字形墨迹。
+    ///
+    /// 用**同一图的空标签**作对照：没有文字时该区域不应出现文字色像素；中文标签必须
+    /// 出现足量 `#e5e7eb` 文字色像素（说明显示层确实选中了可覆盖 CJK 的系统字体，
+    /// 而不是空白/整块丢失）。是否“无可读方框”仍要 Windows 真机看观感。
+    #[test]
+    fn dark_cjk_labels_rasterize_to_visible_glyph_ink() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let ink = |source: &str| {
+            let svg = render_svg_for_preview(source, ThemeId::DARK).expect("深色 SVG");
+            let image = rasterize_svg(&renderer, &svg, 800).expect("真实光栅化必须成功");
+            let bytes = image.image.as_bytes(0).expect("首帧像素");
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220)
+                .count()
+        };
+        let empty = ink("flowchart TD\n  A[ ] --> B[ ]\n");
+        let cjk = ink("flowchart TD\n  开始[开始] --> 结束[结束]\n");
+        assert_eq!(empty, 0, "空标签对照不应有文字色像素");
+        assert!(
+            cjk >= 100,
+            "深色 CJK 标签必须画出文字墨迹（实际 {cjk} 像素）"
+        );
+    }
+
     #[test]
     fn service_is_loading_then_ready_without_sleep() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -961,10 +1011,72 @@ mod tests {
     }
 
     #[test]
+    fn light_and_dark_render_once_each_and_cache_per_theme() {
+        let calls: Arc<Mutex<Vec<ThemeId>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_worker = Arc::clone(&calls);
+        let render: Arc<RenderFn> = Arc::new(move |_source: &str, theme: ThemeId| {
+            calls_worker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(theme);
+            if theme == ThemeId::DARK {
+                Ok(DARK_TINY_SVG.to_owned())
+            } else {
+                Ok(TINY_SVG.to_owned())
+            }
+        });
+        let service = MermaidService::build(Arc::new(()), render, MERMAID_CACHE_BUDGET_BYTES);
+        let source = "flowchart TD\nA-->B\n";
+        let light = MermaidCacheKey::new_for_theme(source, 700.0, ThemeId::LIGHT);
+        let dark = MermaidCacheKey::new_for_theme(source, 700.0, ThemeId::DARK);
+        assert_ne!(light, dark, "浅/深色必须是不同 key");
+
+        service.request(light, source);
+        service.request(dark, source);
+        assert!(service.wait_idle(Duration::from_secs(10)), "渲染必须收敛");
+        assert_eq!(service.render_count(), 2, "浅/深色各渲染一次");
+        assert_eq!(service.cache_entries(), 2);
+        {
+            let themes = calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            assert_eq!(themes.len(), 2, "worker 只应收到两次渲染：{themes:?}");
+            assert!(themes.contains(&ThemeId::LIGHT), "{themes:?}");
+            assert!(themes.contains(&ThemeId::DARK), "{themes:?}");
+        }
+        assert!(matches!(
+            service.state(light),
+            MermaidPreviewState::Ready(_)
+        ));
+        assert!(matches!(service.state(dark), MermaidPreviewState::Ready(_)));
+
+        // 同主题重复请求：命中缓存，不再渲染。
+        service.request(light, source);
+        service.request(dark, source);
+        assert_eq!(service.request_count(), 2, "缓存命中不得再请求");
+        assert_eq!(service.render_count(), 2, "缓存命中不得再渲染");
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2
+        );
+
+        // 新 key（例如窗口宽度跨桶 / 切主题）才再渲染一次；同 key 永远命中。
+        let dark_wider = MermaidCacheKey::new_for_theme(source, 900.0, ThemeId::DARK);
+        service.request(dark_wider, source);
+        assert!(service.wait_idle(Duration::from_secs(10)));
+        assert_eq!(service.render_count(), 3, "新 key 必须再渲染一次");
+        assert_eq!(service.request_count(), 3);
+    }
+
+    #[test]
     fn service_caches_failures_and_never_panics() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_worker = Arc::clone(&calls);
-        let render: Arc<RenderFn> = Arc::new(move |_source: &str| {
+        let render: Arc<RenderFn> = Arc::new(move |_source: &str, _theme: ThemeId| {
             calls_worker.fetch_add(1, Ordering::SeqCst);
             Err(MermaidError::Render("注入的语法错误".to_owned()))
         });
@@ -985,7 +1097,7 @@ mod tests {
     fn retry_discards_the_terminal_state_and_renders_again() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_worker = Arc::clone(&calls);
-        let render: Arc<RenderFn> = Arc::new(move |_source: &str| {
+        let render: Arc<RenderFn> = Arc::new(move |_source: &str, _theme: ThemeId| {
             calls_worker.fetch_add(1, Ordering::SeqCst);
             Ok(TINY_SVG.to_owned())
         });
@@ -1010,7 +1122,7 @@ mod tests {
 
     #[test]
     fn service_catches_renderer_panics_as_failures() {
-        let render: Arc<RenderFn> = Arc::new(|_source: &str| panic!("注入 panic"));
+        let render: Arc<RenderFn> = Arc::new(|_source: &str, _theme: ThemeId| panic!("注入 panic"));
         let service = MermaidService::build(Arc::new(()), render, MERMAID_CACHE_BUDGET_BYTES);
         let key = MermaidCacheKey::new("boom", 700.0);
         service.request(key, "boom");
@@ -1027,7 +1139,7 @@ mod tests {
     fn cache_evicts_oldest_entries_to_stay_within_budget() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_worker = Arc::clone(&calls);
-        let render: Arc<RenderFn> = Arc::new(move |_source: &str| {
+        let render: Arc<RenderFn> = Arc::new(move |_source: &str, _theme: ThemeId| {
             calls_worker.fetch_add(1, Ordering::SeqCst);
             Ok(TINY_SVG.to_owned())
         });

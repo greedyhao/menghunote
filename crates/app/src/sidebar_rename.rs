@@ -440,11 +440,23 @@ impl RenameInput {
         Self::new_with_mode(initial, RenameMode::Cell, cx)
     }
 
+    /// 新建**设置页**输入框：标题语义，但光标在末尾、不预选。
+    ///
+    /// 设置页第一次打开时字段可能已被自动聚焦；若沿用 `new` 的全选，用户会看到
+    /// 「所有文字都被选中」的蓝底。这里只放光标，用户自己点击/拖选才出现选区。
+    pub fn new_at_end(initial: &str, cx: &mut Context<Self>) -> Self {
+        Self::new_with_state(RenameMode::Title, RenameState::at_end(initial), cx)
+    }
+
     fn new_with_mode(initial: &str, mode: RenameMode, cx: &mut Context<Self>) -> Self {
         let state = match mode {
             RenameMode::Title => RenameState::selecting_all(initial),
             RenameMode::Cell => RenameState::at_end(initial),
         };
+        Self::new_with_state(mode, state, cx)
+    }
+
+    fn new_with_state(mode: RenameMode, state: RenameState, cx: &mut Context<Self>) -> Self {
         Self {
             state,
             focus_handle: cx.focus_handle(),
@@ -484,6 +496,13 @@ impl RenameInput {
     /// 把焦点给输入框。
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+    }
+
+    /// 点击设置字段时聚焦并全选：第一次打开不预选，点进来后可以直接输入替换。
+    pub fn focus_for_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus(window, cx);
+        self.state.select_all();
+        cx.notify();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -859,8 +878,10 @@ impl Element for RenameElement {
         // 顺序很重要：**选区底色先画、文字后画**。
         // 反过来的话全选高亮会把文字整块盖住——用户看到的"空输入框只有 caret"
         // 就是这个顺序 bug（预填其实一直是对的）。
+        let focus = self.input.read(cx).focus_handle.clone();
+        let focused = focus.is_focused(window);
         let selection = state.selected_byte_range();
-        if state.marked_utf16().is_none() && selection.start != selection.end {
+        if focused && state.marked_utf16().is_none() && selection.start != selection.end {
             let start_x = shaped.x_for_index(selection.start);
             let end_x = shaped.x_for_index(selection.end);
             window.paint_quad(gpui::fill(
@@ -878,8 +899,6 @@ impl Element for RenameElement {
 
         // 光标（组合中画在 preedit 末尾）。与搜索框共用 `caret_visible` 判定：
         // 空文本聚焦也要画（此前搜索框因为多了一个"非空"守卫而漏掉，这里保持一致）。
-        let focus = self.input.read(cx).focus_handle.clone();
-        let focused = focus.is_focused(window);
         if !crate::search_input::caret_visible(
             focused,
             state.marked_utf16().is_some(),
@@ -950,6 +969,18 @@ mod tests {
 
     fn state(text: &str) -> RenameState {
         RenameState::selecting_all(text)
+    }
+
+    #[test]
+    fn prefill_at_end_has_no_selection() {
+        let state = RenameState::at_end("YYYY-MM-DD");
+        assert_eq!(state.text(), "YYYY-MM-DD");
+        assert_eq!(state.caret(), "YYYY-MM-DD".len());
+        assert_eq!(
+            state.selected_byte_range(),
+            "YYYY-MM-DD".len().."YYYY-MM-DD".len(),
+            "设置字段首次打开不能预选，否则会整段显示蓝底"
+        );
     }
 
     #[test]

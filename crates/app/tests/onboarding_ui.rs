@@ -40,6 +40,7 @@ use menghunote_app::onboarding::{
     ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, RootStateLabel,
     DEFAULT_OPERATION_BUDGET, LOCK_FILE_NAME,
 };
+use menghunote_app::ui_text;
 use menghunote_dev_relay::DevRelay;
 use menghunote_storage::{
     append_updates_with_sync_intents, list_tree, load_body_doc, local_sync_intent, StructureWriter,
@@ -124,7 +125,7 @@ fn temp_layout(prefix: &str) -> (TempDir, ProfileLayout) {
         .tempdir_in(&root)
         .expect("在 target/tmp 下创建临时目录失败");
     let layout = ProfileLayout::new(
-        dir.path().join("config/dev-sync.json"),
+        dir.path().join("config/sync.json"),
         dir.path().join("data/instances"),
     );
     (dir, layout)
@@ -188,6 +189,34 @@ async fn onboarding_welcome_is_shown_without_any_config(cx: &mut TestAppContext)
     assert!(
         !layout.config_path.exists(),
         "读不到配置不算错误，也不得写配置"
+    );
+}
+
+/// P2：`dev-sync` 构建**保留**开发警示条与「继续本地」开发入口。
+///
+/// 产品构建的不存在性由 `sync_ui_product` 断言（同一 selector 在两种构建里互斥）。
+#[gpui::test]
+async fn dev_build_shows_dev_banner_and_local_entry(cx: &mut TestAppContext) {
+    let (_dir, layout) = temp_layout("dev-banner");
+    let mut options = AppRootOptions::for_test(layout, "http://127.0.0.1:18080", "inst-dev-banner");
+    options.allow_local_vault = true;
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+
+    assert_eq!(state_of(&root, cx), RootStateLabel::Welcome);
+    expect_bounds(cx, "app-root-dev-banner");
+    expect_bounds(cx, "app-root-local");
+    // A 组第二切片：dev-sync 构建保留旧「继续本地（DEV ONLY）」文案（同一 selector，
+    // 产品构建是「仅本地使用」）。
+    assert_eq!(
+        AppRoot::local_entry_label(),
+        ui_text::local_dev_action(),
+        "dev-sync 构建必须保留旧「继续本地」开发入口文案"
+    );
+    assert!(
+        AppRoot::local_entry_label().contains("DEV ONLY"),
+        "dev 入口必须明确 DEV ONLY：{}",
+        AppRoot::local_entry_label()
     );
 }
 
@@ -1669,6 +1698,17 @@ fn open_settings(root: &Entity<AppRoot>, cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+/// 点设置页左侧分类导航（`settings-nav-<section>`）并断言右侧真的切到了该分类。
+fn open_settings_nav(cx: &mut VisualTestContext, section: &'static str) {
+    let selector: &'static str = Box::leak(format!("settings-nav-{section}").into_boxed_str());
+    let bounds = expect_bounds(cx, selector);
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    let section_selector: &'static str =
+        Box::leak(format!("settings-section-{section}").into_boxed_str());
+    expect_bounds(cx, section_selector);
+}
+
 /// 验收 1（S4）：创建实例后打开设置 → 列表含该实例、active 标记、公开 id/path 正确；
 /// 面板没有秘密字段（秘密在类型上就不存在）。
 #[gpui::test]
@@ -1691,18 +1731,22 @@ async fn settings_lists_public_instance_without_secret_fields(cx: &mut TestAppCo
         root.update(cx, |root, _| root.settings_is_open()),
         "点击「设置」必须打开面板"
     );
+    // 底栏（错误/提示/保存/关闭）固定在所有分类下都可见；分类内容按导航切换。
     for selector in [
         "dev-sync-settings",
-        "settings-relay",
+        "settings-nav",
         "settings-save",
         "settings-cancel",
-        "settings-instance-0",
-        "settings-instance-0-active",
         "settings-error",
         "settings-notice",
     ] {
         expect_bounds(cx, selector);
     }
+    open_settings_nav(cx, "relay");
+    expect_bounds(cx, "settings-relay");
+    open_settings_nav(cx, "instances");
+    expect_bounds(cx, "settings-instance-0");
+    expect_bounds(cx, "settings-instance-0-active");
     expect_bounds(cx, "app-root-main");
     // 设置里不存在秘密输入控件（setup secret/恢复码/root/manager seed）。
     for absent in [
@@ -1768,6 +1812,204 @@ async fn settings_lists_public_instance_without_secret_fields(cx: &mut TestAppCo
         Some(shell_id),
         "打开/取消设置不得重建 AppShell"
     );
+}
+
+/// 设置页左侧分类导航（Obsidian「选项」式）：默认「外观」，点分类只渲染该分类内容；
+/// 旧 selector 在对应分类打开时仍然存在；覆盖层限高、内容区独立滚动；会话内记住选择。
+#[gpui::test]
+async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("settings-nav");
+    let created = create_instance(&relay, &layout, "inst-settings-nav");
+    write_profile(&layout, &created, "inst-settings-nav");
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), "inst-settings-nav");
+    let (root, cx) = open_root(cx, options);
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+
+    let entry = expect_bounds(cx, "app-root-settings");
+    cx.simulate_click(entry.center(), Modifiers::default());
+    cx.run_until_parked();
+
+    // 左侧导航固定、8 个固定分类 + 分界线 + 已启用的插件分类；默认选中「外观」。
+    expect_bounds(cx, "settings-nav");
+    for section in [
+        "appearance",
+        "language",
+        "sync",
+        "instances",
+        "relay",
+        "security",
+        "plugins",
+        "about",
+    ] {
+        let nav: &'static str = Box::leak(format!("settings-nav-{section}").into_boxed_str());
+        expect_bounds(cx, nav);
+    }
+    // 插件分类默认启用（模板/日记），显示在分界线之后。
+    for section in ["templates", "daily_notes"] {
+        let nav: &'static str = Box::leak(format!("settings-nav-{section}").into_boxed_str());
+        expect_bounds(cx, nav);
+    }
+    // 顺序断言：固定项 → 分界线 → 插件项（y 坐标递增）。
+    let mut previous = f32::MIN;
+    for selector in [
+        "settings-nav-appearance",
+        "settings-nav-language",
+        "settings-nav-sync",
+        "settings-nav-instances",
+        "settings-nav-relay",
+        "settings-nav-security",
+        "settings-nav-plugins",
+        "settings-nav-about",
+        "settings-nav-divider",
+        "settings-nav-templates",
+        "settings-nav-daily_notes",
+    ] {
+        let selector: &'static str = Box::leak(selector.to_owned().into_boxed_str());
+        let bounds = expect_bounds(cx, selector);
+        let y = bounds.origin.y.as_f32();
+        assert!(
+            y > previous,
+            "{selector} 必须在上一项之下（y={y}，上一项 y={previous}）"
+        );
+        previous = y;
+    }
+    let divider = expect_bounds(cx, "settings-nav-divider");
+    assert!(
+        divider.size.height.as_f32() <= 2.0,
+        "分界线必须是 1px 细分隔线：{divider:?}"
+    );
+    assert_eq!(
+        root.update(cx, |root, _| root.settings_section()),
+        menghunote_app::onboarding::app_root::SettingsSection::Appearance,
+        "默认分类必须是「外观」"
+    );
+    for selector in [
+        "settings-section-appearance",
+        "settings-appearance",
+        "settings-theme-light",
+        "settings-theme-dark",
+        "settings-theme-system",
+        "settings-theme-current",
+    ] {
+        expect_bounds(cx, selector);
+    }
+    assert!(
+        cx.debug_bounds("settings-language").is_none(),
+        "只渲染当前分类：外语区不得同时存在"
+    );
+
+    // 内容区独立滚动、外层限高（不把整张卡片拉成长页）。
+    let card = expect_bounds(cx, "dev-sync-settings");
+    let content = expect_bounds(cx, "settings-content");
+    assert!(
+        content.size.height.as_f32() <= card.size.height.as_f32() + 0.5,
+        "内容区不得超出面板高度：content={content:?} card={card:?}"
+    );
+
+    // 「语言」分类。
+    open_settings_nav(cx, "language");
+    for selector in [
+        "settings-section-language",
+        "settings-language",
+        "settings-language-zh-CN",
+        "settings-language-en",
+        "settings-language-system",
+        "settings-language-current",
+    ] {
+        expect_bounds(cx, selector);
+    }
+    assert!(
+        cx.debug_bounds("settings-appearance").is_none(),
+        "切到语言后外观区必须不存在"
+    );
+
+    // 「模板」分类：旧 `settings-templates*` 全在。
+    open_settings_nav(cx, "templates");
+    for selector in [
+        "settings-section-templates",
+        "settings-templates",
+        "settings-templates-toggle",
+        "settings-templates-folder",
+        "settings-templates-example",
+    ] {
+        expect_bounds(cx, selector);
+    }
+
+    // 「日记」分类：旧 `settings-daily-notes*` 全在。
+    open_settings_nav(cx, "daily_notes");
+    for selector in [
+        "settings-section-daily_notes",
+        "settings-daily-notes",
+        "settings-daily-notes-toggle",
+        "settings-daily-notes-folder",
+        "settings-daily-notes-example",
+    ] {
+        expect_bounds(cx, selector);
+    }
+
+    // 「同步」分类：进入分类即直接渲染同步面板（不再需要点「展开」；没有「收起」）。
+    open_settings_nav(cx, "sync");
+    expect_bounds(cx, "settings-section-sync");
+    let sync_content = expect_bounds(cx, "settings-toggle-sync");
+    let sync_panel = expect_bounds(cx, "dev-sync-panel");
+    assert!(
+        sync_content.size.height.as_f32() > 40.0,
+        "settings-toggle-sync 现在是同步内容容器，必须直接包含面板而不是折叠按钮：{sync_content:?}"
+    );
+    let panel_bottom = sync_panel.origin.y.as_f32() + sync_panel.size.height.as_f32();
+    let content_bottom = sync_content.origin.y.as_f32() + sync_content.size.height.as_f32();
+    assert!(
+        sync_panel.origin.y.as_f32() >= sync_content.origin.y.as_f32()
+            && panel_bottom <= content_bottom + 0.5,
+        "同步面板必须位于 settings-toggle-sync 内容容器内：panel={sync_panel:?} container={sync_content:?}"
+    );
+
+    // 「实例」分类：列表 + 公开信息。
+    open_settings_nav(cx, "instances");
+    expect_bounds(cx, "settings-section-instances");
+    expect_bounds(cx, "settings-instance-0");
+    expect_bounds(cx, "settings-instance-0-active");
+    expect_bounds(cx, "settings-api-version");
+
+    // 「Relay」分类：输入框 + 模式选择。
+    open_settings_nav(cx, "relay");
+    expect_bounds(cx, "settings-section-relay");
+    expect_bounds(cx, "settings-relay");
+    expect_bounds(cx, "settings-mode-local_dev");
+    expect_bounds(cx, "settings-mode-remote_tls");
+
+    // 「安全」分类：指纹 + 错误类别。
+    open_settings_nav(cx, "security");
+    expect_bounds(cx, "settings-section-security");
+    expect_bounds(cx, "settings-fingerprint");
+    expect_bounds(cx, "settings-security-category");
+
+    // 「关于」分类：版本/构建信息只读。
+    open_settings_nav(cx, "about");
+    expect_bounds(cx, "settings-section-about");
+    expect_bounds(cx, "settings-about-version");
+    expect_bounds(cx, "settings-about-build");
+
+    // 会话内记住上次分类：关闭再打开仍停在「关于」。
+    let cancel = expect_bounds(cx, "settings-cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("dev-sync-settings").is_none(),
+        "关闭后覆盖层必须卸载"
+    );
+    let entry = expect_bounds(cx, "app-root-settings");
+    cx.simulate_click(entry.center(), Modifiers::default());
+    cx.run_until_parked();
+    expect_bounds(cx, "settings-section-about");
+
+    // 收尾：关闭设置（不影响后续断言/关窗）。
+    let cancel = expect_bounds(cx, "settings-cancel");
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.run_until_parked();
 }
 
 /// 验收 2（S4）：合法 loopback relay → 保存 → 配置更新 + 「重启后生效」；
@@ -1974,6 +2216,7 @@ async fn settings_switches_active_and_restarts_into_it(cx: &mut TestAppContext) 
         Some("inst-active-a")
     );
     // 真实点击第二行（active 优先排序后 A 在前、B 在后）的「设为默认」。
+    open_settings_nav(cx, "instances");
     let set_active = expect_bounds(cx, "settings-instance-1-active");
     cx.simulate_click(set_active.center(), Modifiers::default());
     cx.run_until_parked();
@@ -2444,14 +2687,17 @@ async fn settings_fingerprint_shows_and_copies_only_public_values(cx: &mut TestA
     cx.run_until_parked();
     open_settings(&root, cx);
 
+    open_settings_nav(cx, "security");
     for selector in [
         "settings-fingerprint",
         "settings-fingerprint-headline",
         "settings-copy-fingerprint",
         "settings-security-category",
-        "settings-mode-local_dev",
-        "settings-mode-remote_tls",
     ] {
+        expect_bounds(cx, selector);
+    }
+    open_settings_nav(cx, "relay");
+    for selector in ["settings-mode-local_dev", "settings-mode-remote_tls"] {
         expect_bounds(cx, selector);
     }
     // 只读：没有任何重置 pin / 强制信任 / 接受无效证书的按钮。
@@ -2537,6 +2783,7 @@ async fn settings_fingerprint_without_pin_says_not_trusted(cx: &mut TestAppConte
     assert!(headline.contains("未建立信任"), "{headline}");
     assert!(headline.contains("NeedsTrust"), "{headline}");
     assert!(headline.contains("不会自动信任"), "{headline}");
+    open_settings_nav(cx, "security");
     assert!(cx.debug_bounds("settings-copy-fingerprint").is_some());
     expect_bounds(cx, "settings-security-category");
     for absent in ["settings-reset-pin", "settings-trust-any"] {
@@ -2885,6 +3132,7 @@ async fn remote_create_over_tls_writes_remote_profile_pin_and_restarts(cx: &mut 
 
     // 设置页安全指纹出现（只读，无自动信任按钮）。
     open_settings(&root, cx);
+    open_settings_nav(cx, "security");
     expect_bounds(cx, "settings-fingerprint");
     let fingerprint = root
         .update(cx, |root, _| root.settings_fingerprint_state())
@@ -2988,6 +3236,7 @@ async fn remote_join_over_tls_opens_creator_note_and_writes_remote_profile(
 
     // 设置页指纹出现。
     open_settings(&root, cx);
+    open_settings_nav(cx, "security");
     expect_bounds(cx, "settings-fingerprint");
     root.update(cx, |root, cx| root.close_settings(cx));
     cx.run_until_parked();

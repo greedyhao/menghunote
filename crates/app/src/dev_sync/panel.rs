@@ -1,4 +1,4 @@
-//! dev-only 同步面板（ADR 0009 Phase 1 / 切片 1；ADR 0010 切片 2a-2 加设备列表）。
+//! 同步面板（ADR 0009 Phase 1 / 切片 1；ADR 0010 切片 2a-2 加设备列表；P1 起 `sync-ui` 产品可用）。
 //!
 //! ## 这一层只做投影
 //!
@@ -10,9 +10,16 @@
 //!
 //! ## 门禁
 //!
-//! 只有 `--features dev-sync` **且**运行时门禁通过（[`super::gate`]）才会创建本视图
-//! （见 `shell.rs` 的 `AppShell::new_with_dev_sync`）。默认构建里本模块根本不存在，
+//! 本模块由 `sync-ui` feature（**默认**）编译；`dev-sync` 构建在运行时门禁通过
+//! （[`super::gate`]）后创建本视图（见 `shell.rs` 的 `AppShell::new_with_dev_sync`）。
 //! 未启用时 `AppShell.dev_sync` 是 `None`，不渲染、不占布局。
+//!
+//! ## 去 DEV 标注（P2）
+//!
+//! 面板顶部固定行由 [`header_line`] 投影：`dev-sync` 构建保留开发警示（红字
+//! `DEV ONLY / 非生产 / localhost`）；产品构建（`sync-ui`）**不出现** DEV 标语，
+//! 只显示中性标题「同步面板」。relay 行里的真实地址（例如 `127.0.0.1`）是动态数据，
+//! 照实显示，不在这里改写。
 //!
 //! ## 设备列表与「移除设备」（ADR 0010 切片 2a-2）
 //!
@@ -156,9 +163,25 @@ impl gpui::EventEmitter<DevSyncPanelEvent> for DevSyncPanel {}
 
 /// 面板轮询间隔（事件泵；只影响 dev-only 面板，不是业务时钟）。
 const PUMP_INTERVAL: Duration = Duration::from_millis(40);
-/// 面板宽度（逻辑像素）。
-/// 顶部固定文案：任何 dev 演示都必须一眼看出"这不是生产"。
+/// 顶部固定文案（`dev-sync` 构建）：任何 dev 演示都必须一眼看出"这不是生产"。
+#[cfg(feature = "dev-sync")]
 const BANNER: &str = "DEV ONLY / 非生产 / localhost";
+
+/// 面板顶部固定行的投影：`(文案, 是否是开发警示)`。
+///
+/// - `dev-sync` 构建保留开发警示（红字；原有短句语义不变）；
+/// - 产品构建（`sync-ui`，无 `dev-sync`）**不出现** DEV 标语，只显示中性标题
+///   「同步面板」——文案走 `ui_text` + catalog，不在渲染里硬编码。
+#[cfg(feature = "dev-sync")]
+fn header_line() -> (String, bool) {
+    (BANNER.to_owned(), true)
+}
+
+/// 产品构建：DEV 标语移除，只显示中性「同步面板」标题。
+#[cfg(not(feature = "dev-sync"))]
+fn header_line() -> (String, bool) {
+    (crate::ui_text::settings_sync_panel_title(), false)
+}
 
 /// 轮换确认区的**固定文案**（ADR 0009 Phase 2 切片 6b；一字不改）。
 ///
@@ -1641,6 +1664,7 @@ impl Render for DevSyncPanel {
         self.pump();
 
         let state_text = self.state_text();
+        let (header, dev_warning) = header_line();
         let relay_text = format!("relay：{}", self.relay);
         let error_text = self.error_text();
         let notice_text = match &self.notice {
@@ -1697,9 +1721,14 @@ impl Render for DevSyncPanel {
             .shadow_lg()
             .child(
                 div()
+                    .debug_selector(|| "dev-sync-header".to_string())
                     .text_size(px(11.0))
-                    .text_color(theme::danger_text())
-                    .child(SharedString::from(BANNER)),
+                    .text_color(if dev_warning {
+                        theme::danger_text()
+                    } else {
+                        theme::text_color()
+                    })
+                    .child(SharedString::from(header)),
             )
             .child(
                 div()
@@ -1903,5 +1932,28 @@ mod tests {
             !repeat.contains("认证已刷新"),
             "重复移除不得谎称认证已刷新：{repeat}"
         );
+    }
+
+    /// P2：面板顶部固定行在产品构建不能出现 DEV 标语；dev-sync 构建保留开发警示。
+    #[test]
+    fn panel_header_has_no_dev_wording_in_product_build() {
+        let (text, dev_warning) = header_line();
+        #[cfg(feature = "dev-sync")]
+        {
+            assert!(dev_warning, "dev-sync 构建必须标红显示开发警示");
+            assert_eq!(text, BANNER);
+            assert!(text.contains("DEV ONLY"), "{text}");
+        }
+        #[cfg(not(feature = "dev-sync"))]
+        {
+            assert!(!dev_warning, "产品构建不得把固定行画成开发警示");
+            assert_eq!(text, crate::ui_text::settings_sync_panel_title());
+            for forbidden in ["DEV", "非生产", "localhost"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "产品构建的面板标题不得含 {forbidden:?}：{text}"
+                );
+            }
+        }
     }
 }

@@ -34,8 +34,8 @@ use menghunote_storage::session::{
     ExternalCommitTicket, GateState, LiveRev, SessionDriver,
 };
 use menghunote_storage::{
-    append_updates, create_body_doc, list_tree, load_body_doc, load_head, SyncContext,
-    UpdateRecord, Vault,
+    append_updates, create_body_doc, list_tree_sorted, load_body_doc, load_head, SyncContext,
+    TreeSort, UpdateRecord, Vault,
 };
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
@@ -340,11 +340,17 @@ async fn app_shell_adopts_external_commit_without_reopening(cx: &mut TestAppCont
     let dev = dev_vault::open_vault_at_with_peer(&vault_path, peer).expect("打开实例库");
     assert_ne!(peer, PEER_EXTERNAL, "外部 writer 必须用不同 peer");
 
-    let doc_id = list_tree(&dev.vault)
+    // `AppShell` 打开的是**侧栏展示顺序**（目录优先 + A-Z）的第一篇笔记。
+    let opened = list_tree_sorted(&dev.vault, TreeSort::NameAsc)
         .expect("读结构树")
-        .first()
-        .and_then(|entry| entry.body_doc_id.clone())
+        .into_iter()
+        .find(|entry| entry.is_note())
+        .expect("必须有第一篇笔记");
+    let doc_id = opened
+        .body_doc_id
+        .clone()
         .expect("第一篇笔记必须有 body_doc_id");
+    let opened_title = opened.title.clone();
     let writer = dev.vault.clone();
     let vault = dev.vault.clone();
     let config = DevSyncConfig {
@@ -375,8 +381,8 @@ async fn app_shell_adopts_external_commit_without_reopening(cx: &mut TestAppCont
     cx.run_until_parked();
     let text_before = current_text(cx, &host);
     assert!(
-        text_before.contains(dev_vault::DEMO_TITLE),
-        "活动文档必须是播种的第一篇演示笔记"
+        text_before.contains(&opened_title),
+        "活动文档必须是侧栏展示顺序的第一篇笔记（{opened_title}）"
     );
     let view_before =
         read_shell(cx, &host, |shell, _app| shell.dev_sync_active_view()).expect("当前活动视图");
@@ -474,10 +480,11 @@ async fn adopt_failures_keep_text_and_held_then_cancel_releases(cx: &mut TestApp
     let peer = identity.loro_peer_id();
     let sync = SyncContext::new(peer, identity.current_epoch);
     let dev = dev_vault::open_vault_at_with_peer(&vault_path, peer).expect("打开实例库");
-    let doc_id = list_tree(&dev.vault)
+    let doc_id = list_tree_sorted(&dev.vault, TreeSort::NameAsc)
         .expect("读结构树")
-        .first()
-        .and_then(|entry| entry.body_doc_id.clone())
+        .into_iter()
+        .find(|entry| entry.is_note())
+        .and_then(|entry| entry.body_doc_id)
         .expect("第一篇笔记必须有 body_doc_id");
     let writer = dev.vault.clone();
     let vault = dev.vault.clone();

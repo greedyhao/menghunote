@@ -7,8 +7,9 @@
 //!         \-> JoinForm  -> Working -> Main（成功即写配置，无备份页）
 //!                      \-> Error（保留表单）        （保存配置失败 -> Error，可重试保存）
 //! 已有有效配置 -> Main（启动直接进入，不闪 Welcome）
-//! Welcome -> Main（继续本地 dev vault，明确 DEV 标注）
-//! 任意 -> Error（配置损坏 / 身份缺失 / 库不匹配 / 实例目录被占用）
+//! Welcome -> Main（本地（不同步）库：产品 = 数据根下 local/vault.sqlite3，
+//!               dev-sync = 默认 dev vault；都没有同步面板）
+//! 任意 -> Error（配置损坏 / 身份缺失 / 库不匹配 / 实例目录被占用 / 本地库打不开）
 //! Welcome/Main -> 设置（覆盖层，不销毁 Main 的 AppShell）-> 关闭回原状态
 //! ```
 //!
@@ -32,7 +33,8 @@
 //! | selector | 元素 |
 //! | --- | --- |
 //! | `app-root` | 根视图（铺满窗口） |
-//! | `app-root-welcome` / `app-root-create` / `app-root-join` / `app-root-local` | Welcome 页与三个入口 |
+//! | `app-root-welcome` / `app-root-create` / `app-root-join` / `app-root-local` | Welcome 页与三个入口（`app-root-local` = 本地（不同步）入口，两种构建都出现；产品文案「仅本地使用」，dev-sync 文案「继续本地（DEV ONLY）」） |
+//! | `app-root-dev-banner` | 各页顶部的开发警示条（**只有 `dev-sync` 构建**存在；产品构建不挂节点） |
 //! | `app-root-instances` / `app-root-instance-<i>` | 已保存实例列表与第 i 行（active 优先） |
 //! | `app-root-create-form` / `app-root-dir-input` | Create 表单（只有创建链接 + 实例目录）与目录字段 |
 //! | `app-root-create-link-input` / `app-root-create-link-apply` / `app-root-create-link-clear` | Create 表单的创建链接字段 /「应用」/「移除链接」 |
@@ -45,10 +47,17 @@
 //! | `app-root-backup` / `app-root-vault-id` / `app-root-recovery-code` / `app-root-copy-code` / `app-root-backup-confirm` / `app-root-continue` | 备份页 |
 //! | `app-root-copy-invite` / `app-root-invite-ttl` / `app-root-invite-error` | 备份页「复制邀请链接」（v2、15 分钟；token 只在剪贴板）/ 剩余有效期 / 脱敏失败 |
 //! | `app-root-main` | Main（`AppShell` 子视图宿主） |
+//! | `app-root-local-mode` | Main 顶部的「本地模式：不同步」提示条（**只有本地库入口**出现） |
 //! | `app-root-settings` | 打开设置（Welcome 页与 Main 左侧栏底部入口） |
 //! | `dev-sync-settings` | 设置覆盖层根（打开时存在；Main 仍在其下保留） |
+//! | `settings-nav` / `settings-nav-<section>` | 设置页左侧分类导航 / 单个分类项 |
+//! | `settings-nav-divider` | 固定分类与插件分类之间的 1px 分界线（整行不可点） |
+//! | `settings-section-<section>` | 右侧内容区（**只渲染当前分类**；`settings-content` 是滚动容器） |
+//! | `settings-plugin-<id>` / `-toggle` / `-state` | 「插件」分类里的第一方插件行 / 开关 / 状态（模板 `templates`、日记 `daily_notes`） |
+//! | `settings-toggle-sync` | 「同步」分类的同步面板**内容容器**（进入分类即渲染；没有展开/收起） |
 //! | `settings-instance-<i>` / `settings-instance-<i>-active` | 公开实例行 /「设为默认」控件（active 优先） |
-//! | `settings-relay` / `settings-save` / `settings-cancel` | relay 输入框 / 保存 / 关闭（不保存） |
+//! | `settings-relay` / `settings-save` / `settings-cancel` | relay 输入框 / 保存 / 关闭（不保存；保存与关闭固定在底栏） |
+//! | `settings-about-version` / `settings-about-build` | 关于：版本 / 构建特性（只读） |
 //! | `settings-mode-local_dev` / `settings-mode-remote_tls` / `settings-remote-consent` | relay 模式选择 / 远程确认 |
 //! | `settings-fingerprint` / `settings-fingerprint-headline` / `settings-copy-fingerprint` | 安全指纹只读区 / 标题 / 复制公开值 |
 //! | `settings-security-category` | 当前安全暂停类别（无则「无安全暂停」） |
@@ -80,7 +89,7 @@ use crate::dev_sync::service::ServiceConfig;
 use crate::dev_sync::{DevIdentityStore, DevSyncConfig};
 use crate::dev_vault;
 use crate::editor::theme;
-use crate::shell::AppShell;
+use crate::shell::{AppShell, RIBBON_WIDTH};
 
 use super::create::{CreateEvent, CreateJob, CreateOutcome, CreateRequest, CREATE_PUMP_INTERVAL};
 use super::fingerprint::{FingerprintState, FINGERPRINT_NOTICE};
@@ -98,7 +107,8 @@ use super::layout::{
 use super::lock::{InstanceLock, LOCK_FILE_NAME};
 use super::sanitize_error;
 use super::settings::{
-    remote_option_available, short_public_id, validate_relay_edit, SettingsState,
+    local_option_available, remote_option_available, short_public_id, validate_relay_edit,
+    SettingsState,
 };
 
 /// 操作预算（ADR 0011：沿用 120s；逻辑超时 ≠ 停止）。
@@ -109,11 +119,19 @@ pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(120);
 pub struct AppRootOptions {
     /// 公开配置与实例目录布局。
     pub layout: ProfileLayout,
-    /// Create 表单里 relay 的默认值（生产 = [`DEFAULT_RELAY`]；测试注入进程内 dev relay）。
+    /// Create/Join 表单里 relay 的默认值（dev 构建 = [`DEFAULT_RELAY`]；产品构建留空，
+    /// 由创建/邀请链接或用户输入给出；测试注入进程内 dev relay）。
     pub default_relay: String,
     /// 测试注入固定实例 id；`None` = 每次进入表单自动生成。
     pub instance_id: Option<String>,
-    /// 是否提供「继续本地（默认 dev vault）」入口。
+    /// 是否提供**本地（不同步）**入口（Welcome 的 `app-root-local`）：
+    ///
+    /// - 产品 `sync-ui` 构建 =「仅本地使用（不同步）」→ 打开数据根下
+    ///   `local/vault.sqlite3`（空库、不播种、不联网、不写同步配置/身份）；
+    /// - `dev-sync` 构建 = 旧「继续本地（DEV ONLY）」→ 默认 dev vault（含演示树）。
+    ///
+    /// [`Self::for_test`] 默认**关闭**；需要测本地路径时显式置 `true`（两种构建都会
+    /// 出现同一 selector，文案按构建区分）。
     pub allow_local_vault: bool,
     /// 操作预算（Create 的等待上限；测试可缩短）。
     pub operation_budget: Duration,
@@ -121,17 +139,32 @@ pub struct AppRootOptions {
 
 impl AppRootOptions {
     /// 按平台默认目录构造（生产入口）。
+    ///
+    /// 只做路径解析；旧目录的一次性迁移在 [`AppRoot::new`] 的启动引导里执行——这样
+    /// 旧配置损坏/版本不支持时，能在**GUI 错误页**里给出明确原因（旧 `local_dev`
+    /// 对产品构建不适用时只跳过迁移，不进错误页），
+    /// 而不是带着错误退出、产品看起来"什么都没发生"。
     pub fn discover(env: impl Fn(&str) -> Option<String>) -> Result<Self, ProfileError> {
         Ok(Self {
             layout: ProfileLayout::discover(env)?,
-            default_relay: DEFAULT_RELAY.to_owned(),
+            // 产品构建没有 local_dev：不要把 loopback 地址当成默认值（会被模式校验拒绝）。
+            default_relay: if local_option_available() {
+                DEFAULT_RELAY.to_owned()
+            } else {
+                String::new()
+            },
             instance_id: None,
+            // 本地（不同步）入口：产品构建是「仅本地使用」，dev-sync 构建保留
+            // 「继续本地（DEV ONLY）」开发入口；同一 selector，文案/行为按构建区分。
             allow_local_vault: true,
             operation_budget: DEFAULT_OPERATION_BUDGET,
         })
     }
 
     /// 测试用：显式目录 + relay + 固定实例 id。
+    ///
+    /// **默认关闭本地（不同步）入口**（既有测试的 Welcome 契约不变）；要测本地库
+    /// 路径的测试把它显式置 `true`。
     #[must_use]
     pub fn for_test(layout: ProfileLayout, relay: impl Into<String>, instance_id: &str) -> Self {
         Self {
@@ -411,17 +444,27 @@ pub struct AppRoot {
     invite: Option<InvitePendingState>,
     /// bootstrap 已完成、但公开配置写失败：只重试保存（不重新联网/不重新 bootstrap）。
     pending_invite: Option<(Box<InviteOutcome>, String)>,
+    /// 设置页「模板」区（第一方插件；首次打开设置页时懒创建）。
+    templates_settings: Option<Entity<crate::templates::TemplatesSettingsPanel>>,
+    /// 设置页「日记」区（同上）。
+    daily_notes_settings: Option<Entity<crate::daily_notes::DailyNotesSettingsPanel>>,
+    /// 第一方插件设置面板的事件订阅（启用开关变化 → 左栏插件分类立即刷新）。
+    plugin_settings_subs: Vec<gpui::Subscription>,
     /// 设置面板（overlay；Main/Welcome 都可用，关闭后回到原状态）。
     settings: Option<SettingsState>,
-    /// 设置页里的同步面板是否展开（默认收起，避免设置页无限长）。
-    settings_sync_open: bool,
     /// 设置页里的「管理（V2 控制面）」区是否展开（默认收起；展开时才触发网络刷新）。
     settings_management_open: bool,
+    /// 设置页当前分类（默认「外观」；本次会话内记住，不持久化）。
+    settings_section: SettingsSection,
     /// 关闭设置后要把焦点还给 Main 的编辑器（下一帧渲染时消费）。
     pending_focus_restore: bool,
     main: Option<Entity<AppShell>>,
     lock: Option<InstanceLock>,
     instance: Option<InstanceEntry>,
+    /// Main 是否来自**本地（不同步）**库入口（产品 `local/vault.sqlite3` 或
+    /// dev-sync 默认 dev vault）。只影响 Main 顶部提示条与只读投影；同步实例 Main
+    /// 恒为 `false`。
+    local_mode: bool,
     retry_entry: Option<InstanceEntry>,
     error: Option<ErrorState>,
     notice: Option<String>,
@@ -442,6 +485,9 @@ pub struct AppRoot {
 impl AppRoot {
     /// 构造根视图并尝试自动打开已保存实例。
     pub fn new(options: AppRootOptions, cx: &mut Context<Self>) -> Self {
+        // 本机 UI 偏好（侧栏排序）在产品根视图初始化一次；`AppShell` 只读缓存值，
+        // 这样 headless 测试不会因为本机残留 `sidebar.json` 而改变默认顺序。
+        crate::shell::init_sidebar_sort_from_disk();
         let store = options.layout.store();
         let mut root = Self {
             options,
@@ -459,13 +505,17 @@ impl AppRoot {
             invite_copy_job: None,
             invite: None,
             pending_invite: None,
+            templates_settings: None,
+            daily_notes_settings: None,
+            plugin_settings_subs: Vec::new(),
             settings: None,
-            settings_sync_open: false,
             settings_management_open: false,
+            settings_section: SettingsSection::default(),
             pending_focus_restore: false,
             main: None,
             lock: None,
             instance: None,
+            local_mode: false,
             retry_entry: None,
             error: None,
             notice: None,
@@ -489,10 +539,43 @@ impl AppRoot {
         });
     }
 
-    /// 启动引导：读公开配置 → 有 active 且有效就自动进 Main。
+    /// 启动引导：一次性迁移旧开发目录 → 读公开配置 → 有 active 且有效就自动进 Main。
     fn boot(&mut self, cx: &mut Context<Self>) {
         self.state = State::Welcome;
         self.error = None;
+        // P2：旧目录（`menghunote-dev/dev-sync.json`）的一次性保守迁移。显式布局
+        // （`ProfileLayout::new`）没有旧路径，因此测试/第三方注入完全不受影响。
+        match self.options.layout.migrate_legacy_profile() {
+            Ok(true) => {
+                eprintln!(
+                    "[menghunote] 已迁移旧同步配置：{} → {}（库路径与旧目录保持原样）",
+                    self.options
+                        .layout
+                        .legacy_config_path
+                        .as_deref()
+                        .map_or_else(|| "<旧配置>".to_owned(), |path| path.display().to_string()),
+                    self.store.path().display()
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // 旧配置损坏/版本不支持/模式不被本构建允许：不重建、不覆盖；用现有
+                // Error 页明确提示（含旧配置路径），绝不静默白屏或改写模式。
+                let path = self
+                    .options
+                    .layout
+                    .legacy_config_path
+                    .as_deref()
+                    .map_or_else(String::new, |path| path.display().to_string());
+                self.set_error(
+                    "旧同步配置无法迁移",
+                    error.to_string(),
+                    vec![("旧配置文件".to_owned(), path)],
+                    RetryKind::ReloadConfig,
+                );
+                return;
+            }
+        }
         match self.store.load() {
             Err(error) => {
                 let path = self.store.path().display().to_string();
@@ -657,6 +740,7 @@ impl AppRoot {
         self.main = Some(shell);
         self.lock = Some(lock);
         self.instance = Some(entry.clone());
+        self.local_mode = false;
         self.state = State::Main;
         self.error = None;
         // active 指向被点开的实例（保存失败不影响本次打开，只提示）。
@@ -801,6 +885,12 @@ impl AppRoot {
         self.main.is_some()
     }
 
+    /// Main 是否来自**本地（不同步）**入口（测试/诊断；同步实例 Main 恒为 `false`）。
+    #[must_use]
+    pub const fn is_local_mode(&self) -> bool {
+        self.local_mode
+    }
+
     /// Main 里的 `AppShell`（**只读投影**，测试断言"自动打开了哪篇"用）。
     #[must_use]
     pub fn main_shell(&self) -> Option<&Entity<AppShell>> {
@@ -884,6 +974,34 @@ impl AppRoot {
             }
         };
         self.profile = Some(profile.clone());
+        // 第一方插件设置区（模板/日记）：首次打开设置页时创建（面板持有 IME 输入框）。
+        // 订阅启用开关：关掉插件后左栏对应分类立即消失（不必重开设置页）。
+        if self.templates_settings.is_none() {
+            let panel = cx.new(crate::templates::TemplatesSettingsPanel::new);
+            self.plugin_settings_subs.push(cx.subscribe(
+                &panel,
+                |root: &mut AppRoot,
+                 _panel: Entity<crate::templates::TemplatesSettingsPanel>,
+                 _event: &crate::templates::TemplatesSettingsEvent,
+                 cx| {
+                    root.on_plugin_enabled_changed(cx);
+                },
+            ));
+            self.templates_settings = Some(panel);
+        }
+        if self.daily_notes_settings.is_none() {
+            let panel = cx.new(crate::daily_notes::DailyNotesSettingsPanel::new);
+            self.plugin_settings_subs.push(cx.subscribe(
+                &panel,
+                |root: &mut AppRoot,
+                 _panel: Entity<crate::daily_notes::DailyNotesSettingsPanel>,
+                 _event: &crate::daily_notes::DailyNotesSettingsEvent,
+                 cx| {
+                    root.on_plugin_enabled_changed(cx);
+                },
+            ));
+            self.daily_notes_settings = Some(panel);
+        }
         let active = match profile.active() {
             Ok(active) => active.cloned(),
             Err(active_error) => {
@@ -925,8 +1043,8 @@ impl AppRoot {
                 root.settings_save(cx);
             }
         });
-        self.settings_sync_open = false;
         self.settings_management_open = false;
+        self.clamp_settings_section();
         self.settings = Some(SettingsState {
             active,
             mode,
@@ -947,7 +1065,6 @@ impl AppRoot {
         if self.settings.take().is_none() {
             return;
         }
-        self.settings_sync_open = false;
         self.settings_management_open = false;
         if self.state == State::Main {
             // 下一帧把焦点还给编辑器（设置打开时焦点在 relay 输入框）。
@@ -962,18 +1079,82 @@ impl AppRoot {
         self.settings.is_some()
     }
 
-    /// 展开/收起设置页里的同步面板（默认收起；不改变任何同步状态）。
-    pub fn settings_toggle_sync(&mut self, cx: &mut Context<Self>) {
+    /// 设置页当前分类（默认 [`SettingsSection::Appearance`]；只记本次会话）。
+    #[must_use]
+    pub const fn settings_section(&self) -> SettingsSection {
+        self.settings_section
+    }
+
+    /// 切换设置页分类（点左侧导航；只重绘，不做任何 IO）。
+    ///
+    /// 设置没打开时是 no-op（导航不存在）；同一分类重复点击也只重绘一次。
+    /// 已关闭的插件分类不可选中：目标回退到「插件」页（它没有导航项）。
+    pub fn settings_select_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         if self.settings.is_none() {
             return;
         }
-        self.settings_sync_open = !self.settings_sync_open;
+        let section = if section.is_plugin() && !section.is_enabled() {
+            SettingsSection::Plugins
+        } else {
+            section
+        };
+        if self.settings_section != section {
+            self.settings_section = section;
+            cx.notify();
+        }
+    }
+
+    /// 切换第一方插件总开关（「插件」分类里的行；固定分类传入时 no-op）。
+    ///
+    /// 直接复用插件自己的持久化（`templates.json` / `daily-notes.json` 的 `enabled`），
+    /// **不新建第二份开关状态**；关闭当下若正停在那个插件分类，立即回退到「插件」。
+    /// 侧栏 ribbon 由 `AppShell` 按同一份 `enabled` 渲染，这里只触发一次重绘。
+    pub fn settings_toggle_plugin(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.settings.is_none() || !section.is_plugin() {
+            return;
+        }
+        match section {
+            SettingsSection::Templates => {
+                let mut preferences = crate::templates::preferences();
+                preferences.enabled = !preferences.enabled;
+                crate::templates::set_preferences(preferences);
+            }
+            SettingsSection::DailyNotes => {
+                let mut preferences = crate::daily_notes::preferences();
+                preferences.enabled = !preferences.enabled;
+                crate::daily_notes::set_preferences(preferences);
+            }
+            _ => return,
+        }
+        self.after_plugin_enabled_changed(cx);
+    }
+
+    /// 插件设置面板里切换 `enabled` 后的统一收尾（事件订阅回调）。
+    fn on_plugin_enabled_changed(&mut self, cx: &mut Context<Self>) {
+        self.after_plugin_enabled_changed(cx);
+    }
+
+    fn after_plugin_enabled_changed(&mut self, cx: &mut Context<Self>) {
+        self.clamp_settings_section();
+        // 侧栏 ribbon 的入口按同一份 `enabled` 渲染：通知子视图重绘（不重建 AppShell）。
+        if let Some(shell) = self.main.clone() {
+            shell.update(cx, |_shell, cx| cx.notify());
+        }
         cx.notify();
+    }
+
+    /// 当前分类是已关闭的插件分类时回退到「插件」（避免空白页）。
+    fn clamp_settings_section(&mut self) {
+        if self.settings_section.is_plugin() && !self.settings_section.is_enabled() {
+            self.settings_section = SettingsSection::Plugins;
+        }
     }
 
     /// 展开/收起设置页里的「管理（V2 控制面）」区（ADR 0016 S4d1c）。
     ///
     /// 展开时对管理面板调一次 `activate`（触发首次刷新）；收起不改变任何状态。
+    /// V2 管理是 dev-only 实验：产品 `sync-ui` 构建不编译本入口。
+    #[cfg(feature = "dev-sync")]
     pub fn settings_toggle_management(&mut self, cx: &mut Context<Self>) {
         if self.settings.is_none() {
             return;
@@ -997,6 +1178,62 @@ impl AppRoot {
     #[must_use]
     pub const fn settings_management_open(&self) -> bool {
         self.settings_management_open
+    }
+
+    /// V2 管理区（dev-sync 实验）：产品 `sync-ui` 构建恒为 `None`。
+    #[cfg(feature = "sync-ui")]
+    fn v2_management_block_if_enabled(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        #[cfg(feature = "dev-sync")]
+        {
+            if !crate::dev_sync::experimental_v2_ui() {
+                return None;
+            }
+            let management_panel = self
+                .main
+                .as_ref()
+                .and_then(|shell| shell.read(cx).management_panel());
+            let mut block = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .pt(px(4.0))
+                .border_t_1()
+                .border_color(theme::sidebar_border())
+                .child(section_text(if self.settings_management_open {
+                    "管理（实验：V2 控制面 / 通道 A 双签，已展开）"
+                } else {
+                    "管理（实验：V2 控制面 / 通道 A 双签，默认收起）"
+                }))
+                .child(action_button(
+                    "settings-toggle-management",
+                    if self.settings_management_open {
+                        "收起"
+                    } else {
+                        "展开"
+                    },
+                    false,
+                    false,
+                    cx,
+                    |root, cx| root.settings_toggle_management(cx),
+                ));
+            if self.settings_management_open {
+                if let Some(panel) = management_panel {
+                    block = block.child(div().w_full().child(panel));
+                } else {
+                    block = block.child(hint_text(
+                        "管理面板不可用：当前实例没有真实库路径/管理执行体",
+                    ));
+                }
+            }
+            Some(block.into_any_element())
+        }
+        #[cfg(not(feature = "dev-sync"))]
+        {
+            let _ = cx;
+            None
+        }
     }
 
     /// 设置面板 relay 输入框的当前文本（公开字段；`None` = 面板未打开）。
@@ -1356,8 +1593,8 @@ impl AppRoot {
         self.form = Some(FormState {
             instance_id,
             mode_kind: FormCreateMode::Link,
-            // 尚未应用链接：先按 local_dev 展示，应用链接后由 scheme 覆盖。
-            mode: RelayMode::LocalDev,
+            // 尚未应用链接：按本构建可用的默认模式展示，应用链接后由 scheme 覆盖。
+            mode: default_form_mode(),
             remote_consent: false,
             link,
             link_state: None,
@@ -1480,6 +1717,19 @@ impl AppRoot {
             url,
         } = parsed;
         drop(url);
+        // 产品构建（无 dev-sync）只允许 remote_tls：链接的 http scheme 在应用阶段就
+        // 明确拒绝，不把票据带进后续流程（票据未被消费，可人工核对链接）。
+        if !crate::sync_gate::mode_allowed(mode) {
+            fail(
+                self,
+                format!(
+                    "本次构建不开放 relay 模式 {}：产品构建只允许 remote_tls（local_dev 需要 dev-sync 构建）",
+                    mode.as_str()
+                ),
+                cx,
+            );
+            return;
+        }
         let vault_id_hex = menghunote_sync::ids::hex_of(&vault_id);
         let Some(form) = self.form.as_mut() else {
             return;
@@ -1517,7 +1767,7 @@ impl AppRoot {
         if form.link_state.take().is_none() {
             return;
         }
-        form.mode = RelayMode::LocalDev;
+        form.mode = default_form_mode();
         form.remote_consent = false;
         form.error = None;
         self.notice = Some(
@@ -1646,7 +1896,7 @@ impl AppRoot {
         }
         self.join_form = Some(JoinFormState {
             instance_id,
-            mode: RelayMode::LocalDev,
+            mode: default_form_mode(),
             remote_consent: false,
             relay,
             vault_id,
@@ -1766,13 +2016,84 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// 「继续本地」：打开默认 dev vault（**无同步**，明确 DEV 标注）。
+    /// Welcome 的**本地（不同步）**入口文案（同一 selector，按构建区分）。
+    ///
+    /// 渲染与测试共用这唯一来源：产品 =「仅本地使用（不同步）」；
+    /// `dev-sync` =「继续本地（DEV ONLY，无同步）」。
+    #[must_use]
+    pub fn local_entry_label() -> String {
+        if cfg!(feature = "dev-sync") {
+            crate::ui_text::local_dev_action()
+        } else {
+            crate::ui_text::local_action()
+        }
+    }
+
+    /// 「本地（不同步）」：打开本地库并进入 Main（**无同步面板/状态**）。
+    ///
+    /// 两种构建共用 selector 与状态机，行为按编译期特性区分：
+    ///
+    /// - **产品 `sync-ui`**：`ProfileLayout::local_vault_path()`（数据根下
+    ///   `local/vault.sqlite3`）；空库**不播种 demo**、不联网、不建实例、
+    ///   不写 `sync.json`/身份文件；顶部显示「本地模式：不同步」。
+    /// - **`dev-sync`**：保留旧「继续本地」行为 —— 默认 dev vault（含演示树），
+    ///   提示里明确 DEV ONLY（现有测试/开发路径不变）。
+    ///
+    /// 打不开时进 GUI Error 页（[`Self::set_error`]），不静默退出。
     pub fn open_local_vault(&mut self, cx: &mut Context<Self>) {
         if !self.options.allow_local_vault {
             self.notice = Some("本地入口在本进程被禁用（测试注入）".to_owned());
             cx.notify();
             return;
         }
+        if cfg!(feature = "dev-sync") {
+            self.open_local_dev_vault(cx);
+        } else {
+            self.open_local_only_vault(cx);
+        }
+        cx.notify();
+    }
+
+    /// 产品构建的「仅本地使用」：数据根下 `local/vault.sqlite3`，空库不播种。
+    ///
+    /// 数据安全：
+    /// - 不写 `sync.json`（不登记实例）、不建 instance 目录、不写身份文件；
+    /// - 已有库直接复用（`Vault::open`，不重置内容）；
+    /// - 不取实例目录锁（不影响同步实例的锁；本地库与 instances 目录分离）。
+    fn open_local_only_vault(&mut self, cx: &mut Context<Self>) {
+        let path = self.options.layout.local_vault_path();
+        match dev_vault::open_local_vault_at(&path) {
+            Ok(dev) => {
+                let label = dev.path.display().to_string();
+                let vault = dev.vault.clone();
+                let shell = cx.new(|cx| AppShell::new(vault, label, cx));
+                self.main = Some(shell);
+                self.instance = None;
+                self.lock = None;
+                self.local_mode = true;
+                self.state = State::Main;
+                self.error = None;
+                self.notice = Some(crate::ui_text::local_mode_notice());
+            }
+            Err(error) => {
+                let message = sanitize_error(&error, &[]);
+                let dir = path.parent().map_or_else(
+                    || path.display().to_string(),
+                    |dir| dir.display().to_string(),
+                );
+                self.local_mode = false;
+                self.set_error(
+                    crate::ui_text::local_open_failed_title(),
+                    message,
+                    vec![(crate::ui_text::local_dir_label(), dir)],
+                    RetryKind::None,
+                );
+            }
+        }
+    }
+
+    /// `dev-sync` 构建的旧「继续本地」：默认 dev vault + 演示树（行为不变）。
+    fn open_local_dev_vault(&mut self, cx: &mut Context<Self>) {
         match dev_vault::open_dev_vault() {
             Ok(dev) => {
                 let label = dev.path.display().to_string();
@@ -1781,6 +2102,7 @@ impl AppRoot {
                 self.main = Some(shell);
                 self.instance = None;
                 self.lock = None;
+                self.local_mode = true;
                 self.state = State::Main;
                 self.error = None;
                 self.notice = Some(
@@ -1790,15 +2112,18 @@ impl AppRoot {
             }
             Err(error) => {
                 let message = sanitize_error(&error, &[]);
+                self.local_mode = false;
                 self.set_error(
-                    "无法打开本地 dev vault",
+                    crate::ui_text::local_dev_open_failed_title(),
                     message,
-                    vec![("目录".to_owned(), "target/tmp/menghunote-dev".to_owned())],
+                    vec![(
+                        crate::ui_text::local_dir_label(),
+                        "target/tmp/menghunote-dev".to_owned(),
+                    )],
                     RetryKind::None,
                 );
             }
         }
-        cx.notify();
     }
 
     /// 提交 Create 表单（按钮与 Enter 的同一入口）。
@@ -1846,7 +2171,20 @@ impl AppRoot {
             }
             cx.notify();
         };
-        // 0) remote_tls 必须显式确认（链接只预填端点，不构成授权）。
+        // 0) 产品构建（无 dev-sync）在提交前再拒绝一次 local_dev（防御纵深；应用链接时
+        //    已经拒绝过，但测试/未来入口可能直接构造成状态）。
+        if !crate::sync_gate::mode_allowed(mode) {
+            fail(
+                self,
+                format!(
+                    "本次构建不开放 relay 模式 {}：产品构建只允许 remote_tls（local_dev 需要 dev-sync 构建）",
+                    mode.as_str()
+                ),
+                cx,
+            );
+            return;
+        }
+        // 1) remote_tls 必须显式确认（链接只预填端点，不构成授权）。
         if mode == RelayMode::RemoteTls && !remote_consent {
             fail(
                 self,
@@ -2081,6 +2419,17 @@ impl AppRoot {
                 return;
             }
         };
+        if !crate::sync_gate::mode_allowed(target.mode()) {
+            fail(
+                self,
+                format!(
+                    "本次构建不开放 relay 模式 {}：产品构建只允许 remote_tls（local_dev 需要 dev-sync 构建）",
+                    target.mode().as_str()
+                ),
+                cx,
+            );
+            return;
+        }
         let dir_path = PathBuf::from(dir);
         let vault_path = dir_path.join(VAULT_FILE_NAME);
         // 目录校验：普通情况必须"不存在或空目录"；**唯一例外**是本邀请自己的 PENDING
@@ -2633,6 +2982,7 @@ impl AppRoot {
         self.main = Some(shell);
         self.lock = Some(lock);
         self.instance = Some(entry);
+        self.local_mode = false;
         self.state = State::Main;
         self.error = None;
         self.join_form = None;
@@ -2830,6 +3180,7 @@ impl AppRoot {
         self.main = Some(shell);
         self.lock = Some(lock);
         self.instance = Some(entry);
+        self.local_mode = false;
         self.state = State::Main;
         self.error = None;
         self.join_form = None;
@@ -3147,6 +3498,7 @@ impl AppRoot {
         self.main = Some(shell);
         self.lock = Some(lock);
         self.instance = Some(entry);
+        self.local_mode = false;
         self.state = State::Main;
         self.error = None;
         self.notice = Some(match warning {
@@ -3417,8 +3769,10 @@ impl Render for AppRoot {
             }
         }
         // 设置面板：打开后把焦点放到 relay 输入框（不抢编辑器的键盘输入）。
+        // 分类导航之后 relay 输入框可能不在当前分类里：等到「Relay」分类被打开时再聚焦
+        // （焦点不会落到一个没渲染的输入框上，Esc/键盘输入行为可预期）。
         if let Some(settings) = &mut self.settings {
-            if settings.focus_pending {
+            if settings.focus_pending && self.settings_section == SettingsSection::Relay {
                 settings.focus_pending = false;
                 let target = settings.relay.clone();
                 window.defer(cx, move |window, cx| {
@@ -3445,7 +3799,7 @@ impl Render for AppRoot {
             State::Opening => page_column()
                 .debug_selector(|| "app-root-opening".to_string())
                 .child(title_text("正在打开实例…"))
-                .child(banner_text())
+                .when_some(banner_text(), |this, banner| this.child(banner))
                 .child(hint_text("校验公开配置 → 加载受保护身份 → 打开真实库。"))
                 .into_any_element(),
             State::Main => {
@@ -3454,9 +3808,11 @@ impl Render for AppRoot {
                 // 覆盖在 `AppShell` 侧栏底部；点在按钮上不会漏给编辑器。
                 let settings_entry = div()
                     .absolute()
-                    .left(px(8.0))
+                    // 跳过最左侧图标栏（ribbon）：设置入口仍然在侧栏底部，
+                    // 但不能压在 ribbon 按钮上（`RIBBON_WIDTH` 是唯一口径）。
+                    .left(px(8.0 + RIBBON_WIDTH))
                     .bottom(px(30.0))
-                    .w(px(204.0))
+                    .w(px(196.0))
                     .child(action_button(
                         "app-root-settings",
                         crate::ui_text::sidebar_settings(),
@@ -3465,15 +3821,41 @@ impl Render for AppRoot {
                         cx,
                         |root, cx| root.open_settings(cx),
                     ));
-                div()
+                let shell_body = div()
+                    .size_full()
+                    .when_some(shell, |this, shell| this.child(shell));
+                // 本地（不同步）模式：顶部一条固定提示（不覆盖编辑器，也不挤压
+                // `AppShell` 内部状态栏）；同步实例 Main 不渲染这一行。
+                let mut main = div()
                     .relative()
                     .size_full()
-                    .debug_selector(|| "app-root-main".to_string())
-                    .when_some(shell, |this, shell| {
-                        this.child(div().size_full().child(shell))
-                    })
-                    .child(settings_entry)
-                    .into_any_element()
+                    .debug_selector(|| "app-root-main".to_string());
+                if self.local_mode {
+                    main = main.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .size_full()
+                            .child(
+                                div()
+                                    .debug_selector(|| "app-root-local-mode".to_string())
+                                    .w_full()
+                                    .flex_shrink_0()
+                                    .px_2()
+                                    .py_1()
+                                    .border_b(px(1.0))
+                                    .border_color(theme::sidebar_border())
+                                    .bg(theme::sidebar_bg())
+                                    .text_size(px(11.0))
+                                    .text_color(theme::status_bar_text())
+                                    .child(SharedString::from(crate::ui_text::local_mode_notice())),
+                            )
+                            .child(div().flex_1().min_h(px(0.0)).child(shell_body)),
+                    );
+                } else {
+                    main = main.child(shell_body);
+                }
+                main.child(settings_entry).into_any_element()
             }
             State::Error => self.render_error(cx).into_any_element(),
         };
@@ -3539,14 +3921,162 @@ fn hint_text(text: impl Into<SharedString>) -> gpui::Div {
         .child(text.into())
 }
 
-fn banner_text() -> gpui::Div {
+/// 各页顶部的**开发警示条**：`DEV ONLY · 开发同步…`。
+///
+/// 只有 `dev-sync` 构建渲染；产品 `sync-ui` 构建返回 `None`（调用方用 `when_some`，
+/// 不挂任何节点，避免留下空白行/额外 gap）。文案走 `ui_text` + catalog，不硬编码。
+#[cfg(feature = "dev-sync")]
+fn banner_text() -> Option<gpui::Div> {
+    Some(
+        div()
+            .debug_selector(|| "app-root-dev-banner".to_string())
+            .w_full()
+            .text_size(px(11.0))
+            .text_color(theme::danger_text())
+            .child(SharedString::from(
+                crate::ui_text::settings_sync_dev_banner(),
+            )),
+    )
+}
+
+/// 产品构建：没有开发警示条。
+#[cfg(not(feature = "dev-sync"))]
+fn banner_text() -> Option<gpui::Div> {
+    None
+}
+
+/// 左侧导航的一项（固定分类与插件分类共用同一外观/命中）。
+fn settings_nav_item(
+    section: SettingsSection,
+    selected: bool,
+    cx: &mut Context<AppRoot>,
+) -> gpui::Stateful<gpui::Div> {
+    let key = section.key();
     div()
+        .id(SharedString::from(format!("settings-nav-{key}")))
+        .debug_selector(move || format!("settings-nav-{key}"))
         .w_full()
-        .text_size(px(11.0))
-        .text_color(theme::danger_text())
-        .child(SharedString::from(
-            crate::ui_text::settings_sync_dev_banner(),
-        ))
+        .h(px(26.0))
+        .px_2()
+        .flex()
+        .flex_row()
+        .items_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .text_size(px(12.0))
+        .text_color(if selected {
+            theme::link_color()
+        } else {
+            theme::text_color()
+        })
+        .bg(if selected {
+            theme::sidebar_selected_bg()
+        } else {
+            theme::menu_bg()
+        })
+        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+        .child(SharedString::from(section.label()))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |root, _event: &gpui::MouseDownEvent, _window, cx| {
+                root.settings_select_section(section, cx);
+                cx.stop_propagation();
+            }),
+        )
+}
+
+/// 「插件」分类的一行：名称 + 简短说明 + 启用开关（开关读写插件自己的持久化）。
+///
+/// `settings-plugin-<key>` / `-toggle` / `-state` 是固定 selector；只有开关区域可点，
+/// 整行不可点，避免误触。
+fn plugin_switch_row(
+    section: SettingsSection,
+    enabled: bool,
+    cx: &mut Context<AppRoot>,
+) -> gpui::AnyElement {
+    let key = section.key();
+    let row_selector = format!("settings-plugin-{key}");
+    let toggle_selector = format!("settings-plugin-{key}-toggle");
+    let state_selector = format!("settings-plugin-{key}-state");
+    let title = section.label();
+    let description = match section {
+        SettingsSection::Templates => crate::ui_text::settings_plugins_templates_description(),
+        SettingsSection::DailyNotes => crate::ui_text::settings_plugins_daily_notes_description(),
+        _ => String::new(),
+    };
+    let row_id = row_selector.clone();
+    let toggle_id = toggle_selector.clone();
+    // 开关底色：开 = accent，关 = 灰色轨道；滑块永远白色。
+    let track_bg = if enabled {
+        theme::search_toggle_active()
+    } else {
+        theme::input_border()
+    };
+    let knob_bg = theme::search_toggle_active_text();
+    div()
+        .id(SharedString::from(row_id))
+        .debug_selector(move || row_selector)
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .py(px(10.0))
+        .border_b_1()
+        .border_color(theme::sidebar_border())
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme::text_color())
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme::status_bar_text())
+                        .child(SharedString::from(description)),
+                ),
+        )
+        .child(
+            // 视觉上是 iOS/Obsidian 风格的胶囊开关；`-state` 挂在轨道上只作测试锚点，
+            // 不再重复显示「已启用/已停用」文字。
+            div()
+                .id(SharedString::from(toggle_id))
+                .debug_selector(move || toggle_selector)
+                .flex_shrink_0()
+                .w(px(36.0))
+                .h(px(20.0))
+                .p(px(2.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .rounded(px(10.0))
+                .bg(track_bg)
+                .child(
+                    div()
+                        .debug_selector(move || state_selector)
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .rounded_full()
+                        .bg(knob_bg)
+                        .when(enabled, |this| this.ml_auto()),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |root, _event, _window, cx| {
+                        root.settings_toggle_plugin(section, cx);
+                        cx.stop_propagation();
+                    }),
+                ),
+        )
+        .into_any_element()
 }
 
 fn label_text(text: impl Into<SharedString>) -> gpui::Div {
@@ -3653,6 +4183,15 @@ fn checkbox_row(
         )
 }
 
+/// 表单的默认 relay 模式：产品 `sync-ui` 构建没有 `local_dev`，直接选 `remote_tls`。
+fn default_form_mode() -> RelayMode {
+    if local_option_available() {
+        RelayMode::LocalDev
+    } else {
+        RelayMode::RemoteTls
+    }
+}
+
 /// relay 模式选择行（Create/Join/设置共用；ADR 0013 §1）。
 ///
 /// 选择只改**面板/表单状态**：Create/Join 的 remote 提交会被 S3b 边界明确拒绝；
@@ -3677,13 +4216,17 @@ fn mode_selector(
                 .child(SharedString::from("relay 模式：")),
         );
     let remote_available = remote_option_available();
+    let local_available = local_option_available();
     for mode in [RelayMode::LocalDev, RelayMode::RemoteTls] {
         let label = match mode {
             RelayMode::LocalDev => "local_dev（本机开发 / 明文 loopback）",
             RelayMode::RemoteTls => "remote_tls（远程服务器 / HTTPS）",
         };
         let chosen = current == mode;
-        let disabled = mode == RelayMode::RemoteTls && !remote_available;
+        let disabled = match mode {
+            RelayMode::LocalDev => !local_available,
+            RelayMode::RemoteTls => !remote_available,
+        };
         let selector = format!("{prefix}-{}", mode.as_str());
         let handler = on_select.clone();
         row = row.child(action_button(
@@ -3708,7 +4251,9 @@ fn mode_selector(
         div()
             .text_size(px(10.0))
             .text_color(theme::status_bar_text())
-            .child(SharedString::from(if remote_available {
+            .child(SharedString::from(if !local_available {
+                "本次构建不开放 local_dev（产品构建只允许 remote_tls）"
+            } else if remote_available {
                 "远端模式必须显式确认「远程服务器/HTTPS」；pin/指纹仍独立校验"
             } else {
                 "本次构建不开放 remote_tls（只在含 sync 能力的构建里可见）"
@@ -3716,11 +4261,156 @@ fn mode_selector(
     )
 }
 
+/// 设置页左侧分类（Obsidian「选项」式导航；**只在本次会话记住**，不持久化）。
+///
+/// 导航顺序 = 固定分类（[`SettingsSection::FIXED`]）→ 分界线 →
+/// **已启用**的插件分类（[`SettingsSection::PLUGIN_SECTIONS`]，模板/日记）。
+/// 插件关闭后对应分类整项隐藏；停在该分类时由 `AppRoot` 回退到「插件」页。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsSection {
+    /// 外观（主题）。
+    #[default]
+    Appearance,
+    /// 语言 / Language。
+    Language,
+    /// 同步（同步面板：进入分类即渲染，没有展开/收起）。
+    Sync,
+    /// 实例（公开实例列表 + 公开信息复制）。
+    Instances,
+    /// Relay（模式 + 地址 + 远程确认）。
+    Relay,
+    /// 安全（指纹 + V2 实验入口）。
+    Security,
+    /// 插件（第一方核心插件总开关：模板/日记）。
+    Plugins,
+    /// 关于（版本/构建信息）。
+    About,
+    /// 模板（第一方插件设置；仅在模板插件启用时显示）。
+    Templates,
+    /// 日记（第一方插件设置；仅在日记插件启用时显示）。
+    DailyNotes,
+}
+
+impl SettingsSection {
+    /// 固定分类（永远显示；顺序 = 左侧导航顺序，分界线之前）。
+    pub const FIXED: [SettingsSection; 8] = [
+        SettingsSection::Appearance,
+        SettingsSection::Language,
+        SettingsSection::Sync,
+        SettingsSection::Instances,
+        SettingsSection::Relay,
+        SettingsSection::Security,
+        SettingsSection::Plugins,
+        SettingsSection::About,
+    ];
+
+    /// 插件分类（只在对应插件启用时显示；顺序 = 左侧导航顺序，分界线之后）。
+    pub const PLUGIN_SECTIONS: [SettingsSection; 2] =
+        [SettingsSection::Templates, SettingsSection::DailyNotes];
+
+    /// 全部分类（固定在前、插件在后；仅供枚举/测试，导航本身按固定/插件分组渲染）。
+    pub const ALL: [SettingsSection; 10] = [
+        SettingsSection::Appearance,
+        SettingsSection::Language,
+        SettingsSection::Sync,
+        SettingsSection::Instances,
+        SettingsSection::Relay,
+        SettingsSection::Security,
+        SettingsSection::Plugins,
+        SettingsSection::About,
+        SettingsSection::Templates,
+        SettingsSection::DailyNotes,
+    ];
+
+    /// 稳定短名：固定 selector `settings-nav-<key>` / `settings-section-<key>` 用。
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "appearance",
+            SettingsSection::Language => "language",
+            SettingsSection::Sync => "sync",
+            SettingsSection::Instances => "instances",
+            SettingsSection::Relay => "relay",
+            SettingsSection::Security => "security",
+            SettingsSection::Plugins => "plugins",
+            SettingsSection::About => "about",
+            SettingsSection::Templates => "templates",
+            SettingsSection::DailyNotes => "daily_notes",
+        }
+    }
+
+    /// 是否是插件分类（模板/日记；只在启用时出现在导航里）。
+    #[must_use]
+    pub const fn is_plugin(self) -> bool {
+        matches!(
+            self,
+            SettingsSection::Templates | SettingsSection::DailyNotes
+        )
+    }
+
+    /// 是否是固定分类（永远显示）。
+    #[must_use]
+    pub const fn is_fixed(self) -> bool {
+        !self.is_plugin()
+    }
+
+    /// 分类当前是否可用：固定分类恒 `true`；插件分类读插件自己的 `enabled` 偏好。
+    ///
+    /// **不缓存、不复制**开关状态：与侧栏 ribbon 读的是同一份
+    /// `templates.json` / `daily-notes.json`。
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        match self {
+            SettingsSection::Templates => crate::templates::preferences().enabled,
+            SettingsSection::DailyNotes => crate::daily_notes::preferences().enabled,
+            _ => true,
+        }
+    }
+
+    /// 导航项文案（走 `ui_text` 的中英文案，不在渲染里写字面量）。
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            SettingsSection::Appearance => crate::ui_text::settings_nav_appearance(),
+            SettingsSection::Language => crate::ui_text::settings_nav_language(),
+            SettingsSection::Sync => crate::ui_text::settings_nav_sync(),
+            SettingsSection::Instances => crate::ui_text::settings_nav_instances(),
+            SettingsSection::Relay => crate::ui_text::settings_nav_relay(),
+            SettingsSection::Security => crate::ui_text::settings_nav_security(),
+            SettingsSection::Plugins => crate::ui_text::settings_nav_plugins(),
+            SettingsSection::About => crate::ui_text::settings_nav_about(),
+            SettingsSection::Templates => crate::ui_text::settings_nav_templates(),
+            SettingsSection::DailyNotes => crate::ui_text::settings_nav_daily_notes(),
+        }
+    }
+}
+
+/// 当前构建的 feature 列表（「关于」区只读展示；`--no-default-features` 等构建不同）。
+fn build_features() -> String {
+    const FEATURES: [(&str, bool); 3] = [
+        ("sync", cfg!(feature = "sync")),
+        ("sync-ui", cfg!(feature = "sync-ui")),
+        ("dev-sync", cfg!(feature = "dev-sync")),
+    ];
+    let compiled: Vec<&str> = FEATURES
+        .into_iter()
+        .filter_map(|(name, enabled)| enabled.then_some(name))
+        .collect();
+    if compiled.is_empty() {
+        "none".to_owned()
+    } else {
+        compiled.join(" + ")
+    }
+}
+
 impl AppRoot {
-    /// 设置面板（overlay）：实例列表 + active 切换 + relay 编辑 + 公开信息复制。
+    /// 设置面板（overlay）：左侧分类导航 + 右侧**只渲染当前分类**的内容区。
     ///
     /// 只投影公开配置；不持有 setup secret/恢复码/root/manager seed（类型上也没有）。
     /// 关闭/取消不写配置；保存只写公开配置，运行中的 `AppShell`/Vault/worker 不动。
+    ///
+    /// 布局：标题 + 两栏（左侧固定导航 / 右侧独立滚动内容）+ 底部固定（错误/提示/保存/关闭）。
+    /// 覆盖层仍然限高、拦截滚轮（不穿透到底下的编辑器）。
     fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (
             active_entry,
@@ -3980,18 +4670,227 @@ impl AppRoot {
         let error_text = error.unwrap_or_else(crate::ui_text::settings_error_none);
         let notice_text = notice.unwrap_or_else(crate::ui_text::settings_notice_default);
 
-        // 同步面板作为设置页的一部分渲染（唯一设置入口里同时有连接配置与同步操作）；
+        // 同步面板作为「同步」分类的内容（唯一设置入口里同时有连接配置与同步操作）；
         // 默认构建/未启用时 `None`，整块不存在。
-        #[cfg(feature = "dev-sync")]
+        #[cfg(feature = "sync-ui")]
         let sync_panel = self
             .main
             .as_ref()
             .and_then(|shell| shell.read(cx).dev_sync_panel());
-        #[cfg(feature = "dev-sync")]
-        let management_panel = self
-            .main
-            .as_ref()
-            .and_then(|shell| shell.read(cx).management_panel());
+
+        // 当前分类可能是一个刚被关掉的插件分类（例如偏好被外部改过）：回退到「插件」，
+        // 保证内容区永远不是空白页；状态本身由所有开关路径即时同步。
+        let section = if self.settings_section.is_plugin() && !self.settings_section.is_enabled() {
+            SettingsSection::Plugins
+        } else {
+            self.settings_section
+        };
+
+        // ---- 左侧分类导航（固定宽度，独立滚动）----
+        let mut nav = div()
+            .id("settings-nav")
+            .debug_selector(|| "settings-nav".to_string())
+            .w(px(152.0))
+            .flex_shrink_0()
+            .h_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_2()
+            .border_r(px(1.0))
+            .border_color(theme::sidebar_border())
+            .child(
+                div()
+                    .px_1()
+                    .pb_1()
+                    .text_size(px(11.0))
+                    .text_color(theme::status_bar_text())
+                    .child(SharedString::from(crate::ui_text::settings_nav_title())),
+            );
+        // 固定分类永远显示。
+        for item in SettingsSection::FIXED {
+            nav = nav.child(settings_nav_item(item, item == section, cx));
+        }
+        // 分界线：固定项之后、插件项之前（1px 主题线 + 上下间距；整行不可点）。
+        nav = nav.child(
+            div()
+                .debug_selector(|| "settings-nav-divider".to_string())
+                .w_full()
+                .h(px(1.0))
+                .my_1()
+                .flex_shrink_0()
+                .bg(theme::sidebar_border()),
+        );
+        // 插件分类只显示已启用的（关闭后整项消失；ribbon 用同一份 enabled）。
+        for item in SettingsSection::PLUGIN_SECTIONS {
+            if !item.is_enabled() {
+                continue;
+            }
+            nav = nav.child(settings_nav_item(item, item == section, cx));
+        }
+
+        // ---- 右侧内容：只渲染当前分类 ----
+        let section_key = section.key();
+        let mut content = div()
+            .id(SharedString::from(format!(
+                "settings-section-{section_key}"
+            )))
+            .debug_selector(move || format!("settings-section-{section_key}"))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2();
+        match section {
+            SettingsSection::Appearance => {
+                content = content.child(crate::theme_settings::appearance_section());
+            }
+            SettingsSection::Language => {
+                content = content.child(crate::language_settings::language_section());
+            }
+            SettingsSection::Templates => {
+                content = match self.templates_settings.clone() {
+                    Some(panel) => content.child(div().w_full().child(panel)),
+                    None => content.child(hint_text("模板设置尚未初始化（重新打开设置页）")),
+                };
+            }
+            SettingsSection::DailyNotes => {
+                content = match self.daily_notes_settings.clone() {
+                    Some(panel) => content.child(div().w_full().child(panel)),
+                    None => content.child(hint_text("日记设置尚未初始化（重新打开设置页）")),
+                };
+            }
+            SettingsSection::Sync => {
+                // 进入「同步」分类就直接渲染面板内容：不再有展开/收起状态与标题行。
+                // `settings-toggle-sync` 保留为**同步内容容器**（兼容测试/selector 契约）。
+                content = content.child(section_text(crate::ui_text::settings_nav_sync()));
+                let mut sync_content = div()
+                    .id("settings-toggle-sync")
+                    .debug_selector(|| "settings-toggle-sync".to_string())
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2();
+                match sync_panel {
+                    Some(panel) => {
+                        sync_content = sync_content.child(div().w_full().child(panel));
+                    }
+                    None => {
+                        sync_content = sync_content
+                            .child(hint_text(crate::ui_text::settings_sync_unavailable()));
+                    }
+                }
+                content = content.child(sync_content);
+            }
+            SettingsSection::Plugins => {
+                // Obsidian「核心插件」式总开关页：只列**有运行时开关**的第一方插件
+                // （模板/日记）；Mermaid/图谱没有可切换的开关，不列进来。
+                content = content
+                    .child(section_text(crate::ui_text::settings_plugins_title()))
+                    .child(hint_text(crate::ui_text::settings_plugins_hint()))
+                    .child(
+                        div()
+                            .id("settings-plugins")
+                            .debug_selector(|| "settings-plugins".to_string())
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(plugin_switch_row(
+                                SettingsSection::Templates,
+                                crate::templates::preferences().enabled,
+                                cx,
+                            ))
+                            .child(plugin_switch_row(
+                                SettingsSection::DailyNotes,
+                                crate::daily_notes::preferences().enabled,
+                                cx,
+                            )),
+                    );
+            }
+            SettingsSection::Instances => {
+                content = content
+                    .child(section_text(crate::ui_text::settings_instances_title()))
+                    .child(list)
+                    .child(public_section);
+            }
+            SettingsSection::Relay => {
+                content = content
+                    .child(section_text(crate::ui_text::settings_relay_title()))
+                    .child(mode_selector(
+                        "settings-mode",
+                        mode,
+                        cx,
+                        |root, mode, cx| root.settings_set_mode(mode, cx),
+                    ))
+                    .when(mode == RelayMode::RemoteTls, |this| {
+                        this.child(checkbox_row(
+                            "settings-remote-consent",
+                            remote_consent,
+                            crate::ui_text::settings_remote_consent(),
+                            cx,
+                            |root, cx| {
+                                let next = root
+                                    .settings
+                                    .as_ref()
+                                    .is_some_and(|settings| !settings.remote_consent);
+                                root.settings_set_remote_consent(next, cx);
+                            },
+                        ))
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .bg(theme::window_bg())
+                            .border_1()
+                            .border_color(theme::input_border())
+                            .rounded_sm()
+                            .child(relay),
+                    )
+                    .child(hint_text(match mode {
+                        RelayMode::LocalDev => crate::ui_text::settings_relay_local_hint(),
+                        RelayMode::RemoteTls => crate::ui_text::settings_relay_remote_hint(),
+                    }));
+            }
+            SettingsSection::Security => {
+                content =
+                    content.child(self.render_settings_fingerprint(&fingerprint, security, cx));
+                // V2 管理是实验功能：个人用户只需要 V1 设备列表/邀请/移除。
+                // 只在 `dev-sync` 构建 + `MENGHUNOTE_EXPERIMENTAL_V2=1` 时渲染（安全分类下）。
+                content = content
+                    .when_some(self.v2_management_block_if_enabled(cx), |this, block| {
+                        this.child(block)
+                    });
+            }
+            SettingsSection::About => {
+                content = content
+                    .child(section_text(crate::ui_text::settings_about_title()))
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-about-version".to_string())
+                            .w_full()
+                            .text_size(px(12.0))
+                            .text_color(theme::text_color())
+                            .child(SharedString::from(crate::ui_text::settings_about_version(
+                                env!("CARGO_PKG_VERSION"),
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-about-build".to_string())
+                            .w_full()
+                            .text_size(px(11.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(crate::ui_text::settings_about_build(
+                                &build_features(),
+                            ))),
+                    )
+                    .child(hint_text(crate::ui_text::settings_about_hint()));
+            }
+        }
 
         Some(
             div()
@@ -4021,11 +4920,12 @@ impl AppRoot {
                     div()
                         .id("dev-sync-settings")
                         .debug_selector(|| "dev-sync-settings".to_string())
-                        .w(px(680.0))
+                        .w(px(760.0))
                         .h(px(
                             (window.bounds().size.height.as_f32() - 112.0).clamp(240.0, 900.0)
                         ))
-                        .overflow_y_scroll()
+                        // 外层不滚：标题、左导航、右内容、底栏各自约束（内容区独立滚动）。
+                        .overflow_hidden()
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -4049,178 +4949,85 @@ impl AppRoot {
                                 }
                             },
                         ))
-                        .child(title_text(crate::ui_text::settings_sync_dev_title()))
-                        .child(banner_text())
-                        // ADR 0021 P2 + ADR 0020 P1：应用级外观与语言并排，二者互不依赖。
-                        .child(crate::language_settings::appearance_and_language_row())
+                        // 标题用通用「设置」：这是一张带分类导航的产品设置页，
+                        // 不再是只讲同步的卡片（DEV banner 仍然单独一行）。
+                        .child(title_text(crate::ui_text::settings_nav_title()))
+                        .when_some(banner_text(), |this, banner| this.child(banner))
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
-                                .items_center()
-                                .justify_between()
+                                .flex_1()
+                                .min_h(px(0.0))
                                 .w_full()
-                                .child(section_text(if self.settings_sync_open {
-                                    crate::ui_text::settings_sync_panel_expanded()
-                                } else {
-                                    crate::ui_text::settings_sync_panel_collapsed()
-                                }))
-                                .child(action_button(
-                                    "settings-toggle-sync",
-                                    if self.settings_sync_open {
-                                        crate::ui_text::settings_collapse()
-                                    } else {
-                                        crate::ui_text::settings_expand()
-                                    },
-                                    false,
-                                    false,
-                                    cx,
-                                    |root, cx| root.settings_toggle_sync(cx),
-                                )),
-                        )
-                        .when(self.settings_sync_open, |this| {
-                            #[cfg(feature = "dev-sync")]
-                            {
-                                if let Some(panel) = sync_panel {
-                                    return this.child(div().w_full().child(panel));
-                                }
-                            }
-                            this
-                        })
-                        // V2 管理是实验功能：个人用户只需要 V1 设备列表/邀请/移除。
-                        // 默认不渲染；需要验证 S4d1c 时设置 MENGHUNOTE_EXPERIMENTAL_V2=1。
-                        .when(crate::dev_sync::experimental_v2_ui(), |this| {
-                            this.child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .w_full()
-                                    .pt(px(4.0))
-                                    .border_t_1()
-                                    .border_color(theme::sidebar_border())
-                                    .child(section_text(if self.settings_management_open {
-                                        "管理（实验：V2 控制面 / 通道 A 双签，已展开）"
-                                    } else {
-                                        "管理（实验：V2 控制面 / 通道 A 双签，默认收起）"
-                                    }))
-                                    .child(action_button(
-                                        "settings-toggle-management",
-                                        if self.settings_management_open {
-                                            "收起"
-                                        } else {
-                                            "展开"
-                                        },
-                                        false,
-                                        false,
-                                        cx,
-                                        |root, cx| root.settings_toggle_management(cx),
-                                    )),
-                            )
-                            .when(
-                                self.settings_management_open,
-                                |this| {
-                                    #[cfg(feature = "dev-sync")]
-                                    {
-                                        if let Some(panel) = management_panel {
-                                            this.child(div().w_full().child(panel))
-                                        } else {
-                                            this.child(hint_text(
-                                                "管理面板不可用：当前实例没有真实库路径/管理执行体",
-                                            ))
-                                        }
-                                    }
-                                    #[cfg(not(feature = "dev-sync"))]
-                                    {
-                                        this
-                                    }
-                                },
-                            )
-                        })
-                        .child(section_text(crate::ui_text::settings_instances_title()))
-                        .child(list)
-                        .child(section_text(crate::ui_text::settings_relay_title()))
-                        .child(mode_selector(
-                            "settings-mode",
-                            mode,
-                            cx,
-                            |root, mode, cx| root.settings_set_mode(mode, cx),
-                        ))
-                        .when(mode == RelayMode::RemoteTls, |this| {
-                            this.child(checkbox_row(
-                                "settings-remote-consent",
-                                remote_consent,
-                                crate::ui_text::settings_remote_consent(),
-                                cx,
-                                |root, cx| {
-                                    let next = root
-                                        .settings
-                                        .as_ref()
-                                        .is_some_and(|settings| !settings.remote_consent);
-                                    root.settings_set_remote_consent(next, cx);
-                                },
-                            ))
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .px_2()
-                                .py_1()
-                                .bg(theme::window_bg())
-                                .border_1()
-                                .border_color(theme::input_border())
-                                .rounded_sm()
-                                .child(relay),
-                        )
-                        .child(hint_text(match mode {
-                            RelayMode::LocalDev => crate::ui_text::settings_relay_local_hint(),
-                            RelayMode::RemoteTls => crate::ui_text::settings_relay_remote_hint(),
-                        }))
-                        .child(
-                            div()
-                                .debug_selector(|| "settings-error".to_string())
-                                .w_full()
-                                .text_size(px(11.0))
-                                .text_color(if has_error {
-                                    theme::danger_text()
-                                } else {
-                                    theme::status_bar_text()
-                                })
-                                .child(SharedString::from(error_text)),
+                                .child(nav)
+                                .child(
+                                    div()
+                                        .id("settings-content")
+                                        .debug_selector(|| "settings-content".to_string())
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .min_h(px(0.0))
+                                        .h_full()
+                                        .overflow_y_scroll()
+                                        .px_3()
+                                        .py_1()
+                                        .child(content),
+                                ),
                         )
                         .child(
                             div()
-                                .debug_selector(|| "settings-notice".to_string())
                                 .w_full()
-                                .text_size(px(11.0))
-                                .text_color(theme::caret_color())
-                                .child(SharedString::from(notice_text)),
-                        )
-                        .child(
-                            div()
+                                .flex_shrink_0()
                                 .flex()
-                                .flex_row()
-                                .gap_2()
-                                .child(action_button(
-                                    "settings-save",
-                                    crate::ui_text::settings_save(),
-                                    true,
-                                    false,
-                                    cx,
-                                    |root, cx| root.settings_save(cx),
-                                ))
-                                .child(action_button(
-                                    "settings-cancel",
-                                    crate::ui_text::settings_close_without_save(),
-                                    false,
-                                    false,
-                                    cx,
-                                    |root, cx| root.close_settings(cx),
-                                )),
-                        )
-                        .child(self.render_settings_fingerprint(&fingerprint, security, cx))
-                        .child(public_section),
+                                .flex_col()
+                                .gap_1()
+                                .pt(px(4.0))
+                                .border_t_1()
+                                .border_color(theme::sidebar_border())
+                                .child(
+                                    div()
+                                        .debug_selector(|| "settings-error".to_string())
+                                        .w_full()
+                                        .text_size(px(11.0))
+                                        .text_color(if has_error {
+                                            theme::danger_text()
+                                        } else {
+                                            theme::status_bar_text()
+                                        })
+                                        .child(SharedString::from(error_text)),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "settings-notice".to_string())
+                                        .w_full()
+                                        .text_size(px(11.0))
+                                        .text_color(theme::caret_color())
+                                        .child(SharedString::from(notice_text)),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_2()
+                                        .child(action_button(
+                                            "settings-save",
+                                            crate::ui_text::settings_save(),
+                                            true,
+                                            false,
+                                            cx,
+                                            |root, cx| root.settings_save(cx),
+                                        ))
+                                        .child(action_button(
+                                            "settings-cancel",
+                                            crate::ui_text::settings_close_without_save(),
+                                            false,
+                                            false,
+                                            cx,
+                                            |root, cx| root.close_settings(cx),
+                                        )),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -4356,7 +5163,7 @@ impl AppRoot {
         let mut column = page_column()
             .debug_selector(|| "app-root-welcome".to_string())
             .child(title_text("menghunote · 同步实例"))
-            .child(banner_text())
+            .when_some(banner_text(), |this, banner| this.child(banner))
             .child(
                 content_column()
                     .child(
@@ -4409,22 +5216,29 @@ impl AppRoot {
                     ),
             );
         if self.options.allow_local_vault {
-            column = column.child(
-                content_column()
-                    .child(section_text("没有同步需求？"))
-                    .child(hint_text(
-                        "「继续本地」打开默认 dev vault（target/tmp/menghunote-dev）；\
-                         它不联网、没有同步面板，仅供开发。",
-                    ))
-                    .child(action_button(
-                        "app-root-local",
-                        "继续本地（DEV ONLY，无同步）",
-                        false,
-                        false,
-                        cx,
-                        |root, cx| root.open_local_vault(cx),
-                    )),
-            );
+            // 本地（不同步）：同一 selector，两种构建文案不同（产品 = 仅本地使用；
+            // dev-sync = 旧「继续本地」开发入口）。产品额外显示本地库实际路径，
+            // 让用户知道数据落在哪（不联网、不建同步实例）。
+            let mut local = content_column()
+                .child(section_text(crate::ui_text::local_welcome_title()))
+                .child(hint_text(if cfg!(feature = "dev-sync") {
+                    crate::ui_text::local_dev_hint()
+                } else {
+                    crate::ui_text::local_welcome_hint()
+                }));
+            if !cfg!(feature = "dev-sync") {
+                local = local.child(hint_text(crate::ui_text::local_path_hint(
+                    &self.options.layout.local_vault_path().display().to_string(),
+                )));
+            }
+            column = column.child(local.child(action_button(
+                "app-root-local",
+                Self::local_entry_label(),
+                false,
+                false,
+                cx,
+                |root, cx| root.open_local_vault(cx),
+            )));
         }
         let notice = self.notice.clone();
         column.when_some(notice, |this, notice| {
@@ -4612,7 +5426,7 @@ impl AppRoot {
         let mut column = page_column()
             .debug_selector(|| "app-root-create-form".to_string())
             .child(title_text(title))
-            .child(banner_text())
+            .when_some(banner_text(), |this, banner| this.child(banner))
             .child(content);
         let notice = self.notice.clone();
         column = column.when_some(notice, |this, notice| {
@@ -4649,7 +5463,7 @@ impl AppRoot {
         let column = page_column()
             .debug_selector(|| "app-root-join-form".to_string())
             .child(title_text("加入已有同步实例（Join）"))
-            .child(banner_text())
+            .when_some(banner_text(), |this, banner| this.child(banner))
             .child(
                 content_column()
                     .child(mode_selector(
@@ -4840,7 +5654,7 @@ impl AppRoot {
         let mut column = page_column()
             .debug_selector(|| "app-root-invite-pending".to_string())
             .child(title_text("等待创建者批准（邀请加入）"))
-            .child(banner_text())
+            .when_some(banner_text(), |this, banner| this.child(banner))
             .child(
                 content_column()
                     .child(section_text(
@@ -4935,7 +5749,7 @@ impl AppRoot {
         let column = page_column()
             .debug_selector(|| "app-root-working".to_string())
             .child(title_text(kind.title()))
-            .child(banner_text())
+            .when_some(banner_text(), |this, banner| this.child(banner))
             .child(
                 content_column()
                     .child(
@@ -4987,7 +5801,7 @@ impl AppRoot {
         let column = page_column()
             .debug_selector(|| "app-root-backup".to_string())
             .child(title_text("备份恢复码（只显示这一次）"))
-            .child(banner_text())
+            .when_some(banner_text(), |this, banner| this.child(banner))
             .child(
                 content_column()
                     .child(
@@ -5173,7 +5987,7 @@ impl AppRoot {
         let mut column = page_column()
             .debug_selector(|| "app-root-error".to_string())
             .child(title_text(error.title.clone()))
-            .child(banner_text())
+            .when_some(banner_text(), |this, banner| this.child(banner))
             .child(
                 content_column()
                     .child(
@@ -5344,5 +6158,31 @@ mod tests {
         .expect("写身份文件失败");
         let error = validate_instance_directory(&empty).expect_err("已有身份必须拒绝");
         assert!(error.contains("已有身份文件"), "{error}");
+    }
+
+    /// 分类分组契约：固定分类在前、插件分类在后；两组拼起来就是 `ALL`。
+    #[test]
+    fn settings_sections_split_into_fixed_and_plugin_groups() {
+        assert_eq!(
+            SettingsSection::FIXED.len() + SettingsSection::PLUGIN_SECTIONS.len(),
+            SettingsSection::ALL.len()
+        );
+        assert_eq!(
+            &SettingsSection::ALL[..SettingsSection::FIXED.len()],
+            &SettingsSection::FIXED[..]
+        );
+        assert_eq!(
+            &SettingsSection::ALL[SettingsSection::FIXED.len()..],
+            &SettingsSection::PLUGIN_SECTIONS[..]
+        );
+        assert!(SettingsSection::FIXED
+            .iter()
+            .all(|section| section.is_fixed() && !section.is_plugin()));
+        assert!(SettingsSection::PLUGIN_SECTIONS
+            .iter()
+            .all(|section| section.is_plugin() && !section.is_fixed()));
+        // 默认分类是「外观」（固定组第一项）。
+        assert_eq!(SettingsSection::default(), SettingsSection::Appearance);
+        assert_eq!(SettingsSection::default(), SettingsSection::FIXED[0]);
     }
 }

@@ -2,7 +2,9 @@
 
 mod support;
 
-use menghunote_storage::{list_notes, list_tree, NodeKind, StructureWriter, TreeEntry};
+use menghunote_storage::{
+    list_notes, list_tree, list_tree_sorted, NodeKind, StructureWriter, TreeEntry, TreeSort,
+};
 use support::*;
 
 fn open_writer(vault: &menghunote_storage::Vault) -> StructureWriter {
@@ -192,4 +194,231 @@ fn folder_without_commit_is_not_listed_until_projected() {
 
     writer.commit("create").expect("提交");
     assert_eq!(list_tree(&vault).expect("读树")[0].title, "待提交");
+}
+
+// ---------------------------------------------------------------------------
+// 侧栏排序（`list_tree_sorted`）：目录优先 + 六种排序键
+// ---------------------------------------------------------------------------
+
+fn titles(entries: &[TreeEntry]) -> Vec<&str> {
+    entries.iter().map(|entry| entry.title.as_str()).collect()
+}
+
+/// 根级：目录 F1、笔记 beta、目录 F2、笔记 Alpha；F1 下：目录 Sub、笔记 笔记乙、笔记 笔记甲。
+fn sorted_sample(vault: &menghunote_storage::Vault) {
+    let mut writer = open_writer(vault);
+    writer.doc().create_note("beta", 100).expect("笔记");
+    let f1 = writer.doc().create_folder("F1", 101).expect("目录");
+    writer.doc().create_note("Alpha", 102).expect("笔记");
+    writer.doc().create_folder("F2", 103).expect("目录");
+    let sub = writer.doc().create_folder("Sub", 104).expect("子目录");
+    writer
+        .doc()
+        .move_node(&sub, Some(&f1), 105)
+        .expect("挂子目录");
+    let yi = writer.doc().create_note("笔记乙", 106).expect("笔记");
+    writer
+        .doc()
+        .move_node(&yi.node_id, Some(&f1), 107)
+        .expect("挂笔记乙");
+    let jia = writer.doc().create_note("笔记甲", 108).expect("笔记");
+    writer
+        .doc()
+        .move_node(&jia.node_id, Some(&f1), 109)
+        .expect("挂笔记甲");
+    writer.commit("sorted-sample").expect("提交结构");
+}
+
+#[test]
+fn sorted_view_puts_folders_before_notes_at_every_level() {
+    let (_dir, vault) = fresh_vault();
+    sorted_sample(&vault);
+
+    let tree = list_tree_sorted(&vault, TreeSort::NameAsc).expect("读树");
+    assert_eq!(
+        titles(&tree),
+        vec!["F1", "Sub", "笔记乙", "笔记甲", "F2", "Alpha", "beta"],
+        "每个层级目录都在笔记前；组内按文件名 A-Z"
+    );
+    // 深度/父子结构保留：Sub 在 F1 之后 depth 1，笔记在 Sub 之后仍 depth 1
+    assert_eq!(
+        tree.iter().map(|entry| entry.depth).collect::<Vec<_>>(),
+        vec![0, 1, 1, 1, 0, 0, 0]
+    );
+    assert_eq!(tree[2].parent_id.as_deref(), Some(tree[0].node_id.as_str()));
+    assert_eq!(tree[1].parent_id.as_deref(), Some(tree[0].node_id.as_str()));
+
+    // 与 rank 顺序不同：rank 顺序是创建顺序（beta、F1、Alpha、F2 …）
+    let ranked = list_tree(&vault).expect("读 rank 树");
+    assert_eq!(
+        titles(&ranked),
+        vec!["beta", "F1", "Sub", "笔记乙", "笔记甲", "Alpha", "F2"],
+        "list_tree 的公共语义保持不变（rank 顺序）"
+    );
+}
+
+#[test]
+fn name_sort_is_case_insensitive_and_chinese_stable() {
+    let (_dir, vault) = fresh_vault();
+    let mut writer = open_writer(&vault);
+    for (index, title) in ["beta", "Alpha", "alpha", "笔记乙", "笔记甲"]
+        .iter()
+        .enumerate()
+    {
+        writer
+            .doc()
+            .create_note(title, 100 + index as i64)
+            .expect("笔记");
+    }
+    writer.commit("names").expect("提交");
+
+    let asc = list_tree_sorted(&vault, TreeSort::NameAsc).expect("读树");
+    assert_eq!(
+        titles(&asc),
+        vec!["Alpha", "alpha", "beta", "笔记乙", "笔记甲"],
+        "大小写不敏感（alpha < beta），大小写全同再按原串；中文按码点稳定"
+    );
+    let desc = list_tree_sorted(&vault, TreeSort::NameDesc).expect("读树");
+    assert_eq!(
+        titles(&desc),
+        vec!["笔记甲", "笔记乙", "beta", "alpha", "Alpha"],
+        "Z-A 是 A-Z 的严格逆序（末位 node_id 兜底仍确定）"
+    );
+
+    // 两次调用完全一致（纯函数式读取，不依赖 HashMap 迭代顺序）
+    assert_eq!(
+        list_tree_sorted(&vault, TreeSort::NameAsc).expect("读树"),
+        asc
+    );
+}
+
+#[test]
+fn six_sort_keys_use_joined_timestamps() {
+    let (_dir, vault) = fresh_vault();
+    let mut writer = open_writer(&vault);
+    // 创建时间 A(10) < B(20) < C(30)；随后 A 改到 updated=15、B 改到 updated=25。
+    // → 创建序 A,B,C；修改序（新→旧）C,B,A；两者方向一致但数值可区分。
+    let a = writer.doc().create_note("A", 10).expect("A");
+    let b = writer.doc().create_note("B", 20).expect("B");
+    let c = writer.doc().create_note("C", 30).expect("C");
+    writer.doc().rename(&a.node_id, "A", 15).expect("A 改名");
+    writer.doc().rename(&b.node_id, "B", 25).expect("B 改名");
+    // C 不再编辑：updated_at = created_at = 30
+    assert!(!c.node_id.is_empty());
+    writer.commit("times").expect("提交");
+
+    let tree = list_tree(&vault).expect("读 rank 树");
+    let find = |title: &str| {
+        tree.iter()
+            .find(|entry| entry.title == title)
+            .unwrap_or_else(|| panic!("缺少 {title}"))
+    };
+    assert_eq!(find("A").created_at, Some(10));
+    assert_eq!(find("A").updated_at, Some(15), "updated_at 跟着改名");
+    assert_eq!(find("B").created_at, Some(20));
+    assert_eq!(find("B").updated_at, Some(25));
+    assert_eq!(find("C").created_at, Some(30));
+    assert_eq!(find("C").updated_at, Some(30));
+
+    assert_eq!(
+        titles(&list_tree_sorted(&vault, TreeSort::NameAsc).expect("读树")),
+        vec!["A", "B", "C"]
+    );
+    assert_eq!(
+        titles(&list_tree_sorted(&vault, TreeSort::NameDesc).expect("读树")),
+        vec!["C", "B", "A"]
+    );
+    assert_eq!(
+        titles(&list_tree_sorted(&vault, TreeSort::UpdatedNewest).expect("读树")),
+        vec!["C", "B", "A"],
+        "修改时间 新→旧（30 / 25 / 15）"
+    );
+    assert_eq!(
+        titles(&list_tree_sorted(&vault, TreeSort::UpdatedOldest).expect("读树")),
+        vec!["A", "B", "C"],
+        "修改时间 旧→新"
+    );
+    assert_eq!(
+        titles(&list_tree_sorted(&vault, TreeSort::CreatedNewest).expect("读树")),
+        vec!["C", "B", "A"],
+        "创建时间 新→旧（30 / 20 / 10）"
+    );
+    assert_eq!(
+        titles(&list_tree_sorted(&vault, TreeSort::CreatedOldest).expect("读树")),
+        vec!["A", "B", "C"],
+        "创建时间 旧→新"
+    );
+}
+
+#[test]
+fn sorted_view_keeps_folders_group_and_depths_with_time_keys() {
+    let (_dir, vault) = fresh_vault();
+    sorted_sample(&vault);
+    for sort in TreeSort::ALL {
+        let tree = list_tree_sorted(&vault, sort).expect("读树");
+        assert_eq!(tree.len(), 7, "{sort:?} 不能丢节点");
+        // 每个目录后面紧跟它的全部后代（折叠依赖的连续区间性质）
+        for (index, entry) in tree.iter().enumerate() {
+            if entry.is_folder() {
+                let next_is_child = tree
+                    .get(index + 1)
+                    .is_some_and(|next| next.depth == entry.depth + 1);
+                if entry.title == "F1" {
+                    assert!(next_is_child, "{sort:?}：F1 后必须紧跟子项");
+                }
+            }
+        }
+        // 目录永远在笔记前：每个层级只看「同一 parent」的兄弟序列
+        for parent in [None, Some(tree[0].node_id.as_str())] {
+            let siblings: Vec<&TreeEntry> = tree
+                .iter()
+                .filter(|entry| entry.parent_id.as_deref() == parent)
+                .collect();
+            let first_note = siblings.iter().position(|entry| entry.is_note());
+            let last_folder = siblings.iter().rposition(|entry| entry.is_folder());
+            if let (Some(first_note), Some(last_folder)) = (first_note, last_folder) {
+                assert!(
+                    last_folder < first_note,
+                    "{sort:?}：目录必须全在笔记前：{siblings:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sorted_view_skips_deleted_and_reports_folder_timestamps_as_none() {
+    let (_dir, vault) = fresh_vault();
+    let mut writer = open_writer(&vault);
+    let folder = writer.doc().create_folder("目录", 10).expect("目录");
+    let gone = writer.doc().create_note("会被删", 11).expect("笔记");
+    writer.doc().create_note("留下", 12).expect("笔记");
+    writer.commit("create").expect("提交");
+    writer
+        .doc()
+        .delete_note(&gone.node_id, 13)
+        .expect("删除笔记");
+    writer.commit("delete").expect("提交删除");
+
+    let tree = list_tree_sorted(&vault, TreeSort::UpdatedNewest).expect("读树");
+    assert_eq!(titles(&tree), vec!["目录", "留下"]);
+    assert_eq!(tree[0].node_id, folder);
+    assert!(tree[0].is_folder());
+    assert_eq!(tree[0].created_at, None, "目录没有 notes 行 → 无时间戳");
+    assert_eq!(tree[0].updated_at, None);
+    assert!(tree[1].is_note());
+    assert!(tree[1].created_at.is_some() && tree[1].updated_at.is_some());
+}
+
+#[test]
+fn tree_sort_round_trips_through_stable_keys() {
+    for sort in TreeSort::ALL {
+        assert_eq!(sort.as_str(), sort.as_str());
+        assert_eq!(TreeSort::parse(sort.as_str()), Some(sort));
+    }
+    assert_eq!(TreeSort::default(), TreeSort::NameAsc);
+    assert_eq!(TreeSort::parse("name_asc"), Some(TreeSort::NameAsc));
+    assert_eq!(TreeSort::parse("  name_desc "), Some(TreeSort::NameDesc));
+    assert_eq!(TreeSort::parse("bogus"), None);
+    assert_eq!(TreeSort::parse(""), None);
 }

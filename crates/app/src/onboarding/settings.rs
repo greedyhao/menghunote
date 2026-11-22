@@ -64,11 +64,21 @@ pub(crate) struct SettingsState {
 
 /// 本构建是否提供 `remote_tls` 选项（ADR 0013 §1：模式能力来自编译期，不看环境变量）。
 ///
-/// `onboarding` 只在 `dev-sync` feature 下编译（它隐含 `sync`），因此当前构建恒为
-/// `true`；保留这个单一判定点，默认构建没有任何 sync UI（选项在类型上不存在）。
+/// `onboarding` 只在 `sync-ui`（默认）下编译（它隐含 `sync`），因此当前构建恒为
+/// `true`；保留这个单一判定点，无 sync UI 的构建里选项在类型上不存在。
 #[must_use]
 pub(crate) const fn remote_option_available() -> bool {
     cfg!(feature = "sync") && crate::sync_gate::mode_allowed(RelayMode::RemoteTls)
+}
+
+/// 本构建是否提供 `local_dev` 选项。
+///
+/// **产品 `sync-ui` 构建恒为 `false`**（只有 `dev-sync` 打开 `mode_allowed(LocalDev)`）。
+/// UI 用它在模式选择器里禁用 local_dev，并在表单默认值上直接选 remote_tls；真正的
+/// 拒绝仍在 [`crate::sync_gate::parse_for_build`]（单一权威，不在 UI 复制策略）。
+#[must_use]
+pub(crate) const fn local_option_available() -> bool {
+    cfg!(feature = "sync") && crate::sync_gate::mode_allowed(RelayMode::LocalDev)
 }
 
 /// 校验设置面板里的 relay 编辑值；成功返回**canonical origin**。
@@ -119,6 +129,7 @@ mod tests {
     use super::*;
 
     /// 合法 loopback（含 IPv6/端口边界）通过，并去掉首尾空白。
+    #[cfg(feature = "dev-sync")]
     #[test]
     fn loopback_relays_are_accepted_and_trimmed() {
         for good in [
@@ -149,49 +160,17 @@ mod tests {
         }
     }
 
-    /// 空值/模式不符/userinfo/路径都拒绝；错误不回显 userinfo。
+    /// remote 的负例：scheme/userinfo/路径/query/fragment 都拒绝，且不回显 userinfo。
     #[test]
-    fn invalid_relays_are_rejected_without_echoing_credentials() {
-        for (bad, mode, needle) in [
-            ("", RelayMode::LocalDev, "不能为空"),
-            ("https://127.0.0.1:18080", RelayMode::LocalDev, "http://"),
-            (
-                "http://relay.example:18080",
-                RelayMode::LocalDev,
-                "loopback",
-            ),
-            ("http://192.168.1.9:18080", RelayMode::LocalDev, "loopback"),
-            ("http://0.0.0.0:18080", RelayMode::LocalDev, "loopback"),
-            ("http://127.0.0.2:18080", RelayMode::LocalDev, "loopback"),
-            (
-                "http://user:pass@127.0.0.1:18080",
-                RelayMode::LocalDev,
-                "userinfo",
-            ),
-            (
-                "http://127.0.0.1:18080/api",
-                RelayMode::LocalDev,
-                "canonical origin",
-            ),
-            ("http://relay.example", RelayMode::RemoteTls, "https"),
-            (
-                "https://user:pass@relay.example",
-                RelayMode::RemoteTls,
-                "userinfo",
-            ),
-            (
-                "https://relay.example/api",
-                RelayMode::RemoteTls,
-                "canonical origin",
-            ),
-            ("https://relay.example?x=1", RelayMode::RemoteTls, "query"),
-            (
-                "https://relay.example#frag",
-                RelayMode::RemoteTls,
-                "fragment",
-            ),
+    fn invalid_remote_relays_are_rejected_without_echoing_credentials() {
+        for (bad, needle) in [
+            ("http://relay.example", "https"),
+            ("https://user:pass@relay.example", "userinfo"),
+            ("https://relay.example/api", "canonical origin"),
+            ("https://relay.example?x=1", "query"),
+            ("https://relay.example#frag", "fragment"),
         ] {
-            let error = validate_relay_edit(bad, mode).expect_err("必须拒绝");
+            let error = validate_relay_edit(bad, RelayMode::RemoteTls).expect_err("必须拒绝");
             assert!(error.contains(needle), "{bad:?} → {error}");
             if bad.contains("pass") {
                 assert!(!error.contains("pass"), "不得回显 userinfo：{error}");
@@ -200,11 +179,62 @@ mod tests {
         }
     }
 
+    /// local_dev 的负例只在 dev-sync 构建有意义（产品构建在 parse_for_build 就拒绝模式）。
+    #[cfg(feature = "dev-sync")]
     #[test]
-    fn remote_option_is_compile_time_capability() {
-        // dev-sync 构建隐含 sync：remote_tls 一定可用；local_dev 只在 dev-sync 构建可用。
+    fn invalid_local_relays_are_rejected_without_echoing_credentials() {
+        for (bad, needle) in [
+            ("", "不能为空"),
+            ("https://127.0.0.1:18080", "http://"),
+            ("http://relay.example:18080", "loopback"),
+            ("http://192.168.1.9:18080", "loopback"),
+            ("http://0.0.0.0:18080", "loopback"),
+            ("http://127.0.0.2:18080", "loopback"),
+            ("http://user:pass@127.0.0.1:18080", "userinfo"),
+            ("http://127.0.0.1:18080/api", "canonical origin"),
+        ] {
+            let error = validate_relay_edit(bad, RelayMode::LocalDev).expect_err("必须拒绝");
+            assert!(error.contains(needle), "{bad:?} → {error}");
+            if bad.contains("pass") {
+                assert!(!error.contains("pass"), "不得回显 userinfo：{error}");
+                assert!(!error.contains("user:"), "不得回显 userinfo：{error}");
+            }
+        }
+    }
+
+    /// 产品构建（默认 sync-ui）必须明确拒绝 local_dev，只允许 remote_tls。
+    #[cfg(not(feature = "dev-sync"))]
+    #[test]
+    fn product_build_rejects_local_dev_mode() {
+        assert!(!local_option_available(), "产品构建不得开放 local_dev 选项");
+        for raw in [
+            "http://127.0.0.1:18080",
+            "http://localhost:18080",
+            "http://[::1]:18080",
+        ] {
+            let error = validate_relay_edit(raw, RelayMode::LocalDev)
+                .expect_err("产品构建必须拒绝 local_dev");
+            assert!(
+                error.contains("不开放 relay 模式") && error.contains("local_dev"),
+                "{raw:?} → {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_capabilities_are_compile_time_facts() {
+        // 所有含 sync 能力的构建都允许 remote_tls；local_dev 只在 dev-sync 构建允许。
         assert!(remote_option_available());
         assert!(crate::sync_gate::mode_allowed(RelayMode::RemoteTls));
+        assert_eq!(
+            local_option_available(),
+            crate::sync_gate::mode_allowed(RelayMode::LocalDev),
+            "UI 选项与构建期能力必须同源"
+        );
+        #[cfg(feature = "dev-sync")]
+        assert!(local_option_available(), "dev-sync 构建开放 local_dev");
+        #[cfg(not(feature = "dev-sync"))]
+        assert!(!local_option_available(), "产品构建关闭 local_dev");
     }
 
     #[test]

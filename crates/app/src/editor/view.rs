@@ -56,7 +56,7 @@ use menghunote_editor::{
     SINGLE_INSERT, TASK_BOX_DISPLAY,
 };
 use menghunote_storage::rename_links::{plan_wiki_link_renames, scalar_edits_for_renames};
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 use menghunote_storage::session::{
     AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease, ExternalCommitTicket, GateError,
     GateState, PreparedCommittedDelta,
@@ -169,11 +169,17 @@ struct EditorContextMenu {
 /// 正文右键菜单的内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditorContextMenuTarget {
-    /// 正文空白处：「插入 → 表格」。
-    InsertTable,
+    /// 正文空白处：「插入 → 表格」/「插入 → 模板…」（模板插件启用时多一项）。
+    Insert,
     /// 普通链接：打开 / 复制链接 / 复制 Markdown。
     Link(ExternalLinkHit),
 }
+
+/// 正文右键菜单「插入 → 模板…」多一行时增加的高度（像素）。
+///
+/// 既有 `theme::EDITOR_CONTEXT_MENU_HEIGHT` 是「表头 + 一行」的高度；模板插件启用时
+/// 多一行，菜单面板与命中矩形都要同步变高（位图/几何保持同源）。
+const INSERT_TEMPLATE_ROW_HEIGHT: f32 = 26.0;
 
 /// 链接右键菜单的三个动作（与菜单项一一对应）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +230,8 @@ pub enum EditorEvent {
     PointerDown,
     /// 按了 `Ctrl+K` / `Ctrl+F`：请宿主打开搜索浮层。
     SearchRequested,
+    /// 右键菜单「插入 → 模板…」：请宿主打开模板选择器（覆盖层/需要窗口聚焦）。
+    TemplatePickerRequested,
     /// 一次粘贴/拖放的资产导入结果（宿主据此写提示行；失败时正文与引用都未改变）。
     ImportReported(Box<ImportReport>),
     /// 点击 wiki 链接：目标与可选的 `#heading`（解析/打开由宿主负责）。
@@ -578,7 +586,7 @@ pub struct EditorView {
     ///
     /// 只在 `EditOutcome::Applied` 上自增：远端 adopt 不经过 `submit_request`，
     /// 所以"远端 ACK 不触发自动同步"是结构性的，不依赖调用点自觉。
-    #[cfg(feature = "dev-sync")]
+    #[cfg(feature = "sync-ui")]
     local_edit_seq: u64,
 }
 
@@ -630,7 +638,7 @@ impl EditorView {
             link_notice: None,
             swallow_mouse_up: false,
             zoomed_image: None,
-            #[cfg(feature = "dev-sync")]
+            #[cfg(feature = "sync-ui")]
             local_edit_seq: 0,
         };
         view.spawn_pump(cx);
@@ -3071,10 +3079,10 @@ impl EditorView {
         }
         let target = match link {
             Some(hit) => EditorContextMenuTarget::Link(hit),
-            None => EditorContextMenuTarget::InsertTable,
+            None => EditorContextMenuTarget::Insert,
         };
         let label = match &target {
-            EditorContextMenuTarget::InsertTable => "插入 → 表格",
+            EditorContextMenuTarget::Insert => "插入 → 表格/模板",
             EditorContextMenuTarget::Link(_) => "链接动作",
         };
         self.context_menu = Some(EditorContextMenu { position, target });
@@ -3347,6 +3355,54 @@ impl EditorView {
     /// 清掉非阻塞链接提示（下一次点击/按键时调用）。
     pub(crate) fn clear_link_notice(&mut self) {
         self.link_notice = None;
+    }
+
+    /// 右键菜单「插入 → 模板…」：只发事件给宿主（选择器是宿主覆盖层）。
+    ///
+    /// - 菜单随即关闭；同一次手势的 mouse-up 由 `swallow_mouse_up` 吞掉，**不移动 caret**；
+    /// - 持闸 / IME 组合中直接忽略（不打开选择器，避免把组合串/未保存编辑丢掉）；
+    /// - 插入位置仍是打开菜单时的 caret/选区（选择器只负责挑模板）。
+    pub(crate) fn request_template_picker(&mut self, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.swallow_mouse_up = true;
+        self.pending_enter_text_input = false;
+        if self.frozen_by_external_commit() {
+            self.link_notice = Some(crate::ui_text::templates_insert_failed());
+            eprintln!("[menghunote] 同步持闸中：忽略「插入 → 模板…」（不产生请求）");
+            cx.notify();
+            return;
+        }
+        if self.is_composing() {
+            eprintln!("[menghunote] IME 组合中：忽略「插入 → 模板…」（不产生请求）");
+            cx.notify();
+            return;
+        }
+        cx.emit(EditorEvent::TemplatePickerRequested);
+        cx.notify();
+    }
+
+    /// 宿主插入一段**已渲染**的模板正文（右键「插入 → 模板…」/「从模板新建」/「今日日记」）。
+    ///
+    /// - 有选区则替换、折叠 caret 则插入；走 [`Self::insert_text`]，因此**一次**
+    ///   `EditRequest`（一个撤销组），不自己拼 `ScalarEdit`；
+    /// - 持闸 / IME 组合 / 单元格就地编辑中拒绝（返回 `false`，正文零变化）；
+    /// - 返回值 = 是否真的产生了已提交的请求（空文本 / no-op 返回 `false`）。
+    pub(crate) fn insert_template_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if self.frozen_by_external_commit() || self.is_composing() || self.is_editing_table_cell() {
+            return false;
+        }
+        // 模板是普通正文：清掉对象/单元格的临时选中态，别让旧选中影响后续交互。
+        self.selected_object_line = None;
+        self.selected_table_cell = None;
+        self.table_axis_selection = None;
+        self.pending_enter_text_input = false;
+        let before = self.request_seq;
+        self.insert_text(text, cx);
+        self.ensure_caret_visible(self.controller.selection().head());
+        self.request_seq != before
     }
 
     /// 右键菜单「插入 → 表格」：在**当前 caret/选区**处插入一张默认 GFM 表格
@@ -5589,7 +5645,7 @@ impl EditorView {
         }
         match &outcome {
             EditOutcome::Applied(applied) => {
-                #[cfg(feature = "dev-sync")]
+                #[cfg(feature = "sync-ui")]
                 {
                     // ADR 0012 S3：本地编辑代数（自动同步尾缘 debounce 的触发源）。
                     self.local_edit_seq = self.local_edit_seq.saturating_add(1);
@@ -5995,7 +6051,7 @@ impl EditorView {
 /// 因此 adopt 之后**不需要重开文档**也能看到远端文字。
 ///
 /// 切片 4 的 worker 会从这些方法之上搭（网络/push 都不在这里）。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 impl EditorView {
     /// 登记一次外部提交（对当前活动文档）。
     pub fn dev_sync_begin_external(
@@ -6735,8 +6791,18 @@ impl EditorView {
         let geometry = self.shared.geometry()?;
         let (viewport_width, viewport_height) = self.shared.viewport();
         let width = theme::EDITOR_CONTEXT_MENU_WIDTH;
+        // 「插入」菜单：模板插件启用时多一行「模板…」，面板与命中矩形同步变高。
+        let insert_template = matches!(menu.target, EditorContextMenuTarget::Insert)
+            && crate::templates::preferences().enabled;
         let height = match menu.target {
-            EditorContextMenuTarget::InsertTable => theme::EDITOR_CONTEXT_MENU_HEIGHT,
+            EditorContextMenuTarget::Insert => {
+                theme::EDITOR_CONTEXT_MENU_HEIGHT
+                    + if insert_template {
+                        INSERT_TEMPLATE_ROW_HEIGHT
+                    } else {
+                        0.0
+                    }
+            }
             EditorContextMenuTarget::Link(_) => theme::EDITOR_CONTEXT_MENU_LINK_HEIGHT,
         };
         let local_left = (menu.position.x - geometry.origin.x).as_f32().clamp(
@@ -6756,7 +6822,7 @@ impl EditorView {
         ));
 
         let panel = match menu.target {
-            EditorContextMenuTarget::InsertTable => {
+            EditorContextMenuTarget::Insert => {
                 let item = div()
                     .id("editor-context-insert-table")
                     .debug_selector(|| "editor-context-insert-table".to_string())
@@ -6775,6 +6841,27 @@ impl EditorView {
                             view.insert_table_from_context_menu(Some(window), cx);
                         }),
                     );
+                // 模板插件启用时多一行「模板…」（选择器由宿主渲染；这里只发事件）。
+                let template_item = insert_template.then(|| {
+                    div()
+                        .id("editor-context-insert-template")
+                        .debug_selector(|| "editor-context-insert-template".to_string())
+                        .flex()
+                        .items_center()
+                        .h(px(24.0))
+                        .px(px(8.0))
+                        .rounded(px(4.0))
+                        .text_size(px(13.0))
+                        .text_color(theme::object_toolbar_text())
+                        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                        .child(SharedString::from(crate::ui_text::editor_menu_template()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                                view.request_template_picker(cx);
+                            }),
+                        )
+                });
 
                 div()
                     .flex()
@@ -6794,6 +6881,7 @@ impl EditorView {
                             .child(SharedString::from(crate::ui_text::editor_menu_insert())),
                     )
                     .child(item)
+                    .when_some(template_item, |this, item| this.child(item))
             }
             EditorContextMenuTarget::Link(_) => {
                 // 链接菜单：三个动作，全部在 mouse-down 上执行；动作后由

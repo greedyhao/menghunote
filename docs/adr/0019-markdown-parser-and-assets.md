@@ -1388,8 +1388,9 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 - 一个后台 worker（串行，并发 1）：`render_svg_for_preview` → `SvgRenderer` 光栅化 →
   写缓存；主线程只 `request/state/take_completed`，`pump` 完成计数触发重绘。
 - cache key = 源码 **FNV-1a 64 + 字节长度** + `MERMAN_VERSION`（`0.10.0`）+ 主题 id
-  （M2 = `light`）+ 渲染宽度桶（64px，夹在 128–2048）。同一 key 只渲染一次；失败也缓存
-  为终态（避免每帧重试），工具条「重新渲染」可强制丢弃终态重排一次。
+  （M2 固定 `light`；M3a 起使用真实 `light`/`dark`）+ 渲染宽度桶（64px，夹在
+  128–2048）。同一 key 只渲染一次；失败也缓存为终态（避免每帧重试），工具条
+  「重新渲染」可强制丢弃终态重排一次。
 - LRU：64 MiB / 最多 64 项（失败项零字节，防病态笔记刷爆表）。
 - 光栅预算：单边 ≤ 4096 device px、总像素 ≤ 8 MP（约 32 MiB BGRA）；超限先等比缩小，
   异常 SVG 仍超则 `TooLarge`。失败/空/超限都不 panic、不改正文。
@@ -1421,7 +1422,8 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 ### 18.6 已知限制 / 风险
 
 - **字体/主题**：光栅化走系统字体（GPUI SvgRenderer 的 fontdb）；Merman 的确定性只保证
-  SVG 字符串，**不保证**跨平台像素一致。CJK/暗色主题/字体替换是 M3。
+  SVG 字符串，**不保证**跨平台像素一致。暗色主题与 CJK 字体回退已在 M3a 完成
+  （见 §18.8）；导出/子进程隔离等仍在 M3 后续，字体替换仍需真机看观感。
 - **缓存作用域**：`MermaidService` 与 `ImageService` 一样是 **per-view**（打开/切换笔记
   会重建 EditorView，Mermaid 会重新渲染）；同一视图内同源码不重复渲染。跨文档共享缓存
   需另做（不在 M2）。
@@ -1493,6 +1495,85 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 - 反引号补全靠平台文本输入路径（Windows 实际按键/IME 仍需真机确认）；表格单元格
   浮层编辑走输入框，不经过自动补全。
 - 未做 SVG 文字拖选/复制；工具条仍只有「编辑源码 / 重新渲染」。
+
+### 18.8 M3a 实施记录（2026-11-18，暗色主题 + CJK 字体回退）
+
+> 输入：[`docs/notes/editor-backlog-links-mermaid.md`](../notes/editor-backlog-links-mermaid.md)
+> §2「M3」。本切片只做**暗色 SVG 配色 + CJK 字体回退**，并保持 M1/M2 的
+> 输入/输出上限、`catch_unwind`、`ResvgSafe` 管线与失败回退语义。
+> **不做**：SVG/HTML/PDF 导出、独立子进程 + 超时隔离、WebView、跨文档共享缓存、
+> Mermaid 文字选择。
+
+#### 主题 API（`crates/app/src/mermaid.rs`）
+
+- `render_svg_for_preview(source: &str, theme: crate::theme::ThemeId)`：预览入口新签名。
+  浅色 → `ThemePreset::EditorLight`，深色 → `ThemePreset::EditorDark`；通过
+  `RenderRequest::svg(...).with_theme(compiled)` 绑定到**整条**解析→布局→SVG 管线。
+  `render_svg`（Parity SVG，浏览器/未来导出）保持 M1 语义，**不**绑定主题。
+- 主题编译走 merman 内置 `DiagramThemeCompiler`：`export_preset(preset)` →
+  `with_cjk_font_fallback(recipe)` → `compile_recipe(recipe)`。编译结果按预设
+  `OnceLock` 缓存（`DiagramTheme` 内部 `Arc`，clone 只加引用）；编译失败映射为
+  `MermaidError::Render`，调用方仍回退源码，不 panic。
+- **浅色外观**：M2 的“无主题”输出（Mermaid 默认调色板）→ EditorLight（白底
+  `#ffffff`、深色文字 `#0f172a`）。画布/文字对比度有单测（WCAG AA ≥ 4.5，实测
+  浅/深色都远高于阈值）；`A-->B` 的 SVG 自然尺寸由 `168×156` 变为 `168×162`
+  （预设排版差异），headless 几何断言已同步更新。
+- **深色外观**：EditorDark 深色画布 `#0f172a`、浅色文字 `#e5e7eb`；与应用深色
+  `editor_bg #0d1117` 有一个很浅的层次差（画布即“图卡片”），不额外绘制背板。
+
+#### 缓存 / worker 接线（`editor/mermaid_preview.rs`）
+
+- `MermaidCacheKey` 继续携带主题 id（ADR 0021 P2 已接），新增
+  `theme_id() -> ThemeId` 供 worker 解析；`MermaidService::request` 只按 key 去重。
+- `Job::Render` 与 `RenderFn` 均携带 `ThemeId`：
+  生产为 `render_svg_for_preview(source, theme)`；测试可注入 fake 并记录主题。
+  worker **不读全局主题**，避免“主线程已切主题、任务却是旧 key”的竞态。
+- 行为：浅/深色 key 不同 → 各渲染一次；同一主题重复请求/帧循环命中缓存；
+  切主题后旧 key 不命中、新 key 渲染一次；再切回旧主题命中缓存（不重复渲染）。
+
+#### CJK 字体回退
+
+- merman 的 `SvgEnvironment::deterministic()` 不读系统字体：**排版**是确定性的；
+  **画字**由显示层 GPUI `SvgRenderer`（usvg/fontdb）按 `font-family` 链解析。
+- 内置预设字体栈为 `Inter, ui-sans-serif, system-ui, sans-serif`；编译前把
+  `Microsoft YaHei`、`Noto Sans CJK SC` 插到通用族 `sans-serif` 之前（幂等）：
+  `Inter, ui-sans-serif, system-ui, "Microsoft YaHei", "Noto Sans CJK SC", sans-serif`。
+  只改 SVG 字体栈声明，**不携带字体文件、不新增依赖**；缺失字体仍由 usvg 的
+  per-char fallback 兜底。
+- 真实中文标签（`flowchart TD\n  开始[开始] --> 结束[结束]`）：
+  - ResvgSafe 后是两个 SVG `<text>`（无 `foreignObject`），浅/深色均可渲染；
+  - 单元测试用真实 `SvgRenderer` 光栅化，对照“空标签”为 0 个文字色像素，
+    中文标签出现 ≥100 个 `#e5e7eb` 文字墨迹像素（本机 Linux = 772）；
+  - headless 深色 AppShell 下从占位（Loading）收敛为 Ready，中文标签不失败。
+- **Windows 真机仍需人工确认**字体回退观感（是否出现方框/字重/度量差异）；
+  headless 只能证明“选中了能覆盖 CJK 的系统字体并画出了墨迹”。
+
+#### 测试与计数（本机 Linux，`CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`）
+
+- `crates/app/src/mermaid.rs` **16**（+3）：浅/深色调色板不同 + 文字/画布对比度；
+  字体栈包含四个回退族且通用族在最后；中文标签是 SVG `<text>` 且同主题字节级稳定。
+- `crates/app/src/editor/mermaid_preview.rs` **12**（+2）：浅/深色 key 不同、
+  worker 各渲染一次并记录主题、同主题命中缓存、新宽度桶才再渲染；真实光栅化
+  CJK 墨迹。
+- `crates/app/tests/headless_mermaid.rs` **5**（M2 原 5，几何期望更新为 168×162）。
+- `crates/app/tests/headless_mermaid_theme.rs` **1**（新，单独 binary）：真实
+  AppShell 浅色 Ready → 切深色占位 Loading → 深色 CJK Ready（只多渲染一次）→
+  切回浅/深色命中缓存；正文/选区不变；落库正文逐字节不变。
+- 命令与结果：
+  - `cargo fmt --all -- --check` = 通过；
+  - `cargo clippy -p menghunote-app --all-targets --features dev-sync -- -D warnings`
+    = 通过（0 warning）；
+  - `cargo test -p menghunote-app --features dev-sync` = **626 passed / 0 failed**；
+  - `cargo test -p menghunote-app` = **380 passed / 0 failed**。
+
+#### 已知限制
+
+- **未做导出**：SVG/HTML/PDF 导出、子进程隔离 + 超时仍是后续切片；当前安全边界
+  仍为 256 KiB / 8 MiB + `catch_unwind` + ResvgSafe。
+- **缓存仍 per-view**：切换笔记会重建 `EditorView` 并重新渲染；跨文档共享缓存未做。
+- **主题范围**：只认内置 `light`/`dark`；自定义主题包（ADR 0021 P5）后置。
+- **真机未验**：Windows 的字体回退观感、高 DPI 清晰度、深色画布与编辑器底色
+  的层次感仍需 `ui_smoke.ps1` 人工验收。
 
 ## 19. 外部链接增强实施记录（2026-11-17，Ctrl/Cmd+单击 / 右键菜单 / scheme 策略 / 内部链接）
 

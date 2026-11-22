@@ -432,6 +432,9 @@ pub struct PartUpload<'a> {
     /// **原样**的 MNE1 信封字节（relay 不解密）。
     pub envelope: &'a [u8],
     /// checkpoint/轮换的维护 reservation（非空表示走 `R` 预算）。
+    ///
+    /// 只影响**新字节**的计费来源；同一分片的逐字节幂等重放与它无关（轮换期写入的
+    /// ASSET 在激活后可由普通 checkpoint 的 reservation 重放，仍返回 duplicate）。
     pub reservation: Option<&'a Id16>,
 }
 
@@ -503,10 +506,6 @@ pub fn put_part(
             if mismatch {
                 return Err(Error::api(ErrorCode::IdConflict));
             }
-            if obj.reservation_id != reservation.copied() {
-                // 要么全部维护片、要么全部正常片，不允许中途换预算来源。
-                return Err(Error::api(ErrorCode::IdConflict));
-            }
             (obj.budget_class, obj.reservation_id, obj.state)
         }
         None => {
@@ -545,6 +544,11 @@ pub fn put_part(
     };
 
     // 4) 重复分片：同字节幂等 200（不重复计费），不同字节 409。
+    //
+    // 这一判定先于下面的"预算来源一致"检查：轮换期重加密的 ASSET 挂在 rotation
+    // reservation 上，激活之后普通 checkpoint 会用 checkpoint reservation 重传同一
+    // `object_id` 的确定性密文（task-121）。只要逐字节相同，就必须回 200/duplicate
+    // ——对象只存一份、不重复计费、也不产生新行；不同字节仍然拒绝。
     if let Some(existing_digest) = part_digest(conn, path_object, path_part)? {
         if existing_digest == part_hash {
             return Ok(PartPutOutcome {
@@ -556,6 +560,15 @@ pub fn put_part(
             });
         }
         return Err(Error::api(ErrorCode::PartConflict));
+    }
+    // 4b) 只有"补缺失分片"才要求预算来源一致：已落库字节属于哪份 reservation，新字节
+    //     就必须继续由同一来源计费（避免对象的 reservation 消耗与实际字节脱节，也避免
+    //     跨设备续传绕过 owner 校验）。同字节重放已在上面成功返回，不受此限制——这正是
+    //     rotation→checkpoint 复用成立的关键。
+    if let Some(obj) = &existing {
+        if obj.reservation_id != reservation.copied() {
+            return Err(Error::api(ErrorCode::IdConflict));
+        }
     }
     if state == ObjectState::Complete {
         // 已完成对象不可再补片（内容不同）；幂等重放走上面的同字节分支。

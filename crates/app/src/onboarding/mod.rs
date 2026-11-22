@@ -13,7 +13,8 @@
 //!        ├─ 创建新的同步实例 → CreateForm → Working → BackupRequired → Main
 //!        ├─ 加入已有同步实例 → JoinForm  → Working → Main（成功即写配置，无备份页）
 //!        ├─ 打开已保存实例 → Main
-//!        └─ 继续本地（默认 dev vault，明确 DEV 标注）→ Main（无同步面板）
+//!        └─ 仅本地使用（不同步）→ Main（无同步面板；产品 = 数据根下 local/vault.sqlite3，
+//!           dev-sync = 旧「继续本地」默认 dev vault）
 //! ```
 //!
 //! ## 各文件职责（互不越界）
@@ -88,8 +89,8 @@ pub use invite_copy::{
 pub use join::{JoinEvent, JoinFailureKind, JoinJob, JoinOutcome, JoinRequest, JoinStage};
 pub use layout::{
     generate_instance_id, validate_instance_id, DevSyncProfile, InstanceEntry, ProfileError,
-    ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, PROFILE_VERSION, PROFILE_VERSION_V1,
-    VAULT_FILE_NAME,
+    ProfileLayout, ProfileStore, RelayApiVersion, RelayMode, LOCAL_DIR_NAME, PROFILE_VERSION,
+    PROFILE_VERSION_V1, VAULT_FILE_NAME,
 };
 pub use lock::{InstanceLock, LockError, LOCK_FILE_NAME};
 

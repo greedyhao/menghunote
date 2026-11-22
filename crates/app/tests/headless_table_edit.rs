@@ -517,7 +517,9 @@ async fn narrow_window_keeps_the_corner_buttons_inside_the_viewport(cx: &mut Tes
 
     let (host, cx) = open_shell(cx, vault);
     let view = active_view(&host, cx);
-    cx.simulate_resize(size(px(320.0), px(600.0)));
+    // 320 = 最左侧图标栏 44 + 侧栏 220 + 编辑区 56（旧基线 320 时编辑区 100）。
+    // 要复现"窄但可用"的编辑区，窗口宽度按 ribbon 宽度整体加宽，几何契约不变。
+    cx.simulate_resize(size(px(364.0), px(600.0)));
     cx.run_until_parked();
     let rect = object_rect(TABLE_LINE, &view, cx);
     cx.simulate_click(rect.center(), Modifiers::default());

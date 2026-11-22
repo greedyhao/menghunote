@@ -5456,6 +5456,7 @@ name = "menghunote-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "gpui-kit",
  "image",
  "menghunote-dev-relay",
@@ -5504,6 +5505,15 @@ version = "0.1.0"
 dependencies = [
  "menghunote-text",
  "pulldown-cmark",
+]
+
+[[package]]
+name = "menghunote-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "menghunote-i18n",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

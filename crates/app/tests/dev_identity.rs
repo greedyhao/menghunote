@@ -25,7 +25,9 @@ use menghunote_app::dev_sync::service::ServiceConfig;
 use menghunote_app::dev_sync::DevIdentityStore;
 use menghunote_app::dev_vault;
 use menghunote_app::shell::AppShell;
-use menghunote_storage::{list_tree, load_body_doc, load_head, STRUCTURE_DOC_ID};
+use menghunote_storage::{
+    list_tree, list_tree_sorted, load_body_doc, load_head, TreeSort, STRUCTURE_DOC_ID,
+};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 /// 测试进程级的 `XDG_DATA_HOME`（Linux 用户主键；Windows 是 no-op）。
@@ -228,6 +230,16 @@ impl Render for ShellHost {
     }
 }
 
+/// 根级演示笔记（排序后通常是最后一行）的正文文档 ID。
+fn dev_vault_root_note_doc(vault: &menghunote_storage::Vault) -> String {
+    list_tree_sorted(vault, TreeSort::NameAsc)
+        .expect("读结构树")
+        .into_iter()
+        .find(|entry| entry.title == dev_vault::DEMO_TITLE)
+        .and_then(|entry| entry.body_doc_id)
+        .expect("根级演示笔记必须有 body_doc_id")
+}
+
 #[gpui::test]
 async fn app_shell_uses_identity_peer_for_structure_and_session(cx: &mut TestAppContext) {
     ensure_test_user_key();
@@ -248,11 +260,8 @@ async fn app_shell_uses_identity_peer_for_structure_and_session(cx: &mut TestApp
     assert!(dev.seeded, "空实例库必须播种");
     let tree = list_tree(&dev.vault).expect("读结构树");
     assert_eq!(tree.len(), 3, "demo 树必须 3 个节点");
-    let first_doc = tree[0]
-        .body_doc_id
-        .clone()
-        .expect("第一篇笔记必须有 body_doc_id");
-
+    // `AppShell` 打开的是**侧栏展示顺序**（目录优先 + A-Z）的第一篇笔记；
+    // 本测试随后会点开根级演示笔记，用它的 body doc 做会话断言。
     // 3) 真实 AppShell（dev-sync 启用路径，显式注入身份 peer + epoch）。
     let vault = dev.vault.clone();
     let config = DevSyncConfig {
@@ -277,6 +286,16 @@ async fn app_shell_uses_identity_peer_for_structure_and_session(cx: &mut TestApp
 
     // 4) 会话路径：点正文 → 键入一个字母（真实输入通道 → 会话 flush）。
     //
+    // 启动时打开的是排序后的第一篇（目录内那篇，正文较短）；显式点开根级演示笔记，
+    // 让"正文仍完整（> 100 字符）"这类断言有判别力。
+    // 侧栏（目录优先 + A-Z）：0 = 目录 / 1 = 目录内笔记 / 2 = 根级演示笔记。
+    let root_row = cx
+        .debug_bounds("tree-row-2")
+        .expect("tree-row-2 必须是根级演示笔记");
+    cx.simulate_click(root_row.center(), Modifiers::default());
+    cx.run_until_parked();
+    let first_doc = dev_vault_root_note_doc(&dev.vault);
+    //
     // 先记下 durable seq：播种本身已经带身份 peer，若不确认"本次又写了新 op"，
     // 下面的 VV 断言就没有判别力（新 op 必须让 head_seq 前进）。
     let body_seq_before = load_head(&dev.vault, &first_doc)
@@ -294,9 +313,10 @@ async fn app_shell_uses_identity_peer_for_structure_and_session(cx: &mut TestApp
     let structure_seq_before = load_head(&dev.vault, STRUCTURE_DOC_ID)
         .expect("读结构 head")
         .head_seq;
+    // 侧栏是「目录优先 + 文件名 A-Z」：demo 树里的目录在**第一行**。
     let folder = cx
-        .debug_bounds("tree-row-1")
-        .expect("tree-row-1 必须是目录行");
+        .debug_bounds("tree-row-0")
+        .expect("tree-row-0 必须是目录行");
     cx.simulate_mouse_down(folder.center(), MouseButton::Right, Modifiers::default());
     cx.run_until_parked();
     let item = cx

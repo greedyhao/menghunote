@@ -2,25 +2,29 @@
 //!
 //! 启动有三条互不混淆的路径（顺序 = 优先级）：
 //!
-//! 1. **显式 dev-sync CLI**（`--dev-sync*` / `MENGHUNOTE_DEV_SYNC=1`，含 Create/Join/
-//!    Info/Publish）：沿用 ADR 0009 的启动生命周期，开窗后根视图是 `AppShell`
-//!    ——自动化/测试兼容，行为不变。
-//! 2. **默认构建**（无 `dev-sync` feature）：打开 dev vault（`target/tmp/menghunote-dev/`，
-//!    可用 `MENGHUNOTE_DEV_VAULT` 覆盖），根视图 `AppShell`，行为完全不变。
-//! 3. **带 `dev-sync` feature 且没有显式 CLI 模式**（ADR 0011 新增）：**不再要求**任何
-//!    env/flag——先开窗，根视图是 [`AppRoot`]（Welcome/Create 表单/备份页/错误页/主界面），
-//!    已有有效公开配置 + 身份时启动直接进 Main。
+//! 1. **显式 dev-sync CLI**（仅 `dev-sync` 构建：`--dev-sync*` / `MENGHUNOTE_DEV_SYNC=1`，
+//!    含 Create/Join/Info/Publish）：沿用 ADR 0009 的启动生命周期，开窗后根视图是
+//!    `AppShell`——自动化/测试兼容，行为不变。
+//! 2. **产品同步 UI**（`sync-ui`，**默认 feature**：`cargo build/run -p menghunote-app`）：
+//!    **不需要**任何 env/flag——先开窗，根视图是 [`AppRoot`]（Welcome/Create 表单/
+//!    备份页/错误页/主界面），已有有效公开配置 + 身份时启动直接进 Main。产品构建只
+//!    允许 `remote_tls`；`local_dev` 仍由 `dev-sync` 单独控制。
+//! 3. **无同步 UI**（`--no-default-features`，或只开 `sync`）：打开 dev vault
+//!    （`target/tmp/menghunote-dev/`，可用 `MENGHUNOTE_DEV_VAULT` 覆盖），根视图
+//!    `AppShell`，行为与 P1 之前的默认构建完全一致（保留给纯开发/演示路径）。
 //!
-//! 第 3 条是 ADR 0011 的产品入口：真实用户不再需要 `MENGHUNOTE_DEV_VAULT`、`--dev-sync`
-//! 或命令行就能创建同步实例。CLI/env 只保留给自动化。
+//! 第 2 条是 ADR 0011 的产品入口：真实用户不再需要 `MENGHUNOTE_DEV_VAULT`、
+//! `--dev-sync` 或命令行就能创建同步实例。CLI/env 只保留给自动化。
 
 use anyhow::Result;
 use gpui::{
     px, size, App, AppContext as _, Bounds, SharedString, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
+#[cfg(any(not(feature = "sync-ui"), feature = "dev-sync"))]
 use menghunote_app::dev_vault;
 use menghunote_app::platform;
+#[cfg(any(not(feature = "sync-ui"), feature = "dev-sync"))]
 use menghunote_app::shell::AppShell;
 
 fn main() -> Result<()> {
@@ -37,14 +41,14 @@ fn main() -> Result<()> {
     // 后面 `scale_factor` / 显示器尺寸的数值就是它的下游表现。
     platform::log_startup_dpi_report();
 
-    // ---- dev-sync：编译期门禁 + 运行时门禁（ADR 0009 / ADR 0011）----
+    // ---- 启动路径：编译期门禁决定入口（P1：sync-ui 是产品路径，dev-sync 是 dev 路径）----
     //
-    // 编译期门禁是 `--features dev-sync`；`gate::resolve` 是第二道运行时闸，但它的语义
-    // 在 ADR 0011 后分成两支：
-    // - **请求启用**（显式 `--dev-sync*` 或 `MENGHUNOTE_DEV_SYNC=1`）→ 旧 CLI 生命周期，
-    //   配置不合法（缺 vault / relay 非 loopback）仍然**明确报错退出**，不静默回退；
-    // - **没有请求启用** → 不是错误：进入 ADR 0011 的 GUI 向导（`AppRoot`），由公开配置
-    //   （而不是环境变量）决定打开哪个实例。
+    // 1. `dev-sync`：保留旧的运行时门禁（ADR 0009 / ADR 0011）。`gate::resolve` 的语义
+    //    分两支：
+    //    - **请求启用**（显式 `--dev-sync*` 或 `MENGHUNOTE_DEV_SYNC=1`）→ 旧 CLI 生命周期，
+    //      配置不合法（缺 vault / relay 非 loopback）仍然**明确报错退出**，不静默回退；
+    //    - **没有请求启用** → 不是错误：进入 GUI 向导（`AppRoot`），由公开配置（而不是
+    //      环境变量）决定打开哪个实例。
     #[cfg(feature = "dev-sync")]
     {
         let args: Vec<String> = std::env::args().collect();
@@ -59,14 +63,21 @@ fn main() -> Result<()> {
             }
         }
     }
-    #[cfg(not(feature = "dev-sync"))]
+    // 2. 产品同步 UI（默认构建）：没有 `--dev-sync*` 入口，直接进 AppRoot 向导。
+    #[cfg(all(feature = "sync-ui", not(feature = "dev-sync")))]
+    {
+        run_onboarding_window()
+    }
+    // 3. 无同步 UI（`--no-default-features` / 只开 `sync`）：保持 P1 之前的 dev vault 入口。
+    #[cfg(not(feature = "sync-ui"))]
     {
         run_default_window()
     }
 }
 
-/// 默认路径（无 `dev-sync` feature）：打开 dev vault → `AppShell`（与迁移前逐字节一致）。
-#[cfg(not(feature = "dev-sync"))]
+/// 无同步 UI 路径（`--no-default-features` / 只开 `sync`）：打开 dev vault → `AppShell`
+/// （与 P1 之前逐字节一致，保留给纯开发/演示）。
+#[cfg(not(feature = "sync-ui"))]
 fn run_default_window() -> Result<()> {
     let dev = dev_vault::open_dev_vault()?;
     println!(
@@ -108,14 +119,14 @@ fn run_default_window() -> Result<()> {
 ///
 /// 目录解析失败（HOME/LOCALAPPDATA 都没有）是**错误**：不静默回退 cwd/tmp。此时还没
 /// 有窗口，直接带着明确原因退出。
-#[cfg(feature = "dev-sync")]
+#[cfg(feature = "sync-ui")]
 fn run_onboarding_window() -> Result<()> {
     use menghunote_app::onboarding::{AppRoot, AppRootOptions};
     let options = AppRootOptions::discover(|key| std::env::var(key).ok()).map_err(|error| {
         anyhow::anyhow!("同步向导无法确定数据目录（不静默回退临时目录）：{error}")
     })?;
     println!(
-        "[menghunote] 同步向导：配置 = {}；实例目录 = {}（DEV ONLY / localhost）",
+        "[menghunote] 同步向导：配置 = {}；实例目录 = {}",
         options.layout.config_path.display(),
         options.layout.instances_dir.display()
     );
@@ -284,6 +295,7 @@ fn window_options(title: &'static str, bounds: Bounds<gpui::Pixels>) -> WindowOp
 }
 
 /// 状态栏用的短标签：`<父目录>/<文件名>`（不打印完整绝对路径）。
+#[cfg(any(not(feature = "sync-ui"), feature = "dev-sync"))]
 fn short_vault_label(path: &std::path::Path) -> String {
     let file = path.file_name().map_or_else(
         || path.display().to_string(),

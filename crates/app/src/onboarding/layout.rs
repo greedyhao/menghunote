@@ -10,16 +10,32 @@
 //! - 恢复码只在 Create 成功后的备份页内存里存在（`onboarding::create` 的 `Zeroizing`），
 //!   从 `serialize` 的字段集合里根本不存在——这不是"记得别写"，而是类型上写不进去。
 //!
-//! ## 默认位置（ADR 0011）
+//! ## 默认位置（ADR 0011；P2 改成产品目录）
 //!
 //! | 平台 | 数据 | 配置 |
 //! | --- | --- | --- |
-//! | Windows | `%LOCALAPPDATA%\menghunote-dev\instances\<id>\` | `%LOCALAPPDATA%\menghunote-dev\dev-sync.json` |
-//! | Linux | `$XDG_DATA_HOME/menghunote-dev/instances/<id>/` | `$XDG_CONFIG_HOME/menghunote-dev/dev-sync.json` |
+//! | Windows | `%LOCALAPPDATA%\menghunote\instances\<id>\` | `%LOCALAPPDATA%\menghunote\sync.json` |
+//! | Linux | `$XDG_DATA_HOME/menghunote/instances/<id>/` | `$XDG_CONFIG_HOME/menghunote/sync.json` |
 //!
 //! 环境变量缺失时分别回退 `~/.local/share` 与 `~/.config`；**HOME 也没有就报错**，
 //! 绝不回退 cwd/tmp（真实使用把库留在临时目录是数据丢失）。测试用
 //! [`ProfileLayout::new`] 显式注入 `target/tmp` 下的路径。
+//!
+//! 实例目录内的文件名本轮**不改名**：库仍是 `vault.sqlite3`、身份仍是
+//! `dev-identity.bin`（动它们就会碰用户数据/身份，另行规划）。
+//!
+//! ## 旧开发目录的一次性保守迁移（P2）
+//!
+//! 产品目录从 `menghunote-dev` 改名成 `menghunote`、配置从 `dev-sync.json` 改名成
+//! `sync.json`。默认布局解析后，`AppRoot` 启动引导会调用
+//! [`ProfileLayout::migrate_legacy_profile`] 做一次性保守迁移（失败在 GUI 错误页提示）：
+//!
+//! - 新 `sync.json` **不存在**、旧 `menghunote-dev/dev-sync.json` 存在时，把旧配置里的
+//!   **同一份公开实例列表**写到新 `sync.json`（v1 只在内存升到 v2，旧文件不回写）；
+//! - `vault_path` 原样保留：**不移动/不复制** `instances` 目录（避免大文件与身份文件风险）；
+//! - 旧目录/旧配置**原样保留**（不删、不改写）；
+//! - 新配置已存在 → 一律以新配置为准，不再看旧配置（重复启动幂等，不改新文件）；
+//! - 旧配置损坏/版本不支持/模式不被本次构建允许 → 按现有错误语义报错，不重建、不覆盖。
 //!
 //! ## 配置结构
 //!
@@ -56,17 +72,30 @@ pub const PROFILE_VERSION: u32 = 2;
 /// v1 旧配置（没有 `relay_mode`）：只允许**显式迁移**为 `local_dev` 并写回 v2。
 pub const PROFILE_VERSION_V1: u32 = 1;
 
-/// 实例目录里固定的库文件名。
+/// 实例目录里固定的库文件名（P2 不改名：避免动身份/用户数据）。
 pub const VAULT_FILE_NAME: &str = "vault.sqlite3";
 
-/// 配置文件名。
-pub const PROFILE_FILE_NAME: &str = "dev-sync.json";
+/// 本地（不同步）库的子目录名（与 `instances/` 同级，在产品数据根下）。
+///
+/// 产品路径（A 组第二切片）：
+/// - Windows `%LOCALAPPDATA%\menghunote\local\vault.sqlite3`
+/// - Linux `$XDG_DATA_HOME/menghunote/local/vault.sqlite3`
+pub const LOCAL_DIR_NAME: &str = "local";
+
+/// 配置文件名（产品；P2 从旧的 `dev-sync.json` 改为 `sync.json`）。
+pub const PROFILE_FILE_NAME: &str = "sync.json";
 
 /// 默认实例目录（`instances/`）。
 const INSTANCES_DIR_NAME: &str = "instances";
 
 /// 产品级目录名（与 relay/服务无关，只是本机目录约定）。
-const APP_DIR_NAME: &str = "menghunote-dev";
+const APP_DIR_NAME: &str = "menghunote";
+
+/// 旧（开发期）产品目录名：**只**用于一次性保守迁移，不删除、不改写。
+pub const LEGACY_APP_DIR_NAME: &str = "menghunote-dev";
+
+/// 旧（开发期）配置文件名：**只**用于一次性保守迁移，不删除、不改写。
+pub const LEGACY_PROFILE_FILE_NAME: &str = "dev-sync.json";
 
 /// 路径解析/配置错误。
 ///
@@ -144,25 +173,38 @@ impl std::error::Error for ProfileError {}
 /// 本机目录布局（公开信息）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileLayout {
-    /// `dev-sync.json` 的完整路径。
+    /// `sync.json` 的完整路径。
     pub config_path: PathBuf,
     /// 默认实例目录的上一级（`instances/`）。
     pub instances_dir: PathBuf,
+    /// 旧布局的公开配置路径（`menghunote-dev/dev-sync.json`）。
+    ///
+    /// 只有按平台默认解析（[`Self::discover`]）才会填；显式 [`Self::new`] 恒为
+    /// `None`（测试/兼容注入的显式路径**不触发**任何迁移）。它只用于一次性迁移判定，
+    /// 不是当前配置。
+    pub legacy_config_path: Option<PathBuf>,
 }
 
 impl ProfileLayout {
     /// 显式指定配置路径与实例目录（测试注入；生产走 [`Self::discover`]）。
+    ///
+    /// 不参与旧目录迁移：显式路径的调用方自己决定读哪个文件。
     #[must_use]
     pub fn new(config_path: impl Into<PathBuf>, instances_dir: impl Into<PathBuf>) -> Self {
         Self {
             config_path: config_path.into(),
             instances_dir: instances_dir.into(),
+            legacy_config_path: None,
         }
     }
 
     /// 按平台约定解析默认目录（env 读取闭包便于确定性测试）。
     ///
     /// 缺失 HOME/LOCALAPPDATA 是**错误**：真实使用不允许回退 cwd/tmp。
+    ///
+    /// 只做**路径解析**；旧目录迁移是显式的 [`Self::migrate_legacy_profile`]
+    /// （启动引导 `AppRoot::new` 调用它，这样失败能在 GUI 错误页提示；测试显式布局
+    /// 不受影响）。
     pub fn discover(env: impl Fn(&str) -> Option<String>) -> Result<Self, ProfileError> {
         let env = |key: &str| {
             env(key)
@@ -183,11 +225,15 @@ impl ProfileLayout {
                     })
                 })
                 .ok_or(ProfileError::NoHome("LOCALAPPDATA"))?;
-            let root = PathBuf::from(local).join(APP_DIR_NAME);
-            Ok(Self::new(
-                root.join(PROFILE_FILE_NAME),
-                root.join(INSTANCES_DIR_NAME),
-            ))
+            let root = PathBuf::from(local);
+            Ok(Self {
+                config_path: root.join(APP_DIR_NAME).join(PROFILE_FILE_NAME),
+                instances_dir: root.join(APP_DIR_NAME).join(INSTANCES_DIR_NAME),
+                legacy_config_path: Some(
+                    root.join(LEGACY_APP_DIR_NAME)
+                        .join(LEGACY_PROFILE_FILE_NAME),
+                ),
+            })
         }
         #[cfg(not(windows))]
         {
@@ -197,11 +243,57 @@ impl ProfileLayout {
                 .map_or_else(|| home.join(".local").join("share"), PathBuf::from);
             let config_home =
                 env("XDG_CONFIG_HOME").map_or_else(|| home.join(".config"), PathBuf::from);
-            Ok(Self::new(
-                config_home.join(APP_DIR_NAME).join(PROFILE_FILE_NAME),
-                data_home.join(APP_DIR_NAME).join(INSTANCES_DIR_NAME),
-            ))
+            Ok(Self {
+                config_path: config_home.join(APP_DIR_NAME).join(PROFILE_FILE_NAME),
+                instances_dir: data_home.join(APP_DIR_NAME).join(INSTANCES_DIR_NAME),
+                legacy_config_path: Some(
+                    config_home
+                        .join(LEGACY_APP_DIR_NAME)
+                        .join(LEGACY_PROFILE_FILE_NAME),
+                ),
+            })
         }
+    }
+
+    /// 一次性保守迁移（P2）：把旧开发目录的**公开配置**复制到新配置。
+    ///
+    /// 只在默认布局（[`Self::discover`]）上有旧路径；显式 [`Self::new`] 恒返回
+    /// `Ok(false)`。规则与顺序（任何一条不满足都**不写**）：
+    ///
+    /// 1. 新配置已存在 → 以新配置为准，返回 `Ok(false)`（幂等：重复启动不改新文件）；
+    /// 2. 旧配置不存在 → `Ok(false)`；
+    /// 3. 旧配置只做**只读解析**（v1 在内存升到 v2，旧文件不回写），用同一份公开实例
+    ///    列表原子写新 `sync.json`；`vault_path` 原样保留，**不移动/不复制**库与身份；
+    /// 4. 旧配置损坏/版本不支持/模式不被本构建允许 → 原样返回错误，不重建、不覆盖。
+    ///
+    /// 返回是否真的写了新配置。
+    pub fn migrate_legacy_profile(&self) -> Result<bool, ProfileError> {
+        let Some(legacy_path) = self.legacy_config_path.as_ref() else {
+            return Ok(false);
+        };
+        // 新配置优先：只要它存在，旧配置**完全不读**（幂等的唯一判据）。
+        if self.config_path.exists() || !legacy_path.exists() {
+            return Ok(false);
+        }
+        let legacy = ProfileStore {
+            path: legacy_path.clone(),
+        };
+        // 只读解析：v1 的写回只发生在 `load()`，这里绝不改旧文件。
+        let profile = match legacy.read_only() {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return Ok(false),
+            // 旧开发配置可能是 `local_dev`（v1 默认），而产品构建不开放该模式。
+            // 这不是"配置损坏"：旧文件继续原样保留，产品以空配置从 Welcome 起步，
+            // 避免升级用户第一次打开就被 GUI 错误页挡住。
+            Err(error @ ProfileError::InvalidRelay { .. }) => {
+                eprintln!("[menghunote] 旧同步配置不适用于当前构建，跳过迁移：{error}");
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        // 原子写新配置（`save` 会再校验/ canonical 化，并用同目录临时文件 + rename）。
+        self.store().save(&profile)?;
+        Ok(true)
     }
 
     /// 某个实例 id 对应的默认目录（`instances/<id>/`）。
@@ -213,6 +305,36 @@ impl ProfileLayout {
     /// 某个实例 id 对应的默认库路径（`instances/<id>/vault.sqlite3`）。
     pub fn vault_path(&self, instance_id: &str) -> Result<PathBuf, ProfileError> {
         Ok(self.instance_dir(instance_id)?.join(VAULT_FILE_NAME))
+    }
+
+    /// **数据根**：`instances/` 的上一级（产品目录 `.../menghunote`）。
+    ///
+    /// 本地（不同步）库与 `instances/` 同级，所以只依赖布局解析结果；显式
+    /// [`Self::new`] 的路径也按同一条规则推导（`instances_dir` 的父目录），
+    /// 测试/第三方注入不用再传第二个根。
+    #[must_use]
+    pub fn data_root(&self) -> PathBuf {
+        self.instances_dir
+            .parent()
+            .map_or_else(|| self.instances_dir.clone(), Path::to_path_buf)
+    }
+
+    /// 本地（不同步）库目录：`<数据根>/local/`。
+    #[must_use]
+    pub fn local_dir(&self) -> PathBuf {
+        self.data_root().join(LOCAL_DIR_NAME)
+    }
+
+    /// 本地（不同步）库路径：`<数据根>/local/vault.sqlite3`。
+    ///
+    /// - Windows：`%LOCALAPPDATA%\menghunote\local\vault.sqlite3`
+    /// - Linux：`$XDG_DATA_HOME/menghunote/local/vault.sqlite3`
+    ///
+    /// 只做路径解析：**不建目录、不写配置、不碰同步实例**（打开动作在
+    /// [`crate::dev_vault::open_local_vault_at`]）。
+    #[must_use]
+    pub fn local_vault_path(&self) -> PathBuf {
+        self.local_dir().join(VAULT_FILE_NAME)
     }
 
     /// 配置存储句柄。
@@ -390,6 +512,15 @@ impl DevSyncProfile {
     }
 }
 
+/// 磁盘配置来自哪个版本（决定 [`ProfileStore::load`] 是否要把 v1 写回 v2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileOrigin {
+    /// v1（没有 `relay_mode`）：只在内存里迁到 v2。
+    V1,
+    /// 当前版本 v2。
+    V2,
+}
+
 /// 公开配置的读写（原子写）。
 #[derive(Debug, Clone)]
 pub struct ProfileStore {
@@ -412,6 +543,26 @@ impl ProfileStore {
     /// - 未知版本 / 未知模式 / 坏 JSON / 悬空 active / 非法 relay → 明确错误，
     ///   不重建、不默认回退。
     pub fn load(&self) -> Result<Option<DevSyncProfile>, ProfileError> {
+        match self.read_with_origin()? {
+            None => Ok(None),
+            // 显式迁移：v1 只允许变成 local_dev，并立即写回 v2（失败即错误）。
+            Some((profile, ProfileOrigin::V1)) => {
+                self.save(&profile)?;
+                Ok(Some(profile))
+            }
+            Some((profile, ProfileOrigin::V2)) => Ok(Some(profile)),
+        }
+    }
+
+    /// **只读**解析：v1 只在内存里升到 v2，**不回写**任何文件。
+    ///
+    /// 旧开发目录迁移专用：旧配置必须原样保留（v1 的写回只发生在 [`Self::load`]）。
+    fn read_only(&self) -> Result<Option<DevSyncProfile>, ProfileError> {
+        Ok(self.read_with_origin()?.map(|(profile, _origin)| profile))
+    }
+
+    /// 解析磁盘上的配置并返回它来自哪个版本（v1 需要调用方决定是否写回）。
+    fn read_with_origin(&self) -> Result<Option<(DevSyncProfile, ProfileOrigin)>, ProfileError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -442,7 +593,7 @@ impl ProfileStore {
                         detail: error.to_string(),
                     })?;
                 validate_profile(&profile)?;
-                Ok(Some(profile))
+                Ok(Some((profile, ProfileOrigin::V2)))
             }
             PROFILE_VERSION_V1 => {
                 let legacy: DevSyncProfileV1 =
@@ -458,9 +609,7 @@ impl ProfileStore {
                     });
                 }
                 let profile = migrate_v1(legacy)?;
-                // 显式迁移：v1 只允许变成 local_dev，并立即写回 v2（失败即错误）。
-                self.save(&profile)?;
-                Ok(Some(profile))
+                Ok(Some((profile, ProfileOrigin::V1)))
             }
             other => Err(ProfileError::UnsupportedVersion {
                 path: self.path.clone(),
@@ -502,7 +651,7 @@ impl ProfileStore {
             source,
         })?;
         let file_name = self.path.file_name().map_or_else(
-            || "dev-sync.json".to_owned(),
+            || PROFILE_FILE_NAME.to_owned(),
             |name| name.to_string_lossy().into_owned(),
         );
         let tmp = parent.join(format!(
@@ -689,6 +838,21 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// v2 旧配置（`remote_tls`）：两种构建都允许，用来只测"复制公开实例列表"。
+    const LEGACY_REMOTE_PROFILE: &[u8] = br#"{
+      "version": 2,
+      "active_instance": "inst-old",
+      "instances": [{
+        "instance_id": "inst-old",
+        "relay_mode": "remote_tls",
+        "api_version": 2,
+        "relay_url": "https://relay.example",
+        "vault_path": "/data/menghunote-dev/instances/inst-old/vault.sqlite3",
+        "vault_id": "00112233445566778899aabbccddeeff",
+        "device_id": "ffeeddccbbaa99887766554433221100"
+      }]
+    }"#;
+
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
             .iter()
@@ -709,6 +873,67 @@ mod tests {
         dir
     }
 
+    /// 在临时根下按平台默认布局解析（注入 env，**不碰真实用户目录**）。
+    fn discover_in(root: &Path) -> ProfileLayout {
+        let mut env: HashMap<String, String> = HashMap::new();
+        #[cfg(not(windows))]
+        {
+            let home = root.join("home");
+            let config = root.join("config");
+            let data = root.join("data");
+            for dir in [&home, &config, &data] {
+                std::fs::create_dir_all(dir).expect("创建临时 XDG 目录失败");
+            }
+            env.insert("HOME".to_owned(), home.to_string_lossy().into_owned());
+            env.insert(
+                "XDG_CONFIG_HOME".to_owned(),
+                config.to_string_lossy().into_owned(),
+            );
+            env.insert(
+                "XDG_DATA_HOME".to_owned(),
+                data.to_string_lossy().into_owned(),
+            );
+        }
+        #[cfg(windows)]
+        {
+            let local = root.join("localappdata");
+            std::fs::create_dir_all(&local).expect("创建临时 LOCALAPPDATA 失败");
+            env.insert(
+                "LOCALAPPDATA".to_owned(),
+                local.to_string_lossy().into_owned(),
+            );
+        }
+        ProfileLayout::discover(move |key| env.get(key).cloned()).expect("临时默认布局解析失败")
+    }
+
+    /// 与 [`discover_in`] 对应的期望路径：`(新配置, 旧配置, 新实例目录)`。
+    #[cfg(not(windows))]
+    fn expected_default_paths(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            root.join("config").join("menghunote").join("sync.json"),
+            root.join("config")
+                .join("menghunote-dev")
+                .join("dev-sync.json"),
+            root.join("data").join("menghunote").join("instances"),
+        )
+    }
+
+    /// 与 [`discover_in`] 对应的期望路径：`(新配置, 旧配置, 新实例目录)`。
+    #[cfg(windows)]
+    fn expected_default_paths(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            root.join("localappdata")
+                .join("menghunote")
+                .join("sync.json"),
+            root.join("localappdata")
+                .join("menghunote-dev")
+                .join("dev-sync.json"),
+            root.join("localappdata")
+                .join("menghunote")
+                .join("instances"),
+        )
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn linux_defaults_follow_xdg_and_fall_back_to_home() {
@@ -720,22 +945,43 @@ mod tests {
         .expect("有 HOME 就能解析");
         assert_eq!(
             layout.config_path,
-            PathBuf::from("/tmp/config/menghunote-dev/dev-sync.json")
+            PathBuf::from("/tmp/config/menghunote/sync.json")
         );
         assert_eq!(
             layout.instances_dir,
-            PathBuf::from("/tmp/data/menghunote-dev/instances")
+            PathBuf::from("/tmp/data/menghunote/instances")
+        );
+        assert_eq!(
+            layout.legacy_config_path,
+            Some(PathBuf::from("/tmp/config/menghunote-dev/dev-sync.json")),
+            "默认布局必须知道旧开发目录的配置路径（迁移用），但不去读它"
+        );
+        assert_eq!(
+            layout.local_vault_path(),
+            PathBuf::from("/tmp/data/menghunote/local/vault.sqlite3"),
+            "本地（不同步）库在数据根下：$XDG_DATA_HOME/menghunote/local/vault.sqlite3"
         );
 
         let layout = ProfileLayout::discover(env_of(&[("HOME", "/home/alice")]))
             .expect("只有 HOME 时用 XDG 默认回退");
         assert_eq!(
             layout.config_path,
-            PathBuf::from("/home/alice/.config/menghunote-dev/dev-sync.json")
+            PathBuf::from("/home/alice/.config/menghunote/sync.json")
         );
         assert_eq!(
             layout.instances_dir,
-            PathBuf::from("/home/alice/.local/share/menghunote-dev/instances")
+            PathBuf::from("/home/alice/.local/share/menghunote/instances")
+        );
+        assert_eq!(
+            layout.local_vault_path(),
+            PathBuf::from("/home/alice/.local/share/menghunote/local/vault.sqlite3"),
+            "本地库走 XDG_DATA_HOME 的默认回退（~/.local/share）"
+        );
+        assert_eq!(
+            layout.legacy_config_path,
+            Some(PathBuf::from(
+                "/home/alice/.config/menghunote-dev/dev-sync.json"
+            ))
         );
     }
 
@@ -759,17 +1005,376 @@ mod tests {
                 .expect("有 LOCALAPPDATA 就能解析");
         assert_eq!(
             layout.config_path,
-            PathBuf::from(r"C:\Users\alice\AppData\Local\menghunote-dev\dev-sync.json")
+            PathBuf::from(r"C:\Users\alice\AppData\Local\menghunote\sync.json")
         );
         assert_eq!(
             layout.instances_dir,
-            PathBuf::from(r"C:\Users\alice\AppData\Local\menghunote-dev\instances")
+            PathBuf::from(r"C:\Users\alice\AppData\Local\menghunote\instances")
+        );
+        assert_eq!(
+            layout.legacy_config_path,
+            Some(PathBuf::from(
+                r"C:\Users\alice\AppData\Local\menghunote-dev\dev-sync.json"
+            )),
+            "旧开发目录路径只用于一次性迁移"
+        );
+        assert_eq!(
+            layout.local_vault_path(),
+            PathBuf::from(r"C:\Users\alice\AppData\Local\menghunote\local\vault.sqlite3"),
+            "本地（不同步）库：%LOCALAPPDATA%\\menghunote\\local\\vault.sqlite3"
+        );
+    }
+
+    /// 本地（不同步）库与 `instances/` 同级；显式布局按 `instances_dir` 父目录推导。
+    #[test]
+    fn local_vault_path_lives_next_to_instances() {
+        let root = temp_dir("local-path");
+        let layout = ProfileLayout::new(
+            root.join("config/sync.json"),
+            root.join("data").join("instances"),
+        );
+        assert_eq!(layout.data_root(), root.join("data"));
+        assert_eq!(
+            layout.local_dir(),
+            root.join("data").join(LOCAL_DIR_NAME),
+            "本地目录必须是数据根下的 local/"
+        );
+        assert_eq!(
+            layout.local_vault_path(),
+            root.join("data").join("local").join(VAULT_FILE_NAME),
+            "本地库文件名沿用 vault.sqlite3"
+        );
+    }
+
+    /// 显式 [`ProfileLayout::new`] 不参与迁移：第三方/测试显式路径自己决定读哪个文件。
+    #[test]
+    fn explicit_layout_has_no_legacy_path_and_never_migrates() {
+        let dir = temp_dir("explicit-no-migrate");
+        let legacy = dir.join("menghunote-dev").join(LEGACY_PROFILE_FILE_NAME);
+        std::fs::create_dir_all(legacy.parent().expect("有父目录")).expect("建旧目录");
+        std::fs::write(&legacy, LEGACY_REMOTE_PROFILE).expect("写旧配置");
+        let layout = ProfileLayout::new(dir.join("config/sync.json"), dir.join("instances"));
+        assert_eq!(layout.legacy_config_path, None);
+        assert!(
+            !layout.migrate_legacy_profile().expect("显式布局不迁移"),
+            "显式布局不得触发迁移"
+        );
+        assert!(!layout.config_path.exists(), "不得写任何新配置");
+    }
+
+    /// 旧目录里的 v2 配置（`remote_tls`）：供迁移测试把 `vault_path` 指到临时库文件。
+    fn legacy_remote_json(old_vault: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "version": 2,
+            "active_instance": "inst-old",
+            "instances": [{
+                "instance_id": "inst-old",
+                "relay_mode": "remote_tls",
+                "api_version": 2,
+                "relay_url": "https://relay.example",
+                "vault_path": old_vault.to_string_lossy(),
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+            }]
+        })
+    }
+
+    fn write_json(path: &Path, value: &serde_json::Value) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("创建 JSON 目录失败");
+        }
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(value).expect("序列化 JSON 失败"),
+        )
+        .expect("写 JSON 失败");
+    }
+
+    /// P2 保守迁移：新目录默认路径 + 旧配置复制到 `sync.json`；库/身份不移动、旧文件保留。
+    #[test]
+    fn legacy_profile_is_migrated_to_new_sync_json_without_moving_vault() {
+        let root = temp_dir("migrate-default");
+        let layout = discover_in(&root);
+        let (new_config, expected_legacy, expected_instances) = expected_default_paths(&root);
+        assert_eq!(layout.config_path, new_config, "新配置必须叫 sync.json");
+        assert_eq!(
+            layout.instances_dir, expected_instances,
+            "实例目录仍 instances/"
+        );
+        let legacy = layout
+            .legacy_config_path
+            .clone()
+            .expect("默认布局必须带旧配置路径");
+        assert_eq!(legacy, expected_legacy);
+
+        // 旧库文件真实存在：迁移只能复制公开列表，不得移动/复制/改动库与身份。
+        let old_vault = legacy
+            .parent()
+            .expect("旧配置有父目录")
+            .join(INSTANCES_DIR_NAME)
+            .join("inst-old")
+            .join(VAULT_FILE_NAME);
+        std::fs::create_dir_all(old_vault.parent().expect("旧实例目录")).expect("建旧实例目录");
+        std::fs::write(&old_vault, b"sqlite-bytes-keep").expect("写旧库文件");
+        std::fs::write(
+            old_vault.parent().unwrap().join("dev-identity.bin"),
+            b"identity",
+        )
+        .expect("写旧身份文件");
+        write_json(&legacy, &legacy_remote_json(&old_vault));
+        let legacy_before = std::fs::read(&legacy).expect("读旧配置");
+        let identity_path = old_vault.parent().unwrap().join("dev-identity.bin");
+        let identity_before = std::fs::read(&identity_path).expect("读旧身份");
+
+        assert!(layout.migrate_legacy_profile().expect("迁移必须成功"));
+
+        assert_eq!(
+            std::fs::read(&legacy).expect("旧配置必须仍在"),
+            legacy_before,
+            "旧配置必须原样保留（不删、不改写）"
+        );
+        assert_eq!(
+            std::fs::read(&old_vault).expect("旧库必须仍在"),
+            b"sqlite-bytes-keep",
+            "不得移动/复制/改动库文件"
+        );
+        assert_eq!(
+            std::fs::read(&identity_path).expect("旧身份必须仍在"),
+            identity_before,
+            "不得移动/复制/改动身份文件"
+        );
+        assert!(layout.config_path.exists(), "新 sync.json 必须出现");
+
+        // 新配置是同一份公开实例列表，vault_path 保持旧路径。
+        let loaded = layout
+            .store()
+            .load()
+            .expect("读新配置")
+            .expect("新配置存在");
+        assert_eq!(loaded.version, PROFILE_VERSION);
+        assert_eq!(loaded.active_instance.as_deref(), Some("inst-old"));
+        assert_eq!(loaded.instances.len(), 1);
+        let entry = &loaded.instances[0];
+        assert_eq!(entry.instance_id, "inst-old");
+        assert_eq!(entry.relay_mode, RelayMode::RemoteTls);
+        assert_eq!(entry.api_version, RelayApiVersion::V2);
+        assert_eq!(
+            entry.vault_path,
+            old_vault.to_string_lossy().into_owned(),
+            "vault_path 必须保持旧路径（不迁移 instances 目录）"
+        );
+        assert_eq!(entry.relay_url, "https://relay.example");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&layout.config_path).expect("读新配置"))
+                .expect("新配置是 JSON");
+        assert_eq!(raw["version"], serde_json::json!(2), "新配置必须是 v2");
+
+        // 幂等：第二次启动不再改新配置，也不再读旧配置。
+        let new_before = std::fs::read(&layout.config_path).expect("读新配置");
+        assert!(
+            !layout
+                .migrate_legacy_profile()
+                .expect("二次迁移必须是 no-op"),
+            "重复启动不得再迁移"
+        );
+        assert_eq!(
+            std::fs::read(&layout.config_path).expect("读新配置"),
+            new_before,
+            "重复启动不得改写新配置"
+        );
+    }
+
+    /// 新配置存在时一律以新配置为准：旧配置完全不读（不覆盖、不合并）。
+    #[test]
+    fn existing_new_config_takes_precedence_over_legacy() {
+        let root = temp_dir("migrate-precedence");
+        let layout = discover_in(&root);
+        let legacy = layout.legacy_config_path.clone().expect("默认布局带旧路径");
+        let new_vault = root.join("new").join("inst-new").join(VAULT_FILE_NAME);
+        write_json(
+            &layout.config_path,
+            &serde_json::json!({
+                "version": 2,
+                "active_instance": "inst-new",
+                "instances": [{
+                    "instance_id": "inst-new",
+                    "relay_mode": "remote_tls",
+                    "api_version": 1,
+                    "relay_url": "https://relay.example",
+                    "vault_path": new_vault.to_string_lossy(),
+                    "vault_id": "11112222333344445555666677778888",
+                    "device_id": "88887777666655554444333322221111"
+                }]
+            }),
+        );
+        write_json(
+            &legacy,
+            &legacy_remote_json(Path::new("/old/inst-old/vault.sqlite3")),
+        );
+        let new_before = std::fs::read(&layout.config_path).expect("读新配置");
+        let legacy_before = std::fs::read(&legacy).expect("读旧配置");
+
+        assert!(
+            !layout.migrate_legacy_profile().expect("新配置优先，不迁移"),
+            "新配置存在时不得再迁移旧配置"
+        );
+        assert_eq!(
+            std::fs::read(&layout.config_path).expect("读新配置"),
+            new_before,
+            "不得覆盖/合并新配置"
+        );
+        assert_eq!(
+            std::fs::read(&legacy).expect("读旧配置"),
+            legacy_before,
+            "旧配置也不得被改写"
+        );
+        let loaded = layout.store().load().expect("读配置").expect("配置存在");
+        assert_eq!(loaded.active_instance.as_deref(), Some("inst-new"));
+    }
+
+    /// 旧配置损坏/版本不支持：不自动重建、不写新配置；错误指出旧文件（现有错误语义）。
+    #[test]
+    fn corrupt_or_unsupported_legacy_is_not_rebuilt() {
+        let root = temp_dir("migrate-corrupt");
+        let layout = discover_in(&root);
+        let legacy = layout.legacy_config_path.clone().expect("默认布局带旧路径");
+        std::fs::create_dir_all(legacy.parent().expect("旧配置目录")).expect("建旧配置目录");
+
+        let corrupt = b"{ not json".to_vec();
+        std::fs::write(&legacy, &corrupt).expect("写坏旧配置");
+        match layout
+            .migrate_legacy_profile()
+            .expect_err("坏旧配置必须报错")
+        {
+            ProfileError::Corrupt { path, .. } => assert_eq!(path, legacy, "错误必须指出旧文件"),
+            other => panic!("错误类型不对：{other}"),
+        }
+        assert!(!layout.config_path.exists(), "坏旧配置不得触发重建");
+        assert_eq!(std::fs::read(&legacy).expect("旧文件仍在"), corrupt);
+
+        let unsupported = br#"{ "version": 99, "instances": [] }"#.to_vec();
+        std::fs::write(&legacy, &unsupported).expect("写版本不支持");
+        match layout
+            .migrate_legacy_profile()
+            .expect_err("版本不支持必须报错")
+        {
+            ProfileError::UnsupportedVersion { path, version } => {
+                assert_eq!(path, legacy);
+                assert_eq!(version, 99);
+            }
+            other => panic!("错误类型不对：{other}"),
+        }
+        assert!(!layout.config_path.exists(), "版本不支持不得覆盖/重建");
+        assert_eq!(std::fs::read(&legacy).expect("旧文件仍在"), unsupported);
+    }
+
+    /// 迁移 v1 旧配置：只读解析（旧文件保持 v1），新文件是 v2，模式与 `vault_path` 不变。
+    #[cfg(feature = "dev-sync")]
+    #[test]
+    fn migrating_legacy_v1_keeps_old_file_and_writes_v2() {
+        let root = temp_dir("migrate-v1-new-dir");
+        let layout = discover_in(&root);
+        let legacy = layout.legacy_config_path.clone().expect("默认布局带旧路径");
+        let old_vault = root.join("old").join("inst-old").join(VAULT_FILE_NAME);
+        write_json(
+            &legacy,
+            &serde_json::json!({
+                "version": 1,
+                "active_instance": "inst-old",
+                "instances": [{
+                    "instance_id": "inst-old",
+                    // 非 canonical：若迁移把旧文件写回 v2，这个尾斜杠会被改掉。
+                    "relay_url": "http://127.0.0.1:18080/",
+                    "vault_path": old_vault.to_string_lossy(),
+                    "vault_id": "00112233445566778899aabbccddeeff",
+                    "device_id": "ffeeddccbbaa99887766554433221100"
+                }]
+            }),
+        );
+        let legacy_before = std::fs::read(&legacy).expect("读旧配置");
+
+        assert!(layout.migrate_legacy_profile().expect("v1 必须可迁移"));
+        assert_eq!(
+            std::fs::read(&legacy).expect("旧配置必须仍在"),
+            legacy_before,
+            "v1 旧文件不得被写回 v2（迁移只读旧文件）"
+        );
+
+        let loaded = layout
+            .store()
+            .load()
+            .expect("读新配置")
+            .expect("新配置存在");
+        let entry = loaded.active().expect("active 合法").expect("有 active");
+        assert_eq!(
+            entry.relay_mode,
+            RelayMode::LocalDev,
+            "迁移不得改变模式（local_dev 仍是 local_dev）"
+        );
+        assert_eq!(
+            entry.relay_url, "http://127.0.0.1:18080",
+            "新文件里的 relay_url 由权威 parser canonical 化"
+        );
+        assert_eq!(entry.api_version, RelayApiVersion::V1);
+        assert_eq!(
+            entry.vault_path,
+            old_vault.to_string_lossy().into_owned(),
+            "vault_path 保持旧路径"
+        );
+        let raw = std::fs::read_to_string(&layout.config_path).expect("读新配置");
+        assert!(raw.contains("\"version\": 2"), "新配置必须是 v2：{raw}");
+        assert!(
+            raw.contains("\"relay_mode\": \"local_dev\""),
+            "模式必须原样写入：{raw}"
+        );
+    }
+
+    /// 产品构建：旧 `local_dev` 配置不再适用，**跳过迁移**（不是错误页）；不写新配置、
+    /// 不改旧文件，也**不**把模式悄悄改成 `remote_tls`。
+    #[cfg(not(feature = "dev-sync"))]
+    #[test]
+    fn product_build_skips_legacy_local_dev_without_writing() {
+        let root = temp_dir("migrate-local-product");
+        let layout = discover_in(&root);
+        let legacy = layout.legacy_config_path.clone().expect("默认布局带旧路径");
+        let old_vault = root.join("old").join("inst-old").join(VAULT_FILE_NAME);
+        write_json(
+            &legacy,
+            &serde_json::json!({
+                "version": 2,
+                "active_instance": "inst-old",
+                "instances": [{
+                    "instance_id": "inst-old",
+                    "relay_mode": "local_dev",
+                    "relay_url": "http://127.0.0.1:18080",
+                    "vault_path": old_vault.to_string_lossy(),
+                    "vault_id": "00112233445566778899aabbccddeeff",
+                    "device_id": "ffeeddccbbaa99887766554433221100"
+                }]
+            }),
+        );
+        let legacy_before = std::fs::read(&legacy).expect("读旧配置");
+
+        let migrated = layout
+            .migrate_legacy_profile()
+            .expect("旧 local_dev 是已知不适用，不是配置损坏");
+        assert!(!migrated, "产品构建不得迁移 local_dev 实例");
+        assert!(!layout.config_path.exists(), "跳过迁移时不得写新配置");
+        assert_eq!(
+            std::fs::read(&legacy).expect("旧配置仍在"),
+            legacy_before,
+            "被拒绝时旧文件必须原样保留"
+        );
+        let raw = std::fs::read_to_string(&legacy).expect("读旧配置");
+        assert!(
+            raw.contains("\"relay_mode\": \"local_dev\""),
+            "不得把模式悄悄改成 remote_tls：{raw}"
         );
     }
 
     #[test]
     fn instance_ids_cannot_escape_the_instances_dir() {
-        let layout = ProfileLayout::new("/tmp/cfg/dev-sync.json", "/tmp/data/instances");
+        let layout = ProfileLayout::new("/tmp/cfg/sync.json", "/tmp/data/instances");
         for bad in ["", ".", "..", "../escape", "a/b", "a\\b"] {
             assert!(layout.instance_dir(bad).is_err(), "{bad:?} 必须被拒绝");
         }
@@ -786,17 +1391,16 @@ mod tests {
     #[test]
     fn profile_roundtrip_is_atomic_and_has_no_secret_fields() {
         let dir = temp_dir("roundtrip");
-        let layout =
-            ProfileLayout::new(dir.join("config/dev-sync.json"), dir.join("data/instances"));
+        let layout = ProfileLayout::new(dir.join("config/sync.json"), dir.join("data/instances"));
         let store = layout.store();
         assert!(store.load().expect("缺失不算错误").is_none());
 
         let mut profile = DevSyncProfile::default();
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-a".to_owned(),
-            relay_mode: RelayMode::LocalDev,
+            relay_mode: RelayMode::RemoteTls,
             api_version: RelayApiVersion::V1,
-            relay_url: "http://127.0.0.1:18080".to_owned(),
+            relay_url: "https://relay.example".to_owned(),
             vault_path: "/data/instances/inst-a/vault.sqlite3".to_owned(),
             vault_id: "00112233445566778899aabbccddeeff".to_owned(),
             device_id: "ffeeddccbbaa99887766554433221100".to_owned(),
@@ -823,9 +1427,9 @@ mod tests {
         // 再写一次（覆盖）后旧内容不应残留。
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-b".to_owned(),
-            relay_mode: RelayMode::LocalDev,
+            relay_mode: RelayMode::RemoteTls,
             api_version: RelayApiVersion::V1,
-            relay_url: "http://localhost:18080".to_owned(),
+            relay_url: "https://relay.example".to_owned(),
             vault_path: "/data/instances/inst-b/vault.sqlite3".to_owned(),
             vault_id: "11112222333344445555666677778888".to_owned(),
             device_id: "88887777666655554444333322221111".to_owned(),
@@ -847,7 +1451,7 @@ mod tests {
     #[test]
     fn corrupt_and_unsupported_profiles_are_rejected_without_rebuild() {
         let dir = temp_dir("corrupt");
-        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
         std::fs::write(layout.config_path.clone(), b"{ not json").expect("写坏配置失败");
         let error = layout.store().load().expect_err("坏 JSON 必须报错");
         assert!(matches!(error, ProfileError::Corrupt { .. }), "{error}");
@@ -876,10 +1480,14 @@ mod tests {
     }
 
     /// v1（无 relay_mode）→ 显式迁移为 local_dev，并**写回 v2**。
+    ///
+    /// v1 的迁移目标固定是 `local_dev`，所以只在 dev-sync 构建可用；产品构建必须
+    /// 明确拒绝（见紧邻的 `v1_profile_is_rejected_in_product_build`）。
+    #[cfg(feature = "dev-sync")]
     #[test]
     fn v1_profile_is_migrated_to_local_dev_and_written_back_as_v2() {
         let dir = temp_dir("migrate-v1");
-        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
         std::fs::write(
             layout.config_path.clone(),
             br#"{
@@ -919,11 +1527,44 @@ mod tests {
         assert_eq!(again, loaded);
     }
 
+    /// 产品构建（无 dev-sync）必须拒绝 v1 配置（迁移目标 local_dev 不可用），
+    /// 而不是静默打开一个产品构建无法安全使用的实例。
+    #[cfg(not(feature = "dev-sync"))]
+    #[test]
+    fn v1_profile_is_rejected_in_product_build() {
+        let dir = temp_dir("migrate-v1-product");
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
+        std::fs::write(
+            layout.config_path.clone(),
+            br#"{
+              "version": 1,
+              "active_instance": "inst-old",
+              "instances": [{
+                "instance_id": "inst-old",
+                "relay_url": "http://127.0.0.1:18080/",
+                "vault_path": "/data/instances/inst-old/vault.sqlite3",
+                "vault_id": "00112233445566778899aabbccddeeff",
+                "device_id": "ffeeddccbbaa99887766554433221100"
+              }]
+            }"#,
+        )
+        .expect("写 v1 配置");
+
+        let error = layout.store().load().expect_err("产品构建必须拒绝 v1 配置");
+        assert!(
+            matches!(error, ProfileError::InvalidRelay { .. }),
+            "{error}"
+        );
+        // 失败不改写配置（不迁移、不覆盖）。
+        let raw = std::fs::read_to_string(layout.config_path.clone()).expect("读回");
+        assert!(raw.contains("\"version\": 1"), "失败不得改写配置：{raw}");
+    }
+
     /// v1 里的非 local_dev relay **不能**被静默迁移（只允许显式 local_dev）。
     #[test]
     fn v1_with_non_local_relay_is_rejected_instead_of_reinterpreted() {
         let dir = temp_dir("migrate-v1-bad");
-        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
         for relay in ["https://relay.example", "http://relay.example:18080"] {
             std::fs::write(
                 layout.config_path.clone(),
@@ -954,7 +1595,7 @@ mod tests {
     #[test]
     fn unknown_profile_versions_and_modes_are_rejected() {
         let dir = temp_dir("unknown-v2");
-        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
         std::fs::write(
             layout.config_path.clone(),
             br#"{ "version": 3, "instances": [] }"#,
@@ -1018,7 +1659,7 @@ mod tests {
     #[test]
     fn save_rejects_invalid_relay_before_writing() {
         let dir = temp_dir("save-invalid");
-        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
         let store = layout.store();
         let mut profile = DevSyncProfile::default();
         profile.upsert_active(InstanceEntry {
@@ -1044,7 +1685,7 @@ mod tests {
     #[test]
     fn profile_api_version_defaults_to_v1_and_roundtrips_v2() {
         let dir = temp_dir("api-version");
-        let layout = ProfileLayout::new(dir.join("dev-sync.json"), dir.join("instances"));
+        let layout = ProfileLayout::new(dir.join("sync.json"), dir.join("instances"));
         std::fs::write(
             layout.config_path.clone(),
             br#"{
@@ -1052,8 +1693,8 @@ mod tests {
               "active_instance": "inst-old",
               "instances": [{
                 "instance_id": "inst-old",
-                "relay_mode": "local_dev",
-                "relay_url": "http://127.0.0.1:18080",
+                "relay_mode": "remote_tls",
+                "relay_url": "https://relay.example",
                 "vault_path": "/data/instances/inst-old/vault.sqlite3",
                 "vault_id": "00112233445566778899aabbccddeeff",
                 "device_id": "ffeeddccbbaa99887766554433221100"
@@ -1072,9 +1713,9 @@ mod tests {
         let mut profile = loaded;
         profile.upsert_active(InstanceEntry {
             instance_id: "inst-v2".to_owned(),
-            relay_mode: RelayMode::LocalDev,
+            relay_mode: RelayMode::RemoteTls,
             api_version: RelayApiVersion::V2,
-            relay_url: "http://127.0.0.1:18080".to_owned(),
+            relay_url: "https://relay.example".to_owned(),
             vault_path: "/data/instances/inst-v2/vault.sqlite3".to_owned(),
             vault_id: "11112222333344445555666677778888".to_owned(),
             device_id: "88887777666655554444333322221111".to_owned(),

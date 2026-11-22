@@ -64,7 +64,7 @@ fn temp_layout(prefix: &str) -> (TempDir, ProfileLayout) {
         .tempdir_in(&root)
         .expect("在 target/tmp 下创建临时目录失败");
     let layout = ProfileLayout::new(
-        dir.path().join("config/dev-sync.json"),
+        dir.path().join("config/sync.json"),
         dir.path().join("data/instances"),
     );
     (dir, layout)
@@ -102,9 +102,26 @@ fn expect_bounds(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Bo
             cx.simulate_click(gear.center(), Modifiers::default());
             cx.run_until_parked();
         }
+        // 设置页是「左侧分类导航 + 右侧只渲染当前分类」：按 selector 前缀切到对应分类。
+        let section = match selector {
+            "settings-instance-0" | "settings-instance-1" | "settings-api-version" => {
+                Some("instances")
+            }
+            "settings-fingerprint" => Some("security"),
+            "settings-relay" => Some("relay"),
+            _ => None,
+        };
+        if let Some(section) = section {
+            let nav: &'static str = Box::leak(format!("settings-nav-{section}").into_boxed_str());
+            if let Some(bounds) = cx.debug_bounds(nav) {
+                cx.simulate_click(bounds.center(), Modifiers::default());
+                cx.run_until_parked();
+            }
+        }
         if selector.starts_with("dev-sync-") {
-            if let Some(toggle) = cx.debug_bounds("settings-toggle-sync") {
-                cx.simulate_click(toggle.center(), Modifiers::default());
+            // 同步面板在「同步」分类里；进入分类就直接渲染（没有展开/收起按钮）。
+            if let Some(bounds) = cx.debug_bounds("settings-nav-sync") {
+                cx.simulate_click(bounds.center(), Modifiers::default());
                 cx.run_until_parked();
             }
         }
