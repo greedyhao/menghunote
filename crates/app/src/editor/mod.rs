@@ -8,7 +8,11 @@
 //! | [`shared`] | 视图 ↔ 元素共享的非观察状态（折行缓存 / 上一帧几何） |
 //! | [`input`] | `EntityInputHandler`：IME / 文本输入（虚拟输入文档 + 一次提交） |
 //! | [`clipboard`] | 粘贴/拖放的剪贴板分流（纯逻辑）+ 资产导入能力面（S2b） |
+//! | [`object_image`] | 图片资产的受控解码 + LRU 缓存（S2a） |
+//! | [`mermaid_preview`] | Mermaid 后台渲染/光栅化 + LRU 缓存（M2） |
 //! | [`ime_map`] | 虚拟输入文档 ↔ source 的 UTF-16 换算（纯函数，重点单测） |
+//! | [`link`] | 普通链接 scheme 策略 / 平台打开入口 / 标题提取（纯逻辑） |
+//! | [`link_settings`] | 「未知自定义 scheme 记住」的本机偏好（不同步、不写正文） |
 //! | [`element`] | 单 `Element`：绘制 + 鼠标命中 / 拖拽 / 滚轮 |
 //! | [`view`] | `EditorView`：控制器 + 会话驱动接线、键盘、状态栏 |
 //! | [`theme`] | 字号 / 行高 / 颜色常量 |
@@ -24,6 +28,9 @@ pub mod glyph;
 pub mod ime_map;
 pub mod input;
 pub mod layout;
+pub mod link;
+pub mod link_settings;
+pub mod mermaid_preview;
 pub mod object_image;
 pub mod shared;
 pub mod theme;

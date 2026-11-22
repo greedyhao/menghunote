@@ -71,7 +71,9 @@
 use std::error::Error;
 use std::fmt;
 
-use menghunote_markdown::{self as semantic, ParsedMarkdown, Span as SemanticSpan};
+use menghunote_markdown::{
+    self as semantic, ParsedMarkdown, Span as SemanticSpan, TableCellInline,
+};
 use menghunote_text::{CoordError, SourceByte, SourceRange, UnicodeScalar};
 
 use crate::model::block::BlockRun;
@@ -358,11 +360,18 @@ impl MarkdownImage {
 ///
 /// `cells` 与 [`MarkdownTable::columns`] 等长：缺列由解析器补空区间，
 /// 多列（GFM 会丢弃）不存在；cell 区间已去掉首尾空白，**不含** `|` 边界。
+///
+/// # 行内 Markdown（ADR 0019 S3b7）
+///
+/// 每个 cell 的源码还会**一次性**解析成 [`TableCellInline`]（display 文本 + 样式段 +
+/// 链接可见区间），与 `cells` 一一对应。放在这里而不是 app 每帧解析，是因为
+/// 解析结果只随**源码**变化：Markdown 文档重建时算一次，绘制/命中直接借用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownTableRow {
     span: SourceRange,
     line: usize,
     cells: Vec<SourceRange>,
+    inline: Vec<TableCellInline>,
 }
 
 impl MarkdownTableRow {
@@ -388,6 +397,14 @@ impl MarkdownTableRow {
     #[must_use]
     pub fn cell(&self, column: usize) -> Option<SourceRange> {
         self.cells.get(column).copied()
+    }
+
+    /// 第 `column` 列的行内 Markdown 解析结果（display 文本 + 样式段 + 链接）。
+    ///
+    /// 越界返回 `None`；空 cell 返回 `Some`（display 为空、没有样式段）。
+    #[must_use]
+    pub fn cell_inline(&self, column: usize) -> Option<&TableCellInline> {
+        self.inline.get(column)
     }
 }
 
@@ -513,6 +530,19 @@ impl MarkdownTable {
         }
     }
 
+    /// 第 `row` 行（**0 = 表头**）第 `column` 列的**行内 Markdown** 解析结果
+    /// （display 文本 + 样式段 + 链接）；任一越界返回 `None`。
+    ///
+    /// 与 [`Self::cell`] 同一套行寻址（含表头），供绘制/命中直接借用。
+    #[must_use]
+    pub fn cell_inline(&self, row: usize, column: usize) -> Option<&TableCellInline> {
+        if row == 0 {
+            self.header.cell_inline(column)
+        } else {
+            self.rows.get(row - 1)?.cell_inline(column)
+        }
+    }
+
     /// 第 `row` 行（0 = 表头）的整行源码区间；越界返回 `None`。
     #[must_use]
     pub fn row_span(&self, row: usize) -> Option<SourceRange> {
@@ -530,6 +560,66 @@ impl MarkdownTable {
     }
 
     /// 是否整行独占、可投影成 Object Block（见类型文档的判定规则）。
+    #[must_use]
+    pub const fn is_block(&self) -> bool {
+        self.block
+    }
+}
+
+/// 一个整块 fenced `mermaid`（ADR 0019 M2）。
+///
+/// 与 [`MarkdownImage`] / [`MarkdownTable`] 一样是**附加元数据**：投影仍通过
+/// [`ObjectBlock`]（`SegmentKind::Object`）实现，本类型只提供整块/内容源码区间、
+/// 起止行与 info，**不产生任何新文本**。
+///
+/// # block 判定
+///
+/// 是否可投影成 Object 由 Markdown 解析器（[`menghunote_markdown::FencedMermaidBlock`]）
+/// 按“闭合围栏 + 普通段落上下文（非引用/列表/行首缩进）+ 块尾不含换行”判定；
+/// editor 只做坐标换算，不重复一套平行规则。`block = false` 的 Mermaid 块保持普通
+/// fenced code 行为（源码可编辑），不进入 [`MarkdownDocument::objects`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownMermaid {
+    span: SourceRange,
+    content: SourceRange,
+    line: usize,
+    end_line: usize,
+    info: String,
+    block: bool,
+}
+
+impl MarkdownMermaid {
+    /// 整块源码区间（开围栏行行首 .. 闭围栏行内容终点；**不含**末尾换行）。
+    #[must_use]
+    pub const fn span(&self) -> SourceRange {
+        self.span
+    }
+
+    /// 围栏之间的内容源码区间（不含开/闭围栏行；保留内部换行与缩进）。
+    #[must_use]
+    pub const fn content(&self) -> SourceRange {
+        self.content
+    }
+
+    /// 开围栏源码行号（0 起；也是对象行）。
+    #[must_use]
+    pub const fn line(&self) -> usize {
+        self.line
+    }
+
+    /// 闭围栏源码行号（0 起，含）。
+    #[must_use]
+    pub const fn end_line(&self) -> usize {
+        self.end_line
+    }
+
+    /// info string（本类型恒为 `mermaid`；保留字段便于诊断/未来变体）。
+    #[must_use]
+    pub fn info(&self) -> &str {
+        &self.info
+    }
+
+    /// 是否整块、普通段落上下文里的 fenced mermaid（可投影成 Object Block）。
     #[must_use]
     pub const fn is_block(&self) -> bool {
         self.block
@@ -592,7 +682,10 @@ pub struct MarkdownDocument {
     images: Vec<MarkdownImage>,
     /// 表格块（S3a）：object 投影与 app 的只读表格绘制都从这里取。
     tables: Vec<MarkdownTable>,
-    /// 全部整块 Object（图片 + 表格，按 `span` 起点排序）：投影/选中/源码切换共用。
+    /// 整块 fenced mermaid（M2）：object 投影与 app 的后台渲染从 content 取源码。
+    mermaid: Vec<MarkdownMermaid>,
+    /// 全部整块 Object（图片 + 表格 + Mermaid，按 `span` 起点排序）：
+    /// 投影/选中/源码切换共用。
     objects: Vec<ObjectBlock>,
     /// wiki 链接（L1）：点击/未解析样式/重命名改写用。
     wiki_links: Vec<MarkdownWikiLink>,
@@ -610,7 +703,8 @@ impl MarkdownDocument {
         let semantic = semantic::parse(source);
         let images = collect_images(source, &semantic);
         let tables = collect_tables(source, &semantic);
-        let objects = collect_objects(&images, &tables);
+        let mermaid = collect_mermaid(source, &semantic);
+        let objects = collect_objects(&images, &tables, &mermaid);
         let wiki_links = collect_wiki_links(source, &semantic);
         let links = collect_links(source, &semantic);
         let legacy = legacy_constructs(source)?;
@@ -636,6 +730,7 @@ impl MarkdownDocument {
             constructs,
             images,
             tables,
+            mermaid,
             objects,
             wiki_links,
             links,
@@ -687,9 +782,15 @@ impl MarkdownDocument {
         self.tables.iter().filter(|table| table.block)
     }
 
-    /// 全部整块 Object（图片 + 表格，按源码顺序）。
+    /// 全部整块 fenced mermaid（`block = true` 的块；按文档顺序）。
+    #[must_use]
+    pub fn mermaid_blocks(&self) -> &[MarkdownMermaid] {
+        &self.mermaid
+    }
+
+    /// 全部整块 Object（图片 + 表格 + Mermaid，按源码顺序）。
     ///
-    /// 投影、选中、源码切换、删除**只走这一条路径**；不要再按图片/表格各写一套。
+    /// 投影、选中、源码切换、删除**只走这一条路径**；不要再按种类各写一套。
     #[must_use]
     pub fn objects(&self) -> &[ObjectBlock] {
         &self.objects
@@ -719,6 +820,15 @@ impl MarkdownDocument {
             return None;
         }
         self.tables.get(object.index())
+    }
+
+    /// Object 对应的 Mermaid 载荷；不是 Mermaid 对象时 `None`。
+    #[must_use]
+    pub fn object_mermaid(&self, object: &ObjectBlock) -> Option<&MarkdownMermaid> {
+        if object.kind() != ObjectKind::Mermaid {
+            return None;
+        }
+        self.mermaid.get(object.index())
     }
 
     /// 新解析器的完整语义模型（列表块树 / 行信息）。
@@ -851,6 +961,9 @@ impl MarkdownDocument {
     /// - 该行在 `revealed_object_lines` 里（工具条「编辑源码」/`F2` 进入源码模式）→
     ///   不产生 Object 片段，源码原样显示；
     /// - 混排/行内图片永远不产生 Object 片段（首版保持源码，选择写死在这里）；
+    /// - **Mermaid**：caret（含两端）或非空选区与 block span 相交时，该块不产生
+    ///   Object 片段，源码原样可见/可编辑；移出后下一次投影重新产生 Object。
+    ///   图片/表格**不**使用这条规则（保持原来的整块选中行为）；
     /// - 万一对象区间与隐藏/替换片段重叠（防御：不重叠是 block 判定的前提），
     ///   跳过该对象 —— 宁可不投影，也不产生错位。
     pub fn projection_pieces_with_objects(
@@ -881,6 +994,9 @@ impl MarkdownDocument {
     ) -> Result<Vec<ProjectionPiece>, MarkdownError> {
         let mut hidden = self.hidden_ranges_for_selection_filtered(selection, false)?;
         let revealed = self.list_marker_reveals(selection)?;
+        // Mermaid 的“进入源码”规则（ADR 0019 §18.8）：caret/选区与 block 源码相交时，
+        // 该块**不产生 Object 片段**，整段源码保持 Copy 可见/可编辑；移出后才投影。
+        let (selection_start, selection_end) = self.selection_bytes(selection)?;
         let mut replacements: Vec<ProjectionPiece> = Vec::new();
         for index in 0..self.semantic.items.len() {
             let item = &self.semantic.items[index];
@@ -957,10 +1073,11 @@ impl MarkdownDocument {
         }
         hidden = kept;
         let mut hidden = merge_ranges(&self.source, hidden)?;
-        // 整块 Object（图片 / 表格）：不在显式源码模式里 → 原子对象片段。
+        // 整块 Object（图片 / 表格 / Mermaid）：不在显式源码模式里 → 原子对象片段。
         //
-        // 两种对象走**同一条**路径：block 判定已经把“引用/列表/缩进/表格里的图片”
-        // 和“引用/列表/缩进里的表格”排除掉了，所以这里不再按 kind 分支。
+        // 图片/表格/ Mermaid 走**同一条**路径；只有 Mermaid 额外有一条“**折叠 caret**
+        // 进入即显示源码”的规则：非空选区跨过 block 时仍保持 Object（与图片/表格
+        // 一致），避免拖选经过时块突然变长。
         //
         // 单元格就地编辑（ADR 0019 S3b2）：正在编辑的那张表**不**再是原子对象，
         // 表格源码里除该 cell 之外的部分全部隐藏，display 上只剩 cell 文本。
@@ -970,6 +1087,20 @@ impl MarkdownDocument {
                 continue;
             }
             let span = object.span();
+            let empty_mermaid = object.kind() == ObjectKind::Mermaid
+                && self.mermaid.get(object.index()).is_some_and(|mermaid| {
+                    self.source
+                        .get(mermaid.content().start().get()..mermaid.content().end().get())
+                        .is_none_or(|content| content.trim().is_empty())
+                });
+            if object.kind() == ObjectKind::Mermaid
+                && (empty_mermaid || caret_inside_span(selection_start, selection_end, span))
+            {
+                // 空 Mermaid / 折叠 caret 在 block 内：让源码原样显示（可编辑），
+                // 不请求渲染也不画占位；移出后下一次投影会重新产生 Object 片段。
+                // 非空选区保持 Object，拖选经过时不会突然切源码/变长。
+                continue;
+            }
             if let Some(cell) = cell.filter(|cell| cell.table == span) {
                 if cell.cell.start() > span.start() {
                     hidden.push(self.range(span.start().get(), cell.cell.start().get())?);
@@ -1123,6 +1254,17 @@ impl MarkdownDocument {
             },
         )
     }
+}
+
+/// **折叠 caret** 是否落在某个 source span 内（起点含、终点不含）。
+///
+/// Mermaid 的“进入源码”规则只看折叠 caret：caret 在 block 起止两端都算在块内
+/// （与等待态一致）；**非空选区不触发**（保持 Object，拖选不会突然变长）。
+/// 图片/表格不使用这个规则。
+fn caret_inside_span(start: usize, end: usize, span: SourceRange) -> bool {
+    // 终点不含：块末尾的 caret（尤其文档尾无换行）不应把 Object 切回源码；
+    // 进入源码请点块内/行首，或用工具条「编辑源码」。
+    start == end && span.start().get() <= start && start < span.end().get()
 }
 
 /// 一个列表 item 的 marker（含任务框）是否被 caret/选区显现。
@@ -1362,10 +1504,21 @@ fn convert_table_row(source: &str, row: &semantic::TableRow) -> Option<MarkdownT
         .iter()
         .map(|cell| convert_span(source, *cell))
         .collect();
+    let cells = cells?;
+    // 行内 Markdown（ADR 0019 S3b7）：cell 源码切片 → display 文本 + 样式段 + 链接。
+    // 只随源码变化，因此在这里算一次（绘制/命中每帧只借用，不重复解析）。
+    let inline: Vec<TableCellInline> = row
+        .cells
+        .iter()
+        .map(|cell| {
+            semantic::parse_table_cell_inline(source.get(cell.start..cell.end).unwrap_or_default())
+        })
+        .collect();
     Some(MarkdownTableRow {
         span,
         line: row.line,
-        cells: cells?,
+        cells,
+        inline,
     })
 }
 
@@ -1392,10 +1545,49 @@ fn is_block_table(semantic: &ParsedMarkdown, table: &semantic::TableBlock) -> bo
     table.last_line > table.first_line && table.span.end == last.content.end
 }
 
-/// 图片 + 表格 → 统一的 Object 列表（按源码顺序）。
+/// 新解析器的 fenced mermaid 块 → editor 的 [`MarkdownMermaid`]（ADR 0019 M2）。
 ///
-/// 只收**整行独占**的块：`block = false` 的图片/表格首版保持源码原样显示。
-fn collect_objects(images: &[MarkdownImage], tables: &[MarkdownTable]) -> Vec<ObjectBlock> {
+/// 只收**可投影成 Object** 的块（`block = true`，普通段落上下文）；引用/列表/缩进里
+/// 的 mermaid 仍由 `FencedCode` 构造按普通代码块处理。坐标不合法（越界/内容不在
+/// 整块内）的块直接跳过（保守：源码原样显示）。
+fn collect_mermaid(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownMermaid> {
+    let mut blocks = Vec::new();
+    for block in &semantic.mermaid_blocks {
+        if !block.block {
+            continue;
+        }
+        let (Some(span), Some(content)) = (
+            convert_span(source, block.span),
+            convert_span(source, block.content),
+        ) else {
+            continue;
+        };
+        if block.last_line <= block.first_line
+            || block.span.start > block.content.start
+            || block.content.end > block.span.end
+        {
+            continue;
+        }
+        blocks.push(MarkdownMermaid {
+            span,
+            content,
+            line: block.first_line,
+            end_line: block.last_line,
+            info: block.info.clone(),
+            block: true,
+        });
+    }
+    blocks
+}
+
+/// 图片 + 表格 + Mermaid → 统一的 Object 列表（按源码顺序）。
+///
+/// 只收 Block 块：`block = false` 的图片/表格/Mermaid 保持源码原样显示。
+fn collect_objects(
+    images: &[MarkdownImage],
+    tables: &[MarkdownTable],
+    mermaid: &[MarkdownMermaid],
+) -> Vec<ObjectBlock> {
     let mut objects = Vec::new();
     for (index, image) in images.iter().enumerate() {
         if !image.is_block() {
@@ -1418,6 +1610,18 @@ fn collect_objects(images: &[MarkdownImage], tables: &[MarkdownTable]) -> Vec<Ob
             table.span(),
             table.line(),
             table.end_line(),
+            index,
+        ));
+    }
+    for (index, mermaid) in mermaid.iter().enumerate() {
+        if !mermaid.is_block() {
+            continue;
+        }
+        objects.push(ObjectBlock::new(
+            ObjectKind::Mermaid,
+            mermaid.span(),
+            mermaid.line(),
+            mermaid.end_line(),
             index,
         ));
     }

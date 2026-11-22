@@ -713,3 +713,173 @@ fn ordinary_links_keep_resolved_destinations() {
         "[示例](https://example.com/a?b=1)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR 0019 M2：fenced `mermaid` 块元数据
+// ---------------------------------------------------------------------------
+
+#[test]
+fn top_level_fenced_mermaid_exposes_block_span_content_lines_and_info() {
+    let source = "前\n\n```mermaid\nflowchart TD\nA-->B\n```\n\n后\n";
+    let doc = parse(source);
+    assert_eq!(doc.mermaid_blocks.len(), 1, "只应识别一个 mermaid 块");
+    let block = &doc.mermaid_blocks[0];
+    assert!(
+        block.is_block(),
+        "顶层、无缩进的 mermaid 必须是 Object Block"
+    );
+    assert_eq!(block.first_line, 2);
+    assert_eq!(block.last_line, 5);
+    assert_eq!(block.info, "mermaid");
+    assert_eq!(
+        slice(source, block.span),
+        "```mermaid\nflowchart TD\nA-->B\n```"
+    );
+    assert_eq!(slice(source, block.content), "flowchart TD\nA-->B\n");
+    assert_eq!(slice(source, block.opening), "```mermaid");
+    assert!(
+        doc.code_spans
+            .iter()
+            .any(|span| span.contains_span(block.span) && span.start <= block.span.start),
+        "mermaid 块仍然是代码块（内部行内构造不投影）"
+    );
+    assert!(
+        !doc.constructs
+            .iter()
+            .any(|construct| construct.kind == ConstructKind::FencedCode),
+        "可投影成 Object 的 mermaid 不得再产生 FencedCode 构造（否则围栏会被隐藏/冲突）"
+    );
+    assert!(
+        (2..=5).all(|line| doc.lines[line].kind == LineKind::FencedCode),
+        "围栏行仍然是 FencedCode（源码模式的等宽度量要用）"
+    );
+    // 普通代码块不受影响。
+    let normal = "```rust\nfn main() {}\n```\n";
+    let normal_doc = parse(normal);
+    assert!(normal_doc.mermaid_blocks.is_empty());
+    assert!(normal_doc
+        .constructs
+        .iter()
+        .any(|construct| construct.kind == ConstructKind::FencedCode));
+}
+
+#[test]
+fn mermaid_info_matching_is_exact_after_trim() {
+    for (source, expected) in [
+        ("``` mermaid \nx\n```\n", true),
+        ("```Mermaid\nx\n```\n", false),
+        ("```mermaid title=\"x\"\nx\n```\n", false),
+        ("```mermaid\r\nx\r\n```\r\n", true),
+    ] {
+        let doc = parse(source);
+        assert_eq!(
+            doc.mermaid_blocks.len(),
+            usize::from(expected),
+            "info 判定：{source:?}"
+        );
+        if expected {
+            assert!(doc.mermaid_blocks[0].is_block());
+        }
+    }
+}
+
+#[test]
+fn nested_mermaid_stays_code_not_object() {
+    // 列表 / 引用 / 行首缩进里的 mermaid 都不是 Object；构造要保留，仍是普通代码块。
+    let cases = [
+        "- item\n\n  ```mermaid\n  flowchart TD\n  A-->B\n  ```\n",
+        "   ```mermaid\n   flowchart TD\n   A-->B\n   ```\n",
+    ];
+    for source in cases {
+        let doc = parse(source);
+        assert_eq!(
+            doc.mermaid_blocks.len(),
+            1,
+            "仍应识别出 mermaid 元数据：{source:?}"
+        );
+        let block = &doc.mermaid_blocks[0];
+        assert!(
+            !block.is_block(),
+            "引用/列表/缩进里的 mermaid 不是 Object：{source:?}"
+        );
+        assert!(
+            doc.constructs
+                .iter()
+                .any(|construct| construct.kind == ConstructKind::FencedCode),
+            "非 Object 的 mermaid 必须保留 FencedCode 构造（普通代码块）：{source:?}"
+        );
+    }
+}
+
+#[test]
+fn quoted_mermaid_is_plain_code_without_object_metadata() {
+    // 引用前缀属于围栏解析的既有边界（`fenced_construct` 只跳过空格缩进）：
+    // 引用里的 mermaid 不产生对象元数据，保持普通代码块。这不是 M2 的回归。
+    let source = "> ```mermaid\n> flowchart TD\n> A-->B\n> ```\n";
+    let doc = parse(source);
+    assert!(doc.mermaid_blocks.is_empty());
+    assert!(
+        !doc.code_spans.is_empty(),
+        "它仍然是代码块（内部不投影行内构造）"
+    );
+}
+
+#[test]
+fn unclosed_mermaid_is_not_a_mermaid_block() {
+    let source = "```mermaid\nflowchart TD\nA-->B\n";
+    let doc = parse(source);
+    assert!(doc.mermaid_blocks.is_empty(), "未闭合围栏不产生对象元数据");
+    assert!(doc.code_spans.iter().any(|span| !span.is_empty()));
+}
+
+#[test]
+fn table_cell_inline_markdown_renders_from_the_cell_source_slice() {
+    // ADR 0019 S3b7：cell 源码（`\|` 转义仍在）→ 行内 Markdown 渲染。
+    // 这里把**真实表格解析**给出的 cell 区间喂给行内解析器，钉住两层的接缝。
+    let source =
+        "| 名称 | 说明 |\n|:--|--:|\n| **粗** | `a\\|b` |\n| [文档](https://x.y) | ~~删~~ |\n";
+    let doc = parse(source);
+    let table = doc.tables.first().expect("必须解析出表格");
+    assert_eq!(table.columns, 2);
+
+    let cells: Vec<_> = table
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter().copied())
+        .map(|cell| menghunote_markdown::parse_table_cell_inline(slice(source, cell)))
+        .collect();
+    assert_eq!(cells.len(), 4);
+
+    // 粗体：标记隐藏。
+    assert_eq!(cells[0].display(), "粗");
+    assert_eq!(cells[0].spans().len(), 1);
+    assert_eq!(
+        cells[0].spans()[0].kind,
+        menghunote_markdown::TableCellStyle::Bold
+    );
+    // 行内代码里的 `\|` 还原成字面 `|`（GFM：转义在行内解析之前）。
+    assert_eq!(cells[1].display(), "a|b");
+    assert_eq!(
+        cells[1].spans()[0].kind,
+        menghunote_markdown::TableCellStyle::InlineCode
+    );
+    // 链接：display 只有可见文本，目标原样保留。
+    assert_eq!(cells[2].display(), "文档");
+    assert_eq!(cells[2].links().len(), 1);
+    assert_eq!(cells[2].links()[0].dest, "https://x.y");
+    // 删除线。
+    assert_eq!(cells[3].display(), "删");
+    assert_eq!(
+        cells[3].spans()[0].kind,
+        menghunote_markdown::TableCellStyle::Strike
+    );
+
+    // 空 cell：display 为空、没有样式段、没有链接。
+    const EMPTY: &str = "| | b |\n|---|---|\n| 1 | 2 |\n";
+    let empty = parse(EMPTY);
+    let table = empty.tables.first().expect("空表头仍是表格");
+    let inline = menghunote_markdown::parse_table_cell_inline(slice(EMPTY, table.header.cells[0]));
+    assert_eq!(inline.display(), "");
+    assert!(inline.spans().is_empty());
+    assert!(inline.links().is_empty());
+}

@@ -45,12 +45,15 @@ use std::time::{Duration, Instant};
 use gpui::prelude::*;
 use gpui::{
     div, img, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle,
-    Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, ImageSource, KeyDownEvent,
-    MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Window,
+    Entity, ExternalPaths, FocusHandle, Focusable, ImageSource, KeyDownEvent, MouseButton,
+    MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Window,
 };
 use menghunote_editor::{
-    Bias, DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, MarkdownImage,
-    Selection, SourceByte, SourceRange, StyleKind, UnicodeScalar, TASK_BOX_DISPLAY,
+    BacktickAction, Bias, BlockKind, DisplayByte, EditorController, EditorError, GraphemeStep,
+    InputDocument, MarkdownImage, MarkdownLineKind, MarkdownMermaid, MarkdownTableAlignment,
+    Selection, SourceByte, SourceRange, StyleKind, TableCellInline, TableCellStyle, UnicodeScalar,
+    FENCE_CARET_OFFSET, FENCE_INSERT, PAIR_CARET_OFFSET, PAIR_INSERT, SINGLE_CARET_OFFSET,
+    SINGLE_INSERT, TASK_BOX_DISPLAY,
 };
 use menghunote_storage::rename_links::{plan_wiki_link_renames, scalar_edits_for_renames};
 #[cfg(feature = "dev-sync")]
@@ -72,10 +75,13 @@ use super::clipboard::{
 };
 use super::element::EditorElement;
 use super::geometry::{
-    ObjectPaint, ObjectPaintContent, ObjectPaintState, TableCellPaint, TableDragAxis,
-    TableDragHandlePaint, TablePaint, TableRowPaint,
+    ObjectPaint, ObjectPaintContent, ObjectPaintState, TableCellLinkPaint, TableCellPaint,
+    TableDragAxis, TableDragHandlePaint, TablePaint, TableRowPaint,
 };
 use super::layout::LayoutFrame;
+use super::link::{self, LinkTarget};
+use super::link_settings;
+use super::mermaid_preview::{MermaidCacheKey, MermaidPreviewState, MermaidService};
 use super::object_image::{parse_asset_hash, ImageService, ImageState, SharedAssetProvider};
 use super::shared::EditorShared;
 use super::theme;
@@ -87,10 +93,6 @@ const CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 图片放大遮罩的缩放上下限（有界，滚轮再猛也不越界）。
 const IMAGE_ZOOM_MIN: f32 = 0.5;
 const IMAGE_ZOOM_MAX: f32 = 4.0;
-
-/// 状态栏右侧的固定提示。
-const HINT: &str =
-    "切片 6b：可输入 · Ctrl+Z 撤销 / Ctrl+Shift+Z 重做 · 中文走 IME（组合文本上屏前不落库）";
 
 /// IME 组合状态。
 ///
@@ -151,14 +153,62 @@ impl TableDeleteAxis {
     }
 }
 
-/// 正文右键菜单（ADR 0019 S3b4）：目前只有「插入 → 表格」。
+/// 正文右键菜单（ADR 0019 S3b4）：正文空白处是「插入 → 表格」，普通链接上是
+/// 「打开链接 / 复制链接 / 复制 Markdown」。
 ///
-/// 只存右键**落点**（窗口坐标）：渲染时按编辑器视口夹取，不改变正文 caret/选区。
-/// 插入位置始终是打开菜单时的正文 caret/选区（右键本身不落 caret）。
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// 只存右键**落点**（窗口坐标）与菜单目标：渲染时按编辑器视口夹取，不改变正文
+/// caret/选区。插入位置始终是打开菜单时的正文 caret/选区（右键本身不落 caret）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EditorContextMenu {
     /// 右键落点（窗口坐标；菜单面板左上角的锚点）。
     position: Point<Pixels>,
+    /// 菜单内容（普通链接 / 正文插入）。
+    target: EditorContextMenuTarget,
+}
+
+/// 正文右键菜单的内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditorContextMenuTarget {
+    /// 正文空白处：「插入 → 表格」。
+    InsertTable,
+    /// 普通链接：打开 / 复制链接 / 复制 Markdown。
+    Link(ExternalLinkHit),
+}
+
+/// 链接右键菜单的三个动作（与菜单项一一对应）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkMenuAction {
+    /// 打开链接（与 Ctrl/Cmd+单击同一条路径）。
+    Open,
+    /// 复制链接目标（`dest` 原文）。
+    CopyLink,
+    /// 复制完整 Markdown 源码（`[text](dest)`）。
+    CopyMarkdown,
+}
+
+/// 一次普通链接命中的完整信息（点击打开、右键菜单、复制都从这里取）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalLinkHit {
+    /// 解析后的目标（`https://…` / `#标题` / `Note` 等；原样，不改写）。
+    pub dest: String,
+    /// 完整 Markdown 源码（`[text](dest)`；「复制 Markdown」用）。
+    pub markdown: String,
+}
+
+/// 外部链接确认框（`file:`/UNC 与未知自定义 scheme）。
+///
+/// 只活在 app 内（最小浮层），不依赖系统级对话框；`remember` 只影响本机偏好文件，
+/// 不写正文、不同步。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkConfirm {
+    /// 原始目标（打开时原样交给系统；**不写日志**）。
+    url: String,
+    /// 小写 scheme（确认框标题只显示它，不回显路径）。
+    scheme: String,
+    /// 未知自定义 scheme 才允许「记住」；`file:`/UNC 每次都要确认。
+    rememberable: bool,
+    /// 本次是否勾选「记住此 scheme」。
+    remember: bool,
 }
 
 /// 编辑器窗口的主视图。
@@ -221,6 +271,35 @@ pub struct ObjectSnapshot {
     pub source_visible: bool,
 }
 
+/// 一个表格单元格里的**可见链接**（headless 断言点击命中用）。
+///
+/// 见 [`EditorView::table_cell_render`]：矩形来自绘制用的 `TableCellLinkPaint`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCellLinkSnapshot {
+    /// 链接可见文本在该单元格 display 文本里的字节区间（已按列宽截断裁剪）。
+    pub display: Range<usize>,
+    /// 目标 URL。
+    pub dest: String,
+    /// 点击命中矩形（窗口坐标）。
+    pub rect: Bounds<Pixels>,
+}
+
+/// 一个表格单元格的**本帧绘制快照**（headless 断言行内 Markdown 渲染用）。
+///
+/// 见 [`EditorView::table_cell_render`]：数据直接来自绘制用的 `TableCellPaint`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCellRenderSnapshot {
+    /// 实际 shaping 的文本（行内 Markdown 的 display；被列宽截断时含 `…`）。
+    pub display: String,
+    /// display 字节区间上的语义样式段（与绘制用的 `TextRun` 一一对应；空 cell 为空）。
+    ///
+    /// 注意：headless 的 `NoopTextSystem` 把所有字体解析成同一个 `FontId`，因此
+    /// **不能**用 run 的字体 id 断言样式；这里直接给出绘制时使用的语义段。
+    pub spans: Vec<(Range<usize>, StyleKind)>,
+    /// 单元格内**可见**链接（截断点之后不出现）。
+    pub links: Vec<TableCellLinkSnapshot>,
+}
+
 /// 一个表格 Object Block 的只读快照（headless 测试断言状态用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSnapshot {
@@ -246,6 +325,48 @@ pub struct TableSnapshot {
     pub selected_cell: Option<(usize, usize)>,
     /// 正在就地编辑的单元格 `(row, column)`；`None` = 不在单元格编辑态。
     pub editing_cell: Option<(usize, usize)>,
+}
+
+/// 一个 Mermaid Object Block 的渲染状态（headless 测试断言用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MermaidObjectState {
+    /// 光标/选区仍在该 block 的源码范围内（或内容为空）：不请求渲染。
+    Waiting,
+    /// 正在后台渲染/光栅化（或尚未请求）。
+    Loading,
+    /// 已光栅化，可绘制。
+    Ready,
+    /// 渲染/光栅化失败（显示「Mermaid 渲染失败」占位，源码回退仍可用）。
+    Failed,
+}
+
+/// 一个 Mermaid Object Block 的只读快照（headless 测试断言状态/几何用）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MermaidSnapshot {
+    /// 开围栏行行号（0 起；也是对象行）。
+    pub line: usize,
+    /// 闭围栏行行号（0 起，含）。
+    pub end_line: usize,
+    /// 整块源码跨度 `(start, end)`（UTF-8 bytes，不含末尾换行）。
+    pub span: (usize, usize),
+    /// 围栏之间的内容源码跨度。
+    pub content_span: (usize, usize),
+    /// info string（`mermaid`）。
+    pub info: String,
+    /// 渲染状态。
+    pub state: MermaidObjectState,
+    /// 就绪时的逻辑显示尺寸；未就绪为 `None`。
+    pub size: Option<(f32, f32)>,
+    /// 当前投影里的 display 区间（`None` = 没有投影成对象，源码可见）。
+    pub display: Option<(usize, usize)>,
+    /// 是否处于选中态（单击选中 / 选区相交）。
+    pub selected: bool,
+    /// 是否在显式源码模式。
+    pub editing_source: bool,
+    /// 源码是否直接可见（源码模式 / 未投影）。
+    pub source_visible: bool,
+    /// 占位文案（加载中/失败；就绪为 `None`）。
+    pub label: Option<String>,
 }
 
 /// 一次表格行列拖拽的**进行中**状态（ADR 0019 S3b5；headless/诊断可读）。
@@ -386,8 +507,6 @@ pub struct EditorView {
     focused_once: bool,
     /// 关闭排空结果（留痕用，只在 stderr 打一行）。
     close_report: Option<CloseReport>,
-    /// 状态栏展示的 vault 路径。
-    vault_label: String,
     /// IME 组合状态（preedit 只活在控制器 overlay 里，绝不进 CRDT）。
     composition: Composition,
     /// 已发出的 `EditRequest` 计数：日志里用来证明"一次 commit 只有一个请求"。
@@ -404,6 +523,8 @@ pub struct EditorView {
     held: bool,
     /// 图片资产加载 / 解码 / LRU 缓存（ADR 0019 S2a；后台单线程解码）。
     images: ImageService,
+    /// Mermaid 预览：后台渲染/光栅化 + LRU 缓存（ADR 0019 M2）。
+    mermaid: MermaidService,
     /// 粘贴/拖放的资产导入实现（ADR 0019 S2b）：编辑器只认能力面，不依赖 storage。
     import_writer: SharedImportWriter,
     /// 上一次对账时正文里有没有 `asset://` 链接。
@@ -441,10 +562,16 @@ pub struct EditorView {
     /// 本帧表格拖拽把手的**命中矩形**（窗口坐标）：元素层据此放行把手上的点击，
     /// 避免同一次按下又被当成“选中单元格 / 整表选中 / 落 caret”。
     table_handle_rects: Vec<Bounds<Pixels>>,
-    /// 正文右键菜单（ADR 0019 S3b4：「插入 → 表格」）；`None` = 没有菜单。
+    /// 正文右键菜单（ADR 0019 S3b4：「插入 → 表格」/ 链接动作）；`None` = 没有菜单。
     context_menu: Option<EditorContextMenu>,
     /// 本帧右键菜单面板的**窗口坐标**矩形（点击落在这里时元素层不挪正文 caret）。
     context_menu_rect: Option<Bounds<Pixels>>,
+    /// 外部链接确认框（`file:`/UNC 与未知自定义 scheme）；`None` = 没有确认框。
+    link_confirm: Option<LinkConfirm>,
+    /// 非阻塞链接提示（危险 scheme 拒绝 / 未找到标题）；**不回显路径、不写日志**。
+    link_notice: Option<String>,
+    /// 链接菜单/确认框动作后吞掉同一次手势的 mouse-up（不移动 caret）。
+    swallow_mouse_up: bool,
     /// 放大预览的图片（点击图片/放大按钮后显示；`None` = 关闭）。
     zoomed_image: Option<ImageZoom>,
     /// 已被驱动受理的**本地**编辑代数（ADR 0012 S3 自动同步的触发源）。
@@ -460,7 +587,7 @@ impl EditorView {
     pub fn new(
         controller: EditorController,
         driver: SessionDriver,
-        vault_label: String,
+        _vault_label: String,
         asset_provider: SharedAssetProvider,
         import_writer: SharedImportWriter,
         cx: &mut Context<Self>,
@@ -475,13 +602,14 @@ impl EditorView {
             drag_anchor: None,
             focused_once: false,
             close_report: None,
-            vault_label,
             composition: Composition::default(),
             request_seq: 0,
             pending_enter_text_input: false,
             dump_selection: false,
             held: false,
             images: ImageService::new(asset_provider),
+            // SvgRenderer 只在 worker 线程内构造；这里只传 GPUI 的资产源（bundled fonts）。
+            mermaid: MermaidService::new(cx.asset_source().clone()),
             import_writer,
             had_asset_links: false,
             unresolved_wiki_targets: HashSet::new(),
@@ -498,6 +626,9 @@ impl EditorView {
             table_handle_rects: Vec::new(),
             context_menu: None,
             context_menu_rect: None,
+            link_confirm: None,
+            link_notice: None,
+            swallow_mouse_up: false,
             zoomed_image: None,
             #[cfg(feature = "dev-sync")]
             local_edit_seq: 0,
@@ -578,6 +709,10 @@ impl EditorView {
         }
         // 图片后台解码完成：重绘一次，图片/占位与行高在下一次 prepaint 生效。
         if self.images.take_completed() > 0 {
+            changed = true;
+        }
+        // Mermaid 后台渲染/光栅化完成：同上（占位 → 图片 / 失败文案）。
+        if self.mermaid.take_completed() > 0 {
             changed = true;
         }
         // 引用对账（正文 durable 之后）：只写"引用账本"，不改正文，因此不需要重绘。
@@ -694,6 +829,207 @@ impl EditorView {
         }
     }
 
+    // ---- Mermaid Object Block（ADR 0019 M2）----
+
+    /// 从源码里取 Mermaid 围栏**之间**的内容（渲染输入，不含围栏行）。
+    ///
+    /// 坐标来自最新解析的 `MarkdownMermaid::content()`；越界时返回空串（渲染器会报
+    /// `Empty` → 失败占位），绝不猜偏移。
+    fn mermaid_content(&self, mermaid: &MarkdownMermaid) -> String {
+        let source = self.controller.source_text();
+        source
+            .get(mermaid.content().start().get()..mermaid.content().end().get())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// 当前 source selection 的字节区间（`(start, end)`，折叠时相等）。
+    fn selection_source_bytes(&self) -> Option<(usize, usize)> {
+        let source = self.controller.source_text();
+        let selection = self.controller.selection();
+        let start = selection.start().to_source_byte(&source).ok()?.get();
+        let end = selection.end().to_source_byte(&source).ok()?.get();
+        Some((start, end))
+    }
+
+    /// 是否**暂缓**渲染这个 Mermaid block（ADR 0019 M2 收尾）。
+    ///
+    /// 满足任一条件就等待，不提交渲染请求：
+    ///
+    /// - 内容为空/纯空白（避免输入 ` ```mermaid ` 后立刻「渲染失败」）；
+    /// - 光标/选区仍在该 block 的源码范围内（含两端；非空选区按相交判定）。
+    ///
+    /// 光标移出后由绘制路径正常 `request`；已有缓存/在途请求不受影响（等待态只是
+    /// 视图派生状态，不清理缓存）。
+    fn mermaid_render_deferred(&self, mermaid: &MarkdownMermaid, source: &str) -> bool {
+        if source.trim().is_empty() {
+            return true;
+        }
+        let Some((start, end)) = self.selection_source_bytes() else {
+            return false;
+        };
+        // 只有**折叠 caret** 在 block 内才等待；非空选区跨过 block 时仍正常渲染
+        // （对象保持原子，拖选不应让图变成“等待”占位）。
+        if start != end {
+            return false;
+        }
+        let block_start = mermaid.span().start().get();
+        let block_end = mermaid.span().end().get();
+        // 终点不含：点在块末尾/文档尾时对象保持不变，不突然切成源码。
+        block_start <= start && start < block_end
+    }
+
+    /// 一个 Mermaid 对象当前应显示的派生状态（Waiting 优先于缓存/在途）。
+    fn mermaid_state_for(
+        &self,
+        mermaid: &MarkdownMermaid,
+        content_width: f32,
+    ) -> MermaidPreviewState {
+        let source = self.mermaid_content(mermaid);
+        if self.mermaid_render_deferred(mermaid, &source) {
+            return MermaidPreviewState::Waiting;
+        }
+        self.mermaid
+            .state(MermaidCacheKey::new(&source, content_width))
+    }
+
+    /// 由渲染状态算显示尺寸（逻辑像素）：就绪按内容宽度等比，其它状态为占位框。
+    fn mermaid_size_for_state(
+        &self,
+        state: &MermaidPreviewState,
+        content_width: f32,
+    ) -> (f32, f32) {
+        match state {
+            MermaidPreviewState::Ready(image) => {
+                let scale = if image.width > 0.0 {
+                    (content_width / image.width).min(1.0)
+                } else {
+                    1.0
+                };
+                (
+                    (image.width * scale).max(1.0),
+                    (image.height * scale).max(1.0),
+                )
+            }
+            MermaidPreviewState::Waiting
+            | MermaidPreviewState::Loading
+            | MermaidPreviewState::Failed(_) => {
+                (content_width.max(1.0), theme::MERMAID_PLACEHOLDER_HEIGHT)
+            }
+        }
+    }
+
+    /// 对象内容宽度（与 prepaint 的 `block_metrics` / `object_paints` 同一个值）。
+    fn object_content_width(&self) -> f32 {
+        let (viewport_width, _) = self.shared.viewport();
+        (viewport_width - theme::PAD_X * 2.0).max(super::layout::MIN_WRAP_WIDTH)
+    }
+
+    /// Mermaid 当前的显示尺寸（布局度量与绘制共用）。
+    fn mermaid_display_size(&self, mermaid: &MarkdownMermaid, content_width: f32) -> (f32, f32) {
+        let state = self.mermaid_state_for(mermaid, content_width);
+        self.mermaid_size_for_state(&state, content_width)
+    }
+
+    /// Mermaid 内容高度（不含上下内边距）。
+    fn mermaid_content_height(&self, mermaid: &MarkdownMermaid, content_width: f32) -> f32 {
+        self.mermaid_display_size(mermaid, content_width).1
+    }
+
+    /// Mermaid 对象的**行高**（内容高度 + 上下内边距）。布局度量与绘制共用。
+    fn mermaid_row_height(&self, mermaid: &MarkdownMermaid, content_width: f32) -> f32 {
+        self.mermaid_content_height(mermaid, content_width) + theme::OBJECT_PADDING * 2.0
+    }
+
+    /// 占位/失败文案（失败恒为「Mermaid 渲染失败」，加载中为「Mermaid 渲染中…」）。
+    fn mermaid_label(state: &MermaidPreviewState) -> Option<String> {
+        match state {
+            MermaidPreviewState::Ready(_) => None,
+            MermaidPreviewState::Waiting => Some("等待光标移出后渲染…".to_owned()),
+            MermaidPreviewState::Loading => Some("Mermaid 渲染中…".to_owned()),
+            MermaidPreviewState::Failed(_) => Some("Mermaid 渲染失败".to_owned()),
+        }
+    }
+
+    /// 等 Mermaid 后台渲染收敛（测试/诊断用；有界，生产由 pump + `take_completed` 驱动）。
+    pub fn settle_mermaid(&mut self, timeout: Duration, cx: &mut Context<Self>) -> bool {
+        let settled = self.mermaid.wait_idle(timeout);
+        if settled {
+            cx.notify();
+        }
+        settled
+    }
+
+    /// 实际执行过的 Mermaid 渲染次数（诊断/测试：验证同一源码不重复渲染）。
+    #[must_use]
+    pub fn mermaid_render_count(&self) -> usize {
+        self.mermaid.render_count()
+    }
+
+    /// 实际提交给后台 worker 的 Mermaid 渲染请求数（诊断/测试：验证等待/缓存命中）。
+    #[must_use]
+    pub fn mermaid_request_count(&self) -> usize {
+        self.mermaid.request_count()
+    }
+
+    /// Mermaid 对象的只读快照（headless 测试断言状态/几何用）。
+    #[must_use]
+    pub fn mermaid_snapshots(&self) -> Vec<MermaidSnapshot> {
+        let projection = self.controller.projection();
+        let highlighted = self.highlighted_object_lines();
+        // 与 prepaint 的 `block_metrics` / `object_paints` 同一个内容宽度（同一 key）。
+        let content_width = self.object_content_width();
+        self.controller
+            .mermaid_blocks()
+            .iter()
+            .map(|mermaid| {
+                // 快照不主动 request，只读等待态/缓存/在途状态。
+                let state = self.mermaid_state_for(mermaid, content_width);
+                let (state, size, label) = match &state {
+                    MermaidPreviewState::Ready(image) => (
+                        MermaidObjectState::Ready,
+                        Some((image.width, image.height)),
+                        None,
+                    ),
+                    MermaidPreviewState::Waiting => (
+                        MermaidObjectState::Waiting,
+                        None,
+                        Self::mermaid_label(&MermaidPreviewState::Waiting),
+                    ),
+                    MermaidPreviewState::Loading => (
+                        MermaidObjectState::Loading,
+                        None,
+                        Self::mermaid_label(&MermaidPreviewState::Loading),
+                    ),
+                    MermaidPreviewState::Failed(_) => (
+                        MermaidObjectState::Failed,
+                        None,
+                        Some("Mermaid 渲染失败".to_owned()),
+                    ),
+                };
+                let display = projection.object_display_range(mermaid.span());
+                MermaidSnapshot {
+                    line: mermaid.line(),
+                    end_line: mermaid.end_line(),
+                    span: (mermaid.span().start().get(), mermaid.span().end().get()),
+                    content_span: (
+                        mermaid.content().start().get(),
+                        mermaid.content().end().get(),
+                    ),
+                    info: mermaid.info().to_owned(),
+                    state,
+                    size,
+                    display: display.as_ref().map(|range| (range.start, range.end)),
+                    selected: highlighted.contains(&mermaid.line()),
+                    editing_source: self.controller.object_source_edit_line()
+                        == Some(mermaid.line()),
+                    source_visible: display.is_none(),
+                    label,
+                }
+            })
+            .collect()
+    }
+
     // ---- 表格 Object Block（ADR 0019 S3a）----
 
     /// 表格内容高度（不含上下内边距）：表头 + 数据行 × 固定行高。
@@ -729,8 +1065,6 @@ impl EditorView {
         rect: Bounds<Pixels>,
         viewport_height: f32,
     ) -> TablePaint {
-        // 源码只取一次：单元格 shaping 是逐格的，不能在每次调用里都 clone 全文。
-        let source = self.controller.source_text();
         let columns = table.columns().max(1);
         let column_width = table_column_width(rect.size.width.as_f32(), columns);
         let header_height = theme::TABLE_HEADER_HEIGHT;
@@ -778,15 +1112,14 @@ impl EditorView {
                     point(px(left), px(origin_y)),
                     size(px(column_width), px(header_height)),
                 );
-                cells.push(TableCellPaint {
-                    rect: cell_rect,
-                    text: if editing_cell == Some((0, column)) {
-                        None
-                    } else {
-                        table_cell_paint(window, &source, table.header().cell(column), inner_width)
-                    },
-                    align: table.alignment(column),
-                });
+                cells.push(table_cell_paint(
+                    window,
+                    table.header().cell_inline(column),
+                    cell_rect,
+                    table.alignment(column),
+                    inner_width,
+                    editing_cell != Some((0, column)),
+                ));
             }
             paint.header = Some(TableRowPaint {
                 rect: Bounds::new(
@@ -810,15 +1143,14 @@ impl EditorView {
                     point(px(left), px(top)),
                     size(px(column_width), px(row_height)),
                 );
-                cells.push(TableCellPaint {
-                    rect: cell_rect,
-                    text: if editing_cell == Some((index + 1, column)) {
-                        None
-                    } else {
-                        table_cell_paint(window, &source, row.cell(column), inner_width)
-                    },
-                    align: table.alignment(column),
-                });
+                cells.push(table_cell_paint(
+                    window,
+                    row.cell_inline(column),
+                    cell_rect,
+                    table.alignment(column),
+                    inner_width,
+                    editing_cell != Some((index + 1, column)),
+                ));
             }
             paint.rows.push(TableRowPaint {
                 rect: Bounds::new(
@@ -957,6 +1289,58 @@ impl EditorView {
                     (
                         rect,
                         ObjectPaintContent::Image(Box::new(super::geometry::ImagePaint {
+                            image: paint_image,
+                            label,
+                            state: paint_state,
+                        })),
+                    )
+                }
+                menghunote_editor::ObjectKind::Mermaid => {
+                    let Some(mermaid) = self.controller.mermaid_of(object) else {
+                        continue;
+                    };
+                    let source = self.mermaid_content(mermaid);
+                    // 延迟渲染：光标/选区仍在 block 内、或内容为空时不提交请求；
+                    // 等光标移出后，绘制路径才登记 request（每帧幂等，服务侧去重）。
+                    let state = if self.mermaid_render_deferred(mermaid, &source) {
+                        MermaidPreviewState::Waiting
+                    } else {
+                        let key = MermaidCacheKey::new(&source, content_width);
+                        self.mermaid.request(key, &source);
+                        self.mermaid.state(key)
+                    };
+                    let (display_width, content_height) =
+                        self.mermaid_size_for_state(&state, content_width);
+                    let rect = Bounds::new(
+                        point(px(left), px(row_top + theme::OBJECT_PADDING)),
+                        size(px(display_width), px(content_height)),
+                    );
+                    let (paint_image, paint_state, label) = match &state {
+                        MermaidPreviewState::Ready(image) => (
+                            Some(Arc::clone(&image.image)),
+                            ObjectPaintState::Ready,
+                            None,
+                        ),
+                        MermaidPreviewState::Waiting | MermaidPreviewState::Loading => {
+                            (None, ObjectPaintState::Loading, Self::mermaid_label(&state))
+                        }
+                        MermaidPreviewState::Failed(_) => {
+                            (None, ObjectPaintState::Failed, Self::mermaid_label(&state))
+                        }
+                    };
+                    let label = label.filter(|text| !text.is_empty()).map(|text| {
+                        let spans = [(text.len(), StyleKind::Plain)];
+                        super::glyph::shape_row_styled_at(
+                            window,
+                            &text,
+                            &spans,
+                            theme::OBJECT_LABEL_FONT_SIZE,
+                            false,
+                        )
+                    });
+                    (
+                        rect,
+                        ObjectPaintContent::Mermaid(Box::new(super::geometry::ImagePaint {
                             image: paint_image,
                             label,
                             state: paint_state,
@@ -1356,7 +1740,14 @@ impl EditorView {
         };
         let already_selected = self.selected_object_line == Some(line);
         let text = self.controller.source_text();
-        let Ok(caret) = SourceByte::new(object.span().end().get()).to_scalar(&text) else {
+        let mut caret_byte = object.span().end().get();
+        // Mermaid：caret 在 block 源码内会触发“显示源码、不投影 Object”。单击对象时
+        // 把 caret 放到块末尾换行**之后**（即块外），块保持 Object/工具条；块在文档尾
+        // 且没有换行时只能落在块尾（此时会显示源码，属边界情况）。
+        if object.kind().is_mermaid() && text.as_bytes().get(caret_byte) == Some(&b'\n') {
+            caret_byte += 1;
+        }
+        let Ok(caret) = SourceByte::new(caret_byte).to_scalar(&text) else {
             return;
         };
         if let Some(window) = window {
@@ -1445,6 +1836,86 @@ impl EditorView {
             }
         }
         rects
+    }
+
+    /// 某个单元格的**本帧绘制快照**（headless 断言行内 Markdown 渲染用）。
+    ///
+    /// 全部数据来自 `table_paint` 的 `TableCellPaint`（**绘制同源**，不是重新解析）：
+    /// - `display`：实际 shaping 的文本（标记已隐藏；被列宽截断时含 `…`）；
+    /// - `spans`：绘制时使用的语义样式段（粗体/斜体/删除线/行内代码/链接）；
+    /// - `links`：单元格内**可见**链接的 display 区间 + 目标（截断点之后不出现）。
+    ///
+    /// 不可见（长表格被视口裁剪 / 该格正在就地编辑）返回 `None`。
+    #[must_use]
+    pub fn table_cell_render(
+        &self,
+        line: usize,
+        row: usize,
+        column: usize,
+    ) -> Option<TableCellRenderSnapshot> {
+        let geometry = self.shared.geometry()?;
+        let object = geometry
+            .objects()
+            .iter()
+            .find(|object| object.line == line)?;
+        let table = object.table()?;
+        let paint_row = table
+            .header
+            .iter()
+            .chain(table.rows.iter())
+            .find(|paint_row| paint_row.row == row)?;
+        let cell = paint_row.cells.get(column)?;
+        let display = cell
+            .text
+            .as_ref()
+            .map(|text| text.text.to_string())
+            .unwrap_or_default();
+        // 样式段来自与绘制**同一份**解析结果（`table_cell_paint` 直接把它映射成
+        // `TextRun`）；该格没画文字（正在就地编辑 / 空 cell）时没有样式段。
+        let spans = if cell.text.is_some() {
+            self.controller
+                .object_at_line(line)
+                .filter(|object| object.kind().is_table())
+                .and_then(|object| self.controller.table_of(object))
+                .and_then(|table| table.cell_inline(row, column))
+                .map(|inline| {
+                    inline
+                        .spans()
+                        .iter()
+                        .map(|span| {
+                            (
+                                span.display.start..span.display.end,
+                                table_cell_style_kind(span.kind),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Some(TableCellRenderSnapshot {
+            display,
+            spans,
+            links: cell
+                .links
+                .iter()
+                .map(|link| TableCellLinkSnapshot {
+                    display: link.display.clone(),
+                    dest: link.dest.clone(),
+                    rect: link.rect,
+                })
+                .collect(),
+        })
+    }
+
+    /// 正在就地编辑的单元格**草稿文本**（`None` = 不在单元格编辑态）。
+    ///
+    /// 草稿是 cell 的**源码原文**（`**粗体**` 原样显示，只还原 `\|` 转义），
+    /// 提交时才经 `sanitize_cell_text` 写回正文。
+    #[must_use]
+    pub fn table_cell_edit_draft(&self) -> Option<&str> {
+        self.cell_edit.as_ref().map(|state| state.draft.as_str())
     }
 
     /// 某个单元格的**可编辑显示文本**（源码去掉 `\|` 转义；空 cell = 空串）。
@@ -2567,22 +3038,41 @@ impl EditorView {
         }
     }
 
-    // ---- 正文右键菜单（ADR 0019 S3b4：插入表格）----
+    // ---- 正文右键菜单（ADR 0019 S3b4：插入表格 / 链接动作）----
 
-    /// 在右键落点打开「插入 → 表格」菜单；**不移动正文 caret/选区**。
+    /// 在右键落点打开菜单；**不移动正文 caret/选区**。
     ///
+    /// - 普通链接上 → 「打开链接 / 复制链接 / 复制 Markdown」；
+    /// - 其它位置 → 原有的「插入 → 表格」；
     /// - 右键只决定菜单面板的位置，插入位置始终是打开菜单时编辑器里的 caret/选区；
-    /// - 单元格就地编辑期间不开菜单（镜像领先于会话，菜单项会绕过那格未提交的草稿）；
+    /// - 单元格就地编辑 / 外部链接确认框期间不开菜单（模态浮层优先）；
     /// - 已在别处打开时直接挪到新落点（同一个菜单，不叠两个面板）。
-    pub(crate) fn open_context_menu_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn open_context_menu_at(
+        &mut self,
+        position: Point<Pixels>,
+        link: Option<ExternalLinkHit>,
+        cx: &mut Context<Self>,
+    ) {
         self.pending_enter_text_input = false;
+        if self.link_confirm.is_some() {
+            return;
+        }
         if self.is_editing_table_cell() {
             eprintln!("[menghunote] 单元格编辑中：不打开正文右键菜单（先提交该格）");
             return;
         }
-        self.context_menu = Some(EditorContextMenu { position });
+        let target = match link {
+            Some(hit) => EditorContextMenuTarget::Link(hit),
+            None => EditorContextMenuTarget::InsertTable,
+        };
+        let label = match &target {
+            EditorContextMenuTarget::InsertTable => "插入 → 表格",
+            EditorContextMenuTarget::Link(_) => "链接动作",
+        };
+        self.context_menu = Some(EditorContextMenu { position, target });
+        // 只记菜单种类与落点：链接目标（URL/路径）**不写日志**。
         eprintln!(
-            "[menghunote] 正文右键菜单（插入 → 表格）at=({:.1},{:.1})",
+            "[menghunote] 正文右键菜单（{label}）at=({:.1},{:.1})",
             position.x.as_f32(),
             position.y.as_f32()
         );
@@ -2595,6 +3085,260 @@ impl EditorView {
             self.context_menu_rect = None;
             cx.notify();
         }
+    }
+
+    /// 链接菜单动作（打开 / 复制链接 / 复制 Markdown）。
+    ///
+    /// 动作在菜单项的 **mouse-down** 上执行；菜单随即关闭，同一次手势的 mouse-up
+    /// 必须被吞掉（[`Self::take_swallow_mouse_up`]），否则会落到下层正文。caret 由
+    /// 元素层用「保留 `context_menu_rect` 一帧」放行，不在这里移动。
+    fn run_link_menu_action(&mut self, action: LinkMenuAction, cx: &mut Context<Self>) {
+        let Some(EditorContextMenu {
+            target: EditorContextMenuTarget::Link(hit),
+            ..
+        }) = self.context_menu.clone()
+        else {
+            return;
+        };
+        self.context_menu = None;
+        // **故意不立刻清 `context_menu_rect`**：同一次 mouse-down 的窗口级监听随后
+        // 还会跑，保留命中矩形让 `point_in_toolbar` 继续放行（不挪 caret）；下一帧
+        // render 开头会清掉。
+        self.swallow_mouse_up = true;
+        match action {
+            LinkMenuAction::Open => self.open_link_dest(&hit.dest, cx),
+            LinkMenuAction::CopyLink => {
+                cx.write_to_clipboard(ClipboardItem::new_string(hit.dest));
+                self.link_notice = Some("已复制链接".to_owned());
+            }
+            LinkMenuAction::CopyMarkdown => {
+                cx.write_to_clipboard(ClipboardItem::new_string(hit.markdown));
+                self.link_notice = Some("已复制 Markdown".to_owned());
+            }
+        }
+        cx.notify();
+    }
+
+    /// 吞掉同一次手势的 mouse-up（链接菜单/确认框动作后调用）。
+    pub(crate) fn take_swallow_mouse_up(&mut self) -> bool {
+        std::mem::take(&mut self.swallow_mouse_up)
+    }
+
+    // ---- 普通链接（外部 / 内部）----
+
+    /// 命中普通链接：返回完整信息（`dest` + 完整 Markdown 源码）。
+    ///
+    /// 只接受可见文本区间（末尾边界 `display == end` 不算命中），与
+    /// [`Self::external_link_display_ranges`] 同一套命中规则。
+    pub fn external_link_hit_at_display(&self, display: usize) -> Option<ExternalLinkHit> {
+        let source = self.controller.source_text();
+        for link in self.controller.links() {
+            let Some(start) = self.controller.source_to_display(link.content().start()) else {
+                continue;
+            };
+            let Some(end) = self.controller.source_to_display(link.content().end()) else {
+                continue;
+            };
+            if start.get() <= display && display < end.get() {
+                let markdown = source
+                    .get(link.span().start().get()..link.span().end().get())
+                    .unwrap_or_default()
+                    .to_owned();
+                return Some(ExternalLinkHit {
+                    dest: link.dest().to_owned(),
+                    markdown,
+                });
+            }
+        }
+        None
+    }
+
+    /// 本帧普通链接的**窗口坐标**矩形（headless 点击/断言用；与链接 hitbox 同源）。
+    pub fn external_link_rects(&self) -> Vec<(usize, usize, String, Bounds<Pixels>)> {
+        let Some(geometry) = self.shared.geometry() else {
+            return Vec::new();
+        };
+        let mut rects = Vec::new();
+        for (start, end, dest) in self.external_link_display_ranges() {
+            let Some((row, start_x)) = geometry.caret_row_x(start) else {
+                continue;
+            };
+            let Some((end_row, end_x)) = geometry.caret_row_x(end) else {
+                continue;
+            };
+            if row != end_row || end_x <= start_x {
+                continue;
+            }
+            rects.push((
+                start,
+                end,
+                dest,
+                Bounds::new(
+                    point(start_x, geometry.row_top(row)),
+                    size(end_x - start_x, geometry.row_height(row)),
+                ),
+            ));
+        }
+        rects
+    }
+
+    /// 打开一个普通链接目标（Ctrl/Cmd+单击、右键「打开链接」、`request_external_link`）。
+    ///
+    /// scheme 策略见 [`super::link`]：允许的 scheme 直接交给系统；`file:`/UNC 与未知
+    /// 自定义 scheme 先弹 app 内确认框；危险 scheme 只给提示（不回显路径）；内部链接
+    /// 走标题滚动 / 宿主打开笔记（不自动建笔记）。
+    pub(crate) fn open_link_dest(&mut self, dest: &str, cx: &mut Context<Self>) {
+        match link::classify(dest) {
+            LinkTarget::External { .. } => {
+                self.link_notice = None;
+                link::open_external_url(dest, cx);
+            }
+            LinkTarget::File { scheme } => {
+                self.open_link_confirm(dest, scheme, false, cx);
+            }
+            LinkTarget::Custom { scheme } => {
+                if link_settings::is_remembered(&scheme) {
+                    self.link_notice = None;
+                    link::open_external_url(dest, cx);
+                } else {
+                    self.open_link_confirm(dest, scheme, true, cx);
+                }
+            }
+            LinkTarget::Dangerous { scheme } => {
+                self.link_notice = Some(link::dangerous_notice(&scheme));
+            }
+            LinkTarget::Internal { note, heading } => {
+                self.open_internal_link(note, heading, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 打开确认框（`file:`/UNC 与未知自定义 scheme）。
+    fn open_link_confirm(
+        &mut self,
+        url: &str,
+        scheme: String,
+        rememberable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.link_confirm = Some(LinkConfirm {
+            url: url.to_owned(),
+            scheme,
+            rememberable,
+            remember: false,
+        });
+        self.link_notice = None;
+        cx.notify();
+    }
+
+    /// 关闭确认框（取消 / `Esc` / 点遮罩）。
+    pub(crate) fn close_link_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.link_confirm.take().is_some() {
+            self.swallow_mouse_up = true;
+            cx.notify();
+        }
+    }
+
+    /// 确认框「打开」：按需记住未知 scheme，然后原样交给系统。
+    pub(crate) fn confirm_link_open(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.link_confirm.take() else {
+            return;
+        };
+        self.swallow_mouse_up = true;
+        if confirm.rememberable && confirm.remember {
+            link_settings::remember(&confirm.scheme);
+        }
+        self.link_notice = None;
+        link::open_external_url(&confirm.url, cx);
+        cx.notify();
+    }
+
+    /// 内部链接：`#heading` 滚动/定位到标题；相对笔记路径交给宿主打开。
+    ///
+    /// 解析不到只给**非阻塞提示**，不自动建笔记（与 wiki 链接同一约定）。
+    fn open_internal_link(
+        &mut self,
+        note: Option<String>,
+        heading: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let note = note.filter(|note| !note.trim().is_empty());
+        let heading = heading.filter(|heading| !heading.trim().is_empty());
+        match (note, heading) {
+            (None, Some(heading)) => {
+                self.scroll_to_heading(&heading, cx);
+            }
+            (Some(note), heading) => {
+                // 相对笔记路径：复用 wiki 链接的解析/打开（宿主负责，不自动建笔记）。
+                self.link_notice = None;
+                cx.emit(EditorEvent::WikiLinkRequested {
+                    target: note,
+                    heading,
+                });
+                cx.notify();
+            }
+            (None, None) => {
+                self.link_notice = Some("链接目标为空".to_owned());
+                cx.notify();
+            }
+        }
+    }
+
+    /// 把 caret 移到标题并滚动到标题行顶部；找不到只给非阻塞提示。
+    fn scroll_to_heading(&mut self, heading: &str, cx: &mut Context<Self>) -> bool {
+        let wanted = link::normalize_heading(heading);
+        if wanted.is_empty() {
+            self.link_notice = Some("链接标题为空".to_owned());
+            cx.notify();
+            return false;
+        }
+        let source = self.controller.source_text().to_owned();
+        let mut found = None;
+        for run in self.controller.block_runs() {
+            if run.kind() != BlockKind::Heading {
+                continue;
+            }
+            if link::heading_text(&source, run.source()).eq_ignore_ascii_case(&wanted) {
+                found = Some(run.source().start().get());
+                break;
+            }
+        }
+        let Some(start) = found else {
+            self.link_notice = Some(format!("未找到标题「{wanted}」"));
+            cx.notify();
+            return false;
+        };
+        let Ok(scalar) = SourceByte::new(start).to_scalar(&source) else {
+            return false;
+        };
+        // 跳转语义：标题行**顶部对齐**（不是最小滚动），随后 caret 落到标题行首。
+        if let Some(geometry) = self.shared.geometry() {
+            if let Some(display) = self.controller.source_to_display(SourceByte::new(start)) {
+                let row = geometry.frame.row_of_byte(display.get());
+                self.scroll_y = geometry.frame.row_top_offset(row);
+                self.clamp_scroll();
+            }
+        }
+        self.link_notice = None;
+        self.commit_selection(Selection::caret(scalar), cx);
+        true
+    }
+
+    /// 外部链接确认框是否打开（元素层据此把点击让给模态浮层）。
+    pub(crate) fn link_confirm_open(&self) -> bool {
+        self.link_confirm.is_some()
+    }
+
+    /// 非阻塞链接提示（危险 scheme / 未找到标题 / 复制结果）；`None` = 没有提示。
+    #[must_use]
+    pub fn link_notice_text(&self) -> Option<&str> {
+        self.link_notice.as_deref()
+    }
+
+    /// 清掉非阻塞链接提示（下一次点击/按键时调用）。
+    pub(crate) fn clear_link_notice(&mut self) {
+        self.link_notice = None;
     }
 
     /// 右键菜单「插入 → 表格」：在**当前 caret/选区**处插入一张默认 GFM 表格
@@ -2760,6 +3504,39 @@ impl EditorView {
         }
     }
 
+    /// 工具条「重新渲染」：丢弃 Mermaid 的缓存终态并重新排队（失败后可重试）。
+    ///
+    /// 只对 Mermaid 对象生效；在途时返回 `false`（不重复排队）。**不产生任何
+    /// `EditRequest`**，也不改正文/selection。
+    pub fn retry_object_mermaid(&mut self, line: usize, cx: &mut Context<Self>) -> bool {
+        let Some(object) = self.controller.object_at_line(line) else {
+            return false;
+        };
+        if !object.kind().is_mermaid() {
+            return false;
+        }
+        let Some(mermaid) = self.controller.mermaid_of(object) else {
+            return false;
+        };
+        let content_width = self.object_content_width();
+        let source = self.mermaid_content(mermaid);
+        // 显式「重新渲染」是用户意图，**不受延迟渲染门控**（自动绘制仍然等光标移出）。
+        let key = MermaidCacheKey::new(&source, content_width);
+        let queued = self.mermaid.retry(key, &source);
+        if queued {
+            eprintln!("[menghunote] Mermaid 重新渲染（行 {line}）");
+            cx.notify();
+        }
+        queued
+    }
+
+    /// 工具条「重新渲染」：作用于当前工具条目标对象（只对 Mermaid 生效）。
+    pub fn retry_selected_mermaid(&mut self, cx: &mut Context<Self>) {
+        if let Some(line) = self.toolbar_target_line() {
+            self.retry_object_mermaid(line, cx);
+        }
+    }
+
     /// 工具条「复制 Markdown」：复制对象的**完整源码跨度**（图片/表格通用）。
     pub fn copy_object_markdown(&mut self, line: usize, cx: &mut Context<Self>) {
         let Some(object) = self.controller.object_at_line(line) else {
@@ -2865,28 +3642,45 @@ impl EditorView {
                 // 这是布局、绘制、命中三处**唯一**的高度来源（不在这里估字符宽度）。
                 if object_edit_line != Some(index) {
                     if let Some(object) = self.controller.object_at_line(index) {
-                        let line_height = match object.kind() {
-                            menghunote_editor::ObjectKind::Image => {
-                                self.controller.image_of(object).map_or(
-                                    theme::OBJECT_PLACEHOLDER_HEIGHT + theme::OBJECT_PADDING * 2.0,
-                                    |image| self.object_row_height(image, content_width),
-                                )
-                            }
-                            menghunote_editor::ObjectKind::Table => {
-                                self.controller.table_of(object).map_or(
-                                    theme::TABLE_HEADER_HEIGHT + theme::TABLE_PADDING * 2.0,
-                                    |table| self.table_row_height(table, content_width),
-                                )
-                            }
-                        };
-                        return super::layout::LineMetric {
-                            font_size: theme::FONT_SIZE,
-                            line_height,
-                            mono: false,
-                            indent: 0.0,
-                            wrap_indent: 0.0,
-                            quote_depth: 0,
-                        };
+                        // Mermaid 在光标/选区进入时**不投影**成 Object（源码可编辑）；
+                        // 此时布局必须回落到普通 fenced code 行高，否则 caret 会被
+                        // 撑成占位块的高度（用户实测的“大光标”）。
+                        if object.kind() == menghunote_editor::ObjectKind::Mermaid
+                            && projection.object_display_range(object.span()).is_none()
+                        {
+                            // 落到下面的普通行度量。
+                        } else {
+                            let line_height = match object.kind() {
+                                menghunote_editor::ObjectKind::Image => {
+                                    self.controller.image_of(object).map_or(
+                                        theme::OBJECT_PLACEHOLDER_HEIGHT
+                                            + theme::OBJECT_PADDING * 2.0,
+                                        |image| self.object_row_height(image, content_width),
+                                    )
+                                }
+                                menghunote_editor::ObjectKind::Table => {
+                                    self.controller.table_of(object).map_or(
+                                        theme::TABLE_HEADER_HEIGHT + theme::TABLE_PADDING * 2.0,
+                                        |table| self.table_row_height(table, content_width),
+                                    )
+                                }
+                                menghunote_editor::ObjectKind::Mermaid => {
+                                    self.controller.mermaid_of(object).map_or(
+                                        theme::MERMAID_PLACEHOLDER_HEIGHT
+                                            + theme::OBJECT_PADDING * 2.0,
+                                        |mermaid| self.mermaid_row_height(mermaid, content_width),
+                                    )
+                                }
+                            };
+                            return super::layout::LineMetric {
+                                font_size: theme::FONT_SIZE,
+                                line_height,
+                                mono: false,
+                                indent: 0.0,
+                                wrap_indent: 0.0,
+                                quote_depth: 0,
+                            };
+                        }
                     }
                 }
                 let quote_depth = super::layout::quote_depth(source_line);
@@ -3175,9 +3969,14 @@ impl EditorView {
         cx.emit(EditorEvent::WikiLinkRequested { target, heading });
     }
 
-    /// 发出普通外链请求（宿主负责 scheme 校验并打开系统浏览器）。
+    /// 打开一个普通外链（Ctrl/Cmd+单击、右键「打开链接」与测试的公共入口）。
+    ///
+    /// scheme 策略 / 确认框 / 内部链接都在编辑器侧统一处理（[`Self::open_link_dest`]）；
+    /// 宿主不再参与外链打开。
     pub fn request_external_link(&mut self, url: String, cx: &mut Context<Self>) {
-        cx.emit(EditorEvent::ExternalLinkRequested(url));
+        // 统一收口：scheme 策略 / 确认框 / 内部链接都在编辑器侧处理（见 `open_link_dest`）。
+        // 不再经过宿主事件——宿主只负责解析 wiki 目标，外链打开不需要它。
+        self.open_link_dest(&url, cx);
     }
 
     /// 重命名联动：通过**当前活动 driver** 改写正文里的 wiki 链接 target。
@@ -3585,6 +4384,14 @@ impl EditorView {
             // 平台没有补发 Enter 文本输入时，标记不能留到下一次普通输入。
             self.pending_enter_text_input = false;
         }
+        // 外部链接确认框是**模态**的：`Esc` 关闭，其它按键一律吞掉（不落到正文）。
+        if self.link_confirm.is_some() {
+            if event.keystroke.key.as_str() == "escape" {
+                window.prevent_default();
+                self.close_link_confirm(cx);
+            }
+            return;
+        }
         // 表格行列拖拽（ADR 0019 S3b5）：`Esc` 取消这次拖拽（**不产生任何请求**）；
         // 其它按键先取消拖拽再继续处理（拖拽不接受键盘改目标，也不能和输入抢状态）。
         if self.table_drag.is_some() {
@@ -3605,6 +4412,8 @@ impl EditorView {
                 return;
             }
         }
+        // 非阻塞链接提示：任何按键都清掉（它只用于一次性反馈）。
+        self.link_notice = None;
         let modifiers = event.keystroke.modifiers;
         if std::env::var_os("MENGHUNOTE_TRACE_MENU").is_some() {
             eprintln!(
@@ -4043,8 +4852,17 @@ impl EditorView {
         cx.notify();
     }
 
-    /// 普通文本输入（无组合：打字 / 粘贴）。
+    /// 普通文本输入（粘贴 / 内部换行）：**不**触发反引号自动补全。
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.insert_text_inner(text, false, cx);
+    }
+
+    /// 平台打字的文本输入：允许反引号自动补全（IME 组合不走这里）。
+    pub(crate) fn insert_typed_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.insert_text_inner(text, true, cx);
+    }
+
+    fn insert_text_inner(&mut self, text: &str, allow_backtick: bool, cx: &mut Context<Self>) {
         // 兜底：单元格浮层编辑期间文本属于输入框。正常路径焦点在输入框、不会走到这里；
         // 万一平台把文本送给了正文，也不能把它插进表格/正文（那会写坏结构）。
         if self.is_editing_table_cell() {
@@ -4074,6 +4892,11 @@ impl EditorView {
             // Held：打字/粘贴一律忽略（控制器镜像也不能先乐观改动，否则之后无法对齐）。
             return;
         }
+        // 反引号自动补全只作用于**平台打字**（粘贴走 `insert_text`，不配对）。
+        // 规则在 editor 的纯函数里；这里只按行语义过滤（表格/代码块/Html 不自动补）。
+        if allow_backtick && text == "`" && self.try_backtick_autocomplete(cx) {
+            return;
+        }
         match self.controller.compose_replace_selection(text) {
             Ok(request) => {
                 self.submit_request(request);
@@ -4081,6 +4904,99 @@ impl EditorView {
             Err(error) => eprintln!("[menghunote] 插入文本失败：{error}"),
         }
         cx.notify();
+    }
+
+    /// 反引号自动补全：返回 `true` 表示这次输入已被处理（不再走普通替换）。
+    ///
+    /// 纯规则在 [`menghunote_editor::backtick_action`]；本方法负责上下文过滤与执行：
+    ///
+    /// - IME 组合中不触发（组合上屏走 `commit_composition`）；
+    /// - 非空选区、表格/围栏代码/缩进代码/HTML 行不触发（不破坏结构）；
+    /// - “跳过自动补的那个”只移动 caret，不产生 `EditRequest`；
+    /// - 其余动作都走 `compose_replace_selection`（一次按键一个撤销组）。
+    fn try_backtick_autocomplete(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.is_composing() {
+            return false;
+        }
+        let selection = self.controller.selection();
+        if !selection.is_empty() {
+            return false;
+        }
+        let source = self.controller.source_text();
+        let Ok(caret) = selection
+            .head()
+            .to_source_byte(&source)
+            .map(|byte| byte.get())
+        else {
+            return false;
+        };
+        if !self.backtick_line_allows_autocomplete(&source, caret) {
+            return false;
+        }
+        match menghunote_editor::backtick_action(&source, caret) {
+            BacktickAction::Plain => false,
+            BacktickAction::SkipPaired => {
+                // 自动补的那个反引号已经存在，只把 caret 移过去（零请求）。
+                self.place_caret_at_byte(caret + 1, cx);
+                true
+            }
+            BacktickAction::InsertPair => {
+                self.apply_backtick_edit(caret, PAIR_INSERT, PAIR_CARET_OFFSET, cx);
+                true
+            }
+            BacktickAction::InsertSingle => {
+                self.apply_backtick_edit(caret, SINGLE_INSERT, SINGLE_CARET_OFFSET, cx);
+                true
+            }
+            BacktickAction::CompleteFence => {
+                self.apply_backtick_edit(caret, FENCE_INSERT, FENCE_CARET_OFFSET, cx);
+                true
+            }
+        }
+    }
+
+    /// 当前行是否允许反引号自动补全（表格/代码块/HTML 保持普通输入）。
+    fn backtick_line_allows_autocomplete(&self, source: &str, caret: usize) -> bool {
+        let line = source[..caret.min(source.len())]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let Some(info) = self.controller.line_infos().get(line) else {
+            return false;
+        };
+        !matches!(
+            info.kind,
+            MarkdownLineKind::Table
+                | MarkdownLineKind::FencedCode
+                | MarkdownLineKind::IndentedCode
+                | MarkdownLineKind::Html
+        )
+    }
+
+    /// 在 caret 处插入反引号文本，并把 caret 放到“原 caret + offset”（同一请求）。
+    fn apply_backtick_edit(
+        &mut self,
+        old_caret: usize,
+        insert: &str,
+        caret_offset: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match self.controller.compose_replace_selection(insert) {
+            Ok(Some(request)) => {
+                self.submit_request(Some(request));
+                let source = self.controller.source_text();
+                if let Some(scalar) =
+                    scalar_of_byte(&source, old_caret.saturating_add(caret_offset))
+                {
+                    self.preferred_x = None;
+                    self.commit_selection(Selection::caret(scalar), cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            Ok(None) => cx.notify(),
+            Err(error) => eprintln!("[menghunote] 反引号自动补全失败：{error}"),
+        }
     }
 
     // ---- 粘贴 / 拖放导入（ADR 0019 §2/§3，S2b）----
@@ -5061,50 +5977,9 @@ impl EditorView {
             .geometry()
             .map_or_else(Vec::new, |geometry| geometry.spans_for_row(row))
     }
-
-    /// 状态栏左侧文案：保存状态 / 光标 / 显示行数。
-    fn status_text(&self) -> String {
-        let saved = if self.driver.is_external_commit_held() {
-            // Held：输入被冻结，明确告诉用户为什么按键没反应（不是卡死）。
-            "外部提交中，输入已冻结".to_owned()
-        } else if let Some(preedit) = self.controller.preedit_text() {
-            // 组合期间 preedit 不进 CRDT：明确告诉用户"还没提交"
-            format!("输入中，尚未提交（preedit {} 字）", preedit.chars().count())
-        } else if self.controller.is_saved() {
-            "已保存".to_owned()
-        } else {
-            "保存中".to_owned()
-        };
-        let selection = self.controller.selection();
-        let position = if selection.is_empty() {
-            format!("光标 scalar #{}", selection.head().get())
-        } else {
-            format!(
-                "选区 scalar #{}..#{}（{} 个）",
-                selection.start().get(),
-                selection.end().get(),
-                selection.len()
-            )
-        };
-        let rows = self
-            .shared
-            .geometry()
-            .map_or(0, |geometry| geometry.frame.row_count());
-        // 单元格就地编辑是“模态”式的（display 只剩这一格）：状态栏必须说明当前在干什么
-        // 以及怎么出去，否则用户会以为表格被删掉了。
-        let cell = self
-            .table_cell_edit_target()
-            .map_or(String::new(), |(line, row, column)| {
-                format!(" · 单元格编辑（第 {line} 行表 row={row} col={column}）")
-            });
-        format!(
-            "{} · {saved}{cell} · {position} · {rows} 显示行 · {}",
-            self.controller.doc_id(),
-            self.vault_label
-        )
-    }
 }
 
+/// dev-sync（ADR 0009 切片 3b）
 /// dev-sync（ADR 0009 切片 3b）：外部提交闸门 / adopt 的**最小转发**。
 ///
 /// 这里只做三件事：转发给 [`SessionDriver`]、刷新 `held`（状态栏与 selector 用）、
@@ -5566,8 +6441,10 @@ impl EditorView {
             .iter()
             .find(|object| object.line == line)?;
         // 表格没有“放大”（ADR 0019 S3a：工具条只需要编辑源码）。
+        // Mermaid 没有“放大”，但提供「重新渲染」（失败/改主题后可重试；M2）。
         let has_zoom = object.kind.is_image();
-        let button_count = if has_zoom { 2.0 } else { 1.0 };
+        let has_rerender = object.kind.is_mermaid();
+        let button_count = if has_zoom || has_rerender { 2.0 } else { 1.0 };
         let (viewport_width, _) = self.shared.viewport();
         // 每枚 28px 按钮 + 按钮间 4px gap + 左右各 4px padding。
         let toolbar_width =
@@ -5617,6 +6494,14 @@ impl EditorView {
                 }),
             )
         });
+        let rerender = has_rerender.then(|| {
+            button("object-toolbar-rerender", "⟳").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _event: &MouseDownEvent, _window, cx| {
+                    view.retry_object_mermaid(target_line, cx);
+                }),
+            )
+        });
         let edit = button("object-toolbar-edit", "</>").on_mouse_down(
             MouseButton::Left,
             cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
@@ -5643,6 +6528,7 @@ impl EditorView {
                 .rounded(px(8.0))
                 .overflow_hidden()
                 .when_some(zoom, |this, zoom| this.child(zoom))
+                .when_some(rerender, |this, rerender| this.child(rerender))
                 .child(edit)
                 .into_any_element(),
         )
@@ -5837,11 +6723,14 @@ impl EditorView {
     /// 位置 = 右键落点（窗口坐标）按编辑器视口夹取；点菜单不移动正文 caret
     /// （命中矩形写进 `context_menu_rect`，元素层会放行这些点击）。
     fn render_context_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let menu = self.context_menu?;
+        let menu = self.context_menu.clone()?;
         let geometry = self.shared.geometry()?;
         let (viewport_width, viewport_height) = self.shared.viewport();
         let width = theme::EDITOR_CONTEXT_MENU_WIDTH;
-        let height = theme::EDITOR_CONTEXT_MENU_HEIGHT;
+        let height = match menu.target {
+            EditorContextMenuTarget::InsertTable => theme::EDITOR_CONTEXT_MENU_HEIGHT,
+            EditorContextMenuTarget::Link(_) => theme::EDITOR_CONTEXT_MENU_LINK_HEIGHT,
+        };
         let local_left = (menu.position.x - geometry.origin.x).as_f32().clamp(
             theme::PAD_X,
             (viewport_width - width - theme::PAD_X).max(theme::PAD_X),
@@ -5858,24 +6747,94 @@ impl EditorView {
             size(px(width), px(height)),
         ));
 
-        let item = div()
-            .id("editor-context-insert-table")
-            .debug_selector(|| "editor-context-insert-table".to_string())
-            .flex()
-            .items_center()
-            .h(px(24.0))
-            .px(px(8.0))
-            .rounded(px(4.0))
-            .text_size(px(13.0))
-            .text_color(theme::object_toolbar_text())
-            .hover(|style| style.bg(theme::sidebar_selected_bg()))
-            .child(SharedString::from("表格"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, _event: &MouseDownEvent, window, cx| {
-                    view.insert_table_from_context_menu(Some(window), cx);
-                }),
-            );
+        let panel = match menu.target {
+            EditorContextMenuTarget::InsertTable => {
+                let item = div()
+                    .id("editor-context-insert-table")
+                    .debug_selector(|| "editor-context-insert-table".to_string())
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .rounded(px(4.0))
+                    .text_size(px(13.0))
+                    .text_color(theme::object_toolbar_text())
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(SharedString::from("表格"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _event: &MouseDownEvent, window, cx| {
+                            view.insert_table_from_context_menu(Some(window), cx);
+                        }),
+                    );
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(width))
+                    .h(px(height))
+                    .p(px(4.0))
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .h(px(18.0))
+                            .px(px(8.0))
+                            .text_size(px(11.0))
+                            .text_color(theme::table_actions_text_disabled())
+                            .child(SharedString::from("插入")),
+                    )
+                    .child(item)
+            }
+            EditorContextMenuTarget::Link(_) => {
+                // 链接菜单：三个动作，全部在 mouse-down 上执行；动作后由
+                // `swallow_mouse_up` 吞掉同一次手势的 mouse-up（不移动 caret）。
+                let item = |selector: &'static str, label: &'static str, action: LinkMenuAction| {
+                    div()
+                        .id(selector)
+                        .debug_selector(move || selector.to_string())
+                        .flex()
+                        .items_center()
+                        .h(px(24.0))
+                        .px(px(8.0))
+                        .rounded(px(4.0))
+                        .text_size(px(13.0))
+                        .text_color(theme::object_toolbar_text())
+                        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                        .child(SharedString::from(label))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _event: &MouseDownEvent, _window, cx| {
+                                view.run_link_menu_action(action, cx);
+                            }),
+                        )
+                };
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(width))
+                    .h(px(height))
+                    .p(px(4.0))
+                    .gap(px(2.0))
+                    .child(item(
+                        "editor-context-open-link",
+                        "打开链接",
+                        LinkMenuAction::Open,
+                    ))
+                    .child(item(
+                        "editor-context-copy-link",
+                        "复制链接",
+                        LinkMenuAction::CopyLink,
+                    ))
+                    .child(item(
+                        "editor-context-copy-markdown",
+                        "复制 Markdown",
+                        LinkMenuAction::CopyMarkdown,
+                    ))
+            }
+        };
 
         Some(
             div()
@@ -5895,27 +6854,201 @@ impl EditorView {
                 .border_color(theme::object_toolbar_border())
                 .rounded(px(8.0))
                 .overflow_hidden()
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+    /// 外部链接确认框（`file:`/UNC 与未知自定义 scheme）。
+    ///
+    /// 最小 app 内浮层（不依赖系统级对话框）：遮罩 + 面板 + 「取消 / 打开」；
+    /// 未知自定义 scheme 多一个「记住此 scheme（仅本机）」勾选项。确认框是模态的：
+    /// 遮罩 `occlude` 且各按钮 `stop_propagation`，点击不会落到正文。
+    fn render_link_confirm(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let confirm = self.link_confirm.as_ref()?;
+        // 只显示 scheme[:host]，**不回显 path/query**（可能含敏感信息）。
+        let target = link::display_target(&confirm.url);
+        let rememberable = confirm.rememberable;
+        let remember = confirm.remember;
+
+        let cancel = div()
+            .id("editor-link-confirm-cancel")
+            .debug_selector(|| "editor-link-confirm-cancel".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(26.0))
+            .px(px(12.0))
+            .rounded(px(6.0))
+            .text_size(px(12.0))
+            .text_color(theme::object_toolbar_text())
+            .hover(|style| style.bg(theme::sidebar_selected_bg()))
+            .child(SharedString::from("取消"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    view.close_link_confirm(cx);
+                }),
+            );
+
+        let open = div()
+            .id("editor-link-confirm-open")
+            .debug_selector(|| "editor-link-confirm-open".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(26.0))
+            .px(px(12.0))
+            .rounded(px(6.0))
+            .text_size(px(12.0))
+            .text_color(theme::link_confirm_primary_text())
+            .bg(theme::link_confirm_primary_bg())
+            .hover(|style| style.opacity(0.9))
+            .child(SharedString::from("打开"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    view.confirm_link_open(cx);
+                }),
+            );
+
+        let mut panel = div()
+            .id("editor-link-confirm-panel")
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .w(px(theme::LINK_CONFIRM_WIDTH))
+            .p(px(16.0))
+            .rounded(px(10.0))
+            .bg(theme::object_toolbar_bg())
+            .border(px(1.0))
+            .border_color(theme::object_toolbar_border())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_view, _event: &MouseDownEvent, _window, cx| {
+                    // 面板内部点击不关闭确认框（只有遮罩/取消才关）。
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(theme::text_color())
+                    .child(SharedString::from("打开外部链接？")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme::table_actions_text_disabled())
+                    .child(SharedString::from(format!("目标：{target}"))),
+            );
+        if rememberable {
+            panel = panel.child(
+                div()
+                    .id("editor-link-confirm-remember")
+                    .debug_selector(|| "editor-link-confirm-remember".to_string())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                            if let Some(confirm) = view.link_confirm.as_mut() {
+                                confirm.remember = !confirm.remember;
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .rounded(px(3.0))
+                            .border(px(1.0))
+                            .border_color(theme::object_toolbar_border())
+                            .when(remember, |this| this.bg(theme::link_confirm_primary_bg())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme::table_actions_text_disabled())
+                            .child(SharedString::from("记住此 scheme（仅本机）")),
+                    ),
+            );
+        }
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(8.0))
+                .child(cancel)
+                .child(open),
+        );
+
+        Some(
+            div()
+                .id("editor-link-confirm")
+                .debug_selector(|| "editor-link-confirm".to_string())
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme::link_confirm_overlay())
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                        // 点遮罩 = 取消；吞掉这次点击，不落到正文。
+                        cx.stop_propagation();
+                        view.close_link_confirm(cx);
+                    }),
+                )
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    /// 非阻塞链接提示（危险 scheme 拒绝 / 未找到标题 / 复制结果）。
+    ///
+    /// 浮在状态栏上方，不拦截鼠标（没有交互监听）；下一次点击/按键清除。
+    fn render_link_notice(&self) -> Option<AnyElement> {
+        let notice = self.link_notice.as_ref()?;
+        Some(
+            div()
+                .id("editor-link-notice")
+                .debug_selector(|| "editor-link-notice".to_string())
+                .absolute()
+                .bottom(px(36.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .flex()
+                .justify_center()
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .h(px(18.0))
-                        .px(px(8.0))
-                        .text_size(px(11.0))
-                        .text_color(theme::table_actions_text_disabled())
-                        .child(SharedString::from("插入")),
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .rounded(px(999.0))
+                        .bg(theme::link_notice_bg())
+                        .text_size(px(12.0))
+                        .text_color(theme::link_notice_text())
+                        .child(SharedString::from(notice.clone())),
                 )
-                .child(item)
                 .into_any_element(),
         )
     }
 }
 
-/// 把单元格源码文本变成绘制用纯文本（首版不解析行内格式）。
+/// 把单元格源码文本变成**编辑浮层**用的文本（源码原文 + 只还原 `\|` 转义）。
 ///
-/// 只做两件事：保留源码原文（已由解析器去掉首尾空白）+ 把 `\|` 还原成 `|`
-/// （转义只是源码层的列边界保护，不应显示成反斜杠）。行内的 `**`/`` ` `` 等标记
-/// 首版原样显示（ADR 0019 S3a 明确：单元格不做富文本）。
+/// 单元格就地编辑显示的是**源码**（ADR 0019 S3b7）：`**粗体**` 原样显示成
+/// `**粗体**`，用户改的就是真源；只有 GFM 的列边界转义 `\|` 还原成 `|`
+/// （否则每敲一个字都要面对反斜杠）。提交时仍走 `sanitize_cell_text` 重新转义，
+/// 因此「显示 → 提交」逐字节稳定。
 #[must_use]
 pub(crate) fn table_cell_display_text(source: &str, cell: SourceRange) -> String {
     source
@@ -5924,30 +7057,117 @@ pub(crate) fn table_cell_display_text(source: &str, cell: SourceRange) -> String
         .replace("\\|", "|")
 }
 
-/// 一个单元格的 shaping 文本：源码原文（去 `\|` 转义）→ 按列宽截断。
+/// 一个单元格的绘制数据：行内 Markdown 的 display 文本（按列宽截断）+ 可见链接矩形。
 ///
-/// 首版纯文本：单段 `Plain` 样式（表格内不做行内富文本）。空 cell 返回 `None`
-/// （不 shaping，也不画字形）。
+/// 文本与链接**同源**：都来自 [`TableCellInline`]（解析文档时算一次），链接矩形用
+/// 截断后 `ShapedLine` 的 `x_for_index` 换算，因此点击与绘制逐像素一致。
+///
+/// `visible = false`（该格正在就地编辑）时不 shaping、不产生链接矩形：浮层输入框
+/// 覆盖在 cell 上，旧文字必须隐藏，否则会与草稿叠成重影。
 #[must_use]
 pub(crate) fn table_cell_paint(
     window: &Window,
-    source: &str,
-    cell: Option<SourceRange>,
+    inline: Option<&TableCellInline>,
+    rect: Bounds<Pixels>,
+    align: MarkdownTableAlignment,
     inner_width: f32,
-) -> Option<gpui::ShapedLine> {
-    let text = table_cell_display_text(source, cell?);
-    if text.is_empty() {
-        return None;
+    visible: bool,
+) -> TableCellPaint {
+    let empty = TableCellPaint {
+        rect,
+        text: None,
+        align,
+        links: Vec::new(),
+    };
+    if !visible {
+        return empty;
     }
-    let spans = [(text.len(), StyleKind::Plain)];
-    super::glyph::shape_row_truncated_at(
+    let Some(inline) = inline else {
+        return empty;
+    };
+    let display = inline.display();
+    if display.is_empty() {
+        return empty;
+    }
+    let spans: Vec<(usize, StyleKind)> = inline
+        .spans()
+        .iter()
+        .map(|span| (span.len(), table_cell_style_kind(span.kind)))
+        .collect();
+    let Some(truncated) = super::glyph::shape_row_truncated_at(
         window,
-        &text,
+        display,
         &spans,
         theme::TABLE_FONT_SIZE,
         false,
         inner_width,
-    )
+    ) else {
+        return empty;
+    };
+    let links = table_cell_link_paints(&truncated, inline, rect, align, inner_width);
+    TableCellPaint {
+        rect,
+        text: Some(truncated.line),
+        align,
+        links,
+    }
+}
+
+/// 单元格行内语义 → 正文的 [`StyleKind`]（同一套外观：粗体/斜体/删除线/代码/链接）。
+fn table_cell_style_kind(kind: TableCellStyle) -> StyleKind {
+    match kind {
+        TableCellStyle::Plain => StyleKind::Plain,
+        TableCellStyle::Bold => StyleKind::Bold,
+        TableCellStyle::Emphasis => StyleKind::Emphasis,
+        TableCellStyle::InlineCode => StyleKind::InlineCode,
+        TableCellStyle::Strike => StyleKind::Strike,
+        TableCellStyle::Link => StyleKind::Link,
+    }
+}
+
+/// 单元格里的链接 → 窗口矩形（按**截断后**的可见前缀裁剪）。
+///
+/// 偏移与 `ShapedLine::paint` 的 `TextAlign` 语义一致：左对齐从内边距起点开始，
+/// 居中/右对齐在单元格内宽里平移。截断点之后的链接没有画出来，直接丢弃（不可点）。
+fn table_cell_link_paints(
+    truncated: &super::glyph::TruncatedLine,
+    inline: &TableCellInline,
+    rect: Bounds<Pixels>,
+    align: MarkdownTableAlignment,
+    inner_width: f32,
+) -> Vec<TableCellLinkPaint> {
+    if inline.links().is_empty() || truncated.visible_len == 0 {
+        return Vec::new();
+    }
+    let text_width = truncated.line.width().as_f32();
+    let align_offset = match align {
+        MarkdownTableAlignment::Center => ((inner_width - text_width) / 2.0).max(0.0),
+        MarkdownTableAlignment::Right => (inner_width - text_width).max(0.0),
+        MarkdownTableAlignment::None | MarkdownTableAlignment::Left => 0.0,
+    };
+    let left = rect.origin.x.as_f32() + theme::TABLE_CELL_PAD_X + align_offset;
+    let mut paints = Vec::with_capacity(inline.links().len());
+    for link in inline.links() {
+        let start = link.display.start.min(truncated.visible_len);
+        let end = link.display.end.min(truncated.visible_len);
+        if start >= end {
+            continue;
+        }
+        let x0 = truncated.line.x_for_index(start).as_f32();
+        let x1 = truncated.line.x_for_index(end).as_f32();
+        if x1 <= x0 {
+            continue;
+        }
+        paints.push(TableCellLinkPaint {
+            rect: Bounds::new(
+                point(px(left + x0), rect.origin.y),
+                size(px(x1 - x0), rect.size.height),
+            ),
+            display: start..end,
+            dest: link.dest.clone(),
+        });
+    }
+    paints
 }
 
 /// 表格列宽：均分内容宽度，但每列不小于主题最小列宽（窄窗口下由内容遮罩裁剪）。
@@ -5987,7 +7207,6 @@ impl Render for EditorView {
             window.focus(&self.focus_handle, cx);
         }
 
-        let status = SharedString::from(self.status_text());
         // 每帧请求加载当前文档的图片（幂等；解码完成由 pump 触发重绘）。
         self.request_object_images();
         // 工具条/表格边缘浮层/右键菜单每帧重建：目标对象/几何变化时自动跟随，
@@ -6001,6 +7220,9 @@ impl Render for EditorView {
         let toolbar = self.render_object_toolbar(cx);
         let table_actions = self.render_table_actions(cx);
         let context_menu = self.render_context_menu(cx);
+        // 外部链接确认框（模态浮层）与非阻塞提示：确认框在最上层，提示在状态栏上方。
+        let link_confirm = self.render_link_confirm(cx);
+        let link_notice = self.render_link_notice();
         // 表格行列拖拽把手/插入指示线（ADR 0019 S3b5）：绘制在正文与表格之上、
         // 悬浮工具条与浮层之下（后者更靠近边缘，不能被把手压住）。
         let drag_handles = self.render_table_drag_handles(cx);
@@ -6053,32 +7275,23 @@ impl Render for EditorView {
                     .when_some(table_actions, |this, actions| this.child(actions))
                     .when_some(context_menu, |this, menu| this.child(menu)),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .w_full()
-                    .gap_3()
-                    .px_3()
-                    .py_1()
-                    .bg(theme::status_bar_bg())
-                    .text_size(px(12.0))
-                    .text_color(theme::status_bar_text())
-                    .font_weight(FontWeight::NORMAL)
-                    // 测试元数据：`editor-sync-held` **仅** Held 时存在（headless 断言用）。
-                    // 同一个 div 只能记一个 selector，根视图已占用 `editor-current-doc`，
-                    // 所以挂在这层；只加 id 不改任何布局。
-                    .when(self.driver.is_external_commit_held(), |this| {
-                        this.debug_selector(|| "editor-sync-held".to_string())
-                    })
-                    .child(status)
-                    .child(SharedString::from(HINT)),
-            )
+            // 状态/保存提示统一由外层 shell 的底栏承担，编辑器内部不再画一条
+            // 会挤压正文高度的灰色状态条（真机反馈：底栏遮挡正文）。
+            // `editor-sync-held` 仍保留为 0 尺寸的测试标记，不影响布局。
+            .when(self.driver.is_external_commit_held(), |this| {
+                this.child(
+                    div()
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .debug_selector(|| "editor-sync-held".to_string()),
+                )
+            })
+            .when_some(link_notice, |this, notice| this.child(notice))
             .when_some(self.zoomed_image.clone(), |this, image| {
                 this.child(self.render_image_zoom(image, cx))
             })
+            // 确认框是模态的：画在最后（图片放大遮罩之上），保证按钮可达。
+            .when_some(link_confirm, |this, confirm| this.child(confirm))
     }
 }
 

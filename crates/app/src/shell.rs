@@ -43,9 +43,15 @@ use menghunote_storage::{
 use menghunote_storage::{load_head, STRUCTURE_DOC_ID};
 
 use crate::editor::view::EditorEvent;
-// 图谱（G1）：模型/视口数学全在 `graph` 模块，这里只做覆盖层与交互。
-// `hint_line` / `scroll_zoom_factor` 是纯函数，UI 与测试共用同一份口径。
-use crate::graph::{hint_line, scroll_zoom_factor, GraphLimits, GraphModel, GraphViewport};
+// 图谱（G1/G2）：模型/视口数学全在 `graph` 模块，这里只做覆盖层与交互。
+// `hint_line` / `scroll_zoom_factor` / `GraphLod` / `arrow_head` 都是纯函数，
+// UI 与测试共用同一份口径。
+use crate::graph::{
+    arrow_head, hint_line, node_offscreen, scroll_zoom_factor, GraphLimits, GraphLod, GraphModel,
+    GraphOptions, GraphScope, GraphSearch, GraphViewport, DEFAULT_LOCAL_DEPTH, GHOST_RADIUS_SCALE,
+    MAX_LOCAL_DEPTH, MIN_LOCAL_DEPTH,
+};
+use crate::search_input::{SearchInput, SearchInputEvent};
 use crate::sidebar_rename::{RenameEvent, RenameInput};
 
 /// 新建笔记的默认标题（与现有标题重名时自动加序号）。
@@ -134,6 +140,14 @@ const GRAPH_ENTRY_BOTTOM_GAP: f32 = 40.0;
 /// 默认构建（没有 `AppRoot` 设置按钮）的底部留白。
 #[cfg(not(feature = "dev-sync"))]
 const GRAPH_ENTRY_BOTTOM_GAP: f32 = 8.0;
+/// 图谱过滤条高度（逻辑像素；工具条下面一行）。
+const GRAPH_FILTER_HEIGHT: f32 = 32.0;
+/// 图谱搜索框宽度（逻辑像素）。
+const GRAPH_SEARCH_WIDTH: f32 = 168.0;
+/// 过滤条最多显示几个文件夹 chips（超出只提示数量，不做横向滚动）。
+const MAX_FOLDER_CHIPS: usize = 8;
+/// 过滤条最多显示几个标签 chips。
+const MAX_TAG_CHIPS: usize = 6;
 
 /// 当前打开的笔记。
 /// 正在编辑的行。
@@ -161,7 +175,9 @@ struct OpenNote {
 /// **坐标只存在内存里**（`model` 里的布局 + `view` 的平移缩放），不写库、不进同步；
 /// 关闭即丢弃，下次打开重新构建（G3 才考虑布局缓存）。
 struct GraphOverlay {
-    /// 打开时构建的只读模型（节点/边/度数/布局坐标）。
+    /// 整库模型（切换 scope/过滤的**基底**；打开时构建一次，不截断）。
+    full: GraphModel,
+    /// 当前显示的派生模型（局部深度 + 过滤 + 上限）。
     model: GraphModel,
     /// 平移/缩放：绘制、命中、点击共用这一份映射。
     view: GraphViewport,
@@ -171,6 +187,20 @@ struct GraphOverlay {
     drag: Option<GraphDrag>,
     /// 悬停节点下标（高亮它和邻居；`None` = 没悬停）。
     hovered: Option<usize>,
+    /// 当前观察范围（局部/全库；G2）。
+    scope: GraphScope,
+    /// 当前过滤 + 显示选项（文件夹/标签/未解析/方向；G2）。
+    options: GraphOptions,
+    /// 顶层文件夹 chips（来自整库模型）。
+    folders: Vec<String>,
+    /// 标签 chips（来自整库模型；当前 app 没有打标签入口，通常为空）。
+    tags: Vec<String>,
+    /// 搜索输入框（自绘 + IME；复用 `search_input` 模块）。
+    search_input: Entity<SearchInput>,
+    /// 搜索状态（查询 / 匹配 / 选中）。
+    search: GraphSearch,
+    /// 搜索框事件订阅（drop = 取消订阅）。
+    _search_events: gpui::Subscription,
 }
 
 /// 图谱里的一次左键手势。
@@ -181,6 +211,8 @@ struct GraphDrag {
     origin_pan: Point<f32>,
     /// 按下瞬间命中的节点（点击时用它决定"打开笔记"还是"点遮罩关闭"）。
     pressed_node: Option<usize>,
+    /// 按下瞬间命中的未解析占位（点它只提示，不关覆盖层）。
+    pressed_ghost: Option<usize>,
     /// 已经超过拖拽阈值（此时抬手不算点击）。
     moved: bool,
 }
@@ -404,24 +436,36 @@ impl AppShell {
         cx.notify();
     }
 
-    // ---- 图谱覆盖层（G1）：打开/关闭/交互 ----
+    // ---- 图谱覆盖层（G1/G2）：打开/关闭/交互 ----
 
-    /// 打开全库图谱覆盖层（侧栏底部「图谱」）。
+    /// 打开图谱覆盖层（侧栏底部「图谱」）。
     ///
-    /// 打开前先按现有表构建一次模型（`tree`/`notes`/`links` 只读查询，几毫秒级）；
-    /// 失败只写侧栏提示，**不 panic、不改编辑器**。打开时把焦点交给覆盖层，
+    /// **默认视图（G2 决策）**：有当前打开的笔记 → 以它为中心的**局部图（2 跳）**；
+    /// 没有当前笔记 → 全库图（空库就是空图）。打开前先按现有表构建一次**整库模型**
+    /// （`tree`/`notes`/`links`/`note_tags` 只读查询，几毫秒级）；失败只写侧栏提示，
+    /// **不 panic、不改编辑器**。打开时把焦点交给搜索框（`Esc` 由它抛事件关闭覆盖层），
     /// 编辑器的文档/滚动/撤销状态原样保留（覆盖层只是盖在上面）。
     fn open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.graph.is_some() {
             return;
         }
         let viewport = window.bounds().size;
-        match GraphModel::build_with_limits(&self.vault, GraphLimits::default()) {
-            Ok(model) => {
+        match GraphModel::build(&self.vault) {
+            Ok(full) => {
+                // 局部图优先：中心 = 当前笔记；没有打开的笔记时回退全库图。
+                let scope = match self.active.as_ref() {
+                    Some(active) => GraphScope::local(active.note_id.clone(), DEFAULT_LOCAL_DEPTH),
+                    None => GraphScope::full(),
+                };
+                let options = GraphOptions::default();
+                let model = full.derive(&scope, &options, GraphLimits::default());
                 let mut view = GraphViewport::default();
                 view.fit_to(&model, viewport);
+                let folders = full.folders();
+                let tags = full.tags();
                 eprintln!(
-                    "[menghunote] 打开图谱：节点 {} 边 {} 未解析 {} 自环 {} 悬空 {}（zoom={:.2}）",
+                    "[menghunote] 打开图谱：{} · 节点 {} 边 {} 未解析 {} 自环 {} 悬空 {}（zoom={:.2}）",
+                    if scope.is_local() { "局部" } else { "全库" },
                     model.node_count(),
                     model.edge_count(),
                     model.unresolved_links(),
@@ -429,14 +473,34 @@ impl AppShell {
                     model.dangling_links(),
                     view.zoom
                 );
+                // 自绘输入框（带 IME）：组件 `Input` 没有 `EntityInputHandler`，见 search_input.rs。
+                let search_input = cx.new(SearchInput::new);
+                let search_events = cx.subscribe_in(
+                    &search_input,
+                    window,
+                    |shell, _input, event: &SearchInputEvent, window, cx| match event {
+                        SearchInputEvent::Changed => shell.graph_search_changed(cx),
+                        SearchInputEvent::Submit => shell.graph_search_submit(window, cx),
+                        SearchInputEvent::Escape => shell.close_graph(window, cx),
+                    },
+                );
                 self.graph = Some(GraphOverlay {
+                    full,
                     model,
                     view,
                     viewport,
                     drag: None,
                     hovered: None,
+                    scope,
+                    options,
+                    folders,
+                    tags,
+                    search_input: search_input.clone(),
+                    search: GraphSearch::default(),
+                    _search_events: search_events,
                 });
-                self.graph_focus.focus(window, cx);
+                // 焦点直接给搜索框（打开即可输入；`Esc` 由输入框抛事件关闭覆盖层）。
+                search_input.update(cx, |input, cx| input.focus(window, cx));
                 cx.notify();
             }
             Err(error) => {
@@ -484,16 +548,193 @@ impl AppShell {
         self.open_entry(tree_index, cx);
     }
 
-    /// 左键按下：记录手势（是否命中节点 + 起始平移量）。
+    /// 重新派生当前视图（scope/过滤/深度变化）：**不重查数据库**，只做 O(V+E) 派生。
+    ///
+    /// 派生后重新自适应（过滤/范围变化会改变图的大小），并把搜索匹配重算一遍
+    /// （同一查询在新视图里可能不同）；有匹配时仍居中到选中项。
+    fn graph_rebuild(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        state.model = state
+            .full
+            .derive(&state.scope, &state.options, GraphLimits::default());
+        state.drag = None;
+        state.hovered = None;
+        let query = state.search.query.clone();
+        state.search = GraphSearch::apply(&state.model, &query);
+        state.view.fit_to(&state.model, state.viewport);
+        if let Some(index) = state.search.selected_node() {
+            if let Some(node) = state.model.nodes().get(index) {
+                state.view.center_on(node.pos);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 切换局部/全库（局部图以当前笔记为中心；没有打开的笔记时只提示、保持全库）。
+    fn graph_set_scope(&mut self, local: bool, cx: &mut Context<Self>) {
+        if self.graph.is_none() {
+            return;
+        }
+        if local {
+            let Some(note_id) = self.active.as_ref().map(|active| active.note_id.clone()) else {
+                self.notice = Some("没有打开的笔记，已显示全库图".to_owned());
+                cx.notify();
+                return;
+            };
+            let depth = self
+                .graph
+                .as_ref()
+                .map_or(DEFAULT_LOCAL_DEPTH, |state| state.scope.clamped_depth());
+            if let Some(state) = self.graph.as_mut() {
+                state.scope = GraphScope::local(note_id, depth);
+            }
+        } else if let Some(state) = self.graph.as_mut() {
+            // 切回全库时**保留上次的局部深度**（再切回局部不用重设 1/2/3）。
+            state.scope = GraphScope {
+                center: None,
+                depth: state.scope.clamped_depth(),
+            };
+        }
+        self.graph_rebuild(cx);
+    }
+
+    /// 设置局部图深度（1–3 跳；全库图下无效果）。
+    fn graph_set_depth(&mut self, depth: usize, cx: &mut Context<Self>) {
+        {
+            let Some(state) = self.graph.as_mut() else {
+                return;
+            };
+            if !state.scope.is_local() {
+                return;
+            }
+            state.scope.depth = depth.clamp(MIN_LOCAL_DEPTH, MAX_LOCAL_DEPTH);
+        }
+        self.graph_rebuild(cx);
+    }
+
+    /// 按顶层文件夹过滤（`None` = 全部）。
+    fn graph_set_folder(&mut self, folder: Option<String>, cx: &mut Context<Self>) {
+        {
+            let Some(state) = self.graph.as_mut() else {
+                return;
+            };
+            state.options.folder = folder;
+        }
+        self.graph_rebuild(cx);
+    }
+
+    /// 按标签过滤（`None` = 全部）。
+    fn graph_set_tag(&mut self, tag: Option<String>, cx: &mut Context<Self>) {
+        {
+            let Some(state) = self.graph.as_mut() else {
+                return;
+            };
+            state.options.tag = tag;
+        }
+        self.graph_rebuild(cx);
+    }
+
+    /// 未解析链接开关（虚线 + 灰色占位；默认关）。
+    fn graph_toggle_unresolved(&mut self, cx: &mut Context<Self>) {
+        {
+            let Some(state) = self.graph.as_mut() else {
+                return;
+            };
+            state.options.show_unresolved = !state.options.show_unresolved;
+        }
+        self.graph_rebuild(cx);
+    }
+
+    /// 方向箭头开关（默认关；只影响绘制，不重派生模型）。
+    fn graph_toggle_arrows(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        state.options.show_arrows = !state.options.show_arrows;
+        cx.notify();
+    }
+
+    /// 搜索框文本变化：重算匹配；非空时居中到第一个匹配，空查询恢复全景。
+    fn graph_search_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        let query = state.search_input.read(cx).text().to_owned();
+        state.search = GraphSearch::apply(&state.model, &query);
+        if state.search.is_active() {
+            if let Some(index) = state.search.selected_node() {
+                if let Some(node) = state.model.nodes().get(index) {
+                    state.view.center_on(node.pos);
+                }
+            }
+        } else {
+            // 空查询恢复：重新自适应（回到打开时的全景）。
+            state.view.fit_to(&state.model, state.viewport);
+        }
+        cx.notify();
+    }
+
+    /// 搜索框 `Enter`：打开当前选中的匹配（没有匹配时只提示）。
+    fn graph_search_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self
+            .graph
+            .as_ref()
+            .and_then(|state| state.search.selected_node());
+        let Some(index) = selected else {
+            if self
+                .graph
+                .as_ref()
+                .is_some_and(|state| state.search.is_active())
+            {
+                self.notice = Some("没有匹配的笔记".to_owned());
+                cx.notify();
+            }
+            return;
+        };
+        self.open_graph_node(index, window, cx);
+    }
+
+    /// 搜索框 `↑`/`↓`：在匹配之间切换（并居中到新选中项）。
+    fn graph_search_move(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.graph.as_mut() else {
+            return;
+        };
+        if !state.search.is_active() {
+            return;
+        }
+        if forward {
+            state.search.select_next();
+        } else {
+            state.search.select_prev();
+        }
+        if let Some(index) = state.search.selected_node() {
+            if let Some(node) = state.model.nodes().get(index) {
+                state.view.center_on(node.pos);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 左键按下：记录手势（是否命中节点/占位 + 起始平移量）。
     fn graph_mouse_down(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(state) = self.graph.as_mut() else {
             return;
         };
         let pressed_node = state.view.hit_test(&state.model, position, state.viewport);
+        let pressed_ghost = if pressed_node.is_none() {
+            state
+                .view
+                .ghost_hit_test(&state.model, position, state.viewport)
+        } else {
+            None
+        };
         state.drag = Some(GraphDrag {
             start: position,
             origin_pan: state.view.pan,
             pressed_node,
+            pressed_ghost,
             moved: false,
         });
         cx.notify();
@@ -542,12 +783,10 @@ impl AppShell {
         }
     }
 
-    /// 左键抬起：没拖动才算"点击"——命中节点打开笔记，空白处 = 点遮罩关闭。
+    /// 左键抬起：没拖动才算"点击"——命中节点打开笔记，命中未解析占位只提示，
+    /// 空白处 = 点遮罩关闭。
     fn graph_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(state) = self.graph.as_mut() else {
-            return;
-        };
-        let Some(drag) = state.drag.take() else {
+        let Some(drag) = self.graph.as_mut().and_then(|state| state.drag.take()) else {
             return;
         };
         if drag.moved {
@@ -555,9 +794,21 @@ impl AppShell {
             cx.notify();
             return;
         }
-        match drag.pressed_node {
-            Some(index) => self.open_graph_node(index, window, cx),
-            None => self.close_graph(window, cx),
+        match (drag.pressed_node, drag.pressed_ghost) {
+            (Some(index), _) => self.open_graph_node(index, window, cx),
+            (None, Some(ghost)) => {
+                let target = self
+                    .graph
+                    .as_ref()
+                    .and_then(|state| state.model.ghosts().get(ghost))
+                    .map(|ghost| ghost.target.clone());
+                if let Some(target) = target {
+                    eprintln!("[menghunote] 图谱未解析占位：{target}（不自动建笔记）");
+                    self.notice = Some(format!("未解析链接：{target}（不会自动建笔记）"));
+                }
+                cx.notify();
+            }
+            (None, None) => self.close_graph(window, cx),
         }
     }
 
@@ -623,6 +874,71 @@ impl AppShell {
     #[must_use]
     pub fn graph_hovered(&self) -> Option<usize> {
         self.graph.as_ref().and_then(|state| state.hovered)
+    }
+
+    /// 当前观察范围（`None` = 未打开）。
+    #[must_use]
+    pub fn graph_scope(&self) -> Option<&GraphScope> {
+        self.graph.as_ref().map(|state| &state.scope)
+    }
+
+    /// 当前过滤 + 显示选项（`None` = 未打开）。
+    #[must_use]
+    pub fn graph_options(&self) -> Option<&GraphOptions> {
+        self.graph.as_ref().map(|state| &state.options)
+    }
+
+    /// 当前搜索查询（`None` = 未打开；空串 = 未搜索）。
+    #[must_use]
+    pub fn graph_search_query(&self) -> Option<&str> {
+        self.graph.as_ref().map(|state| state.search.query.as_str())
+    }
+
+    /// 当前搜索匹配的节点下标（模型顺序）。
+    #[must_use]
+    pub fn graph_search_matches(&self) -> Vec<usize> {
+        self.graph
+            .as_ref()
+            .map(|state| state.search.matches.clone())
+            .unwrap_or_default()
+    }
+
+    /// 当前选中的匹配（`None` = 未搜索/无匹配）。
+    #[must_use]
+    pub fn graph_selected_match(&self) -> Option<usize> {
+        self.graph
+            .as_ref()
+            .and_then(|state| state.search.selected_node())
+    }
+
+    /// 未解析占位节点数（`show_unresolved = false` 时恒为 0）。
+    #[must_use]
+    pub fn graph_ghost_count(&self) -> usize {
+        self.graph
+            .as_ref()
+            .map_or(0, |state| state.model.ghost_count())
+    }
+
+    /// 被 scope/过滤隐藏的节点数。
+    #[must_use]
+    pub fn graph_hidden_nodes(&self) -> usize {
+        self.graph
+            .as_ref()
+            .map_or(0, |state| state.model.hidden_nodes())
+    }
+
+    /// 当前 LOD（低缩放不画标签/箭头/细边）。
+    #[must_use]
+    pub fn graph_lod(&self) -> Option<GraphLod> {
+        self.graph
+            .as_ref()
+            .map(|state| GraphLod::for_zoom(state.view.zoom))
+    }
+
+    /// 当前打开的笔记 ID（`None` = 没有打开的笔记；局部图的默认中心）。
+    #[must_use]
+    pub fn active_note_id(&self) -> Option<&str> {
+        self.active.as_ref().map(|active| active.note_id.as_str())
     }
 
     /// 图谱节点标题（按模型顺序；headless 断言排序/数量用）。
@@ -2648,35 +2964,58 @@ impl AppShell {
         )
     }
 
-    /// 图谱覆盖层（G1）：全屏 canvas 自绘（不引 WebView/JS）。
+    /// 图谱覆盖层（G1/G2）：全屏 canvas 自绘（不引 WebView/JS）。
     ///
     /// 层次（后画的在上，也先收到鼠标事件）：
     ///
     /// 1. `graph-canvas` 舞台：全屏、半透明底、[`gpui::InteractiveElement::occlude`]
     ///    挡住后面编辑器的鼠标命中；**平移/缩放/悬停/点击全走
     ///    [`crate::graph::GraphViewport::hit_test`]**（与绘制同一份坐标）；
-    /// 2. 节点层：圆点 + 标签，位置来自同一个 `screen_pos`，本身不挂鼠标监听
-    ///    （没有 hitbox 就不会挡住舞台）；
-    /// 3. 顶部工具条：统计行 +「复位」「关闭」，自己吞掉鼠标事件——点工具条空白
-    ///    不等于"点遮罩关闭"。
+    /// 2. 边层（canvas 自绘）：视口裁剪 + LOD 细边 + 可选方向箭头 + 未解析虚线；
+    /// 3. 节点层：圆点 + 标签（低缩放不画标签），位置来自同一个 `screen_pos`，
+    ///    本身不挂鼠标监听（没有 hitbox 就不会挡住舞台）；视口裁剪掉画布外的节点；
+    /// 4. 顶部工具条（统计行 + 局部/全库 + 深度 + 搜索 + 复位/关闭）与过滤条
+    ///    （文件夹/标签/未解析/方向），自己吞掉鼠标事件——点工具条空白不等于
+    ///    "点遮罩关闭"。
     fn render_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewport = window.bounds().size;
-        let (paint_edges, paint_dim, layer, hint, empty) = {
-            let state = self.graph.as_mut()?;
-            // 每帧同步一次画布尺寸：命中/拖拽/测试与绘制共用这个值（窗口缩放后自动跟上）。
-            state.viewport = viewport;
-            let model = &state.model;
-            let view = state.view;
-            let hovered = state.hovered;
-            let hint = hint_line(model);
-            let empty = model.is_empty();
-            let radius = view.node_radius();
-            let neighbors: HashSet<usize> = hovered
-                .map(|index| model.neighbor_indices_of(index).into_iter().collect())
-                .unwrap_or_default();
+        let state = self.graph.as_mut()?;
+        // 每帧同步一次画布尺寸：命中/拖拽/测试与绘制共用这个值（窗口缩放后自动跟上）。
+        state.viewport = viewport;
+        let model = &state.model;
+        let view = state.view;
+        let hovered = state.hovered;
+        let lod = GraphLod::for_zoom(view.zoom);
+        let show_arrows = state.options.show_arrows && lod.show_arrows;
+        let hint = hint_line(model);
+        let empty = model.is_empty();
+        let radius = view.node_radius();
+        let ghost_radius = radius * GHOST_RADIUS_SCALE;
+        let matches: HashSet<usize> = state.search.matches.iter().copied().collect();
+        let selected_match = state.search.selected_node();
+        let neighbors: HashSet<usize> = hovered
+            .map(|index| model.neighbor_indices_of(index).into_iter().collect())
+            .unwrap_or_default();
 
-            // 边：先做视口裁剪，画布外的边不产生图元。
-            let mut edges: Vec<(Point<Pixels>, Point<Pixels>, bool)> = Vec::new();
+        // 边：先做视口裁剪，画布外的边不产生图元。
+        let mut edges: Vec<(Point<Pixels>, Point<Pixels>, bool)> = Vec::new();
+        for edge in model.edges() {
+            let (Some(from), Some(to)) = (model.nodes().get(edge.from), model.nodes().get(edge.to))
+            else {
+                continue;
+            };
+            let a = view.screen_pos(from.pos, viewport);
+            let b = view.screen_pos(to.pos, viewport);
+            if edge_offscreen(a, b, viewport) {
+                continue;
+            }
+            let active = hovered.is_some_and(|index| edge.from == index || edge.to == index);
+            edges.push((a, b, active));
+        }
+
+        // 方向箭头：只在开关打开且缩放够大（LOD）时画。
+        let mut arrows: Vec<[Point<Pixels>; 3]> = Vec::new();
+        if show_arrows {
             for edge in model.edges() {
                 let (Some(from), Some(to)) =
                     (model.nodes().get(edge.from), model.nodes().get(edge.to))
@@ -2688,83 +3027,155 @@ impl AppShell {
                 if edge_offscreen(a, b, viewport) {
                     continue;
                 }
-                let active = hovered.is_some_and(|index| edge.from == index || edge.to == index);
-                edges.push((a, b, active));
+                if let Some(head) = arrow_head(a, b, radius + 2.0) {
+                    arrows.push(head);
+                }
             }
+        }
 
-            // 节点层：圆点位置 = `screen_pos`（命中/绘制/测试共用），标签固定宽度单行省略。
-            let mut layer = div().absolute().inset_0().overflow_hidden();
-            for (index, node) in model.nodes().iter().enumerate() {
-                let center = view.screen_pos(node.pos, viewport);
-                let active = hovered == Some(index);
-                let related = active || (hovered.is_some() && neighbors.contains(&index));
-                let dimmed = hovered.is_some() && !related;
-                let (fill, border, text) = if active {
-                    (
-                        theme::graph_node_active_bg(),
-                        theme::graph_node_active_bg(),
-                        theme::graph_node_active_text(),
-                    )
-                } else if dimmed {
-                    (
-                        theme::graph_node_dim_bg(),
-                        theme::graph_node_dim_border(),
-                        theme::status_bar_text(),
-                    )
-                } else if related {
-                    (
-                        theme::graph_node_bg(),
-                        theme::graph_edge_active(),
-                        theme::graph_label_text(),
-                    )
-                } else {
-                    (
-                        theme::graph_node_bg(),
-                        theme::graph_node_border(),
-                        theme::graph_label_text(),
-                    )
-                };
-                layer = layer.child(
+        // 未解析占位：虚线边 + 灰色虚线小圆（不是正式节点、不可打开）。
+        let mut ghost_edges: Vec<(Point<Pixels>, Point<Pixels>)> = Vec::new();
+        let mut ghost_layer = div().absolute().inset_0().overflow_hidden();
+        for (index, ghost) in model.ghosts().iter().enumerate() {
+            let Some(source) = model.nodes().get(ghost.from) else {
+                continue;
+            };
+            let from = view.screen_pos(source.pos, viewport);
+            let center = view.screen_pos(ghost.pos, viewport);
+            if node_offscreen(center, viewport) {
+                continue;
+            }
+            ghost_edges.push((from, center));
+            let mut ghost_box = div()
+                .absolute()
+                .left(px(center.x.as_f32() - GRAPH_NODE_BOX_WIDTH * 0.5))
+                .top(px(center.y.as_f32() - ghost_radius))
+                .w(px(GRAPH_NODE_BOX_WIDTH))
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(
                     div()
-                        .absolute()
-                        .left(px(center.x.as_f32() - GRAPH_NODE_BOX_WIDTH * 0.5))
-                        .top(px(center.y.as_f32() - radius))
+                        // 测试元数据（只读断言用）：`graph-ghost-<占位下标>`。
+                        .debug_selector(move || format!("graph-ghost-{index}"))
+                        .w(px(ghost_radius * 2.0))
+                        .h(px(ghost_radius * 2.0))
+                        .rounded_full()
+                        .border(px(1.0))
+                        .border_dashed()
+                        .border_color(theme::graph_node_dim_border())
+                        .bg(theme::graph_node_dim_bg()),
+                );
+            if lod.show_labels {
+                ghost_box = ghost_box.child(
+                    div()
                         .w(px(GRAPH_NODE_BOX_WIDTH))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .child(
-                            div()
-                                // 测试元数据（只读断言用）：`graph-node-<模型下标>`。
-                                .debug_selector(move || format!("graph-node-{index}"))
-                                .w(px(radius * 2.0))
-                                .h(px(radius * 2.0))
-                                .rounded_full()
-                                .bg(fill)
-                                .border(px(1.0))
-                                .border_color(border),
-                        )
-                        .child(
-                            div()
-                                .w(px(GRAPH_NODE_BOX_WIDTH))
-                                .mt(px(2.0))
-                                .text_size(px(11.0))
-                                .text_color(text)
-                                .text_center()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(SharedString::from(node.title.clone())),
-                        ),
+                        .mt(px(2.0))
+                        .text_size(px(11.0))
+                        .text_color(theme::status_bar_text())
+                        .text_center()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(SharedString::from(ghost.target.clone())),
                 );
             }
-            (
-                std::rc::Rc::new(edges),
-                hovered.is_some(),
-                layer,
-                hint,
-                empty,
-            )
-        };
+            ghost_layer = ghost_layer.child(ghost_box);
+        }
+
+        // 节点层：圆点位置 = `screen_pos`（命中/绘制/测试共用），标签固定宽度单行省略。
+        let mut layer = div().absolute().inset_0().overflow_hidden();
+        for (index, node) in model.nodes().iter().enumerate() {
+            let center = view.screen_pos(node.pos, viewport);
+            // 视口裁剪：远离画布的节点不生成图元（大库/远平移省开销）。
+            if node_offscreen(center, viewport) {
+                continue;
+            }
+            let active = hovered == Some(index);
+            let related = active || (hovered.is_some() && neighbors.contains(&index));
+            let matched = matches.contains(&index);
+            let selected = selected_match == Some(index);
+            // 悬停时压暗无关节点；搜索匹配不压暗（否则高亮看不出来）。
+            let dimmed = hovered.is_some() && !related && !matched;
+            let (fill, border, text) = if selected || active {
+                (
+                    theme::graph_node_active_bg(),
+                    theme::graph_node_active_bg(),
+                    theme::graph_node_active_text(),
+                )
+            } else if matched {
+                (
+                    theme::graph_node_bg(),
+                    theme::graph_edge_active(),
+                    theme::graph_label_text(),
+                )
+            } else if dimmed {
+                (
+                    theme::graph_node_dim_bg(),
+                    theme::graph_node_dim_border(),
+                    theme::status_bar_text(),
+                )
+            } else if related {
+                (
+                    theme::graph_node_bg(),
+                    theme::graph_edge_active(),
+                    theme::graph_label_text(),
+                )
+            } else {
+                (
+                    theme::graph_node_bg(),
+                    theme::graph_node_border(),
+                    theme::graph_label_text(),
+                )
+            };
+            let selector_index = index;
+            let selector_matched = matched || selected;
+            let mut node_box = div()
+                .absolute()
+                .left(px(center.x.as_f32() - GRAPH_NODE_BOX_WIDTH * 0.5))
+                .top(px(center.y.as_f32() - radius))
+                .w(px(GRAPH_NODE_BOX_WIDTH))
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(
+                    div()
+                        // 测试元数据（只读断言用）：`graph-node-<模型下标>`；
+                        // 搜索匹配时换成 `graph-node-<i>-match`（高亮态）。
+                        .debug_selector(move || {
+                            if selector_matched {
+                                format!("graph-node-{selector_index}-match")
+                            } else {
+                                format!("graph-node-{selector_index}")
+                            }
+                        })
+                        .w(px(radius * 2.0))
+                        .h(px(radius * 2.0))
+                        .rounded_full()
+                        .bg(fill)
+                        .border(px(1.0))
+                        .border_color(border),
+                );
+            if lod.show_labels {
+                node_box = node_box.child(
+                    div()
+                        .w(px(GRAPH_NODE_BOX_WIDTH))
+                        .mt(px(2.0))
+                        .text_size(px(11.0))
+                        .text_color(text)
+                        .text_center()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(SharedString::from(node.title.clone())),
+                );
+            }
+            layer = layer.child(node_box);
+        }
+
+        let edge_width = lod.edge_width;
+        let paint_edges = std::rc::Rc::new(edges);
+        let paint_arrows = std::rc::Rc::new(arrows);
+        let paint_ghost_edges = std::rc::Rc::new(ghost_edges);
+        let paint_dim = hovered.is_some();
 
         let stage = div()
             .id("graph-canvas")
@@ -2810,7 +3221,7 @@ impl AppShell {
                             } else {
                                 theme::graph_edge()
                             };
-                            let width = if *active { 1.8 } else { 1.0 };
+                            let width = if *active { 1.8 } else { edge_width };
                             let mut builder = gpui::PathBuilder::stroke(px(width));
                             builder.move_to(*a);
                             builder.line_to(*b);
@@ -2818,14 +3229,44 @@ impl AppShell {
                                 window.paint_path(path, color);
                             }
                         }
+                        // 未解析占位：虚线（低缩放也画，否则看不到"有未解析"）。
+                        for (a, b) in paint_ghost_edges.iter() {
+                            let mut builder =
+                                gpui::PathBuilder::stroke(px(1.0)).dash_array(&[px(4.0), px(3.0)]);
+                            builder.move_to(*a);
+                            builder.line_to(*b);
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, theme::graph_edge_dim());
+                            }
+                        }
+                        // 方向箭头：两条翼（V 形）。
+                        for head in paint_arrows.iter() {
+                            let [tip, left, right] = *head;
+                            let mut builder = gpui::PathBuilder::stroke(px(1.2));
+                            builder.move_to(tip);
+                            builder.line_to(left);
+                            builder.move_to(tip);
+                            builder.line_to(right);
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, theme::graph_edge_active());
+                            }
+                        }
                     },
                 )
                 .absolute()
                 .inset_0(),
             )
+            .child(ghost_layer)
             .child(layer);
 
-        let header = div()
+        let search_input = state.search_input.clone();
+        let scope = state.scope.clone();
+        let options = state.options.clone();
+        let folders = state.folders.clone();
+        let tags = state.tags.clone();
+
+        // ---- 顶部工具条：统计 + 局部/全库 + 深度 + 搜索 + 复位/关闭 ----
+        let mut header = div()
             .id("graph-header")
             .debug_selector(|| "graph-header".to_string())
             .absolute()
@@ -2838,7 +3279,8 @@ impl AppShell {
             .flex_row()
             .items_center()
             .justify_between()
-            .gap_3()
+            .gap_2()
+            .overflow_hidden()
             .bg(theme::graph_toolbar_bg())
             .border_b(px(1.0))
             .border_color(theme::sidebar_border())
@@ -2879,6 +3321,86 @@ impl AppShell {
                             .text_color(theme::status_bar_text())
                             .child(SharedString::from(hint.clone())),
                     ),
+            );
+        // 局部/全库（G2：默认局部，可切回全库）。
+        header = header.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .flex_shrink_0()
+                .child(
+                    graph_chip(
+                        "graph-scope-local".to_owned(),
+                        "局部".to_owned(),
+                        scope.is_local(),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.graph_set_scope(true, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+                )
+                .child(
+                    graph_chip(
+                        "graph-scope-full".to_owned(),
+                        "全库".to_owned(),
+                        !scope.is_local(),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.graph_set_scope(false, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+                ),
+        );
+        // 深度 1–3（只在局部图下显示；全库图没有"深度"概念）。
+        if scope.is_local() {
+            let mut depth_group = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .flex_shrink_0();
+            for depth in MIN_LOCAL_DEPTH..=MAX_LOCAL_DEPTH {
+                depth_group = depth_group.child(
+                    graph_chip(
+                        format!("graph-depth-{depth}"),
+                        depth.to_string(),
+                        scope.clamped_depth() == depth,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.graph_set_depth(depth, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+                );
+            }
+            header = header.child(depth_group);
+        }
+        header = header
+            .child(
+                div()
+                    .id("graph-search")
+                    // 测试元数据（只读断言用）：搜索框容器。
+                    .debug_selector(|| "graph-search".to_string())
+                    .w(px(GRAPH_SEARCH_WIDTH))
+                    .h(px(28.0))
+                    .flex_shrink_0()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(search_input),
             )
             .child(
                 div()
@@ -2886,6 +3408,7 @@ impl AppShell {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .flex_shrink_0()
                     .child(graph_button("graph-reset", "复位", false).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
@@ -2900,6 +3423,174 @@ impl AppShell {
                             cx.stop_propagation();
                         }),
                     )),
+            );
+
+        // ---- 过滤条：文件夹 / 标签 / 未解析 / 方向 ----
+        let mut filter_bar = div()
+            .id("graph-filters")
+            .debug_selector(|| "graph-filters".to_string())
+            .absolute()
+            .top(px(GRAPH_HEADER_HEIGHT))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(GRAPH_FILTER_HEIGHT))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .overflow_hidden()
+            .bg(theme::graph_toolbar_bg())
+            .border_b(px(1.0))
+            .border_color(theme::sidebar_border())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|_shell, _event: &MouseUpEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::status_bar_text())
+                    .flex_shrink_0()
+                    .child(SharedString::from("文件夹")),
+            )
+            .child(
+                graph_chip(
+                    "graph-folder-all".to_owned(),
+                    "全部".to_owned(),
+                    options.folder.is_none(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                        shell.graph_set_folder(None, cx);
+                        cx.stop_propagation();
+                    }),
+                ),
+            );
+        for (index, folder) in folders.iter().take(MAX_FOLDER_CHIPS).enumerate() {
+            let selected = options.folder.as_deref() == Some(folder.as_str());
+            let value = folder.clone();
+            filter_bar = filter_bar.child(
+                graph_chip(format!("graph-folder-{index}"), folder.clone(), selected)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.graph_set_folder(Some(value.clone()), cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+        if folders.len() > MAX_FOLDER_CHIPS {
+            filter_bar = filter_bar.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::status_bar_text())
+                    .flex_shrink_0()
+                    .child(SharedString::from(format!(
+                        "+{}",
+                        folders.len() - MAX_FOLDER_CHIPS
+                    ))),
+            );
+        }
+        filter_bar = filter_bar
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .flex_shrink_0()
+                    .bg(theme::sidebar_border()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::status_bar_text())
+                    .flex_shrink_0()
+                    .child(SharedString::from("标签")),
+            );
+        if tags.is_empty() {
+            // 当前 app 没有打标签入口（schema 有 tags/note_tags，projector 会写），
+            // 列表通常为空——空时明确提示，不留空白。
+            filter_bar = filter_bar.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::graph_edge_dim())
+                    .flex_shrink_0()
+                    .child(SharedString::from("无标签")),
+            );
+        } else {
+            filter_bar = filter_bar.child(
+                graph_chip(
+                    "graph-tag-all".to_owned(),
+                    "全部".to_owned(),
+                    options.tag.is_none(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                        shell.graph_set_tag(None, cx);
+                        cx.stop_propagation();
+                    }),
+                ),
+            );
+            for (index, tag) in tags.iter().take(MAX_TAG_CHIPS).enumerate() {
+                let selected = options.tag.as_deref() == Some(tag.as_str());
+                let value = tag.clone();
+                filter_bar = filter_bar.child(
+                    graph_chip(format!("graph-tag-{index}"), tag.clone(), selected).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.graph_set_tag(Some(value.clone()), cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+                );
+            }
+        }
+        filter_bar = filter_bar
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .flex_shrink_0()
+                    .bg(theme::sidebar_border()),
+            )
+            .child(
+                graph_chip(
+                    "graph-toggle-unresolved".to_owned(),
+                    "未解析".to_owned(),
+                    options.show_unresolved,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                        shell.graph_toggle_unresolved(cx);
+                        cx.stop_propagation();
+                    }),
+                ),
+            )
+            .child(
+                graph_chip(
+                    "graph-toggle-arrows".to_owned(),
+                    "方向".to_owned(),
+                    options.show_arrows,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                        shell.graph_toggle_arrows(cx);
+                        cx.stop_propagation();
+                    }),
+                ),
             );
 
         let empty_state = div()
@@ -2927,15 +3618,34 @@ impl AppShell {
                 .track_focus(&self.graph_focus)
                 .on_key_down(
                     cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
-                        if event.keystroke.key == "escape" {
-                            shell.close_graph(window, cx);
-                            cx.stop_propagation();
-                            window.prevent_default();
+                        // 输入法组合态的 Esc 归输入框（只取消组合），不能关覆盖层。
+                        let composing = shell
+                            .graph
+                            .as_ref()
+                            .is_some_and(|state| state.search_input.read(cx).is_composing());
+                        match event.keystroke.key.as_str() {
+                            "escape" if !composing => {
+                                shell.close_graph(window, cx);
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            }
+                            "up" if !composing => {
+                                shell.graph_search_move(false, cx);
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            }
+                            "down" if !composing => {
+                                shell.graph_search_move(true, cx);
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            }
+                            _ => {}
                         }
                     }),
                 )
                 .child(stage)
                 .child(header)
+                .child(filter_bar)
                 .when(empty, |this| this.child(empty_state))
                 .into_any_element(),
         )
@@ -6620,6 +7330,42 @@ fn graph_button(
         })
         .text_size(px(12.0))
         .text_color(if primary {
+            theme::graph_node_active_text()
+        } else {
+            theme::text_color()
+        })
+        .cursor_pointer()
+        .child(SharedString::from(label))
+}
+
+/// 图谱过滤条上的小 chip（动态标签：文件夹/标签/开关；`active` = 当前选中）。
+///
+/// 与 [`graph_button`] 同一套配色，只是标签是运行时字符串（文件夹/标签名）。
+#[must_use]
+fn graph_chip(selector: String, label: String, active: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(selector.clone()))
+        // 测试元数据（只读断言用）：`graph-folder-<i>` / `graph-tag-<i>` / `graph-toggle-*`。
+        .debug_selector(move || selector)
+        .h(px(20.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border(px(1.0))
+        .border_color(if active {
+            theme::graph_edge_active()
+        } else {
+            theme::sidebar_border()
+        })
+        .bg(if active {
+            theme::graph_edge_active()
+        } else {
+            theme::graph_toolbar_bg()
+        })
+        .text_size(px(11.0))
+        .text_color(if active {
             theme::graph_node_active_text()
         } else {
             theme::text_color()

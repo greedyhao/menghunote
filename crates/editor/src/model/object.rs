@@ -8,14 +8,16 @@
 //!
 //! 因此本模块只定义“块的公共身份”：
 //!
-//! - [`ObjectKind`]：图片 / 表格；
+//! - [`ObjectKind`]：图片 / 表格 / Mermaid；
 //! - [`ObjectBlock`]：整块 source 区间 + 起始/结束源码行 + 在同类集合里的下标。
 //!
-//! 具体数据（图片的 `dest`/`alt`、表格的行列/对齐）仍然留在
-//! [`crate::model::markdown::MarkdownImage`] / [`crate::model::markdown::MarkdownTable`]
+//! 具体数据（图片的 `dest`/`alt`、表格的行列/对齐、Mermaid 的围栏内容/info）仍然
+//! 留在 [`crate::model::markdown::MarkdownImage`] /
+//! [`crate::model::markdown::MarkdownTable`] / [`crate::model::markdown::MarkdownMermaid`]
 //! 里，通过 [`crate::model::markdown::MarkdownDocument::object_image`] /
-//! [`crate::model::markdown::MarkdownDocument::object_table`] 取回 —— 不复制一套
-//! 平行逻辑，也不把两种载荷塞进同一个大 enum 里让所有调用方写 `match`。
+//! [`crate::model::markdown::MarkdownDocument::object_table`] /
+//! [`crate::model::markdown::MarkdownDocument::object_mermaid`] 取回 —— 不复制一套
+//! 平行逻辑，也不把三种载荷塞进同一个大 enum 里让所有调用方写 `match`。
 //!
 //! # “对象行”与多行对象
 //!
@@ -33,6 +35,8 @@ pub enum ObjectKind {
     Image,
     /// GFM 表格块（ADR 0019 S3a）。
     Table,
+    /// 整块 fenced `mermaid`（普通段落上下文，ADR 0019 M2）。
+    Mermaid,
 }
 
 impl ObjectKind {
@@ -48,12 +52,19 @@ impl ObjectKind {
         matches!(self, Self::Table)
     }
 
+    /// 是否 Mermaid 对象。
+    #[must_use]
+    pub const fn is_mermaid(self) -> bool {
+        matches!(self, Self::Mermaid)
+    }
+
     /// 日志/诊断用的中文名（不带尺寸等渲染信息）。
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Image => "图片",
             Self::Table => "表格",
+            Self::Mermaid => "Mermaid",
         }
     }
 }

@@ -204,13 +204,16 @@ pub fn shape_row_truncated_at(
     font_size: f32,
     mono: bool,
     max_width: f32,
-) -> Option<ShapedLine> {
+) -> Option<TruncatedLine> {
     if text.is_empty() || !max_width.is_finite() || max_width <= 0.0 {
         return None;
     }
     let full = shape_row_styled_at(window, text, spans, font_size, mono);
     if full.width().as_f32() <= max_width {
-        return Some(full);
+        return Some(TruncatedLine {
+            line: full,
+            visible_len: text.len(),
+        });
     }
     let ellipsis = "…";
     let ellipsis_spans = [(ellipsis.len(), StyleKind::Plain)];
@@ -218,7 +221,10 @@ pub fn shape_row_truncated_at(
     let ellipsis_width = ellipsis.width().as_f32();
     let budget = (max_width - ellipsis_width).max(0.0);
     if budget <= 0.0 {
-        return Some(ellipsis);
+        return Some(TruncatedLine {
+            line: ellipsis,
+            visible_len: 0,
+        });
     }
     // `closest_index_for_x` 返回字节下标；吸附到 char 边界后再切（不切坏 UTF-8）。
     let mut cut = full.closest_index_for_x(px(budget)).min(text.len());
@@ -226,17 +232,29 @@ pub fn shape_row_truncated_at(
         cut -= 1;
     }
     if cut == 0 {
-        return Some(ellipsis);
+        return Some(TruncatedLine {
+            line: ellipsis,
+            visible_len: 0,
+        });
     }
     let truncated = format!("{}…", &text[..cut]);
     let truncated_spans = [(truncated.len(), StyleKind::Plain)];
-    Some(shape_row_styled_at(
-        window,
-        &truncated,
-        &truncated_spans,
-        font_size,
-        mono,
-    ))
+    Some(TruncatedLine {
+        line: shape_row_styled_at(window, &truncated, &truncated_spans, font_size, mono),
+        visible_len: cut,
+    })
+}
+
+/// [`shape_row_truncated_at`] 的结果：shaping 后的行 + **可见前缀**的字节长度。
+///
+/// `visible_len` 是截断点（未截断 = 全文长度）。表格单元格里的链接命中必须按它裁剪：
+/// 省略号之后的内容没有画出来，也就不该可点。
+#[derive(Debug, Clone)]
+pub struct TruncatedLine {
+    /// 实际 shaping（并绘制）的行：`display[..visible_len]` + 可选省略号。
+    pub line: ShapedLine,
+    /// 可见 display 前缀的字节长度（未截断 = `display.len()`）。
+    pub visible_len: usize,
 }
 
 #[cfg(test)]

@@ -27,6 +27,8 @@
 //!   续行缩进、子段落、内部围栏）；
 //! - [`TableBlock`] / [`TableRow`]：GFM 表格块树（整表跨度、表头行、分隔行、
 //!   数据行、每格源码区间与对齐方式；ADR 0019 S3a）；
+//! - [`FencedMermaidBlock`]：fenced `mermaid` 代码块的源码元数据（整块/内容跨度、
+//!   起止行、info、是否可投影成 Object；ADR 0019 M2）；
 //! - [`LineInfo`]：逐源码行语义（引用前缀、列表归属、是否在围栏/表格里），
 //!   供 app 做 gutter / hanging indent / 命中几何；
 //! - [`ParsedMarkdown`]：上述内容的集合，外加 `code_spans` / `unsupported_spans`
@@ -42,6 +44,17 @@
 use std::fmt;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+/// ADR 0019 S3b7：GFM 表格**单元格行内 Markdown**（纯解析；display 文本 + 样式段 +
+/// 链接可见区间）。
+///
+/// 单独成模块是因为它的输入是**cell 源码切片**（不是整篇文档），输出是 display 坐标
+/// （标记隐藏后与源码不再线性对应），与整篇的 [`ParsedMarkdown`] 是两套不同的坐标。
+pub mod table_inline;
+
+pub use table_inline::{
+    parse_table_cell_inline, TableCellInline, TableCellLink, TableCellSpan, TableCellStyle,
+};
 
 /// 源码字节区间（半开 `[start, end)`）。
 ///
@@ -441,6 +454,64 @@ impl TableBlock {
     }
 }
 
+/// 一个 fenced `mermaid` 代码块的源码元数据（ADR 0019 M2）。
+///
+/// Mermaid 块在编辑器里不是普通代码块，而是 **Object Block**：整块源码被一个
+/// display 占位符替换，只有显式「编辑源码」/`F2` 才显示 fenced 源码。本类型只提供
+/// **源码事实**（跨度/行号/info），不解析 Mermaid 语法，也不产生任何新文本。
+///
+/// # 边界（写死，测试钉住）
+///
+/// - [`Self::span`]：开围栏行行首 .. 闭围栏行内容终点（**不含**闭围栏行之后的
+///   换行）；把它换成单行 Object 占位时，后面的换行仍留在正文里；
+/// - [`Self::content`]：开围栏行行尾 .. 闭围栏行行首（即两条围栏之间的原始源码，
+///   保留内部换行与缩进；行内字符逐字节保留，不做转义/实体还原）；
+/// - [`Self::opening`]：开围栏标记本身（跳过行首缩进，到行内容终点；含 info string）；
+/// - [`Self::first_line`] / [`Self::last_line`]：开/闭围栏的源码行号（0 起）；
+/// - [`Self::info`]：`pulldown-cmark` 给出的 info string（去掉首尾空白）；本块只收
+///   **精确等于 `mermaid`** 的 info。
+///
+/// # `block` 判定（普通段落上下文）
+///
+/// 只有满足全部条件才 `block = true`（编辑器据此投影成 Object）：
+///
+/// 1. 围栏块是闭合的（未闭合围栏按普通代码块处理，不产生本类型）；
+/// 2. 开/闭围栏所在行都是 `LineKind::FencedCode`；
+/// 3. 两行都不是引用、不在列表项里；
+/// 4. 开围栏标记从该行**内容起点**开始（行首缩进不投影成对象）；
+/// 5. 块区间结束在闭围栏行的内容终点（不含末尾换行）。
+///
+/// `block = false` 的 Mermaid 块（列表/缩进里）保持普通 fenced code 的编辑
+/// 行为：仍然有 `ConstructKind::FencedCode` 构造、可编辑源码。
+///
+/// 注意：**引用前缀里的围栏**（`> ```mermaid`）沿用 `fenced_construct` 的既有边界
+/// （它只跳过空格缩进，不跳过 `>`），因此不产生本类型，仍按普通代码块处理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencedMermaidBlock {
+    /// 整块源码区间（开围栏行行首 .. 闭围栏行内容终点；不含末尾换行）。
+    pub span: Span,
+    /// 围栏之间的内容区间（不含开/闭围栏行）。
+    pub content: Span,
+    /// 开围栏标记区间（跳过行首缩进，到行内容终点；含 info string）。
+    pub opening: Span,
+    /// 开围栏源码行号（0 起）。
+    pub first_line: usize,
+    /// 闭围栏源码行号（0 起，含）。
+    pub last_line: usize,
+    /// info string（去掉首尾空白；本类型只出现在精确等于 `mermaid` 时）。
+    pub info: String,
+    /// 是否可投影成 Object Block（见类型文档的判定规则）。
+    pub block: bool,
+}
+
+impl FencedMermaidBlock {
+    /// 是否整块、普通段落上下文里的 fenced mermaid（可投影成 Object Block）。
+    #[must_use]
+    pub const fn is_block(&self) -> bool {
+        self.block
+    }
+}
+
 /// 一行源码的语义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineInfo {
@@ -498,6 +569,14 @@ pub struct ParsedMarkdown {
     /// 表格是**原子块**：内部行内构造不会出现在 [`Self::constructs`] 里，
     /// editor 把它投影成 Object Block 或（不满足整行独占时）原样显示源码。
     pub tables: Vec<TableBlock>,
+    /// fenced `mermaid` 块（按 `span` 起点排序）。
+    ///
+    /// `block = true` 的块**不产生** `ConstructKind::FencedCode`（它投影成 Object
+    /// Block，不能同时被当成隐藏围栏的普通代码块）；`block = false` 的块保持普通
+    /// 代码块行为（构造仍在 [`Self::constructs`] 里）。两种块都在 `code_spans` 里，
+    /// 内部行内构造一律不投影。引用前缀里的围栏不产生本类型（见
+    /// [`FencedMermaidBlock`] 的说明）。
+    pub mermaid_blocks: Vec<FencedMermaidBlock>,
     /// 可投影构造（块级 + 行内；按 span/kind 稳定排序）。
     pub constructs: Vec<Construct>,
     /// 代码块区间（围栏/缩进；editor 用它抑制旧 scanner 在代码内部的构造）。
@@ -650,6 +729,8 @@ struct Builder<'a> {
     table_cell_start: Option<usize>,
     /// 解析出的表格块（按 `span` 起点排序后写进 [`ParsedMarkdown::tables`]）。
     tables: Vec<TableBlock>,
+    /// 解析出的 fenced `mermaid` 块（`block` 在 finish 阶段按行语义计算）。
+    mermaid_blocks: Vec<FencedMermaidBlock>,
     html_stack: Vec<Span>,
     constructs: Vec<Construct>,
     headings: Vec<(Span, u8)>,
@@ -682,6 +763,7 @@ impl<'a> Builder<'a> {
             table_stack: Vec::new(),
             table_cell_start: None,
             tables: Vec::new(),
+            mermaid_blocks: Vec::new(),
             html_stack: Vec::new(),
             constructs: Vec::new(),
             headings: Vec::new(),
@@ -1268,13 +1350,27 @@ impl<'a> Builder<'a> {
         if !frame.fenced {
             return;
         }
-        let Some(construct) = self.fenced_construct(first, last, &frame.info) else {
+        let Some(construct) = self.fenced_construct(first, last) else {
             return;
         };
+        if is_mermaid_info(&frame.info) {
+            // 普通 fenced code 的构造照旧先登记；`finish` 阶段按行语义决定是否
+            // 把可投影成 Object 的 Mermaid 块从构造表里摘掉（引用/列表/缩进里的
+            // Mermaid 仍是普通代码块，保留该构造）。
+            self.mermaid_blocks.push(FencedMermaidBlock {
+                span: construct.span,
+                content: construct.content,
+                opening: construct.markers[0],
+                first_line: first,
+                last_line: last,
+                info: frame.info.trim().to_owned(),
+                block: false,
+            });
+        }
         self.constructs.push(construct);
     }
 
-    fn fenced_construct(&self, first: usize, last: usize, _info: &str) -> Option<Construct> {
+    fn fenced_construct(&self, first: usize, last: usize) -> Option<Construct> {
         let bytes = self.source.as_bytes();
         let open = self.lines[first];
         let open_at = skip_spaces(bytes, open.start, open.content_end);
@@ -1460,6 +1556,7 @@ impl<'a> Builder<'a> {
             mut unsupported_spans,
             mut tables,
             table_spans,
+            mut mermaid_blocks,
             html_spans,
             rule_lines,
             uncertain_inline,
@@ -1525,8 +1622,26 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // fenced mermaid：`block` 依赖逐行语义（引用/列表归属在上一段才补齐）。
+        // 只有可投影成 Object 的块才摘掉 `FencedCode` 构造：它不再是一个可编辑的
+        // 代码块，而是原子的 Object（源码模式由对象行控制，不靠围栏构造显现）。
+        for block in &mut mermaid_blocks {
+            block.block = mermaid_block_is_object(&line_infos, block);
+        }
+        mermaid_blocks.sort_by_key(|block| (block.span.start, block.span.end));
+        mermaid_blocks.dedup();
+        let object_mermaid_spans: Vec<Span> = mermaid_blocks
+            .iter()
+            .filter(|block| block.block)
+            .map(|block| block.span)
+            .collect();
+
         // 由列表 item 生成 ListItem 构造（每项首行一段）。
         let mut all = constructs;
+        all.retain(|construct| {
+            !(construct.kind == ConstructKind::FencedCode
+                && object_mermaid_spans.contains(&construct.span))
+        });
         for item in &items {
             if item.marker.is_empty() {
                 continue;
@@ -1611,6 +1726,7 @@ impl<'a> Builder<'a> {
             tables,
             links,
             wiki_links,
+            mermaid_blocks,
             constructs: all,
             code_spans,
             unsupported_spans,
@@ -1916,6 +2032,40 @@ fn scan_list_marker(source: &str, start: usize, end: usize) -> Option<MarkerScan
         content_start: index,
         delimiter,
     })
+}
+
+/// info string 是否是 Mermaid 语言标记。
+///
+/// 只接受**去掉首尾空白后精确等于 `mermaid`**（小写）：Mermaid CLI / GitHub /
+/// Obsidian 的 fenced mermaid 都是这个写法。`Mermaid`、`mermaid title="x"` 等
+/// 变体不识别（保守：不猜用户意图，按普通代码块处理）。
+fn is_mermaid_info(info: &str) -> bool {
+    info.trim() == "mermaid"
+}
+
+/// fenced mermaid 是否可投影成 Object Block（普通段落上下文，见类型文档）。
+fn mermaid_block_is_object(line_infos: &[LineInfo], block: &FencedMermaidBlock) -> bool {
+    if block.last_line <= block.first_line {
+        return false;
+    }
+    let (Some(first), Some(last)) = (
+        line_infos.get(block.first_line),
+        line_infos.get(block.last_line),
+    ) else {
+        return false;
+    };
+    // 开/闭围栏行都必须是围栏代码，且不在引用/列表项里。
+    if first.kind != LineKind::FencedCode || last.kind != LineKind::FencedCode {
+        return false;
+    }
+    if !first.quote.is_empty() || !last.quote.is_empty() {
+        return false;
+    }
+    if first.list.is_some() || last.list.is_some() {
+        return false;
+    }
+    // 行首缩进不投影（否则布局缩进与源码缩进会叠加）；块必须结束在闭围栏行内容终点。
+    block.opening.start == first.content.start && block.span.end == last.content.end
 }
 
 fn count_run(bytes: &[u8], start: usize, end: usize, marker: u8) -> usize {

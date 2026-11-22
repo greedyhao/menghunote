@@ -46,7 +46,10 @@
   - 悬停行/列边缘显示行/列把手与增删入口；删除行列走确认或撤销可恢复。
 - 单元格编辑：单击选中单元格，键入进入 cell 编辑（不显示 `|`）；Tab/ShiftTab 移动单元格，
   Esc 退出表格对象，Ctrl+Enter 提交；单元格内容转义 `|`、保留行内 Markdown，禁止破坏表格结构。
-- 首版不做合并单元格、嵌套表格、富文本单元格；表格对象与图片/Mermaid 一样在文本选区中保持原子。
+- **合并单元格、嵌套表格、富文本单元格不做**（2026-11-17 确认）；表格对象与图片/Mermaid
+  一样在文本选区中保持原子。cell 仍是 GFM 源码文本，后续只考虑**行内 Markdown**
+  （粗体/斜体/删除线/行内代码/链接等），不支持块级元素/换行/图片；当前 cell 渲染仍是
+  纯文本，行内 Markdown 属于后续切片，不是既有能力。
 - 表格源码仍是唯一真源；插件/外部编辑产生的非规范表格先按原样显示并提示，不静默重写。
 
 ## 2. 图片与外部导入
@@ -1338,6 +1341,321 @@ display 永远由镜像派生（投影层只认 source），所以编辑中的 c
 - 点**编辑器以外**（侧栏 / 状态栏 / 设置页）不会立刻清除轴选中：编辑器收不到那次点击，
   回到编辑器后任意点击（正文/单元格/表格）会按上面的清除路径处理；
 - 轴选中不参与 Ctrl+C 复制（复制语义仍是图片对象/正文选区，未扩展到整行/整列）。
+
+## 18. M2 实施记录（2026-11-17，fenced Mermaid Object 预览）
+
+> 范围：` ```mermaid ` fenced code → 编辑器 Object Block（后台渲染/光栅化/缓存/源码切换/
+> 工具条）。**不做**暗色主题、CJK 字体策略、导出、子进程隔离（M3）；不改
+> storage/sync/relay/schema/wire/tag；不改表格单元格/拖拽/shell。
+> M1 的 `render_svg` 语义不变，只**新增**预览入口 `render_svg_for_preview`。
+
+### 18.1 解析（`menghunote-markdown`）
+
+- 新增 `FencedMermaidBlock`：整块 span（开围栏行首 .. 闭围栏行内容终点，不含末尾换行）、
+  content span（围栏之间原始源码）、opening span（围栏标记，跳过行首缩进，含 info）、
+  first/last line、info、`block`。
+- 只识别 **去掉首尾空白后精确等于 `mermaid`** 的 info（小写；`Mermaid`/`mermaid title=…`
+  按普通代码块处理）。未闭合围栏不产生该元数据（沿用 `fenced_construct` 的闭合判定）。
+- `block = true` 的条件：闭合围栏 + 开/闭行都是 `LineKind::FencedCode` + 非引用/非列表 +
+  开围栏从行内容起点开始（无行首缩进）+ 结束在闭围栏行内容终点。引用里的围栏沿用
+  M1 前的既有边界（不产生 mermaid 元数据，仍是普通代码）。
+- 可投影块**移除** `ConstructKind::FencedCode`（否则围栏隐藏会与 Object 段重叠）；
+  其它语言/非 Object 的 mermaid（引用/列表/缩进）构造与行为完全不变。
+  `code_spans` 仍包含 mermaid 块（内部行内构造不投影）。
+
+### 18.2 编辑器（`menghunote-editor`）
+
+- `ObjectKind::Mermaid` + `MarkdownMermaid`（span/content/line/end_line/info/block）。
+  图片/表格/Mermaid 共用 **同一条** `ObjectBlock` 路径：投影占位符、整块选中、
+  `begin/end_object_source_edit`、删除完整 span、复制完整源码、端点偏置都不另写一套。
+- `collect_objects(images, tables, mermaid)` 按 span 排序；`object_mermaid` 取载荷。
+- 源码模式显示**完整 fenced 源码**（` ```mermaid ` + 内容 + ` ``` `）；单击/选区相交不展开。
+
+### 18.3 app：SVG → GPUI 图像（关键取舍）
+
+- **不新增依赖**：`gpui-pre 0.3.12` 已带 `gpui::SvgRenderer`（usvg/resvg 0.46，与
+  gpui-kit 同一依赖图/版本）。不引 resvg/usvg 第二份、不开 Node/WebView。
+- Mermaid 默认标签是 `<foreignObject>` HTML，`usvg` 会忽略 → 直接光栅化会“没有文字”。
+  因此 M1 新增 `render_svg_for_preview`：用 merman 的 `SvgPipeline::resvg_safe()` 把
+  HTML 标签投影成 SVG `<text>` 并清理 rasterization hazard；仍复用 M1 的输入/输出上限、
+  `catch_unwind`、SVG 形状校验。`render_svg`（Parity）语义不变。
+- 光栅化：`SvgRenderer::render_single_frame(svg, scale)`（内部固定 2× 平滑，逻辑尺寸
+  记自然尺寸 × scale）。自然尺寸取 SVG 根 `viewBox`；无 `viewBox` 时退回数值
+  `width`/`height`，百分比宽高按失败占位。小图不放大，大图按内容宽度缩到上限。
+
+### 18.4 后台线程、缓存与资源上限
+
+- 一个后台 worker（串行，并发 1）：`render_svg_for_preview` → `SvgRenderer` 光栅化 →
+  写缓存；主线程只 `request/state/take_completed`，`pump` 完成计数触发重绘。
+- cache key = 源码 **FNV-1a 64 + 字节长度** + `MERMAN_VERSION`（`0.10.0`）+ 主题 id
+  （M2 = `light`）+ 渲染宽度桶（64px，夹在 128–2048）。同一 key 只渲染一次；失败也缓存
+  为终态（避免每帧重试），工具条「重新渲染」可强制丢弃终态重排一次。
+- LRU：64 MiB / 最多 64 项（失败项零字节，防病态笔记刷爆表）。
+- 光栅预算：单边 ≤ 4096 device px、总像素 ≤ 8 MP（约 32 MiB BGRA）；超限先等比缩小，
+  异常 SVG 仍超则 `TooLarge`。失败/空/超限都不 panic、不改正文。
+- 失败回退：Object 仍存在，显示「Mermaid 渲染失败」占位；「编辑源码」/F2/Esc 仍走
+  与图片/表格相同的源码切换。工具条：Mermaid 只有「编辑源码 + 重新渲染」，**没有放大**。
+
+### 18.5 测试与计数（本机 Linux）
+
+- `crates/markdown/tests/golden.rs` +5：顶层元数据（span/content/opening/行号/info）、
+  info 精确匹配、列表/缩进非 Object、引用 mermaid 不产生对象、未闭合围栏。
+- `crates/editor/tests/mermaid_object.rs` **9**：Object/投影/端点偏置/复制完整源码/
+  选区不展开/源码往返/删除整块/非普通上下文保持代码/三类对象源码顺序。
+- `crates/app/src/editor/mermaid_preview.rs` **10**：宽度桶、key（版本/主题/宽度）、
+  viewBox/属性解析、真实 GPUI 光栅化 2×、后台 Loading→Ready（Condvar 收敛，无 sleep）、
+  失败缓存、renderer panic 兜底、LRU 淘汰、重新渲染。
+- `crates/app/src/mermaid.rs` +2：ResvgSafe 无 `foreignObject` 且有 `<text>`；失败分类一致。
+- `crates/app/tests/headless_mermaid.rs` **3**：真实 AppShell+vault+真实 merman 渲染，
+  成功/失败对象、占位→Ready 几何、工具条（无放大）、F2/工具条/Esc、完整复制、
+  帧循环不重复渲染、重新渲染恰好一次、正文逐字节不变；失败回退与列表内 mermaid。
+- 命令（`CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`，环境变量见 AGENTS §6）：
+  - `cargo fmt --all -- --check` = 通过；
+  - `cargo clippy -p menghunote-markdown -p menghunote-editor -p menghunote-app
+    --all-targets --features dev-sync -- -D warnings` = 通过（0 warning）；
+  - `cargo test -p menghunote-markdown` = **33 passed / 0 failed**；
+  - `cargo test -p menghunote-editor` = **274 passed / 0 failed**；
+  - `cargo test -p menghunote-app --features dev-sync` = **525 passed / 0 failed**（36 suites）；
+  - `cargo test -p menghunote-app` = **294 passed / 0 failed**（36 suites）。
+
+### 18.6 已知限制 / 风险
+
+- **字体/主题**：光栅化走系统字体（GPUI SvgRenderer 的 fontdb）；Merman 的确定性只保证
+  SVG 字符串，**不保证**跨平台像素一致。CJK/暗色主题/字体替换是 M3。
+- **缓存作用域**：`MermaidService` 与 `ImageService` 一样是 **per-view**（打开/切换笔记
+  会重建 EditorView，Mermaid 会重新渲染）；同一视图内同源码不重复渲染。跨文档共享缓存
+  需另做（不在 M2）。
+- **安全**：输入仍有 256 KiB / 8 MiB 上限与 `catch_unwind`；ResvgSafe 会清理动画/外链
+  等 rasterization hazard，但**不是**完整沙箱；恶意输入仍可能耗时/OOM。子进程隔离 +
+  超时是 M3。
+- **真机未验**：高 DPI 下 2× 光栅化的清晰度、字体回退、选中描边与工具条观感、Windows
+  实际窗口行为仍需 `ui_smoke.ps1` 人工验收。
+
+### 18.7 M2 收尾（2026-11-17，延迟渲染 + 反引号补全）
+
+> 用户真机反馈后的收尾。**明确不做** SVG 文字拖选/复制文字（GPUI 的 `SvgRenderer`
+> 是光栅图，没有 DOM 文本；完整实现需自建矢量文本/命中/选区层，成本高且易错，用户
+> 决定先不做）；不引入 WebView。
+
+#### 延迟渲染 + “光标进入即显示源码”（避免输入 ` ```mermaid ` 时立刻变占位）
+
+- **投影规则**（editor）：caret（含两端）或非空选区与 Mermaid block span 相交时，
+  该块**不产生 `ProjectionPiece::Object`**，整段 fenced 源码保持 Copy 可见/可编辑；
+  此时 `object_rects` 为空、工具条不出现，也不提交渲染请求。移出后下一次投影重新
+  产生 Object。图片/表格**不变**（仍是整块选中，不跟随 caret 展开源码）。
+- 单击 Mermaid 对象 / 退出源码模式时，app/controller 把 caret 放到块尾换行**之后**
+  （块外），因此对象仍能被点选并显示工具条；块在文档尾且无换行时只能落在块尾
+  （此时显示源码，属边界情况）。
+- **等待态** `MermaidPreviewState::Waiting`（服务本身不会返回）：Object 已投影
+  （caret 已移出）但内容为空/纯空白时，显示「等待光标移出后渲染…」占位且不请求；
+  空 fenced block 永远等待，不进入 `Failed`。未闭合围栏本来就不产生 Object。
+- 移出后绘制路径才 `request`；服务按 key 去重，所以**只请求/渲染一次**。等待态不
+  清理缓存：已有 `Ready` 移出后立即复用，不产生第二次请求。
+- 工具条「重新渲染」是**显式用户动作**，不受自动延迟门控；自动绘制仍等光标移出。
+- 测试：`headless_mermaid` 2 个更新为“caret 内显示源码/无 Object/0 请求 → 移出后
+  出现 Object/请求 1/Ready、缓存复用；空内容/未闭合不 Failed”。editor
+  `mermaid_object` 增加 selection/caret 端点投影断言。
+
+#### 反引号补全（纯函数 + 平台输入接线）
+
+- 纯规则在 `crates/editor/src/model/backtick.rs`（`backtick_action`），app 只按行语义
+  过滤并执行：表格 / 围栏代码 / 缩进代码 / HTML 行**不自动补全**；IME 组合中不触发
+  （组合上屏走 `commit_composition`）；非空选区走普通替换。
+- 规则（写死，单测钉住）：
+  1. 普通位置输入 `` ` `` → 插入成对 `` `` ``，caret 在中间；
+  2. caret 在成对反引号中间（含行内代码闭合位置）再输入 `` ` `` → 跳过自动补的那个，
+     caret 右移，**零 `EditRequest`**；
+  3. 行首连续反引号：已有 1 个时继续单个；第 3 个（行尾只有空白）补全
+     ```` ``` ```` + 空行 + 闭围栏，caret 落在**开围栏之后**（可直接输入 `mermaid`
+     info string）；一次按键一个 `EditRequest`/撤销组；
+  4. 行首已有正文/表格时只继续单个反引号，不吞已有文本；已有 3+ 个时不再嵌套围栏。
+- 普通行内代码（`` `x` ``）闭合、表格输入、已有文本均不回归；IME 组合测试覆盖。
+- 测试：editor 纯函数 **9**；app `headless_backtick` **4**（成对/跳过、行内闭合、
+  三反引号围栏 + 一次撤销、IME 组合不触发）。
+
+#### 计数（本机 Linux）
+
+- `cargo fmt --all -- --check` = 通过；
+- `cargo clippy -p menghunote-markdown -p menghunote-editor -p menghunote-app
+  --all-targets --features dev-sync -- -D warnings` = 通过；
+- `cargo test -p menghunote-markdown` = **33 passed / 0 failed**；
+- `cargo test -p menghunote-editor` = **283 passed / 0 failed**（+9 backtick）；
+- `cargo test -p menghunote-app --features dev-sync` = **531 passed / 0 failed**（+6 headless）；
+- `cargo test -p menghunote-app` = **300 passed / 0 failed**。
+
+#### 真机注意点
+
+- 打开笔记时光标默认在文首：若文首就是 Mermaid block，会先显示**完整源码**（可编辑），
+  **移动光标离开 block 后**才投影成 Object 并渲染；这是预期行为。
+- 空 fenced block 在 caret 移出后显示等待态（不会自动变成失败）；需要内容后移出光标。
+- Mermaid 的“单击选中对象”与“caret 在块内显示源码”以 caret 位置区分：单击对象会把
+  caret 落到块尾换行之后；文档尾无换行的块是边界情况。
+- 反引号补全靠平台文本输入路径（Windows 实际按键/IME 仍需真机确认）；表格单元格
+  浮层编辑走输入框，不经过自动补全。
+- 未做 SVG 文字拖选/复制；工具条仍只有「编辑源码 / 重新渲染」。
+
+## 19. 外部链接增强实施记录（2026-11-17，Ctrl/Cmd+单击 / 右键菜单 / scheme 策略 / 内部链接）
+
+> 输入：[`docs/notes/editor-backlog-links-mermaid.md`](../notes/editor-backlog-links-mermaid.md) §1。
+> 本切片只做**普通 Markdown 链接**（`[text](dest)`）；wiki 链接、图片、表格、Mermaid
+> 的既有行为不变（wiki 仍是单击打开；图片/表格/Mermaid 仍是 Object）。
+
+### 19.1 交互（写死，headless 钉住）
+
+- **普通单击即打开**（Ctrl/Cmd+单击同样打开）。修饰键判定仍保留在
+  `editor::link::is_open_link_modifier`，但不再作为打开的必要条件。
+- 悬停手形、链接末尾边界（`display == end` 不命中）保持：命中仍走
+  `external_link_hit_at_display` 的可见内容区间。
+- **右键菜单**：普通链接上右键显示「打开链接 / 复制链接 / 复制 Markdown」；
+  其它位置仍是既有的「插入 → 表格」。右键本身**不移动 caret**；动作在菜单项的
+  mouse-down 上执行，随后 `swallow_mouse_up` 吞掉同一次手势的 mouse-up，并保留
+  `context_menu_rect` 一帧让窗口级左键监听放行（不挪 caret）。
+- 确认框是 app 内最小浮层（`editor-link-confirm`）：遮罩 + 面板 +「取消 / 打开」；
+  未知自定义 scheme 多一个「记住此 scheme（仅本机）」。模态：遮罩 `occlude` 且各
+  按钮 `stop_propagation`，点击不落到正文；`Esc` 关闭。
+
+### 19.2 scheme 策略（`crates/app/src/editor/link.rs`）
+
+| 目标 | 行为 |
+| --- | --- |
+| `http` / `https` / `mailto` / `zotero` | 直接交给系统；Zotero **原样**传递（不解析/不改写） |
+| `file:` / UNC（`\\server\share`、`//server/share`）/ Windows 盘符路径 | 打开前**确认**（每次） |
+| 未知自定义 scheme | 首次**确认**，可勾选「记住此 scheme」 |
+| `javascript` / `data` / `vbscript` / 含控制字符 | **拒绝**；提示只显示 scheme，不回显路径 |
+| 无 scheme（`#heading` / `Note` / `Folder/Note`） | 内部链接（见 19.3） |
+
+- 确认框/错误提示只显示 `scheme[:host]`（`display_target`）：`mailto:` 不显示收件人、
+  `file:` 不显示本地路径、`https://user:pass@host/...` 只显示 host；**URL 不写日志**。
+- 「记住」落在**本机偏好文件**（`crates/app/src/editor/link_settings.rs`）：
+  `MENGHUNOTE_LINK_SCHEMES_PATH` 覆盖；否则平台配置目录
+  （Windows `%LOCALAPPDATA%\menghunote\link-schemes.txt`、macOS
+  `~/Library/Application Support/menghunote/link-schemes.txt`、Linux
+  `$XDG_CONFIG_HOME|~/.config/menghunote/link-schemes.txt`）。只存 scheme 名，
+  **不写正文、不同步**；写盘失败退化为进程内记忆（打开流程不失败）。
+- **平台打开统一收口** `editor::link::open_external_url`：交给 GPUI 平台层
+  （Windows `ShellExecuteW`、macOS `NSWorkspace`、Linux `xdg-open`/portal），
+  都是**参数数组**调用、不经 `sh -c`/`cmd /c`；只去掉首尾空白，其余原样传递。
+
+### 19.3 内部链接
+
+- `#heading`：在当前笔记里按标题文本（大小写不敏感、去掉 `#` 与首尾空白）匹配
+  `BlockRun::kind == Heading` 的行；命中后**滚动到标题行顶部**并把 caret 放到标题行首；
+  找不到只给非阻塞提示（`editor-link-notice`），不改正文。
+- 相对笔记路径（`Note`、`Folder/Note`，可带 `#heading`）：复用 wiki 链接的宿主解析
+  （`EditorEvent::WikiLinkRequested`），按路径精确 > 标题 > 最短路径打开；解析不到
+  只提示、**不自动建笔记**。`Note#heading` 的 heading 目前只参与语法识别（宿主打开
+  笔记后不滚动，沿用 wiki 链接的既有语义）。
+
+### 19.4 验证
+
+- 纯逻辑单测（`editor::link` 9 + `editor::link_settings` 2）：scheme 分类、Zotero 原样、
+  file/UNC 确认、未知 scheme、危险 scheme、显示脱敏、标题提取、修饰键、偏好持久化。
+- `crates/app/tests/headless_links.rs`（12）：普通单击不打开、Ctrl+单击打开且 caret 不动、
+  末尾边界、Zotero、file 确认、未知 scheme 记住、危险 scheme 拒绝不回显路径、右键三项
+  与 caret 不动、`#heading` 滚动/定位、相对笔记打开、解析不到只提示。
+- 计数（本机 Linux）：`cargo test -p menghunote-editor` = **284**；
+  `cargo test -p menghunote-app --features dev-sync` = **575**（+12 headless_links）；
+  `cargo test -p menghunote-app` = **344**。
+- 真机注意点：手形光标/确认框阴影/DPI 仍需真机；macOS 的 Cmd 判定按 `platform`
+  修饰键（本机 Linux 只验证了 Ctrl 路径）。
+
+### 19.5 已知限制
+
+- `Note#heading` 打开笔记后不滚动到标题（需要宿主把 heading 传给新视图，本切片未做）；
+- 未知 scheme 的「记住」是**全局本机**偏好（不按 vault 区分）；
+- 确认框不显示完整 URL（安全取舍：只显示 scheme/host）；
+- 危险 scheme 名单目前是 `javascript`/`data`/`vbscript` + 控制字符，未做可配置。
+
+## 20. S3b7 实施记录（2026-11-17，表格单元格行内 Markdown）
+
+> 范围：GFM 表格 cell 的**渲染**（行内 Markdown → 样式 span + 可见链接）与**链接点击**。
+> 源码仍是 GFM 文本（`|` 必须转义），编辑浮层仍显示源码原文，提交仍走
+> `sanitize_cell_text`。**不改** storage/sync/relay/schema/wire，不新增依赖，
+> 不引入第二套表格几何。
+
+### 20.1 支持与不支持（写死，测试钉住）
+
+| 构造 | 语法 | 渲染 |
+| --- | --- | --- |
+| 粗体 | `**text**` | `StyleKind::Bold` |
+| 斜体 | `*text*` / `_text_` | `StyleKind::Emphasis` |
+| 删除线 | `~~text~~` | `StyleKind::Strike` |
+| 行内代码 | `` `text` `` | `StyleKind::InlineCode`（等宽 + 底色） |
+| 普通链接 | `[text](url)` / `<https://…>` | `StyleKind::Link` + 可点击 |
+
+不支持（**整格退回源码原文**，`TableCellInline::is_plain() == true`）：块级元素
+（标题/引用/列表/围栏代码/分隔线/HTML 块/嵌套表格）、换行、图片、合并单元格、富文本 cell。
+图片按 `![alt](dest)` 源码原样显示（不解码、不投影成对象）；同一格里其它受支持的构造
+仍正常渲染。行内 HTML / 脚注引用按源码原样显示。
+
+### 20.2 解析层（`menghunote-markdown::table_inline`）
+
+- 新增 `parse_table_cell_inline(&str) -> TableCellInline`（纯函数，无 IO/无 GPUI）：
+  - `display`：渲染用文本（标记隐藏、转义还原、实体解码）。**不是**源码切片，
+    因此不保留源码偏移（与整篇 `ParsedMarkdown` 是两套坐标）；
+  - `spans`：display 字节区间上的语义段，**有序、不重叠、完整覆盖** `[0, display.len())`，
+    无样式处为 `Plain`；
+  - `links`：链接的 display 可见区间 + 目标（自动链接/引用式链接已展开）。
+- **`\|` 在行内解析之前还原**：GFM 规定 `\|` 是列边界保护，行内代码**内部**也要还原
+  （`` `a\|b` `` 渲染成 `a|b`，不是 `a\|b`）。因此解析前先做一次 `\|` → `|` 预处理
+  （`unescape_cell_pipes`，按 CommonMark 的奇偶反斜杠规则）；不预处理会让代码里的
+  `\|` 原样显示成反斜杠。
+- 语义枚举 `TableCellStyle` 是本 crate 自己的类型（与 `TableAlignment` 同一套做法）：
+  依赖方向 `editor → markdown`，本 crate 不能反向依赖 editor 的 `StyleKind`。
+- 嵌套/优先级与 editor 的 `model::style::runs` **同一套规则**：同一 display 位置取
+  display 区间最短的构造，长度相同再按 `InlineCode > Bold > Emphasis > Strike > Link`。
+  因此 `**a *b* c**` 在正文与表格 cell 里着色完全一致。
+- 防御性：`\n`/`\r` 一律收敛成空格（`shape_line` 对含换行的文本会断言）；未闭合定界符
+  是字面文本（不隐藏）。
+
+### 20.3 编辑器（`menghunote-editor`）
+
+- `MarkdownTableRow` 新增 `inline: Vec<TableCellInline>`（与 `cells` 一一对应），在
+  `convert_table_row` 里**随 Markdown 文档重建算一次**；新增
+  `MarkdownTableRow::cell_inline(column)` 与 `MarkdownTable::cell_inline(row, column)`
+  （行寻址含表头，与 `cell` 同一套）。
+- 放在这里的理由：cell 行内解析只随**源码**变化，绘制/命中每帧只借用；放在 app 里
+  按帧解析会在大表格上产生无谓的重复工作。
+- 源码零改写：`cells` 仍是原始源码区间（`\|` 与标记都在），编辑浮层/提交路径不变。
+
+### 20.4 app（`crates/app/src/editor/{view,geometry,element,glyph}.rs`）
+
+- `table_cell_paint` 从「Plain 单段」改为**样式段**：`TableCellInline.spans()` →
+  `(字节数, StyleKind)` → `shape_row_truncated_at`（列宽截断/对齐/空 cell 逻辑不变）。
+- `glyph::shape_row_truncated_at` 返回 `TruncatedLine { line, visible_len }`：
+  `visible_len` 是**可见前缀**的字节长度（未截断 = 全文长度）。链接命中必须按它裁剪——
+  省略号之后的内容没画出来，也就不该可点。
+- `TableCellPaint.links: Vec<TableCellLinkPaint>`（`rect` + `display` 区间 + `dest`）：
+  矩形用截断后 `ShapedLine::x_for_index` 换算，偏移与 `ShapedLine::paint` 的 `TextAlign`
+  语义一致（Center/Right 在单元格内宽里平移），因此点击与绘制逐像素一致。
+- 命中优先级：`EditorGeometry::table_cell_link_at` 在**单元格命中之前**判定
+  （`element.rs` 的 mouse-down）。单击链接只发 `EditorEvent::ExternalLinkRequested`，
+  不移动正文 caret、不选中单元格、不进入编辑；scheme 白名单仍是
+  `http`/`https`/`mailto`（其它明确拒绝并给提示）。链接末尾边界不算命中（与正文链接一致）。
+- 悬停：单元格链接矩形与正文链接共用 `link_hitboxes`（gpui 原生 `PointingHand`）。
+- 编辑浮层：`table_cell_display_text` 仍是**源码原文**（只还原 `\|`），提交走
+  `sanitize_cell_text`；无改动提交逐字节不变（不会把标记重写/转义）。
+
+### 20.5 验证
+
+- `cargo test -p menghunote-markdown` = **45 passed / 0 failed**（+11 table_inline 单测，
+  +1 golden 接缝）；
+- `cargo test -p menghunote-editor` = **285 passed / 0 failed**（+1 `cell_inline`）；
+- `cargo test -p menghunote-app --features dev-sync` = **538 passed / 0 failed**
+  （+7 `headless_table_inline`）；
+- `cargo test -p menghunote-app` = **307 passed / 0 failed**；
+- 现有表格/任务/图片/Mermaid 测试全绿（结构、拖拽、undo、加删行列、单元格编辑均未回退）。
+
+### 20.6 已知限制（本切片写死）
+
+- 只渲染**单行**：cell 不能跨行，块级元素/图片一律退回源码原文（不做部分渲染之外的
+  富文本 cell）；
+- 表格 cell 里的链接**只支持单击打开**：不做 Ctrl+单击/右键菜单/复制链接；
+- 链接命中矩形按截断后的可见前缀裁剪：被省略号截掉的链接部分不可点（与“没画出来就
+  不可点”一致）；
+- 样式外观（粗体字重、代码底色、链接下划线）仍需真机验证：headless 的
+  `NoopTextSystem` 把所有字体解析成同一个 `FontId`，无法用 run 的字体 id 断言；
+- 不做单元格内的 wiki 链接（`[[Note]]` 在 cell 里按普通文本显示）。
 
 ## 非目标
 

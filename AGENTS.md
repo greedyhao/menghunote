@@ -395,7 +395,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 356 / sync 605 / app `--features dev-sync` 510 / 默认 279 / storage 195 / editor 265 / markdown 28。
+> 测试：relay 356 / sync 605 / app `--features dev-sync` 583 / 默认 352 / storage 195 / editor 287 / markdown 45。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
@@ -430,7 +430,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > 统一转 PNG（`image` 增加 `bmp` feature），粘贴写出 `![粘贴图片.png](asset://…)`
 > 并投影成图片对象；CF_DIBV5 仍是缺口。
 > **普通链接打开（2026-11-17）**：`[text](url)` 解析 destination，按可见文本区间命中，
-> 单击交给系统打开 `http`/`https`/`mailto`，悬停手形；末尾边界不误触；其它 scheme 明确拒绝。
+> **单击即打开**（Ctrl/Cmd 同样打开），悬停手形；末尾边界不误触；其它 scheme 明确拒绝。
 > **交互修复（2026-11-17）**：设置页按窗口高度限高并可滚动；wiki 链接悬停手形、
 > 末尾边界不跳转、点击仅命中 display 可见区间（修复上一行误跳）；右键菜单动作后
 > 吞掉同一次手势的 mouse-up，修复根目录笔记/文件夹右键重命名被立刻提交。
@@ -447,13 +447,30 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > caret 不变、表格仍为 Object；行尾换行留在槽位，列重排对齐一起移动。
 > **图谱 G0+G1（2026-11-17）**：`GraphModel`（tree+notes 节点、已解析 wiki 边、去重权重、
 > 自环/未解析/悬空统计、确定性圆周布局、800/3000 上限）+ 侧栏「图谱」全屏覆盖层；
-> 平移/缩放/悬停邻居/点节点打开笔记。局部深度/过滤/搜索/LOD 仍是 G2/G3。
+> 平移/缩放/悬停邻居/点节点打开笔记。
+> **图谱 G2（2026-11-17）**：局部图 depth 1–3（默认 2，无当前笔记回退全库）、
+> 文件夹/标签/未解析过滤、搜索定位/居中/Enter 打开、LOD、方向箭头；未解析只画
+> 灰色虚线占位（不可打开），不自动建笔记。大库后台布局/缓存仍待 G3。
 > **Mermaid M1（2026-11-17）**：`merman 0.10.0` 精确 pin（all-diagrams+complete-svg，
 > 不引 ELK/Node/WebView）；`render_svg` 输入/输出上限 + catch_unwind + SVG 形状校验；
-> 11 个渲染测试。**编辑器 Object 预览/缓存仍待 M2。**
+> 11 个渲染测试。
+> **Mermaid M2（2026-11-17）**：```mermaid fenced block 投影为 Object；后台线程
+> `ResvgSafe` SVG → GPUI `SvgRenderer` 光栅化，per-view LRU 64MiB/64 项；渲染中占位、
+> 失败回退源码、工具条「编辑源码/重新渲染」；无新增依赖。**光标/选区在 block 内时
+> 保持完整源码可编辑、不投影 Object，布局回落到普通 fenced code 行高（不再出现
+> “大光标”）；**非空选区跨过 block 时仍保持 Object 并正常渲染**，拖选不会突然
+> 切源码/变长；空 Mermaid 永远显示源码、不出现“等待渲染”占位。** 暗色/导出/子进程
+> 超时隔离仍待 M3。
+> **反引号补全（2026-11-17）**：普通输入自动配对、成对中间跳过、行首 ``` 自动补
+> fenced block；表格/代码块/HTML/IME 组合中不触发，一次按键一个撤销组。
 > **资产 GC dry-run（2026-11-17）**：storage 只读扫描候选，保护根=正文引用/历史版本/
 > 同步 outbox/无本地字节/baseline journal；保护根解析不确定时整次 fail-closed；
 > 只报告，不物理删除、不改 orphan_since/schema。
+> **表格 cell 行内 Markdown（2026-11-17，S3b7）**：cell 非编辑时渲染粗体/斜体/
+> 删除线/行内代码/普通链接，编辑浮层仍显示源码；`\|` 在行内代码里仍是字面 `|`；
+> 不支持块级/图片/合并单元格/富文本；cell 链接单击打开（不做 Ctrl/右键）。
+> 编辑器内部灰色状态条已移除，保存/同步状态统一由 shell 底栏承担。
+> 列表项（含引用内列表）的行内 Markdown 有 app headless 回归，光标在行尾也不会显露标记。
 > **S3b3/S3b4 表格删除与右键插入（2026-11-17）**：表格浮层增删行/删列
 >（表头不删、至少保留 1 列、删除后修正选中格）；编辑器右键「插入 → 表格」，
 > 默认 2 列 × 1 数据行，一条 EditRequest，右键不移动 caret。拖拽重排仍未做。

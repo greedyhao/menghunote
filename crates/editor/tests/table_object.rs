@@ -407,3 +407,38 @@ fn object_ranges_are_sorted_and_do_not_overlap() {
         vec![ObjectKind::Table, ObjectKind::Image, ObjectKind::Table]
     );
 }
+
+#[test]
+fn table_row_exposes_parsed_inline_markdown_per_cell() {
+    // ADR 0019 S3b7：cell 源码在解析文档时**一次性**变成行内 Markdown
+    // （display 文本 + 样式段 + 链接），绘制/命中只借用，不每帧重解析。
+    let source = "| **粗** | `a\\|b` |\n|---|---|\n| [文档](https://x.y) | 平 |\n";
+    let doc = parse(source);
+    let table = &doc.tables()[0];
+    let header = table.header();
+    assert_eq!(header.cell_inline(0).expect("表头第 1 格").display(), "粗");
+    assert_eq!(
+        header.cell_inline(0).expect("表头第 1 格").spans()[0].kind,
+        menghunote_editor::TableCellStyle::Bold
+    );
+    assert_eq!(
+        header.cell_inline(1).expect("表头第 2 格").display(),
+        "a|b",
+        "行内代码里的 `\\|` 还原成字面 `|`"
+    );
+    let row = &table.rows()[0];
+    let link = &row.cell_inline(0).expect("数据行第 1 格").links()[0];
+    assert_eq!(link.dest, "https://x.y");
+    assert_eq!(
+        &row.cell_inline(0).expect("数据行第 1 格").display()[link.display.start..link.display.end],
+        "文档"
+    );
+    assert_eq!(row.cell_inline(1).expect("数据行第 2 格").display(), "平");
+    // 越界不 panic。
+    assert!(row.cell_inline(9).is_none());
+    // 源码零改写：cell 区间仍是原始切片（`\|` 与标记都在）。
+    assert_eq!(
+        &source[row.cells()[0].start().get()..row.cells()[0].end().get()],
+        "[文档](https://x.y)"
+    );
+}

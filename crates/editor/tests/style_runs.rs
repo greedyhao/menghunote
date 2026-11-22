@@ -312,3 +312,43 @@ fn complex_document_is_covered_and_deterministic() {
         .expect("末尾 caret 合法");
     assert_eq!(layout(controller.style_runs()), layout(&runs));
 }
+
+#[test]
+fn list_items_render_inline_markdown() {
+    let source = "> - `javascript:`: 拒绝，提示只显示 scheme。\n> - **粗** 和 [链接](https://e.com) 还有 *斜*\n";
+    let doc = parse(source);
+    let caret = source.chars().count();
+    let projection = project(&doc, caret);
+    let display = projection.display_text().into_owned();
+    assert!(
+        display.contains("javascript:: 拒绝"),
+        "列表行内代码标记必须隐藏：{display:?}"
+    );
+    assert!(
+        !display.contains('`'),
+        "列表行内代码不得残留反引号：{display:?}"
+    );
+    assert!(
+        display.contains("粗 和 链接 还有 斜"),
+        "列表行内标记必须隐藏：{display:?}"
+    );
+    let runs = doc.style_runs(&projection);
+    let rendered: Vec<(&str, StyleKind)> = runs
+        .iter()
+        .map(|run| (range(&display, run), run.kind()))
+        .collect();
+    assert!(
+        rendered.contains(&("javascript:", StyleKind::InlineCode)),
+        "{rendered:?}"
+    );
+    assert!(rendered.contains(&("粗", StyleKind::Bold)), "{rendered:?}");
+    assert!(
+        rendered.contains(&("链接", StyleKind::Link)),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains(&("斜", StyleKind::Emphasis)),
+        "{rendered:?}"
+    );
+    assert_coverage(&display, &runs);
+}

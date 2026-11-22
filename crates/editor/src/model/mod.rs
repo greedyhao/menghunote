@@ -19,6 +19,7 @@
 //!
 //! 依赖方向（ADR 0003 §3）：`editor → storage / text`，且不依赖 GPUI。
 
+pub mod backtick;
 pub mod block;
 pub mod controller;
 pub mod error;

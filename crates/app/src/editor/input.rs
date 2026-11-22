@@ -115,7 +115,8 @@ impl EntityInputHandler for EditorView {
         if self.is_composing() {
             self.commit_composition(text, cx);
         } else {
-            self.insert_text(text, cx);
+            // 平台打字：允许反引号自动补全（粘贴/内部换行仍走 `insert_text`）。
+            self.insert_typed_text(text, cx);
         }
         cx.notify();
     }

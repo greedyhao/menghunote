@@ -84,20 +84,25 @@ pub use menghunote_text::{
 
 pub mod model;
 
+pub use model::backtick::{
+    action as backtick_action, BacktickAction, FENCE_CARET_OFFSET, FENCE_INSERT, PAIR_CARET_OFFSET,
+    PAIR_INSERT, SINGLE_CARET_OFFSET, SINGLE_INSERT,
+};
 pub use model::block::{BlockKind, BlockRun};
 // ADR 0019 S1：列表/行语义由 menghunote-markdown 定义，editor 原样再导出（同一类型，
 // 不是副本）；app 用它们算 gutter / hanging indent，不自己重扫 Markdown。
 pub use menghunote_markdown::{
     LineInfo as MarkdownLineInfo, LineKind as MarkdownLineKind, ListBlock as MarkdownListBlock,
     ListItem as MarkdownListItem, ListLineInfo as MarkdownListLineInfo, Span as MarkdownSpan,
-    TableAlignment as MarkdownTableAlignment,
+    TableAlignment as MarkdownTableAlignment, TableCellInline, TableCellLink, TableCellSpan,
+    TableCellStyle,
 };
 pub use model::controller::{EditorController, GraphemeStep, OutcomeEffect, TableCellTarget};
 pub use model::error::EditorError;
 pub use model::input::InputDocument;
 pub use model::markdown::{
     ConstructKind, MarkdownConstruct, MarkdownDocument, MarkdownError, MarkdownImage,
-    MarkdownTable, MarkdownTableRow, ProjectionCellReveal, TASK_BOX_DISPLAY,
+    MarkdownMermaid, MarkdownTable, MarkdownTableRow, ProjectionCellReveal, TASK_BOX_DISPLAY,
 };
 pub use model::object::{ObjectBlock, ObjectKind};
 pub use model::projection::{

@@ -43,7 +43,7 @@
 
 use std::any::Any;
 
-use merman::svg::RenderResourcePolicy;
+use merman::svg::{RenderResourcePolicy, SvgPipeline};
 use merman::{OperationControl, RenderRequest, Renderer, SvgEnvironment, SvgRequest};
 
 /// Mermaid 源码的字节上限（256 KiB）。
@@ -149,6 +149,28 @@ impl std::error::Error for MermaidError {}
 /// 上面这段不编成 doctest：本机 app crate 的 doctest 链接缺 `zed_font_kit` rlib
 /// （环境限制），同一路径已由模块内 `flowchart_renders_svg` 单测覆盖。
 pub fn render_svg(source: &str) -> Result<String, MermaidError> {
+    render_svg_with_pipeline(source, None)
+}
+
+/// 预览用渲染：在 [`render_svg`] 之上启用 merman 的 `ResvgSafe` SVG 管线。
+///
+/// Mermaid 12 默认把标签放在 `<foreignObject>` 里的 HTML（浏览器能画，`usvg`/`resvg`
+/// 会直接忽略），所以 **M2 的编辑器预览**不能直接拿 Parity SVG 去光栅化。`ResvgSafe`
+/// 会把 HTML 标签投影成等价的 SVG `<text>`，并清掉已知的 rasterization hazard；
+/// 其余行为与 [`render_svg`] 完全一致（同样的输入/输出上限、`catch_unwind`、SVG
+/// 形状校验与确定性环境）。
+///
+/// 这是 M2 新增的**独立入口**：没有改 [`render_svg`] 的语义（Parity SVG 仍供浏览器/
+/// 未来导出使用），也不做暗色主题（M3）。
+pub fn render_svg_for_preview(source: &str) -> Result<String, MermaidError> {
+    render_svg_with_pipeline(source, Some(SvgPipeline::resvg_safe()))
+}
+
+/// [`render_svg`] / [`render_svg_for_preview`] 的公共实现。
+fn render_svg_with_pipeline(
+    source: &str,
+    pipeline: Option<SvgPipeline>,
+) -> Result<String, MermaidError> {
     if source.trim().is_empty() {
         return Err(MermaidError::Empty);
     }
@@ -166,6 +188,7 @@ pub fn render_svg(source: &str) -> Result<String, MermaidError> {
         OperationControl::new(),
         SvgRequest {
             environment,
+            pipeline,
             ..SvgRequest::default()
         },
     );
@@ -289,6 +312,45 @@ mod tests {
         // 参与者名字应出现在文本节点里（宽松断言，避免绑定 merman 内部 id 方案）。
         assert!(svg.contains("Alice"), "时序图缺少参与者文本");
         assert!(svg.contains("Bob"), "时序图缺少参与者文本");
+    }
+
+    #[test]
+    fn preview_pipeline_projects_html_labels_to_svg_text() {
+        let source = "flowchart TD\nA[开始] --> B[结束]\n";
+        let parity = render_svg(source).expect("Parity SVG");
+        let preview = render_svg_for_preview(source).expect("ResvgSafe SVG");
+        // Parity 保持 Mermaid 默认的 HTML 标签（浏览器能画，usvg 会忽略）。
+        assert!(
+            parity.contains("<foreignObject"),
+            "Mermaid 默认标签是 foreignObject（前置条件）"
+        );
+        // 预览管线把它们投影成 SVG <text>，否则光栅化后没有文字。
+        assert!(
+            !preview.contains("<foreignObject"),
+            "ResvgSafe 必须去掉 foreignObject"
+        );
+        assert!(preview.contains("<text"), "标签必须变成 SVG <text>");
+        // 形状校验/确定性仍成立。
+        assert!(preview.starts_with("<svg"));
+        assert!(preview.contains("</svg>"));
+        assert_eq!(
+            preview,
+            render_svg_for_preview(source).expect("第二次渲染"),
+            "同一输入必须字节级一致"
+        );
+    }
+
+    #[test]
+    fn preview_pipeline_reports_the_same_failures() {
+        assert_eq!(render_svg_for_preview(""), Err(MermaidError::Empty));
+        assert!(matches!(
+            render_svg_for_preview("这不是 Mermaid"),
+            Err(MermaidError::Render(_))
+        ));
+        assert!(matches!(
+            render_svg_for_preview("flowchart TD\nA[未闭合"),
+            Err(MermaidError::Render(_))
+        ));
     }
 
     #[test]

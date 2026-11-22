@@ -281,6 +281,8 @@ pub fn search_group_selected() -> Rgba {
 pub const OBJECT_PADDING: f32 = 6.0;
 /// 图片尚未就绪（加载中 / 缺失 / 失败）时的占位框高度（像素）。
 pub const OBJECT_PLACEHOLDER_HEIGHT: f32 = 34.0;
+/// Mermaid 渲染中/失败时的占位框高度（像素；图形通常比图片高）。
+pub const MERMAID_PLACEHOLDER_HEIGHT: f32 = 120.0;
 /// 占位框里 alt/状态文案的字号（像素）。
 pub const OBJECT_LABEL_FONT_SIZE: f32 = 12.0;
 /// 占位文案与框左边界的内边距（像素）。
@@ -527,6 +529,40 @@ pub const TABLE_DRAG_GHOST_LABEL_HEIGHT: f32 = 24.0;
 pub const EDITOR_CONTEXT_MENU_WIDTH: f32 = 148.0;
 /// 右键菜单面板高度（像素）：4px 内边距 ×2 + 分组标签 18 + gap 2 + 菜单项 24 + 边框 2。
 pub const EDITOR_CONTEXT_MENU_HEIGHT: f32 = 54.0;
+/// 链接右键菜单面板高度（像素）：4px 内边距 ×2 + 3 个菜单项 × 24 + 2 个 gap × 2 + 边框 2。
+pub const EDITOR_CONTEXT_MENU_LINK_HEIGHT: f32 = 86.0;
+
+// ---------------------------------------------------------------------------
+// 外部链接确认框（file/UNC 与未知自定义 scheme）
+// ---------------------------------------------------------------------------
+
+/// 确认框面板宽度（像素）。
+pub const LINK_CONFIRM_WIDTH: f32 = 340.0;
+/// 确认框遮罩色（半透明黑，压住正文但不完全遮挡上下文）。
+#[must_use]
+pub fn link_confirm_overlay() -> Rgba {
+    rgba(0x00000033)
+}
+/// 确认框「打开」主按钮底色。
+#[must_use]
+pub fn link_confirm_primary_bg() -> Rgba {
+    rgb(0x0969da)
+}
+/// 确认框「打开」主按钮文字色。
+#[must_use]
+pub fn link_confirm_primary_text() -> Rgba {
+    rgb(0xffffff)
+}
+/// 链接提示（非阻塞 toast）底色。
+#[must_use]
+pub fn link_notice_bg() -> Rgba {
+    rgba(0x1f2328e6)
+}
+/// 链接提示（非阻塞 toast）文字色。
+#[must_use]
+pub fn link_notice_text() -> Rgba {
+    rgb(0xffffff)
+}
 
 /// 表格外框 / 单元格分隔线颜色。
 #[must_use]

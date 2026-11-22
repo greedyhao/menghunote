@@ -62,15 +62,35 @@ pub enum ObjectPaintState {
     Ready,
 }
 
-/// 一个表格单元格的绘制数据（首版纯文本，不做行内富文本）。
+/// 一个表格单元格的绘制数据（ADR 0019 S3b7：行内 Markdown）。
 #[derive(Debug, Clone)]
 pub struct TableCellPaint {
     /// 单元格矩形（窗口坐标，不含边框）。
     pub rect: Bounds<Pixels>,
-    /// 已 shaping 的文本（已按列宽截断；空 cell 为 `None`）。
+    /// 已 shaping 的文本（行内 Markdown 的 display 文本，已按列宽截断；空 cell 为
+    /// `None`）。
     pub text: Option<ShapedLine>,
     /// 对齐方式（GFM 分隔行；表头与数据行共用）。
     pub align: MarkdownTableAlignment,
+    /// 单元格内的行内链接（已按列宽截断；空 = 没有可见链接）。
+    ///
+    /// 矩形来自**同一份** shaping（`ShapedLine::x_for_index`），因此点击与绘制逐像素
+    /// 一致；截断点之后的链接不在列表里（没画出来就不可点）。
+    pub links: Vec<TableCellLinkPaint>,
+}
+
+/// 一个表格单元格里的行内链接（ADR 0019 S3b7）。
+///
+/// 与正文链接的 `link_hitboxes` 同一套语义：**可见文本**区间可点，末尾边界不算命中，
+/// 单击交给宿主按 scheme 白名单（http/https/mailto）打开。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCellLinkPaint {
+    /// 链接可见文本的窗口矩形（已含单元格内边距与对齐偏移）。
+    pub rect: Bounds<Pixels>,
+    /// 链接可见文本在该单元格 **display** 文本里的字节区间（已按列宽截断裁剪）。
+    pub display: Range<usize>,
+    /// 目标 URL（原样字符串；scheme 校验在宿主）。
+    pub dest: String,
 }
 
 /// 一行表格的绘制数据。
@@ -166,9 +186,9 @@ pub struct ImagePaint {
     pub state: ObjectPaintState,
 }
 
-/// 一个 Object 的绘制载荷：图片像素 / GFM 表格。
+/// 一个 Object 的绘制载荷：图片像素 / GFM 表格 / Mermaid 光栅图。
 ///
-/// 两个分支都装箱：`ShapedLine`/`TablePaint` 让 enum 本体很大，而 `ObjectPaint`
+/// 三个分支都装箱：`ShapedLine`/`TablePaint` 让 enum 本体很大，而 `ObjectPaint`
 /// 每帧按可见对象存进 `Vec`，不装箱会在滚动时反复拷贝大块内存。
 #[derive(Debug, Clone)]
 pub enum ObjectPaintContent {
@@ -177,6 +197,11 @@ pub enum ObjectPaintContent {
     /// GFM 表格（表格内不做富文本）。单元格原地编辑时**仍然**走这个分支：
     /// 编辑输入框是浮在这个矩形上的独立元素，表格其它行列照常绘制（ADR 0019 §12.6）。
     Table(Box<TablePaint>),
+    /// Mermaid（后台渲染/光栅化后的像素，或「渲染中…/渲染失败」占位）。
+    ///
+    /// 与图片共用 [`ImagePaint`]：两者都是“一张位图 + 可选占位文案”，绘制路径相同，
+    /// 差异只在数据来源（资产解码 / Mermaid 渲染）与状态文案。
+    Mermaid(Box<ImagePaint>),
 }
 
 /// 一个**可见**的 Object 行（ADR 0019 S2a 图片 / S3a 表格）：绘制、命中、工具条共用它。
@@ -208,6 +233,9 @@ impl TableCellPaint {
     /// 平移矩形（元素局部坐标 → 窗口坐标）。
     fn translate(&mut self, origin: Point<Pixels>) {
         self.rect = Bounds::new(self.rect.origin + origin, self.rect.size);
+        for link in &mut self.links {
+            link.rect = Bounds::new(link.rect.origin + origin, link.rect.size);
+        }
     }
 }
 
@@ -472,11 +500,11 @@ impl ObjectPaint {
         }
     }
 
-    /// 是否可直接绘制（图片已解码 / 表格恒可绘制）。
+    /// 是否可直接绘制（图片/Mermaid 已解码 / 表格恒可绘制）。
     #[must_use]
     pub fn is_ready(&self) -> bool {
         match &self.content {
-            ObjectPaintContent::Image(image) => {
+            ObjectPaintContent::Image(image) | ObjectPaintContent::Mermaid(image) => {
                 matches!(image.state, ObjectPaintState::Ready) && image.image.is_some()
             }
             ObjectPaintContent::Table(_) => true,
@@ -487,7 +515,7 @@ impl ObjectPaint {
     #[must_use]
     pub fn table(&self) -> Option<&TablePaint> {
         match &self.content {
-            ObjectPaintContent::Image(_) => None,
+            ObjectPaintContent::Image(_) | ObjectPaintContent::Mermaid(_) => None,
             ObjectPaintContent::Table(table) => Some(table),
         }
     }
@@ -712,6 +740,25 @@ impl EditorGeometry {
         self.task_boxes
             .iter()
             .find(|task| task.rect.contains(&position))
+    }
+
+    /// 窗口坐标命中的**表格单元格内行内链接**（ADR 0019 S3b7）。
+    ///
+    /// 只认本帧画出来的链接：矩形来自单元格 shaping（`TableCellLinkPaint.rect`），
+    /// 截断点之后的链接没有矩形，也就点不到。命中优先级由调用方决定（链接先于
+    /// 单元格：点链接要打开，不是进入编辑）。
+    #[must_use]
+    pub fn table_cell_link_at(&self, position: Point<Pixels>) -> Option<&TableCellLinkPaint> {
+        let row = self.row_at_y(position.y);
+        let object = self.object_row(row)?;
+        let table = object.table()?;
+        table
+            .header
+            .iter()
+            .chain(table.rows.iter())
+            .flat_map(|paint_row| paint_row.cells.iter())
+            .flat_map(|cell| cell.links.iter())
+            .find(|link| link.rect.contains(&position))
     }
 
     /// 第 `row` 行的样式分段 `(字节数, 种类)`（总长等于该行字节数）。

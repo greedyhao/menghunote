@@ -281,7 +281,7 @@ impl EditorElement {
         for object in geometry.objects() {
             let rect = object.rect;
             match &object.content {
-                ObjectPaintContent::Image(paint) => {
+                ObjectPaintContent::Image(paint) | ObjectPaintContent::Mermaid(paint) => {
                     if let Some(image) = &paint.image {
                         // `bounds` 是视口裁剪框：图片可能被滚出视口，交给 gpui 裁剪。
                         if let Err(error) = window.paint_image(
@@ -509,6 +509,18 @@ impl EditorElement {
                 {
                     return;
                 }
+                // 外部链接确认框是模态的：点击只由遮罩/按钮处理，绝不落到正文
+                // （正常情况下遮罩已经 `stop_propagation`，这里是兜底）。
+                if down_view
+                    .update(cx, |view, _| view.link_confirm_open())
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                // 非阻塞链接提示：任何正文点击都清掉（它只用于一次性反馈）。
+                down_view
+                    .update(cx, |view, _| view.clear_link_notice())
+                    .ok();
                 // 悬浮工具条上的点击由工具条自己的按钮处理：这里必须放行，否则会同时挪光标。
                 let toolbar_hit = down_view
                     .update(cx, |view, _| view.point_in_toolbar(event.position))
@@ -573,6 +585,18 @@ impl EditorElement {
                         .ok();
                     return;
                 }
+                // 表格单元格里的行内链接（ADR 0019 S3b7）：**链接优先于单元格**。
+                // 单击只打开链接（与正文普通链接同一套语义：不移动 caret、不进入编辑），
+                // 否则 cell 永远先被选中，链接就再也点不开了。
+                if let Some(dest) = down_geometry
+                    .table_cell_link_at(event.position)
+                    .map(|link| link.dest.clone())
+                {
+                    down_view
+                        .update(cx, |view, cx| view.request_external_link(dest, cx))
+                        .ok();
+                    return;
+                }
                 // 表格单元格（ADR 0019 S3b2）：单击只选中该格（不移动正文 caret）；
                 // 再次单击同一格 / 双击才进入就地编辑。点到表格的非单元格区域（内边距/
                 // 边框）仍然走 S3a 的整块选中。
@@ -605,6 +629,18 @@ impl EditorElement {
                 let (byte, bias) = down_geometry
                     .byte_at_with_bias(event.position)
                     .unwrap_or((down_geometry.byte_at(event.position), Bias::Right));
+                // 普通链接（外部 / 内部）：**单击即打开**（Ctrl/Cmd+单击同样打开）。
+                // 末尾边界（`display == end`）不算命中，因此点链接末尾仍会正常落 caret。
+                let external = down_view
+                    .update(cx, |view, _| view.external_link_hit_at_display(byte))
+                    .ok()
+                    .flatten();
+                if let Some(hit) = external {
+                    down_view
+                        .update(cx, |view, cx| view.request_external_link(hit.dest, cx))
+                        .ok();
+                    return;
+                }
                 // wiki 链接：单击打开（不先移动 caret；未解析由宿主提示）。
                 let wiki = down_view
                     .update(cx, |view, _| view.wiki_link_at_display(byte))
@@ -616,16 +652,6 @@ impl EditorElement {
                         .ok();
                     return;
                 }
-                let external = down_view
-                    .update(cx, |view, _| view.external_link_at_display(byte))
-                    .ok()
-                    .flatten();
-                if let Some(url) = external {
-                    down_view
-                        .update(cx, |view, cx| view.request_external_link(url, cx))
-                        .ok();
-                    return;
-                }
                 down_view
                     .update(cx, |view, cx| {
                         view.begin_pointer_selection(byte, bias, window, cx)
@@ -634,9 +660,11 @@ impl EditorElement {
             },
         );
 
-        // 右键：正文「插入 → 表格」菜单（ADR 0019 S3b4）。右键本身**不移动 caret**；
-        // 菜单里的插入动作使用打开菜单时的 caret/选区。
+        // 右键：普通链接上是「打开链接 / 复制链接 / 复制 Markdown」，其它位置是
+        // 「插入 → 表格」（ADR 0019 S3b4）。右键本身**不移动 caret**；菜单里的动作
+        // 使用打开菜单时的 caret/选区。
         let right_view = self.view.downgrade();
+        let right_geometry = Rc::clone(&geometry);
         window.on_mouse_event(
             move |event: &MouseDownEvent,
                   phase: DispatchPhase,
@@ -648,6 +676,13 @@ impl EditorElement {
                 {
                     return;
                 }
+                // 确认框是模态的：右键也不得在它下面开菜单。
+                if right_view
+                    .update(cx, |view, _| view.link_confirm_open())
+                    .unwrap_or(false)
+                {
+                    return;
+                }
                 let toolbar_hit = right_view
                     .update(cx, |view, _| view.point_in_toolbar(event.position))
                     .unwrap_or(false);
@@ -655,8 +690,16 @@ impl EditorElement {
                     // 右键落在浮层/菜单本身上：不重开菜单，也不打扰当前菜单。
                     return;
                 }
+                // 右键落点 → display 字节 → 命中普通链接（没有就退回「插入表格」）。
+                let display = right_geometry.byte_at(event.position);
+                let link = right_view
+                    .update(cx, |view, _| view.external_link_hit_at_display(display))
+                    .ok()
+                    .flatten();
                 right_view
-                    .update(cx, |view, cx| view.open_context_menu_at(event.position, cx))
+                    .update(cx, |view, cx| {
+                        view.open_context_menu_at(event.position, link, cx)
+                    })
                     .ok();
             },
         );
@@ -701,6 +744,15 @@ impl EditorElement {
                   _phase: DispatchPhase,
                   window: &mut Window,
                   cx: &mut App| {
+                // 链接菜单/确认框动作后**吞掉同一次手势的 mouse-up**：动作在
+                // mouse-down 上执行，菜单随即关闭；抬起若继续走下面的 `end_drag`
+                // 会清掉拖拽锚点（并可能让宿主把这次点击当成正文点击）。
+                if up_view
+                    .update(cx, |view, _| view.take_swallow_mouse_up())
+                    .unwrap_or(false)
+                {
+                    return;
+                }
                 // 表格行列拖拽（ADR 0019 S3b5）：释放位置决定插入槽位 → 一次
                 // `EditRequest`（原地/表格外则取消，零请求）。必须在 `end_drag`
                 // 之前处理：它读的是拖拽状态，不是文本拖选锚点。
@@ -956,6 +1008,28 @@ impl Element for EditorElement {
             }
             self.link_hitboxes
                 .push(window.insert_hitbox(rect, gpui::HitboxBehavior::Normal));
+        }
+        // 表格单元格里的行内链接（ADR 0019 S3b7）：矩形来自单元格 shaping（截断后的
+        // 可见前缀），与绘制逐像素一致；悬停同样是手形。命中优先级在鼠标按下时处理
+        // （链接先于单元格：点链接要打开，不是进入编辑）。
+        for object in geometry.objects() {
+            let Some(table) = object.table() else {
+                continue;
+            };
+            for cell in table
+                .header
+                .iter()
+                .chain(table.rows.iter())
+                .flat_map(|paint_row| paint_row.cells.iter())
+            {
+                for link in &cell.links {
+                    if !bounds.intersects(&link.rect) {
+                        continue;
+                    }
+                    self.link_hitboxes
+                        .push(window.insert_hitbox(link.rect, gpui::HitboxBehavior::Normal));
+                }
+            }
         }
         self.object_hitboxes.clear();
         for object in geometry.objects() {

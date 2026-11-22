@@ -66,7 +66,7 @@ use crate::model::block::BlockRun;
 use crate::model::error::EditorError;
 use crate::model::input::InputDocument;
 use crate::model::markdown::{
-    MarkdownDocument, MarkdownImage, MarkdownTable, ProjectionCellReveal,
+    MarkdownDocument, MarkdownImage, MarkdownMermaid, MarkdownTable, ProjectionCellReveal,
 };
 use crate::model::object::ObjectBlock;
 use crate::model::projection::ProjectionMap;
@@ -409,6 +409,18 @@ impl EditorController {
         self.markdown.object_table(object)
     }
 
+    /// Object 对应的 Mermaid 载荷（不是 Mermaid 对象时 `None`）。
+    #[must_use]
+    pub fn mermaid_of(&self, object: &ObjectBlock) -> Option<&MarkdownMermaid> {
+        self.markdown.object_mermaid(object)
+    }
+
+    /// 全部整块 fenced mermaid（可投影成 Object 的块；后台渲染按 content 取源码）。
+    #[must_use]
+    pub fn mermaid_blocks(&self) -> &[MarkdownMermaid] {
+        self.markdown.mermaid_blocks()
+    }
+
     /// 指定源码行上的整行独占图片（Object Block 候选；图片专用便捷入口）。
     #[must_use]
     pub fn block_image_at_line(&self, line: usize) -> Option<&MarkdownImage> {
@@ -466,7 +478,14 @@ impl EditorController {
         };
         if let Some(object) = self.markdown.object_at_line(line).cloned() {
             let text = self.mirror.to_string();
-            if let Ok(caret) = SourceByte::new(object.span().end().get()).to_scalar(&text) {
+            let mut caret_byte = object.span().end().get();
+            // Mermaid：caret 落在 block 源码内会触发“显示源码、不投影 Object”，
+            // 因此退出源码模式时把 caret 放到块末尾换行之后（块外），对象重新出现。
+            // 图片/表格保持原行为（caret 落在对象末尾）。
+            if object.kind().is_mermaid() && text.as_bytes().get(caret_byte) == Some(&b'\n') {
+                caret_byte += 1;
+            }
+            if let Ok(caret) = SourceByte::new(caret_byte).to_scalar(&text) {
                 self.selection = Selection::caret(caret);
             }
         }
