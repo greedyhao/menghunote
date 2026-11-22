@@ -282,6 +282,18 @@ impl EditorElement {
             let rect = object.rect;
             match &object.content {
                 ObjectPaintContent::Image(paint) | ObjectPaintContent::Mermaid(paint) => {
+                    // 图片与 Mermaid 共用几何，但占位框 token 分开（深色主题下
+                    // Mermaid 占位需要独立可读的背景/文案色，ADR 0021 §3.2）。
+                    let (placeholder_bg, placeholder_border) = match &object.content {
+                        ObjectPaintContent::Image(_) => (
+                            theme::object_placeholder_bg(),
+                            theme::object_placeholder_border(),
+                        ),
+                        _ => (
+                            theme::mermaid_placeholder_bg(),
+                            theme::object_placeholder_border(),
+                        ),
+                    };
                     if let Some(image) = &paint.image {
                         // `bounds` 是视口裁剪框：图片可能被滚出视口，交给 gpui 裁剪。
                         if let Err(error) = window.paint_image(
@@ -298,9 +310,9 @@ impl EditorElement {
                         window.paint_quad(quad(
                             rect,
                             Corners::default(),
-                            theme::object_placeholder_bg(),
+                            placeholder_bg,
                             Edges::all(px(1.0)),
-                            theme::object_placeholder_border(),
+                            placeholder_border,
                             BorderStyle::default(),
                         ));
                         if let Some(label) = &paint.label {

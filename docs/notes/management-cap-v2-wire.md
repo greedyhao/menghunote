@@ -486,7 +486,8 @@ S4c 新增 `tests/management_cap_v2_rotation.rs`（4）与 `tests/management_cap
 ## 9. `ApprovalEnvelopeV1`（ADR 0016 S4d1b 客户端审批包）
 
 > 实现：`crates/sync/src/approval_v1.rs`。这是**客户端之间**（手工通道 A / 收件箱 B）的
-> 共享不可变操作 + 签名包；relay **不**解析它（提交时仍解出 `SignedControlV2` 走 §2.2）。
+> 共享不可变操作 + 签名包。relay 在通道 B（§11）会**严格解析**它做收件箱校验；提交时
+> 仍解出 `SignedControlV2` 走 §2.2。
 
 ### 9.1 布局（canonical CDE，整数键 0..6，字段严格齐全）
 
@@ -547,3 +548,171 @@ ApprovalEnvelopeV1 = {
   `head_hash` 比对、刷新回放后在同一 rev 对账——relay 摘要不作为授权依据。
 - 已在链上（`record_hash_at(expected+1)` 命中本地复算值）时**重发原字节**：relay `dedup_v2`
   返回原回执（丢响应/重复提交幂等；不会重复写链）。
+
+## 10. 客户端管理 UI（ADR 0016 S4d1c，2026-11-18）
+
+> 实现：`crates/app/src/dev_sync/management.rs`。入口在 AppRoot/AppShell 的设置页
+> （「管理（V2 控制面 / 通道 A 双签）」区，默认收起；不新建窗口）。本切片**不改 wire**，
+> 只消费 §8/§9 的客户端 API。
+
+### 10.1 数据来源
+
+| UI 区块 | 来源 | 是否授权证据 |
+|---|---|---|
+| V2 是否启用 / control head/rev / authz/authority rev | `V2ManagementClient::state()`（已验证回放 + durable pin） | 是 |
+| cap 摘要（主体/scope/生效窗/撤销/此刻有效） | `ControlStateV2::caps()` + `cap_is_effective_at` | 是 |
+| 设备 ACTIVE/REVOKED | `ControlStateV2::devices()` | 是 |
+| 设备 PENDING | relay `/control` 响应 `members[].status`，经 `V2ManagementClient::relay_member_hints()` 暴露 | **否**（只读展示；不参与动作，不写 pin/缓存） |
+| 审批草稿/回执/失败 | vault 公开 meta `sync.approval_draft_v1`（`ApprovalDraftV1`） | 公开证据 |
+| 操作详情/指纹 | `ApprovalEnvelopeV1`（`operation_summary` / `comparison_fingerprint` / `digest`） | 公开证据 |
+
+`relay_member_hints` 的解析是**尽力而为**：字段缺失/类型不符的条目直接跳过，不影响控制链
+验证；客户端仍对 ACTIVE/REVOKED 以已验证控制链为准（`ControlStateV2`）。
+
+### 10.2 动作与本地前置
+
+| 动作 | 客户端 API | 本地前置（不满足只给原因，不发命令） |
+|---|---|---|
+| 刷新 | `refresh_control` + `load_draft` | 无 |
+| 导入文件/文本 | `import_approval_file` / `import_approval_base64`（内部 `refresh_control` + `verify_import`） | 文件 >1 MiB / 非 canonical / 跨租户 / 链证据不符一律拒绝 |
+| 导出文件/文本 | `ApprovalDraftV1::write_file` / `to_base64` + `mark_handed_off` | 有本地草稿 |
+| A 签署 / B 加签 | `verify_against`（签前重验）→ `sign_with` | 唯一匹配未签槽；首签必须是发起者；未过期/未失效 |
+| 满签提交 | `ApprovalDraftV1::submit`（满签/时间窗/链位置/自证提交/回执对账） | 满签；`not_after` 未过；证据未失效 |
+| 取消协调 | `ApprovalDraftV1::clear_draft` | 有本地草稿（只清协调状态，已外发签名不可撤回） |
+
+禁止项（实现上不存在入口）：自动签、自动改 rev/head、延长 `not_after`、后台自动提交、
+失败后清库/换 pin/回退 creator、等待第二签期间持有 vault 编辑/同步闸。
+
+### 10.3 展示与脱敏
+
+- `h` 的 128 位比较指纹 = `SHA256(CDE(OperationV2))` 前 16 字节（32 hex，4×8 分组）；
+  完整 256 位 = 全部 32 字节（64 hex，8×8 分组），默认收起、`mgmt-toggle-fingerprint` 展开。
+- 错误/提示统一经 `sanitize_management_text`：遮 `mnrec1…` 恢复码、`http(s)://` /
+  `mn-pair://` URL、绝对路径（`/…/…`、`X:\…`）与 ≥64 字符长 token/base64，并截断；
+  **本模块不打印日志**，UI 只显示脱敏摘要。
+- 导入/导出的 base64 文本是**公开证据**，但仍不渲染进布局（只写剪贴板/文件），避免
+  截图泄露完整包。
+
+## 11. relay 审批收件箱（ADR 0016 S4d2，2026-11-18）
+
+> 实现：`crates/relay/src/approvals.rs`（schema 14：`approval_jobs`/`approval_signatures`）。
+> 这是 relay 侧的**通道 B**：A 上传已冻结的半签包，B 在自己的待办里读取并加签；relay 只
+> 运输/存储/验证，**不代签、不改控制链**。所有端点只在 `/v2` 挂载，要求 realm3 bearer。
+
+### 11.1 端点
+
+| 方法 | 路径 | body | 响应 |
+| --- | --- | --- | --- |
+| POST | `/v2/vaults/{V}/approvals` | `{0: bytes(ApprovalEnvelopeV1)}` | `{0: job, 1: created(bool)}`，201/200 |
+| GET | `/v2/vaults/{V}/approvals?role=&status=&after_seq=&limit=` | — | `{0: [job…], 1: next_seq?, 2: server_time, 3: page_limit}` |
+| GET | `/v2/vaults/{V}/approvals/{R}` | — | `{0: job, 1?: op_bytes, 2?: [{0:index,1:sig64}…], 3?: [cap bytes…]}` |
+| POST | `/v2/vaults/{V}/approvals/{R}/signatures` | `{0: bytes(sig64)}` | `{0: job}` |
+| POST | `/v2/vaults/{V}/approvals/{R}/cancel` | 空 body | `{0: job}` |
+
+`{V}` 与其它 v2 路径一样接受 hex/uuid/base64url；`{R}` 是 `request_id`（16B）。
+查询串只允许 `role`（`recipient` 默认 / `initiator`）、`status`、`after_seq`、`limit`
+（1..=50，默认 20，超出收敛到 50）；未知键 → 400。响应体 `application/cbor`（CDE）。
+
+### 11.2 `job` 摘要（store 视图）
+
+整数键 CDE map（升序）：
+
+| 键 | 字段 | 说明 |
+| --- | --- | --- |
+| 0 | request_id (16B) | 操作 `request_id`（幂等键） |
+| 1 | kind (u) | `ControlKindV2`（收件箱只接 2/3/4/5/6–10/14/16） |
+| 2 | status (text) | `PENDING/READY/EXECUTED/CANCELLED/EXPIRED/STALE` |
+| 3 | op_digest (32B) | `SHA256(CDE(OperationV2))`（= 信封 `h`） |
+| 4 | initiator_device (16B) | A（必须是 `initiator_index` 槽） |
+| 5 | initiator_cap (16B) | A 的冻结 cap（读取/加签必须用同一 cap） |
+| 6 | recipient_device (16B) | B（另一个 Device 槽） |
+| 7 | initiator_index (u) | 信封里的发起者槽下标 |
+| 8 | signed_at (u) | op 的签名时刻 |
+| 9 | not_after (u) | op 的截止时刻 |
+| 10 | created_at (u) | relay 创建时刻 |
+| 11 | expires_at (u) | `min(op.not_after, 参与 cap 的 expires_at)` |
+| 12 | seq (u) | vault 内单调序号（分页游标） |
+| 13 | expected_control_rev (u) | op 绑定的提交前 rev |
+| 14 | expected_head_hash (32B) | op 绑定的提交前链尾 |
+| 15 | expected_authz_rev (u) | op 绑定的授权 rev |
+| 16 | authority_rev (u) | op 绑定的恢复根代 |
+| 17 | signed_indices (array<u>) | 已收到的槽位（缺签不是零占位） |
+| 18? | terminal_at (u) | 终态时刻（墓碑 24h 的起点） |
+| 19? | receipt_ref (u) | 已执行时的控制回执 `control_rev`（`dedup_v2` 对账命中） |
+
+`GET {R}` 的键 1/2/3 只在**活状态**（`PENDING/READY`）出现：`1` 是 canonical
+`CDE(OperationV2)` 字节，`2` 是已收签名（槽位升序），`3` 是 op 里每个 Device 槽引用的
+canonical `CDE(ManagementCapV2)`（B 据此重建 `ApprovalEnvelopeV1` 再逐槽验签）。
+终态（墓碑）只有键 0（摘要），正文/签名已清空。
+
+### 11.3 创建（A → relay）
+
+- 信封必须是 canonical `ApprovalEnvelopeV1`（§9.1，键 0..6）；relay 重编码逐字节比较、
+  重算 `h`、校验签名项升序/非零/槽位范围、cap 证据**恰好等于** role0 槽引用的 cap 集合、
+  control 证据与 op 的 rev/head 逐项一致。
+- `initiator_index` 槽必须是 `Device` 且 `(device_id, cap_id)` 等于 realm3 bearer 的主体/cap；
+  否则 404。非 Device 槽（PoP/恢复根/旧 creator）必须**已签**；A 必须已签；
+  至少一个 Device 槽未签（满签包 → 409 `INVALID_STATE`）。
+- relay 用与 `/control/submit` 同源的路径做整包干跑（时间窗、链 CAS、kind 门限、
+  payload、路径、I/V/rev/signers、每个 Device 槽 cap/scope/ACTIVE/公钥、不同设备不同公钥），
+  缺签槽位跳过验签；`EpochActivate` 的候选 promote 等副作用在 SAVEPOINT 里回滚。
+- 幂等：同 `(V, request_id, h)` 返回原 job（200，`created=false`），不重新做时间窗/
+  签名/CAS 校验，也不改写状态；同 `request_id` 异 `h` → 409 `ID_CONFLICT`。
+  注意 bearer 仍每请求重验 cap：A 的 cap 撤销/过期后 HTTP 层先拒绝（客户端需自己保留原包）。
+- cap 证据必须与 relay 已验证控制链里的 canonical cap 逐字节一致（缺失/伪造 → 403/400）；
+  授权判定只用 relay 自己的 cap 投影，不用证据值。
+- 派生 `recipient_device` = 另一个 Device 槽；`expires_at` 见上。
+
+### 11.4 列表/读取/加签/取消
+
+- 列表默认只返回**调用者自己的活待办**（`recipient_device = 自己`）；`role=initiator`
+  返回自己的 outgoing。排序 `seq ASC`；`next_seq` 仅在满页时给出，下一页用 `after_seq`。
+  `seq` 是分页序号（`MAX(seq)+1`），终态墓碑删除后可能回退：游标只在同一清理窗口内
+  稳定，**不是**审计序号；不要把超过 24h 的游标当可靠断点（通知可丢，轮询才是基线）。
+- 读取/加签/取消只对 A 与预选 B 可见；A 必须用 `initiator_cap`，B 必须用 op 里
+  **该 Device 槽冻结的 cap**；不符统一 404。墓碑下 B 只要求"当前有效且覆盖 kind
+  基础 scope 的 cap"（正文已清空）。
+- 加签：body 的 64B 签名必须对 `MN/v2/control\0 || h`（Device 域；与槽位无关）有效；
+  槽位由 realm3 主体/cap 唯一确定。同槽已有同字节签名 → 200 幂等；不同字节 → 409
+  `ID_CONFLICT`。成功后全槽已签 → `READY`，否则 `PENDING`。
+- 取消：`PENDING/READY` → `CANCELLED`（清正文/签名，摘要留 24h）；重复取消幂等；
+  到期/陈旧/已执行 → 409 `INVALID_STATE`。取消**不**撤回已外发签名、不改控制链：
+  任何持有满签包的人仍可 `/control/submit`。
+
+### 11.5 状态机与错误
+
+```text
+PENDING ──加签满槽──▶ READY ──dedup 命中逐字节相同回执──▶ EXECUTED
+   │                    │
+   ├─ expires_at 到 ────┴──▶ EXPIRED        （410，正文清空）
+   ├─ head/authz/authority rev 变化 ──▶ STALE （409 CAS_CONFLICT，正文清空）
+   └─ 显式 cancel ──▶ CANCELLED             （409 INVALID_STATE 再加签）
+```
+
+| 情况 | HTTP / code |
+| --- | --- |
+| 无/坏 bearer | 401 `UNAUTHORIZED` |
+| 非 realm3（设备/恢复 realm） | 403 `MANAGEMENT_REQUIRED` |
+| cap 撤销/到期/轮换使 bearer 失效 | 403 `REVOKED` |
+| 非 A/B、cap 不匹配、未知 job | 404 `NOT_FOUND` |
+| 信封非 canonical/版本/字段/证据/签名布局/单签 kind | 400 `INVALID_REQUEST` |
+| 已存在的签名槽收到不同字节 | 409 `ID_CONFLICT` |
+| 信封里任一已收签名验不过 | 400 `SIGNATURE_INVALID` |
+| kind 门限/scope/ACTIVE/authority/不同设备不同公钥不符 | 403 `FORBIDDEN` |
+| 链 CAS/陈旧（head/rev） | 409 `CAS_CONFLICT`（带当前 `control_rev`） |
+| 已到期 | 410 `EXPIRED` |
+| 满签包 / 终态再加签/取消 | 409 `INVALID_STATE` |
+| 待办/字节/包大小超限 | 507 `QUOTA_EXCEEDED` / 413 `REQUEST_TOO_LARGE` |
+| 入口限流 | 429 `RATE_LIMITED` |
+
+### 11.6 客户端接入要点
+
+- 创建前必须按 §8/§9 的规则构造并自检信封（本模块不复刻客户端构造逻辑）；A 先签，
+  非 Device 证明沿 A 收集。
+- B 的待办轮询：`GET .../approvals?status=PENDING`（或默认活状态）；加签前重新 `GET {R}`
+  并用返回的 op/签名/证据重建信封、重放本地控制链，再逐槽验签（**不得**只信摘要）。
+- 满签后由任意持有者用 §2.2 的唯一路径 submit；随后 `GET {R}` 观察 `EXECUTED`
+  （`receipt_ref` = 控制 rev，仍以本地 `SHA256(prev||signed_bytes)` 对账为准）。
+- 失败分类：404 表示"不是你的/不存在"（不要当重试依据）；409 CAS 表示必须新建操作
+  全部重签（禁止自动改 rev/延 deadline）；410 表示过期；`ID_CONFLICT` 表示槽位冲突，
+  不要静默覆盖。

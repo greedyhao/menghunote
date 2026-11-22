@@ -38,7 +38,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{random_id16, Id16};
 use crate::registry::{self, LifecycleState, RegistryRow};
 
-/// 删除作业按 FK **子 → 父**顺序清理的表（25 张租户表 + `vaults`）与每行的**字节口径**。
+/// 删除作业按 FK **子 → 父**顺序清理的表（27 张租户表 + `vaults`）与每行的**字节口径**。
 ///
 /// 顺序约束（schema 13 的复合 FK，**不关闭** `PRAGMA foreign_keys`）：
 /// - `checkpoint_refs → checkpoints`、`object_parts/key_slots → objects`、
@@ -76,6 +76,10 @@ pub const PURGE_TABLES: &[(&str, &str)] = &[
     ("challenges", "LENGTH(nonce)"),
     ("tokens", "0"),
     ("invites", "0"),
+    // ADR 0016 收件箱：`approval_signatures` FK 连 `approval_jobs`，
+    // `approval_jobs` FK 连 `devices`/`management_caps`，所以必须先于它们删除。
+    ("approval_signatures", "LENGTH(sig64)"),
+    ("approval_jobs", "COALESCE(LENGTH(op_bytes),0)"),
     ("management_caps", "LENGTH(canonical_bytes)"),
     (
         "device_credentials",
@@ -118,6 +122,8 @@ pub const PURGE_ORDER: &[&str] = &[
     "challenges",
     "tokens",
     "invites",
+    "approval_signatures",
+    "approval_jobs",
     "management_caps",
     "device_credentials",
     "device_grants",
@@ -1219,7 +1225,7 @@ mod tests {
         let purge: BTreeSet<&str> = PURGE_ORDER.iter().copied().collect();
         assert_eq!(purge.len(), PURGE_ORDER.len(), "PURGE_ORDER 不得有重复表");
         let mut expected: BTreeSet<&str> = schema::TENANT_TABLE_NAMES.iter().copied().collect();
-        assert_eq!(expected.len(), 25, "schema 13 应有 25 张租户表");
+        assert_eq!(expected.len(), 27, "schema 14 应有 27 张租户表");
         expected.insert("vaults");
         assert_eq!(
             purge, expected,

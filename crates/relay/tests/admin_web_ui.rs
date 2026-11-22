@@ -29,7 +29,7 @@ use relay::admin;
 use relay::admin_web::{self, AdminHostPolicy, AdminWeb, SESSION_COOKIE};
 use relay::config::PublicUrl;
 use relay::db::{Db, DbConfig};
-use relay::deletion::{DeleteEvent, Deletion, PurgeFailpoint, PurgeLimits};
+use relay::deletion::{DeleteEvent, Deletion, PurgeFailpoint, PurgeLimits, PURGE_ORDER};
 use relay::ids::{b64url_decode, hex_lower, parse_id16_text, Id16};
 use relay::registry::{self, LifecycleState};
 use relay::time::{Clock, FakeClock};
@@ -42,6 +42,8 @@ const ADMIN_AUTHORITY: &str = "127.0.0.1:18081";
 const ADMIN_ORIGIN: &str = "http://127.0.0.1:18081";
 const DATA_PUBLIC_URL: &str = "http://127.0.0.1:18080";
 const CONVERGE: Duration = Duration::from_secs(30);
+/// 删除进度分母 = `PURGE_ORDER.len()`（schema 14 起 27 张租户表 + `vaults` = 28）。
+const PURGE_STEPS: usize = PURGE_ORDER.len();
 
 fn block<T>(f: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(f)
@@ -421,7 +423,10 @@ async fn list_page_shows_active_reserved_deleting_and_deleted_rows() {
     let (status, _, body) = call(&app, get_req("/admin", Some(&client))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("DELETING"), "{body}");
-    assert!(body.contains("<code>0/26</code>"), "{body}");
+    assert!(
+        body.contains(&format!("<code>0/{PURGE_STEPS}</code>")),
+        "{body}"
+    );
     assert!(body.contains("RESERVED"), "其它 vault 不受影响：{body}");
     contains_before(&body, &active_hex, &reserved_hex);
 
@@ -435,7 +440,10 @@ async fn list_page_shows_active_reserved_deleting_and_deleted_rows() {
     let (status, _, body) = call(&app, get_req("/admin", Some(&client))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("DELETED"), "{body}");
-    assert!(body.contains("<code>26/26</code>"), "{body}");
+    assert!(
+        body.contains(&format!("<code>{PURGE_STEPS}/{PURGE_STEPS}</code>")),
+        "{body}"
+    );
 }
 
 // ---------------------------------------------------------------- 2) 详情
@@ -911,7 +919,10 @@ async fn delete_ui_requires_exact_confirm_and_202_is_not_completion() {
         page.contains("DELETING"),
         "202 后必须是持久 DELETING：{page}"
     );
-    assert!(page.contains("<code>0/26</code>"), "{page}");
+    assert!(
+        page.contains(&format!("<code>0/{PURGE_STEPS}</code>")),
+        "{page}"
+    );
     assert!(!page.contains("已删除"), "202 页不得声称已完成：{page}");
     let row = env
         .db
@@ -924,13 +935,19 @@ async fn delete_ui_requires_exact_confirm_and_202_is_not_completion() {
     // 详情页同样显示 DELETING 的进度/错误（生命周期小节）。
     let (_, _, detail_body) = call(&app, get_req(&detail_uri, Some(&client))).await;
     assert!(detail_body.contains("DELETING"), "{detail_body}");
-    assert!(detail_body.contains("<code>0/26</code>"), "{detail_body}");
+    assert!(
+        detail_body.contains(&format!("<code>0/{PURGE_STEPS}</code>")),
+        "{detail_body}"
+    );
 
     // GET 进度页：DELETING + 进度 + meta refresh（无 JS）+ 明确"不代表已完成"。
     let (status, _, page) = call(&app, get_req(&delete_uri, Some(&client))).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(page.contains("DELETING"), "{page}");
-    assert!(page.contains("<code>0/26</code>"), "{page}");
+    assert!(
+        page.contains(&format!("<code>0/{PURGE_STEPS}</code>")),
+        "{page}"
+    );
     assert!(
         page.contains("http-equiv=\"refresh\""),
         "进度页必须有无 JS 的自动刷新：{page}"
@@ -967,7 +984,10 @@ async fn delete_ui_requires_exact_confirm_and_202_is_not_completion() {
 
     let (_, _, list_body) = call(&app, get_req("/admin", Some(&client))).await;
     assert!(list_body.contains("DELETED"), "{list_body}");
-    assert!(list_body.contains("<code>26/26</code>"), "{list_body}");
+    assert!(
+        list_body.contains(&format!("<code>{PURGE_STEPS}/{PURGE_STEPS}</code>")),
+        "{list_body}"
+    );
     let (_, _, detail_body) = call(&app, get_req(&detail_uri, Some(&client))).await;
     assert!(detail_body.contains("DELETED"), "{detail_body}");
     assert!(
@@ -985,7 +1005,10 @@ async fn delete_ui_requires_exact_confirm_and_202_is_not_completion() {
     let (status, _, page) = call(&app, get_req(&delete_uri, Some(&client))).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(page.contains("DELETED"), "{page}");
-    assert!(page.contains("<code>26/26</code>"), "{page}");
+    assert!(
+        page.contains(&format!("<code>{PURGE_STEPS}/{PURGE_STEPS}</code>")),
+        "{page}"
+    );
     assert!(
         !page.contains("http-equiv=\"refresh\""),
         "终态不应自动刷新：{page}"

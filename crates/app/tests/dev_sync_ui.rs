@@ -102,9 +102,6 @@ async fn dev_sync_panel_and_buttons_are_mounted_when_enabled(cx: &mut TestAppCon
         "dev-sync-sync-state",
         "dev-sync-sync",
         "dev-sync-stop",
-        // 切片 6b：轮换入口常显（不可用时置灰 + 原因），必须在真实布局里占位。
-        "dev-sync-rotate",
-        "dev-sync-apply-epoch",
     ] {
         let bounds = cx
             .debug_bounds(selector)
@@ -114,6 +111,11 @@ async fn dev_sync_panel_and_buttons_are_mounted_when_enabled(cx: &mut TestAppCon
             "{selector} 必须有非零尺寸：{bounds:?}"
         );
     }
+    // 个人用户默认只看到设备列表/邀请/移除；轮换是实验性高级入口。
+    assert!(
+        cx.debug_bounds("dev-sync-rotation").is_none(),
+        "默认设备页不得出现轮换高级入口"
+    );
     // 面板不再重复 Create/Join 入口；发布入口只在"有管理钥 + 基线已知缺失"时渲染
     // （本夹具没有身份/relay，事实未知 → 不渲染）。
     for selector in ["dev-sync-create", "dev-sync-join", "dev-sync-publish"] {

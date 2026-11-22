@@ -89,8 +89,17 @@ fn push_span(spans: &mut Vec<(usize, StyleKind)>, len: usize, kind: StyleKind) {
 /// `(字节数, 种类)` 列表 → GPUI 的 [`TextRun`] 列表（字体/颜色在这一步决定）。
 #[must_use]
 pub fn text_runs(spans: &[(usize, StyleKind)]) -> Vec<TextRun> {
+    text_runs_with_color(spans, theme::text_color())
+}
+
+/// 同 [`text_runs`]，但显式指定 `Plain` 段的基础色。
+///
+/// 占位文案（图片/Mermaid）压在浅灰/深灰占位框上，必须用 `object_label_color` /
+/// `mermaid_placeholder_text` 而不是正文色，否则深色主题下会看不见。
+#[must_use]
+pub fn text_runs_with_color(spans: &[(usize, StyleKind)], plain_color: gpui::Rgba) -> Vec<TextRun> {
     let base = theme::font();
-    let text_color = theme::text_color().into();
+    let text_color = plain_color.into();
     spans
         .iter()
         .map(|(len, kind)| {
@@ -171,11 +180,24 @@ pub fn shape_row_styled_at(
     font_size: f32,
     mono: bool,
 ) -> ShapedLine {
+    shape_row_styled_at_with_color(window, text, spans, font_size, mono, theme::text_color())
+}
+
+/// 同 [`shape_row_styled_at`]，但显式指定 `Plain` 段的基础色（占位文案用）。
+#[must_use]
+pub fn shape_row_styled_at_with_color(
+    window: &Window,
+    text: &str,
+    spans: &[(usize, StyleKind)],
+    font_size: f32,
+    mono: bool,
+    plain_color: gpui::Rgba,
+) -> ShapedLine {
     let shared = SharedString::from(text);
     let runs = if shared.is_empty() {
         Vec::new()
     } else {
-        let mut runs = text_runs(spans);
+        let mut runs = text_runs_with_color(spans, plain_color);
         if mono {
             let font = theme::code_block_font();
             for run in &mut runs {

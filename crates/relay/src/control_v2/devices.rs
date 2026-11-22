@@ -66,7 +66,7 @@ use rusqlite::OptionalExtension;
 
 use super::{
     bump_authz_and_auth, forbidden, i64_of, invalid, load_policy, proto_sha256, signature_invalid,
-    two_scope_signers, verify_signature,
+    two_scope_signers, SigPolicy,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::Id16;
@@ -175,6 +175,7 @@ fn verify_target_pop(
     signed: &proto::SignedControlV2,
     target: &Id16,
     expected_pk: &[u8; 32],
+    policy: SigPolicy<'_>,
 ) -> Result<()> {
     let mut seen = false;
     for (index, signer) in signed.operation.signers.iter().enumerate() {
@@ -191,7 +192,10 @@ fn verify_target_pop(
         }
         let input = proto::pop_signing_input(&signed.operation, &signer.pk, proto_sha256)
             .map_err(|_| invalid())?;
-        if verify_signature(&input, &signer.pk, &signed.signatures[index]).is_err() {
+        if policy
+            .verify(index, &input, &signer.pk, &signed.signatures[index])
+            .is_err()
+        {
             return Err(signature_invalid());
         }
     }
@@ -515,6 +519,7 @@ pub(super) fn validate_approve(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<DevicePlan> {
     let operation = &signed.operation;
     let payload =
@@ -538,12 +543,13 @@ pub(super) fn validate_approve(
                 &digest_input,
                 &[proto::CapScope::APPROVE],
                 &[proto::SignerRole::TargetPop],
+                policy,
             )?;
             // 绑定 PENDING 已提交的两把公钥（防 approve 换钥匙）。
             if row.sign_pk != cert.sign_ed25519_pub || row.hpke_pk != cert.hpke_x25519_pub {
                 return Err(forbidden());
             }
-            verify_target_pop(signed, &cert.device_id, &row.sign_pk)?;
+            verify_target_pop(signed, &cert.device_id, &row.sign_pk, policy)?;
             // 首份 V2 凭证：serial=1 且该设备没有任何历史凭证（serial 不复用）。
             if cert.cert_serial != 1 || credential_count(conn, &cert.device_id)? != 0 {
                 return Err(forbidden());
@@ -578,6 +584,7 @@ pub(super) fn validate_approve(
                 &digest_input,
                 &[proto::CapScope::APPROVE],
                 &[],
+                policy,
             )?;
             if row.certificate != cert_bytes {
                 return Err(Error::api(ErrorCode::InvalidState));
@@ -602,6 +609,7 @@ pub(super) fn validate_revoke(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<DevicePlan> {
     let operation = &signed.operation;
     let payload =
@@ -615,6 +623,7 @@ pub(super) fn validate_revoke(
         &digest_input,
         &[proto::CapScope::REVOKE],
         &[],
+        policy,
     )?;
     let mut targets = Vec::with_capacity(payload.device_ids.len());
     let mut changed = false;
@@ -645,6 +654,7 @@ pub(super) fn validate_rights_change(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<DevicePlan> {
     let operation = &signed.operation;
     let payload =
@@ -668,6 +678,7 @@ pub(super) fn validate_rights_change(
         &digest_input,
         &[proto::CapScope::APPROVE],
         &[],
+        policy,
     )?;
     // 改权不改钥：证书里的两把公钥必须仍是登记值（换钥是轮换/激活，S4c）。
     if row.sign_pk != cert.sign_ed25519_pub || row.hpke_pk != cert.hpke_x25519_pub {

@@ -289,12 +289,25 @@ pub struct AppShell {
     activation_observed: bool,
     /// 激活变化的订阅（持有到视图销毁；drop 即取消订阅）。
     activation_subscription: Option<gpui::Subscription>,
+    /// 系统外观（浅色/深色）变化的订阅（ADR 0021 P2；只订阅一次，drop 即取消）。
+    ///
+    /// 默认构建也订阅：`ThemeMode::System` 下 OS 切换要立即重绘。
+    appearance_subscription: Option<gpui::Subscription>,
     /// dev-only 同步面板（ADR 0009 Phase 1 / 切片 1）。
     ///
     /// **只有** `--features dev-sync` + 运行时门禁通过时才存在；默认构建里这个字段
     /// 连类型都不存在（模块被 cfg 掉），因此结构体布局/渲染分支零变化。
     #[cfg(feature = "dev-sync")]
     dev_sync: Option<Entity<crate::dev_sync::DevSyncPanel>>,
+    /// V2 管理面板（ADR 0016 S4d1c；设置页里的「管理」区）。
+    ///
+    /// 只有 `dev-sync` + 真实 dev-local 服务（有 `dev-identity.bin` 路径）时才创建；
+    /// 默认构建/注入 fake runner 的测试里是 `None`（不渲染管理区）。
+    #[cfg(feature = "dev-sync")]
+    management: Option<Entity<crate::dev_sync::ManagementPanel>>,
+    /// 设置页里的「管理」区是否展开（默认收起，避免设置页默认触发网络刷新）。
+    #[cfg(feature = "dev-sync")]
+    management_open: bool,
     /// dev-sync 设置页是否打开（默认关闭；面板只在设置页里渲染）。
     #[cfg(feature = "dev-sync")]
     settings_open: bool,
@@ -1028,8 +1041,13 @@ impl AppShell {
             menu_focus: cx.focus_handle(),
             activation_observed: false,
             activation_subscription: None,
+            appearance_subscription: None,
             #[cfg(feature = "dev-sync")]
             dev_sync: None,
+            #[cfg(feature = "dev-sync")]
+            management: None,
+            #[cfg(feature = "dev-sync")]
+            management_open: false,
             #[cfg(feature = "dev-sync")]
             settings_open: false,
             #[cfg(feature = "dev-sync")]
@@ -1177,9 +1195,39 @@ impl AppShell {
         auto: Option<crate::dev_sync::AutoSync>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_dev_sync_service_auto_and_management(
+            vault,
+            vault_label,
+            sync,
+            service,
+            auto,
+            None,
+            cx,
+        )
+    }
+
+    /// 与 [`Self::new_with_dev_sync_service_auto`] 相同，但允许注入**管理执行体**
+    /// （ADR 0016 S4d1c）。
+    ///
+    /// 生产路径传 `None`：若同步服务带真实库路径，就用 [`crate::dev_sync::RealManagementRunner`]
+    /// 构造管理面板（身份解封/网络都在管理 worker 线程里）。测试传脚本化 runner，
+    /// 在真实 `AppShell` + 设置页里验证管理区交互（不发真实网络请求）。
+    #[cfg(feature = "dev-sync")]
+    pub fn new_with_dev_sync_service_auto_and_management(
+        vault: Vault,
+        vault_label: String,
+        sync: SyncContext,
+        service: std::sync::Arc<crate::dev_sync::service::SyncService>,
+        auto: Option<crate::dev_sync::AutoSync>,
+        management: Option<Box<dyn crate::dev_sync::ManagementRunner>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // 管理面板与同步面板共享同一个 `Vault` 句柄（`Vault` 是 `Clone + Send + Sync`）。
+        let management_vault = vault.clone();
         let mut shell =
             Self::new_with_peer_and_sync(vault, vault_label, sync.peer_id, Some(sync), cx);
-        let panel = cx.new(|cx| crate::dev_sync::panel::DevSyncPanel::with_service(service, cx));
+        let panel =
+            cx.new(|cx| crate::dev_sync::panel::DevSyncPanel::with_service(service.clone(), cx));
         // 「同步」按钮不直接发命令：面板只请求，本视图先 Prepare/持闸再派发（顺序在
         // `dev_sync_sync_once` / `dev_sync_pump` 里，见 dev_sync::sync_once 的模块文档）。
         let subscription = cx.subscribe(
@@ -1214,6 +1262,22 @@ impl AppShell {
         });
         shell.dev_sync = Some(panel);
         shell.dev_sync_subscription = Some(subscription);
+        // ADR 0016 S4d1c：管理面板（设置页里的「管理」区）。执行体优先用调用方注入的
+        // （测试），否则只在真实 dev-local 服务（有库路径）时构造；默认构建/无路径 = None。
+        let management_service = management
+            .map(crate::dev_sync::ManagementService::new)
+            .or_else(|| {
+                let path = service.vault_path()?;
+                let runner = crate::dev_sync::RealManagementRunner::new(
+                    crate::dev_sync::ManagementRunConfig::from_service(service.config()),
+                    management_vault,
+                    path.to_path_buf(),
+                );
+                Some(crate::dev_sync::ManagementService::new(Box::new(runner)))
+            });
+        shell.management = management_service.map(|service| {
+            cx.new(|cx| crate::dev_sync::ManagementPanel::with_service(service, cx))
+        });
         // ADR 0012 S3：启动合并一次（只有 durable outbox/inbox 有待办才排队）。
         // 真正的派发在第一拍（生产 ticker 40ms；测试显式 `dev_sync_auto_tick`），
         // 避免在构造期重入同步状态机。
@@ -1242,6 +1306,10 @@ impl AppShell {
         // 二者都**不** join、不等网络（S1/S2 的安全收尾语义不变）。
         if let Some(auto) = &mut self.dev_sync_auto {
             auto.stop();
+        }
+        // ADR 0016 S4d1c：管理 worker 同样只请求停止（在途命令跑完后退出），不 join。
+        if let Some(panel) = &self.management {
+            panel.read(cx).service().request_stop();
         }
         let Some(panel) = &self.dev_sync else {
             return;
@@ -2367,6 +2435,21 @@ impl AppShell {
         self.settings_open
     }
 
+    /// 订阅系统外观变化（ADR 0021 P2）：只订阅一次，首帧先按当前 OS 外观解析。
+    ///
+    /// 默认构建也订阅：`ThemeMode::System` 下 OS 切换必须立即重绘。回调只改全局
+    /// 主题并 `refresh_windows()`，不重建编辑器/不写正文。
+    fn observe_appearance_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.appearance_subscription.is_some() {
+            return;
+        }
+        crate::theme::apply_system_appearance(window.appearance(), cx);
+        self.appearance_subscription =
+            Some(cx.observe_window_appearance(window, |_shell, window, cx| {
+                crate::theme::apply_system_appearance(window.appearance(), cx);
+            }));
+    }
+
     /// 只做投屏：状态由 [`crate::dev_sync::AutoSync`] 决定（`sync-status` / `sync-status-error`
     /// 两个固定 selector）。每轮成功不弹 toast、不抢焦点；"需要处理"才多一行。
     #[cfg(feature = "dev-sync")]
@@ -2451,9 +2534,8 @@ impl AppShell {
                         div()
                             .text_size(px(12.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(SharedString::from(format!(
-                                "反向链接 {}",
-                                self.backlinks.len()
+                            .child(SharedString::from(crate::ui_text::sidebar_backlinks(
+                                self.backlinks.len(),
                             ))),
                     )
                     .child(
@@ -2488,7 +2570,9 @@ impl AppShell {
                                 .py_2()
                                 .text_size(px(11.0))
                                 .text_color(theme::status_bar_text())
-                                .child(SharedString::from("没有反向链接")),
+                                .child(SharedString::from(
+                                    crate::ui_text::sidebar_backlinks_empty(),
+                                )),
                         )
                     })
                     .children(rows),
@@ -2650,7 +2734,7 @@ impl AppShell {
                     .px_2()
                     .text_size(px(12.0))
                     .text_color(theme::status_bar_text())
-                    .child(SharedString::from("笔记"))
+                    .child(SharedString::from(crate::ui_text::sidebar_notes()))
                     .child(SharedString::from(format!("{note_count}"))),
             )
             .child(
@@ -2675,7 +2759,7 @@ impl AppShell {
                             .justify_center()
                             .text_size(px(12.0))
                             .text_color(theme::text_color())
-                            .child(SharedString::from("＋ 笔记"))
+                            .child(SharedString::from(crate::ui_text::sidebar_new_note()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
@@ -2694,7 +2778,7 @@ impl AppShell {
                             .justify_center()
                             .text_size(px(12.0))
                             .text_color(theme::status_bar_text())
-                            .child(SharedString::from("＋ 文件夹"))
+                            .child(SharedString::from(crate::ui_text::sidebar_new_folder()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
@@ -2713,9 +2797,9 @@ impl AppShell {
                             .text_size(px(12.0))
                             .text_color(theme::status_bar_text())
                             .child(SharedString::from(if self.exporting {
-                                "导出中…"
+                                crate::ui_text::sidebar_exporting()
                             } else {
-                                "导出"
+                                crate::ui_text::sidebar_export()
                             }))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2735,37 +2819,9 @@ impl AppShell {
                     .overflow_y_scroll()
                     .children(rows),
             )
-            // 图谱入口：侧栏底部（「⚙ 设置」正上方，见 `GRAPH_ENTRY_BOTTOM_GAP`）。
-            // 用 `on_mouse_down` 而不是 up：与侧栏其它动作行一致，真实右键/快速点击
-            // 都不会因为"上一次 mouse move 的命中链"不满足而被静默跳过。
-            .child(
-                div().w_full().px_2().pb(px(GRAPH_ENTRY_BOTTOM_GAP)).child(
-                    div()
-                        .id("sidebar-graph")
-                        // 测试元数据（只读断言用）：侧栏图谱入口。
-                        .debug_selector(|| "sidebar-graph".to_string())
-                        .h(px(22.0))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .border(px(1.0))
-                        .border_color(theme::sidebar_border())
-                        .text_size(px(12.0))
-                        .text_color(theme::text_color())
-                        .cursor_pointer()
-                        .child(SharedString::from("图谱"))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
-                                shell.open_graph(window, cx);
-                            }),
-                        ),
-                ),
-            )
-            // 提示放在按钮**上方**：按钮位置固定，二次确认时不会"跑掉"
-            // （踩过：提示出现在按钮下面，按钮被顶上去，第二次点击点空 → 只剩超时复位）。
+            // 提示放在按钮**上方**：按钮位置固定，二次确认时不会"跑掉"，
+            // 也不会把「图谱」入口往上顶（真机反馈：未解析链接提示出现后，
+            // 图谱与设置之间突然多出一段偏移）。
             .when_some(self.notice.clone(), |this, notice| {
                 this.child(
                     div()
@@ -2802,6 +2858,35 @@ impl AppShell {
                         .child(SharedString::from(notice)),
                 )
             })
+            // 图谱入口：侧栏底部（「⚙ 设置」正上方，见 `GRAPH_ENTRY_BOTTOM_GAP`）。
+            // 用 `on_mouse_down` 而不是 up：与侧栏其它动作行一致，真实右键/快速点击
+            // 都不会因为"上一次 mouse move 的命中链"不满足而被静默跳过。
+            .child(
+                div().w_full().px_2().pb(px(GRAPH_ENTRY_BOTTOM_GAP)).child(
+                    div()
+                        .id("sidebar-graph")
+                        // 测试元数据（只读断言用）：侧栏图谱入口。
+                        .debug_selector(|| "sidebar-graph".to_string())
+                        .h(px(22.0))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .border(px(1.0))
+                        .border_color(theme::sidebar_border())
+                        .text_size(px(12.0))
+                        .text_color(theme::text_color())
+                        .cursor_pointer()
+                        .child(SharedString::from(crate::ui_text::sidebar_graph()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                                shell.open_graph(window, cx);
+                            }),
+                        ),
+                ),
+            )
     }
 
     /// 右键菜单（根层绝对定位）：透明遮罩负责"点外面关闭"，面板负责菜单项。
@@ -3677,9 +3762,8 @@ impl AppShell {
                     } else {
                         theme::status_bar_text()
                     })
-                    .child(SharedString::from(format!(
-                        "反向链接 {}",
-                        self.backlinks.len()
+                    .child(SharedString::from(crate::ui_text::status_backlinks(
+                        self.backlinks.len(),
                     )))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3709,9 +3793,9 @@ impl AppShell {
                             this.text_color(theme::danger_text())
                         })
                         .child(SharedString::from(if error.is_some() {
-                            "同步：需处理".to_string()
+                            crate::ui_text::status_sync_attention()
                         } else {
-                            format!("同步：{line}")
+                            crate::ui_text::status_sync(&line)
                         }))
                         .on_mouse_down(
                             MouseButton::Left,
@@ -3741,6 +3825,66 @@ impl AppShell {
             .text_color(theme::status_bar_text())
             .child(left)
             .child(right)
+            .into_any_element()
+    }
+
+    /// 设置页里的「管理」区（ADR 0016 S4d1c）。
+    ///
+    /// 默认收起；展开时挂载面板并触发一次刷新。没有管理面板时整块不渲染（默认构建/
+    /// 注入 fake service 且没有真实库路径的测试）。
+    #[cfg(feature = "dev-sync")]
+    fn render_management_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        if !crate::dev_sync::experimental_v2_ui() {
+            return div().into_any_element();
+        }
+        let Some(panel) = self.management.clone() else {
+            return div().into_any_element();
+        };
+        let open = self.management_open;
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .pb_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from("管理（V2 控制面 / 通道 A 双签）")),
+                    )
+                    .child(
+                        div()
+                            .id("settings-toggle-management")
+                            .debug_selector(|| "settings-toggle-management".to_string())
+                            .px(px(10.0))
+                            .py(px(5.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme::input_border())
+                            .bg(theme::menu_bg())
+                            .text_size(px(12.0))
+                            .text_color(theme::text_color())
+                            .cursor_pointer()
+                            .child(SharedString::from(if open { "收起" } else { "展开" }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    shell.toggle_management(cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    ),
+            )
+            .when(open, |this| this.child(div().w_full().child(panel)))
             .into_any_element()
     }
 
@@ -3792,7 +3936,7 @@ impl AppShell {
                         div()
                             .text_size(px(14.0))
                             .text_color(theme::text_color())
-                            .child(SharedString::from("设置 · 同步")),
+                            .child(SharedString::from(crate::ui_text::settings_sync_title())),
                     )
                     .child(
                         div()
@@ -3801,7 +3945,7 @@ impl AppShell {
                             .px_2()
                             .rounded_sm()
                             .hover(|style| style.bg(theme::sidebar_selected_bg()))
-                            .child(SharedString::from("关闭"))
+                            .child(SharedString::from(crate::ui_text::settings_close()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
@@ -3810,7 +3954,18 @@ impl AppShell {
                             ),
                     ),
             )
-            .child(div().p_2().child(panel));
+            .child(div().p_2().child(panel))
+            .child(self.render_management_section(cx))
+            // ADR 0021 P2：外观（浅色/深色/跟随系统）。放在最下面，避免把既有
+            // 同步/设备/轮换按钮顶出设置页可视区（headless 真机都按可见 bounds 点击）。
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme::sidebar_border())
+                    .child(crate::language_settings::appearance_and_language_row()),
+            );
         Some(
             div()
                 .id("settings-overlay")
@@ -3824,7 +3979,7 @@ impl AppShell {
                 .justify_center()
                 .items_start()
                 .pt(px(24.0))
-                .bg(gpui::rgba(0x0000001a))
+                .bg(theme::overlay_scrim_soft())
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
@@ -4046,6 +4201,32 @@ impl AppShell {
     #[must_use]
     pub fn dev_sync_panel(&self) -> Option<Entity<crate::dev_sync::DevSyncPanel>> {
         self.dev_sync.clone()
+    }
+
+    /// V2 管理面板（ADR 0016 S4d1c；`None` = 默认构建或没有真实库路径）。
+    #[must_use]
+    pub fn management_panel(&self) -> Option<Entity<crate::dev_sync::ManagementPanel>> {
+        self.management.clone()
+    }
+
+    /// 设置页里的「管理」区是否展开。
+    #[must_use]
+    pub const fn management_open(&self) -> bool {
+        self.management_open
+    }
+
+    /// 展开/收起设置页里的「管理」区；展开时触发一次刷新（不重复触发）。
+    pub fn toggle_management(&mut self, cx: &mut Context<Self>) {
+        if self.management.is_none() {
+            return;
+        }
+        self.management_open = !self.management_open;
+        if self.management_open {
+            if let Some(panel) = &self.management {
+                panel.update(cx, |panel, cx| panel.activate(cx));
+            }
+        }
+        cx.notify();
     }
 
     /// 持闸同步是否在途（面板按钮置灰 / 测试收敛判据）。
@@ -7096,6 +7277,8 @@ enum SyncOnceFinish {
 
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // ADR 0021 P2：系统外观（浅色/深色）变化 → 全局主题 + 重绘；只订阅一次。
+        self.observe_appearance_once(window, cx);
         // 输入框刚创建时拿不到 `&mut Window`（订阅回调里没有），在这一帧补一次焦点。
         if self.pending_focus_rename {
             self.pending_focus_rename = false;

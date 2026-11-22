@@ -28,8 +28,8 @@ use support::relay::time::FakeClock;
 /// 冻结的 schema 11 DDL（迁移起点；由 schema 11 二进制的 `sqlite_master` 导出）。
 const V11_DDL: &str = include_str!("fixtures/relay_schema11.sql");
 
-/// 当前版本号的字符串形式（12→13 之后本文件的全量迁移测试都落在 13）。
-const SCHEMA_VERSION_STR: &str = "13";
+/// 当前版本号的字符串形式（12→13→14 之后本文件的全量迁移测试都落在 14）。
+const SCHEMA_VERSION_STR: &str = "14";
 
 // ---------------------------------------------------------------- 固定 seed
 

@@ -1759,6 +1759,51 @@ mod approval_s4d1b {
         );
     }
 
+    #[test]
+    fn sign_precheck_reverifies_local_draft_against_verified_chain() {
+        // UI 的「A 签署」在签名前会调用 `verify_against`：链前进/证据不符/过期都必须在
+        // 本地拦下（禁止自动改 rev/延 deadline），零签名草稿也适用。
+        let world = upgrade_world("approval-verify-against");
+        let a_id = world.fx.a.identity.device_id;
+        let mut client = client_a(&world);
+        client.refresh_control().expect("refresh");
+        let now = client.now_secs();
+        let mut rng = TestRng::new(17);
+        let draft = ApprovalDraftV1::propose(
+            client.replay(),
+            a_id,
+            &ApprovalRequestV1::InviteCreate(InviteCreateRequestV1 {
+                invite_id: [0x52; 16],
+                token_hash: [0x62; 32],
+                expires_at: now + 600,
+            }),
+            &mut rng,
+            now,
+        )
+        .expect("propose");
+        // 正例：与当前已验证链一致 → Ok（零签名也允许）。
+        draft
+            .verify_against(client.replay(), now)
+            .expect("当前链上证据必须通过");
+        // 过期：短窗过后必须拒绝（UI 显示「失效」，不自动延 deadline）。
+        let expired = draft
+            .verify_against(client.replay(), now + 301)
+            .expect_err("过期必须拒绝");
+        assert!(
+            expired.to_string().contains("短窗"),
+            "错误必须点明短窗：{expired}"
+        );
+        // 陈旧：用一个从未回放的客户端视图（rev/head 不符）→ 拒绝。
+        let stale = b_side_client(&world);
+        let error = draft
+            .verify_against(stale.replay(), now)
+            .expect_err("空回放与草稿证据不符必须拒绝");
+        assert!(
+            error.to_string().contains("控制链证据") || error.to_string().contains("陈旧"),
+            "错误必须点明链证据不符：{error}"
+        );
+    }
+
     // ------------------------------------------------------------ 2. 双签 cap
 
     #[test]

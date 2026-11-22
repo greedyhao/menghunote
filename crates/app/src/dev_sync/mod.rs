@@ -65,6 +65,7 @@ pub mod autosync;
 pub mod cli;
 pub mod gate;
 pub mod identity;
+pub mod management;
 pub mod panel;
 pub mod scheduler;
 pub mod service;
@@ -79,6 +80,15 @@ pub use autosync::{
 pub use cli::{create_handoff_block, info_block, inspect, publish_baseline, publish_block};
 pub use gate::{DevSyncConfig, Gate, GateError};
 pub use identity::{ensure_instance_vault_ready, DevIdentityStore};
+pub use management::{
+    approval_view, build_snapshot, format_data_rights, format_fingerprint_128,
+    format_fingerprint_256, format_scopes, format_unix_utc, key_fingerprint,
+    sanitize_management_text, short_hash, short_id, ApprovalView, CapView, DeviceStatusView,
+    DeviceView, ManagementArtifact, ManagementCommand, ManagementEvent, ManagementPanel,
+    ManagementReport, ManagementRunConfig, ManagementRunner, ManagementService, ManagementSnapshot,
+    PolicyView, RealManagementRunner, ReceiptView, SlotView, MANAGEMENT_PUMP_INTERVAL,
+    MAX_MANAGEMENT_ERROR_CHARS, V2_DISABLED_MESSAGE,
+};
 pub use panel::{
     DevSyncPanel, DevSyncPanelEvent, APPLY_CONFIRM_TEXT, REVOKE_WARNING, ROTATE_CONFIRM_TEXT,
     ROTATE_NO_RECOVERY_WARNING, ROTATE_RECOVERY_EMPTY_WARNING, ROTATE_STAGES_TEXT,
@@ -101,3 +111,11 @@ pub use sync_once::{
     release_gate_allowed, ActiveSyncOnce, GatedTask, RotateRequest, SyncOnceReport, SyncOnceStage,
     SyncOnceTarget, SYNC_PUMP_INTERVAL,
 };
+
+/// 实验性 V2 管理 UI 是否展示（默认关闭）。
+///
+/// 个人用户只需要 V1 的设备列表/邀请/移除；V2 的 cap/双签/审批是高风险多管理员场景，
+/// 不应出现在正常设置页。需要验证 S4d1c 时显式设置 `MENGHUNOTE_EXPERIMENTAL_V2=1`。
+pub(crate) fn experimental_v2_ui() -> bool {
+    std::env::var_os("MENGHUNOTE_EXPERIMENTAL_V2").is_some()
+}

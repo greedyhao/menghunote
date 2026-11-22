@@ -253,6 +253,7 @@ menghunote/
 │  ├─ app/        # 桌面入口、窗口、GPUI Element、native 输入/shape/executor 适配
 │  ├─ ui/         # 可复用视图与主题（后补）
 │  ├─ editor/     # 编辑器纯模型：Rope 镜像、选择、ProjectionMap、IME 输入文档（不含 GPUI）
+│  ├─ i18n/       # 纯 i18n：Locale/消息 id/静态 catalog/t·t_with·t_count（零外部依赖、无 GPUI）
 │  ├─ text/       # 唯一坐标/单位原语：SourceByte/UnicodeScalar/InputUtf16/DisplayByte、SourceRange、CoordError
 │  ├─ core/       # 领域模型（后补，暂未落地）
 │  └─ storage/    # SQLite/CRDT/物化/同步 + session（EditorDocumentPort 的串行 reducer）
@@ -262,8 +263,10 @@ menghunote/
 └─ AGENTS.md
 ```
 
-**依赖方向（ADR 0003 + ADR 0006，禁止成环，含 dev-dependency）**：
-`app → editor/storage/text/gpui/sync`；`editor → storage/text`；`storage → text/loro/rusqlite`；
+**依赖方向（ADR 0003 + ADR 0006 + ADR 0020，禁止成环，含 dev-dependency）**：
+`app → editor/storage/text/gpui/sync/i18n`；
+`i18n` **不依赖** GPUI/storage/sync/editor（纯 Rust、零外部依赖）；
+`editor → storage/text`；`storage → text/loro/rusqlite`；
 `sync → storage + sync-proto`；`relay → sync-proto`；`sync-proto` 纯类型（serde，无 IO/crypto/Loro/SQLite）；
 `text → unicode-segmentation`；`storage → markdown`（仅 L2 正文链接物化/重写，markdown 不反向依赖 storage）。`storage` **不依赖** `editor`/`sync`；`editor`/`storage`/`text` **不依赖** GPUI；
 `relay` **不依赖** storage/Loro/Tantivy。
@@ -384,8 +387,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **ManagementCapV2（ADR 0015 S4a–S4c + ADR 0016 S4d1a/b，2026-11-14，当前 `b32a5b2`）**：
 > schema 12；relay 控制提交链/CAS/dedup、Upgrade/Cap/Device/Invite/rotation/Recovery 全链路；
 > 客户端库已能回放控制链、选择 cap、realm3 鉴权、ApprovalEnvelope 双签、submit/回执/重放。
-> **客户端管理 UI（S4d1c）与 relay 审批收件箱（S4d2）未做；真实 vault 未启用 V2；
-> TLS/Windows 未验。**
+> **S4d1c App 管理 UI + S4d2 relay 审批收件箱已实现**（见 ADR 0016 实施记录）；
+> relay schema 14（approval_jobs/signatures）；真实 vault 未启用 V2、TLS/Windows 未验。
+> **V2 管理 UI 默认隐藏**：个人用户使用 V1 设备列表/邀请/移除即可；设置页只在
+> `MENGHUNOTE_EXPERIMENTAL_V2=1` 时显示 V2 管理区（实验）。
 > **内嵌 Web 管理 + 旧入口移除（ADR 0018 S1–S4b，2026-11-16，当前为 12 组语义提交）**：
 > S1 独立 admin listener/token/session/CSRF/Host 白名单；S2 schema 13 `vault_registry` +
 > 原子 claim/cancel；S3 fenced 在线删除（admission + 事务复核、WS 关闭、分批可恢复 purge）；
@@ -395,7 +400,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 356 / sync 605 / app `--features dev-sync` 583 / 默认 352 / storage 195 / editor 287 / markdown 45。
+> 测试：relay 373 / sync 613 / app `--features dev-sync` **620** / 默认 **374** / i18n **16** / storage 195 / editor 287 / markdown 45。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
@@ -471,6 +476,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > 不支持块级/图片/合并单元格/富文本；cell 链接单击打开（不做 Ctrl/右键）。
 > 编辑器内部灰色状态条已移除，保存/同步状态统一由 shell 底栏承担。
 > 列表项（含引用内列表）的行内 Markdown 有 app headless 回归，光标在行尾也不会显露标记。
+> 侧栏提示（未解析链接/导入错误）移到「图谱」入口**上方**，不再把图谱顶上去。
+> 设置覆盖层拦截滚轮/触控板滚动，滚设置页不再带动底层笔记滚动。
+> V2 管理 UI 默认隐藏（`MENGHUNOTE_EXPERIMENTAL_V2=1` 才显示）；个人路径回到 V1。
+> 设备页默认只保留设备列表/邀请/移除；轮换入口默认隐藏（`MENGHUNOTE_EXPERIMENTAL_ROTATION=1`）。
 > **S3b3/S3b4 表格删除与右键插入（2026-11-17）**：表格浮层增删行/删列
 >（表头不删、至少保留 1 列、删除后修正选中格）；编辑器右键「插入 → 表格」，
 > 默认 2 列 × 1 数据行，一条 EditRequest，右键不移动 caret。拖拽重排仍未做。
@@ -495,8 +504,8 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `[[Note#Heading]]` / `[[#Heading]]` 解析、投影隐藏括号、单击打开、unresolved 灰色波浪线；
 > 目标解析按路径精确 > 标题（大小写不敏感）> 最短路径，歧义/无匹配只提示不自动建。
 > 代码/围栏/转义/`![[...]]` 不解析；links 物化/反向链接/重命名联动（L2）仍后置。
-> **Windows 真机（Web 管理/claim/App 粘贴）与真实 TLS relay 未验；S4d1c 客户端管理 UI、
-> S4d2 relay 审批收件箱仍未做。**
+> **Windows 真机（Web 管理/claim/App 粘贴）与真实 TLS relay 未验；S4d1c/S4d2 已实现
+> （Linux headless + relay 测试），真实 V2 vault/TLS/Windows 仍待验。**
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
 - **版本管理**：当前开发分支 **`dev`**（2026-11-16 历史整理：`v0.4-sync` 后 12 个语义提交；
@@ -563,3 +572,41 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   平台入口 `gpui::platform::application()`；`text`/`editor`/`storage` **零改动**。
   探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口；迁移后三绿 329 用例 + UI smoke 10/10 + 用户真机 IME/DPI 通过。
   迁移/探针 worktree 与临时分支已清理；**升级必须整套对齐**，见 §1 依赖基线。
+- **应用级主题（ADR 0021 P1/P2，2026-11-18，`5fc84c5`）**：
+  `crates/app/src/theme.rs` 定义 `ThemeMode { Light, Dark, System }` / `ThemeId` / 91 个语义 token；
+  内置浅色**逐色等于**迁移前硬编码（零视觉回归），新增深色；全局 `ThemeState`（`RwLock`）+
+  `current_theme()` / `theme_id()` / `set_mode()` / `apply_system_appearance()`；
+  `editor::theme::*` 的 81 个取色函数保留为兼容包装（读当前主题，600+ 调用点零改动）。
+  `ThemeMode::System` 用 `observe_window_appearance` 跟随 OS（`AppShell` / `AppRoot` 各订阅一次），
+  启动无窗口回退浅色；**默认模式 = System**。本机偏好 `theme.json`（`MENGHUNOTE_THEME_PATH` /
+  `%LOCALAPPDATA%\menghunote` / `$XDG_CONFIG_HOME/menghunote`），只存 `mode`（+ 可选 `theme_id`），
+  原子写、损坏/未知回退 System、不阻塞启动、不同步/不写正文。
+  设置页「外观」（浅色/深色/跟随系统）在 AppRoot 设置页（标题下）与 AppShell 设置页底部；
+  切换立即生效、不重建编辑器、不丢选区/滚动/撤销栈、不产生 `EditRequest`。
+  Mermaid 缓存 key 的 `PREVIEW_THEME` 改为真实 `theme_id`（切主题重渲染一次）；图谱/表格/任务框/
+  图片遮罩/工具条/状态栏/侧栏全部从 token 取色；4 处散落遮罩 `rgba` 已收口。
+  测试：app 默认 **363** / `--features dev-sync` **608**；新增 `headless_theme`（4）与
+  `headless_theme_ui`（1，dev-sync）+ theme 单测 7；fmt/clippy 干净。
+  已知限制：自定义主题包（P5）后置；Mermaid SVG 内容暗色配色属 M3；真实 OS 外观切换/像素/DPI
+  仍需 Windows 真机验；默认 demo 构建（无 `dev-sync`）没有设置页（仍默认跟随系统）。
+- **i18n 基础设施 + 首批迁移（ADR 0020 P1，2026-11-18，`7ef5040`）**：
+  新增纯 crate `crates/i18n`（`menghunote-i18n`，零外部依赖、不依赖 GPUI）：
+  `Locale { ZhCn, En }`（`LC_ALL`→`LANG` 解析；未知/`C`/缺失回退中文，Windows 无
+  `LANG` 等价默认 `zh-CN`）+ `LocaleMode { ZhCn, En, System }`；消息 id 常量
+  （`settings.*`/`sidebar.*`/`editor.menu.*`/`status.*`，宏生成 `ALL`）+ 静态
+  中英 catalog；`t(id)` 回退链 **当前语言 → 英文 → 中文 → key 本身**、
+  `t_with` `{name}` 插值、`t_count` 英文 `one/other` 两 key 复数（中文同形）。
+  **不引入 fluent 等重依赖**（最终格式选型留到插件 API 冻结前，ADR 0020 §8/§9）。
+  本机偏好 `language.json`（`MENGHUNOTE_LANGUAGE_PATH` / 平台配置目录），只存
+  locale（`system`/`zh-CN`/`en`），原子写、损坏回退 `System`、不同步/不写正文；
+  `main.rs` 启动调 `language_settings::init_from_disk()`。
+  设置页「语言 / Language」（中文 / English / 跟随系统）与「外观」并排（同一设置页），
+  切换立即生效、只重绘，不重建编辑器、不丢选区/滚动/撤销栈、不产生 `EditRequest`。
+  首批迁移：设置页固定文案（外观/语言/同步区标题、按钮、错误/提示）、侧栏
+  （笔记/新建/文件夹/导出/图谱/设置/反向链接标题与空态）、编辑器右键菜单
+  （插入/表格/打开链接/复制链接/复制 Markdown）、状态栏固定提示（反向链接/同步）；
+  动态数据/路径/错误原文不翻译。详细覆盖与未迁移清单见 ADR 0020 §9.4/§9.5。
+  测试：i18n **16**；app 默认 **374** / `--features dev-sync` **620**（新增
+  `headless_language` 3、`headless_language_ui` 1、`language_settings`/`ui_text`
+  单测 8）；fmt/clippy 干净。已知限制：不订阅 OS 语言切换（需重启/重选跟随系统）；
+  未迁移页面在英文界面仍显示中文。

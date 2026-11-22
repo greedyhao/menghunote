@@ -235,6 +235,21 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v2/vaults/{vault}/recovery/evidence",
             get(get_recovery_evidence),
         )
+        // ADR 0016 S4d2：relay 审批收件箱（通道 B，schema 14）。只在 v2 挂载：
+        // v1 没有 V2 授权/cap 语义，收件箱也不改 v1 wire。
+        .route(
+            "/v2/vaults/{vault}/approvals",
+            post(create_approval).get(list_approvals),
+        )
+        .route("/v2/vaults/{vault}/approvals/{request}", get(get_approval))
+        .route(
+            "/v2/vaults/{vault}/approvals/{request}/signatures",
+            post(add_approval_signature),
+        )
+        .route(
+            "/v2/vaults/{vault}/approvals/{request}/cancel",
+            post(cancel_approval),
+        )
         // 租户业务路由：v1 legacy 与 v2 各注册一份（同一实现，差异见 `ApiFace`）。
         .merge(tenant_routes("/v1/vaults/"))
         .merge(tenant_routes("/v2/vaults/"))
@@ -1094,6 +1109,207 @@ async fn get_recovery_evidence(
         Ok(fields)
     })?;
     Ok(cbor_ok(fields))
+}
+
+// ---------------------------------------------------------------- 审批收件箱（ADR 0016 S4d2）
+
+/// 收件箱请求的**事务内**鉴权（realm3 收窄在 `approvals::actor`）。
+///
+/// 为什么不用外层 `authenticate_v2` 的结果：收件箱每次请求都会惰性改写状态（stale/expired/
+/// 墓碑清理/加签），必须在**同一个写事务**里重验 bearer——否则"读完 token 到写事务开始"
+/// 之间发生的撤权/轮换会留下授权窗口（ADR 0016「事务内重验授权/时间/CAS」）。
+fn approval_actor(
+    conn: &ScopeConn,
+    clock: &dyn crate::time::Clock,
+    token: &str,
+    scope: VaultScope,
+) -> Result<AuthContext> {
+    let ctx = auth::authenticate(conn, clock, token)?;
+    if ctx.vault != scope {
+        return Err(Error::api(ErrorCode::NotFound));
+    }
+    Ok(ctx)
+}
+
+/// 收件箱查询串的允许键（未知键 → 400，避免同一语义多种 wire 形式）。
+const APPROVAL_QUERY_KEYS: [&str; 4] = ["role", "status", "after_seq", "limit"];
+
+/// `POST /v2/vaults/{vault}/approvals`：body 固定 `{0: bytes(ApprovalEnvelopeV1)}`。
+///
+/// 首次创建 → 201；同一 `(V, request_id, h)` 的重放 → 200（原 job，不重新授权）。
+async fn create_approval(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_data_rate(ApiFace::V2)?;
+    let vault_id = parse_id16(&vault_id)?;
+    let fields = parse_body(&state, &body)?;
+    if fields.len() != 1 || fields[0].0 != 0 {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let envelope = wire::bytes_field(&fields, 0)?;
+    let token = bearer(&headers)?;
+    let scope = VaultScope::new(vault_id);
+    let (job, created) = state
+        .write(scope, move |conn, clock| {
+            let auth = approval_actor(conn, clock, &token, scope)?;
+            crate::approvals::create(conn, clock, &auth, &envelope)
+        })
+        .await?;
+    let fields = vec![
+        (0, wire::map(job.summary_fields())),
+        (1, wire::boolean(created)),
+    ];
+    if created {
+        Ok(cbor_created(fields))
+    } else {
+        Ok(cbor_ok(fields))
+    }
+}
+
+/// `GET /v2/vaults/{vault}/approvals?role=&status=&after_seq=&limit=`。
+///
+/// 只返回调用者自己的 job（默认 `role=recipient` 的待办；`role=initiator` 看自己的 outgoing），
+/// 按 `seq` 升序分页（`limit ≤ 50`，`after_seq` 为下一页游标）。
+async fn list_approvals(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    state.check_v2_data_rate(ApiFace::V2)?;
+    let vault_id = parse_id16(&vault_id)?;
+    for key in query.keys() {
+        if !APPROVAL_QUERY_KEYS.contains(&key.as_str()) {
+            return Err(Error::api(ErrorCode::InvalidRequest));
+        }
+    }
+    let role = match query.get("role").map(String::as_str) {
+        None | Some("recipient") => crate::approvals::ListRole::Recipient,
+        Some("initiator") => crate::approvals::ListRole::Initiator,
+        Some(_) => return Err(Error::api(ErrorCode::InvalidRequest)),
+    };
+    let status = match query.get("status") {
+        None => None,
+        Some(text) => Some(
+            crate::approvals::ApprovalStatus::parse(text)
+                .ok_or_else(|| Error::api(ErrorCode::InvalidRequest))?,
+        ),
+    };
+    let after_seq = match query.get("after_seq") {
+        None => None,
+        Some(text) => Some(
+            text.parse::<i64>()
+                .map_err(|_| Error::api(ErrorCode::InvalidRequest))?,
+        ),
+    };
+    let limit = match query.get("limit") {
+        None => crate::approvals::DEFAULT_APPROVAL_PAGE,
+        Some(text) => text
+            .parse::<i64>()
+            .map_err(|_| Error::api(ErrorCode::InvalidRequest))?,
+    };
+    let limit = limit.clamp(1, crate::approvals::MAX_APPROVAL_PAGE);
+    let token = bearer(&headers)?;
+    let scope = VaultScope::new(vault_id);
+    let now = state.db.clock_handle().now_secs();
+    let (jobs, next) = state
+        .write(scope, move |conn, clock| {
+            let auth = approval_actor(conn, clock, &token, scope)?;
+            crate::approvals::list(conn, clock, &auth, role, status, after_seq, limit)
+        })
+        .await?;
+    let mut fields = vec![
+        (
+            0,
+            wire::array(
+                jobs.iter()
+                    .map(|job| wire::map(job.summary_fields()))
+                    .collect(),
+            ),
+        ),
+        (2, cbor_uint(u64::try_from(now).unwrap_or(0))),
+        (3, cbor_uint(u64::try_from(limit).unwrap_or(0))),
+    ];
+    if let Some(next) = next {
+        fields.push((1, cbor_uint(u64::try_from(next).unwrap_or(0))));
+    }
+    fields.sort_by_key(|(key, _)| *key);
+    Ok(cbor_ok(fields))
+}
+
+/// `GET /v2/vaults/{vault}/approvals/{request}`：摘要 + 完整 op/签名/cap 证据。
+///
+/// 终态（墓碑）只返回摘要（正文/签名在终结时已清空）。
+async fn get_approval(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, request_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    state.check_v2_data_rate(ApiFace::V2)?;
+    let vault_id = parse_id16(&vault_id)?;
+    let request_id = parse_id16(&request_id)?;
+    let token = bearer(&headers)?;
+    let scope = VaultScope::new(vault_id);
+    let (job, caps) = state
+        .write(scope, move |conn, clock| {
+            let auth = approval_actor(conn, clock, &token, scope)?;
+            crate::approvals::read(conn, clock, &auth, &request_id)
+        })
+        .await?;
+    Ok(cbor_ok(job.detail_fields(&caps)?))
+}
+
+/// `POST .../approvals/{request}/signatures`：body 固定 `{0: bytes(sig64)}`（固定槽位加签）。
+async fn add_approval_signature(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, request_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_data_rate(ApiFace::V2)?;
+    let vault_id = parse_id16(&vault_id)?;
+    let request_id = parse_id16(&request_id)?;
+    let fields = parse_body(&state, &body)?;
+    if fields.len() != 1 || fields[0].0 != 0 {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let signature = wire::bytes_field(&fields, 0)?;
+    let token = bearer(&headers)?;
+    let scope = VaultScope::new(vault_id);
+    let job = state
+        .write(scope, move |conn, clock| {
+            let auth = approval_actor(conn, clock, &token, scope)?;
+            crate::approvals::add_signature(conn, clock, &auth, &request_id, &signature)
+        })
+        .await?;
+    Ok(cbor_ok(vec![(0, wire::map(job.summary_fields()))]))
+}
+
+/// `POST .../approvals/{request}/cancel`：无 body；只停止协调，不撤回已外发签名。
+async fn cancel_approval(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, request_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    state.check_v2_data_rate(ApiFace::V2)?;
+    let vault_id = parse_id16(&vault_id)?;
+    let request_id = parse_id16(&request_id)?;
+    if !body.is_empty() {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let token = bearer(&headers)?;
+    let scope = VaultScope::new(vault_id);
+    let job = state
+        .write(scope, move |conn, clock| {
+            let auth = approval_actor(conn, clock, &token, scope)?;
+            crate::approvals::cancel(conn, clock, &auth, &request_id)
+        })
+        .await?;
+    Ok(cbor_ok(vec![(0, wire::map(job.summary_fields()))]))
 }
 
 // ---------------------------------------------------------------- state / control / log

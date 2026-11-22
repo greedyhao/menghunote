@@ -47,3 +47,12 @@ pub mod search_service;
 pub mod shell;
 pub mod sidebar_rename;
 pub mod text_shortcuts;
+// 应用级主题（ADR 0021 P1/P2）：语义 token 集 + 浅色/深色/跟随系统 + 本机偏好。
+// **默认构建也编进来**：编辑器/侧栏/状态栏都靠它取色，不依赖 dev-sync。
+pub mod theme;
+// 设置页的「外观」选择（浅色/深色/跟随系统）；只投影主题状态，不持有文档。
+pub mod theme_settings;
+// 设置页的「语言」选择与本机 `language.json`（ADR 0020 P1）；与主题相互独立。
+pub mod language_settings;
+// 首批迁移的固定 UI 文案（侧栏/状态栏/编辑器右键菜单/设置页）；渲染与测试共用。
+pub mod ui_text;

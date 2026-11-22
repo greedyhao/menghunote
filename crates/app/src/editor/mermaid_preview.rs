@@ -61,9 +61,6 @@ use crate::mermaid::{render_svg_for_preview, MermaidError};
 /// 必须与 `crates/app/Cargo.toml` 的 `merman = "=0.10.0"` 一致（升级时两边一起改）。
 pub const MERMAN_VERSION: &str = "0.10.0";
 
-/// 预览主题 id。M2 只有浅色主题；M3 引入暗色主题时改这里并让缓存 key 失效。
-pub const PREVIEW_THEME: &str = "light";
-
 /// 已光栅化图片的缓存预算（BGRA 字节）。
 pub const MERMAID_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
@@ -102,13 +99,22 @@ pub struct MermaidCacheKey {
 
 impl MermaidCacheKey {
     /// 由 Mermaid 源码（**content**，不含围栏行）与可用内容宽度构造 key。
+    ///
+    /// 主题取**全局当前主题 id**（ADR 0021 P2）：切主题后 key 自然变化，旧缓存不再
+    /// 命中并重新渲染一次。SVG 内容本身的暗色配色属于 M3，本切片只保证缓存失效。
     #[must_use]
     pub fn new(source: &str, content_width: f32) -> Self {
+        Self::new_for_theme(source, content_width, crate::theme::theme_id())
+    }
+
+    /// 显式指定主题 id 构造 key（测试/后台渲染用；不读全局状态）。
+    #[must_use]
+    pub fn new_for_theme(source: &str, content_width: f32, theme: crate::theme::ThemeId) -> Self {
         Self {
             source_hash: fnv1a64(source.as_bytes()),
             source_len: source.len(),
             merman_version: MERMAN_VERSION,
-            theme: PREVIEW_THEME,
+            theme: theme.as_str(),
             width: width_bucket(content_width),
         }
     }
@@ -854,17 +860,34 @@ mod tests {
 
     #[test]
     fn cache_key_includes_source_version_theme_and_width() {
+        use crate::theme::ThemeId;
+
         let source = "flowchart TD\nA-->B\n";
-        let base = MermaidCacheKey::new(source, 700.0);
+        let base = MermaidCacheKey::new_for_theme(source, 700.0, ThemeId::LIGHT);
         assert_eq!(base.merman_version(), MERMAN_VERSION);
-        assert_eq!(base.theme(), PREVIEW_THEME);
+        assert_eq!(base.theme(), "light");
         assert_eq!(base.source_len(), source.len());
-        assert_ne!(base, MermaidCacheKey::new("flowchart TD\nA-->C\n", 700.0));
-        assert_ne!(base, MermaidCacheKey::new(source, 900.0));
+        assert_ne!(
+            base,
+            MermaidCacheKey::new_for_theme("flowchart TD\nA-->C\n", 700.0, ThemeId::LIGHT)
+        );
+        assert_ne!(
+            base,
+            MermaidCacheKey::new_for_theme(source, 900.0, ThemeId::LIGHT)
+        );
         assert_eq!(
             base,
-            MermaidCacheKey::new(source, 701.0),
+            MermaidCacheKey::new_for_theme(source, 701.0, ThemeId::LIGHT),
             "同桶宽度必须命中"
+        );
+        // ADR 0021 P2：浅色/深色必须是**不同** key（切主题后旧缓存失效）。
+        assert_ne!(
+            base,
+            MermaidCacheKey::new_for_theme(source, 700.0, ThemeId::DARK)
+        );
+        assert_eq!(
+            MermaidCacheKey::new_for_theme(source, 700.0, ThemeId::DARK).theme(),
+            "dark"
         );
     }
 

@@ -26,6 +26,13 @@ use menghunote_app::shell::AppShell;
 fn main() -> Result<()> {
     // 第一行就记启动时刻：后面所有 `t=+…ms`（含「首帧就绪」）都以它为基准。
     platform::mark_app_start();
+    // 应用级主题（ADR 0021 P2）：读本机偏好（只含 mode/theme_id）。文件缺失/损坏
+    // 一律回退 `System`（无窗口时解析为浅色），**不阻塞启动**；根视图第一次渲染后
+    // 由 `observe_window_appearance` 按真实 OS 外观校正。
+    menghunote_app::theme::init_from_disk();
+    // 应用语言（ADR 0020 P1）：读本机 `language.json`（只含 locale 选择）。缺失/损坏
+    // 回退「跟随系统」（`LC_ALL`/`LANG`，未知语言回退中文）；不阻塞启动、不同步。
+    menghunote_app::language_settings::init_from_disk();
     // 先读 DPI 感知：清单没生效时这里会打一条明确警告（不 panic），
     // 后面 `scale_factor` / 显示器尺寸的数值就是它的下游表现。
     platform::log_startup_dpi_report();

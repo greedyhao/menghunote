@@ -404,7 +404,8 @@ fn try_open_db(path: &Path) -> relay::Result<Db> {
 }
 
 fn open_db(path: &Path) -> Db {
-    try_open_db(path).expect("open triggers 12 -> 13")
+    // `apply` 会继续跑到当前 SCHEMA_VERSION（12 → 13 → 14）。
+    try_open_db(path).expect("open triggers 12 -> 13 -> 14")
 }
 
 // ---------------------------------------------------------------- 1) 全量迁移
@@ -416,7 +417,11 @@ fn v12_two_vault_fixture_migrates_to_v13_preserving_every_fact() {
     let db = open_db(&path);
 
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("13"), "必须升到 schema 13");
+        assert_eq!(
+            version(conn).as_deref(),
+            Some("14"),
+            "必须升到当前 schema（12→13→14）"
+        );
         // ---- 租户事实逐字节不变（registry 是唯一新增的生命周期事实来源）----
         for (table, cols, rows) in &before.tables {
             assert_eq!(
@@ -553,7 +558,7 @@ fn v12_two_vault_fixture_migrates_to_v13_preserving_every_fact() {
     };
     let db = open_db(&path);
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("13"));
+        assert_eq!(version(conn).as_deref(), Some("14"));
         assert_eq!(
             dump_rows(conn, "vault_registry", &columns(conn, "vault_registry")),
             registry_before.0
@@ -615,7 +620,7 @@ fn interrupted_v13_migration_rolls_back_and_retry_succeeds() {
     // ---- 重试（正常路径）成功，数据仍完整 ----
     let db = open_db(&path);
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("13"));
+        assert_eq!(version(conn).as_deref(), Some("14"));
         assert!(table_exists(conn, "vault_registry"));
         assert_eq!(fk_violations(conn), 0);
         assert_eq!(count(conn, "create_tickets"), 5);
@@ -647,7 +652,7 @@ fn missing_metadata_on_v12_shape_is_recognised_as_12_and_migrated() {
 
     let db = open_db(&path);
     db.read_instance(|conn| {
-        assert_eq!(version(conn).as_deref(), Some("13"));
+        assert_eq!(version(conn).as_deref(), Some("14"));
         assert!(table_exists(conn, "vault_registry"), "12→13 必须真的跑过");
         assert_eq!(
             relay::registry::load_raw(conn, &VAULT_RESERVED)
@@ -671,37 +676,50 @@ fn missing_metadata_on_v12_shape_is_recognised_as_12_and_migrated() {
 }
 
 #[test]
-fn missing_metadata_on_v13_shape_is_recognised_without_remigrating() {
+fn missing_metadata_on_v13_shape_is_recognised_as_13_and_upgrades_to_14() {
     let path = temp_path("migration-v13-no-meta-13");
     let _ = build_v12(&path);
     let db = open_db(&path);
     drop(db);
-    // 记录迁移后的 registry 行，删版本号与快照，再打开。
+    // 记录迁移后的 registry 行；把库改回**纯 schema 13 形状**（删掉 14 的两张收件箱表、
+    // 版本号与维护窗口快照），再打开——必须被识别成 13（而不是 12/14）并补跑 13→14，
+    // 不得重跑 12→13。
     let conn = Connection::open(&path).expect("open raw");
     let registry_rows = dump_rows(&conn, "vault_registry", &columns(&conn, "vault_registry"));
-    conn.execute("DELETE FROM relay_meta WHERE key = 'schema_version'", [])
-        .expect("drop version");
+    conn.execute_batch(
+        "DROP TABLE approval_signatures; DROP TABLE approval_jobs;
+         DELETE FROM relay_meta WHERE key = 'schema_version';",
+    )
+    .expect("shape back to v13");
     drop(conn);
     std::fs::remove_file(schema::backup_path_v12(&path)).expect("remove snapshot");
 
-    let db = try_open_db(&path).expect("v13 shape must open without migration");
+    let db = try_open_db(&path).expect("v13 shape must upgrade to 14");
     db.read_instance(|conn| {
         assert_eq!(
             version(conn).as_deref(),
-            Some("13"),
-            "必须显式识别 13 并写回版本"
+            Some("14"),
+            "必须显式识别 13 并补跑 13→14"
+        );
+        assert!(
+            table_exists(conn, "approval_jobs") && table_exists(conn, "approval_signatures"),
+            "识别为 13 才会创建收件箱表"
         );
         assert_eq!(
             dump_rows(conn, "vault_registry", &columns(conn, "vault_registry")),
             registry_rows,
-            "13 形状不得重跑迁移改写 registry"
+            "不得重跑 12→13 改写 registry"
         );
         Ok(())
     })
     .expect("v13 shape asserts");
     assert!(
         !schema::backup_path_v12(&path).exists(),
-        "没有跑迁移就不应产生新的 schema 12 快照"
+        "没有重跑 12→13，就不应产生新的 schema 12 快照"
+    );
+    assert!(
+        schema::backup_path_v13(&path).exists(),
+        "真的跑了 13→14，必须留 schema 13 快照"
     );
     db.close();
     cleanup(&path);

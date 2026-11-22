@@ -210,6 +210,17 @@ impl ApprovalEnvelopeV1 {
         self.digest
     }
 
+    /// `h` 的 **128 位比较指纹**（前 16 字节；ADR 0016「双端显示同一操作详情」）。
+    ///
+    /// 只用于**人工比对**的短形式：双端显示同一个 128 位值，完整 256 位（`digest()`）
+    /// 可展开。它不改变任何校验：导入/提交仍用完整 `h`（`digest()`/`SHA256(op_bytes)`）。
+    #[must_use]
+    pub fn comparison_fingerprint(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&self.digest[..16]);
+        out
+    }
+
     /// 发起者在 `signers` 里的下标。
     #[must_use]
     pub const fn initiator_index(&self) -> u32 {
@@ -625,6 +636,202 @@ impl ApprovalEnvelopeV1 {
             signatures,
         })
     }
+}
+
+// ---------------------------------------------------------------- 操作详情摘要（UI/双端比对）
+
+/// typed `OperationV2` 的公开详情摘要（ADR 0016「双端显示同一操作详情」）。
+///
+/// 只含公开证据（kind/目标/scope/到期），不含任何秘密；双端渲染同一份摘要可以避免
+/// 各自解析 payload 造成文案/字段漂移。解析失败时 `target` 给出固定占位，不 panic。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalOperationSummaryV1 {
+    /// kind（`ControlKindV2::as_u8`）。
+    pub kind: u8,
+    /// kind 中文/英文标签。
+    pub kind_label: &'static str,
+    /// 目标摘要（设备/cap/邀请/设备集合等公开事实；不含时间）。
+    pub target: String,
+    /// cap scope / 门限摘要。
+    pub scopes: String,
+    /// 相关到期时刻（cap 到期 / 邀请到期；`None` = 不适用）。
+    pub expires_at: Option<u64>,
+}
+
+impl ApprovalEnvelopeV1 {
+    /// 解析当前操作，返回 UI/日志用的公开详情摘要。
+    #[must_use]
+    pub fn operation_summary(&self) -> ApprovalOperationSummaryV1 {
+        operation_summary(&self.operation)
+    }
+}
+
+/// 把 `OperationV2` 的 typed payload 投影成公开摘要（不验签/不联网）。
+#[must_use]
+pub fn operation_summary(operation: &OperationV2) -> ApprovalOperationSummaryV1 {
+    let kind = operation.kind;
+    let mut summary = ApprovalOperationSummaryV1 {
+        kind: kind.as_u8(),
+        kind_label: kind_label(kind),
+        target: "payload 无法解析".to_owned(),
+        scopes: "—".to_owned(),
+        expires_at: None,
+    };
+    match kind {
+        ControlKindV2::UpgradePolicy => {
+            if let Ok(payload) = UpgradePolicyPayloadV2::decode(&operation.payload) {
+                summary.target = format!(
+                    "升级到 V2：旧管理 rev {} · 成员 {} 台 · bootstrap cap {} 张 · 新恢复钥 {}",
+                    payload.old_manager_rev,
+                    payload.active_manifest.len(),
+                    payload.bootstrap_caps.len(),
+                    key_fingerprint(&payload.fresh_recovery_pk)
+                );
+                summary.scopes = "2/2（旧 creator + 恢复根 + 设备）".to_owned();
+            }
+        }
+        ControlKindV2::CapGrant => {
+            if let Ok(payload) = CapGrantPayloadV2::decode(&operation.payload) {
+                summary.target = format!(
+                    "授予设备 {} · cap {}",
+                    short_hex(&payload.cap.subject_device_id),
+                    short_hex(&payload.cap.cap_id)
+                );
+                summary.scopes = describe_scopes(payload.cap.scopes.bits());
+                summary.expires_at = Some(payload.cap.expires_at);
+            }
+        }
+        ControlKindV2::CapRevoke => {
+            if let Ok(payload) = CapRevokePayloadV2::decode(&operation.payload) {
+                summary.target = format!("撤销 cap {}", short_hex(&payload.cap_id));
+            }
+        }
+        ControlKindV2::DeviceApprove | ControlKindV2::DeviceRightsChange => {
+            if let Ok(payload) = DeviceCredentialPayloadV2::decode(&operation.payload) {
+                let action = if kind == ControlKindV2::DeviceApprove {
+                    "批准"
+                } else {
+                    "改权"
+                };
+                summary.target = format!(
+                    "{action}设备 {}（serial {} · 权限 {}）",
+                    short_hex(&payload.cert.device_id),
+                    payload.cert.cert_serial,
+                    describe_rights(payload.cert.data_rights.bits())
+                );
+                summary.scopes = if kind == ControlKindV2::DeviceApprove {
+                    "2/2 设备批准 + 目标 PoP".to_owned()
+                } else {
+                    "2/2 设备批准".to_owned()
+                };
+            }
+        }
+        ControlKindV2::DeviceRevoke => {
+            if let Ok(payload) = DeviceRevokePayloadV2::decode(&operation.payload) {
+                summary.target = format!(
+                    "撤销 {} 台设备：{}",
+                    payload.device_ids.len(),
+                    payload
+                        .device_ids
+                        .iter()
+                        .map(|id| short_hex(id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                summary.scopes = "2/2 设备撤销".to_owned();
+            }
+        }
+        ControlKindV2::InviteCreate => {
+            if let Ok(payload) = InviteCreatePayloadV2::decode(&operation.payload) {
+                summary.target = format!("创建邀请 {}", short_hex(&payload.invite_id));
+                summary.scopes = "邀请（单签，INVITE）".to_owned();
+                summary.expires_at = Some(payload.expires_at);
+            }
+        }
+        ControlKindV2::InviteCancel => {
+            if let Ok(payload) = InviteCancelPayloadV2::decode(&operation.payload) {
+                summary.target = format!("取消邀请 {}", short_hex(&payload.invite_id));
+                summary.scopes = "邀请（单签，INVITE）".to_owned();
+            }
+        }
+        ControlKindV2::RecoveryReset | ControlKindV2::RecoveryKeyChange => {
+            summary.target = "恢复根/策略变更（只读导入）".to_owned();
+        }
+        ControlKindV2::RotationBegin
+        | ControlKindV2::RotationAbort
+        | ControlKindV2::RotationRestart
+        | ControlKindV2::RotationAddRevokes
+        | ControlKindV2::EpochActivate => {
+            summary.target = format!("轮换 kind {}（只读导入）", kind.as_u8());
+        }
+        ControlKindV2::PolicyReplace => {
+            summary.target = "PolicyReplace（relay 仍 501）".to_owned();
+        }
+    }
+    summary
+}
+
+/// kind 的中文/英文标签（UI 摘要与错误信息共用）。
+#[must_use]
+pub const fn kind_label(kind: ControlKindV2) -> &'static str {
+    match kind {
+        ControlKindV2::UpgradePolicy => "升级策略（UpgradePolicy）",
+        ControlKindV2::PolicyReplace => "策略替换（PolicyReplace）",
+        ControlKindV2::CapGrant => "授予 cap（CapGrant）",
+        ControlKindV2::CapRevoke => "撤销 cap（CapRevoke）",
+        ControlKindV2::DeviceApprove => "批准设备（DeviceApprove）",
+        ControlKindV2::DeviceRevoke => "撤销设备（DeviceRevoke）",
+        ControlKindV2::RotationBegin => "开始轮换（RotationBegin）",
+        ControlKindV2::RotationAbort => "中止轮换（RotationAbort）",
+        ControlKindV2::RotationRestart => "重启轮换（RotationRestart）",
+        ControlKindV2::RotationAddRevokes => "轮换追加撤销（RotationAddRevokes）",
+        ControlKindV2::EpochActivate => "激活 epoch（EpochActivate）",
+        ControlKindV2::InviteCreate => "创建邀请（InviteCreate）",
+        ControlKindV2::InviteCancel => "取消邀请（InviteCancel）",
+        ControlKindV2::RecoveryReset => "离线恢复（RecoveryReset）",
+        ControlKindV2::RecoveryKeyChange => "恢复换钥（RecoveryKeyChange）",
+        ControlKindV2::DeviceRightsChange => "设备改权（DeviceRightsChange）",
+    }
+}
+
+/// cap scope 位的中文摘要（与 UI 的 `format_scopes` 同口径）。
+#[must_use]
+pub fn describe_scopes(bits: u32) -> String {
+    let mut parts = Vec::new();
+    for (bit, label) in [
+        (CapScope::INVITE, "邀请"),
+        (CapScope::APPROVE, "批准"),
+        (CapScope::REVOKE, "撤销"),
+        (CapScope::CAP_ADMIN, "cap 管理"),
+        (CapScope::ROTATE, "轮换"),
+        (CapScope::POLICY, "策略"),
+    ] {
+        if bits & bit != 0 {
+            parts.push(label);
+        }
+    }
+    if parts.is_empty() {
+        "—".to_owned()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn describe_rights(bits: u32) -> &'static str {
+    match (bits & 1 != 0, bits & 2 != 0) {
+        (true, true) => "读写",
+        (true, false) => "只读",
+        (false, true) => "只写",
+        (false, false) => "无数据权限",
+    }
+}
+
+fn short_hex(bytes: &[u8]) -> String {
+    crate::ids::hex_of(&bytes[..bytes.len().min(4)])
+}
+
+fn key_fingerprint(pk: &[u8; 32]) -> String {
+    short_hex(&pk[..8])
 }
 
 // ---------------------------------------------------------------- 签名输入
@@ -1254,8 +1461,6 @@ impl ApprovalDraftV1 {
     /// 控制链证据 == 本地已验证位置、A 的授权/cap/scope（与回放同一验证路径）、
     /// 目标/证书/grant/集合承诺、签名槽与已存在签名。
     pub fn verify_import(&self, replay: &V2ControlReplay, now: u64) -> Result<(), SyncError> {
-        self.envelope.validate()?;
-        self.envelope.verify_present_signatures()?;
         if self.envelope.signatures().is_empty() {
             return Err(approval_error(
                 "导入的审批包没有任何签名（必须先由发起者签署）",
@@ -1268,6 +1473,17 @@ impl ApprovalDraftV1 {
         {
             return Err(approval_error("导入的审批包缺发起者签名（A 必须先签）"));
         }
+        self.verify_against(replay, now)
+    }
+
+    /// 按本地**已验证**回放验证当前草稿（**不要求已有签名**；签前/刷新后重验用）。
+    ///
+    /// 与 [`Self::verify_import`] 共用同一条验证路径，区别只是允许零签名草稿：
+    /// 发起者刚 `propose` 出来、还没签的本地草稿也要能在签前重验（链前进/到期/
+    /// 证据缺口 → 明确失败，禁止自动改 rev/延 deadline）。
+    pub fn verify_against(&self, replay: &V2ControlReplay, now: u64) -> Result<(), SyncError> {
+        self.envelope.validate()?;
+        self.envelope.verify_present_signatures()?;
         let operation = self.envelope.operation();
         let state = replay.state();
         let vault_id = state.vault_id();
@@ -2829,6 +3045,40 @@ mod tests {
         assert!(ApprovalFailureV1::Server.is_retryable());
         assert!(!ApprovalFailureV1::Stale.is_retryable());
         assert!(!ApprovalFailureV1::Expired.is_retryable());
+    }
+
+    #[test]
+    fn comparison_fingerprint_is_the_first_128_bits_of_h() {
+        let fixture = fixture();
+        let draft = sample_draft(&fixture);
+        let envelope = draft.envelope();
+        let digest = envelope.digest();
+        let short = envelope.comparison_fingerprint();
+        assert_eq!(short.len(), 16);
+        assert_eq!(&digest[..16], &short[..], "128 位指纹必须是 h 的前 16 字节");
+        assert_eq!(
+            crate::ids::hex_of(&short).len(),
+            32,
+            "128 位 = 32 个小写 hex 字符（双端人工比对长度）"
+        );
+        assert_eq!(crate::ids::hex_of(&digest).len(), 64);
+    }
+
+    #[test]
+    fn zero_signature_draft_can_be_reverified_before_signing() {
+        // 零签名草稿的 `verify_against` 只做到本地结构/时间窗检查为止；这里用一个
+        // 链位置不匹配的**空回放**证明它确实会拒绝陈旧证据（而不是永远 Ok）。
+        let fixture = fixture();
+        let draft = sample_draft(&fixture);
+        let replay = V2ControlReplay::new(vault_id(), instance());
+        let error = draft
+            .verify_against(&replay, NOW)
+            .expect_err("空回放与草稿的 rev/head 不符必须拒绝");
+        let text = error.to_string();
+        assert!(
+            text.contains("控制链证据") || text.contains("陈旧"),
+            "错误必须点明链证据不符：{text}"
+        );
     }
 
     #[test]

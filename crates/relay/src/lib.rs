@@ -24,6 +24,7 @@
 //! | [`gc`] | 7 天持久计划 + §13.3 删除前摘要校验 |
 //! | [`rotations`] | freeze → 候选 epoch → staged grants → atomic activate |
 //! | [`control`] | 控制链 typed 记录（`SignedControlRecord` + `epoch.activated` 事件）|
+//! | [`approvals`] | ADR 0016 S4d2 审批收件箱（通道 B）：半签包存储、list/read/加签/取消、惰性终态 |
 //! | [`management`] | §26：管理写只解析唯一 canonical body + `request_id` 幂等 |
 //! | [`verify`] | 真实验签：`sync-proto` 解 CDE + relay 算 SHA/Ed25519 |
 //! | [`wire`] | 控制面 `application/cbor` + CDE 记录适配 |
@@ -38,6 +39,7 @@
 pub mod admin;
 pub mod admin_web;
 pub mod api;
+pub mod approvals;
 pub mod auth;
 pub mod authz;
 pub mod checkpoints;

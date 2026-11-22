@@ -187,6 +187,14 @@ pub const ROTATE_STAGES_TEXT: &str = "轮换中（申请/候选/激活/推广）
 /// 轮换确认区里恢复码输入框的 placeholder（不含任何真实恢复码）。
 const RECOVERY_PLACEHOLDER: &str = "当前恢复码 mnrec1…（只用于本次重封）";
 
+/// 轮换/应用轮换是否展示（默认关闭）。
+///
+/// 个人用户只需要“设备列表 / 邀请 / 移除”；轮换是高级操作，默认不出现在面板里。
+/// 需要验证 ADR 0009 Phase 2 时设置 `MENGHUNOTE_EXPERIMENTAL_ROTATION=1`。
+fn experimental_rotation_ui() -> bool {
+    std::env::var_os("MENGHUNOTE_EXPERIMENTAL_ROTATION").is_some()
+}
+
 /// 「移除设备（不轮换密钥）」的**固定安全文案**（ADR 0010 §安全边界）。
 ///
 /// 只要界面上出现移除入口（按钮/确认框），这段文字就必须同时可见——它是这项操作的
@@ -1141,19 +1149,26 @@ impl DevSyncPanel {
             .border_color(theme::sidebar_border())
             .child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(theme::danger_text())
-                    .child(SharedString::from(REVOKE_WARNING)),
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text_color())
+                    .child(SharedString::from("设备")),
             )
             .child(
                 div()
                     .text_size(px(10.0))
                     .text_color(theme::status_bar_text())
                     .child(SharedString::from(if can_manage {
-                        "本机有管理密钥：可以移除其它设备；初始基线在 Create 时自动发布，失败可重试。"
+                        "丢失设备时，在另一台设备上点「移除」即可；移除只阻断它继续访问 relay。"
                     } else {
-                        "本机没有管理密钥（Join 设备）：移除设备与发布基线都不可用。"
+                        "只有管理设备可以移除其它设备；本机没有管理密钥。"
                     })),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme::danger_text())
+                    .child(SharedString::from(REVOKE_WARNING)),
             )
             .child(self.action_button(
                 "dev-sync-refresh-devices",
@@ -1172,7 +1187,10 @@ impl DevSyncPanel {
     ///
     /// 两个动作**独立**于「移除设备」：移除只删凭证（ADR 0010 默认），轮换只有用户显式
     /// 点这里才会发生；轮换也不会自动串联到移除。
-    fn render_rotation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_rotation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if !experimental_rotation_ui() {
+            return div().into_any_element();
+        }
         let rotate_dimmed = self.rotate_block_reason().is_some();
         let apply_dimmed = self.apply_block_reason().is_some();
         let hint = self.rotation_hint();
@@ -1221,7 +1239,7 @@ impl DevSyncPanel {
         if self.pending_apply_confirm {
             block = block.child(self.render_apply_confirm(cx));
         }
-        block
+        block.into_any_element()
     }
 
     /// 轮换入口的状态行：先给"正在轮换"的阶段（四段 + worker 明细），再给不可用原因。

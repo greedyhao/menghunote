@@ -43,7 +43,7 @@ use rusqlite::OptionalExtension;
 
 use super::{
     forbidden, i64_of, insert_cap, invalid, proto_sha256, signature_invalid, two_scope_signers,
-    verify_signature,
+    SigPolicy,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::Id16;
@@ -282,6 +282,7 @@ fn verify_add_pop(
     signed: &proto::SignedControlV2,
     device_id: &Id16,
     expected_pk: &[u8; 32],
+    policy: SigPolicy<'_>,
 ) -> Result<()> {
     let mut seen = 0usize;
     for (index, signer) in signed.operation.signers.iter().enumerate() {
@@ -297,7 +298,10 @@ fn verify_add_pop(
         }
         let input = proto::pop_signing_input(&signed.operation, &signer.pk, proto_sha256)
             .map_err(|_| invalid())?;
-        if verify_signature(&input, &signer.pk, &signed.signatures[index]).is_err() {
+        if policy
+            .verify(index, &input, &signer.pk, &signed.signatures[index])
+            .is_err()
+        {
             return Err(signature_invalid());
         }
     }
@@ -308,7 +312,11 @@ fn verify_add_pop(
 }
 
 /// 恢复根签名（`recover` 域）：role2 + 指定 pk，必须恰好一个。
-fn verify_recovery_signer(signed: &proto::SignedControlV2, expected_pk: &[u8; 32]) -> Result<()> {
+fn verify_recovery_signer(
+    signed: &proto::SignedControlV2,
+    expected_pk: &[u8; 32],
+    policy: SigPolicy<'_>,
+) -> Result<()> {
     let input =
         proto::recover_signing_input(&signed.operation, proto_sha256).map_err(|_| invalid())?;
     let mut seen = 0usize;
@@ -323,7 +331,10 @@ fn verify_recovery_signer(signed: &proto::SignedControlV2, expected_pk: &[u8; 32
         if signer.device_id.is_some() || signer.cap_id.is_some() {
             return Err(forbidden());
         }
-        if verify_signature(&input, &signer.pk, &signed.signatures[index]).is_err() {
+        if policy
+            .verify(index, &input, &signer.pk, &signed.signatures[index])
+            .is_err()
+        {
             return Err(signature_invalid());
         }
     }
@@ -354,6 +365,7 @@ pub(super) fn validate_reset(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<RecoveryPlan> {
     let current_recovery_pk = require_v2(vault)?;
     let payload =
@@ -416,7 +428,7 @@ pub(super) fn validate_reset(
         if reused != 0 {
             return Err(Error::api(ErrorCode::IdConflict));
         }
-        verify_add_pop(signed, &cert.device_id, &cert.sign_ed25519_pub)?;
+        verify_add_pop(signed, &cert.device_id, &cert.sign_ed25519_pub, policy)?;
         adds.push(AddPlan {
             cert,
             cert_bytes,
@@ -446,8 +458,8 @@ pub(super) fn validate_reset(
 
     // 签名：旧恢复根（当前代）+ 新钥 PoP；role2 恰好两颗不同 pk（结构上也不允许相同）。
     ensure_role2_count(signed, 2)?;
-    verify_recovery_signer(signed, &current_recovery_pk)?;
-    verify_recovery_signer(signed, &payload.fresh_recovery_pk)?;
+    verify_recovery_signer(signed, &current_recovery_pk, policy)?;
+    verify_recovery_signer(signed, &payload.fresh_recovery_pk, policy)?;
     // 不允许 role0：恢复记录不是普通管理写（离线根 + 新钥 + 设备 PoP 才是授权面）。
     if signed
         .operation
@@ -477,6 +489,7 @@ pub(super) fn validate_key_change(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<RecoveryPlan> {
     let _ = require_v2(vault)?;
     if vault.authz_state != AuthzState::Active {
@@ -486,14 +499,14 @@ pub(super) fn validate_key_change(
     let payload = proto::RecoveryKeyChangePayloadV2::decode(&signed.operation.payload)
         .map_err(|_| invalid())?;
     ensure_fresh_recovery_key(vault, &payload.fresh_recovery_pk)?;
-    let policy = super::load_policy(vault)?;
+    let policy_v2 = super::load_policy(vault)?;
     let post = PostRevs::of(vault)?;
     let (after, keep_active) = active_after(conn, &[], &[])?;
     let cap_plan = validate_caps(
         conn,
         now,
         vault,
-        &policy,
+        &policy_v2,
         &payload.bootstrap_caps,
         &after,
         post,
@@ -508,9 +521,10 @@ pub(super) fn validate_key_change(
         &digest_input,
         &[proto::CapScope::POLICY],
         &[proto::SignerRole::OfflineRecovery],
+        policy,
     )?;
     ensure_role2_count(signed, 1)?;
-    verify_recovery_signer(signed, &payload.fresh_recovery_pk)?;
+    verify_recovery_signer(signed, &payload.fresh_recovery_pk, policy)?;
     Ok(RecoveryPlan::KeyChange(KeyChangePlan {
         recovery_pk: payload.fresh_recovery_pk,
         keep_active,

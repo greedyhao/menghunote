@@ -1,10 +1,22 @@
 //! 编辑器视图的视觉常量（字号 / 行高 / 颜色）。
 //!
-//! 切片 5a 只要求"固定字号 + 固定行高"，不引入主题系统（ADR 0003 §7 切片 5
-//! 的可见验收只要肉眼能确认绘制与命中）。所有像素值都用 `f32` 存，
-//! 在用到的地方再包一层 `px()`，避免常量求值依赖 GPUI 的构造器。
+//! ## 颜色：迁移期兼容包装（ADR 0021）
+//!
+//! 本文件的**颜色函数**全部是 [`crate::theme`] 的兼容包装：它们读**全局当前主题**
+//! （浅色 / 深色 / 跟随系统），因此 600+ 现有调用点不需要改签名就能跟着切主题。
+//! 新代码应优先直接接收 `&Theme`（或读 [`crate::theme::current_theme`]），
+//! 逐步把语义 token 显式化；迁移完成后这些自由函数可以删除或降为 `light()` 测试辅助。
+//!
+//! **浅色主题的每个值都与 ADR 0021 迁移前的硬编码颜色逐色一致**，避免视觉回归；
+//! 深色主题是新增值。组件只允许读语义 token，不允许在绘制代码里写 `0x...` 颜色。
+//!
+//! ## 排版常量
+//!
+//! 字体族/字号/行高/间距属于**排版**，首版不进入主题（ADR 0021 §3.2：主题不得改变
+//! 布局命中契约）。所有像素值都用 `f32` 存，在用到的地方再包一层 `px()`，避免常量
+//! 求值依赖 GPUI 的构造器。
 
-use gpui::{rgb, rgba, Font, Rgba};
+use gpui::{Font, Rgba};
 
 /// 等宽字体族（Windows 自带 Consolas；缺失时由 GPUI 的平台回退链接管）。
 pub const FONT_FAMILY: &str = "Consolas";
@@ -21,109 +33,6 @@ pub const PAD_Y: f32 = 8.0;
 #[must_use]
 pub fn font() -> Font {
     gpui::font(FONT_FAMILY)
-}
-
-/// 窗口背景。
-#[must_use]
-pub fn window_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 正文颜色。
-#[must_use]
-pub fn text_color() -> Rgba {
-    rgb(0x1f2328)
-}
-
-/// 选区底色。
-#[must_use]
-pub fn selection_bg() -> Rgba {
-    rgb(0xcfe4fd)
-}
-
-/// 光标颜色。
-#[must_use]
-pub fn caret_color() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 状态栏背景。
-#[must_use]
-pub fn status_bar_bg() -> Rgba {
-    rgb(0xf6f8fa)
-}
-
-/// 状态栏文字。
-#[must_use]
-pub fn status_bar_text() -> Rgba {
-    rgb(0x59636e)
-}
-
-/// 侧栏背景。
-#[must_use]
-pub fn sidebar_bg() -> Rgba {
-    rgb(0xf6f8fa)
-}
-
-/// 侧栏与正文之间的分隔线。
-#[must_use]
-pub fn sidebar_border() -> Rgba {
-    rgb(0xd0d7de)
-}
-
-/// 侧栏"已选中但未打开"的浅色底（与"已打开"的蓝色区分开）。
-#[must_use]
-pub fn sidebar_selected_bg() -> Rgba {
-    rgb(0xeaeef6)
-}
-
-/// 危险操作（删除）的文字色。
-#[must_use]
-pub fn danger_text() -> Rgba {
-    rgb(0xcf222e)
-}
-
-/// 右键菜单 / popup 的面板底色。
-#[must_use]
-pub fn menu_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 行内输入框的表面色（不透明，压住行背景的蓝/浅色）。
-#[must_use]
-pub fn input_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 行内输入框边框（中性灰，和行底色分层）。
-#[must_use]
-pub fn input_border() -> Rgba {
-    rgb(0x57606a)
-}
-
-/// 行内输入框的"选中"高亮：**比行选中底色（0xcfe4fd）明显更深**的蓝，
-/// 深色文字压在上面仍有足够对比（约 7:1）。
-#[must_use]
-pub fn input_selection() -> Rgba {
-    rgb(0x7aa7e8)
-}
-
-/// 行内输入框的 caret（深色，在白色底色与深蓝高亮上都清楚）。
-#[must_use]
-pub fn input_caret() -> Rgba {
-    rgb(0x1f2328)
-}
-
-/// 行内代码的底色（浅灰，压在窗口底色上仍可读）。
-#[must_use]
-pub fn code_bg() -> Rgba {
-    rgb(0xeff1f3)
-}
-
-/// 链接文字色（与正文区分，再配合下划线）。
-#[must_use]
-pub fn link_color() -> Rgba {
-    rgb(0x0969da)
 }
 
 /// 等宽字体族（行内代码用）；找不到时退回编辑器主字体。
@@ -178,100 +87,10 @@ pub const TASK_BOX_MIN_SIZE: f32 = 9.0;
 /// 任务复选框圆角（像素）。
 pub const TASK_BOX_RADIUS: f32 = 3.0;
 
-/// 任务复选框（未勾选）底色。
-#[must_use]
-pub fn task_box_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 任务复选框（未勾选）描边色。
-#[must_use]
-pub fn task_box_border() -> Rgba {
-    rgb(0x8c959f)
-}
-
-/// 任务复选框（已勾选）底色 / 描边色（主题强调色）。
-#[must_use]
-pub fn task_box_checked_bg() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 任务复选框（已勾选）描边色。
-#[must_use]
-pub fn task_box_checked_border() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 已勾选时的勾形颜色（压在强调色上）。
-#[must_use]
-pub fn task_box_check() -> Rgba {
-    rgb(0xffffff)
-}
-
 /// 引用块左侧竖条宽度（像素）。
 pub const QUOTE_BAR_WIDTH: f32 = 3.0;
 /// 竖条与文字之间的距离（像素）。
 pub const QUOTE_BAR_GAP: f32 = 6.0;
-
-/// 引用块左侧竖条的颜色（比正文弱，用于"这是个引用块"的视觉锚点）。
-#[must_use]
-pub fn quote_bar_color() -> Rgba {
-    rgb(0xc4c9d0)
-}
-
-/// 引用块正文颜色（略弱化，字号不变）。
-#[must_use]
-pub fn quote_text_color() -> Rgba {
-    rgb(0x57606a)
-}
-
-/// 搜索结果里高亮片段的底色（浅黄，和正文区分开）。
-#[must_use]
-pub fn search_highlight_bg() -> Rgba {
-    rgb(0xfff1b8)
-}
-
-/// 高亮片段的文字色（保持与正文一致的深浅，避免"高亮处反而看不清"）。
-#[must_use]
-pub fn search_highlight_text() -> Rgba {
-    rgb(0x24292f)
-}
-
-/// 索引降级/查询失败的提示色。
-#[must_use]
-pub fn search_warn_text() -> Rgba {
-    rgb(0xb35900)
-}
-
-/// 进度条底槽色（浅灰，和面板背景区分）。
-#[must_use]
-pub fn search_progress_track() -> Rgba {
-    rgb(0xe6e9ed)
-}
-
-/// 进度条填充色（低饱和蓝，与选区色同族）。
-#[must_use]
-pub fn search_progress_fill() -> Rgba {
-    rgb(0x7aa7e8)
-}
-
-/// 开关「打开」态底色。
-#[must_use]
-pub fn search_toggle_active() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 开关「打开」态文字色。
-#[must_use]
-pub fn search_toggle_active_text() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 搜索结果里"当前选中分组"的底色（浅蓝，保证正文与统计行都可读）。
-#[must_use]
-pub fn search_group_selected() -> Rgba {
-    rgb(0xe8f0fb)
-}
 
 // ---------------------------------------------------------------------------
 // 图片 Object Block（ADR 0019 S2a）
@@ -294,54 +113,12 @@ pub const OBJECT_SELECTED_BORDER: f32 = 2.0;
 /// 未选中时图片边框宽度（像素；0 = 不描边）。
 pub const OBJECT_BORDER: f32 = 0.0;
 
-/// 占位框底色（浅灰，与正文区分但不抢眼）。
-#[must_use]
-pub fn object_placeholder_bg() -> Rgba {
-    rgb(0xf3f4f6)
-}
-
-/// 占位框边框色。
-#[must_use]
-pub fn object_placeholder_border() -> Rgba {
-    rgb(0xd0d7de)
-}
-
-/// 占位文案颜色。
-#[must_use]
-pub fn object_label_color() -> Rgba {
-    rgb(0x59636e)
-}
-
-/// 选中态描边色（与光标同族的蓝，明确"选中了整块"）。
-#[must_use]
-pub fn object_selected_border() -> Rgba {
-    rgb(0x0969da)
-}
-
 /// 悬浮工具条高度（像素，Obsidian 式圆形/胶囊按钮）。
 pub const OBJECT_TOOLBAR_HEIGHT: f32 = 28.0;
 /// 悬浮工具条按钮（单个）宽度（像素）。
 pub const OBJECT_TOOLBAR_BUTTON_WIDTH: f32 = 28.0;
 /// 悬浮工具条与图片顶部的间距（像素）。
 pub const OBJECT_TOOLBAR_GAP: f32 = 4.0;
-
-/// 悬浮工具条底色（不透明，压住图片也看得清）。
-#[must_use]
-pub fn object_toolbar_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 悬浮工具条边框色。
-#[must_use]
-pub fn object_toolbar_border() -> Rgba {
-    rgb(0xd0d7de)
-}
-
-/// 悬浮工具条按钮文字色。
-#[must_use]
-pub fn object_toolbar_text() -> Rgba {
-    rgb(0x1f2328)
-}
 
 // ---------------------------------------------------------------------------
 // 表格 Object Block（ADR 0019 S3a）
@@ -383,33 +160,6 @@ pub const TABLE_ACTIONS_PAD: f32 = 4.0;
 /// 按钮圆角（像素）。
 pub const TABLE_ACTIONS_RADIUS: f32 = 6.0;
 
-/// 边缘操作浮层底色（与悬浮工具条一致，压住下方文字也看得清）。
-#[must_use]
-pub fn table_actions_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 边缘操作浮层边框色。
-#[must_use]
-pub fn table_actions_border() -> Rgba {
-    rgb(0xd0d7de)
-}
-
-/// 边缘操作浮层按钮文字色。
-#[must_use]
-pub fn table_actions_text() -> Rgba {
-    rgb(0x1f2328)
-}
-
-/// 边缘操作浮层**禁用**按钮的文字色（例如只剩 1 列时的「删除列」）。
-///
-/// 禁用是“提示”而不是隐藏：按钮画出来但明显弱化，用户能看出这里以后可能有动作，
-/// 同时点击不产生任何请求（不把表格改成非法结构）。
-#[must_use]
-pub fn table_actions_text_disabled() -> Rgba {
-    rgb(0x8c959f)
-}
-
 // ---------------------------------------------------------------------------
 // 表格行列拖拽把手（ADR 0019 S3b5：拖拽重排行 / 列）
 // ---------------------------------------------------------------------------
@@ -429,60 +179,8 @@ pub const TABLE_DRAG_INDICATOR_THICKNESS: f32 = 2.0;
 /// 指针离开表格多远算“拖出表格 → 取消”（像素；任意方向）。
 pub const TABLE_DRAG_CANCEL_MARGIN: f32 = 24.0;
 
-/// 把手（可拖拽）底色：比边框略深，停在表头/行边框上仍然可见。
-#[must_use]
-pub fn table_drag_handle_bg() -> Rgba {
-    rgb(0x8c959f)
-}
-
-/// 把手悬停底色（drag affordance 的高亮）。
-#[must_use]
-pub fn table_drag_handle_hover_bg() -> Rgba {
-    rgb(0x57606a)
-}
-
-/// 拖动中的插入位置指示线颜色（主题强调色）。
-#[must_use]
-pub fn table_drag_indicator() -> Rgba {
-    rgb(0x0969da)
-}
-
-// ---------------------------------------------------------------------------
-// 表格整行/整列选中 + 拖拽 ghost（ADR 0019 S3b6：Obsidian 式选中/拖动反馈）
-// ---------------------------------------------------------------------------
-
-/// 整行/整列选中的填充色：**低透明度**（约 12%），压在表格上文字仍然清晰可读。
-#[must_use]
-pub fn table_axis_selection_bg() -> Rgba {
-    rgba(0x0969da1f)
-}
-
-/// 整行/整列选中的边框色（强调色）。
-#[must_use]
-pub fn table_axis_selection_border() -> Rgba {
-    rgb(0x0969da)
-}
-
 /// 整行/整列选中的边框宽度（像素）。
 pub const TABLE_AXIS_SELECTION_BORDER: f32 = 2.0;
-
-/// 被选中的行/列把手底色：强调色，与普通灰把手区分（选中反馈的一部分）。
-#[must_use]
-pub fn table_drag_handle_selected_bg() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 拖拽 ghost（跟随指针的整行/整列半透明预览）填充色（约 20%）。
-#[must_use]
-pub fn table_drag_ghost_bg() -> Rgba {
-    rgba(0x0969da33)
-}
-
-/// 拖拽 ghost 的边框色。
-#[must_use]
-pub fn table_drag_ghost_border() -> Rgba {
-    rgb(0x0969da)
-}
 
 /// 拖拽 ghost 的边框宽度（像素）。
 pub const TABLE_DRAG_GHOST_BORDER: f32 = 1.0;
@@ -499,18 +197,6 @@ pub const TABLE_DRAG_GHOST_COLUMN_HEIGHT: f32 = 8.0;
 pub const TABLE_DRAG_GHOST_ROW_WIDTH: f32 = 8.0;
 /// 拖动 ghost 的行块高度。
 pub const TABLE_DRAG_GHOST_ROW_HEIGHT: f32 = 22.0;
-
-/// ghost 上“移动第 N 列/行”浮层的底色（深色半透明，压在任何表格内容上都可读）。
-#[must_use]
-pub fn table_drag_ghost_label_bg() -> Rgba {
-    rgba(0x1f2328e6)
-}
-
-/// ghost 浮层的文字色。
-#[must_use]
-pub fn table_drag_ghost_label_text() -> Rgba {
-    rgb(0xffffff)
-}
 
 /// ghost 浮层与指针的横向间距（像素）。
 pub const TABLE_DRAG_GHOST_LABEL_OFFSET_X: f32 = 14.0;
@@ -538,139 +224,190 @@ pub const EDITOR_CONTEXT_MENU_LINK_HEIGHT: f32 = 86.0;
 
 /// 确认框面板宽度（像素）。
 pub const LINK_CONFIRM_WIDTH: f32 = 340.0;
-/// 确认框遮罩色（半透明黑，压住正文但不完全遮挡上下文）。
-#[must_use]
-pub fn link_confirm_overlay() -> Rgba {
-    rgba(0x00000033)
-}
-/// 确认框「打开」主按钮底色。
-#[must_use]
-pub fn link_confirm_primary_bg() -> Rgba {
-    rgb(0x0969da)
-}
-/// 确认框「打开」主按钮文字色。
-#[must_use]
-pub fn link_confirm_primary_text() -> Rgba {
-    rgb(0xffffff)
-}
-/// 链接提示（非阻塞 toast）底色。
-#[must_use]
-pub fn link_notice_bg() -> Rgba {
-    rgba(0x1f2328e6)
-}
-/// 链接提示（非阻塞 toast）文字色。
-#[must_use]
-pub fn link_notice_text() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 表格外框 / 单元格分隔线颜色。
-#[must_use]
-pub fn table_border() -> Rgba {
-    rgb(0xd0d7de)
-}
-
-/// 表格底色（不透明，压住正文行背景）。
-#[must_use]
-pub fn table_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 表头底色（与正文行区分）。
-#[must_use]
-pub fn table_header_bg() -> Rgba {
-    rgb(0xf6f8fa)
-}
-
-/// 选中单元格的底色（ADR 0019 S3b2）：与文本选区同色系，压在表格底色之上、
-/// 单元格文字之下，因此文字仍然清晰可读。
-#[must_use]
-pub fn table_cell_selected_bg() -> Rgba {
-    rgb(0xdbeafe)
-}
-
-/// 选中单元格的描边色（2px，压住 1px 网格线）。
-#[must_use]
-pub fn table_cell_selected_border() -> Rgba {
-    rgb(0x0969da)
-}
 
 /// 选中单元格的描边宽度（像素）。
 pub const TABLE_CELL_SELECTED_BORDER: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
-// 图谱覆盖层（G1）：全屏 canvas 自绘的背景/节点/边/标签颜色。
-// 与编辑器共用同一套中性灰 + 强调蓝，避免出现第二套配色。
+// 颜色：语义 token 兼容包装（ADR 0021）
 // ---------------------------------------------------------------------------
+//
+// 每个函数都读**全局当前主题**。浅色主题的值与迁移前硬编码逐色一致；深色主题
+// 由 `crate::theme` 提供。绘制代码不要新增 `rgb(...)` 字面量。
 
-/// 图谱覆盖层的背景（近不透明的窗口底色：盖住编辑器但仍能透出一点层次）。
-#[must_use]
-pub fn graph_backdrop() -> Rgba {
-    gpui::rgba(0xf6f8faf7)
+macro_rules! theme_token_fns {
+    ($($(#[$doc:meta])* $name:ident => $field:ident),* $(,)?) => {
+        $(
+            $(#[$doc])*
+            #[must_use]
+            pub fn $name() -> Rgba {
+                crate::theme::current_theme().$field
+            }
+        )*
+    };
 }
 
-/// 图谱顶部工具条的底色（不透明，压住下面的边线）。
-#[must_use]
-pub fn graph_toolbar_bg() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 节点填充色（未悬停）。
-#[must_use]
-pub fn graph_node_bg() -> Rgba {
-    rgb(0xdbeafe)
-}
-
-/// 节点描边色（未悬停）。
-#[must_use]
-pub fn graph_node_border() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 悬停节点/邻居节点的填充色（强调态）。
-#[must_use]
-pub fn graph_node_active_bg() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 悬停时的节点文字色（深底白字）。
-#[must_use]
-pub fn graph_node_active_text() -> Rgba {
-    rgb(0xffffff)
-}
-
-/// 与悬停节点无关的节点被压暗后的填充色。
-#[must_use]
-pub fn graph_node_dim_bg() -> Rgba {
-    rgb(0xf0f3f6)
-}
-
-/// 与悬停节点无关的节点被压暗后的描边色。
-#[must_use]
-pub fn graph_node_dim_border() -> Rgba {
-    rgb(0xd0d7de)
-}
-
-/// 节点标签文字色（未悬停）。
-#[must_use]
-pub fn graph_label_text() -> Rgba {
-    rgb(0x1f2328)
-}
-
-/// 边线颜色（未高亮）。
-#[must_use]
-pub fn graph_edge() -> Rgba {
-    rgb(0xc3ccd6)
-}
-
-/// 悬停高亮时的边线颜色。
-#[must_use]
-pub fn graph_edge_active() -> Rgba {
-    rgb(0x0969da)
-}
-
-/// 悬停时被压暗的边线颜色（只突出与被悬停节点相连的边）。
-#[must_use]
-pub fn graph_edge_dim() -> Rgba {
-    rgb(0xe4e8ec)
+theme_token_fns! {
+    /// 窗口背景。
+    window_bg => window_bg,
+    /// 正文颜色。
+    text_color => text,
+    /// 选区底色。
+    selection_bg => selection_bg,
+    /// 光标颜色。
+    caret_color => caret,
+    /// 状态栏背景。
+    status_bar_bg => status_bar_bg,
+    /// 状态栏文字。
+    status_bar_text => status_bar_text,
+    /// 侧栏背景。
+    sidebar_bg => sidebar_bg,
+    /// 侧栏与正文之间的分隔线。
+    sidebar_border => sidebar_border,
+    /// 侧栏"已选中但未打开"的浅色底（与"已打开"的蓝色区分开）。
+    sidebar_selected_bg => sidebar_selected_bg,
+    /// 危险操作（删除）的文字色。
+    danger_text => danger,
+    /// 右键菜单 / popup 的面板底色。
+    menu_bg => surface,
+    /// 行内输入框的表面色（不透明，压住行背景的蓝/浅色）。
+    input_bg => input_bg,
+    /// 行内输入框边框（中性灰，和行底色分层）。
+    input_border => input_border,
+    /// 行内输入框的"选中"高亮：比行选中底色明显更深，深色文字压在上面仍有足够对比。
+    input_selection => input_selection,
+    /// 行内输入框的 caret（深色，在白色底色与深蓝高亮上都清楚）。
+    input_caret => input_caret,
+    /// 行内代码的底色（浅灰，压在窗口底色上仍可读）。
+    code_bg => code_bg,
+    /// 链接文字色（与正文区分，再配合下划线）。
+    link_color => link,
+    /// 任务复选框（未勾选）底色。
+    task_box_bg => task_box_bg,
+    /// 任务复选框（未勾选）描边色。
+    task_box_border => task_box_border,
+    /// 任务复选框（已勾选）底色 / 描边色（主题强调色）。
+    task_box_checked_bg => task_box_checked_bg,
+    /// 任务复选框（已勾选）描边色。
+    task_box_checked_border => task_box_checked_border,
+    /// 已勾选时的勾形颜色（压在强调色上）。
+    task_box_check => task_box_check,
+    /// 引用块左侧竖条的颜色（比正文弱，用于"这是个引用块"的视觉锚点）。
+    quote_bar_color => quote_border,
+    /// 引用块正文颜色（略弱化，字号不变）。
+    quote_text_color => quote_text,
+    /// 搜索结果里高亮片段的底色（浅黄，和正文区分开）。
+    search_highlight_bg => search_highlight_bg,
+    /// 高亮片段的文字色（保持与正文一致的深浅，避免"高亮处反而看不清"）。
+    search_highlight_text => search_highlight_text,
+    /// 索引降级/查询失败的提示色。
+    search_warn_text => warning,
+    /// 进度条底槽色（浅灰，和面板背景区分）。
+    search_progress_track => search_progress_track,
+    /// 进度条填充色（低饱和蓝，与选区色同族）。
+    search_progress_fill => search_progress_fill,
+    /// 开关「打开」态底色。
+    search_toggle_active => accent,
+    /// 开关「打开」态文字色。
+    search_toggle_active_text => on_accent,
+    /// 搜索结果里"当前选中分组"的底色（浅蓝，保证正文与统计行都可读）。
+    search_group_selected => search_group_selected,
+    /// 占位框底色（浅灰，与正文区分但不抢眼）。
+    object_placeholder_bg => object_placeholder_bg,
+    /// 占位框边框色。
+    object_placeholder_border => object_placeholder_border,
+    /// 占位文案颜色。
+    object_label_color => object_label_color,
+    /// 选中态描边色（与光标同族的蓝，明确"选中了整块"）。
+    object_selected_border => object_selected_border,
+    /// 悬浮工具条底色（不透明，压住图片也看得清）。
+    object_toolbar_bg => object_toolbar_bg,
+    /// 悬浮工具条边框色。
+    object_toolbar_border => object_toolbar_border,
+    /// 悬浮工具条按钮文字色。
+    object_toolbar_text => object_toolbar_text,
+    /// 边缘操作浮层底色（与悬浮工具条一致，压住下方文字也看得清）。
+    table_actions_bg => table_actions_bg,
+    /// 边缘操作浮层边框色。
+    table_actions_border => table_actions_border,
+    /// 边缘操作浮层按钮文字色。
+    table_actions_text => table_actions_text,
+    /// 边缘操作浮层**禁用**按钮的文字色（例如只剩 1 列时的「删除列」）。
+    table_actions_text_disabled => table_actions_text_disabled,
+    /// 把手（可拖拽）底色：比边框略深，停在表头/行边框上仍然可见。
+    table_drag_handle_bg => table_drag_handle_bg,
+    /// 把手悬停底色（drag affordance 的高亮）。
+    table_drag_handle_hover_bg => table_drag_handle_hover_bg,
+    /// 拖动中的插入位置指示线颜色（主题强调色）。
+    table_drag_indicator => table_drag_indicator,
+    /// 整行/整列选中的填充色：低透明度，压在表格上文字仍然清晰可读。
+    table_axis_selection_bg => table_axis_selection_bg,
+    /// 整行/整列选中的边框色（强调色）。
+    table_axis_selection_border => table_axis_selection_border,
+    /// 被选中的行/列把手底色：强调色，与普通灰把手区分（选中反馈的一部分）。
+    table_drag_handle_selected_bg => table_drag_handle_selected_bg,
+    /// 拖拽 ghost（跟随指针的整行/整列半透明预览）填充色。
+    table_drag_ghost_bg => table_drag_ghost_bg,
+    /// 拖拽 ghost 的边框色。
+    table_drag_ghost_border => table_drag_ghost_border,
+    /// ghost 上"移动第 N 列/行"浮层的底色（压在任何表格内容上都可读）。
+    table_drag_ghost_label_bg => table_drag_ghost_label_bg,
+    /// ghost 浮层的文字色。
+    table_drag_ghost_label_text => table_drag_ghost_label_text,
+    /// 确认框遮罩色（半透明黑，压住正文但不完全遮挡上下文）。
+    link_confirm_overlay => link_confirm_overlay,
+    /// 确认框「打开」主按钮底色。
+    link_confirm_primary_bg => link_confirm_primary_bg,
+    /// 确认框「打开」主按钮文字色。
+    link_confirm_primary_text => link_confirm_primary_text,
+    /// 链接提示（非阻塞 toast）底色。
+    link_notice_bg => link_notice_bg,
+    /// 链接提示（非阻塞 toast）文字色。
+    link_notice_text => link_notice_text,
+    /// 表格外框 / 单元格分隔线颜色。
+    table_border => table_border,
+    /// 表格底色（不透明，压住正文行背景）。
+    table_bg => table_bg,
+    /// 表头底色（与正文行区分）。
+    table_header_bg => table_header_bg,
+    /// 选中单元格的底色：与文本选区同色系，压在表格底色之上、单元格文字之下。
+    table_cell_selected_bg => table_cell_selected_bg,
+    /// 选中单元格的描边色（2px，压住 1px 网格线）。
+    table_cell_selected_border => table_cell_selected_border,
+    /// 图谱覆盖层的背景（近不透明的窗口底色：盖住编辑器但仍能透出一点层次）。
+    graph_backdrop => graph_backdrop,
+    /// 图谱顶部工具条的底色（不透明，压住下面的边线）。
+    graph_toolbar_bg => graph_toolbar_bg,
+    /// 节点填充色（未悬停）。
+    graph_node_bg => graph_node_bg,
+    /// 节点描边色（未悬停）。
+    graph_node_border => graph_node_border,
+    /// 悬停节点/邻居节点的填充色（强调态）。
+    graph_node_active_bg => graph_node_active_bg,
+    /// 悬停时的节点文字色（深底白字）。
+    graph_node_active_text => graph_node_active_text,
+    /// 与悬停节点无关的节点被压暗后的填充色。
+    graph_node_dim_bg => graph_node_dim_bg,
+    /// 与悬停节点无关的节点被压暗后的描边色。
+    graph_node_dim_border => graph_node_dim_border,
+    /// 节点标签文字色（未悬停）。
+    graph_label_text => graph_label_text,
+    /// 边线颜色（未高亮）。
+    graph_edge => graph_edge,
+    /// 悬停高亮时的边线颜色。
+    graph_edge_active => graph_edge_active,
+    /// 悬停时被压暗的边线颜色（只突出与被悬停节点相连的边）。
+    graph_edge_dim => graph_edge_dim,
+    /// Mermaid 占位框底色。
+    mermaid_placeholder_bg => mermaid_placeholder_bg,
+    /// Mermaid 占位文案颜色。
+    mermaid_placeholder_text => mermaid_placeholder_text,
+    /// Mermaid 渲染失败文字色。
+    mermaid_error => mermaid_error,
+    /// 图片放大遮罩色。
+    image_overlay_bg => image_overlay_bg,
+    /// 设置/搜索浮层遮罩。
+    overlay_scrim => overlay_scrim,
+    /// 设置页浅遮罩。
+    overlay_scrim_soft => overlay_scrim_soft,
 }

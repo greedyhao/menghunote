@@ -49,7 +49,9 @@
 
 use rusqlite::OptionalExtension;
 
-use super::{bump_authz_and_auth, forbidden, i64_of, invalid, proto_sha256, two_scope_signers};
+use super::{
+    bump_authz_and_auth, forbidden, i64_of, invalid, proto_sha256, two_scope_signers, SigPolicy,
+};
 use crate::checkpoints;
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{sha256, Hash32, Id16};
@@ -208,6 +210,7 @@ pub(super) fn validate_begin(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<RotationPlan> {
     ensure_can_begin(conn, vault)?;
     let payload =
@@ -226,7 +229,7 @@ pub(super) fn validate_begin(
     if !payload.revoke_ids.is_empty() {
         scopes.push(proto::CapScope::REVOKE);
     }
-    two_scope_signers(conn, now, signed, &digest_input, &scopes, &[])?;
+    two_scope_signers(conn, now, signed, &digest_input, &scopes, &[], policy)?;
     ensure_revocable(conn, &payload.revoke_ids)?;
     if let Some(first) = payload.revoke_ids.first() {
         super::devices::ensure_revoke_quorum(conn, now, vault, &payload.revoke_ids)?;
@@ -253,6 +256,7 @@ pub(super) fn validate_abort(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<RotationPlan> {
     let payload =
         proto::RotationAbortPayloadV2::decode(&signed.operation.payload).map_err(|_| invalid())?;
@@ -273,6 +277,7 @@ pub(super) fn validate_abort(
         &digest_input,
         &[proto::CapScope::ROTATE],
         &[],
+        policy,
     )?;
     let _ = vault;
     Ok(RotationPlan::Abort(AbortPlan {
@@ -289,6 +294,7 @@ pub(super) fn validate_restart(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<RotationPlan> {
     if vault.state != vault::VaultState::Rotating {
         return Err(Error::api(ErrorCode::InvalidState));
@@ -313,7 +319,7 @@ pub(super) fn validate_restart(
     if !payload.extra_ids.is_empty() {
         scopes.push(proto::CapScope::REVOKE);
     }
-    two_scope_signers(conn, now, signed, &digest_input, &scopes, &[])?;
+    two_scope_signers(conn, now, signed, &digest_input, &scopes, &[], policy)?;
     ensure_revocable(conn, &payload.extra_ids)?;
     if !payload.extra_ids.is_empty() {
         super::devices::ensure_revoke_quorum(conn, now, vault, &payload.extra_ids)?;
@@ -339,6 +345,7 @@ pub(super) fn validate_add_revokes(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<RotationPlan> {
     if vault.state != vault::VaultState::Rotating {
         return Err(Error::api(ErrorCode::InvalidState));
@@ -361,6 +368,7 @@ pub(super) fn validate_add_revokes(
         &digest_input,
         &[proto::CapScope::ROTATE, proto::CapScope::REVOKE],
         &[],
+        policy,
     )?;
     ensure_revocable(conn, &payload.device_ids)?;
     super::devices::ensure_revoke_quorum(conn, now, vault, &payload.device_ids)?;
@@ -398,6 +406,7 @@ pub(super) fn validate_activate(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<RotationPlan> {
     let payload =
         proto::EpochActivatePayloadV2::decode(&signed.operation.payload).map_err(|_| invalid())?;
@@ -430,6 +439,7 @@ pub(super) fn validate_activate(
         &digest_input,
         &[proto::CapScope::ROTATE],
         &[],
+        policy,
     )?;
     // §28.1 条目 2–3：只 promote 被指名的两个 cid（独立性/覆盖 S/完整性都在这里校验）。
     let pair = checkpoints::promote_named_candidates(

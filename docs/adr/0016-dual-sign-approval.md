@@ -367,3 +367,279 @@ cargo test -p menghunote-app --features dev-sync # 365 passed（基线）
   401→`Expired`（relay 410）与 `CAS_CONFLICT`（409）；跨 vault 导入拒绝；路径篡改 decode 拒绝；
   超限文件拒绝；草稿保存/恢复后从新 client 提交；`LossyTransport` 丢响应 → `Transport` →
   重发原字节 → `Confirmed`，控制链**只前进一条**（不重复写链）。
+
+## S4d1c 实施记录（2026-11-18）
+
+> 状态：**S4d1c 已实现但默认隐藏**（Linux，dev `e3830ec` + 本切片；个人用户不需要 V2，
+> 只有 `MENGHUNOTE_EXPERIMENTAL_V2=1` 才在设置页显示）。范围 = App 侧**管理 UI**
+> （设置页里的「管理（V2 控制面 / 通道 A 双签）」区）：状态概览、设备/成员只读列表、
+> 审批详情/指纹、`.mn-approval` 导入导出、A 签署 / B 加签 / 满签提交 / 取消。
+> 不改 relay / sync-proto / schema / wire；不新增依赖；**真实 vault 仍未启用 V2**；
+> 真实 TLS/Windows 未验，不宣称生产可用。
+>
+> 代码：`crates/app/src/dev_sync/management.rs`（新模块：快照/执行体/worker/面板）、
+> `crates/app/src/dev_sync/mod.rs`（注册/导出）、`crates/app/src/dev_sync/service.rs`
+> （只读 `vault_path` 投影）、`crates/app/src/shell.rs`（面板创建/设置页管理区/关停）、
+> `crates/app/src/onboarding/app_root.rs`（真实设置页入口）；
+> `crates/sync/src/approval_v1.rs`（`comparison_fingerprint`/`verify_against`/
+> `operation_summary` 公开客户端方法）、`crates/sync/src/management_v2.rs`
+> （`relay_member_hints` 只读成员投影）。**没有 wire 变更**。
+
+### 1. 入口与布局
+
+- 唯一入口在设置页：`AppRoot` 的真实设置覆盖层新增「管理（V2 控制面 / 通道 A 双签）」
+  区（默认收起；`settings-toggle-management` 展开，展开时对面板调一次 `activate`
+  触发首次刷新）；AppShell 自己的设置页有同一区块（`settings-toggle-management`），
+  便于 headless 测试与诊断。**不新建窗口**。
+- 面板固定 selector：`mgmt-panel` / `mgmt-v2-status` / `mgmt-control` / `mgmt-policy` /
+  `mgmt-pending` / `mgmt-cap-<i>` / `mgmt-device-<i>` / `mgmt-approval` /
+  `mgmt-approval-state|kind|target|scopes|ids|path|revs` /
+  `mgmt-approval-fingerprint-128` / `mgmt-toggle-fingerprint` /
+  `mgmt-approval-fingerprint-256` / `mgmt-approval-slot-<i>` /
+  `mgmt-approval-receipt|failure|invalid|expired` / `mgmt-sign` / `mgmt-submit` /
+  `mgmt-cancel-approval` / `mgmt-path-input` / `mgmt-base64-input` /
+  `mgmt-import-file|base64` / `mgmt-export-file` / `mgmt-copy-base64` /
+  `mgmt-error` / `mgmt-notice`。
+
+### 2. 状态概览与设备/成员
+
+- `v2` 来自**已验证回放**（`ControlStateV2::is_v2`）。legacy vault 显示固定文案
+  「当前 vault 未启用 V2（没有已回放的 UpgradePolicy）…」：不展示 cap/设备成功状态、
+  不伪造待办、不把"未启用"当错误；管理动作全部只给明确拒绝原因。
+- control head/rev、authz/authority rev、authz 状态、PolicyV2（门限/TTL）、cap 摘要
+  （主体/scope/生效窗/撤销/此刻是否有效）全部来自已验证控制链。
+- 设备列表：**ACTIVE/REVOKED 只信已验证控制链**；PENDING 来自 relay `/control`
+  响应里的 `members` 投影（`RelayMemberHintV2`，明确标注"relay 投影、不可执行"）。
+  relay 伪造该投影最多影响展示，不参与 cap 选择/门限/任何管理动作，也不写 pin/缓存。
+- 待办审批数 = PENDING 设备数 + 本机未确认草稿数（通道 A 没有 relay 收件箱）。
+
+### 3. 审批详情（双端比对）
+
+- 详情全部由 `ApprovalEnvelopeV1`/`OperationV2` 的公开证据投影：kind、目标
+  （`approval_v1::operation_summary` 统一解析，避免双端文案漂移）、cap scope、
+  租户 vault/实例/唯一提交路径、CAS rev/前链尾/authz/authority、签名时刻与短窗截止、
+  冻结签名槽（角色/设备/cap/公钥短指纹/已签）、发起者下标、回执/失败分类。
+- `h` 的 **128 位比较指纹** = `SHA256(op_bytes)` 前 16 字节（32 hex，4×8 分组）；
+  可展开完整 256 位（64 hex，8×8 分组）。这只是展示投影，校验仍用完整 `h`。
+- 草稿失效：除 `Confirmed` 外的状态会重新走 `verify_against(本地已验证回放, now)`；
+  链前进/证据缺口 → 显示「已失效：…（禁止自动改 rev/延 deadline；必须新建 Operation）」；
+  `now > not_after` → 显示已超出短窗。UI 的签署/提交按钮在这两种情况下**本地拦截**，
+  不会把命令发给执行体。
+
+### 4. 导入/导出与双签动作
+
+- 导入：文件（`.mn-approval`）或带 `mn-approval-v1:` 前缀的 base64url；复用
+  `V2ManagementClient::import_approval_file/base64`（刷新已验证链 + 限长 1 MiB +
+  `verify_import`）。解析本身不执行、不自动签；验证需要显式刷新，失败只显示摘要。
+- 导出：文件走 `ApprovalDraftV1::write_file`（临时文件 + rename，标记已导交给对方）；
+  base64 走 `to_base64` 并写剪贴板（面板不把完整文本渲染进布局）。
+- 动作：`Sign` → `verify_against`（签前重验）→ `sign_with`（只签唯一匹配的未签槽；
+  首签必须是发起者）；`Submit` → `submit`（满签前置、时间窗/链位置、自证提交、回执
+  按本地复算链 hash 对账）；`Cancel` → 只清 vault 公开 meta 里的本地草稿（已外发签名
+  不可撤回）。**没有任何自动签/自动改 rev/延 deadline/自动提交**。
+- 失败：提交失败分类写回草稿并持久化；不清库、不换 pin、不回退 creator；可重发的
+  传输/限流/5xx 在 UI 提示「可重发原字节」，其余提示重建 Operation。
+- **等待第二签不持 vault 编辑/同步闸**：管理执行体是独立 worker 线程，从不调用
+  `storage::session` 闸门，也不碰 `AppShell` 的同步状态机；A 签后编辑器仍可输入、
+  自动/手动同步不受影响。
+- 重启恢复：草稿/回执存在 vault 公开 meta（`sync.approval_draft_v1`，ADR 0016 原约定）；
+  面板首次刷新时 `load_draft` 恢复，并重新走 `refresh_control` + `verify_against`
+  重验 pin/控制链。丢响应重发仍由 `ApprovalDraftV1::submit` 的原字节路径幂等处理。
+
+### 5. 秘密纪律
+
+- 本模块**不打印日志**；错误统一经 `sanitize_management_text`：遮恢复码（`mnrec1…`）、
+  URL（`http(s)://` / `mn-pair://`）、绝对路径（`/…/…`、`X:\…`）与 ≥64 字符长
+  token/base64，再截断到 240 字符。UI 只显示摘要。
+- 不直接读写 SQLite/密钥文件：身份由 `DevIdentityStore::load` 在 worker 线程解封，
+  网络/签名只经 `V2ManagementClient`/`ApprovalDraftV1`；面板拿到的全是公开快照。
+
+### 6. 限制（明确不假装验证过的部分）
+
+- **不在 UI 里构造新 Operation**（kind 0/2/3/4/5/11/12/16 的 typed 构造仍在库层
+  S4d1b）；管理页处理"本地草稿 / 导入包"，不提供新建表单。rotation/recovery 只读导入、
+  不构造。
+- relay 成员投影只用于 PENDING 展示；"兑换公钥绑定"等仍是 relay 事实（S4d1a §4）。
+- headless 测试用脚本化执行体验证 UI 状态机与真实 `ApprovalDraftV1` 的导入/导出/
+  Ed25519 签署/草稿持久化；**真实两设备端到端提交**仍由
+  `crates/sync/tests/management_v2.rs`（真实 dev relay）覆盖，未在 App 层重复。
+- 真实 TLS/Windows 系统根/DPAPI 与真实 vault 启用 V2 仍未验（S0 门禁不变）；
+  S4d2 relay 收件箱（schema 13→14）不在本切片。
+
+### 7. 验证（2026-11-18，Linux）
+
+```bash
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+cargo fmt --all -- --check
+cargo clippy -p menghunote-sync -p menghunote-app --all-targets --features dev-sync -- -D warnings
+cargo test -p menghunote-sync
+cargo test -p menghunote-app --features dev-sync
+cargo test -p menghunote-app
+```
+
+新增用例：`crates/app/tests/management_ui.rs`（8 个 `#[gpui::test]`）：
+legacy 真实 relay/vault 的"未启用 V2"、真实 `AppRoot` 设置页入口、概览/设备/审批详情
+与 128/256 位指纹、导入/导出（文件+base64）/A 签/B 加签/满签提交/重启恢复、
+取消只清本地草稿、过期与失效本地拦截、错误脱敏、等待第二签不冻结编辑/同步。
+
+## S4d2 实施记录（2026-11-18）
+
+> 状态：**S4d2 已实现**（Linux，dev `e3830ec` + 本切片）。范围 = relay 侧**审批收件箱（通道 B）**：
+> schema 14、5 个 `/v2/vaults/{V}/approvals*` 端点、事务内授权/验签/幂等/惰性终态。
+> **未做**：客户端管理 UI（S4d1c）、真实 vault 启用 V2、真实 TLS/Windows 实机；
+> relay 仍**不持**任何管理私钥、不代签、不改控制链/门限/Operation 语义。
+>
+> 代码：`crates/relay/src/approvals.rs`（新模块）+ `crates/relay/src/control_v2/mod.rs`
+> （`SigPolicy` / `validate_partial`：半签包**同源干跑**）+ `crates/relay/src/db/schema.rs`
+> （13→14）+ `crates/relay/src/api.rs`（路由/鉴权接线）。
+> 测试：`crates/relay/tests/approvals.rs`（10 个真实 HTTP + 真实 Ed25519 用例）、
+> `crates/relay/tests/migration_v14.rs`（4 个）、模块内 3 个单测。
+> wire 对照见 [`docs/notes/management-cap-v2-wire.md`](../notes/management-cap-v2-wire.md) §11。
+
+### 1. schema 14（13 已被 web admin 的 `vault_registry` 占用）
+
+`SCHEMA_VERSION = 14`；13→14 是**纯新增**迁移（不改任何既有表/数据）：
+
+- `approval_jobs`：PK `(vault_id, request_id)`、UNIQUE `(vault_id, op_digest)`；字段
+  `op_bytes`（canonical `CDE(OperationV2)`，终态清空）/`op_digest`/`kind`/
+  `initiator_device + initiator_cap + initiator_index`/`recipient_device`/
+  `expected_control_rev + expected_head_hash + expected_authz_rev + authority_rev`/
+  `signed_at + not_after`/`created_at`/`expires_at`/`status`/`seq`/`terminal_at`/`receipt_ref`。
+  复合 FK 连 `devices(vault_id, device_id)` 与 `management_caps(vault_id, cap_id)`；
+  所有键/索引都含 `vault_id`。
+- `approval_signatures`：PK `(vault_id, request_id, signer_index)`、复合 FK 连
+  `approval_jobs`；`sig64`（64B）/`received_at`。
+- 索引：`(vault_id, recipient_device, status, seq)`（待办）、
+  `(vault_id, initiator_device, status, seq)`（outgoing）、
+  `(vault_id, status, expires_at)`、`(vault_id, terminal_at)`、
+  `(vault_id, request_id, received_at)`。
+- 迁移：文件库先 `VACUUM INTO <db>.schema13.bak`，再单事务 `CREATE TABLE IF NOT EXISTS`
+  + 索引 + `PRAGMA foreign_key_check` + 写版本；中断整体回滚。版本推断按**表形状**：
+  12 标记齐全才是 12，13 标记（`vault_registry` + `create_tickets.created_at`）齐全才是 13，
+  14 标记（两张收件箱表）齐全才是 14；标记只出现一半 → fail closed（绝不猜）。
+
+**回退口径**：不支持降 schema。`SCHEMA_VERSION=13` 的旧 binary 打开本库会命中
+"schema is newer than this binary" 门禁并拒绝启动；要回到 13 只能恢复 `.schema13.bak`
+完整快照，迁移后新增的收件箱数据与其它写入都会丢失。删除作业（ADR 0018 S3）的分批
+purge 已同步加入两张表（子表 `approval_signatures` 先删，再删 `approval_jobs`）。
+
+### 2. API（只在 v2 挂载；v1 wire 不变）
+
+| 方法 | 路径 | 语义 |
+| --- | --- | --- |
+| POST | `/v2/vaults/{V}/approvals` | 上传 A 已签的 `ApprovalEnvelopeV1`（body `{0: bytes}`，≤1MiB）。首次 201、幂等重放 200 |
+| GET | `.../approvals?role=&status=&after_seq=&limit=` | 自己的待办（默认 `role=recipient`、活状态），分页 ≤50 |
+| GET | `.../approvals/{R}` | 摘要 + 完整 op + 已收签名 + cap 证据（终态只给摘要） |
+| POST | `.../approvals/{R}/signatures` | B 加签（body `{0: bytes(sig64)}`），固定槽位 |
+| POST | `.../approvals/{R}/cancel` | 取消协调（无 body；已外发签名不可撤回） |
+
+响应字段、状态机与错误码见 wire 文档 §11。全部端点要求 realm3 bearer（管理设备 +
+有效 cap），且**事务内**重新鉴权（撤权/轮换/授权 rev 变化立即生效，不存在"读完 token
+再开事务"的授权窗口）。
+
+### 3. 创建/加签的校验顺序
+
+创建（`approvals::create`）：
+1. 严格解码信封：canonical CDE（重编码逐字节相同）、`version=1`、`op_bytes` 必须是
+   `OperationV2` 唯一 canonical 编码、`h=SHA256(op_bytes)`、签名项按槽位严格升序且
+   非零/不越界、cap 证据按 `cap_id` 升序且**恰好等于** role0 槽引用的 cap 集合、
+   control 证据与 `expected_*`/`prev_control_hash`/`authority_rev` 逐项一致
+   （Upgrade 特例：证据 `authz=authority=0`）。
+2. 幂等 `(V,R,h)`：同 R 同 h → 原 job（不重新授权、不改写状态）；同 R 异 h → 409。
+   bearer 仍每请求重验 cap——A 的 cap 撤销/过期后 HTTP 层先拒绝，重放只能发生在
+   bearer 仍有效期间（客户端必须自己保留原包，relay 不是可靠备份）。
+3. kind 白名单：只接**两签 + 两个 Device 槽**的 kind（2/3/4/5/16、6–10、14）。
+   单签邀请（11/12）、Upgrade（0，升级前无法建立 realm3）、RecoveryReset（13，无 Device 槽）、
+   PolicyReplace（1，仍 501）不开放通用收件箱。
+4. `initiator_index` 槽必须是 `Device`、`device_id/cap_id` **等于 realm3 主体/cap**；不符 → 404。
+5. 签名布局：A 必须已签；**非 Device 槽（目标 PoP/恢复根/旧 creator）必须已签**
+   （这些证明沿 A 收集）；至少留一个 Device 槽未签（满签包应直接 submit → 409）。
+6. **同源干跑**：`control_v2::validate_partial` 复用 `/control/submit` 的校验路径
+   （时间窗/链 CAS/kind 门限/payload/路径/I/V/rev/signers/每一个 Device 槽的
+   cap 有效性/ACTIVE/公钥/scope 覆盖/不同设备不同公钥/旧 creator/恢复根/PoP 域验签），
+   只跳过"尚未收到的槽位"的验签（`SigPolicy::Partial`）。干跑包在 `SAVEPOINT` 里，
+   无论成败都回滚——`EpochActivate` 的候选 promote 等投影副作用**绝不由收件箱触发**。
+7. 派生 `recipient` = 另一个 Device 槽；`expires_at = min(op.not_after, 每个 Device 槽
+   cap 的 expires_at)`（以 relay DB 的有效 cap 为准，不用信封证据）。
+8. 限额 → 分配 `seq` → 落库（job + 已收签名，同事务）。
+
+加签（`add_signature`）顺序：可见性（统一 404）→ 惰性终结（EXECUTED/EXPIRED/STALE）→
+固定槽位（realm3 主体/cap 必须就是该 Device 槽）→ 幂等（同字节返回原 job、异字节 409）→
+域验签（`MN/v2/control\0||h`，Device 槽共用 op 摘要）→ 整包干跑（含新签名的完整集合）→
+落库 + 状态 `PENDING/READY`。
+
+### 4. 可见性与失败语义
+
+- list/read/sign/cancel 只对**该 job 的 A 与预选 B**可见；A 用创建时的 `initiator_cap`，
+  B 用 op 里冻结的槽位 cap（换 cap 不认）；任何不符统一 **404**（不提供"存在但不是你的"
+  的 oracle）。
+- 墓碑（正文已清空）下 B 的冻结 cap 已不可考：只要求"本设备持一张覆盖该 kind 基础 scope
+  的当前有效 cap"；摘要里没有任何正文。
+- 到期 → 410 `EXPIRED`；陈旧（head/authz/authority rev 变化）→ 409 `CAS_CONFLICT`
+  （带当前 control rev）；撤权/轮换导致的 bearer 失效 → 403 `REVOKED`；
+  终态取消 → 409 `INVALID_STATE`。
+
+### 5. 生命周期与清理
+
+`PENDING → READY → EXECUTED`（`dedup_v2` 里出现**逐字节相同**的满签包回执，用本地
+op 字节 + 槽位签名重建 `SignedControlV2` 并比较 `request_hash`；relay 摘要不作为授权依据）；
+`READY/PENDING → EXPIRED`（`expires_at`）、`→ STALE`（head/authz/authority rev 变化）、
+`→ CANCELLED`（显式取消）。终态**立即清空** `op_bytes` 与签名（墓碑只留摘要：
+request_id/op_digest/kind/设备/rev/时间/状态/回执 rev/终态时刻），24h 后由有界 sweep
+（每次收件箱请求 ≤64 行）删除；正式 `control_commits`/`dedup_v2` 历史**永不删除**。
+
+实现取舍：清理与业务操作**同事务**，失败请求整体回滚（sweep 也回滚），下次成功请求
+再清一次；这只影响清理时机，不改变终结判定的正确性（始终按提交时刻的事实重算）。
+HTTP 轮询是基线，收件箱**不发** WS 通知（丢通知不影响正确性）。
+
+### 6. 限额/限流/不存什么
+
+完整包 ≤1MiB、vault 待办 ≤64、同一源设备待办 ≤8、待办正文总字节 ≤16MiB、分页 ≤50；
+超限 507 `QUOTA_EXCEEDED` / 413 `REQUEST_TOO_LARGE`。入口复用 v2 业务限流（实例级
+固定窗口）；**没有**独立的 per-IP/per-设备/per-cap 限流器（见 §7 限制）。
+不存笔记明文、root/seed/恢复私钥、邀请 token、私密备注；本模块不写业务日志。
+
+### 7. 已知限制
+
+- 客户端 UI/确认页见 S4d1c 实施记录；本切片 App 仍只走通道 A。
+- 收件箱不接收 PENDING 目标 PoP/Upgrade/恢复根证明的"收集"过程：这些证明必须由 A
+  连同包一起上传（非 Device 槽未签 → 400），relay 不代替它们收集。
+- 未提供 WS 推送/通知；客户端按启动/重连/前台 ~30s 轮询（本切片只保证 HTTP）。
+- 限流是实例级固定窗口，不声称 per-IP/per-设备公平性；上限是资源保护，不是授权。
+- 墓碑回收依赖"下一次成功请求"；长期无人访问的库会保留墓碑行直到下次访问/其它维护。
+- 删除作业（S3）会随 vault 删除清空收件箱（不迁移到别处）；不是"永久审计日志"。
+- 信封类型有**两份实现**（客户端 `crates/sync/src/approval_v1.rs` 与 relay
+  `crates/relay/src/approvals.rs`）：本切片不允许改 sync 客户端，因此没有把纯类型上移
+  `sync-proto`；`docs/notes/management-cap-v2-wire.md` §9 是唯一 wire 契约，两边都有严格
+  解码测试。后续可把 `ApprovalEnvelopeV1` 纯类型与严格解码收口到 `sync-proto`。
+- 真实 TLS/Windows 系统根/DPAPI 与真实 vault 启用 V2 仍未验（S0 门禁不变）。
+
+### 8. 验证（2026-11-18，Linux）
+
+```bash
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+cargo fmt --all -- --check
+cargo clippy -p menghunote-relay -p menghunote-sync-proto --all-targets -- -D warnings
+cargo test -p menghunote-relay        # 373 passed（356 基线 + 3 lib + 10 approvals + 4 migration）
+cargo test -p menghunote-sync-proto   # 61 passed（基线，未改 wire 类型）
+```
+
+新增用例（真实 relay 路由 + 真实 Ed25519 + FakeClock，无 sleep）：
+
+- `tests/approvals.rs`（10）：
+  - 全链路：A 创建 → B list/read（完整 op/签名/cap 证据）→ B 加签 → 满签提交 →
+    再读 `EXECUTED`（回执 rev 对账）→ 默认待办为空、墓碑可查；
+  - 创建负例：无 bearer/ realm1/ B 的 cap 上传 A 包/跨租户 token；篡改签名、缺 A 签、
+    满签包、非 canonical、单签 kind、非 Device 槽未签、>1MiB；head 前进 CAS、
+    过期、B 槽 cap 不存在、同设备两 cap 凑数；幂等重放与同 R 异 h 409；
+  - 可见性：非 A/B 的 ACTIVE 管理设备 read/sign → 404、列表为空；未知 id → 404；
+    未知 query 键 → 400；`limit` 收敛 50；A/B 视角区分；
+  - 加签：错钥/全零 → 400、A 重发自己签名 → 200 幂等、异字节 → 409、撤权后
+    B 的旧 token → 403 `REVOKED`、A 读 → 惰性 `STALE`（正文清空）、终态取消 409；
+  - 生命周期：+301s → `EXPIRED`（410 加签）、+24h 墓碑删除（行/签名都为 0）；
+    取消 → `CANCELLED`、重复取消幂等、加签 409、满签包仍可 submit；
+  - 限额/分页：`limit=2` + `after_seq`、同源设备 8 待办上限 507、取消释放配额。
+- `tests/migration_v14.rs`（4）：13→14 纯新增（非收件箱 schema 对象与既有行逐字节
+  不变）、`.schema13.bak` 快照可独立打开、中断回滚 + 重试、缺元数据的 13/14 形状推断、
+  14 标记只出现一半 fail closed、更高版本门禁不改写数据。
+- 模块内 3 个：信封篡改/非 canonical/版本/证据集合负例、收件箱 kind 白名单、状态往返。

@@ -744,7 +744,7 @@ impl Render for SearchOverlay {
             .items_start()
             .justify_center()
             .pt(px(96.0))
-            .bg(gpui::rgba(0x00000026))
+            .bg(theme::overlay_scrim())
             .track_focus(&self.focus_handle)
             // 点空白（遮罩）= 关闭浮层；面板内部自己拦冒泡。
             .on_mouse_down(

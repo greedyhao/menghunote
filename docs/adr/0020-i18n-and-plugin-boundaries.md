@@ -1,6 +1,7 @@
 # ADR 0020 — i18n 与插件边界（方向提案）
 
 > 状态：**提议**（2026-11-17，用户方向；未冻结实现）。
+> P1 i18n 基础设施 + 首批 UI 文案迁移已实施（2026-11-18，见 §9）；插件 API/加载器仍未开始。
 > 关联：ADR 0003（模块边界）、ADR 0006（sync v1）、ADR 0009/0011（同步 UI/初始化）、
 > ADR 0019（Markdown/Object/资产）。
 >
@@ -167,3 +168,131 @@ Obsidian 的 Mermaid 是内置 Markdown 渲染能力（第一方），社区插�
 3. 插件 UI 的声明式 schema 粒度：只允许命令/设置/列表面板，还是允许自定义布局。
 4. 第一方 sync UI 是否在正式构建中默认编入，还是作为可选 feature。
 5. 插件签名/来源信任模型（官方仓库、手动安装、企业分发）的优先级。
+
+---
+
+## 9. 实施记录（P1，2026-11-18）
+
+> 本节只记录 **P1 i18n 基础设施 + 首批 UI 文案迁移** 的落地事实。插件加载器、
+> host API、同步插件化（P2–P4）仍未开始，§8 的其余待决问题继续开放。
+
+### 9.1 消息格式选型（本切片）
+
+**结论：先用轻量静态 key-value catalog，不引入 `fluent` 等重依赖。**
+
+- 新增纯 crate `crates/i18n`（`menghunote-i18n`）：不依赖 GPUI/storage/sync，
+  **零外部依赖**；消息是 `&'static [(&'static str, &'static str)]` 静态表。
+- 理由：P1 只需要 `t(id)`、`{name}` 插值、单复数两条 key；静态表零启动成本，
+  且能在编译期测试里做「中英 key 集合一致 / 占位符合法」的强校验。当前若引入
+  fluent 生态，会在插件 API 冻结前把消息格式、运行时与工具链一起焊死。
+- **§8 问题 1 仍未决**：fluent vs 轻量 key-value 的最终选型留到插件 API 冻结前
+  评估；届时只替换 `menghunote-i18n` 内部实现，业务代码继续用 `t(...)`。
+- 命名空间：`settings.*` / `sidebar.*` / `editor.menu.*` / `status.*`；
+  `plugin.<plugin_id>.*` 已在规范里预留，但本切片没有插件运行时，不实现装载。
+- 消息 id 常量集中在 `menghunote_i18n::msg`（宏同时生成 `ALL`），catalog 测试断言
+  **catalog key 集合 == msg 常量集合 == 中英两边集合**，杜绝加了一边漏另一边。
+
+### 9.2 API 与回退/复数规则
+
+| API | 行为 |
+| --- | --- |
+| `Locale { ZhCn, En }` | `parse` 接受 `zh`/`zh-CN`/`zh_CN`/`zh-Hans`/`en-US` 等；`detect()` 读 `LC_ALL` → `LANG`，未知/`C`/缺失回退 `ZhCn`（Windows 无 `LANG` 时等价默认 `zh-CN`） |
+| `LocaleMode { ZhCn, En, System }` | 持久化选择；`as_str` = `"system"`/`"zh-CN"`/`"en"`，`resolve(system)` 得输出语言 |
+| `t(id) -> String` | 查找顺序：**当前语言 → 英文 → 中文 → key 本身**；缺 key 不 panic、不打印 |
+| `t_with(id, &[(name, value)])` | 在 `t` 结果上做 `{name}` 逐字替换；未知占位符原样保留；缺 key 时原样返回 id（不拿 key 当模板） |
+| `t_count(one_id, other_id, count)` | `count == 1` 用 `one`，其它（含 0）用 `other`；只支持英文这一条规则，中文两条 key 同文案 |
+| `current_locale()` / `mode()` / `set_mode()` / `set_locale()` | 进程级 `RwLock` 状态；`set_mode(System)` 调用时按环境解析 |
+| `lock_for_test()` | 串行化测试并自动复位（`System` + 中文），只给测试用 |
+
+**禁止字符串拼接语言逻辑**：业务代码只允许 `t`/`t_with`/`t_count`；组合文案用
+带占位符的完整模板（如 `settings.instance_row` 的 `{role}`），不把中英片段先拼再判断。
+
+### 9.3 语言偏好与本机持久化
+
+- 文件：平台配置目录下 `language.json`（与 `theme.json` 同一目录逻辑）；
+  `MENGHUNOTE_LANGUAGE_PATH` 可覆盖（测试/便携）。
+- 内容**只存 locale 选择**（`"system"` / `"zh-CN"` / `"en"`），不存解析结果：
+  ```json
+  { "version": 1, "locale": "system" }
+  ```
+- 原子写：同目录临时文件 → rename；Windows 目标存在时退化为直接覆盖。
+- 缺失/损坏/未知版本/未知值 → 回退 `System`（按 `LC_ALL`/`LANG` 解析，未知语言
+  回退中文），**不阻塞启动**。
+- 启动：`main.rs` 在主题之后调用 `language_settings::init_from_disk()`。
+- 边界：**不同步、不写正文、不写进 vault/schema/wire**；语言与主题互不依赖。
+- 设置页：`AppRoot` 与 `AppShell`（dev-sync）的设置页都挂
+  `appearance_and_language_row()`，外观与语言并排；固定 selector：
+  `settings-language`、`settings-language-zh-CN`、`settings-language-en`、
+  `settings-language-system`、`settings-language-current`。
+- 切换只更新全局语言 + `refresh_windows()`：不重建编辑器、不丢选区/滚动/撤销栈、
+  不产生 `EditRequest`。
+
+### 9.4 覆盖范围（首批迁移）
+
+只迁移以下四处**固定 UI 文案**，全部走 `crates/app/src/ui_text.rs`
+（渲染与测试共用同一入口）：
+
+1. **设置页固定文案**：
+   - 外观区：标题/提示、浅色/深色/跟随系统、当前模式行；
+   - 语言区：标题/提示、中文/English/跟随系统、当前语言行；
+   - 同步区：`设置 · 同步`、`同步设置（DEV ONLY）`、DEV ONLY 提示条、同步面板
+     展开/收起标题与按钮；
+   - 设置页按钮：展开/收起/关闭/复制/设为默认/当前默认、保存模式/relay、
+     关闭（不保存）；
+   - 错误/提示：`无错误` 占位、默认提示、无 active 实例提示、无实例提示、
+     保存时无 active 实例、未勾选 remote_tls 确认、实例未打开时的指纹占位；
+   - 实例/relay/公开信息/安全指纹区标题、实例行角色、`vault_id`/`device_id`/
+     库文件路径标签（**路径值本身不翻译**）。
+2. **侧栏固定文案**：`笔记`、`＋ 笔记`、`＋ 文件夹`、`导出`/`导出中…`、`图谱`、
+   `⚙ 设置`；反向链接面板标题（`反向链接 N` / 英文 `1 backlink`/`N backlinks`）
+   与空态 `没有反向链接`。
+3. **编辑器右键菜单**：`插入`、`表格`、`打开链接`、`复制链接`、`复制 Markdown`。
+4. **状态栏固定提示**：`反向链接 N`、`同步：需处理`、`同步：{status}` 前缀。
+
+**不翻译**：笔记标题/正文/Markdown、用户输入、路径、同步状态行正文、
+worker/配置/解析器返回的错误原文、公开 id、fingerprint 值、URL。
+
+侧栏树本身没有独立的空态文案（空树渲染空列表，空态可操作项就是「＋ 笔记」），
+因此“空态”覆盖的是反向链接面板的空态行。
+
+### 9.5 未迁移清单（明确后置）
+
+- **同步面板内部**（`dev_sync/panel.rs`：设备/邀请/轮换/基线/最近错误等全部文案）；
+- **onboarding**：Welcome/Create/Join/InvitePending/Working/Backup/Error 页面、
+  relay 模式选择器（Create/Join/设置共用）、表单校验错误；
+- **图谱覆盖层**：标题、统计 hint、过滤器（文件夹/标签/无标签/未解析）、
+  搜索框、空态、复位/关闭按钮；
+- **编辑器**：外部链接确认框（`取消`/`打开`/`打开外部链接？`/记住 scheme）、
+  复制链接/复制 Markdown 的 notice、表格工具条（加行/加列/编辑源码等）、
+  图片/Mermaid 工具条、搜索浮层；
+- **侧栏其它**：重命名输入框错误、导入错误/提示、右键菜单项
+  （重命名/新建笔记/新建文件夹/删除）、导出过程的提示；
+- **设置页剩余**：V2 管理区标题（实验、默认隐藏）、fingerprint 明细行标签、
+  安全暂停类别、API 版本说明行、保存成功 notice、配置保存失败/找不到实例等
+  带动态值的错误提示（这些属“错误原文”边界）；
+- **编辑器空态**：`没有打开的笔记（从左侧选一篇）`；
+- 日期/数字/相对时间格式化、RTL、字体/CJK 换行、复数 `zero/few/many`、
+  插件运行时命名空间装载。
+
+### 9.6 测试与验证
+
+- `cargo test -p menghunote-i18n`：**16 passed**（语言解析/系统探测、模式
+  往返、catalog 中英 key 集合一致、占位符合法、回退链、插值、复数、全局状态）。
+- `cargo test -p menghunote-app`（默认）：**374 passed**；
+  `--features dev-sync`：**620 passed**（新增 `headless_language` 3 +
+  `headless_language_ui` 1；app lib 单测新增 `language_settings` 4 +
+  `ui_text` 4）。
+- `cargo fmt --all -- --check`、`cargo clippy -p menghunote-i18n -p menghunote-app
+  --all-targets --features dev-sync -- -D warnings`：干净。
+- headless 证明：设置页点语言按钮 → 全局语言/偏好文件立即变化；编辑器实体、
+  正文、选区、滚动、撤销栈、本地编辑代数不变（不产生 `EditRequest`）；
+  重启恢复/损坏回退；英文下右键菜单真实渲染。
+
+### 9.7 已知限制
+
+- **不订阅 OS 语言变化**（GPUI 无跨平台语言变化回调）：改完系统语言需重启或
+  重新点「跟随系统」。
+- 复数只支持英文 `one/other`；中文同形。消息格式最终选型（§8 问题 1）未定。
+- 静态 catalog 每次 `t` 返回 `String`（多数固定文案每帧一次小分配）；对话框/
+  长列表全量迁移前若出现性能问题，再评估 `Cow<'static, str>`/预编译表。
+- 未迁移文案在英文界面仍显示中文（见 §9.5），这是分页面推进的预期中间态。

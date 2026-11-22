@@ -66,6 +66,8 @@ fn ensure_test_user_key() {
             .join(format!("dev-sync-rotation-xdg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("创建测试 XDG_DATA_HOME 失败");
         std::env::set_var("XDG_DATA_HOME", &dir);
+        // 轮换是实验性高级入口，默认不在设备页出现；本文件显式打开。
+        std::env::set_var("MENGHUNOTE_EXPERIMENTAL_ROTATION", "1");
         menghunote_sync::identity_wrap::initialize_user_key()
             .expect("初始化测试用户主键失败（ADR 0008）");
     });

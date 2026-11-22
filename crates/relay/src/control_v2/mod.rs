@@ -58,6 +58,13 @@
 //! 邀请与纯 rotation 只推进 control（ADR）。cap 自然到期**不造记录**：每次使用按
 //! `expires_at` 即时失效。
 //!
+//! # 收件箱干跑（S4d2）
+//!
+//! 审批收件箱（[`crate::approvals`]）用 [`validate_partial`] 对**半签包**做与提交同源的
+//! 干跑：`SigPolicy::Partial` 只要求已收到的槽位验签通过，缺签槽位跳过；时间窗/链 CAS/
+//! kind 门限/payload/每一位 Device 的 cap·scope·ACTIVE 全部照验。干跑的投影副作用
+//! （`EpochActivate` 的候选 promote 等）由调用方包在 `SAVEPOINT` 里回滚，提交路径不受影响。
+//!
 //! # 失败语义（fail-stop）
 //!
 //! - 结构/CDE/时间格式 → 400 `INVALID_REQUEST`；签名不过 → 400 `SIGNATURE_INVALID`；
@@ -159,6 +166,45 @@ pub struct SubmitOutcome {
 
 // ---------------------------------------------------------------- 提交主流程
 
+/// 签名集合策略（S4d2 收件箱）。
+///
+/// `/control/submit` 永远走 [`SigPolicy::Complete`]（每个槽位都必须有有效签名，且由
+/// `SignedControlV2::validate` 保证签名条数 == signer 数）；审批收件箱的**半签包**
+/// 只能走 [`SigPolicy::Partial`]：缺签槽位不是"零签名占位"，而是**尚未收集到的签名**，
+/// 干跑校验时跳过该槽位的验签，其余结构/域/payload/路径/I/V/rev/signers/cap/scope/
+/// 时间窗校验与提交路径**完全同源**。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SigPolicy<'a> {
+    /// 全槽验签（提交路径）。
+    Complete,
+    /// 只验集合里的槽位（收件箱创建/加签的干跑）。
+    Partial(&'a BTreeSet<usize>),
+}
+
+impl SigPolicy<'_> {
+    /// 该槽位是否必须在此刻验签。
+    fn present(self, index: usize) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Partial(present) => present.contains(&index),
+        }
+    }
+
+    /// 按策略验签；缺签槽位直接放行（调用方必须在别处拒绝"缺签却被执行"）。
+    fn verify(
+        self,
+        index: usize,
+        input: &[u8],
+        public_key: &[u8; 32],
+        signature: &[u8],
+    ) -> Result<()> {
+        if !self.present(index) {
+            return Ok(());
+        }
+        verify_signature(input, public_key, signature)
+    }
+}
+
 /// V2 控制提交（事务内调用；外层已 `BEGIN IMMEDIATE`）。
 pub fn submit(
     conn: &ScopeConn,
@@ -172,12 +218,7 @@ pub fn submit(
     let operation = &signed.operation;
 
     // ① 结构/租户/路径：签名覆盖了这些事实，不一致即 fail-stop。
-    if operation.vault_id != vault.vault_id || operation.instance_id != vault.instance_id {
-        return Err(forbidden());
-    }
-    if operation.canonical_path != proto::canonical_submit_path(&vault.vault_id) {
-        return Err(Error::api(ErrorCode::NotFound));
-    }
+    check_operation_binding(&vault, signed)?;
     // 链 hash 的输入必须唯一：只接受重新编码后逐字节相同的 SignedControlV2。
     if signed.encode().map_err(|_| invalid())? != signed_bytes {
         return Err(invalid());
@@ -195,7 +236,80 @@ pub fn submit(
         });
     }
 
-    // ③ 时间窗（只看首次提交；历史回放走上面的幂等分支）。
+    // ③–⑦ 时间窗/链 CAS/kind/授权 rev/kind 专属校验（与收件箱干跑共用同一路径）。
+    let plan = validate_operation(conn, now, &vault, signed, SigPolicy::Complete)?;
+
+    // ⑧ 执行（控制提交 + 投影/rev）与回执。
+    let (_, head_hash) = vault::control_head(conn)?;
+    let rev = vault::append_control(conn, now_i64, signed_bytes)?;
+    if rev
+        != operation
+            .expected_control_rev
+            .checked_add(1)
+            .ok_or_else(invalid)?
+    {
+        return Err(Error::Invariant("control rev"));
+    }
+    let record_hash = signed
+        .chain_hash(&head_hash, proto_sha256)
+        .map_err(|_| invalid())?;
+    let (authz_rev, authority_rev) = apply(conn, now_i64, &vault, rev, plan)?;
+    let receipt = ControlReceipt {
+        control_rev: rev,
+        head_hash: record_hash,
+        kind: operation.kind.as_u8(),
+        request_id: operation.request_id,
+        authz_rev,
+        authority_rev,
+    };
+    let response = crate::wire::encode(receipt.fields())?;
+    // ⑨ 幂等回执与业务写入同事务（dedup_v2 的 control_rev 复合 FK 指向刚写出的提交）。
+    conn.execute(
+        "INSERT INTO dedup_v2(vault_id, request_id, request_hash, control_rev, accepted_seq,
+                               response, created_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+        (
+            conn.scope().as_slice(),
+            operation.request_id.as_slice(),
+            request_hash.as_slice(),
+            i64_of(rev, "dedup_v2.control_rev")?,
+            response.as_slice(),
+            now_i64,
+        ),
+    )?;
+    Ok(SubmitOutcome {
+        response,
+        replayed: false,
+    })
+}
+
+/// ① 结构/租户/路径绑定（提交与收件箱干跑共用）。
+fn check_operation_binding(vault: &Vault, signed: &proto::SignedControlV2) -> Result<()> {
+    let operation = &signed.operation;
+    if operation.vault_id != vault.vault_id || operation.instance_id != vault.instance_id {
+        return Err(forbidden());
+    }
+    if operation.canonical_path != proto::canonical_submit_path(&vault.vault_id) {
+        return Err(Error::api(ErrorCode::NotFound));
+    }
+    Ok(())
+}
+
+/// ③–⑦：时间窗、链 CAS、kind 门禁、授权 rev、kind 专属校验（含 `policy` 指定的签名集合）。
+///
+/// 返回**待执行计划**；调用方只有在 `SigPolicy::Complete` 且本函数成功后才可以执行它。
+/// `SigPolicy::Partial` 的干跑由 [`validate_partial`] 包在 SAVEPOINT 里回滚：
+/// `EpochActivate` 等的校验会顺手 promote 候选/建 GC 计划，收件箱创建/加签不得留下这些效果。
+fn validate_operation(
+    conn: &ScopeConn,
+    now: u64,
+    vault: &Vault,
+    signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
+) -> Result<Plan> {
+    let operation = &signed.operation;
+
+    // ③ 时间窗（只看首次提交；历史回放走幂等分支）。
     check_time_window(operation, now)?;
 
     // ④ 链 CAS + 时间不倒退。
@@ -238,7 +352,7 @@ pub fn submit(
         {
             return Err(forbidden());
         }
-        require_v2_authz(&vault)?;
+        require_v2_authz(vault)?;
         if operation.expected_authz_rev != vault.authz_rev
             || operation.authority_rev != vault.authority_rev
         {
@@ -246,101 +360,82 @@ pub fn submit(
         }
     }
 
-    // ⑦ kind 专属校验（含全部签名者验签）。
+    // ⑦ kind 专属校验（含 `policy` 指定的签名者验签）。
     let plan = match operation.kind {
-        proto::ControlKindV2::UpgradePolicy => {
-            Plan::Upgrade(validate_upgrade(conn, now, &vault, signed, head_rev)?)
-        }
+        proto::ControlKindV2::UpgradePolicy => Plan::Upgrade(validate_upgrade(
+            conn, now, vault, signed, head_rev, policy,
+        )?),
         proto::ControlKindV2::CapGrant => {
-            Plan::CapGrant(validate_cap_grant(conn, now, &vault, signed)?)
+            Plan::CapGrant(validate_cap_grant(conn, now, vault, signed, policy)?)
         }
         proto::ControlKindV2::CapRevoke => {
-            Plan::CapRevoke(validate_cap_revoke(conn, now, &vault, signed)?)
+            Plan::CapRevoke(validate_cap_revoke(conn, now, vault, signed, policy)?)
         }
         proto::ControlKindV2::InviteCreate => {
-            Plan::Invite(validate_invite_create(conn, now, &vault, signed)?)
+            Plan::Invite(validate_invite_create(conn, now, vault, signed, policy)?)
         }
         // ADR 0015 S4b2：设备凭证/撤销/改权（见 `devices` 子模块）。
         proto::ControlKindV2::DeviceApprove => {
-            Plan::Device(devices::validate_approve(conn, now, &vault, signed)?)
+            Plan::Device(devices::validate_approve(conn, now, vault, signed, policy)?)
         }
         proto::ControlKindV2::DeviceRevoke => {
-            Plan::Device(devices::validate_revoke(conn, now, &vault, signed)?)
+            Plan::Device(devices::validate_revoke(conn, now, vault, signed, policy)?)
         }
-        proto::ControlKindV2::DeviceRightsChange => {
-            Plan::Device(devices::validate_rights_change(conn, now, &vault, signed)?)
-        }
-        // ADR 0015 S4c：轮换/激活（授权只走 V2 控制记录，无 v1 管理签名旁路）。
+        proto::ControlKindV2::DeviceRightsChange => Plan::Device(devices::validate_rights_change(
+            conn, now, vault, signed, policy,
+        )?),
         proto::ControlKindV2::RotationBegin => {
-            Plan::Rotation(rotation::validate_begin(conn, now, &vault, signed)?)
+            Plan::Rotation(rotation::validate_begin(conn, now, vault, signed, policy)?)
         }
         proto::ControlKindV2::RotationAbort => {
-            Plan::Rotation(rotation::validate_abort(conn, now, &vault, signed)?)
+            Plan::Rotation(rotation::validate_abort(conn, now, vault, signed, policy)?)
         }
-        proto::ControlKindV2::RotationRestart => {
-            Plan::Rotation(rotation::validate_restart(conn, now, &vault, signed)?)
-        }
-        proto::ControlKindV2::RotationAddRevokes => {
-            Plan::Rotation(rotation::validate_add_revokes(conn, now, &vault, signed)?)
-        }
-        proto::ControlKindV2::EpochActivate => {
-            Plan::Rotation(rotation::validate_activate(conn, now, &vault, signed)?)
-        }
+        proto::ControlKindV2::RotationRestart => Plan::Rotation(rotation::validate_restart(
+            conn, now, vault, signed, policy,
+        )?),
+        proto::ControlKindV2::RotationAddRevokes => Plan::Rotation(rotation::validate_add_revokes(
+            conn, now, vault, signed, policy,
+        )?),
+        proto::ControlKindV2::EpochActivate => Plan::Rotation(rotation::validate_activate(
+            conn, now, vault, signed, policy,
+        )?),
         proto::ControlKindV2::InviteCancel => {
-            Plan::InviteCancel(validate_invite_cancel(conn, now, &vault, signed)?)
+            Plan::InviteCancel(validate_invite_cancel(conn, now, vault, signed, policy)?)
         }
         proto::ControlKindV2::RecoveryReset => {
-            Plan::Recovery(recovery::validate_reset(conn, now, &vault, signed)?)
+            Plan::Recovery(recovery::validate_reset(conn, now, vault, signed, policy)?)
         }
-        proto::ControlKindV2::RecoveryKeyChange => {
-            Plan::Recovery(recovery::validate_key_change(conn, now, &vault, signed)?)
-        }
+        proto::ControlKindV2::RecoveryKeyChange => Plan::Recovery(recovery::validate_key_change(
+            conn, now, vault, signed, policy,
+        )?),
         // 已知但未实现（PolicyReplace 属后续切片）：fail-stop，绝不静默接受。
         proto::ControlKindV2::PolicyReplace => return Err(Error::api(ErrorCode::NotImplemented)),
     };
-
-    // ⑧ 执行（控制提交 + 投影/rev）与回执。
-    let rev = vault::append_control(conn, now_i64, signed_bytes)?;
-    if rev
-        != operation
-            .expected_control_rev
-            .checked_add(1)
-            .ok_or_else(invalid)?
-    {
-        return Err(Error::Invariant("control rev"));
-    }
-    let record_hash = signed
-        .chain_hash(&head_hash, proto_sha256)
-        .map_err(|_| invalid())?;
-    let (authz_rev, authority_rev) = apply(conn, now_i64, &vault, rev, plan)?;
-    let receipt = ControlReceipt {
-        control_rev: rev,
-        head_hash: record_hash,
-        kind: operation.kind.as_u8(),
-        request_id: operation.request_id,
-        authz_rev,
-        authority_rev,
-    };
-    let response = crate::wire::encode(receipt.fields())?;
-    // ⑨ 幂等回执与业务写入同事务（dedup_v2 的 control_rev 复合 FK 指向刚写出的提交）。
-    conn.execute(
-        "INSERT INTO dedup_v2(vault_id, request_id, request_hash, control_rev, accepted_seq,
-                               response, created_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-        (
-            conn.scope().as_slice(),
-            operation.request_id.as_slice(),
-            request_hash.as_slice(),
-            i64_of(rev, "dedup_v2.control_rev")?,
-            response.as_slice(),
-            now_i64,
-        ),
-    )?;
-    Ok(SubmitOutcome {
-        response,
-        replayed: false,
-    })
+    Ok(plan)
 }
+
+/// S4d2：对**半签**审批包做与提交同源的干跑校验（不写链、不执行投影）。
+///
+/// 调用方必须把本函数包在 `SAVEPOINT` 里回滚（见 `crate::approvals`）：`EpochActivate`
+/// 的校验会顺手 promote 候选 checkpoint / 建 GC 计划，收件箱不得留下这些效果。
+///
+/// 前置条件：`signed.operation` 已严格解码；`signed.signatures` 与 signers 等长，
+/// 缺签槽位用零占位（`present` 决定哪些槽位必须验签）。
+pub(crate) fn validate_partial(
+    conn: &ScopeConn,
+    clock: &dyn Clock,
+    signed: &proto::SignedControlV2,
+    present: &BTreeSet<usize>,
+) -> Result<()> {
+    let now = u64::try_from(clock.now_secs()).map_err(|_| invalid())?;
+    let vault = vault::load(conn)?;
+    check_operation_binding(&vault, signed)?;
+    validate_operation(conn, now, &vault, signed, SigPolicy::Partial(present))?;
+    Ok(())
+}
+
+/// 未签名占位（S4d2 半签包干跑用；**不会**被 `SigPolicy::Complete` 当成有效签名）。
+pub(crate) const UNSIGNED_SLOT: [u8; 64] = [0u8; 64];
 
 /// 读 `dedup_v2` 回执：`(request_hash, response_bytes)`。
 fn lookup(conn: &ScopeConn, request_id: &[u8; 16]) -> Result<Option<(Hash32, Vec<u8>)>> {
@@ -440,6 +535,7 @@ fn validate_upgrade(
     vault: &Vault,
     signed: &proto::SignedControlV2,
     head_rev: u64,
+    policy: SigPolicy<'_>,
 ) -> Result<UpgradePlan> {
     // Upgrade 只在 legacy（未启用 V2）的 vault 上成立，且必须是全新 authority 代。
     if vault.authz_state != AuthzState::Legacy
@@ -515,23 +611,27 @@ fn validate_upgrade(
     let (creator_index, creator) = creator.ok_or_else(forbidden)?;
     let manager_pub = vault::manager_pubkey(conn)?.ok_or_else(forbidden)?;
     if creator.pk != manager_pub
-        || verify_signature(
-            &upgrade_input,
-            &creator.pk,
-            &signed.signatures[creator_index],
-        )
-        .is_err()
+        || policy
+            .verify(
+                creator_index,
+                &upgrade_input,
+                &creator.pk,
+                &signed.signatures[creator_index],
+            )
+            .is_err()
     {
         return Err(signature_invalid());
     }
     let (recovery_index, recovery) = recovery.ok_or_else(forbidden)?;
     if recovery.pk != payload.fresh_recovery_pk
-        || verify_signature(
-            &recover_input,
-            &recovery.pk,
-            &signed.signatures[recovery_index],
-        )
-        .is_err()
+        || policy
+            .verify(
+                recovery_index,
+                &recover_input,
+                &recovery.pk,
+                &signed.signatures[recovery_index],
+            )
+            .is_err()
     {
         return Err(signature_invalid());
     }
@@ -555,7 +655,15 @@ fn validate_upgrade(
         {
             return Err(forbidden());
         }
-        if verify_signature(&digest_input, &signer.pk, &signed.signatures[*index]).is_err() {
+        if policy
+            .verify(
+                *index,
+                &digest_input,
+                &signer.pk,
+                &signed.signatures[*index],
+            )
+            .is_err()
+        {
             return Err(signature_invalid());
         }
     }
@@ -607,12 +715,13 @@ fn validate_cap_grant(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<proto::ManagementCapV2> {
     require_active(vault)?;
     let operation = &signed.operation;
     let payload = proto::CapGrantPayloadV2::decode(&operation.payload).map_err(|_| invalid())?;
     let cap = payload.cap;
-    let policy = load_policy(vault)?;
+    let policy_v2 = load_policy(vault)?;
     let digest_input =
         proto::control_signing_input(operation, proto_sha256).map_err(|_| invalid())?;
     let signers = two_scope_signers(
@@ -622,6 +731,7 @@ fn validate_cap_grant(
         &digest_input,
         &[proto::CapScope::CAP_ADMIN],
         &[],
+        policy,
     )?;
 
     for signer in &signers {
@@ -643,7 +753,7 @@ fn validate_cap_grant(
     if cap.not_before > now || cap.expires_at <= now {
         return Err(forbidden());
     }
-    if cap.expires_at.saturating_sub(cap.not_before) > policy.max_cap_ttl {
+    if cap.expires_at.saturating_sub(cap.not_before) > policy_v2.max_cap_ttl {
         return Err(forbidden());
     }
     // subject 必须是本 vault 的 ACTIVE 设备，且 key 与登记公钥一致。
@@ -662,6 +772,7 @@ fn validate_cap_revoke(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<Id16> {
     require_active(vault)?;
     let operation = &signed.operation;
@@ -675,6 +786,7 @@ fn validate_cap_revoke(
         &digest_input,
         &[proto::CapScope::CAP_ADMIN],
         &[],
+        policy,
     )?;
 
     // 目标必须存在且未撤销（重复撤销不是幂等成功：必须显式换 request_id 重签）。
@@ -700,12 +812,13 @@ fn validate_invite_create(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<InvitePlan> {
     require_active(vault)?;
     let operation = &signed.operation;
     let payload =
         proto::InviteCreatePayloadV2::decode(&operation.payload).map_err(|_| invalid())?;
-    let policy = load_policy(vault)?;
+    let policy_v2 = load_policy(vault)?;
     let digest_input =
         proto::control_signing_input(operation, proto_sha256).map_err(|_| invalid())?;
 
@@ -727,14 +840,17 @@ fn validate_invite_create(
     {
         return Err(forbidden());
     }
-    if verify_signature(&digest_input, &signer.pk, &signed.signatures[0]).is_err() {
+    if policy
+        .verify(0, &digest_input, &signer.pk, &signed.signatures[0])
+        .is_err()
+    {
         return Err(signature_invalid());
     }
     // TTL 以签名时刻为基准（signed_at 已在实时窗口内），且邀请必须仍在未来。
     if payload.expires_at <= operation.signed_at || payload.expires_at <= now {
         return Err(Error::api(ErrorCode::InvalidRequest));
     }
-    if payload.expires_at.saturating_sub(operation.signed_at) > policy.max_invite_ttl {
+    if payload.expires_at.saturating_sub(operation.signed_at) > policy_v2.max_invite_ttl {
         return Err(Error::api(ErrorCode::InvalidRequest));
     }
     // 邀请/令牌事实永不复用：主键或 token_hash 冲突一律 409。
@@ -769,6 +885,7 @@ fn validate_invite_cancel(
     now: u64,
     vault: &Vault,
     signed: &proto::SignedControlV2,
+    policy: SigPolicy<'_>,
 ) -> Result<InviteCancelPlan> {
     require_active(vault)?;
     let operation = &signed.operation;
@@ -794,7 +911,10 @@ fn validate_invite_cancel(
     {
         return Err(forbidden());
     }
-    if verify_signature(&digest_input, &signer.pk, &signed.signatures[0]).is_err() {
+    if policy
+        .verify(0, &digest_input, &signer.pk, &signed.signatures[0])
+        .is_err()
+    {
         return Err(signature_invalid());
     }
     let row: Option<(Option<i64>, Option<Vec<u8>>)> = conn
@@ -831,6 +951,7 @@ fn two_scope_signers(
     digest_input: &[u8],
     required_scopes: &[u32],
     allowed_extra: &[proto::SignerRole],
+    policy: SigPolicy<'_>,
 ) -> Result<Vec<CapSigner>> {
     let operation = &signed.operation;
     let mut approvers: Vec<CapSigner> = Vec::new();
@@ -852,7 +973,10 @@ fn two_scope_signers(
                 return Err(forbidden());
             }
         }
-        if verify_signature(digest_input, &signer.pk, &signed.signatures[index]).is_err() {
+        if policy
+            .verify(index, digest_input, &signer.pk, &signed.signatures[index])
+            .is_err()
+        {
             return Err(signature_invalid());
         }
         approvers.push(CapSigner { device_id, cap });

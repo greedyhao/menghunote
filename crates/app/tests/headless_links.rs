@@ -535,10 +535,20 @@ async fn unresolved_relative_note_link_only_notices(cx: &mut TestAppContext) {
     let (host, cx) = open_shell(cx, vault);
     let view = active_view(cx, &host);
     let rect = link_rect(&view, cx);
+    let graph_before = cx
+        .debug_bounds("sidebar-graph")
+        .expect("侧栏图谱入口必须存在");
 
     cx.simulate_click(rect.center(), open_modifiers());
     cx.run_until_parked();
 
+    let graph_after = cx
+        .debug_bounds("sidebar-graph")
+        .expect("侧栏图谱入口必须存在");
+    assert_eq!(
+        graph_before, graph_after,
+        "未解析链接提示不得把图谱入口顶上去（与设置之间出现偏移）"
+    );
     assert_eq!(
         view_text(cx, &view),
         "[不存在](不存在的笔记)",

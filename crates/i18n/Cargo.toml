@@ -1,0 +1,11 @@
+[package]
+name = "menghunote-i18n"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ADR 0020 P1：**纯 crate**，不依赖 GPUI、不依赖 storage/sync，也没有任何外部依赖。
+# 消息格式先用轻量静态 catalog（key-value + `{name}` 插值），fluent 等重依赖留到
+# 插件 API 冻结前再评估（见 ADR 0020 §8/§9）；本 crate 的 API 面刻意保持小，
+# 将来换格式时只替换内部实现，不牵动业务代码。
+[dependencies]

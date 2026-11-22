@@ -1278,12 +1278,13 @@ impl EditorView {
                     };
                     let label = label.filter(|text| !text.is_empty()).map(|text| {
                         let spans = [(text.len(), StyleKind::Plain)];
-                        super::glyph::shape_row_styled_at(
+                        super::glyph::shape_row_styled_at_with_color(
                             window,
                             &text,
                             &spans,
                             theme::OBJECT_LABEL_FONT_SIZE,
                             false,
+                            theme::object_label_color(),
                         )
                     });
                     (
@@ -1330,12 +1331,19 @@ impl EditorView {
                     };
                     let label = label.filter(|text| !text.is_empty()).map(|text| {
                         let spans = [(text.len(), StyleKind::Plain)];
-                        super::glyph::shape_row_styled_at(
+                        // 失败文案用错误色；加载/等待用占位文案色（深色主题下都可读）。
+                        let color = if paint_state == ObjectPaintState::Failed {
+                            theme::mermaid_error()
+                        } else {
+                            theme::mermaid_placeholder_text()
+                        };
+                        super::glyph::shape_row_styled_at_with_color(
                             window,
                             &text,
                             &spans,
                             theme::OBJECT_LABEL_FONT_SIZE,
                             false,
+                            color,
                         )
                     });
                     (
@@ -6188,7 +6196,7 @@ impl EditorView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::rgba(0x000000cc))
+            .bg(theme::image_overlay_bg())
             .overflow_hidden()
             // 覆盖层语义：滚轮/点击都不许漏给下面的编辑器。
             .occlude()
@@ -6760,7 +6768,7 @@ impl EditorView {
                     .text_size(px(13.0))
                     .text_color(theme::object_toolbar_text())
                     .hover(|style| style.bg(theme::sidebar_selected_bg()))
-                    .child(SharedString::from("表格"))
+                    .child(SharedString::from(crate::ui_text::editor_menu_table()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, _event: &MouseDownEvent, window, cx| {
@@ -6783,14 +6791,14 @@ impl EditorView {
                             .px(px(8.0))
                             .text_size(px(11.0))
                             .text_color(theme::table_actions_text_disabled())
-                            .child(SharedString::from("插入")),
+                            .child(SharedString::from(crate::ui_text::editor_menu_insert())),
                     )
                     .child(item)
             }
             EditorContextMenuTarget::Link(_) => {
                 // 链接菜单：三个动作，全部在 mouse-down 上执行；动作后由
                 // `swallow_mouse_up` 吞掉同一次手势的 mouse-up（不移动 caret）。
-                let item = |selector: &'static str, label: &'static str, action: LinkMenuAction| {
+                let item = |selector: &'static str, label: String, action: LinkMenuAction| {
                     div()
                         .id(selector)
                         .debug_selector(move || selector.to_string())
@@ -6820,17 +6828,17 @@ impl EditorView {
                     .gap(px(2.0))
                     .child(item(
                         "editor-context-open-link",
-                        "打开链接",
+                        crate::ui_text::editor_menu_open_link(),
                         LinkMenuAction::Open,
                     ))
                     .child(item(
                         "editor-context-copy-link",
-                        "复制链接",
+                        crate::ui_text::editor_menu_copy_link(),
                         LinkMenuAction::CopyLink,
                     ))
                     .child(item(
                         "editor-context-copy-markdown",
-                        "复制 Markdown",
+                        crate::ui_text::editor_menu_copy_markdown(),
                         LinkMenuAction::CopyMarkdown,
                     ))
             }

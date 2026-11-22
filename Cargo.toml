@@ -6,6 +6,8 @@ members = [
     "crates/editor",
     "crates/markdown",
     "crates/text",
+    # ADR 0020 P1：纯 i18n 基础设施（无 GPUI/无外部依赖）。
+    "crates/i18n",
     "crates/search",
     "crates/sync-proto",
     "crates/sync",

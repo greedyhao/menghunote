@@ -1925,6 +1925,11 @@ pub struct SyncService {
     /// 两阶段同步的独立控制通道（`GrantGate` / `Finish` / 取消 / 停止）。
     control: Mutex<Option<Sender<SyncControl>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// 本实例的库文件路径（只有真实 dev-local 构造有；注入 runner 的测试为空）。
+    ///
+    /// 管理 UI（ADR 0016 S4d1c）要用它定位 `dev-identity.bin`；`SyncService` 是宿主
+    /// 唯一已经持有该路径的长期对象，因此在这里只读投影一份（不复制任何秘密）。
+    vault_path: Option<PathBuf>,
 }
 
 impl SyncService {
@@ -1944,11 +1949,16 @@ impl SyncService {
         let runner = DevLocalRunner::new_with_mode_and_transport(
             config.mode,
             config.relay.clone(),
-            vault_path,
+            vault_path.clone(),
             config.transport,
         )
         .with_api_version(config.api_version);
-        Self::with_runner(config, Box::new(runner))
+        Self::with_runner_impl(
+            config,
+            Box::new(runner),
+            Arc::new(SystemOperationClock),
+            Some(vault_path),
+        )
     }
 
     /// 注入执行体（测试/切片 4 用；deadline 用系统单调时钟）。
@@ -1963,6 +1973,15 @@ impl SyncService {
         config: ServiceConfig,
         runner: Box<dyn SyncRunner>,
         clock: Arc<dyn OperationClock>,
+    ) -> Arc<Self> {
+        Self::with_runner_impl(config, runner, clock, None)
+    }
+
+    fn with_runner_impl(
+        config: ServiceConfig,
+        runner: Box<dyn SyncRunner>,
+        clock: Arc<dyn OperationClock>,
+        vault_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (event_tx, event_rx) = mpsc::channel::<Event>();
@@ -1984,6 +2003,7 @@ impl SyncService {
             jobs: Mutex::new(Some(job_tx)),
             control: Mutex::new(Some(control_tx)),
             worker: Mutex::new(Some(handle)),
+            vault_path,
         })
     }
 
@@ -1991,6 +2011,12 @@ impl SyncService {
     #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config
+    }
+
+    /// 本实例库文件路径（只有真实 dev-local 构造有；测试注入 runner 时为 `None`）。
+    #[must_use]
+    pub fn vault_path(&self) -> Option<&Path> {
+        self.vault_path.as_deref()
     }
 
     /// 只读状态快照（面板渲染用；不触碰通道）。

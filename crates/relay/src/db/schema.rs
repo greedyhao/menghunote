@@ -42,11 +42,23 @@
 //! 本模块只提供**存储形状**：控制链验证、cap 门限、`/authz/*` 与 V2 提交路径属于 S4b，
 //! schema 12 不启用 V2，v1 行为与 wire 完全不变。
 //!
+//! 迁移 13 → 14 是 ADR 0016 §收件箱 B 的 relay 审批收件箱（S4d2）：
+//! - **纯新增** tenant 表 `approval_jobs`（PK `(vault_id, request_id)`、UNIQUE
+//!   `(vault_id, op_digest)`）与 `approval_signatures`（PK `(vault_id, request_id,
+//!   signer_index)`、复合 FK 连 jobs），外加 `(vault_id, recipient_device, status, seq)` /
+//!   `(vault_id, initiator_device, status, seq)` / `(vault_id, status, expires_at)` 索引；
+//! - 单事务 + `IF NOT EXISTS`（重复执行幂等），不重建/不改写任何既有表；
+//! - 迁移前对文件库 `VACUUM INTO <db>.schema13.bak`（WAL 一致快照）；中断整体回滚；
+//! - **回退只完整快照恢复**：relay 不支持降 schema，旧 binary（SCHEMA_VERSION=13）打开
+//!   本库会按版本门禁明确拒绝；要回到 13 必须恢复 `.schema13.bak`，迁移后新增的收件箱
+//!   数据（以及其它新写入）都会丢失。
+//!
 //! **版本推断**（ADR 0018 §2 修复）：元数据缺失时不能用 `authz_state` 存在性猜版本——
-//! 那会把 schema 12 误标成最新版并跳过迁移。这里按**表形状标记**显式识别 11/12/13：
+//! 那会把 schema 12 误标成最新版并跳过迁移。这里按**表形状标记**显式识别 11/12/13/14：
 //! 12 标记（`vaults.authz_state` + `management_caps`/`device_credentials`/`dedup_v2` +
 //! `challenges.realm` 已是 INTEGER）齐全才是 12；13 标记（`vault_registry` 表 +
-//! `create_tickets.created_at` 列）齐全才是 13；标记部分存在 = 形状矛盾，fail closed，
+//! `create_tickets.created_at` 列）齐全才是 13；14 标记（`approval_jobs` +
+//! `approval_signatures`）齐全才是 14；标记部分存在 = 形状矛盾，fail closed，
 //! 绝不猜版本。
 
 use std::path::{Path, PathBuf};
@@ -64,7 +76,10 @@ use crate::time::{Clock, SystemClock};
 /// 11 → 12：ADR 0015 S4a2 的授权/control 投影（cap、challenge/token 扩展、凭证历史、dedup_v2）。
 /// 12 → 13：ADR 0018 §2 的权威生命周期（`vault_registry`、票据 `created_at`/registry 关联、
 ///          版本推断修复；claim/cancel 原子语义）。
-pub const SCHEMA_VERSION: i64 = 13;
+/// 13 → 14：ADR 0016 §收件箱 B 的 relay 审批收件箱（`approval_jobs`/`approval_signatures`）。
+///          **纯新增**两张租户表 + 索引，不改任何既有表/数据；收件箱只是协调记录，
+///          不改控制链/门限，也不持有任何管理私钥。
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// relay_meta 中保存本实例 id 的键（cursor 的 `instance16`）。
 pub const META_INSTANCE_ID: &str = "instance_id";
@@ -219,6 +234,10 @@ pub fn apply_at(conn: &mut Connection, now: Option<i64>) -> Result<()> {
                 migrate_v12_to_v13(conn, migration_now)?;
                 13
             }
+            13 => {
+                migrate_v13_to_v14(conn)?;
+                14
+            }
             _ => return Err(Error::Invariant("unsupported relay schema version")),
         };
     }
@@ -232,7 +251,7 @@ enum InferredVersion {
     LegacySingleVault,
     /// 完全没有多租户表：按最新版初始化。
     Empty,
-    /// 明确识别出的 10/11/12/13 形状。
+    /// 明确识别出的 10/11/12/13/14 形状。
     Known(i64),
 }
 
@@ -242,10 +261,11 @@ enum InferredVersion {
 /// - schema 12 标记**必须齐全**：`vaults.authz_state`、`management_caps`、
 ///   `device_credentials`、`dedup_v2`、`challenges.realm` 为 INTEGER；
 /// - schema 13 标记**必须齐全**：`vault_registry` 表、`create_tickets.created_at` 列；
+/// - schema 14 标记**必须齐全**：`approval_jobs` + `approval_signatures`（ADR 0016 收件箱 B）；
 /// - 标记部分存在 = 半迁移/矛盾形状 → `Invariant`（fail closed，不猜）。
 ///
 /// 关键修复：绝不因为 `vaults.authz_state` 存在就断定是最新版本——那会把 schema 12
-/// 误标成 13 并跳过 12→13 迁移。
+/// 误标成 13 并跳过 12→13 迁移；同理 13 不会因 `vault_registry` 存在就跳过 13→14。
 fn infer_schema_version(conn: &Connection) -> Result<InferredVersion> {
     let has_legacy_vault = table_exists(conn, "vault")?;
     let has_vaults = table_exists(conn, "vaults")?;
@@ -270,22 +290,36 @@ fn infer_schema_version(conn: &Connection) -> Result<InferredVersion> {
     let has_registry = table_exists(conn, "vault_registry")?;
     let tickets_exist = table_exists(conn, "create_tickets")?;
     let tickets_created_at = column_exists(conn, "create_tickets", "created_at")?;
+    let approval_jobs = table_exists(conn, "approval_jobs")?;
+    let approval_signatures = table_exists(conn, "approval_signatures")?;
+    // 14 的两张表只可能一起出现（同一迁移事务）；缺一即矛盾形状。
+    if approval_jobs != approval_signatures {
+        return Err(Error::Invariant(
+            "relay schema is ambiguous: partial v14 approval tables",
+        ));
+    }
     if has_registry {
-        // registry 是 schema 13 独有的表。票据表整体缺失（空表被误删）→ 按 13 重建空表；
-        // 票据表在但没有 `created_at` → 12/13 混合形状，fail closed（不猜）。
+        // registry 是 schema 13 独有的表。
         if !tickets_exist {
-            return Ok(InferredVersion::Known(13));
+            // 票据表整体缺失（空表被误删，ADR 0018 §2 的修复路径）：按已存在的表形状
+            // 推断 13/14，随后 `repair_global_tables` 只补**空表**，不猜任何票据事实。
+            return Ok(InferredVersion::Known(if approval_jobs { 14 } else { 13 }));
         }
         if !tickets_created_at {
             return Err(Error::Invariant(
                 "relay schema is ambiguous: vault_registry without create_tickets.created_at",
             ));
         }
-        if v12_markers.iter().all(|marker| *marker) {
-            return Ok(InferredVersion::Known(13));
+        if !v12_markers.iter().all(|marker| *marker) {
+            return Err(Error::Invariant(
+                "relay schema is ambiguous: v13 markers without the v12 shape",
+            ));
         }
+        return Ok(InferredVersion::Known(if approval_jobs { 14 } else { 13 }));
+    }
+    if approval_jobs {
         return Err(Error::Invariant(
-            "relay schema is ambiguous: v13 markers without the v12 shape",
+            "relay schema is ambiguous: approval tables without vault_registry",
         ));
     }
     if tickets_created_at {
@@ -1033,6 +1067,93 @@ fn backup_before_v13(conn: &Connection) -> Result<()> {
     vacuum_snapshot(conn, &backup_path_v12)
 }
 
+/// 迁移 13 → 14 前的 `<db>.schema13.bak` 快照。
+fn backup_before_v14(conn: &Connection) -> Result<()> {
+    vacuum_snapshot(conn, &backup_path_v13)
+}
+
+/// v13 → 14 迁移的故障注入点（测试只用 `None`/`Halfway`）。
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationFaultV14 {
+    /// 不注入故障。
+    None,
+    /// `approval_jobs` 建好、`approval_signatures`/索引/版本号尚未写时强制失败
+    /// （验证单事务回滚 + schema 13 快照）。
+    Halfway,
+}
+
+/// v13 → 14：ADR 0016 §收件箱 B 的 relay 审批收件箱（S4d2）。
+///
+/// 步骤（单事务；**纯新增**，不改写任何既有表/数据）：
+/// 1. 文件库先 `VACUUM INTO <db>.schema13.bak`（WAL 一致快照；已存在则保留最早一份）；
+/// 2. `BEGIN IMMEDIATE`：`CREATE TABLE IF NOT EXISTS approval_jobs/approval_signatures`
+///    + 收件箱索引（`IF NOT EXISTS`，于是重复执行幂等）；
+/// 3. `PRAGMA foreign_key_check` 必须为空；
+/// 4. 写 `schema_version=14` 并提交；任何一步失败 → 整体回滚（旧库仍是 schema 13）。
+///
+/// **回退口径**：relay 不支持降 schema。旧 binary（`SCHEMA_VERSION=13`）打开本库会在
+/// `apply` 的版本门禁处明确拒绝；要回到 13 只能恢复 `.schema13.bak` 完整快照，
+/// 迁移后新增的收件箱数据（以及其它写入）都会丢失。
+fn migrate_v13_to_v14(conn: &mut Connection) -> Result<()> {
+    migrate_v13_to_v14_impl(conn, MigrationFaultV14::None)
+}
+
+/// 测试入口：验证迁移中断/回滚/幂等（见 `tests/migration_v14.rs`）。
+#[doc(hidden)]
+pub fn migrate_v13_to_v14_with_fault(
+    conn: &mut Connection,
+    fault: MigrationFaultV14,
+) -> Result<()> {
+    migrate_v13_to_v14_impl(conn, fault)
+}
+
+fn migrate_v13_to_v14_impl(conn: &mut Connection, fault: MigrationFaultV14) -> Result<()> {
+    backup_before_v14(conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(&tenant_table_ddl("approval_jobs")?)?;
+    if fault == MigrationFaultV14::Halfway {
+        return Err(Error::Invariant("injected migration fault (test)"));
+    }
+    tx.execute_batch(&tenant_table_ddl("approval_signatures")?)?;
+    tx.execute_batch(APPROVAL_INDEXES)?;
+    // 自检：形状标记必须齐全（`infer_schema_version` 依赖它们）。
+    for table in ["approval_jobs", "approval_signatures"] {
+        if !table_exists(&tx, table)? {
+            return Err(Error::Invariant("migration: missing approval table"));
+        }
+    }
+    for column in [
+        "op_bytes",
+        "op_digest",
+        "initiator_device",
+        "initiator_cap",
+        "recipient_device",
+        "status",
+        "seq",
+    ] {
+        if !column_exists(&tx, "approval_jobs", column)? {
+            return Err(Error::Invariant("migration: incomplete approval_jobs"));
+        }
+    }
+    verify_migration(&tx)?;
+    tx.execute(
+        "UPDATE relay_meta SET value = ?1 WHERE key = ?2",
+        ("14".as_bytes(), META_SCHEMA_VERSION),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 取一张租户表的建表模板（`{table}` 占位；顺序与 [`TENANT_TABLES`] 同源）。
+fn tenant_table_ddl(name: &'static str) -> Result<String> {
+    TENANT_TABLES
+        .iter()
+        .find(|(candidate, _, _)| *candidate == name)
+        .map(|(_, template, _)| template.replace("{table}", name))
+        .ok_or(Error::Invariant("unknown tenant table"))
+}
+
 fn vacuum_snapshot(conn: &Connection, target_of: &dyn Fn(&Path) -> PathBuf) -> Result<()> {
     let Some(path) = conn.path() else {
         return Ok(());
@@ -1062,6 +1183,11 @@ pub fn backup_path_v11(db: &Path) -> PathBuf {
 /// `<db>.schema12.bak`：迁移 12 → 13 之前的一致快照（ADR 0018 §2 回滚口径）。
 pub fn backup_path_v12(db: &Path) -> PathBuf {
     PathBuf::from(format!("{}.schema12.bak", db.display()))
+}
+
+/// `<db>.schema13.bak`：迁移 13 → 14 之前的一致快照（ADR 0016 §收件箱 B 回滚口径）。
+pub fn backup_path_v13(db: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.schema13.bak", db.display()))
 }
 
 fn staging_name(name: &str) -> String {
@@ -1097,6 +1223,10 @@ fn legacy_vault_id_for_migration(conn: &Connection) -> Result<Option<Id16>> {
 
 fn ensure_tenant_tables_empty(conn: &Connection) -> Result<()> {
     for (name, _, _) in TENANT_TABLES {
+        // 9→10 时 schema 12/14 才新增的表尚未创建（这里只校验**已存在**的表为空）。
+        if !table_exists(conn, name)? {
+            continue;
+        }
         let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
             row.get(0)
         })?;
@@ -1979,6 +2109,74 @@ const TENANT_TABLES: &[(&str, &str, &[&str])] = &[
 ) STRICT;",
         &[],
     ),
+    (
+        // ADR 0016 §收件箱 B（S4d2，schema 14）：relay 审批收件箱的一行 = 一个已冻结的
+        // 双签操作 + 已收到的签名。**只存公开证据**（完整 OperationV2 字节、投影、摘要），
+        // 不存任何私钥/root/seed/邀请 token/笔记明文。
+        //
+        // - `op_bytes` 是 canonical `CDE(OperationV2)`；终态（EXECUTED/CANCELLED/EXPIRED/
+        //   STALE）后清空成 NULL（墓碑只留摘要），不删行，24h 后由 sweep 删除；
+        // - `op_digest` = SHA256(op_bytes)，与 `request_id` 一起构成幂等/去重键
+        //   （`(vault_id, request_id)` 主键 + `(vault_id, op_digest)` 唯一）；
+        // - `expires_at = min(op.not_after, 参与 cap 的 expires_at)`（创建时算好，不重算）；
+        // - `seq` 是 vault 内的分页序号（`(recipient_device,status,seq)` 索引）。分配方式为
+        //   `MAX(seq)+1`；终态墓碑被删除后它可能回退——游标只保证同一清理窗口内的稳定
+        //   分页，不是永不重复的审计序号（通知可丢，正确性不依赖游标）。
+        "approval_jobs",
+        "CREATE TABLE IF NOT EXISTS {table}(
+  vault_id             BLOB NOT NULL CHECK(length(vault_id) = 16),
+  request_id           BLOB NOT NULL CHECK(length(request_id) = 16),
+  op_bytes             BLOB,
+  op_digest            BLOB NOT NULL CHECK(length(op_digest) = 32),
+  kind                 INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 16 AND kind <> 15),
+  initiator_device     BLOB NOT NULL CHECK(length(initiator_device) = 16),
+  initiator_cap        BLOB NOT NULL CHECK(length(initiator_cap) = 16),
+  initiator_index      INTEGER NOT NULL CHECK(initiator_index >= 0),
+  recipient_device     BLOB NOT NULL CHECK(length(recipient_device) = 16),
+  expected_control_rev INTEGER NOT NULL CHECK(expected_control_rev >= 0),
+  expected_head_hash   BLOB NOT NULL CHECK(length(expected_head_hash) = 32),
+  expected_authz_rev   INTEGER NOT NULL CHECK(expected_authz_rev >= 0),
+  authority_rev        INTEGER NOT NULL CHECK(authority_rev >= 0),
+  signed_at            INTEGER NOT NULL,
+  not_after            INTEGER NOT NULL CHECK(not_after >= signed_at),
+  created_at           INTEGER NOT NULL,
+  expires_at           INTEGER NOT NULL
+                       CHECK(expires_at > created_at AND expires_at <= not_after),
+  status               TEXT NOT NULL CHECK(status IN (
+                         'PENDING','READY','EXECUTED','CANCELLED','EXPIRED','STALE')),
+  seq                  INTEGER NOT NULL CHECK(seq >= 1),
+  terminal_at          INTEGER,
+  receipt_ref          INTEGER CHECK(receipt_ref IS NULL OR receipt_ref >= 1),
+  PRIMARY KEY(vault_id, request_id),
+  UNIQUE(vault_id, op_digest),
+  FOREIGN KEY(vault_id, initiator_device) REFERENCES devices(vault_id, device_id),
+  FOREIGN KEY(vault_id, recipient_device) REFERENCES devices(vault_id, device_id),
+  FOREIGN KEY(vault_id, initiator_cap) REFERENCES management_caps(vault_id, cap_id),
+  -- 活状态（PENDING/READY）必须有正文且没有终结时刻；终态必须有终结时刻且正文已清空。
+  CHECK(status NOT IN ('PENDING','READY') OR terminal_at IS NULL),
+  CHECK(status IN ('PENDING','READY') OR terminal_at IS NOT NULL),
+  CHECK(status NOT IN ('PENDING','READY') OR op_bytes IS NOT NULL),
+  CHECK(op_bytes IS NULL OR length(op_bytes) > 0),
+  -- 只有真正执行（dedup_v2 里有同 request_id/同完整字节的回执）才能是 EXECUTED。
+  CHECK(status <> 'EXECUTED' OR receipt_ref IS NOT NULL)
+) STRICT;",
+        &[],
+    ),
+    (
+        // ADR 0016 §收件箱 B：每个签名槽最多一条 64B 签名；复合 FK 连 jobs（跨 vault 必失败）。
+        "approval_signatures",
+        "CREATE TABLE IF NOT EXISTS {table}(
+  vault_id     BLOB NOT NULL CHECK(length(vault_id) = 16),
+  request_id   BLOB NOT NULL CHECK(length(request_id) = 16),
+  signer_index INTEGER NOT NULL CHECK(signer_index >= 0),
+  sig64        BLOB NOT NULL CHECK(length(sig64) = 64),
+  received_at  INTEGER NOT NULL,
+  PRIMARY KEY(vault_id, request_id, signer_index),
+  FOREIGN KEY(vault_id, request_id)
+    REFERENCES approval_jobs(vault_id, request_id)
+) STRICT;",
+        &[],
+    ),
 ];
 
 /// 租户表名（**权威清单**：与 [`TENANT_TABLES`] 一一对应，顺序 = 建表顺序）。
@@ -2011,6 +2209,8 @@ pub const TENANT_TABLE_NAMES: &[&str] = &[
     "dedup",
     "dedup_v2",
     "gc_plans",
+    "approval_jobs",
+    "approval_signatures",
 ];
 
 /// 租户表索引（表名已是最终名；每个索引都带 `vault_id` 前缀）。
@@ -2045,6 +2245,27 @@ CREATE INDEX IF NOT EXISTS device_grants_approval
 CREATE UNIQUE INDEX IF NOT EXISTS vaults_legacy_default ON vaults(legacy_default) WHERE legacy_default = 1;
 "#;
 
+/// schema 14 收件箱索引（ADR 0016 §收件箱 B）。
+///
+/// **单独成常量**而不是并入 [`INDEXES`]：`INDEXES` 也会在 9→10/11→12 迁移里执行，
+/// 那时 `approval_jobs` 还不存在；这份索引只由新建库 DDL 与 13→14 迁移使用。
+const APPROVAL_INDEXES: &str = r#"
+-- list：只看自己的待办，按 (recipient_device,status,seq) 取。
+CREATE INDEX IF NOT EXISTS approval_jobs_recipient
+  ON approval_jobs(vault_id, recipient_device, status, seq);
+-- A 的 outgoing 视图（同一形状，换 initiator）。
+CREATE INDEX IF NOT EXISTS approval_jobs_initiator
+  ON approval_jobs(vault_id, initiator_device, status, seq);
+-- 惰性过期/墓碑清理：按状态 + 到期时刻扫。
+CREATE INDEX IF NOT EXISTS approval_jobs_expiry
+  ON approval_jobs(vault_id, status, expires_at);
+-- 墓碑清理/终态时间。
+CREATE INDEX IF NOT EXISTS approval_jobs_terminal
+  ON approval_jobs(vault_id, terminal_at);
+CREATE INDEX IF NOT EXISTS approval_signatures_received
+  ON approval_signatures(vault_id, request_id, received_at);
+"#;
+
 /// 构建新建库的 DDL（表模板按 [`TENANT_TABLES`] 顺序替换成真实表名）。
 pub(crate) fn render_ddl() -> String {
     let mut out = String::from(GLOBAL_DDL);
@@ -2057,6 +2278,8 @@ pub(crate) fn render_ddl() -> String {
         out.push_str(&template.replace("{table}", name));
     }
     out.push_str(INDEXES);
+    // schema 14 收件箱索引（表已在 TENANT_TABLES 末尾建好）。
+    out.push_str(APPROVAL_INDEXES);
     out
 }
 

@@ -3027,6 +3027,19 @@ impl ManagementTokenV2 {
     }
 }
 
+/// relay `/control` 响应里的**只读成员投影**（relay `devices` 表；含 PENDING 兑换）。
+///
+/// **不是授权证据**（ADR 0016）：ACTIVE/REVOKED 一律以已验证控制链为准，本类型只用于
+/// UI 补全"已兑换但未批准（PENDING）"的设备行。relay 伪造它最多影响展示，不参与任何
+/// cap 选择、门限或管理动作；客户端也不会把这里的状态写进 pin/缓存。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayMemberHintV2 {
+    /// 设备 id。
+    pub device_id: [u8; 16],
+    /// relay 投影状态（`active` / `pending` / `revoked`；未知值原样保留）。
+    pub status: String,
+}
+
 /// 控制提交回执（ADR 0015 §1 的公开链事实；`{0:rev,1:head,2:kind,3:request_id,4:authz,5:authority}`）。
 ///
 /// 回执**只**是"relay 说这次提交落在哪一 rev"的公开事实：客户端仍要用自己的已验证
@@ -3084,6 +3097,8 @@ pub struct V2ManagementClient<T: HttpTransport, C: Clock = SystemClock> {
     store: Option<Vault>,
     pin: Option<V2PinV1>,
     relay_epoch_hint: Option<u64>,
+    /// relay `/control` 的只读成员投影（含 PENDING；**不是**授权证据）。
+    relay_member_hints: Vec<RelayMemberHintV2>,
 }
 
 impl<T: HttpTransport> V2ManagementClient<T, SystemClock> {
@@ -3108,6 +3123,7 @@ impl<T: HttpTransport> V2ManagementClient<T, SystemClock> {
             store: None,
             pin: None,
             relay_epoch_hint: None,
+            relay_member_hints: Vec::new(),
         }
     }
 }
@@ -3135,6 +3151,7 @@ impl<T: HttpTransport, C: Clock> V2ManagementClient<T, C> {
             store: None,
             pin: None,
             relay_epoch_hint: None,
+            relay_member_hints: Vec::new(),
         }
     }
 
@@ -3167,6 +3184,15 @@ impl<T: HttpTransport, C: Clock> V2ManagementClient<T, C> {
     #[must_use]
     pub const fn pin(&self) -> Option<&V2PinV1> {
         self.pin.as_ref()
+    }
+
+    /// relay `/control` 的只读成员投影（含 PENDING；**不是**授权证据）。
+    ///
+    /// ACTIVE/REVOKED 一律以 [`Self::state`] 的已验证控制链为准；这里只补
+    /// "已兑换但未批准（PENDING）"的设备行。relay 伪造它不影响任何授权判断。
+    #[must_use]
+    pub fn relay_member_hints(&self) -> &[RelayMemberHintV2] {
+        &self.relay_member_hints
     }
 
     fn load_persisted(&mut self) -> Result<(), SyncError> {
@@ -3404,6 +3430,8 @@ impl<T: HttpTransport, C: Clock> V2ManagementClient<T, C> {
         loop {
             let path = format!("{}/control?after_rev={after_rev}", self.vault_path(""));
             let fields = self.authorized_get(path, now)?;
+            // 只读成员投影（含 PENDING）：解析失败就当没有，不影响控制链验证。
+            self.relay_member_hints = parse_relay_member_hints(&fields);
             let page_head =
                 cbor::uint_field(&fields, 1).map_err(|_| invariant("控制链分页缺 control_rev"))?;
             if let Some(expected) = head_rev {
@@ -3834,6 +3862,30 @@ fn is_revoked_response(response: &HttpResponse) -> bool {
         Ok(fields) => matches!(cbor::text_field(&fields, 0).as_deref(), Ok("REVOKED")),
         Err(_) => false,
     }
+}
+
+/// 解析 `/control` 响应里的成员投影（键 3）：只取 `device_id` + `status`。
+///
+/// **展示专用**：任何字段缺失/类型不符的条目直接跳过（不 fail-stop，也不参与授权）。
+/// relay 投影不是授权证据，UI 必须对 ACTIVE/REVOKED 以已验证控制链为准。
+fn parse_relay_member_hints(fields: &cbor::Fields) -> Vec<RelayMemberHintV2> {
+    let Ok(items) = cbor::array_field(fields, 3) else {
+        return Vec::new();
+    };
+    let mut hints = Vec::with_capacity(items.len());
+    for item in items {
+        let Ok(entry) = cbor::value_map(&item) else {
+            continue;
+        };
+        let (Ok(device_id), Ok(status)) = (
+            cbor::bytes_fixed::<16>(&entry, 0),
+            cbor::text_field(&entry, 2),
+        ) else {
+            continue;
+        };
+        hints.push(RelayMemberHintV2 { device_id, status });
+    }
+    hints
 }
 
 fn parse_control_commit(value: &CdeValue) -> Result<ControlCommitV2, SyncError> {

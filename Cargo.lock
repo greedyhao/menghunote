@@ -5460,6 +5460,7 @@ dependencies = [
  "image",
  "menghunote-dev-relay",
  "menghunote-editor",
+ "menghunote-i18n",
  "menghunote-search",
  "menghunote-storage",
  "menghunote-sync",
@@ -5492,6 +5493,10 @@ dependencies = [
  "menghunote-text",
  "ropey 1.6.1",
 ]
+
+[[package]]
+name = "menghunote-i18n"
+version = "0.1.0"
 
 [[package]]
 name = "menghunote-markdown"

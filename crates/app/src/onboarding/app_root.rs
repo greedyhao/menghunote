@@ -415,6 +415,8 @@ pub struct AppRoot {
     settings: Option<SettingsState>,
     /// 设置页里的同步面板是否展开（默认收起，避免设置页无限长）。
     settings_sync_open: bool,
+    /// 设置页里的「管理（V2 控制面）」区是否展开（默认收起；展开时才触发网络刷新）。
+    settings_management_open: bool,
     /// 关闭设置后要把焦点还给 Main 的编辑器（下一帧渲染时消费）。
     pending_focus_restore: bool,
     main: Option<Entity<AppShell>>,
@@ -425,6 +427,8 @@ pub struct AppRoot {
     notice: Option<String>,
     pending_focus: bool,
     pump_started: bool,
+    /// 系统外观（浅色/深色）变化的订阅（ADR 0021 P2；只订阅一次，drop 即取消）。
+    appearance_subscription: Option<gpui::Subscription>,
     /// **测试专用**：remote_tls 初始化注入的显式信任根（DER；本地 TLS harness）。
     ///
     /// 生产恒为空（系统信任根）。只增加显式信任，不关闭证书链/SAN/有效期校验。
@@ -457,6 +461,7 @@ impl AppRoot {
             pending_invite: None,
             settings: None,
             settings_sync_open: false,
+            settings_management_open: false,
             pending_focus_restore: false,
             main: None,
             lock: None,
@@ -466,6 +471,7 @@ impl AppRoot {
             notice: None,
             pending_focus: false,
             pump_started: false,
+            appearance_subscription: None,
             test_relay_roots: Vec::new(),
             test_baseline_unreachable: false,
         };
@@ -843,6 +849,20 @@ impl AppRoot {
 
     // ---- 设置面板（ADR 0011 S4：不改配置/命令行就能查看/修改同步配置） ----
 
+    /// 订阅系统外观变化（ADR 0021 P2）：只订阅一次，首帧先按当前 OS 外观解析。
+    ///
+    /// 回调只改全局主题并 `refresh_windows()`；不重建 `AppShell`/编辑器、不写正文。
+    fn observe_appearance_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.appearance_subscription.is_some() {
+            return;
+        }
+        crate::theme::apply_system_appearance(window.appearance(), cx);
+        self.appearance_subscription =
+            Some(cx.observe_window_appearance(window, |_root, window, cx| {
+                crate::theme::apply_system_appearance(window.appearance(), cx);
+            }));
+    }
+
     /// 打开设置面板（Welcome / Main 可用；Main 里 `AppShell` 保留不销毁）。
     ///
     /// 打开时重新读一次公开配置：设置面板显示的是**配置文件当前内容**（外部手改也
@@ -906,6 +926,7 @@ impl AppRoot {
             }
         });
         self.settings_sync_open = false;
+        self.settings_management_open = false;
         self.settings = Some(SettingsState {
             active,
             mode,
@@ -927,6 +948,7 @@ impl AppRoot {
             return;
         }
         self.settings_sync_open = false;
+        self.settings_management_open = false;
         if self.state == State::Main {
             // 下一帧把焦点还给编辑器（设置打开时焦点在 relay 输入框）。
             self.pending_focus_restore = true;
@@ -947,6 +969,34 @@ impl AppRoot {
         }
         self.settings_sync_open = !self.settings_sync_open;
         cx.notify();
+    }
+
+    /// 展开/收起设置页里的「管理（V2 控制面）」区（ADR 0016 S4d1c）。
+    ///
+    /// 展开时对管理面板调一次 `activate`（触发首次刷新）；收起不改变任何状态。
+    pub fn settings_toggle_management(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            return;
+        }
+        self.settings_management_open = !self.settings_management_open;
+        if self.settings_management_open {
+            if let Some(panel) = self
+                .main
+                .as_ref()
+                .and_then(|shell| shell.read(cx).management_panel())
+            {
+                panel.update(cx, |panel: &mut crate::dev_sync::ManagementPanel, cx| {
+                    panel.activate(cx)
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// 设置页「管理」区是否展开（测试/投影用）。
+    #[must_use]
+    pub const fn settings_management_open(&self) -> bool {
+        self.settings_management_open
     }
 
     /// 设置面板 relay 输入框的当前文本（公开字段；`None` = 面板未打开）。
@@ -1016,21 +1066,14 @@ impl AppRoot {
             )
         };
         let Some(active) = active else {
-            self.set_settings_error(
-                "当前没有 active 实例：先在实例列表里点「设为默认」，再修改 relay 模式/地址"
-                    .to_owned(),
-            );
+            self.set_settings_error(crate::ui_text::settings_no_active_save_error());
             cx.notify();
             return;
         };
         // ADR 0013 §1：remote_tls 必须显式确认"远程服务器/HTTPS"（确认端点 ≠ 授权接受
         // 服务器任意 hash；pin 仍独立校验）。
         if mode == RelayMode::RemoteTls && !remote_consent {
-            self.set_settings_error(
-                "切换到 remote_tls 需要显式勾选「我确认要连接远程服务器（HTTPS）」；\
-                 确认不会清 pin、也不会自动信任新服务器"
-                    .to_owned(),
-            );
+            self.set_settings_error(crate::ui_text::settings_remote_tls_consent_required());
             cx.notify();
             return;
         }
@@ -1186,8 +1229,7 @@ impl AppRoot {
             .is_some_and(|current| current.instance_id == entry.instance_id);
         let Some(shell) = self.main.as_ref().filter(|_| opened_same) else {
             return FingerprintState::Unavailable(
-                "该实例当前没有打开；打开后才能读取 durable pin（切换默认/保存模式只写配置，重启后生效）"
-                    .to_owned(),
+                crate::ui_text::settings_fingerprint_instance_closed_detail(),
             );
         };
         let vault_id = match menghunote_sync::ids::parse_hex::<16>(&entry.vault_id) {
@@ -3355,6 +3397,8 @@ fn parse_vault_id_input(raw: &str) -> Result<[u8; 16], String> {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // ADR 0021 P2：系统外观（浅色/深色）变化 → 全局主题 + 重绘；只订阅一次。
+        self.observe_appearance_once(window, cx);
         if self.pending_focus {
             self.pending_focus = false;
             // Join 失败后最该重输的是恢复码；Create 聚焦创建链接（唯一入口）。
@@ -3415,7 +3459,7 @@ impl Render for AppRoot {
                     .w(px(204.0))
                     .child(action_button(
                         "app-root-settings",
-                        "⚙ 设置",
+                        crate::ui_text::sidebar_settings(),
                         false,
                         false,
                         cx,
@@ -3501,7 +3545,7 @@ fn banner_text() -> gpui::Div {
         .text_size(px(11.0))
         .text_color(theme::danger_text())
         .child(SharedString::from(
-            "DEV ONLY · 开发同步：relay 只允许 localhost，服务端验签放行，非生产、非端到端安全验收",
+            crate::ui_text::settings_sync_dev_banner(),
         ))
 }
 
@@ -3565,10 +3609,11 @@ where
 fn checkbox_row(
     selector: &'static str,
     checked: bool,
-    label: &'static str,
+    label: impl Into<SharedString>,
     cx: &mut Context<AppRoot>,
     on_click: impl Fn(&mut AppRoot, &mut Context<AppRoot>) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let label: SharedString = label.into();
     div()
         .id(SharedString::from(selector))
         .debug_selector(move || selector.to_string())
@@ -3596,7 +3641,7 @@ fn checkbox_row(
                 .flex_1()
                 .text_size(px(12.0))
                 .text_color(theme::text_color())
-                .child(SharedString::from(label)),
+                .child(label),
         )
         .on_mouse_down(
             MouseButton::Left,
@@ -3711,7 +3756,7 @@ impl AppRoot {
             } else {
                 stored_fingerprint.clone().unwrap_or_else(|| {
                     FingerprintState::Unavailable(
-                        "该实例当前没有打开；打开后才能读取 durable pin".to_owned(),
+                        crate::ui_text::settings_fingerprint_instance_closed(),
                     )
                 })
             }
@@ -3729,9 +3774,7 @@ impl AppRoot {
 
         let mut list = div().w_full().flex().flex_col().gap_1();
         if entries.is_empty() {
-            list = list.child(hint_text(
-                "配置里还没有实例：先返回欢迎页创建或加入一个同步实例。",
-            ));
+            list = list.child(hint_text(crate::ui_text::settings_no_instances_hint()));
         }
         for (index, entry) in entries.iter().enumerate() {
             let is_active = active_id.as_deref() == Some(entry.instance_id.as_str());
@@ -3740,11 +3783,13 @@ impl AppRoot {
             let row_id = entry.instance_id.clone();
             let row_selector = format!("settings-instance-{index}");
             let active_selector = format!("settings-instance-{index}-active");
-            let row_label = format!(
-                "{} · 本机实例 {}",
-                if is_active { "当前默认" } else { "实例" },
-                short_public_id(&entry.instance_id)
-            );
+            let role = if is_active {
+                crate::ui_text::settings_active_now()
+            } else {
+                crate::ui_text::settings_instance()
+            };
+            let row_label =
+                crate::ui_text::settings_instance_row(&role, &short_public_id(&entry.instance_id));
             let ids_line = format!(
                 "API {} · {} · vault_id {} · device_id {}",
                 entry.api_version.as_str(),
@@ -3791,9 +3836,9 @@ impl AppRoot {
                     .child(action_button(
                         active_selector,
                         if is_active {
-                            "当前默认"
+                            crate::ui_text::settings_active_now()
                         } else {
-                            "设为默认"
+                            crate::ui_text::settings_set_active()
                         },
                         false,
                         is_active,
@@ -3823,9 +3868,7 @@ impl AppRoot {
                     .pt(px(4.0))
                     .border_t_1()
                     .border_color(theme::sidebar_border())
-                    .child(section_text(
-                        "公开信息（可复制；不要分享 setup secret、恢复码或主密钥）",
-                    ))
+                    .child(section_text(crate::ui_text::settings_public_title()))
                     .child(
                         div()
                             .debug_selector(|| "settings-api-version".to_string())
@@ -3852,11 +3895,13 @@ impl AppRoot {
                                     .flex_1()
                                     .text_size(px(11.0))
                                     .text_color(theme::text_color())
-                                    .child(SharedString::from(format!("vault_id：{vault_id}"))),
+                                    .child(SharedString::from(crate::ui_text::settings_vault_id(
+                                        &vault_id,
+                                    ))),
                             )
                             .child(action_button(
                                 "settings-copy-vault-id",
-                                "复制",
+                                crate::ui_text::settings_copy(),
                                 false,
                                 false,
                                 cx,
@@ -3879,11 +3924,13 @@ impl AppRoot {
                                     .flex_1()
                                     .text_size(px(11.0))
                                     .text_color(theme::text_color())
-                                    .child(SharedString::from(format!("device_id：{device_id}"))),
+                                    .child(SharedString::from(crate::ui_text::settings_device_id(
+                                        &device_id,
+                                    ))),
                             )
                             .child(action_button(
                                 "settings-copy-device-id",
-                                "复制",
+                                crate::ui_text::settings_copy(),
                                 false,
                                 false,
                                 cx,
@@ -3906,11 +3953,13 @@ impl AppRoot {
                                     .flex_1()
                                     .text_size(px(11.0))
                                     .text_color(theme::status_bar_text())
-                                    .child(SharedString::from(format!("库文件：{vault_path}"))),
+                                    .child(SharedString::from(
+                                        crate::ui_text::settings_vault_path(&vault_path),
+                                    )),
                             )
                             .child(action_button(
                                 "settings-copy-path",
-                                "复制",
+                                crate::ui_text::settings_copy(),
                                 false,
                                 false,
                                 cx,
@@ -3924,17 +3973,12 @@ impl AppRoot {
                     )
                     .into_any_element()
             }
-            None => hint_text(
-                "当前没有 active 实例：列表里点「设为默认」后才能修改 relay（保存后重启生效）。",
-            )
-            .into_any_element(),
+            None => hint_text(crate::ui_text::settings_no_active_hint()).into_any_element(),
         };
 
         let has_error = error.is_some();
-        let error_text = error.unwrap_or_else(|| "无错误".to_owned());
-        let notice_text = notice.unwrap_or_else(|| {
-            "修改保存后需重启应用才生效；公开 id 可复制，秘密不要分享。".to_owned()
-        });
+        let error_text = error.unwrap_or_else(crate::ui_text::settings_error_none);
+        let notice_text = notice.unwrap_or_else(crate::ui_text::settings_notice_default);
 
         // 同步面板作为设置页的一部分渲染（唯一设置入口里同时有连接配置与同步操作）；
         // 默认构建/未启用时 `None`，整块不存在。
@@ -3943,6 +3987,11 @@ impl AppRoot {
             .main
             .as_ref()
             .and_then(|shell| shell.read(cx).dev_sync_panel());
+        #[cfg(feature = "dev-sync")]
+        let management_panel = self
+            .main
+            .as_ref()
+            .and_then(|shell| shell.read(cx).management_panel());
 
         Some(
             div()
@@ -3953,7 +4002,14 @@ impl AppRoot {
                 .items_start()
                 .justify_center()
                 .pt(px(56.0))
-                .bg(gpui::rgba(0x00000026))
+                .bg(theme::overlay_scrim())
+                // 设置页是覆盖层：滚轮/触控板滚动到这里就停住，不能穿透到下面的
+                // 编辑器（真机反馈：滚设置页时底部笔记也跟着滚）。
+                .on_scroll(
+                    cx.listener(|_root, _event: &gpui::ScrollEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
                 // 点空白 = 关闭（不保存）；面板内部拦冒泡。
                 .on_mouse_down(
                     MouseButton::Left,
@@ -3993,8 +4049,10 @@ impl AppRoot {
                                 }
                             },
                         ))
-                        .child(title_text("同步设置（DEV ONLY）"))
+                        .child(title_text(crate::ui_text::settings_sync_dev_title()))
                         .child(banner_text())
+                        // ADR 0021 P2 + ADR 0020 P1：应用级外观与语言并排，二者互不依赖。
+                        .child(crate::language_settings::appearance_and_language_row())
                         .child(
                             div()
                                 .flex()
@@ -4003,16 +4061,16 @@ impl AppRoot {
                                 .justify_between()
                                 .w_full()
                                 .child(section_text(if self.settings_sync_open {
-                                    "同步面板（已展开）"
+                                    crate::ui_text::settings_sync_panel_expanded()
                                 } else {
-                                    "同步面板（默认收起，展开后查看设备/邀请/轮换）"
+                                    crate::ui_text::settings_sync_panel_collapsed()
                                 }))
                                 .child(action_button(
                                     "settings-toggle-sync",
                                     if self.settings_sync_open {
-                                        "收起"
+                                        crate::ui_text::settings_collapse()
                                     } else {
-                                        "展开"
+                                        crate::ui_text::settings_expand()
                                     },
                                     false,
                                     false,
@@ -4029,13 +4087,60 @@ impl AppRoot {
                             }
                             this
                         })
-                        .child(section_text(
-                            "实例（active 优先；点「设为默认」只写配置，重启后生效）",
-                        ))
+                        // V2 管理是实验功能：个人用户只需要 V1 设备列表/邀请/移除。
+                        // 默认不渲染；需要验证 S4d1c 时设置 MENGHUNOTE_EXPERIMENTAL_V2=1。
+                        .when(crate::dev_sync::experimental_v2_ui(), |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .w_full()
+                                    .pt(px(4.0))
+                                    .border_t_1()
+                                    .border_color(theme::sidebar_border())
+                                    .child(section_text(if self.settings_management_open {
+                                        "管理（实验：V2 控制面 / 通道 A 双签，已展开）"
+                                    } else {
+                                        "管理（实验：V2 控制面 / 通道 A 双签，默认收起）"
+                                    }))
+                                    .child(action_button(
+                                        "settings-toggle-management",
+                                        if self.settings_management_open {
+                                            "收起"
+                                        } else {
+                                            "展开"
+                                        },
+                                        false,
+                                        false,
+                                        cx,
+                                        |root, cx| root.settings_toggle_management(cx),
+                                    )),
+                            )
+                            .when(
+                                self.settings_management_open,
+                                |this| {
+                                    #[cfg(feature = "dev-sync")]
+                                    {
+                                        if let Some(panel) = management_panel {
+                                            this.child(div().w_full().child(panel))
+                                        } else {
+                                            this.child(hint_text(
+                                                "管理面板不可用：当前实例没有真实库路径/管理执行体",
+                                            ))
+                                        }
+                                    }
+                                    #[cfg(not(feature = "dev-sync"))]
+                                    {
+                                        this
+                                    }
+                                },
+                            )
+                        })
+                        .child(section_text(crate::ui_text::settings_instances_title()))
                         .child(list)
-                        .child(section_text(
-                            "relay 模式与地址（只对 active 实例；保存后重启生效）",
-                        ))
+                        .child(section_text(crate::ui_text::settings_relay_title()))
                         .child(mode_selector(
                             "settings-mode",
                             mode,
@@ -4046,7 +4151,7 @@ impl AppRoot {
                             this.child(checkbox_row(
                                 "settings-remote-consent",
                                 remote_consent,
-                                "我确认要连接远程服务器（HTTPS）；确认端点 ≠ 授权接受服务器任意 hash",
+                                crate::ui_text::settings_remote_consent(),
                                 cx,
                                 |root, cx| {
                                     let next = root
@@ -4069,14 +4174,8 @@ impl AppRoot {
                                 .child(relay),
                         )
                         .child(hint_text(match mode {
-                            RelayMode::LocalDev => {
-                                "local_dev：只允许 http://localhost / 127.0.0.1 / [::1]；\
-                                 空值/非 loopback/https/带 userinfo/带路径一律内联报错且不写配置。"
-                            }
-                            RelayMode::RemoteTls => {
-                                "remote_tls：只允许 https + canonical origin（DNS/IP；拒绝 \
-                                 userinfo/query/fragment/非根路径）；必须勾选上面的确认。"
-                            }
+                            RelayMode::LocalDev => crate::ui_text::settings_relay_local_hint(),
+                            RelayMode::RemoteTls => crate::ui_text::settings_relay_remote_hint(),
                         }))
                         .child(
                             div()
@@ -4105,7 +4204,7 @@ impl AppRoot {
                                 .gap_2()
                                 .child(action_button(
                                     "settings-save",
-                                    "保存模式/relay（重启后生效）",
+                                    crate::ui_text::settings_save(),
                                     true,
                                     false,
                                     cx,
@@ -4113,7 +4212,7 @@ impl AppRoot {
                                 ))
                                 .child(action_button(
                                     "settings-cancel",
-                                    "关闭（不保存）",
+                                    crate::ui_text::settings_close_without_save(),
                                     false,
                                     false,
                                     cx,
@@ -4145,11 +4244,9 @@ impl AppRoot {
             .pt(px(4.0))
             .border_t_1()
             .border_color(theme::sidebar_border())
-            .child(section_text(
-                "安全指纹（公开、只读；不含 token/恢复码/主密钥）",
-            ));
+            .child(section_text(crate::ui_text::settings_fingerprint_title()));
         let headline = fingerprint.as_ref().map_or_else(
-            || "尚未打开实例：无法读取 pin 指纹".to_owned(),
+            crate::ui_text::settings_fingerprint_unopened,
             FingerprintState::headline,
         );
         section = section.child(
