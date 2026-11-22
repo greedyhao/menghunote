@@ -1549,6 +1549,10 @@ fn read_meta_u64(vault: &Vault, key: &str) -> Result<Option<u64>, SyncError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use menghunote_storage::{
+        append_updates, baseline_verify_failure, create_body_doc, load_head, StorageError,
+        UpdateRecord,
+    };
 
     fn manifest(key_epoch: u64, total_plain_len: u64) -> ManifestV1 {
         ManifestV1 {
@@ -1812,5 +1816,166 @@ mod tests {
             new_signature: None,
         };
         assert_ne!(control_head_hash(&state, &[entry]), base);
+    }
+
+    /// 单测用的临时 vault：lib 单测没有编译期 `CARGO_TARGET_TMPDIR`，回退到仓库 `target/tmp`。
+    fn fresh_vault() -> (tempfile::TempDir, Vault) {
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")
+            });
+        std::fs::create_dir_all(&base).expect("创建 target/tmp");
+        let dir = tempfile::Builder::new()
+            .prefix("bootstrap-gate-")
+            .tempdir_in(&base)
+            .expect("创建临时目录");
+        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开 vault");
+        (dir, vault)
+    }
+
+    /// 基线 staging 的预期参与集合（本文件两个用例都只声明文档）。
+    fn expectation(docs: &[&str]) -> BaselineExpectation {
+        BaselineExpectation::new(
+            docs.iter().map(|doc_id| (*doc_id).to_owned()),
+            std::iter::empty::<[u8; 32]>(),
+        )
+    }
+
+    /// 生成一份基线快照（另一个 peer 的空文档，只含给定正文）。
+    fn baseline_snapshot(doc_id: &str, peer_id: u64, text: &str) -> Vec<u8> {
+        let doc = BodyDoc::create(doc_id, peer_id).expect("创建基线 LoroDoc");
+        doc.insert_scalars(0, text).expect("写基线正文");
+        doc.export_snapshot().expect("导出基线 snapshot")
+    }
+
+    /// 在本地先提交一条正文 update（证明 abort 不会丢本地已 merge 的 op）。
+    fn seed_local_body(vault: &Vault, doc_id: &str, peer_id: u64, text: &str) {
+        create_body_doc(vault, doc_id).expect("建 loro_docs 行");
+        let doc = BodyDoc::create(doc_id, peer_id).expect("创建本地 BodyDoc");
+        doc.insert_scalars(0, text).expect("写本地正文");
+        let head = load_head(vault, doc_id).expect("读本地 head");
+        let base = head.version_vector().expect("解码 head_vv");
+        let update = doc.pending_update(&base).expect("导出本地增量");
+        append_updates(
+            vault,
+            doc_id,
+            head.head_seq,
+            &[UpdateRecord::new("local-merge", update)],
+        )
+        .expect("提交本地增量");
+    }
+
+    #[test]
+    fn reconcile_journal_auto_aborts_bootstrap_staging_and_clears_marker() {
+        let (_dir, vault) = fresh_vault();
+        // 本地先有一份正文；随后 baseline 批次与它 merge（staging 里已有 merged 数据）。
+        seed_local_body(&vault, "doc-merged", 0xA11CE, "local-merged|");
+        begin_baseline_apply(
+            &vault,
+            &[1; 16],
+            10,
+            "bootstrap:relay-cursor-10",
+            &expectation(&["doc-merged"]),
+        )
+        .expect("begin bootstrap staging");
+        let applied = apply_baseline_batch(
+            &vault,
+            &[(
+                "doc-merged".to_owned(),
+                baseline_snapshot("doc-merged", 0xB0B, "baseline-merged"),
+            )],
+            &[],
+        )
+        .expect("merge baseline snapshot");
+        assert_eq!(applied.applied_docs, 1, "前置条件：基线批次已 merge");
+        mark_baseline_verify_failed(&vault, "读回校验失败：注入").expect("写失败标记");
+        assert!(
+            baseline_apply_state(&vault).expect("state").is_some(),
+            "前置条件：staging journal 必须存在"
+        );
+
+        // 换新基线（checkpoint / S / source 全不同）：bootstrap staging 必须 auto-abort。
+        reconcile_journal(&vault, &[2; 16], 20, "bootstrap:relay-cursor-20")
+            .expect("bootstrap 换基线应 auto-abort 旧 staging");
+
+        assert!(
+            baseline_apply_state(&vault).expect("state").is_none(),
+            "auto-abort 后 staging journal 必须清除"
+        );
+        assert_eq!(
+            baseline_verify_failure(&vault).expect("读失败标记"),
+            None,
+            "auto-abort 必须同时清除 verify 失败标记"
+        );
+        // 已 merge 的 Loro 数据保留（abort 只清 journal，不回滚 CRDT merge）。
+        let (merged, _) =
+            load_body_doc(&vault, "doc-merged", 0xA11CE, None).expect("读回 merged 文档");
+        let merged_text = merged.text();
+        assert!(
+            merged_text.contains("local-merged"),
+            "auto-abort 不得丢本地已 merge 的 op，实际={merged_text:?}"
+        );
+        assert!(
+            merged_text.contains("baseline-merged"),
+            "auto-abort 不得回滚已 merge 的基线数据，实际={merged_text:?}"
+        );
+        // 新基线可以直接 begin（旧 journal/marker 不会挡住续跑）。
+        let reopened = begin_baseline_apply(
+            &vault,
+            &[2; 16],
+            20,
+            "bootstrap:relay-cursor-20",
+            &expectation(&["doc-merged"]),
+        )
+        .expect("auto-abort 后必须能以新基线重新 begin");
+        assert_eq!(reopened.status, BaselineApplyStatus::Staging);
+        assert_eq!(reopened.applied_docs, 0, "新基线应是全新 journal");
+    }
+
+    #[test]
+    fn reconcile_journal_refuses_rotation_staging_without_abort() {
+        // 轮换的 baseline apply 传空 source（rotation_apply.rs）；非 bootstrap 前缀同样拒绝。
+        for source_cursor in ["", "rotation:custom"] {
+            let (_dir, vault) = fresh_vault();
+            begin_baseline_apply(
+                &vault,
+                &[3; 16],
+                5,
+                source_cursor,
+                &expectation(&["doc-rotation"]),
+            )
+            .expect("begin rotation staging");
+            mark_baseline_verify_failed(&vault, "轮换中的失败标记").expect("写失败标记");
+
+            let error = reconcile_journal(&vault, &[4; 16], 9, "bootstrap:relay-cursor-9")
+                .expect_err("不得 auto-abort 非 bootstrap 的 staging");
+            match &error {
+                SyncError::Storage(StorageError::SyncConflict { context }) => {
+                    assert!(
+                        context.contains("非 bootstrap"),
+                        "错误必须点明拒绝原因，实际：{context}"
+                    );
+                }
+                other => panic!("应当拒绝为 SyncConflict，实际 {other:?}"),
+            }
+
+            // journal 与失败标记都必须原样保留：绝不能被误当成 bootstrap 的 staging 清掉。
+            let state = baseline_apply_state(&vault)
+                .expect("state")
+                .expect("轮换 journal 必须保留");
+            assert_eq!(state.status, BaselineApplyStatus::Staging);
+            assert_eq!(state.checkpoint_id, [3; 16]);
+            assert_eq!(state.baseline_s, 5);
+            assert_eq!(state.source_cursor, source_cursor);
+            assert!(!state.finishable, "失败标记存在时不得 finishable");
+            assert_eq!(
+                baseline_verify_failure(&vault)
+                    .expect("读失败标记")
+                    .as_deref(),
+                Some("轮换中的失败标记"),
+                "拒绝 auto-abort 时绝不能误清失败标记"
+            );
+        }
     }
 }

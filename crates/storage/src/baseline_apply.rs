@@ -416,6 +416,16 @@ pub fn mark_baseline_verify_failed(vault: &Vault, reason: &str) -> Result<(), St
     vault.set_meta(META_BASELINE_VERIFY_FAILED, &value)
 }
 
+/// 失败标记存在时统一的拒绝错误：必须带原因，并明确唯一清理入口是 abort。
+fn verify_failed_conflict(reason: &str, action: &str) -> StorageError {
+    StorageError::SyncConflict {
+        context: format!(
+            "baseline 导入的读回校验已失败（{META_BASELINE_VERIFY_FAILED}: {reason}）；\
+             {action} 已拒绝且零写入，必须先 abort_baseline_apply 清理失败 journal 与标记"
+        ),
+    }
+}
+
 /// 读失败标记的原因；没有标记返回 `None`。
 ///
 /// 标记存在但编码非法（缺魔数/非 UTF-8）返回 [`StorageError::Corrupt`]，不静默当成
@@ -589,11 +599,20 @@ pub fn baseline_apply_state(vault: &Vault) -> Result<Option<BaselineApplyState>,
 }
 
 /// 应用一批已验证的快照文档和远端 tombstone。
+///
+/// 若存在 [`META_BASELINE_VERIFY_FAILED`] 标记，本函数在**任何解码/写事务之前**返回
+/// [`StorageError::SyncConflict`]（带原因并提示先 [`abort_baseline_apply`]），零写入。
 pub fn apply_baseline_batch(
     vault: &Vault,
     docs: &[(String, Vec<u8>)],
     tombstones: &[String],
 ) -> Result<BaselineApplyState, StorageError> {
+    // 失败标记优先于一切：journal 仍是 staging（schema 不允许新 status），但语义上
+    // 已不可续跑。必须在解码 snapshot / 开写事务之前拒绝，避免继续往失败 journal
+    // 里追加数据而让 abort 后的重跑更难判断。
+    if let Some(reason) = baseline_verify_failure(vault)? {
+        return Err(verify_failed_conflict(&reason, "apply_baseline_batch"));
+    }
     let journal = load_active_journal(vault)?;
     if docs.is_empty() && tombstones.is_empty() {
         return state_from_journal(vault, &journal);
@@ -998,6 +1017,12 @@ pub fn apply_baseline_assets(
     vault: &Vault,
     assets: &[BaselineAsset],
 ) -> Result<BaselineApplyState, StorageError> {
+    // 与 batch/finish 一致：失败标记存在时，资产批也必须在任何解码/写事务之前
+    // 拒绝。否则 Phase 1B 的 catchup_integrate 循环调用这批 API 时，会在已判定
+    // 失败的 journal 上继续写 baseline_apply_assets/计数，破坏"marker = 完全冻结"。
+    if let Some(reason) = baseline_verify_failure(vault)? {
+        return Err(verify_failed_conflict(&reason, "apply_baseline_assets"));
+    }
     let journal = load_active_journal(vault)?;
     if assets.is_empty() {
         return state_from_journal(vault, &journal);
@@ -1134,6 +1159,12 @@ pub fn finish_baseline_apply(
         None => return Ok(BaselineApplyFinish::NotFound),
         Some(journal) => journal,
     };
+    // 失败标记必须在任何写之前拒绝，且不能退化成不带原因的 `Ok(Conflict)`：
+    // journal 仍是 staging（schema 不允许 failed），但 finish 只会推进水位/cursor，
+    // 在"导入读回校验已失败"时推进等于把未证明完整的基线当成已消费。
+    if let Some(reason) = baseline_verify_failure(vault)? {
+        return Err(verify_failed_conflict(&reason, "finish_baseline_apply"));
+    }
     if journal.status != BaselineApplyStatus::Staging || journal.baseline_s != chosen_baseline_s {
         return Ok(BaselineApplyFinish::Conflict);
     }
@@ -1602,7 +1633,13 @@ fn state_from_journal(
     };
     // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
     // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
-    let finishable = journal.status == BaselineApplyStatus::Staging
+    //
+    // 失败标记存在时 journal 仍是 staging（schema v3 的 CHECK 只允许 staging/completed），
+    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false，否则 UI/续跑逻辑
+    // 会把"读回校验失败"当成"可以 finish"。标记损坏返回 Corrupt，同样是 fail-closed。
+    let verify_failed = baseline_verify_failure(vault)?.is_some();
+    let finishable = !verify_failed
+        && journal.status == BaselineApplyStatus::Staging
         && match &expected {
             Some(expected) => expected_is_complete(vault, journal, expected)?,
             None => false,

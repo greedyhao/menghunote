@@ -462,11 +462,16 @@ merge 是超线性的；**不能**把该倍率外推到 128 MiB 上限。
   `crates/storage/tests/sync_inbox_batch.rs` 仍覆盖批量 ack/冲突/前缀语义；
   本次只新增/扩展 ignored 的 release 基准。
 
-### 8.7 `checkpoint validate` 覆盖日志扫描（S = 1k / 5k / 25k，2026-11-21）
+### 8.7 `checkpoint validate` 覆盖日志扫描（S = 1k / 5k / 25k / 1M，2026-11-21）
 
 > 任务 4 P1 探针：`crates/sync/tests/phase1a_release.rs::checkpoint_validate_scan_cost`
 > （`#[ignore = "manual benchmark"]`）。只加基准与文档：**不改**生产
 > `scan_coverage_log`，不改 relay / `sync-proto` / schema，未 commit。
+>
+> **M3 标定补充（同日）**：同一探针新增 **S = 1 048 576（= 4096 页）上限档**，
+> 且该档只跑 1 次；另新增 `large_doc_per_page_replay_cost` 大文档 replay 探针。
+> 结果与限制见 §8.7.7 / §8.7.8。两节都只打印、不 assert 时间；3 s / 16 MiB /
+> `N_min = 25 000` 阈值与 `COVERAGE_SCAN_MAX_PAGES = 4096` 均未改。
 
 #### 8.7.1 目的与口径
 
@@ -503,7 +508,8 @@ merge 是超线性的；**不能**把该倍率外推到 128 MiB 上限。
   `prepare` 会扫一遍日志并落 pending receipt；`validate` 再从 `c0` 扫一遍、
   逐条核对 receipt 候选，并对尾部 ASSET 真实下载/解密/AEAD 验证。
 - 每档同一夹具连续 `validate` 3 次（`prepare` 只做一次；每次 validate 前清零计数器），
-  取中位数；一次进程内 3 档串行（1k → 5k → 25k）。
+  取中位数；一次进程内 4 档串行（1k → 5k → 25k → 1M）。**1M 上限档只跑 1 次**
+  （避免百万事件 × 3，见 §8.7.8）；本节表中 3 档仍是 3-run 中位数。
 - 硬断言（与时间无关）：`covered_seq == S`、`coverage_verified_candidates == 1`、
   `coverage_durable_assets == 0`、每次 validate 的 `pages == ceil(S/256)`。
   **只打印不 assert 时间。**
@@ -552,6 +558,10 @@ cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --no
 [phase1a] scan_cost S=25000 pages=98 scan_ms=3.796 (median of 3; raw_scan_ms=[3.796107, 3.7794470000000002, 3.829243] log_ms_median=3.183 validate_ms_median=4.376 validate_ms_raw=[4.376248, 4.35638, 4.46814] part_calls=4 part_ms_raw=[0.002683, 0.001617, 0.001777])
 ```
 
+> 上面是初次 3 档 3-run 批次的原始输出（旧 summary 行格式：`(median of 3; ...)`）。
+> M3 追加 1M 档时 summary 行改为 `S=... pages=... scan_ms=... log_ms=... validate_ms=...`；
+> 旧批次数字不回改，新格式的 1M 档原始输出见 §8.7.8。
+
 #### 8.7.4 结果
 
 | S | 事件（ASSET / UPDATE） | pages | `scan_ms` 中位数 | raw `scan_ms` | `log_ms` 中位数 | visitor ≈ | `validate_ms` 中位数 | prepare pages / `prepare_scan_ms` |
@@ -559,6 +569,10 @@ cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --no
 | 1 000 | 143 / 857 | 4 | **0.076 ms** | 0.074–0.083 | 0.057 ms | 0.019 ms | **0.542 ms** | 4 / 0.114 ms |
 | 5 000 | 715 / 4 285 | 20 | **0.479 ms** | 0.440–0.617 | 0.344 ms | 0.135 ms | **0.919 ms** | 20 / 0.450 ms |
 | 25 000 | 3 572 / 21 428 | 98 | **3.796 ms** | 3.779–3.829 | 3.183 ms | 0.613 ms | **4.376 ms** | 98 / 3.660 ms |
+
+> 上表是**初次 3-run、单探针批次**（§8.7.3 的 `scan-cost-run.log`，一次进程只跑本探针）。
+> 最终 release 复跑（4-run 批次）得到的是 **0.428 / 4.039 ms**（1k 0.078），两批不要混用；
+> 批次差异与口径见 §8.7.6。
 
 读法：
 
@@ -593,9 +607,194 @@ cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --no
   不随 S 缩放；真实 checkpoint 的快照导入/资产实证成本本探针只测了 1 条尾部 ASSET。
 - **没有覆盖的形状**：缺口在持久游标之前（durable skipped-asset 路径）、多个缺口、
   ASSET 占 10–20% 之外、S < 1k / > 1M（`COVERAGE_SCAN_MAX_PAGES = 4096` 上限）、
-  relay GC 后日志不可读、真实网络抖动；均未测。
+  relay GC 后日志不可读、真实网络抖动；均未测。S = 1M（= 4096 页上限）已由
+  §8.7.8 单跑一次覆盖，但只有 1 run、无真实 RTT。
 - **页大小耦合**：256 是生产私有常量，探针里用 `ceil(S/256)` 校验页数；生产改页大小
   时探针与本节需同步。
 - **时间噪声**：共享 8 vCPU 机器、load 0.1–2.4；5k 的第 3 轮 0.617 ms（比中位数高 29%），
   25k 的 prepare 曾出现一次 8.8 ms 冷启动离群值。绝对值只用于量级/线性度判断。
 - 探针**未 commit**；写作用域仅 `crates/sync/tests/phase1a_release.rs` 与本文件。
+
+#### 8.7.6 最终 release 复跑（4-run 批次）与数字口径
+
+2026-11-21 评审收尾时又跑了一次 release 批次：`phase1a_release` 的两个 ignored 探针
+（`checkpoint_validate_scan_cost` + `phase1a_baseline_apply_gate_hold`）同进程执行，
+scan 仍是同档 3 轮取中位数。这是本探针的**第 4 次运行（4-run 批次）**，不是 §8.7.4
+那一批的续测。
+
+| S | pages | `scan_ms` 中位数（4-run 批次） | raw `scan_ms` | `validate_ms` 中位数 |
+| --- | --- | --- | --- | --- |
+| 1 000 | 4 | **0.078 ms** | 0.074–0.089 | 0.525 ms |
+| 5 000 | 20 | **0.428 ms** | 0.419–0.449 | 0.848 ms |
+| 25 000 | 98 | **4.039 ms** | 3.849–4.250 | 4.594 ms |
+
+口径（两组都保留，不要混成一组）：
+
+- §8.7.4 的 **0.479 / 3.796 ms** 是**初次 3-run、单探针批次**（`scan-cost-run.log`；
+  一次进程只跑本探针，1k → 5k → 25k 串行）。
+- 本节的 **0.428 / 4.039 ms** 是**最终 release 复跑（4-run 批次）**；同一进程还并行
+  跑了 `baseline_apply` 探针，机器负载更高。25k 比初次高约 6%（4.039 vs 3.796），
+  5k 低约 11%（0.428 vs 0.479）。**这是批次/负载差异，不是 scan 代码变化**：
+  `scan_coverage_log` 两批之间未改，pages 仍严格 = `ceil(S/256)`。
+- 评审摘要（`sync-review-272k.md` / `sync-review-1m.md` 的 §0）引用的是**本节这批
+  0.428 / 4.039**；正文 §8.7.4 是初次 3-run 的 0.479 / 3.796。引用时必须带批次名，
+  不能把两组放进同一张表或算同一个中位数。
+- 绝对值仍只用于量级/线性度：1k 0.076 → 0.078、25k 3.796 → 4.039，都在共享机器
+  噪声量级内；页数（4 / 20 / 98）与“visitor 线性、页数严格 = `ceil(S/256)`”的结论
+  不受影响。
+
+#### 8.7.7 M3 大文档 per-page replay（1 MiB 单文档，两种 update 形状，2026-11-21）
+
+> 探针：`crates/sync/tests/phase1a_release.rs::large_doc_per_page_replay_cost` /
+> `fragmented_doc_per_page_replay_cost`（均 `#[ignore = "manual benchmark"]`）。与 §8.7 的 coverage scan 无关：它测 aggregate
+> 每页为每个 **touched doc** 做的全量 `load_body_doc`（快照 + 该 doc 全部
+> `loro_updates` 重放）里，**单篇 1 MiB 正文**这一形状。只打印，不 assert 时间。
+
+**环境**：Linux 6.8.0-149（Ubuntu），Intel Xeon Gold 6330 @ 2.00 GHz，8 vCPU，
+15 GiB RAM，ext4（`/dev/sda1`）；`rustc`/`cargo` **1.100.0**，`--release`
+（`opt-level=3`、`debug=0`、无 LTO）。同一台共享机器，测量时 load average 约
+**0.5–2.4**（8 vCPU）。下表是**单探针单跑批次**（`cargo test ... large_doc_per_page_replay_cost
+-- --ignored --nocapture`，一次进程只跑本探针；日志
+`target/tmp/phase1a-logs/large-doc-replay-run.log`）。
+
+**文本形状**（只此一档）：
+- fresh vault（`CARGO_TARGET_TMPDIR` 下真 SQLite）+ `seed_doc("large-doc", LOCAL_PEER=0x41)`；
+- 确定性伪随机 **ASCII** 正文 **1 MiB**（`pseudo_text`，小写字母 + 数字；byte ==
+  Unicode scalar == UTF-8 字节）；一次 `insert_scalars(0, &text)` + `commit_local`；
+- 落库恰好 **1 条 `loro_updates` 行**（单条大 insert op），Loro update payload
+  **1 048 671 B**（1 048 576 B 正文 + 约 95 B 的 Loro 结构开销）。
+
+**测量**：连续 **5 次** `load_body_doc(&vault, "large-doc", LOCAL_PEER, None)`，每次都是
+新的 SQLite 读取 + snapshot/update import（不共享 BodyDoc）；每次断言
+`scalar_len == byte_len == 1 048 576`、`head_seq` 等于提交后水位（与时间无关）。
+
+| 项目 | 数值 | 说明 |
+| --- | --- | --- |
+| raw `replay_ms`（5 次） | **2.536 / 2.438 / 1.917 / 1.793 / 1.975 ms** | 第 1 轮含冷页缓存 |
+| `replay_ms_median` | **1.975 ms** | 5 次中位数（最终复跑 1.996） |
+| `replay_ms_warm_median` | **1.975 ms** | 去掉第 1 轮后的 4 次中位数 |
+| `pending_update`（空 VV，参考） | 1.610 ms / 1 048 671 B | 全量 update 导出，不是 replay |
+| `export_snapshot`（参考） | 7.580 ms / 2 097 403 B | snapshot ≈2.0× 正文 |
+| `BodyDoc::restore(snapshot)`（参考） | 3.688 ms | 只含 snapshot import |
+
+```text
+[phase1a] large_doc_replay run=0 replay_ms=2.536
+[phase1a] large_doc_replay run=1 replay_ms=2.438
+[phase1a] large_doc_replay run=2 replay_ms=1.917
+[phase1a] large_doc_replay run=3 replay_ms=1.793
+[phase1a] large_doc_replay run=4 replay_ms=1.975
+[phase1a] large_doc_replay doc_mib=1.000 text_bytes=1048576 loro_payload_bytes=1048671 update_rows=1 replay_runs=5 replay_ms_raw=[2.53614, 2.438051, 1.917222, 1.7926360000000001, 1.9749149999999998] replay_ms_median=1.975 replay_ms_warm_median=1.975
+[phase1a] large_doc_replay_ref pending_update_ms=1.610 pending_bytes=1048671 export_snapshot_ms=7.580 snapshot_bytes=2097403 restore_from_snapshot_ms=3.688
+```
+
+**第二种形状：同一篇 1 MiB 正文拆成 256 条 4 KiB update**（`fragmented_doc_per_page_replay_cost`），
+模拟真实库中“大文档 + 多批增量”而不是单条大 insert：
+
+| 项目 | 数值 | 说明 |
+| --- | --- | --- |
+| `loro_updates` 行数 | **256** | 每 4 KiB 一次 `commit_local` |
+| raw `replay_ms`（5 次） | **8.421 / 6.210 / 5.965 / 5.569 / 5.743 ms** | 首轮冷缓存 |
+| `replay_ms_median` | **5.965 ms** | 仍远低于 2 s（最终复跑 5.322） |
+
+结论：**单条大 op 与 256 条增量都只是毫秒级**。真实大文档的 per-page replay
+成本由 update 条数/并发形状决定，但本机 1 MiB × 256 行也只有 ≈6 ms；不能把
+verify 的 45 s 折算成 per-page replay。
+
+读法：
+
+1. **per-page replay 是毫秒级，§10.4 的 ~2 s/篇折算不成立。** 单条大 insert ≈2 ms，
+   256 条 4 KiB 增量 ≈6 ms；§10.4 的 45 s 是 **baseline_apply 的 `verify_imported`**——
+   每篇要 import `local` + `baseline_merge` 两行 update（后者是并发合并后的组合
+   update），含 attached import 的 diff/merge 成本（§8.4b 的 5→20 MiB 超线性），
+   不是 `load_body_doc` 的纯 replay。**不能把 verify 的 45 s 折算成 per-page 2 s**。
+   仍需保留的结论是：大文档的 **verify/attached merge** 成本高；纯 replay 不是
+   aggregate 页的已知瓶颈（本机 1 MiB 最多 ~6 ms）。
+2. **本地 replay 本身不是 aggregate 页的瓶颈**：本探针只量 `load_body_doc` 这一小段，
+   不含该页的 pull/解密/多文档 visitor；单篇 1 MiB 的 replay ≈2 ms。
+3. **visitor/固定成本另计**：snapshot 导出/导入（7.6 / 3.7 ms）都比 update replay 贵，
+   快照约 2.0× 正文；若后续 catch-up 用 snapshot 恢复单篇，不能拿 2 ms 代替。
+4. **时间只用于量级**：5 次都在 1.8–2.5 ms；首轮冷缓存 2.54 ms，稳态 ≈1.8–2.0 ms。
+   共享机器上 ±20% 属正常，不做阈值断言。
+5. 该探针**不改变** §9.1 的 3 s 持闸预算 / 16 MiB 机会性上限 / `N_min = 25 000`，
+   也不改任何生产 replay 路径；它只说明"纯 update replay"不是这些阈值的瓶颈。
+
+整文件并行批次（`-- --ignored` 同时跑 4 个探针：baseline / large / frag / scan，2026-11-21）两次都通过
+（3 passed 旧批次 / **4 passed 63.31 s**），同批 large-doc 中位数 **1.842 / 2.032 ms**
+（第二次 raw 3.855 / 2.713 / 2.032 / 1.836 / 1.808——并行时另一探针的 CPU 竞争
+把第 1 轮抬高）。两批都在噪声量级内；**表格取单跑批次**，并行批次只作为
+可复跑证据。
+
+#### 8.7.8 4096 页上限档（S = 1 048 576，单 run，2026-11-21）
+
+> 探针仍是 `checkpoint_validate_scan_cost`（§8.7），只是 `SCAN_COST_S` 追加
+> `1_048_576 = 4096 × 256`；**1k/5k/25k 仍 3 次取中位数，1M 档只跑 1 次**。
+> 生产常量 `COVERAGE_SCAN_MAX_PAGES = 4096`、`COVERAGE_SCAN_PAGE_LIMIT = 256`
+> 未改；`pages` 仍硬断言 = `ceil(S/256)`。
+
+**结论先说：4096 页本机真跑通了，没有降档。** `S = 1 048 576` 恰好用满
+`COVERAGE_SCAN_MAX_PAGES = 4096` 次页请求（每页 256 条）并在最后一页到达 S；
+按 `scan_coverage_log` 的循环上界（代码路径，未单独构造失败用例），再多 1 条事件
+（4097 页）会返回 `未证明覆盖到 S（coverage scan 页数超过上限）`。本档
+`covered_seq == S`、`coverage_verified_candidates == 1`、`pages == 4096`
+三条断言全部通过。
+
+**结果（单探针单跑批次，日志 `target/tmp/phase1a-logs/scan-cost-4096-run.log`）**：
+
+| 项目 | 数值 |
+| --- | --- |
+| S | **1 048 576**（ASSET 149 797 / UPDATE 898 779，14.3% ASSET） |
+| pages | **4 096**（严格 = `ceil(S/256)`） |
+| 夹具 setup（建 1M 事件 + prepare 扫描） | **13 737 ms**（其中 prepare scan 13 403 ms） |
+| prepare pages / `prepare_scan_ms` / `prepare_log_ms` | 4 096 / **13 403 ms** / 13 372 ms |
+| validate `scan_ms`（1 run） | **12 848 ms**（最终复跑 12 248 ms） |
+| validate `log_ms`（1 run） | **12 814 ms** |
+| visitor ≈ `scan_ms - log_ms` | **≈33 ms**（1.05M 事件 ≈32 ns/事件） |
+| validate `validate_ms`（1 run，含 manifest/快照/尾部 ASSET） | **12 848 ms** |
+| 进程峰值 RSS（夹具 + 1M 内存事件） | **≈202 MiB**（`VmHWM` 202.3；`/usr/bin/time -v` 206 828 KB） |
+
+同批次常规档（3-run 中位数，仅为对照）：1k `scan_ms` **0.074 ms** / 4 页，
+5k **0.421 ms** / 20 页，25k **3.822 ms** / 98 页；与 §8.7.4/§8.7.6 的批次同量级，
+常规档口径仍以那两节为准。
+
+```text
+[phase1a] scan_cost setup S=1048576 asset_events=149797 update_events=898779 asset_pct=14.3 prepare_pages=4096 prepare_scan_ms=13403.399 prepare_log_ms=13372.472 setup_ms=13737.377 runs=1 peak_rss_mib=202.3
+[phase1a] scan_cost S=1048576 run=0 pages=4096 scan_ms=12847.716 log_ms=12814.289 validate_ms=12848.455 part_calls=4 part_ms=0.003
+[phase1a] scan_cost S=1048576 pages=4096 scan_ms=12847.716 log_ms=12814.289 validate_ms=12848.455 runs=1 raw_scan_ms=[12847.715872] raw_log_ms=[12814.289152] raw_validate_ms=[12848.454609999999] part_calls=4 part_ms_raw=[0.00316]
+```
+
+读法与限制：
+
+1. **`scan_ms` 的 12.8 s 几乎全是 FakeRelay 的夹具成本，不是生产扫描成本。**
+   `log_ms` 12.81 s、visitor 只有 ≈33 ms；FakeRelay 的 `log()` 每页都从 `Vec` 头
+   `iter().filter(seq > cursor).take(256)`，第 p 页要跳过约 `256·p` 条，4096 页合计
+   ≈`256 × (4095×4096/2)` ≈ **2.15×10⁹ 次跳过**。真实 relay 用游标/索引取页，
+   单页 O(256)，不会随页号线性增长。因此**本表 `scan_ms` / `validate_ms` 是本地
+   （夹具）上界**，25k → 1M 的 3361× 放大（3.822 ms → 12 848 ms，页数只 ×41.8）
+   正是这个 artifact。
+2. **4096 页的真实成本 = 4096 × RTT + 本地 visitor**：页请求是串行的；visitor 实测
+   ≈32 ns/事件（1.05M 事件 ≈33 ms，与 25k 档 ≈0.6 ms 同量级）。本机没有真实
+   relay/TLS/RTT，**不能把这 12.8 s 外推成生产延迟**。按算术（不是实测）：
+   RTT 10 ms/页 → 4096 页 ≈41 s；RTT 50 ms/页 → ≈205 s。真实 relay 的单页
+   查询/传输成本、TLS、丢包重试、relay GC 都未测，机会性追赶启用前仍需真实
+   relay RTT 标定。
+3. **prepare 也会扫一遍同一区间**：1M 档 `prepare_scan_ms` 13.4 s，与 validate
+   同量级；一次 `prepare → validate` 最多访问 2×S 条事件。若本地账簿已完整覆盖
+   （`missing` 为空），`ensure_coverage_proven` 直接返回、不扫描（生产路径，本档
+   不是这个形状）。
+4. **峰值 RSS ≈202 MiB 是夹具内存，不是生产内存**：FakeRelay 在 `Vec` 里持有
+   1M 条 `RelayLogEvent`（每条一个 32 B 载荷 `Vec` + 固定字段），而生产 validate
+   按页流式处理 256 条，不会同时持有整段 1M 事件。真实 relay/客户端缓存另需实测。
+5. **1M 档只有 1 run**：不取中位数、无重复性数据；1k/5k/25k 仍为 3-run 中位数。
+   1M 的绝对时间受共享机器负载影响，只用于三个结论：**能跑通、pages 严格
+   4096、内存量级 ≈200 MiB（夹具）**。
+6. **本节不改变任何生产阈值**：3 s 持闸预算、16 MiB 机会性硬上限、
+   `N_min = 25 000`、`COVERAGE_SCAN_MAX_PAGES = 4096` 全部保留；也未改
+   `scan_coverage_log` 实现。
+
+> 口径说明：追加 1M 档时 summary 行改为
+> `S=... pages=... scan_ms=... log_ms=... validate_ms=...`（§8.7.3 的
+> `(median of 3; ...)` 是历史输出，不回改）；1M 档单 run 直接填中位数位置。
+> 整文件并行批次（3 探针同跑，`-- --ignored`，2026-11-21）两次都通过
+> （旧批 3 passed / 62.96 s、63.67 s；新批 4 passed / 63.31 s），但并行时基线探针占内存/CPU，1M 档 `scan_ms`
+> 升到 **13 345 / 13 049 ms**、夹具峰值 RSS **348 MiB**（`VmHWM`，隔离单跑是
+> 202 MiB）——**不要用并行批次数值**；本节表格取单跑批次。

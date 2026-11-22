@@ -215,6 +215,21 @@ impl JournalHandle {
         }
     }
 
+    /// 最近一次 flush 写失败的原因（**一次取锁**）。
+    ///
+    /// 优先返回 [`PendingState::unrecoverable`]：不可恢复的失败必须让 UI/调用方看到
+    /// 「需要重开文档」，不能被后到的普通写失败（字段会被覆盖）稀释；没有不可恢复失败时
+    /// 返回最近一次普通写失败（成功写入后清空）。会话核的
+    /// [`super::core::DocumentSession::last_write_error`] 与 `CloseReport.flush_error`
+    /// 都以本方法为唯一来源（闸门走 [`Self::gate_progress`]，读同一份状态的字段）。
+    pub(crate) fn last_write_error(&self) -> Option<String> {
+        let guard = lock(&self.state);
+        guard
+            .unrecoverable
+            .clone()
+            .or_else(|| guard.last_write_error.clone())
+    }
+
     /// 外部提交 adopt / end 之后重定 durable 基准（调用方必须已持锁）。
     ///
     /// `loro_docs.head_*` 已由外部提交（`engine.integrate`）推进；这里把 flusher 的 CAS

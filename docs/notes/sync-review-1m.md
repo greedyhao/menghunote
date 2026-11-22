@@ -1,77 +1,62 @@
-# 同步评审完整稿：1M 上下文
+# 同步评审完整稿（1M 上下文，review 后更新）
 
-> **目标**：给 1M token 上下文的 chat 模型一份**单文件**评审稿。
-> 与 272K 精简稿的区别：保留完整 `sync` 核心模块、storage 会话/同步代码、
-> sync-proto、全部关键测试、8 份核心文档和完整 diff；省略与本轮无关的
-> HTTP/管理/审批/邀请/初始化大文件（它们未在本轮修改，diff 仍完整）。
-> 代码截止 `1bededa`，文档入口 `fda0dab`；**Phase 1B 未实现**。
->
-> 本文件约 2,816,010 字符，按混合内容保守估计 **75–95 万 token**，给 1M 留出
-> 提示词/回答余量。若平台显示截断，先让模型报告最后看到的 `@@SECTION`；
-> 核心实现已放在最前，即使中段截断也能审 P0/P1。
+> **代码/文档截止 `46b214e`**。本文件是高级评审后的更新版：包含 marker 门禁下沉、
+> 不可恢复 flush 错误可读（API/CloseReport）、journal 契约对齐、速度校准。
+> **Phase 1B 未实现**。
+> 约 2,865,334 字符，按混合内容保守估计 **80–100 万 token**；若平台显示截断，
+> 先让模型报告最后看到的 `@@SECTION`。核心实现放在最前。
+> 省略本轮未改的 HTTP/管理/审批/邀请/初始化大文件全文；diff 完整。
 
 ## 提示词（复制给模型）
 
-你是 Rust / CRDT / 本地存储与同步的评审者。只依据本 Markdown 评审；不要假设能运行
-cargo、访问仓库、调用工具或联网。先回答：你看到的 `@@SECTION` 数量、最后一个完整
-文件、是否截断。确认后再按任务审：
+你是 Rust / CRDT / 本地存储与同步评审者。只依据本 Markdown；不要假设能运行 cargo、
+访问仓库或调用工具。先回答看到的 `@@SECTION` 数量、最后一个完整文件、是否截断。再按：
 
-1. **P1-3 生产 flush**：`session/flush.rs` 的 HeadConflict 是否在同后台线程有界重建
-   sink 并重试；成功是否发 DurableAck；失败是否可读地进入“需要重开文档”，不无限写；
-   是否仍是单 writer、无第二 journal、不阻塞 UI。特别审查：只有新 head 的 ops ⊆
-   未 ACK 前缀 `end_vv` 时才重试同一字节；未知外部 ops 时 fail-closed 要求重开。
-2. **detached oplog**：`body_doc_detached_oplog.rs` 是否覆盖两 peer、LoroTree
-   create/move/delete、并发本地编辑、空/单字符/emoji/组合字符；是否比较文本/树形状，
-   而不是只比 frontier；detached 与 attached 是否等价。
-3. **verify 失败语义**：失败是否不回滚 merged Loro；`sync.baseline_verify_failed`
-   meta 标记、下一次 begin 必须 abort 的契约是否成立；是否用 `actual_vv ⊆ local_vv`
-   而非相等；`verify_ms` 是否只读；schema 不能新增 failed 的冲突是否处理诚实。
-4. **checkpoint 扫描**：`checkpoint_validate_scan_cost` 是否走真实 prepare→validate；
-   S=1k/5k/25k 的 pages/scan_ms 是否可复现；是否没改 `scan_coverage_log`。
-5. **未做项**：幂等重放只读预检未做（可选 P2），是否影响正确性/仅性能。
+1. **P1-3 生产 flush**：HeadConflict 同后台线程有界重建 sink、成功 DurableAck、
+   失败可读“需要重开文档”；单 writer/无第二 journal/不阻塞 UI；兼容 head 才重试，
+   未知外部 ops fail-closed。
+2. **verify marker 门禁（review P1）**：batch/finish 在任何解码/写前拒绝 marker、
+   零写；finishable=false；abort 清 marker 且保留 merged 数据。
+3. **不可恢复 flush 可读（review P1）**：`last_write_error`/`CloseReport.flush_error`
+   是否覆盖非持闸调用方；UI 导出/重开流程仍缺是否阻断。
+4. **detached oplog**：11 用例是否覆盖两 peer/LoroTree/并发本地编辑/边界；文本/形状
+   比较而非只比 frontier。
+5. **checkpoint 扫描**：真实 prepare→validate；S=1k/5k/25k pages/scan_ms；未改
+   `scan_coverage_log`。
+6. **P2 缺口**：SyncContext 重建、结构文档 local_extra、auto-abort、Retryable 四测试
+   未补，是否阻断 Phase 1B。
+7. **速度结论**：N_min=25k 诚实兜底；verify ~45s@20MiB；大文档全量 `load_body_doc`；
+   Phase1B 核心价值是 correctness 而非速度。
 
-硬性检查：
-- `integrated >= S` 前是否可能删 inbox / skipped_asset；
-- 是否违反 `loro_updates.seq = head_seq + 1`；
-- 是否违反 received/integrated 连续前缀；
-- remote/adopt 是否可能产生 outbox；
-- 是否新增第二写连接、网络阶段是否持闸。
-
-输出：
-1. 任务 1–4 每项“完成 / 部分 / 不能判断”，引用文件/函数/测试；
-2. 必须修正（按严重度）；
-3. 不能判断/需补材料；
-4. 未关风险，以及是否允许进入 Phase 1B。
-不要重复贴大段代码；不要假设 Phase 1B 已实现。
+硬性检查：`integrated>=S` 前不删 inbox/skipped_asset；`seq=head+1`；
+received/integrated 连续前缀；remote/adopt 不产生 outbox；无第二写连接/网络持闸。
+输出：完成/部分/不能判断 + 必须修正 + 不能判断项 + 是否允许进入 Phase1B。
 
 ---
 
-## 0. 状态与证据
+## 0. review 后状态
 
-| 任务 | 状态 | 证据 |
+| 项 | 状态 | 证据 |
 |---|---|---|
-| 1 HeadConflict 生产接线 | 完成（功能） | `flush_recovers_from_head_conflict_by_rebuilding_sink` 等 3 个 |
-| 2 detached oplog 矩阵 | 完成 | `body_doc_detached_oplog` 11 passed（无 ignore） |
-| 3 verify 失败语义 | 完成（schema 限制用 meta） | `verify_accepts_concurrent_local_edits_after_export`、`verify_failure_keeps_merged_data_and_marks_journal_failed` |
-| 4 覆盖扫描成本 | 完成（探针） | `checkpoint_validate_scan_cost`（ignored） |
-| 5 幂等只读预检 | 未做（可选 P2） | 不影响 P0/P1 正确性 |
+| marker 门禁下沉 | 完成 | `marker_blocks_apply_and_finish_and_finishable`；batch/finish 零写拒绝；finishable=false |
+| 不可恢复 flush 错误可读 | **部分**：后端完成，UI 流程未接 | `driver_forwards_unrecoverable_flush_error`、`close_report_surfaces_unrecoverable_flush_error` |
+| P1-3 生产 flush | 完成（功能） | 3 个 flush 测试；兼容 head 同字节重试，未知 ops fail-closed |
+| detached oplog | 完成 | 11 passed |
+| verify 失败语义 | 完成（schema 限制用 meta） | 两个 verify 测试 |
+| checkpoint 扫描 | 完成（探针） | `checkpoint_validate_scan_cost` ignored |
+| 幂等只读预检 | 未做（可选 P2） | 仅性能 |
 
 ```text
-storage 288 passed / 0 failed / 1 ignored (manual bench)
-sync 636 passed / 0 failed / 4 ignored (manual/probes)
+storage 291 passed / 0 failed / 1 ignored(bench)
+sync 636 / 0 / 4 ignored(manual/probes)
 app 740 / dev-sync 891
-workspace 2900 / 0；workspace dev-sync 3051 / 0
-release phase1a 2 passed (baseline + scan)
+workspace 2903 / 0；workspace dev-sync 3054 / 0
 fmt / clippy workspace -D warnings 全绿
 ```
 
-**P1-3 残余**：自动重建只在兼容 head 时可重试同一字节前缀；未知外部 ops 时 fail-closed
-要求重开；真正跨会话重导出 rebase 未做。`session/flush.rs` 仍直接 `VaultJournalSink`
-（不是 `JournalWriter`），无第二 journal。
-
-**任务 4 实测**：S=1k pages=4 scan_ms≈0.076；5k pages=20≈0.428；25k pages=98≈4.039；
-FakeRelay 页内 `log()` 扫描是夹具 artifact，真实成本主要是 98 次串行 RTT；
-prepare+validate 最多 2×S 事件访问。
+**仍缺**：P2 四测试；UI“导出/复制 live 正文 → 重开”流程；跨会话 rebase；Phase1B。
+**任务 4**：最终 4-run 1k/5k/25k = 0.078/0.428/4.039 ms，pages=4/20/98；§8.7.4 初次
+3-run 为 0.076/0.479/3.796，两批不得混算。
 
 ---
 
@@ -296,6 +281,21 @@ impl JournalHandle {
             durable_head_seq: guard.durable.head_seq,
             last_write_error: guard.last_write_error.clone(),
         }
+    }
+
+    /// 最近一次 flush 写失败的原因（**一次取锁**）。
+    ///
+    /// 优先返回 [`PendingState::unrecoverable`]：不可恢复的失败必须让 UI/调用方看到
+    /// 「需要重开文档」，不能被后到的普通写失败（字段会被覆盖）稀释；没有不可恢复失败时
+    /// 返回最近一次普通写失败（成功写入后清空）。会话核的
+    /// [`super::core::DocumentSession::last_write_error`] 与 `CloseReport.flush_error`
+    /// 都以本方法为唯一来源（闸门走 [`Self::gate_progress`]，读同一份状态的字段）。
+    pub(crate) fn last_write_error(&self) -> Option<String> {
+        let guard = lock(&self.state);
+        guard
+            .unrecoverable
+            .clone()
+            .or_else(|| guard.last_write_error.clone())
     }
 
     /// 外部提交 adopt / end 之后重定 durable 基准（调用方必须已持锁）。
@@ -698,16 +698,18 @@ fn reopen_message(doc_id: &str, pending: usize, reason: String) -> String {
 //! 崩溃语义：sink 成功 = 已 durable；未 flush 的条目只在内存里，重启后自然丢掉。
 //! 因此「已 ACK 的不丢、未 ACK 的只丢连续前缀之后」由本模块与 [`crate::store`] 的 A 事务共同保证。
 //!
-//! # head 过期：可重试 vs 必须重建 session（P1-3 契约）
+//! # head 过期：两条恢复路径（P1-3 契约）
 //!
 //! journal 条目里的 `PendingUpdate` 是**追加那一刻**按当时 head 导出的字节
 //! （`end_frontier` / `end_vv` 是那次导出的快照），**不可重算**。如果同一文档的 head
 //! 被别的 writer 推进（同步引擎 integrate、`SessionDriver` 的 adopt、另一个 Vault
 //! 进程……），前缀的 CAS 基准（`loro_docs.head_seq`）就永远对不上：`append_updates`
-//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节重试多少次都不会成功**。
-//! 这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
+//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节按旧基准重试多少次都不会
+//! 成功**。这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
 //!
-//! 本模块用一条明确的二分法代替无限重试：
+//! 本节先写库内契约（[`JournalWriter`]），再写生产 flusher 的实际路径；两者不要混为一谈。
+//!
+//! ## 1. `JournalWriter`：冻结 writer，调用方重建 sink / 重新导出
 //!
 //! - [`JournalWriter::flush`] 捕获 sink 的 [`StorageError::HeadConflict`]，**不重试**
 //!   （0 次），立即转成终态错误 [`StorageError::JournalHeadStale`]
@@ -717,20 +719,35 @@ fn reopen_message(doc_id: &str, pending: usize, reason: String) -> String {
 //! - 进入 stale 之后，`flush` / `flush_all` **不再触碰数据库**，幂等地返回同一个
 //!   stale 错误；`submit` 也返回 `JournalHeadStale`（writer 已冻结，新条目必须交给
 //!   重建后的 writer）。因此调用方无论怎么轮询，都不会挂死、也不会刷屏重试。
-//! - **谁负责重建**：持有 live `BodyDoc` 的会话层（`session::JournalHandle` /
-//!   `SessionDriver`，实现在 `crate::session::flush`）。重建顺序：
-//!   ① 先停外部写并按 ADR 0012 对账（`HeadConflict` 先停外部写、验证授权、再对账，
-//!   然后才允许有界重放）；② 把 durable journal 重放到**新 head**（`load_body_doc` /
-//!   `load_head`），让内存文档与库一致；③ 用新 head 的 VV 重新导出本地意图
-//!   （`BodyDoc::pending_update`）——只有这一步得到的字节才能写；④ 用新 `head_seq`
-//!   造一个 [`VaultJournalSink`]，调用 [`JournalWriter::rebuild_sink`] 装回去。
+//! - **谁负责重建**：持有 live `BodyDoc` 的调用方，而不是本模块。调用方必须：
+//!   ① 把 durable journal 重放到**新 head**（`load_body_doc` / `load_head`），让内存
+//!   文档与库一致；② 用新 head 的 VV 重新导出本地意图（`BodyDoc::pending_update`）——
+//!   只有这一步得到的字节才能写；③ 用新 `head_seq` 造一个 [`VaultJournalSink`]，
+//!   调用 [`JournalWriter::rebuild_sink`] 装回去。
 //! - **未 durable 的旧条目怎么办**：`rebuild_sink` 把它们**原样交还**调用方（返回值）
 //!   并从 writer 的 journal 里清空。它们**没有被写入、也没有被静默丢弃** —— 调用方
-//!   必须用 ③ 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
+//!   必须用 ② 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
 //!   并在上层报告，不能假装成功。重建后 `durable_seq` 等于新 sink 的 CAS 基准。
-//! - **有界重试规则**：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
-//!   重试不可能成功）；需要重放时由 session 层按 ADR 0012 做**有界**重放（一次），
-//!   再失败就上报告需要人工处理。本模块不提供、也不会退化成无限重试。
+//!
+//! ## 2. 生产 `session/flush.rs`：兼容 head 时同字节有界重试（当前接线）
+//!
+//! 生产后台 flusher **不经过** [`JournalWriter`]：它直接在后台线程构造
+//! [`VaultJournalSink`] 并调用 `write_prefix`，因此**不会**调用
+//! [`JournalWriter::rebuild_sink`]，也不会重新导出增量。它的
+//! [`StorageError::HeadConflict`] 路径是**同一份字节前缀的有界重试**：
+//!
+//! 1. `load_head` 读回当前 `head_seq` 与 VV；
+//! 2. **仅当新 head 的 ops 全部包含在**未 ACK 前缀最后一条的 `end_vv` 里
+//!    （`prefix_vv.includes_vv(head_vv)`，即外部推进写的是本会话 live 已知的 op）时，
+//!    用新 CAS 基准重试**同一份字节前缀一次**；
+//! 3. 新 head 含本会话未知 ops、head 未前进/回退、VV 为空或解码失败、重试后仍冲突
+//!    → **fail-closed**：不写库、journal 原样保留，`last_write_error` 明确要求
+//!    「关闭并重开文档」；后续 flush 立即失败，不再碰数据库。
+//!
+//! 两条路径的共同点：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
+//! 重试同一份旧字节不可能成功）；有界重试只发生在生产 session flusher，且**仅一次**，
+//! 条件不满足就上报告，不无限重试。生产路径**没有第二 journal**：journal 仍是会话
+//! 内存里的那一条，重建的只是 sink 的 CAS 基准。
 
 use std::collections::VecDeque;
 
@@ -2176,6 +2193,16 @@ pub fn mark_baseline_verify_failed(vault: &Vault, reason: &str) -> Result<(), St
     vault.set_meta(META_BASELINE_VERIFY_FAILED, &value)
 }
 
+/// 失败标记存在时统一的拒绝错误：必须带原因，并明确唯一清理入口是 abort。
+fn verify_failed_conflict(reason: &str, action: &str) -> StorageError {
+    StorageError::SyncConflict {
+        context: format!(
+            "baseline 导入的读回校验已失败（{META_BASELINE_VERIFY_FAILED}: {reason}）；\
+             {action} 已拒绝且零写入，必须先 abort_baseline_apply 清理失败 journal 与标记"
+        ),
+    }
+}
+
 /// 读失败标记的原因；没有标记返回 `None`。
 ///
 /// 标记存在但编码非法（缺魔数/非 UTF-8）返回 [`StorageError::Corrupt`]，不静默当成
@@ -2349,11 +2376,20 @@ pub fn baseline_apply_state(vault: &Vault) -> Result<Option<BaselineApplyState>,
 }
 
 /// 应用一批已验证的快照文档和远端 tombstone。
+///
+/// 若存在 [`META_BASELINE_VERIFY_FAILED`] 标记，本函数在**任何解码/写事务之前**返回
+/// [`StorageError::SyncConflict`]（带原因并提示先 [`abort_baseline_apply`]），零写入。
 pub fn apply_baseline_batch(
     vault: &Vault,
     docs: &[(String, Vec<u8>)],
     tombstones: &[String],
 ) -> Result<BaselineApplyState, StorageError> {
+    // 失败标记优先于一切：journal 仍是 staging（schema 不允许新 status），但语义上
+    // 已不可续跑。必须在解码 snapshot / 开写事务之前拒绝，避免继续往失败 journal
+    // 里追加数据而让 abort 后的重跑更难判断。
+    if let Some(reason) = baseline_verify_failure(vault)? {
+        return Err(verify_failed_conflict(&reason, "apply_baseline_batch"));
+    }
     let journal = load_active_journal(vault)?;
     if docs.is_empty() && tombstones.is_empty() {
         return state_from_journal(vault, &journal);
@@ -2894,6 +2930,12 @@ pub fn finish_baseline_apply(
         None => return Ok(BaselineApplyFinish::NotFound),
         Some(journal) => journal,
     };
+    // 失败标记必须在任何写之前拒绝，且不能退化成不带原因的 `Ok(Conflict)`：
+    // journal 仍是 staging（schema 不允许 failed），但 finish 只会推进水位/cursor，
+    // 在"导入读回校验已失败"时推进等于把未证明完整的基线当成已消费。
+    if let Some(reason) = baseline_verify_failure(vault)? {
+        return Err(verify_failed_conflict(&reason, "finish_baseline_apply"));
+    }
     if journal.status != BaselineApplyStatus::Staging || journal.baseline_s != chosen_baseline_s {
         return Ok(BaselineApplyFinish::Conflict);
     }
@@ -3362,7 +3404,13 @@ fn state_from_journal(
     };
     // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
     // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
-    let finishable = journal.status == BaselineApplyStatus::Staging
+    //
+    // 失败标记存在时 journal 仍是 staging（schema v3 的 CHECK 只允许 staging/completed），
+    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false，否则 UI/续跑逻辑
+    // 会把"读回校验失败"当成"可以 finish"。标记损坏返回 Corrupt，同样是 fail-closed。
+    let verify_failed = baseline_verify_failure(vault)?.is_some();
+    let finishable = !verify_failed
+        && journal.status == BaselineApplyStatus::Staging
         && match &expected {
             Some(expected) => expected_is_complete(vault, journal, expected)?,
             None => false,
@@ -3567,1115 +3615,1819 @@ fn hex32(bytes: &[u8; 32]) -> String {
 `````
 
 
-@@SECTION `crates/storage/src/store.rs`
+@@SECTION `crates/storage/src/session/core.rs`
 
 `````rust
-//! `loro_docs` / `loro_updates` 的读写与 A 事务。
+//! 会话核：`EditorDocumentPort` 的串行 reducer（ADR 0003 §5）。
 //!
-//! A 事务（ADR 0001 §3.4）在一次 SQLite 事务里完成三件事：
+//! 一个 [`DocumentSession`] = 一个正文文档的**唯一 live owner**：
 //!
-//! 1. 逐个 append `loro_updates`（seq 连续，`update_id` 唯一）；
-//! 2. 以 CAS 方式推进 `loro_docs.head_seq / head_frontier / head_vv`；
-//! 3. 写 `projection_outbox.target_seq`（提醒 B 物化器）。
+//! - 持有 live [`BodyDoc`]（Loro）、generation / session_epoch / live_rev；
+//! - 持有唯一未 ACK journal 与事件队列；
+//! - 所有编辑走 [`DocumentSession::apply`]，受理顺序**固定**（见方法文档）；
+//! - `flush` 只投递命令即返回票据，SQLite 由后台线程写（见 [`super::flush`]）。
 //!
-//! CAS 用「该语句必须影响 1 行」的事务守卫实现：一旦 head 已被别人推进，
-//! 整笔事务回滚，**不会出现「update 落库了但 head 没动」的半截状态**。
+//! 端口协议类型在 [`super::protocol`]，本模块**不新增协议字段**（缺字段应先报告 Lead）。
+//! 远端导入路径在 [`DocumentSession::apply_remote`]，撤销/重做在
+//! [`DocumentSession::undo`] / [`DocumentSession::redo`]，都用同一个 Loro `UndoManager`。
 
-use loro::{Frontiers, VersionVector};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use loro::{UndoManager, VersionVector};
+use menghunote_text::UnicodeScalar;
 use rusqlite::types::Value;
 
-use crate::actor::{AffectedGuard, Statement};
-use crate::body_doc::{BodyDoc, PendingUpdate, APP_DOC_SCHEMA, CODEC_VERSION, MIN_READER};
+use super::flush::{lock, JournalHandle};
+use super::gate::ExternalCommitGate;
+use super::protocol::{
+    Applied, ChangeSource, CommandId, DeltaSplice, DocId, DurableAck, EditOutcome, EditRequest,
+    FlushReason, FlushTicket, Generation, HistoryState, LiveDelta, LiveRev, MergeInfo,
+    OpenSnapshot, PortError, RejectReason, Rejected, ScalarEdit, SessionEpoch, SessionEvent,
+    StaleBase,
+};
+use crate::body_doc::BodyDoc;
 use crate::error::StorageError;
+use crate::store;
 use crate::Vault;
 
-/// 文档在 `loro_docs` 里的权威行摘要。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeadState {
-    /// 文档 ID。
-    pub doc_id: String,
-    /// 已持久化的最后一个 batch seq（0 表示还没有任何 update）。
-    pub head_seq: u64,
-    /// 已持久化的 frontier（`Frontiers::encode`）。
-    pub head_frontier: Vec<u8>,
-    /// 已持久化的 VV（`VersionVector::encode`）。
-    pub head_vv: Vec<u8>,
-}
-
-impl HeadState {
-    /// 解码 frontier。
-    pub fn frontiers(&self) -> Result<Frontiers, StorageError> {
-        if self.head_frontier.is_empty() {
-            return Ok(Frontiers::default());
-        }
-        Frontiers::decode(&self.head_frontier).map_err(StorageError::from)
-    }
-
-    /// 解码 VV。全新的文档 `head_vv` 是 NULL/空，等价于空版本向量。
-    pub fn version_vector(&self) -> Result<loro::VersionVector, StorageError> {
-        if self.head_vv.is_empty() {
-            return Ok(loro::VersionVector::default());
-        }
-        loro::VersionVector::decode(&self.head_vv).map_err(StorageError::from)
-    }
-}
-
-/// `loro_docs` 的一行（含快照）。
-struct StoredDoc {
-    snapshot: Option<Vec<u8>>,
-    snapshot_seq: u64,
-    head: HeadState,
-}
-
-/// 新建一个正文文档行（`kind = 'body'`）。
-pub fn create_body_doc(vault: &Vault, doc_id: &str) -> Result<(), StorageError> {
-    vault.exec(
-        "INSERT INTO loro_docs(doc_id, kind, generation, app_doc_schema, codec_version, min_reader) \
-         VALUES(?1, 'body', 1, ?2, ?3, ?4)",
-        &[
-            Value::Text(doc_id.to_owned()),
-            Value::Integer(APP_DOC_SCHEMA),
-            Value::Text(CODEC_VERSION.to_owned()),
-            Value::Integer(MIN_READER),
-        ],
-    )?;
-    Ok(())
-}
-
-/// 为一篇笔记准备好投影行，关联它的正文文档。
+/// 会话配置。
 ///
-/// 注意：`notes` 是**投影**（ADR 0001 §3.1），最终由结构 CRDT 的投影器写入；
-/// 本函数只是 S0 阶段的脚手架，让两阶段物化有落点，后续切片会由投影器接管。
-pub fn create_note_slot(
-    vault: &Vault,
-    note_id: &str,
-    body_doc_id: &str,
-    title: &str,
-    created_at: i64,
-) -> Result<(), StorageError> {
-    vault.exec(
-        "INSERT INTO notes(note_id, body_doc_id, title, created_at, updated_at, deleted, is_favorite, is_pinned) \
-         VALUES(?1, ?2, ?3, ?4, ?4, 0, 0, 0)",
-        &[
-            Value::Text(note_id.to_owned()),
-            Value::Text(body_doc_id.to_owned()),
-            Value::Text(title.to_owned()),
-            Value::Integer(created_at),
-        ],
-    )?;
-    Ok(())
-}
-
-/// 读 `loro_docs` 的 head 三件套；行不存在时报 [`StorageError::Corrupt`]。
-pub fn load_head(vault: &Vault, doc_id: &str) -> Result<HeadState, StorageError> {
-    let rows = vault.query(
-        "SELECT head_seq, head_frontier, head_vv FROM loro_docs WHERE doc_id = ?1",
-        &[Value::Text(doc_id.to_owned())],
-    )?;
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| StorageError::Corrupt {
-            context: format!("loro_docs 缺少文档 {doc_id}"),
-        })?;
-
-    Ok(HeadState {
-        doc_id: doc_id.to_owned(),
-        head_seq: u64_of(&row, 0, "loro_docs.head_seq")?,
-        head_frontier: blob_of(&row, 1, "loro_docs.head_frontier")?,
-        head_vv: blob_of(&row, 2, "loro_docs.head_vv")?,
-    })
-}
-
-/// 读 `loro_docs.head_seq` 仍等于 `expected_head_seq` 时的 `head_vv`（远端已知 VV 的起点）。
-///
-/// 若 head 已被并发推进（CAS 必然失败、整笔事务回滚），返回空 VV 即可：它不会落库。
-fn load_head_vv_at(
-    vault: &Vault,
-    doc_id: &str,
-    expected_head_seq: u64,
-) -> Result<VersionVector, StorageError> {
-    let rows = vault.query(
-        "SELECT head_seq, head_vv FROM loro_docs WHERE doc_id = ?1",
-        &[Value::Text(doc_id.to_owned())],
-    )?;
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| StorageError::Corrupt {
-            context: format!("loro_docs 缺少文档 {doc_id}"),
-        })?;
-    if u64_of(&row, 0, "loro_docs.head_seq")? != expected_head_seq {
-        return Ok(VersionVector::default());
-    }
-    match row.get(1) {
-        Some(Value::Null) | None => Ok(VersionVector::default()),
-        Some(Value::Blob(bytes)) => VersionVector::decode(bytes).map_err(StorageError::from),
-        Some(other) => Err(StorageError::Corrupt {
-            context: format!("loro_docs.head_vv 读回异常：{other:?}"),
-        }),
-    }
-}
-
-/// 读文档行 + 快照元信息。
-fn load_stored(vault: &Vault, doc_id: &str) -> Result<StoredDoc, StorageError> {
-    let rows = vault.query(
-        "SELECT snapshot, snapshot_seq, head_seq, head_frontier, head_vv FROM loro_docs WHERE doc_id = ?1",
-        &[Value::Text(doc_id.to_owned())],
-    )?;
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| StorageError::Corrupt {
-            context: format!("loro_docs 缺少文档 {doc_id}"),
-        })?;
-
-    Ok(StoredDoc {
-        snapshot: optional_blob(&row, 0)?,
-        snapshot_seq: u64_of(&row, 1, "loro_docs.snapshot_seq")?,
-        head: HeadState {
-            doc_id: doc_id.to_owned(),
-            head_seq: u64_of(&row, 2, "loro_docs.head_seq")?,
-            head_frontier: blob_of(&row, 3, "loro_docs.head_frontier")?,
-            head_vv: blob_of(&row, 4, "loro_docs.head_vv")?,
-        },
-    })
-}
-
-/// 库里的 frontier 可能是 NULL（从未提交），语义等价于空 frontier。
-///
-/// 注意：`Frontiers::default().encode()` **不是**空字节，所以不能直接比较原始 bytes。
-pub(crate) fn encoded_frontier(head: &HeadState) -> Vec<u8> {
-    if head.head_frontier.is_empty() {
-        Frontiers::default().encode()
-    } else {
-        head.head_frontier.clone()
-    }
-}
-
-/// 重放所需材料：快照 + 后续 update payload + 目标 head。
-pub(crate) struct ReplayParts {
-    pub(crate) snapshot: Option<Vec<u8>>,
-    pub(crate) payloads: Vec<Vec<u8>>,
-    pub(crate) head: HeadState,
-}
-
-/// 读取重放材料（快照 + 连续 update 前缀），并校验 seq 连续、不越过快照边界。
-///
-/// `up_to_seq = Some(n)` 只重放到第 n 个 batch（固定 frontier）；`None` 重放到 head。
-pub(crate) fn load_replay_parts(
-    vault: &Vault,
-    doc_id: &str,
-    up_to_seq: Option<u64>,
-) -> Result<ReplayParts, StorageError> {
-    let stored = load_stored(vault, doc_id)?;
-    let limit = match up_to_seq {
-        Some(seq) => {
-            if seq > stored.head.head_seq {
-                return Err(StorageError::Corrupt {
-                    context: format!(
-                        "请求重放到 seq {seq}，但 {doc_id} 的 head_seq 只有 {}",
-                        stored.head.head_seq
-                    ),
-                });
-            }
-            seq
-        }
-        None => stored.head.head_seq,
-    };
-    if limit < stored.snapshot_seq {
-        return Err(StorageError::Corrupt {
-            context: format!(
-                "请求重放到 seq {limit}，但快照已经覆盖到 seq {}；不能倒着物化",
-                stored.snapshot_seq
-            ),
-        });
-    }
-
-    let rows = vault.query(
-        "SELECT seq, payload FROM loro_updates WHERE doc_id = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq",
-        &[
-            Value::Text(doc_id.to_owned()),
-            Value::Integer(i64_of(stored.snapshot_seq)?),
-            Value::Integer(i64_of(limit)?),
-        ],
-    )?;
-
-    let mut payloads = Vec::with_capacity(rows.len());
-    for (expected_seq, row) in (stored.snapshot_seq + 1..).zip(rows.iter()) {
-        let seq = u64_of(row, 0, "loro_updates.seq")?;
-        if seq != expected_seq {
-            return Err(StorageError::Corrupt {
-                context: format!(
-                    "{doc_id} 的 loro_updates 出现断档：期望 seq {expected_seq}，实际 {seq}"
-                ),
-            });
-        }
-        payloads.push(blob_of(row, 1, "loro_updates.payload")?);
-    }
-
-    let snapshot = if stored.snapshot_seq == 0 {
-        None
-    } else {
-        stored.snapshot.clone()
-    };
-
-    let mut head = stored.head;
-    if let Some(limit) = up_to_seq {
-        head = HeadState {
-            doc_id: doc_id.to_owned(),
-            head_seq: limit,
-            head_frontier: end_frontier_at(vault, doc_id, limit)?,
-            head_vv: end_vv_at(vault, doc_id, limit)?,
-        };
-    }
-
-    Ok(ReplayParts {
-        snapshot,
-        payloads,
-        head,
-    })
-}
-
-/// 从库里重放出一个 [`BodyDoc`]。
-///
-/// `up_to_seq = Some(n)` 时只重放到第 n 个 batch，用于**固定 frontier** 的 B 物化；
-/// `None` 表示重放到当前 head，并在结尾校验 frontier 与库中记录一致（不一致说明数据损坏）。
-pub fn load_body_doc(
-    vault: &Vault,
-    doc_id: &str,
-    peer_id: u64,
-    up_to_seq: Option<u64>,
-) -> Result<(BodyDoc, HeadState), StorageError> {
-    let parts = load_replay_parts(vault, doc_id, up_to_seq)?;
-    let doc = BodyDoc::restore(doc_id, peer_id, parts.snapshot.as_deref(), &parts.payloads)?;
-
-    if up_to_seq.is_none() {
-        // 启动校验：重放结果必须与库中 head_frontier 一致，否则视为损坏（不回写、不猜）
-        let replayed = doc.frontiers().encode();
-        let expected = encoded_frontier(&parts.head);
-        if replayed != expected {
-            return Err(StorageError::Corrupt {
-                context: format!(
-                    "重放 {doc_id} 得到的 frontier 与 loro_docs.head_frontier 不一致（len {} vs {}）",
-                    replayed.len(),
-                    expected.len()
-                ),
-            });
-        }
-    }
-
-    Ok((doc, parts.head))
-}
-
-/// 读某个 batch 落库时的 `end_vv`。
-pub fn end_vv_at(vault: &Vault, doc_id: &str, seq: u64) -> Result<Vec<u8>, StorageError> {
-    let rows = vault.query(
-        "SELECT end_vv FROM loro_updates WHERE doc_id = ?1 AND seq = ?2",
-        &[Value::Text(doc_id.to_owned()), Value::Integer(i64_of(seq)?)],
-    )?;
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| StorageError::Corrupt {
-            context: format!("{doc_id} 缺少 seq {seq} 的 loro_updates 行"),
-        })?;
-    blob_of(&row, 0, "loro_updates.end_vv")
-}
-
-/// 读某个 batch 落库时的 `end_frontier`（B 物化的固定 frontier）。
-pub fn end_frontier_at(vault: &Vault, doc_id: &str, seq: u64) -> Result<Vec<u8>, StorageError> {
-    let rows = vault.query(
-        "SELECT end_frontier FROM loro_updates WHERE doc_id = ?1 AND seq = ?2",
-        &[Value::Text(doc_id.to_owned()), Value::Integer(i64_of(seq)?)],
-    )?;
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| StorageError::Corrupt {
-            context: format!("{doc_id} 缺少 seq {seq} 的 loro_updates 行"),
-        })?;
-    blob_of(&row, 0, "loro_updates.end_frontier")
-}
-
-/// A 事务里要写入的一条 update（带它自己的 `batch_id`）。
-///
-/// 一次 flush 的连续前缀可能来自不同逻辑批次（例如慢盘合并了两次提交），
-/// 所以 `batch_id` 是**逐行**的，不能整批共用一个。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateRecord {
-    /// 该 update 所属的逻辑批次。
-    pub batch_id: String,
-    /// 增量内容。
-    pub update: PendingUpdate,
-}
-
-impl UpdateRecord {
-    /// 构造一条记录。
-    pub fn new(batch_id: impl Into<String>, update: PendingUpdate) -> Self {
-        Self {
-            batch_id: batch_id.into(),
-            update,
-        }
-    }
-}
-
-/// 把一份快照落库，记录它覆盖到的 seq 与 frontier。
-///
-/// 本切片只提供落库与「snapshot + 后续 update」重放路径；快照的生成节奏与旧 update 的
-/// 真正 GC（ADR 0001 §3.5）留给后续切片。快照不能倒退覆盖更早的 seq。
-pub fn store_snapshot(
-    vault: &Vault,
-    doc_id: &str,
-    seq: u64,
-    frontier: &[u8],
-    snapshot: &[u8],
-) -> Result<(), StorageError> {
-    if seq == 0 || seq > load_head(vault, doc_id)?.head_seq {
-        return Err(StorageError::Corrupt {
-            context: format!("快照 seq {seq} 不在 (0, head] 区间内"),
-        });
-    }
-    let affected = vault.exec(
-        "UPDATE loro_docs SET snapshot = ?2, snapshot_seq = ?3, snapshot_frontier = ?4 \
-         WHERE doc_id = ?1 AND snapshot_seq <= ?3",
-        &[
-            Value::Text(doc_id.to_owned()),
-            Value::Blob(snapshot.to_vec()),
-            Value::Integer(i64_of(seq)?),
-            Value::Blob(frontier.to_vec()),
-        ],
-    )?;
-    if affected != 1 {
-        return Err(StorageError::Corrupt {
-            context: format!("{doc_id} 的快照 seq 倒退，拒绝覆盖"),
-        });
-    }
-    Ok(())
-}
-
-/// A 事务：追加一批 update + 推进 head + 写 projection_outbox。
-///
-/// `expected_head_seq` 是调用方看到的 head（CAS 基准）；不匹配时整笔回滚并返回
-/// [`StorageError::HeadConflict`]，绝不覆盖别人的新结果。
-pub fn append_updates(
-    vault: &Vault,
-    doc_id: &str,
-    expected_head_seq: u64,
-    records: &[UpdateRecord],
-) -> Result<HeadState, StorageError> {
-    append_updates_inner(
-        vault,
-        doc_id,
-        expected_head_seq,
-        records,
-        &[],
-        &[],
-        OriginMarks::AllLocal,
-    )
-}
-
-/// A 事务：追加**一条**组合 update，并把同一批 remote inbox 行标为 `integrated`。
-///
-/// Phase 1A-2 的聚合 integrate 入口：同一文档的多条 inbox 行先在内存里逐条
-/// `BodyDoc::import`，再把 `before..end` 的增量合成**一条** `UpdateRecord` 落盘；
-/// 「追加 update + 推进 head + projection_outbox + 标记 inbox 行」全部在**同一个**
-/// A 事务里（守卫要求每条 `UPDATE sync_inbox` 恰好影响 1 行，任何一行不存在/已不是
-/// `verified` 都会整笔回滚，不会出现「update 写了但 inbox 没标」的半份状态）。
-///
-/// 与 [`append_updates`] 的差别只有同事务的批量标记：
-/// - `relay_seqs` 为空时行为与 [`append_updates`] 逐字节一致（仍然只有一条记录）；
-/// - 本函数**不推进** `sync.integrated_seq`；调用方在整批正文都完成后统一调用
-///   [`crate::advance_integrated_prefix`]，避免每个 doc 组各写一次前缀；
-/// - 校验失败映射：head CAS 失败仍是 [`StorageError::HeadConflict`]；inbox 标记失败
-///   （行不存在 / 已 integrated / 已 quarantine）映射为 [`StorageError::SyncConflict`]，
-///   两种情况下 update 都没有落库；
-/// - 同事务把 `end_vv - 旧 head_vv`（= 这条远端消息实际带来的 ops）并入本机的
-///   「远端已知 VV」（`sync.remote_known_vv.<doc_id>`，non-destructive meta），
-///   供 `baseline_apply` 的 tombstone 判定区分已同步文档与 local-only 文档。
-pub fn append_updates_with_integrated_marks(
-    vault: &Vault,
-    doc_id: &str,
-    expected_head_seq: u64,
-    record: &UpdateRecord,
-    log_id: &[u8; 16],
-    relay_seqs: &[u64],
-) -> Result<HeadState, StorageError> {
-    let marks: Vec<(&[u8; 16], u64)> = relay_seqs
-        .iter()
-        .map(|relay_seq| (log_id, *relay_seq))
-        .collect();
-    append_updates_inner(
-        vault,
-        doc_id,
-        expected_head_seq,
-        std::slice::from_ref(record),
-        &[],
-        &marks,
-        // engine integrate 的这条组合 update 全部来自远端消息：其 `end_vv - 旧 head_vv`
-        // 就是远端实际带来的 ops，记入「远端已知 VV」（tombstone 判定用）。
-        OriginMarks::PerRecord(&[true]),
-    )
-}
-
-/// 一次 A 事务里每条 update 的**来源标记**。
-///
-/// 这是 P2-8 修掉的类型陷阱：旧接口用 `&[bool]` 表示来源，**空切片 = 全部本地**；
-/// 而同一次调用的 `slots` 也是切片，**空切片 = 没有任何出站意图**。两个空切片含义
-/// 相反、类型相同，调用点很容易把「没有意图」写成「全部本地」或反之。这里把来源标记
-/// 收成枚举，让「空」不再是两种含义：
-///
-/// - [`OriginMarks::AllLocal`]：本批记录全部是本地写入，**不**扩大远端已知 VV；
-/// - [`OriginMarks::PerRecord`]：与 `records` **一一对应**（长度不匹配直接报
-///   [`StorageError::Corrupt`]），`true` = 该条来自远端消息，其
-///   `end_vv - 前一条 end_vv` 并入「远端已知 VV」。
-///
-/// 本地写入即使已经 ACK 也不会扩大远端已知 VV（tombstone 判定只允许更保守）。
+/// `flush_delay` 是**测试/故障注入**用的可控慢盘延迟，生产用 `None`；
+/// `sync` 是 ADR 0009 切片 2b 的本地意图上下文，`None` = 不产生 `sync_outbox`
+/// 行（默认构建与既有调用点行为完全不变）。
 #[derive(Debug, Clone, Copy)]
-pub enum OriginMarks<'a> {
-    /// 全部记录都是本地写入。
-    AllLocal,
-    /// 逐条标记（必须与 records 等长）。
-    PerRecord(&'a [bool]),
+pub struct SessionOptions {
+    /// 本机 peer id（每设备唯一）。
+    pub peer_id: u64,
+    /// 会话纪元：旧会话的迟到请求会被拒。
+    pub session_epoch: SessionEpoch,
+    /// 未 ACK journal 容量（条）。满了就是背压（拒绝新写，不丢已 ACC 部分）。
+    pub journal_capacity: usize,
+    /// 一次 A 事务最多合并多少条（慢盘时 pending 会堆到这里为止）。
+    pub flush_batch: usize,
+    /// 注入的 flush 延迟（模拟慢盘）。
+    pub flush_delay: Option<Duration>,
+    /// 本地写入的同步上下文；`None` = 不产生出站意图（默认）。
+    pub sync: Option<crate::sync_bridge::SyncContext>,
 }
 
-impl<'a> OriginMarks<'a> {
-    /// 本批是否有远端条目。
-    fn any_remote(self) -> bool {
-        match self {
-            Self::AllLocal => false,
-            Self::PerRecord(marks) => marks.iter().any(|flag| *flag),
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            peer_id: 1,
+            session_epoch: SessionEpoch(1),
+            journal_capacity: 64,
+            flush_batch: 8,
+            flush_delay: None,
+            sync: None,
+        }
+    }
+}
+
+/// 一个正文文档的会话（串行 reducer）。
+///
+/// 字段对 `super::gate` 开放（`pub(crate)`）：外部提交闸门与 adopt 必须直接操作**同一份**
+/// live 文档、journal 与水位，复制状态只会制造撕裂。对外部 crate 仍然是完全私有的。
+pub struct DocumentSession {
+    pub(crate) vault: Vault,
+    pub(crate) doc_id: DocId,
+    /// 本机 peer id（重放 scratch 副本时用；不影响 import）。
+    pub(crate) peer_id: u64,
+    generation: Generation,
+    pub(crate) session_epoch: SessionEpoch,
+    pub(crate) doc: BodyDoc,
+    pub(crate) live_rev: LiveRev,
+    pub(crate) live_frontier: Vec<u8>,
+    /// 上一次写入 journal 的 VV：增量导出的起点（不在 durable 前推进）。
+    pub(crate) journal_base_vv: VersionVector,
+    pub(crate) journal: JournalHandle,
+    undo: UndoManager,
+    /// command_id 幂等缓存（只缓存终态：Applied；背压/过期不缓存）。
+    command_cache: HashMap<CommandId, EditOutcome>,
+    /// composition 深度（`> 0` 表示组合中；嵌套 begin 计数）。
+    composition_depth: u32,
+    /// composition 期间延后的远端 update（按到达顺序；结束后串行合并，不丢）。
+    deferred_remote: Vec<Vec<u8>>,
+    /// 外部提交闸门（ADR 0009 切片 3a）；无新线程/新全局状态。
+    pub(crate) gate: ExternalCommitGate,
+}
+
+impl std::fmt::Debug for DocumentSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocumentSession")
+            .field("doc_id", &self.doc_id)
+            .field("generation", &self.generation)
+            .field("session_epoch", &self.session_epoch)
+            .field("live_rev", &self.live_rev)
+            .field("pending", &self.pending_len())
+            .finish()
+    }
+}
+
+impl DocumentSession {
+    /// 打开会话：从库里的 snapshot + updates 重放出 live 文档。
+    pub fn open(vault: &Vault, doc_id: &str, options: SessionOptions) -> Result<Self, PortError> {
+        // 同步上下文在打开时校验一次：epoch/peer 非法要尽早报错，
+        // 而不是让之后每一次 flush 都因非法 intent 失败、journal 永远重试。
+        if let Some(sync) = options.sync {
+            sync.validate().map_err(port)?;
+        }
+        let generation = load_generation(vault, doc_id)?;
+        let (doc, head) =
+            store::load_body_doc(vault, doc_id, options.peer_id, None).map_err(port)?;
+        let live_frontier = doc.frontiers().encode();
+        // 打开时没有未 ACK 条目：增量基准就是 durable 的 VV
+        let journal_base_vv = head.version_vector().map_err(port)?;
+        let journal = JournalHandle::spawn(
+            vault.clone(),
+            doc_id.to_owned(),
+            head,
+            options.journal_capacity,
+            options.flush_batch,
+            options.flush_delay,
+            options.sync,
+        );
+        let undo = doc.undo_manager();
+        Ok(Self {
+            vault: vault.clone(),
+            doc_id: doc_id.to_owned(),
+            peer_id: options.peer_id,
+            generation,
+            session_epoch: options.session_epoch,
+            doc,
+            live_rev: LiveRev(0),
+            live_frontier,
+            journal_base_vv,
+            journal,
+            undo,
+            command_cache: HashMap::new(),
+            composition_depth: 0,
+            deferred_remote: Vec::new(),
+            gate: ExternalCommitGate::default(),
+        })
+    }
+
+    /// 文档 ID。
+    pub fn doc_id(&self) -> &str {
+        &self.doc_id
+    }
+
+    /// 文档代际。
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// 会话纪元。
+    pub fn session_epoch(&self) -> SessionEpoch {
+        self.session_epoch
+    }
+
+    /// 当前 live 修订号（`EditRequest.base_live_rev` 的正确基准）。
+    pub fn live_rev(&self) -> LiveRev {
+        self.live_rev
+    }
+
+    /// 当前 live frontier（不透明字节）。
+    pub fn live_frontier(&self) -> &[u8] {
+        &self.live_frontier
+    }
+
+    /// 当前 live 正文（LF 归一后的 Markdown）。
+    pub fn markdown(&self) -> String {
+        self.doc.text()
+    }
+
+    /// 打开快照（调用方据此初始化自己的 Rope 镜像）。
+    pub fn snapshot(&self) -> OpenSnapshot {
+        OpenSnapshot {
+            doc_id: self.doc_id.clone(),
+            generation: self.generation,
+            session_epoch: self.session_epoch,
+            live_rev: self.live_rev,
+            live_frontier: self.live_frontier.clone(),
+            live_vv: self.doc.vv().encode(),
+            // 批次号不跨会话持久化：重启后只能确认 durable 水位（head_seq）
+            durable_batch: None,
+            durable_head_seq: self.journal.durable_head_seq(),
+            markdown: self.doc.text(),
         }
     }
 
-    /// 第 `index` 条是否来自远端（`AllLocal` 恒为 false）。
-    fn is_remote(self, index: usize) -> bool {
-        match self {
-            Self::AllLocal => false,
-            Self::PerRecord(marks) => marks.get(index).copied().unwrap_or(false),
-        }
+    /// 未 ACK 条数。
+    pub fn pending_len(&self) -> usize {
+        self.journal.pending_len()
     }
 
-    /// 校验来源标记与 records 的对应关系。
+    /// 未 ACK update 的总字节数（调度器用：达到 64 KiB 立即 flush）。
+    pub fn pending_bytes(&self) -> usize {
+        self.journal.pending_bytes()
+    }
+
+    /// 已 durable 的 head seq。
+    pub fn durable_head_seq(&self) -> u64 {
+        self.journal.durable_head_seq()
+    }
+
+    /// 已 durable 到哪个 live 修订号。
+    pub fn durable_through(&self) -> LiveRev {
+        self.journal.durable_through()
+    }
+
+    /// 最近一次 flush 写失败的可读原因（`None` = 没有已知失败）。
     ///
-    /// `AllLocal` 不需要长度；`PerRecord` 必须与 records 等长——**空 records 配非空
-    /// marks、或 records 配空 marks 都会在这里被拒绝**，不会退化成「全部本地」。
-    fn validate(self, records_len: usize) -> Result<(), StorageError> {
-        if let Self::PerRecord(marks) = self {
-            if marks.len() != records_len {
-                return Err(StorageError::Corrupt {
-                    context: format!(
-                        "append_updates: records={records_len} \
-                         OriginMarks::PerRecord={} 必须一对一",
-                        marks.len()
-                    ),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-/// A 事务内同时写出站同步意图（按位置一一对应；`None` = 该条不产生意图）。
-///
-/// 与 [`append_updates_with_sync_intents`] 相比，这里允许"某些 update 没有意图"：
-/// 一次 flush 的前缀可能混本地编辑与 remote 导入，而 remote 导入**绝不能**产生
-/// 出站意图（ADR 0009）。仍然只有**一条** A 事务，失败即整笔回滚。
-///
-/// 参数语义（P2-8 钉死）：
-/// - `slots` 空 = 本批**没有任何**出站意图（不是"每条都要一条意图"）；`None` 位 = 该条
-///   不产生意图；
-/// - `origin` 见 [`OriginMarks`]：只有远端条目会扩大远端已知 VV，本地条目永远不扩大。
-pub(crate) fn append_updates_with_intent_slots(
-    vault: &Vault,
-    doc_id: &str,
-    expected_head_seq: u64,
-    records: &[UpdateRecord],
-    slots: &[Option<crate::sync_bridge::SyncIntent>],
-    origin: OriginMarks<'_>,
-) -> Result<HeadState, StorageError> {
-    append_updates_inner(
-        vault,
-        doc_id,
-        expected_head_seq,
-        records,
-        slots,
-        &[],
-        origin,
-    )
-}
-
-/// 同事务附加的 inbox 标记：`(log_id, relay_seq)`，每个都要求恰好命中一行 `verified`。
-type IntegratedMarks<'a> = &'a [(&'a [u8; 16], u64)];
-
-fn append_updates_inner(
-    vault: &Vault,
-    doc_id: &str,
-    expected_head_seq: u64,
-    records: &[UpdateRecord],
-    slots: &[Option<crate::sync_bridge::SyncIntent>],
-    integrated_marks: IntegratedMarks<'_>,
-    origin: OriginMarks<'_>,
-) -> Result<HeadState, StorageError> {
-    if records.is_empty() {
-        if !slots.is_empty() {
-            return Err(StorageError::Corrupt {
-                context: "空 update 批次不能带 sync intent".to_owned(),
-            });
-        }
-        if !integrated_marks.is_empty() {
-            return Err(StorageError::Corrupt {
-                context: "空 update 批次不能带 inbox 标记".to_owned(),
-            });
-        }
-        // `PerRecord` 配空 records 时，非空标记同样算长度不匹配（不会退化成全部本地）。
-        origin.validate(0)?;
-        return load_head(vault, doc_id);
-    }
-    if !slots.is_empty() && slots.len() != records.len() {
-        return Err(StorageError::Corrupt {
-            context: format!(
-                "append_updates: records={} intents={} 必须一对一",
-                records.len(),
-                slots.len()
-            ),
-        });
-    }
-    origin.validate(records.len())?;
-
-    // 远端已知 VV 的增量：只有 remote 条目会扩大它（`after_vv - running_vv`）。
-    //
-    // 这里只算「本批新增了哪些远端 ops」；旧值读取与 CAS 语句在构造语句阶段生成，
-    // 重试时按最新旧值重算并集，但 `added` 本身不变（head 基准没变）。
-    let remote_added = if origin.any_remote() {
-        let mut running = load_head_vv_at(vault, doc_id, expected_head_seq)?;
-        let mut known = VersionVector::new();
-        for (index, record) in records.iter().enumerate() {
-            let after = VersionVector::decode(&record.update.end_vv).map_err(StorageError::from)?;
-            if origin.is_remote(index) {
-                let added = crate::remote_known::added_since(&after, &running);
-                known = crate::remote_known::union(&known, &added);
-            }
-            running = after;
-        }
-        if known.is_empty() {
-            None
-        } else {
-            Some(known)
-        }
-    } else {
-        None
-    };
-
-    let last = &records
-        .last()
-        .ok_or_else(|| StorageError::Corrupt {
-            context: "append_updates 收到空批次".to_owned(),
-        })?
-        .update;
-    let head_seq = expected_head_seq + records.len() as u64;
-
-    let mut statements = Vec::with_capacity(records.len() + 2 + slots.len());
-
-    // 第 0 条就是 CAS：head_seq 必须还是调用方看到的那个值。
-    // 放在最前面，过期基准会在碰到任何唯一约束之前就被守卫拦下，报 HeadConflict 而不是 UNIQUE。
-    statements.push(Statement::new(
-        "UPDATE loro_docs SET head_seq = ?2, head_frontier = ?3, head_vv = ?4 \
-         WHERE doc_id = ?1 AND head_seq = ?5",
-        vec![
-            Value::Text(doc_id.to_owned()),
-            Value::Integer(i64_of(head_seq)?),
-            Value::Blob(last.end_frontier.clone()),
-            Value::Blob(last.end_vv.clone()),
-            Value::Integer(i64_of(expected_head_seq)?),
-        ],
-    ));
-
-    for (index, record) in records.iter().enumerate() {
-        let seq = expected_head_seq + 1 + index as u64;
-        statements.push(Statement::new(
-            "INSERT INTO loro_updates(doc_id, seq, update_id, batch_id, codec_version, payload, end_frontier, end_vv) \
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            vec![
-                Value::Text(doc_id.to_owned()),
-                Value::Integer(i64_of(seq)?),
-                Value::Text(format!("{doc_id}#{seq}")),
-                Value::Text(record.batch_id.clone()),
-                Value::Text(CODEC_VERSION.to_owned()),
-                Value::Blob(record.update.payload.clone()),
-                Value::Blob(record.update.end_frontier.clone()),
-                Value::Blob(record.update.end_vv.clone()),
-            ],
-        ));
+    /// 不可恢复的失败（head 过期且无法安全自动重建）优先，文案明确提示
+    /// 「需要重开文档」；否则是最近一次普通写失败（磁盘/SQLite 等，下次写成功后清空）。
+    ///
+    /// **只读且稳定**：同一失败可以反复读取，UI 可以在状态栏/关闭报告里直接展示；
+    /// 不要求调用方先走外部提交闸门（`GateState::Failed` 只有走闸门的路径才看得到）。
+    pub fn last_write_error(&self) -> Option<String> {
+        self.journal.last_write_error()
     }
 
-    statements.push(Statement::new(
-        "INSERT INTO projection_outbox(doc_id, target_seq) VALUES(?1, ?2) \
-         ON CONFLICT(doc_id) DO UPDATE SET target_seq = MAX(target_seq, excluded.target_seq)",
-        vec![
-            Value::Text(doc_id.to_owned()),
-            Value::Integer(i64_of(head_seq)?),
-        ],
-    ));
-
-    for (index, slot) in slots.iter().enumerate() {
-        // `None`：这条 update 不产生出站意图（remote 导入 / adopt 等），同事务里跳过。
-        let Some(intent) = slot else {
-            continue;
-        };
-        if intent.message_id.is_empty() || intent.batch_id.is_empty() || intent.key_epoch == 0 {
-            return Err(StorageError::Corrupt {
-                context: "sync intent message/batch/epoch 非法".to_owned(),
-            });
-        }
-        let seq = expected_head_seq + 1 + index as u64;
-        statements.push(Statement::new(
-            "INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,object_id,state,ciphertext) \
-             VALUES(?1,?2,?3,?4,?5,?6,'pending',NULL)",
-            vec![
-                Value::Text(intent.message_id.clone()),
-                Value::Text(intent.batch_id.clone()),
-                Value::Text(doc_id.to_owned()),
-                Value::Integer(i64_of(seq)?),
-                Value::Integer(i64_of(intent.key_epoch)?),
-                Value::Blob(intent.object_id.to_vec()),
-            ],
-        ));
+    /// 取走事件队列（Durable / Remote）。
+    pub fn events(&self) -> Vec<SessionEvent> {
+        self.journal.drain_events()
     }
 
-    // 远端已知 VV 的 meta 写入（与 update/head 同一 A 事务；失败一起回滚）。
-    //
-    // **值 CAS**：语句里带读到的旧值，只有库中值仍是旧值才会更新（`WHERE meta.value=?old`，
-    // 旧值不存在时用 `INSERT ... WHERE NOT EXISTS`）。这样两个写者（普通 pull 的 A 事务
-    // 与 baseline apply 批次）即使都拿着同一份旧并集，后到的那个也不会把先到的扩大值
-    // 覆盖回更小的并集；CAS 不命中 → 0 行 → 守卫失败 → 整笔回滚后重读重试。
-    let remote_slot = match &remote_added {
-        Some(added) => {
-            let index = statements.len();
-            statements.push(cas_statement_or_corrupt(
-                crate::remote_known::merge_statement(vault, doc_id, added)?,
-                doc_id,
-            )?);
-            Some(index)
-        }
-        None => None,
-    };
-
-    // 同事务标记 inbox 行：每条都要求恰好影响 1 行（不存在 / 已 integrated /
-    // 已 quarantine 都会让整笔 A 事务回滚）。标记语句放在最后，避免它们的守卫先于
-    // head CAS 暴露，保证并发冲突仍然报 HeadConflict。
-    let marks_start = statements.len();
-    for (mark_log_id, relay_seq) in integrated_marks {
-        statements.push(Statement::new(
-            "UPDATE sync_inbox SET state='integrated' \
-             WHERE log_id=?1 AND relay_seq=?2 AND state='verified'",
-            vec![
-                Value::Blob(mark_log_id.to_vec()),
-                Value::Integer(i64_of(*relay_seq)?),
-            ],
-        ));
-    }
-    let mut guards = Vec::with_capacity(2 + integrated_marks.len());
-    guards.push(AffectedGuard::exactly(0, 1));
-    if let Some(index) = remote_slot {
-        guards.push(AffectedGuard::exactly(index, 1));
-    }
-    guards.extend(
-        integrated_marks
-            .iter()
-            .enumerate()
-            .map(|(index, _)| AffectedGuard::exactly(marks_start + index, 1)),
-    );
-
-    // 远端已知 VV 的 CAS 失败是**可重试**的：并发写者只是先扩大了一步，重读旧值后
-    // 把两边并集再写一次即可。重试期间 head CAS 仍在 index 0：若真的有人推进了 head，
-    // 依旧按 HeadConflict 返回，不会把「基准过期」误当成 meta 冲突。
-    const REMOTE_KNOWN_CAS_ATTEMPTS: usize = 4;
-    let mut attempt = 0usize;
-    loop {
-        attempt += 1;
-        match vault.exec_transaction(&statements, &guards) {
-            Ok(_) => {
-                return Ok(HeadState {
-                    doc_id: doc_id.to_owned(),
-                    head_seq,
-                    head_frontier: last.end_frontier.clone(),
-                    head_vv: last.end_vv.clone(),
-                });
-            }
-            // 第 0 条守卫 = head CAS。
-            Err(StorageError::GuardFailed { statement: 0, .. }) => {
-                let actual = load_head(vault, doc_id)
-                    .map(|head| head.head_seq)
-                    .unwrap_or(0);
-                return Err(StorageError::HeadConflict {
-                    doc_id: doc_id.to_owned(),
-                    expected: expected_head_seq,
-                    actual,
-                });
-            }
-            // 远端已知 VV 的值 CAS 不命中：指定下标只有它这一条守卫。
-            Err(StorageError::GuardFailed { statement, .. }) if remote_slot == Some(statement) => {
-                let Some(added) = remote_added.as_ref() else {
-                    return Err(StorageError::Corrupt {
-                        context: format!("文档 {doc_id} 的远端已知 VV CAS 守卫缺少重算依据"),
-                    });
-                };
-                if attempt >= REMOTE_KNOWN_CAS_ATTEMPTS {
-                    return Err(StorageError::SyncConflict {
-                        context: format!(
-                            "文档 {doc_id} 的远端已知 VV 值 CAS 连续 {attempt} 次被并发写者改写；\
-                             整笔 A 事务（update+head+meta）已回滚，可重试"
-                        ),
-                    });
+    /// 等待某个 live 修订号变成 durable（测试/关闭前等待用）。
+    ///
+    /// 只消费覆盖到 `target` 的 `Durable`，其它事件留在队列里。
+    pub fn wait_for_durable(&self, target: LiveRev, timeout: Duration) -> Option<DurableAck> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut found = None;
+            {
+                let mut queue = lock(self.journal.events_ref());
+                let mut remaining = std::collections::VecDeque::new();
+                while let Some(event) = queue.pop_front() {
+                    match event {
+                        SessionEvent::Durable(ack)
+                            if ack.through_live_rev >= target && found.is_none() =>
+                        {
+                            found = Some(ack);
+                        }
+                        other => remaining.push_back(other),
+                    }
                 }
-                let slot = remote_slot.expect("守卫命中说明 remote_slot 存在");
-                statements[slot] = cas_statement_or_corrupt(
-                    crate::remote_known::merge_statement(vault, doc_id, added)?,
-                    doc_id,
-                )?;
+                *queue = remaining;
             }
-            // 标记失败：update 与所有标记一起回滚；调用方必须保持 inbox verified 原样。
-            Err(StorageError::GuardFailed { statement, .. }) if statement >= marks_start => {
-                return Err(StorageError::SyncConflict {
-                    context: format!(
-                        "inbox 标记 integrated 失败（第 {} 个标记行不存在或当前不是 verified）；\
-                         整笔 A 事务（update+标记）已回滚",
-                        statement - marks_start
-                    ),
-                });
+            if let Some(ack) = found {
+                return Some(ack);
             }
-            Err(error) => return Err(error),
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// 受理一次编辑请求（顺序固定，任何一步失败都**不改 Loro**）。
+    ///
+    /// 顺序：
+    ///
+    /// 1. 校验 `doc_id` / `generation` / `session_epoch`；
+    /// 2. 按 `command_id` 幂等（终态直接返回首次结果）；
+    /// 3. 外部提交闸门 Held → `Rejected{NotReady}`（ADR 0009：Held 期间禁写，fail-closed）；
+    /// 4. composition 进行中 → `Rejected{CompositionActive}`；
+    /// 5. 校验 `edits`：升序、互不重叠、`end <= scalar_len`；`base_live_rev` 不匹配 → `Stale`；
+    /// 6. journal 容量准入（满了 → `Rejected{Backpressure}`，此时 Loro 未被触碰）；
+    /// 7. 才允许改 Loro：按**逆序** `delete + insert`，导出增量、进 journal、推进 live_rev。
+    pub fn apply(&mut self, request: EditRequest) -> EditOutcome {
+        // 1. 身份与代际
+        if request.doc_id != self.doc_id {
+            return rejected(request.command_id, RejectReason::UnknownDoc);
+        }
+        if request.generation != self.generation {
+            return rejected(request.command_id, RejectReason::WrongGeneration);
+        }
+        if request.session_epoch != self.session_epoch {
+            return rejected(request.command_id, RejectReason::WrongEpoch);
+        }
+
+        // 2. 幂等：只命中终态（背压会随 flush 解除，不能缓存）
+        if let Some(cached) = self.command_cache.get(&request.command_id) {
+            return cached.clone();
+        }
+
+        // 2.5 外部提交闸门 Held：一律拒绝新的本地正文改动（fail-closed，不碰 Loro）。
+        //     3b 负责让界面在 Held 期间禁写；存储层这里必须自己兜底。
+        if self.gate.is_held() {
+            return rejected(request.command_id, RejectReason::NotReady);
+        }
+
+        // 3. composition 闸门：组合期间拒绝其它本地正文改动（**不碰 Loro**）
+        if self.is_composing() {
+            return rejected(request.command_id, RejectReason::CompositionActive);
+        }
+
+        // 4. 区间校验 + 基准校验（都在改 Loro 之前）
+        let scalar_len = self.doc.scalar_len();
+        if validate_edits(&request.edits, scalar_len).is_err() {
+            return rejected(request.command_id, RejectReason::InvalidRange);
+        }
+        if request.base_live_rev != self.live_rev {
+            return EditOutcome::Stale(StaleBase {
+                command_id: request.command_id,
+                current_live_rev: self.live_rev,
+                compensation: None,
+            });
+        }
+
+        // 5+6. 容量准入与 Loro 修改在同一把锁内完成：
+        //      持锁期间 flush 线程只会**释放**容量，因此准入通过后 append 不可能失败。
+        let mut guard = lock(self.journal.state_ref());
+        if guard.journal.is_full() {
+            drop(guard);
+            return rejected(request.command_id, RejectReason::Backpressure);
+        }
+
+        if request.edits.is_empty() {
+            let outcome = EditOutcome::Applied(Applied {
+                command_id: request.command_id.clone(),
+                live_rev: self.live_rev,
+                live_frontier: self.live_frontier.clone(),
+                splice: DeltaSplice {
+                    at: UnicodeScalar::new(0),
+                    delete_scalars: 0,
+                    insert: String::new(),
+                },
+                local_echo: true,
+                source: ChangeSource::Local,
+                merge: MergeInfo::default(),
+            });
+            self.command_cache
+                .insert(request.command_id.clone(), outcome.clone());
+            return outcome;
+        }
+
+        // 逆序应用：后面的编辑先做，前面编辑的坐标才不会失效（协议 §「按逆序应用」）
+        self.doc.set_next_commit_origin(&request.origin);
+        if self.undo.group_start().is_err() {
+            drop(guard);
+            return rejected(request.command_id, RejectReason::NotReady);
+        }
+        for edit in request.edits.iter().rev() {
+            let start = edit.start.get();
+            let len = edit.end.get() - start;
+            if let Err(_error) = self.doc.replace_scalars(start, len, &edit.replacement) {
+                // 校验已保证范围内合法；真出错时丢弃分组，不推进任何水位
+                self.undo.group_end();
+                drop(guard);
+                return rejected(request.command_id, RejectReason::InvalidRange);
+            }
+        }
+        self.undo.group_end();
+
+        // 没有产生任何 op（例如空替换）→ 不回显、不进 journal、不推进 live_rev
+        let vv_after = self.doc.vv();
+        if vv_after == self.journal_base_vv {
+            let first = request.edits.first().map_or(0, |edit| edit.start.get());
+            let outcome = EditOutcome::Applied(Applied {
+                command_id: request.command_id.clone(),
+                live_rev: self.live_rev,
+                live_frontier: self.live_frontier.clone(),
+                splice: DeltaSplice {
+                    at: UnicodeScalar::new(first),
+                    delete_scalars: 0,
+                    insert: String::new(),
+                },
+                local_echo: true,
+                source: ChangeSource::Local,
+                merge: MergeInfo::default(),
+            });
+            self.command_cache
+                .insert(request.command_id.clone(), outcome.clone());
+            return outcome;
+        }
+
+        let update = match self.doc.pending_update(&self.journal_base_vv) {
+            Ok(update) => update,
+            Err(_) => {
+                drop(guard);
+                return rejected(request.command_id, RejectReason::NotReady);
+            }
+        };
+
+        let rev = LiveRev(self.live_rev.0 + 1);
+        // 持锁且已准入：这里不可能失败（见上面的注释），失败只可能是内部不一致
+        if JournalHandle::append(
+            &mut guard,
+            &self.doc_id,
+            "session",
+            crate::journal::JournalOrigin::Local,
+            update,
+            rev,
+        )
+        .is_err()
+        {
+            debug_assert!(false, "持锁且已准入时 journal 追加失败");
+            drop(guard);
+            return rejected(request.command_id, RejectReason::NotReady);
+        }
+        drop(guard);
+
+        self.journal_base_vv = vv_after;
+        self.live_rev = rev;
+        self.live_frontier = self.doc.frontiers().encode();
+
+        let first = request.edits.first();
+        let splice = DeltaSplice {
+            at: first.map_or(UnicodeScalar::new(0), |edit| edit.start),
+            delete_scalars: first.map_or(0, |edit| (edit.end.get() - edit.start.get()) as u64),
+            insert: first
+                .map(|edit| edit.replacement.clone())
+                .unwrap_or_default(),
+        };
+        let outcome = EditOutcome::Applied(Applied {
+            command_id: request.command_id.clone(),
+            live_rev: self.live_rev,
+            live_frontier: self.live_frontier.clone(),
+            splice,
+            // 调用方已经把自己的镜像写好了：不得再按 splice 二次应用
+            local_echo: true,
+            source: ChangeSource::Local,
+            merge: MergeInfo::default(),
+        });
+        self.command_cache
+            .insert(request.command_id.clone(), outcome.clone());
+        outcome
+    }
+
+    /// 开始一次 IME composition（可嵌套，深度计数）。
+    ///
+    /// preedit **不经过本层**：会话只记录「组合是否在进行」，不接收 preedit 文本，
+    /// 也不因 preedit 更新而阻塞。返回当前嵌套深度。
+    ///
+    /// 外部提交闸门 Held 期间**不进入组合**（fail-closed）并返回当前深度；需要显式
+    /// 错误请用 [`DocumentSession::try_begin_composition`]（3b 用）。
+    pub fn begin_composition(&mut self) -> u32 {
+        match self.try_begin_composition() {
+            Ok(depth) => depth,
+            Err(_) => self.composition_depth,
+        }
+    }
+
+    /// 开始一次 IME composition 的**可报错**版本：Held 期间返回 [`PortError`]。
+    ///
+    /// Held 期间通道已冻结，这里再开组合只会让 preedit 与提交竞争，因此直接拒绝。
+    pub fn try_begin_composition(&mut self) -> Result<u32, PortError> {
+        if self.gate.is_held() {
+            return Err(PortError::Storage(
+                "外部提交闸门 Held：拒绝开始 IME 组合".to_owned(),
+            ));
+        }
+        self.composition_depth += 1;
+        Ok(self.composition_depth)
+    }
+
+    /// 结束一次 composition；只有**最外层**结束才合并延后的远端导入。
+    ///
+    /// 重复 `end`（没有对应 `begin`）是 no-op：平台可能重复回调 cancel，
+    /// 这里不 panic、不改变状态。
+    pub fn end_composition(&mut self) -> Vec<LiveDelta> {
+        if self.composition_depth > 0 {
+            self.composition_depth -= 1;
+        }
+        if self.is_composing() {
+            return Vec::new();
+        }
+        self.merge_deferred_remote()
+    }
+
+    /// 按到达顺序串行合并延后的远端 update。
+    ///
+    /// - 背压（journal 满）时**保留剩余项**，等 `flush` 之后调用方再调一次；
+    /// - 解码/写入失败时也保留队首，不丢远端数据。
+    pub fn merge_deferred_remote(&mut self) -> Vec<LiveDelta> {
+        let mut merged = Vec::new();
+        loop {
+            if self.deferred_remote.is_empty() || !self.can_accept_remote() {
+                break;
+            }
+            let Some(update) = self.deferred_remote.first().cloned() else {
+                break;
+            };
+            match self.merge_remote_inner(&update, false) {
+                Ok(outcome) => {
+                    self.deferred_remote.remove(0);
+                    if let Some(delta) = outcome {
+                        merged.push(delta);
+                    }
+                }
+                // 保留在队首：不丢远端数据，调用方可稍后重试
+                Err(_) => break,
+            }
+        }
+        merged
+    }
+
+    /// 是否正处于 composition 中。
+    pub fn is_composing(&self) -> bool {
+        self.composition_depth > 0
+    }
+
+    /// 当前嵌套深度（0 = 不在组合中）。
+    pub fn composition_depth(&self) -> u32 {
+        self.composition_depth
+    }
+
+    /// 仍未合并的远端 update 条数。
+    pub fn deferred_remote_len(&self) -> usize {
+        self.deferred_remote.len()
+    }
+
+    fn can_accept_remote(&self) -> bool {
+        // Held 期间不合并延后的远端：闸门要求 live 水位静止，等 end 之后再合并
+        !self.journal.is_full() && !self.gate.is_held()
+    }
+
+    /// 远端导入：把 update 合进 live 文档，返回驱动镜像的 [`LiveDelta`]。
+    ///
+    /// 容量不足时拒绝（返回 `PortError::Storage`），保证「背压时 Loro 未被修改」对远端路径同样成立。
+    /// Held 期间一律拒绝（fail-closed）：调用方应在 `end_external_commit` 之后重试。
+    pub fn apply_remote(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
+        if self.gate.is_held() {
+            return Err(PortError::Storage(
+                "外部提交闸门 Held：暂不接受远端导入".to_owned(),
+            ));
+        }
+        if self.is_composing() {
+            // 组合期间延后：进队列（不丢、不报错），结束后按到达顺序串行合并
+            self.deferred_remote.push(update.to_vec());
+            return Ok(None);
+        }
+        self.merge_remote_now(update)
+    }
+
+    /// 立即合并一条远端 update（**不做** composition 判断；闸门在 [`Self::apply_remote`]）。
+    fn merge_remote_now(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
+        self.merge_remote_inner(update, true)
+    }
+
+    /// `publish = false` 时只返回 delta、不重复推进事件队列（延后合并的唯一投递口是
+    /// [`Self::end_composition`] 的返回值，避免调用方把同一条变更应用到镜像两次）。
+    fn merge_remote_inner(
+        &mut self,
+        update: &[u8],
+        publish: bool,
+    ) -> Result<Option<LiveDelta>, PortError> {
+        if self.journal.is_full() {
+            return Err(PortError::Storage(
+                "未 ACK journal 已满，暂不接受远端导入（背压）".to_owned(),
+            ));
+        }
+
+        let mut guard = lock(self.journal.state_ref());
+        let diff = match import_updates(&self.doc, std::iter::once(update)) {
+            Ok(diff) => diff,
+            Err(error) => {
+                drop(guard);
+                return Err(port(error));
+            }
+        };
+        if !diff.changed() {
+            drop(guard);
+            return Ok(None);
+        }
+
+        let splice = diff.splice();
+        let after_vv = diff.after_vv;
+        let from_rev = self.live_rev;
+        let to_rev = LiveRev(self.live_rev.0 + 1);
+
+        // 远端 op 也进 journal（A 事务落库后才算 durable）；容量已准入。
+        let pending = match self.doc.pending_update(&self.journal_base_vv) {
+            Ok(update) => update,
+            Err(error) => {
+                drop(guard);
+                return Err(port(error));
+            }
+        };
+        if JournalHandle::append(
+            &mut guard,
+            &self.doc_id,
+            "remote",
+            // 远端导入**绝不**产生出站意图（ADR 0009）；否则会把刚收到的数据推回 relay。
+            crate::journal::JournalOrigin::Remote,
+            pending,
+            to_rev,
+        )
+        .is_err()
+        {
+            drop(guard);
+            return Err(PortError::Storage("journal 追加失败".to_owned()));
+        }
+        drop(guard);
+
+        self.journal_base_vv = after_vv;
+        self.live_rev = to_rev;
+        self.live_frontier = self.doc.frontiers().encode();
+
+        let delta = LiveDelta {
+            doc_id: self.doc_id.clone(),
+            from_rev,
+            to_rev,
+            live_frontier: self.live_frontier.clone(),
+            splice,
+            cause: None,
+            source: ChangeSource::Remote,
+            merge: MergeInfo {
+                concurrent: true,
+                remote_changes: 1,
+            },
+        };
+        if publish {
+            lock(self.journal.events_ref()).push_back(SessionEvent::Remote(delta.clone()));
+        }
+        Ok(Some(delta))
+    }
+
+    /// 撤销：用**唯一** `UndoManager` 生成本地新 op（不回退 VV，也不回退远端字符）。
+    ///
+    /// 返回：
+    /// - `Ok(Some(Applied))`：已撤销并进 journal；
+    /// - `Ok(None)`：没有可撤销项（no-op undo，应提示调用方消费该项）；
+    /// - `Ok(Some(Rejected{Backpressure}))`：journal 满，**未 undo**（Loro 未被修改）；
+    /// - `Ok(Some(Rejected{NotReady}))`：外部提交闸门 Held，**未 undo**（fail-closed）。
+    pub fn undo(&mut self) -> Result<Option<EditOutcome>, PortError> {
+        // Held 期间 undo 也会改 Loro/journal：fail-closed，等 end 之后重试
+        if self.gate.is_held() {
+            return Ok(Some(rejected(
+                CommandId::from("undo"),
+                RejectReason::NotReady,
+            )));
+        }
+        // composition 期间 undo/redo 也属于「其它本地正文改动」：拒绝且不碰 Loro
+        if self.is_composing() {
+            return Ok(Some(rejected(
+                CommandId::from("undo"),
+                RejectReason::CompositionActive,
+            )));
+        }
+        // 容量准入在改 Loro 之前；准入通过后 flusher 只会释放容量，append 必然成功
+        if self.journal.is_full() {
+            return Ok(Some(rejected(
+                CommandId::from("undo"),
+                RejectReason::Backpressure,
+            )));
+        }
+        let before = self.doc.text();
+        let before_vv = self.doc.vv();
+        if self.undo.group_start().is_err() {
+            return Err(PortError::Storage("UndoManager 分组失败".to_owned()));
+        }
+        let changed = match self.undo.undo() {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.undo.group_end();
+                return Err(port_loro(error));
+            }
+        };
+        self.undo.group_end();
+        if !changed || self.doc.vv() == before_vv {
+            return Ok(None);
+        }
+        Ok(Some(EditOutcome::Applied(
+            self.finish_history_change(&before, ChangeSource::Undo)?,
+        )))
+    }
+
+    /// 重做：与 [`DocumentSession::undo`] 对称。
+    pub fn redo(&mut self) -> Result<Option<EditOutcome>, PortError> {
+        if self.gate.is_held() {
+            return Ok(Some(rejected(
+                CommandId::from("redo"),
+                RejectReason::NotReady,
+            )));
+        }
+        if self.is_composing() {
+            return Ok(Some(rejected(
+                CommandId::from("redo"),
+                RejectReason::CompositionActive,
+            )));
+        }
+        if self.journal.is_full() {
+            return Ok(Some(rejected(
+                CommandId::from("redo"),
+                RejectReason::Backpressure,
+            )));
+        }
+        let before = self.doc.text();
+        let before_vv = self.doc.vv();
+        let changed = match self.undo.redo() {
+            Ok(changed) => changed,
+            Err(error) => return Err(port_loro(error)),
+        };
+        if !changed || self.doc.vv() == before_vv {
+            return Ok(None);
+        }
+        Ok(Some(EditOutcome::Applied(
+            self.finish_history_change(&before, ChangeSource::Redo)?,
+        )))
+    }
+
+    /// 撤销/重做共同的收尾：导出增量、进 journal、推进 live_rev、产出 Applied。
+    fn finish_history_change(
+        &mut self,
+        before: &str,
+        source: ChangeSource,
+    ) -> Result<Applied, PortError> {
+        let after_vv = self.doc.vv();
+        let update = self
+            .doc
+            .pending_update(&self.journal_base_vv)
+            .map_err(port)?;
+        let rev = LiveRev(self.live_rev.0 + 1);
+        let label = match source {
+            ChangeSource::Undo => "undo",
+            ChangeSource::Redo => "redo",
+            _ => "history",
+        };
+        {
+            let mut guard = lock(self.journal.state_ref());
+            // 外层已做容量准入，且持锁期间容量只增不减 → 这里不会失败
+            // undo/redo 是本机产生的新 op（不是远端回放），因此同样产生出站意图。
+            if JournalHandle::append(
+                &mut guard,
+                &self.doc_id,
+                label,
+                crate::journal::JournalOrigin::Local,
+                update,
+                rev,
+            )
+            .is_err()
+            {
+                debug_assert!(false, "持锁且已准入时 journal 追加失败");
+                return Err(PortError::Storage("journal 追加失败".to_owned()));
+            }
+        }
+        self.journal_base_vv = after_vv;
+        self.live_rev = rev;
+        self.live_frontier = self.doc.frontiers().encode();
+
+        let splice = diff_splice(before, &self.doc.text());
+        Ok(Applied {
+            command_id: format!("{label}-{}", rev.0),
+            live_rev: rev,
+            live_frontier: self.live_frontier.clone(),
+            splice,
+            // 撤销不是用户"已经写好"的输入：调用方要按 splice 更新镜像
+            local_echo: false,
+            source,
+            merge: MergeInfo::default(),
+        })
+    }
+
+    /// 撤销/重做栈状态。
+    pub fn history(&self) -> HistoryState {
+        HistoryState {
+            can_undo: self.undo.can_undo(),
+            undo_count: self.undo.undo_count(),
+            can_redo: self.undo.can_redo(),
+            redo_count: self.undo.redo_count(),
+        }
+    }
+
+    /// 受理一次 flush：同步返回票据，后台线程写 A 事务并推 `DurableAck`。
+    pub fn flush(&mut self, _reason: FlushReason) -> FlushTicket {
+        let ticket_id = self.journal.submit_ticket(self.live_rev);
+        FlushTicket {
+            ticket_id,
+            target_live_rev: self.live_rev,
+        }
+    }
+
+    /// 已 durable 的 head seq（方便测试/状态栏）。
+    pub fn vault(&self) -> &Vault {
+        &self.vault
     }
 }
 
-/// [`crate::remote_known::merge_statement`] 在 `remote_added` 非空时必然返回语句；
-/// 这里把它转成带文档上下文的损坏错误，避免业务路径 `unwrap`。
-fn cas_statement_or_corrupt(
-    statement: Option<Statement>,
-    doc_id: &str,
-) -> Result<Statement, StorageError> {
-    statement.ok_or_else(|| StorageError::Corrupt {
-        context: format!("文档 {doc_id} 的远端已知 VV 增量非空，但没有生成 CAS 语句"),
-    })
+fn rejected(command_id: CommandId, reason: RejectReason) -> EditOutcome {
+    EditOutcome::Rejected(Rejected { command_id, reason })
 }
 
-/// 笔记当前的物化水位（供 B 事务与测试读取）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BodyState {
-    /// 笔记 ID。
-    pub note_id: String,
-    /// 已物化的 body_md。
-    pub body_md: Option<String>,
-    /// 已物化的 batch seq。
-    pub body_seq: u64,
-    /// 已物化的 frontier。
-    pub body_frontier: Option<Vec<u8>>,
+fn port(error: StorageError) -> PortError {
+    PortError::Storage(error.to_string())
 }
 
-/// 读一篇笔记的物化状态。
-pub fn load_body_state(vault: &Vault, note_id: &str) -> Result<BodyState, StorageError> {
-    let rows = vault.query(
-        "SELECT body_md, body_seq, body_frontier FROM notes WHERE note_id = ?1",
-        &[Value::Text(note_id.to_owned())],
-    )?;
+/// Loro 错误同样归到端口错误（协议不泄露 Loro 类型）。
+fn port_loro(error: loro::LoroError) -> PortError {
+    PortError::Storage(error.to_string())
+}
+
+/// 区间校验：升序、互不重叠、`end <= scalar_len`。
+fn validate_edits(edits: &[ScalarEdit], scalar_len: usize) -> Result<(), ()> {
+    let mut previous_end = 0usize;
+    for (index, edit) in edits.iter().enumerate() {
+        let start = edit.start.get();
+        let end = edit.end.get();
+        if start > end || end > scalar_len {
+            return Err(());
+        }
+        if index > 0 && start < previous_end {
+            return Err(());
+        }
+        previous_end = end;
+    }
+    Ok(())
+}
+
+/// 读文档代际（`loro_docs.generation`），并确认它是正文文档。
+fn load_generation(vault: &Vault, doc_id: &str) -> Result<Generation, PortError> {
+    let rows = vault
+        .query(
+            "SELECT generation, kind FROM loro_docs WHERE doc_id = ?1",
+            &[Value::Text(doc_id.to_owned())],
+        )
+        .map_err(port)?;
     let row = rows
         .into_iter()
         .next()
-        .ok_or_else(|| StorageError::Corrupt {
-            context: format!("notes 缺少 {note_id}"),
-        })?;
+        .ok_or_else(|| PortError::NotOpen(doc_id.to_owned()))?;
 
-    let body_md = match row.first() {
-        Some(Value::Text(text)) => Some(text.clone()),
-        Some(Value::Null) | None => None,
-        Some(other) => {
-            return Err(StorageError::Corrupt {
-                context: format!("notes.body_md 类型异常：{other:?}"),
-            });
-        }
+    let generation = match row.first() {
+        Some(Value::Integer(value)) if *value >= 0 => Generation(*value as u64),
+        _ => return Err(PortError::NotOpen(doc_id.to_owned())),
     };
-
-    Ok(BodyState {
-        note_id: note_id.to_owned(),
-        body_md,
-        body_seq: u64_of(&row, 1, "notes.body_seq")?,
-        body_frontier: optional_blob(&row, 2)?,
-    })
-}
-
-fn i64_of(value: u64) -> Result<i64, StorageError> {
-    i64::try_from(value).map_err(|_| StorageError::Corrupt {
-        context: format!("数值 {value} 超出 SQLite INTEGER 范围"),
-    })
-}
-
-fn u64_of(row: &[Value], index: usize, field: &str) -> Result<u64, StorageError> {
-    match row.get(index) {
-        Some(Value::Integer(value)) if *value >= 0 => Ok(*value as u64),
-        other => Err(StorageError::Corrupt {
-            context: format!("{field} 读回异常：{other:?}"),
-        }),
+    match row.get(1) {
+        Some(Value::Text(kind)) if kind == "body" => Ok(generation),
+        _ => Err(PortError::NotOpen(doc_id.to_owned())),
     }
 }
 
-fn blob_of(row: &[Value], index: usize, field: &str) -> Result<Vec<u8>, StorageError> {
-    match row.get(index) {
-        Some(Value::Blob(bytes)) => Ok(bytes.clone()),
-        Some(Value::Null) | None => Ok(Vec::new()),
-        other => Err(StorageError::Corrupt {
-            context: format!("{field} 读回异常：{other:?}"),
-        }),
+/// 一批 update 导入后的文本/版本变化（**不推进任何水位、不碰 journal**）。
+pub(crate) struct ImportDiff {
+    /// 导入前的正文。
+    pub(crate) before_text: String,
+    /// 导入后的正文（没有新 op 时与 `before_text` 相同）。
+    pub(crate) after_text: String,
+    /// 导入后的版本向量。
+    pub(crate) after_vv: VersionVector,
+    /// 是否真的产生了新的 op（以 VV 为准：文本相同也可能有纯格式 op）。
+    changed: bool,
+}
+
+impl ImportDiff {
+    /// 是否产生了新的 op。
+    pub(crate) fn changed(&self) -> bool {
+        self.changed
+    }
+
+    /// 本次变化的最小 splice（驱动调用方镜像与选区变换）。
+    pub(crate) fn splice(&self) -> DeltaSplice {
+        diff_splice(&self.before_text, &self.after_text)
     }
 }
 
-fn optional_blob(row: &[Value], index: usize) -> Result<Option<Vec<u8>>, StorageError> {
-    match row.get(index) {
-        Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
+/// 把一批 update 合进 live 文档，返回前后文本与 VV。
+///
+/// **只做 Loro 导入**：journal、水位、事件全部由调用方决定——
+/// `apply_remote` 走 journal（会产生 A 事务条目），`adopt_committed_delta` 走已 durable
+/// 路径（不进 journal、不产生 sync intent）。两条路径共用同一份导入/选区变换逻辑。
+pub(crate) fn import_updates<'a, I>(doc: &BodyDoc, updates: I) -> Result<ImportDiff, StorageError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let before_text = doc.text();
+    let before_vv = doc.vv();
+    for update in updates {
+        doc.import(update)?;
+    }
+    let after_vv = doc.vv();
+    let changed = after_vv != before_vv;
+    let after_text = if changed {
+        doc.text()
+    } else {
+        before_text.clone()
+    };
+    Ok(ImportDiff {
+        before_text,
+        after_text,
+        after_vv,
+        changed,
+    })
+}
+
+/// 以 scalar 为单位求「最小差异」splice（公共前缀 + 公共后缀）。
+pub(crate) fn diff_splice(before: &str, after: &str) -> DeltaSplice {
+    let before_chars: Vec<char> = before.chars().collect();
+    let after_chars: Vec<char> = after.chars().collect();
+
+    let mut prefix = 0usize;
+    while prefix < before_chars.len()
+        && prefix < after_chars.len()
+        && before_chars[prefix] == after_chars[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < before_chars.len() - prefix
+        && suffix < after_chars.len() - prefix
+        && before_chars[before_chars.len() - 1 - suffix]
+            == after_chars[after_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let delete_scalars = before_chars.len() - prefix - suffix;
+    let insert: String = after_chars[prefix..after_chars.len() - suffix]
+        .iter()
+        .collect();
+    DeltaSplice {
+        at: UnicodeScalar::new(prefix),
+        delete_scalars: delete_scalars as u64,
+        insert,
+    }
+}
+
+`````
+
+
+@@SECTION `crates/storage/src/session/schedule.rs`
+
+`````rust
+//! 存储侧调度（ADR 0003 切片 4a）：自动 flush + B 物化后台驱动。
+//!
+//! ## 自动 flush（ADR 0002 §9）
+//!
+//! - **固定窗口**：从「首次 dirty」起算 250 ms，**后续输入不重置**（不是尾缘 debounce），
+//!   否则连续输入会无限延期；
+//! - **64 KiB**：未 ACK 的 update 字节数达到阈值立即 flush；
+//! - `Ctrl+S` / 切换 / 关闭仍可显式 [`SessionDriver::flush`]；[`SessionDriver::close`] 有界排空。
+//!
+//! 时钟通过 [`Clock`] 注入：生产用 [`SystemClock`]（墙钟），测试用 [`ManualClock`]
+//! 直接 [`ManualClock::set`] 推进——不靠真睡 250 ms 碰运气。
+//!
+//! ## B 物化
+//!
+//! 只有收到 [`SessionEvent::Durable`] 之后才把 B 任务入队；后台线程按 ACK 里的
+//! `head_seq` 从**固定 frontier**调用 [`materialize_body`]（内部 `end_frontier_at` + CAS），
+//! 因此：
+//!
+//! - 不读取、不修改正在编辑的 live doc（worker 自己从库里重放）；
+//! - 旧任务迟到时 CAS 命中 0 行 → `Stale`，不会覆盖新结果；
+//! - 失败会记录在 [`DriverEvent::MaterializeFailed`]，可用 [`SessionDriver::retry_failed`] 重试。
+//!
+//! 调用方线程只做内存操作：`apply` / `flush` / `pump` 都不等待 SQLite；只有 `close`
+//! 与显式 `materialize_now` 会有界等待。
+//!
+//! ## 切片 3b：外部提交闸门 / adopt 的驱动转发
+//!
+//! [`SessionDriver`] 不重新实现闸门语义，只把 [`DocumentSession`] 的 3a API 原样转发，
+//! 并把 adopt 的结果变成**驱动事件**：
+//!
+//! - `adopt` 成功后把 `AdoptOutcome.delta` 作为 [`DriverEvent::Remote`]、把 `ack` 作为
+//!   [`DriverEvent::Durable`] 推入事件队列（顺序固定：先 Remote 再 Durable），
+//!   这样 UI 的 pump 就能在不重开文档的情况下更新镜像与 durable 水位；
+//! - **绝不**调用会 journal 的 `apply_remote`：那份 update 已经 durable，
+//!   再走一次会让 flusher 重复写库并产生多余的出站意图；
+//! - Held 期间 `apply` 的拒绝（[`super::protocol::RejectReason::NotReady`]）原样透传，
+//!   驱动不额外吞错、也不替调用方兜底。
+
+use std::collections::VecDeque;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use rusqlite::types::Value;
+
+use super::core::{DocumentSession, SessionOptions};
+use super::gate::{
+    AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease, ExternalCommitTicket, GateError,
+    GateState, PreparedCommittedDelta,
+};
+use super::protocol::{
+    DurableAck, EditOutcome, EditRequest, FlushReason, FlushTicket, HistoryState, LiveDelta,
+    LiveRev, PortError, SessionEvent,
+};
+use crate::error::StorageError;
+use crate::materialize::{materialize_body, MaterializeOutcome};
+use crate::Vault;
+
+/// 取锁；毒化也继续用内部值。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 可注入时钟：返回「驱动启动以来」的时长。
+pub trait Clock: Send + 'static {
+    /// 当前虚拟/墙钟时刻。
+    fn now(&self) -> Duration;
+}
+
+/// 墙钟（生产用）。
+#[derive(Debug)]
+pub struct SystemClock {
+    started: Instant,
+}
+
+impl SystemClock {
+    /// 从现在开始计时。
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for SystemClock {
+    fn now(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+/// 手动时钟（测试用）：显式 `set`/`advance`，不依赖真实时间。
+#[derive(Debug, Clone)]
+pub struct ManualClock {
+    now: Arc<Mutex<Duration>>,
+}
+
+impl ManualClock {
+    /// 从 0 开始。
+    pub fn new() -> Self {
+        Self {
+            now: Arc::new(Mutex::new(Duration::ZERO)),
+        }
+    }
+
+    /// 设置到某个时刻。
+    pub fn set(&self, at: Duration) {
+        *lock(&self.now) = at;
+    }
+
+    /// 前进一段时间。
+    pub fn advance(&self, by: Duration) {
+        let mut now = lock(&self.now);
+        *now += by;
+    }
+
+    /// 读取当前时刻。
+    pub fn get(&self) -> Duration {
+        *lock(&self.now)
+    }
+}
+
+impl Default for ManualClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Duration {
+        self.get()
+    }
+}
+
+/// 自动 flush 策略。
+#[derive(Debug, Clone, Copy)]
+pub struct FlushPolicy {
+    /// 首次 dirty 起算的固定窗口（默认 250 ms）。
+    pub interval: Duration,
+    /// 未 ACK update 字节阈值（默认 64 KiB）。
+    pub size_bytes: usize,
+}
+
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_millis(250),
+            size_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// 驱动配置。
+#[derive(Debug, Clone, Copy)]
+pub struct DriverOptions {
+    /// 会话配置。
+    pub session: SessionOptions,
+    /// flush 策略。
+    pub policy: FlushPolicy,
+    /// 是否启动墙钟 ticker（生产 `true`；测试用假时钟时可关）。
+    pub auto_tick: bool,
+    /// ticker 间隔（默认 = `policy.interval`）。
+    pub tick_interval: Option<Duration>,
+}
+
+impl Default for DriverOptions {
+    fn default() -> Self {
+        Self {
+            session: SessionOptions::default(),
+            policy: FlushPolicy::default(),
+            auto_tick: true,
+            tick_interval: None,
+        }
+    }
+}
+
+/// 驱动向调用方推送的事件（不含请求的同步回复）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverEvent {
+    /// 已提交一张 flush 票据（后台还没写完）。
+    FlushScheduled {
+        /// 票据。
+        ticket: FlushTicket,
+        /// 触发原因。
+        reason: FlushReason,
+    },
+    /// durable 水位推进（同时会触发 B 物化入队）。
+    Durable(DurableAck),
+    /// 远端变更。
+    Remote(LiveDelta),
+    /// B 物化完成。
+    Materialized(MaterializeOutcome),
+    /// B 物化失败（已记录，可 `retry_failed` 重试）。
+    MaterializeFailed {
+        /// 笔记 ID。
+        note_id: String,
+        /// 失败信息。
+        message: String,
+    },
+}
+
+/// `close` 的排空报告。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseReport {
+    /// 覆盖到最后一个 live_rev 的 ACK（超时为 `None`）。
+    pub durable: Option<DurableAck>,
+    /// 本次关闭过程中完成的 B 物化数。
+    pub materialized: usize,
+    /// 仍未 ACK 的编辑条数（正常情况下为 0）。
+    pub pending_edits: usize,
+    /// 仍未完成的 B 任务数（正常情况下为 0）。
+    pub pending_materialize: usize,
+    /// 是否超时（`true` 表示没排空，调用方应保留现场）。
+    pub timed_out: bool,
+    /// 关闭时仍未解决的 flush 写失败原因（`None` = 没有已知失败）。
+    ///
+    /// 取自 [`DocumentSession::last_write_error`]：不可恢复的失败（文案含
+    /// 「需要重开文档」）优先，否则是最近一次普通写失败。关闭之后会话可能被丢弃，
+    /// 调用方只能靠这份报告知道「没排空是为什么」，因此它必须随报告一起返回。
+    pub flush_error: Option<String>,
+}
+
+/// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializeJob {
+    note_id: String,
+    doc_id: String,
+    target_seq: u64,
+}
+
+/// B 物化后台线程。
+struct Materializer {
+    sender: Option<Sender<MaterializeJob>>,
+    results: Arc<Mutex<VecDeque<MaterializeOutcome>>>,
+    errors: Arc<Mutex<VecDeque<(MaterializeJob, String)>>>,
+    pending: Arc<Mutex<usize>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Materializer {
+    fn spawn(vault: Vault, peer_id: u64, delay: Option<Duration>) -> Self {
+        let (sender, receiver) = channel::<MaterializeJob>();
+        let results: Arc<Mutex<VecDeque<MaterializeOutcome>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let errors: Arc<Mutex<VecDeque<(MaterializeJob, String)>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let pending = Arc::new(Mutex::new(0usize));
+
+        let worker_results = Arc::clone(&results);
+        let worker_errors = Arc::clone(&errors);
+        let worker_pending = Arc::clone(&pending);
+        let worker = thread::Builder::new()
+            .name("menghunote-materialize".to_owned())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    if let Some(delay) = delay {
+                        thread::sleep(delay);
+                    }
+                    // 运行期再解析 note_id：笔记行可能还没投影出来（失败要能记录并重试）
+                    let outcome = run_materialize(&vault, &job, peer_id);
+                    match outcome {
+                        Ok(outcome) => lock(&worker_results).push_back(outcome),
+                        Err(error) => {
+                            let message = error.to_string();
+                            lock(&worker_errors).push_back((job, message));
+                        }
+                    }
+                    let mut pending = lock(&worker_pending);
+                    *pending = pending.saturating_sub(1);
+                }
+            })
+            .ok();
+
+        Self {
+            sender: Some(sender),
+            results,
+            errors,
+            pending,
+            worker,
+        }
+    }
+
+    fn enqueue(&self, job: MaterializeJob) {
+        if let Some(sender) = self.sender.as_ref() {
+            *lock(&self.pending) += 1;
+            if sender.send(job).is_err() {
+                let mut pending = lock(&self.pending);
+                *pending = pending.saturating_sub(1);
+            }
+        }
+    }
+
+    fn pending(&self) -> usize {
+        *lock(&self.pending)
+    }
+
+    fn take_results(&self) -> Vec<MaterializeOutcome> {
+        lock(&self.results).drain(..).collect()
+    }
+
+    fn take_errors(&self) -> Vec<(MaterializeJob, String)> {
+        lock(&self.errors).drain(..).collect()
+    }
+}
+
+impl Drop for Materializer {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// 墙钟 ticker：按固定间隔投递 `()`，驱动 `pump` 检查固定窗口。
+struct Ticker {
+    stop: Option<Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Ticker {
+    fn spawn(interval: Duration) -> (Self, Receiver<()>) {
+        let interval = interval.max(Duration::from_millis(1));
+        let (tick_sender, tick_receiver) = channel::<()>();
+        let (stop_sender, stop_receiver) = channel::<()>();
+
+        let worker = thread::Builder::new()
+            .name("menghunote-tick".to_owned())
+            .spawn(move || loop {
+                match stop_receiver.recv_timeout(interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if tick_sender.send(()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+
+        (
+            Self {
+                stop: Some(stop_sender),
+                worker,
+            },
+            tick_receiver,
+        )
+    }
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// 会话驱动：会话核 + 自动 flush 调度 + B 物化后台线程。
+pub struct SessionDriver {
+    session: DocumentSession,
+    vault: Vault,
+    peer_id: u64,
+    policy: FlushPolicy,
+    clock: Box<dyn Clock>,
+    /// 首次 dirty 的虚拟时刻；`None` = 没有等待窗口的脏数据。
+    dirty_since: Option<Duration>,
+    /// 已提交 flush 覆盖到的 live_rev（避免空 flush 造成重复票据）。
+    flushed_live_rev: LiveRev,
+    materializer: Materializer,
+    /// B 失败任务（可 `retry_failed`）。
+    failed_jobs: Vec<MaterializeJob>,
+    /// 只负责保活：Drop 时停线程；逻辑上不读取。
+    _ticker: Option<Ticker>,
+    tick_receiver: Option<Receiver<()>>,
+    events: VecDeque<DriverEvent>,
+}
+
+impl std::fmt::Debug for SessionDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionDriver")
+            .field("doc_id", &self.session.doc_id())
+            .field("live_rev", &self.session.live_rev())
+            .field("dirty_since", &self.dirty_since)
+            .field("pending_bytes", &self.session.pending_bytes())
+            .finish()
+    }
+}
+
+impl SessionDriver {
+    /// 打开驱动（墙钟 + ticker）。
+    pub fn open(vault: &Vault, doc_id: &str, options: DriverOptions) -> Result<Self, PortError> {
+        Self::open_with_clock(vault, doc_id, options, Box::new(SystemClock::new()))
+    }
+
+    /// 打开驱动并注入时钟（测试用假时钟）。
+    pub fn open_with_clock(
+        vault: &Vault,
+        doc_id: &str,
+        options: DriverOptions,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, PortError> {
+        Self::open_with_clock_and_materialize_delay(vault, doc_id, options, clock, None)
+    }
+
+    /// 打开驱动并注入时钟 + **B 物化延迟**（测试/故障注入，与 `SessionOptions::flush_delay` 同性质）。
+    ///
+    /// 延迟是构造参数而不是 `DriverOptions` 字段：后者是公开结构体，
+    /// 加字段会让外部（editor 的 e2e 夹具）的结构体字面量编译失败。
+    pub fn open_with_clock_and_materialize_delay(
+        vault: &Vault,
+        doc_id: &str,
+        options: DriverOptions,
+        clock: Box<dyn Clock>,
+        materialize_delay: Option<Duration>,
+    ) -> Result<Self, PortError> {
+        let session = DocumentSession::open(vault, doc_id, options.session)?;
+        let materializer =
+            Materializer::spawn(vault.clone(), options.session.peer_id, materialize_delay);
+        let (ticker, tick_receiver) = if options.auto_tick {
+            let interval = options.tick_interval.unwrap_or(options.policy.interval);
+            let (ticker, receiver) = Ticker::spawn(interval);
+            (Some(ticker), Some(receiver))
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            session,
+            vault: vault.clone(),
+            peer_id: options.session.peer_id,
+            policy: options.policy,
+            clock,
+            dirty_since: None,
+            flushed_live_rev: LiveRev(0),
+            materializer,
+            failed_jobs: Vec::new(),
+            _ticker: ticker,
+            tick_receiver,
+            events: VecDeque::new(),
+        })
+    }
+
+    /// 会话核（只读能力：快照/历史/水位）。
+    pub fn session(&self) -> &DocumentSession {
+        &self.session
+    }
+
+    /// 当前 live 正文。
+    pub fn markdown(&self) -> String {
+        self.session.markdown()
+    }
+
+    /// 当前 live 修订号。
+    pub fn live_rev(&self) -> LiveRev {
+        self.session.live_rev()
+    }
+
+    /// 未 ACK update 字节数。
+    pub fn pending_bytes(&self) -> usize {
+        self.session.pending_bytes()
+    }
+
+    /// 未 ACK 编辑条数。
+    pub fn pending_edits(&self) -> usize {
+        self.session.pending_len()
+    }
+
+    /// 最近一次 flush 写失败的可读原因（转发会话核的只读快照）。
+    ///
+    /// 不可恢复的失败（「需要重开文档」）优先，否则是最新一次普通写失败；`None` = 没失败。
+    /// UI 不必等 `pump` 或走外部提交闸门就能读到它。
+    #[must_use]
+    pub fn last_write_error(&self) -> Option<String> {
+        self.session.last_write_error()
+    }
+
+    /// 下一次固定窗口到期时刻（`None` 表示当前没有等待中的脏数据）。
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.dirty_since.map(|since| since + self.policy.interval)
+    }
+
+    /// 开始组合（透传会话闸门）。
+    pub fn begin_composition(&mut self) -> u32 {
+        self.session.begin_composition()
+    }
+
+    /// 结束组合：合并延后的远端导入；这些 op 已进 journal，需要计入 dirty。
+    pub fn end_composition(&mut self) -> Vec<LiveDelta> {
+        let deltas = self.session.end_composition();
+        if !deltas.is_empty() {
+            self.mark_dirty();
+        }
+        deltas
+    }
+
+    /// 背压导致延后队列没排空时，flush 之后再调一次。
+    pub fn merge_deferred_remote(&mut self) -> Vec<LiveDelta> {
+        let deltas = self.session.merge_deferred_remote();
+        if !deltas.is_empty() {
+            self.mark_dirty();
+        }
+        deltas
+    }
+
+    /// 是否正处于 composition。
+    pub fn is_composing(&self) -> bool {
+        self.session.is_composing()
+    }
+
+    /// 仍未合并的远端 update 条数。
+    pub fn deferred_remote_len(&self) -> usize {
+        self.session.deferred_remote_len()
+    }
+
+    /// 受理编辑；首次 dirty 记录窗口起点，达到 64 KiB 立即 flush。
+    pub fn apply(&mut self, request: EditRequest) -> EditOutcome {
+        let outcome = self.session.apply(request);
+        if matches!(outcome, EditOutcome::Applied(_)) {
+            self.mark_dirty();
+        }
+        outcome
+    }
+
+    /// 远端导入：同样计入 dirty（远端 op 也要落 durable）。
+    ///
+    /// **已 durable** 的外部增量不要走这里（见 [`Self::adopt_committed_delta`]）：
+    /// 这条路径会 journal 并产生出站意图。
+    pub fn apply_remote(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
+        let delta = self.session.apply_remote(update)?;
+        if delta.is_some() {
+            self.mark_dirty();
+        }
+        Ok(delta)
+    }
+
+    // ---- 外部提交闸门 / adopt（ADR 0009 切片 3b：只转发 3a 的存储层语义）----
+
+    /// Held 期间本地写入是否被冻结（= 外部提交闸门持有中）。
+    #[must_use]
+    pub fn is_external_commit_held(&self) -> bool {
+        self.session.is_external_commit_held()
+    }
+
+    /// 当前外部提交租约（`None` = 不在 Held）。
+    #[must_use]
+    pub fn external_commit_lease(&self) -> Option<&ExternalCommitLease> {
+        self.session.external_commit_lease()
+    }
+
+    /// 登记一次外部提交（只建立票据；重复 begin 由会话拒绝）。
+    pub fn begin_external_commit(&mut self) -> Result<ExternalCommitTicket, GateError> {
+        self.session.begin_external_commit()
+    }
+
+    /// 非阻塞推进闸门：`WaitingIME` → `Flushing` → `Held(lease)`。
+    ///
+    /// 进入 Held 时顺手把调度器自己的水位对齐：闸门的成立条件就是「目标已 durable 且
+    /// journal 空闲」，因此这里不再欠这次 flush（否则下一次 pump 会为已经不脏的数据
+    /// 再投一张空票据）。
+    pub fn poll_external_commit(&mut self, ticket: &ExternalCommitTicket) -> GateState {
+        let state = self.session.poll_external_commit(ticket);
+        if let GateState::Held(lease) = &state {
+            self.dirty_since = None;
+            self.flushed_live_rev = self.flushed_live_rev.max(lease.target_live_rev());
+        }
+        state
+    }
+
+    /// adopt 一份**已 durable** 的外部增量（必须 Held 且租约匹配）。
+    ///
+    /// 成功后把增量与 ACK 变成驱动事件（**先 Remote 再 Durable**），`pump` / `tick`
+    /// 立刻能取到；失败时 live 与 durable 水位都不变（3a 保证）。
+    pub fn adopt_committed_delta(
+        &mut self,
+        lease: &ExternalCommitLease,
+        prepared: PreparedCommittedDelta,
+    ) -> Result<AdoptOutcome, AdoptError> {
+        let outcome = self.session.adopt_committed_delta(lease, prepared)?;
+        // 不调用 `apply_remote`：这份 CRDT 已经 durable，再 journal 一次会重复写库 + 产生意图。
+        self.events
+            .push_back(DriverEvent::Remote(outcome.delta.clone()));
+        self.push_durable(outcome.ack.clone());
+        // adopt 要求 journal 空闲，因此"欠一次 flush"的水位到此为止。
+        self.dirty_since = None;
+        self.flushed_live_rev = self.flushed_live_rev.max(outcome.ack.through_live_rev);
+        Ok(outcome)
+    }
+
+    /// 结束外部提交并释放闸门（`applied` 必须就是库中当前 head）。
+    ///
+    /// 失败/取消路径下 3a 会把 Held 期间已 durable 的变化交付进 live 并作为
+    /// `SessionEvent::Remote` 入队，驱动会在下一次 `pump` 转发成 [`DriverEvent::Remote`]。
+    pub fn end_external_commit(
+        &mut self,
+        lease: ExternalCommitLease,
+        applied: AppliedHeads,
+    ) -> Result<(), GateError> {
+        self.session.end_external_commit(lease, applied)
+    }
+
+    /// 放弃一次外部提交（失败/取消），同样先交付已 durable 的变化。
+    ///
+    /// 返回的错误原样来自会话（例如仍 `pending` 时 [`GateError::Pending`]）；交付的增量
+    /// 会作为会话事件由下一次 `pump` 转发，这里不重复推送，避免同一份 delta 应用两次。
+    pub fn cancel_external_commit(
+        &mut self,
+        ticket: &ExternalCommitTicket,
+    ) -> Result<(), GateError> {
+        self.session.cancel_external_commit(ticket).map(|_| ())
+    }
+
+    /// **固定窗口**：只在首次 dirty 时记录起点，后续输入不重置。
+    fn mark_dirty(&mut self) {
+        if self.dirty_since.is_none() {
+            self.dirty_since = Some(self.clock.now());
+        }
+        if self.session.pending_bytes() >= self.policy.size_bytes
+            && self.session.live_rev() > self.flushed_live_rev
+        {
+            self.flush(FlushReason::Size);
+        }
+    }
+
+    /// 撤销（转发会话核的唯一 `UndoManager`）。
+    ///
+    /// dirty 规则与 [`SessionDriver::apply`] 对齐：
+    /// - `Ok(Some(Applied))` → `mark_dirty()`（撤销也是正文改动，必须落 durable）；
+    /// - `Ok(None)`（没有可撤销项）/ `Ok(Some(Rejected))` / `Stale`（不会出现）→ **不** dirty；
+    /// - `Err(PortError)` → 原样透传，不 dirty。
+    pub fn undo(&mut self) -> Result<Option<EditOutcome>, PortError> {
+        let outcome = self.session.undo()?;
+        if matches!(&outcome, Some(EditOutcome::Applied(_))) {
+            self.mark_dirty();
+        }
+        Ok(outcome)
+    }
+
+    /// 重做；dirty 规则同 [`SessionDriver::undo`]。
+    pub fn redo(&mut self) -> Result<Option<EditOutcome>, PortError> {
+        let outcome = self.session.redo()?;
+        if matches!(&outcome, Some(EditOutcome::Applied(_))) {
+            self.mark_dirty();
+        }
+        Ok(outcome)
+    }
+
+    /// 撤销/重做栈状态（真实计数来自 Loro `UndoManager`）。
+    pub fn history(&self) -> HistoryState {
+        self.session.history()
+    }
+
+    /// 手动/按原因 flush（同步返回票据，不等待 SQLite）。
+    pub fn flush(&mut self, reason: FlushReason) -> FlushTicket {
+        let ticket = self.session.flush(reason);
+        self.flushed_live_rev = ticket.target_live_rev;
+        self.dirty_since = None;
+        self.events
+            .push_back(DriverEvent::FlushScheduled { ticket, reason });
+        ticket
+    }
+
+    /// 推进到指定虚拟时刻（测试用于精确控制固定窗口）。
+    pub fn tick(&mut self, now: Duration) -> Vec<DriverEvent> {
+        self.advance_to(now);
+        self.collect_session_events();
+        self.collect_materialize_results();
+        self.drain_events()
+    }
+
+    /// 非阻塞泵：读 ticker、检查固定窗口、收 session/B 事件。
+    pub fn pump(&mut self) -> Vec<DriverEvent> {
+        self.take_ticks();
+        let now = self.clock.now();
+        self.advance_to(now);
+        self.collect_session_events();
+        self.collect_materialize_results();
+        self.drain_events()
+    }
+
+    fn take_ticks(&mut self) {
+        let Some(receiver) = self.tick_receiver.as_ref() else {
+            return;
+        };
+        // 只做「消化信号」：固定窗口是否到期由虚拟/墙钟时刻决定
+        while receiver.try_recv().is_ok() {}
+    }
+
+    fn advance_to(&mut self, now: Duration) {
+        if let Some(since) = self.dirty_since {
+            if now >= since + self.policy.interval {
+                self.flush(FlushReason::Interval);
+            }
+        }
+    }
+
+    fn collect_session_events(&mut self) {
+        for event in self.session.events() {
+            match event {
+                SessionEvent::Durable(ack) => self.push_durable(ack),
+                SessionEvent::Remote(delta) => self.events.push_back(DriverEvent::Remote(delta)),
+            }
+        }
+    }
+
+    /// 推入一条 `Durable` 事件，并按既有约定入队 B 物化。
+    ///
+    /// 两条来源共用：flush 线程的 ACK，以及 adopt 之后由外部提交推进的 head（3b）。
+    fn push_durable(&mut self, ack: DurableAck) {
+        // DurableAck 之后才入队 B（用 ACK 的固定 head_seq，不碰 live doc）。
+        self.enqueue_materialize(&ack);
+        self.events.push_back(DriverEvent::Durable(ack));
+    }
+
+    /// DurableAck 之后才入队 B（用 ACK 的固定 head_seq，不碰 live doc）。
+    fn enqueue_materialize(&mut self, ack: &DurableAck) {
+        if ack.head_seq == 0 {
+            return;
+        }
+        let doc_id = self.session.doc_id().to_owned();
+        // note_id 只是给事件用的提示；权威解析在 worker 运行期做
+        let note_hint = lookup_note_id(&self.vault, &doc_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.materializer.enqueue(MaterializeJob {
+            note_id: note_hint,
+            doc_id,
+            target_seq: ack.head_seq,
+        });
+    }
+
+    fn collect_materialize_results(&mut self) {
+        for outcome in self.materializer.take_results() {
+            self.events.push_back(DriverEvent::Materialized(outcome));
+        }
+        for (job, message) in self.materializer.take_errors() {
+            self.events.push_back(DriverEvent::MaterializeFailed {
+                note_id: job.note_id.clone(),
+                message,
+            });
+            self.failed_jobs.push(job);
+        }
+    }
+
+    fn drain_events(&mut self) -> Vec<DriverEvent> {
+        self.events.drain(..).collect()
+    }
+
+    /// 有界排空：flush(Close) → 等 durable → 等 B 完成。
+    ///
+    /// 调用方可以是 UI 线程（关闭窗口），但必须有界：`timeout` 到了就返回并置 `timed_out`。
+    pub fn close(&mut self, timeout: Duration) -> CloseReport {
+        let target = self.session.live_rev();
+        let needs_flush = self.session.pending_len() > 0 || target > self.flushed_live_rev;
+        if needs_flush {
+            self.flush(FlushReason::Close);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut durable: Option<DurableAck> = None;
+        let mut materialized = 0usize;
+
+        loop {
+            for event in self.pump() {
+                match event {
+                    DriverEvent::Durable(ack) if ack.through_live_rev >= target => {
+                        durable = Some(ack);
+                    }
+                    DriverEvent::Materialized(_) => materialized += 1,
+                    _ => {}
+                }
+            }
+
+            let durable_ok = durable.is_some() || !needs_flush;
+            let drained = durable_ok && self.materializer.pending() == 0;
+            if drained || Instant::now() >= deadline {
+                // 收尾：把最后一批 B 结果也计入
+                for event in self.pump() {
+                    if matches!(event, DriverEvent::Materialized(_)) {
+                        materialized += 1;
+                    }
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        CloseReport {
+            durable,
+            materialized,
+            pending_edits: self.session.pending_len(),
+            pending_materialize: self.materializer.pending(),
+            timed_out: self.session.pending_len() > 0 || self.materializer.pending() > 0,
+            // 关闭后会话可能被丢弃：没排空的原因必须随报告带走（不可恢复优先）。
+            flush_error: self.session.last_write_error(),
+        }
+    }
+
+    /// 显式同步物化（启动修复/测试用）：从固定 `target_seq` 走 CAS。
+    pub fn materialize_now(
+        &mut self,
+        note_id: &str,
+        doc_id: &str,
+        target_seq: u64,
+    ) -> Result<MaterializeOutcome, StorageError> {
+        materialize_body(&self.vault, note_id, doc_id, target_seq, self.peer_id)
+    }
+
+    /// 重新入队失败的 B 任务；返回重试条数。
+    pub fn retry_failed(&mut self) -> usize {
+        let jobs = std::mem::take(&mut self.failed_jobs);
+        let count = jobs.len();
+        for job in jobs {
+            self.materializer.enqueue(job);
+        }
+        count
+    }
+
+    /// 已 durable 的 head seq。
+    pub fn durable_head_seq(&self) -> u64 {
+        self.session.durable_head_seq()
+    }
+
+    /// 等待 B 队列排空（测试/关闭辅助），返回是否排空。
+    ///
+    /// **契约**：返回 `true` 时，worker 已完成的 B 结果都已经被搬进事件队列并取走，
+    /// 之后的 `pump()` 不会再冒出「上一次等待之前就该完成」的 `Materialized` 事件。
+    /// （worker 是「先 push 结果、再减 pending」，所以 pending 归零后再泵一次才能收干净。）
+    pub fn wait_materialize(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // 搬走已完成的结果/错误（本方法是等待辅助，事件直接丢弃）
+            for _ in self.pump() {}
+            if self.materializer.pending() == 0 {
+                // 收尾：把「pending 已减、结果刚入队」的那一批也搬走
+                for _ in self.pump() {}
+                return self.materializer.pending() == 0;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// worker 运行期：解析 note_id 后从固定 seq 物化。
+fn run_materialize(
+    vault: &Vault,
+    job: &MaterializeJob,
+    peer_id: u64,
+) -> Result<MaterializeOutcome, StorageError> {
+    let note_id = lookup_note_id(vault, &job.doc_id)?.ok_or_else(|| StorageError::Corrupt {
+        context: format!("找不到 body_doc_id={} 的笔记行，暂时无法物化", job.doc_id),
+    })?;
+    materialize_body(vault, &note_id, &job.doc_id, job.target_seq, peer_id)
+}
+
+/// `body_doc_id` → `note_id`（B 物化需要笔记行）。
+fn lookup_note_id(vault: &Vault, doc_id: &str) -> Result<Option<String>, StorageError> {
+    let rows = vault.query(
+        "SELECT note_id FROM notes WHERE body_doc_id = ?1 ORDER BY note_id LIMIT 1",
+        &[Value::Text(doc_id.to_owned())],
+    )?;
+    match rows.first().and_then(|row| row.first()) {
+        Some(Value::Text(note_id)) => Ok(Some(note_id.clone())),
         Some(Value::Null) | None => Ok(None),
         other => Err(StorageError::Corrupt {
-            context: format!("期望 BLOB/NULL，实际 {other:?}"),
+            context: format!("notes.note_id 读回异常：{other:?}"),
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use loro::VersionVector;
-
-    use super::*;
-    use crate::body_doc::BodyDoc;
-    use crate::remote_known;
-
-    /// 临时 vault：目录建在 `target/tmp` 下（AGENTS §6：不用 `%TEMP%`）。
-    ///
-    /// lib 单元测试拿不到 `CARGO_TARGET_TMPDIR`（只有集成测试有），所以从
-    /// `CARGO_MANIFEST_DIR` 拼出同一个位置。
-    fn fresh_vault(prefix: &str) -> (tempfile::TempDir, Vault) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/tmp")
-            .join(format!("store-origin-{prefix}"));
-        std::fs::create_dir_all(&root).expect("创建 target/tmp 下的测试根目录");
-        let dir = tempfile::Builder::new()
-            .prefix("vault-")
-            .tempdir_in(&root)
-            .expect("创建临时目录");
-        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
-        (dir, vault)
-    }
-
-    fn scalar_i64(vault: &Vault, sql: &str) -> i64 {
-        let rows = vault.query(sql, &[]).expect("查询");
-        match rows.first().and_then(|row| row.first()) {
-            Some(Value::Integer(value)) => *value,
-            other => panic!("期望整数结果，实际 {other:?}"),
-        }
-    }
-
-    fn local_update(doc: &BodyDoc, base: &VersionVector) -> PendingUpdate {
-        doc.pending_update(base).expect("导出增量")
-    }
-
-    /// `OriginMarks::AllLocal`（显式类型）不扩大远端已知 VV，也不产生 outbox。
-    #[test]
-    fn all_local_origin_does_not_extend_remote_known() {
-        let (_dir, vault) = fresh_vault("all-local");
-        create_body_doc(&vault, "doc-local").expect("loro_docs 行");
-        let doc = BodyDoc::create("doc-local", 0xA1).expect("创建 BodyDoc");
-        doc.insert_scalars(0, "local").expect("本地编辑");
-        let update = local_update(&doc, &VersionVector::default());
-
-        let head = append_updates_inner(
-            &vault,
-            "doc-local",
-            0,
-            &[UpdateRecord::new("b0", update)],
-            &[],
-            &[],
-            OriginMarks::AllLocal,
-        )
-        .expect("A 事务");
-
-        assert_eq!(head.head_seq, 1);
-        assert!(
-            remote_known::load(&vault, "doc-local")
-                .expect("读远端已知")
-                .is_none(),
-            "全部本地的批次绝不能创建/扩大远端已知 VV"
-        );
-        assert_eq!(
-            scalar_i64(&vault, "SELECT count(*) FROM sync_outbox"),
-            0,
-            "slots 空 = 本批没有任何出站意图"
-        );
-    }
-
-    /// `PerRecord` 混排：只有 remote 条目的 `after - running` 记入远端已知 VV。
-    #[test]
-    fn per_record_origin_only_extends_for_remote_records() {
-        let (_dir, vault) = fresh_vault("mixed");
-        create_body_doc(&vault, "doc-mixed").expect("loro_docs 行");
-
-        let doc = BodyDoc::create("doc-mixed", 0xA1).expect("创建 BodyDoc");
-        doc.insert_scalars(0, "local").expect("本地编辑");
-        let local = local_update(&doc, &VersionVector::default());
-        let remote_doc = BodyDoc::create("doc-mixed", 0xB2).expect("创建 BodyDoc");
-        remote_doc.insert_scalars(0, "remote").expect("远端编辑");
-        doc.import(&remote_doc.export_all_updates().expect("远端 update"))
-            .expect("本地副本导入远端");
-        let local_end = VersionVector::decode(&local.end_vv).expect("本地 VV");
-        let remote = local_update(&doc, &local_end);
-        let remote_end = VersionVector::decode(&remote.end_vv).expect("远端 VV");
-        let expected = remote_known::added_since(&remote_end, &local_end);
-
-        let head = append_updates_inner(
-            &vault,
-            "doc-mixed",
-            0,
-            &[
-                UpdateRecord::new("b0", local),
-                UpdateRecord::new("b1", remote),
-            ],
-            &[],
-            &[],
-            OriginMarks::PerRecord(&[false, true]),
-        )
-        .expect("A 事务");
-
-        assert_eq!(head.head_seq, 2, "两条记录都必须落库");
-        let known = remote_known::load(&vault, "doc-mixed")
-            .expect("读远端已知")
-            .expect("有 remote 条目就必须写 meta");
-        assert_eq!(
-            known, expected,
-            "远端条目带来的 ops 必须记入，且只记入远端那一小段"
-        );
-        assert_eq!(
-            known.get(&0xA1).copied().unwrap_or(0),
-            0,
-            "本地条目（哪怕同批先落库）绝不能记入远端已知 VV"
-        );
-        assert_eq!(
-            scalar_i64(&vault, "SELECT count(*) FROM sync_outbox"),
-            0,
-            "没有传 slots 就不得写出站意图"
-        );
-    }
-
-    /// 空 `PerRecord` 不再表示「全部本地」：长度不匹配直接拒绝，且不写任何行。
-    #[test]
-    fn per_record_origin_length_mismatch_is_rejected() {
-        let (_dir, vault) = fresh_vault("mismatch");
-        create_body_doc(&vault, "doc-mismatch").expect("loro_docs 行");
-        let doc = BodyDoc::create("doc-mismatch", 0xA1).expect("创建 BodyDoc");
-        doc.insert_scalars(0, "x").expect("编辑");
-        let update = local_update(&doc, &VersionVector::default());
-        let record = UpdateRecord::new("b0", update);
-
-        let error = append_updates_inner(
-            &vault,
-            "doc-mismatch",
-            0,
-            std::slice::from_ref(&record),
-            &[],
-            &[],
-            OriginMarks::PerRecord(&[]),
-        )
-        .expect_err("空 PerRecord 配非空 records 必须报错");
-        assert!(
-            matches!(error, StorageError::Corrupt { .. }),
-            "必须是显式损坏/参数错误，实际 {error:?}"
-        );
-        assert_eq!(
-            scalar_i64(&vault, "SELECT count(*) FROM loro_updates"),
-            0,
-            "参数错误不得留下半写"
-        );
-
-        let error = append_updates_inner(
-            &vault,
-            "doc-mismatch",
-            0,
-            &[record],
-            &[],
-            &[],
-            OriginMarks::PerRecord(&[true, false]),
-        )
-        .expect_err("标记多于 records 也必须报错");
-        assert!(matches!(error, StorageError::Corrupt { .. }));
-    }
-
-    /// 值 CAS 不命中（并发写者改了 meta）→ 有界重试后返回明确 SyncConflict，
-    /// 整笔 A 事务回滚：head/update/outbox/meta 都不留半写，也绝不写入更小值。
-    ///
-    /// 注入方式：`loro_updates` 的 BEFORE INSERT 触发器在**同一事务里**把 meta 改成
-    /// 别的值（模拟「读旧值之后、CAS 之前的并发提交」）；每次重试都会再次命中，
-    /// 因此有界重试必然耗尽。
-    #[test]
-    fn stale_remote_known_cas_fails_closed_and_rolls_back() {
-        let (_dir, vault) = fresh_vault("cas");
-        create_body_doc(&vault, "doc-cas").expect("loro_docs 行");
-        let remote_doc = BodyDoc::create("doc-cas", 0xB2).expect("创建 BodyDoc");
-        remote_doc.insert_scalars(0, "remote").expect("远端编辑");
-        let update = local_update(&remote_doc, &VersionVector::default());
-        vault
-            .exec(
-                "CREATE TRIGGER remote_known_race BEFORE INSERT ON loro_updates BEGIN \
-                   INSERT OR REPLACE INTO meta(key,value) \
-                   VALUES('sync.remote_known_vv.doc-cas', X'DEADBEEF'); \
-                 END;",
-                &[],
-            )
-            .expect("安装竞态触发器");
-
-        let error = append_updates_inner(
-            &vault,
-            "doc-cas",
-            0,
-            &[UpdateRecord::new("b0", update)],
-            &[],
-            &[],
-            OriginMarks::PerRecord(&[true]),
-        )
-        .expect_err("CAS 必须失败");
-
-        match error {
-            StorageError::SyncConflict { context } => {
-                assert!(
-                    context.contains("远端已知 VV"),
-                    "错误必须点明远端已知 VV CAS：{context}"
-                );
-                assert!(context.contains("可重试"), "错误必须说明可重试：{context}");
-            }
-            other => panic!("期望 SyncConflict，实际 {other:?}"),
-        }
-        assert_eq!(load_head(&vault, "doc-cas").expect("head").head_seq, 0);
-        assert_eq!(
-            scalar_i64(&vault, "SELECT count(*) FROM loro_updates"),
-            0,
-            "整笔回滚：update 不得落库"
-        );
-        assert_eq!(
-            scalar_i64(&vault, "SELECT count(*) FROM projection_outbox"),
-            0
-        );
-        assert_eq!(
-            scalar_i64(
-                &vault,
-                "SELECT count(*) FROM meta WHERE key='sync.remote_known_vv.doc-cas'"
-            ),
-            0,
-            "触发器写入随整笔回滚，失败后不残留"
-        );
-        assert!(
-            remote_known::load(&vault, "doc-cas")
-                .expect("读远端已知")
-                .is_none(),
-            "失败路径绝不能写入更小/错误的值"
-        );
     }
 }
 
@@ -6515,8 +7267,9 @@ mod support;
 use std::time::{Duration, Instant};
 
 use menghunote_storage::session::{
-    DocumentSession, EditOutcome, EditRequest, ExternalCommitTicket, FlushReason, GateError,
-    GateState, LiveRev, ScalarEdit, SessionEpoch, SessionEvent, SessionOptions,
+    DocumentSession, DriverOptions, EditOutcome, EditRequest, ExternalCommitTicket, FlushReason,
+    GateError, GateState, LiveRev, ManualClock, ScalarEdit, SessionDriver, SessionEpoch,
+    SessionEvent, SessionOptions,
 };
 use menghunote_storage::{
     append_updates, load_body_doc, load_body_state, materialize_body, BodyDoc, UpdateRecord, Value,
@@ -6933,6 +7686,26 @@ fn flush_reports_unrecoverable_after_bounded_rebuild() {
         "本地",
         "live 保持会话内容，靠关闭并重开文档与库对账"
     );
+
+    // P1：不可恢复原因必须能被会话**直接**读到（UI/驱动不必先走外部提交闸门），
+    // 且与闸门看到的是同一个字符串；反复读取与再次 flush 都不得改变它。
+    let direct = session
+        .last_write_error()
+        .expect("不可恢复失败必须能从会话读到");
+    assert_eq!(direct, message, "会话与闸门必须看到同一个失败原因");
+    assert!(
+        direct.contains("需要重开文档"),
+        "会话读到的原因必须可执行：{direct}"
+    );
+    for _ in 0..3 {
+        session.flush(FlushReason::Manual);
+        assert_eq!(
+            session.last_write_error().as_deref(),
+            Some(message.as_str()),
+            "多次读取/再次 flush 不得改变不可恢复原因"
+        );
+    }
+    assert_eq!(session.pending_len(), 1, "读取失败原因不得动 journal");
 }
 
 /// P1-3 的另一个不可恢复分支：自动重建要读新 head，读不到/解码失败同样必须 fail-closed
@@ -6981,6 +7754,113 @@ fn flush_reports_unrecoverable_when_new_head_is_unreadable() {
         ),
         1,
         "拒绝重建后不得写旧前缀"
+    );
+}
+
+/// 打开一个不启 ticker 的驱动（假时钟）：失败路径的收敛只靠显式 `poll`，不靠真睡。
+fn open_test_driver(vault: &Vault) -> SessionDriver {
+    SessionDriver::open_with_clock(
+        vault,
+        "doc-1",
+        DriverOptions {
+            session: options(PEER_A),
+            auto_tick: false,
+            ..DriverOptions::default()
+        },
+        Box::new(ManualClock::new()),
+    )
+    .expect("打开驱动")
+}
+
+/// 把驱动推进到「不可恢复 flush 失败」，返回闸门读到的失败原因。
+///
+/// 构造方式与 [`flush_reports_unrecoverable_after_bounded_rebuild`] 相同：外部 writer 写入
+/// 本会话 live 未知的并发 ops，自动重建必须拒绝。
+fn drive_driver_to_unrecoverable(driver: &mut SessionDriver, vault: &Vault) -> String {
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "本地")]));
+
+    let external = BodyDoc::create("doc-1", PEER_B).expect("外部副本");
+    external.insert_scalars(0, "远端").expect("外部编辑");
+    let external_update = pending(&external, &loro::VersionVector::default()).expect("外部增量");
+    append_updates(
+        vault,
+        "doc-1",
+        0,
+        &[UpdateRecord::new("external-1", external_update)],
+    )
+    .expect("外部推进 head");
+
+    let ticket = driver.begin_external_commit().expect("begin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match driver.poll_external_commit(&ticket) {
+            GateState::Failed(GateError::FlushFailed { message, .. }) => return message,
+            GateState::Flushing | GateState::WaitingIME => std::thread::yield_now(),
+            other => panic!("闸门没有给出明确失败：{other:?}"),
+        }
+        assert!(Instant::now() < deadline, "闸门 10s 内没有给出明确失败");
+    }
+}
+
+/// P1：不可恢复的 flush 失败必须能通过 `SessionDriver::last_write_error` 直接读到
+/// （UI 不必先走外部提交闸门），并且没有失败时是 `None`。
+#[test]
+fn driver_forwards_unrecoverable_flush_error() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let mut driver = open_test_driver(&vault);
+    assert_eq!(
+        driver.last_write_error(),
+        None,
+        "没有失败时驱动必须返回 None"
+    );
+
+    let message = drive_driver_to_unrecoverable(&mut driver, &vault);
+    let forwarded = driver
+        .last_write_error()
+        .expect("驱动必须转发不可恢复的失败原因");
+    assert_eq!(forwarded, message, "驱动与闸门必须看到同一个原因");
+    assert!(
+        forwarded.contains("需要重开文档"),
+        "驱动读到的原因必须可执行：{forwarded}"
+    );
+    assert_eq!(
+        driver.last_write_error().as_deref(),
+        Some(forwarded.as_str()),
+        "多次读取必须稳定"
+    );
+}
+
+/// P1：`CloseReport.flush_error` 必须带出没排空的原因；报告拿到之后驱动仍可读同一个值。
+#[test]
+fn close_report_surfaces_unrecoverable_flush_error() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let mut driver = open_test_driver(&vault);
+    let message = drive_driver_to_unrecoverable(&mut driver, &vault);
+
+    // 不可恢复时 `close` 必然排不空：timeout 0 也必须立刻返回（不挂住 UI）。
+    let report = driver.close(Duration::ZERO);
+    let close_error = report
+        .flush_error
+        .clone()
+        .expect("CloseReport 必须带出 flush 失败原因");
+    assert_eq!(close_error, message, "关闭报告与闸门必须一致");
+    assert!(
+        close_error.contains("需要重开文档"),
+        "CloseReport 的原因必须可执行：{close_error}"
+    );
+    assert!(report.timed_out, "不可恢复时关闭必然超时：{report:?}");
+    assert_eq!(report.pending_edits, 1, "未 ACK 条目必须原样保留");
+    assert!(
+        report.durable.is_none(),
+        "不可恢复后不得再发出 DurableAck：{report:?}"
+    );
+    // 报告拿走后驱动仍在：同一个原因必须还能读到。
+    assert_eq!(
+        driver.last_write_error(),
+        Some(close_error),
+        "关闭报告产生后原因仍须可读"
     );
 }
 
@@ -44413,6 +45293,1121 @@ mod tests {
 `````
 
 
+@@SECTION `crates/storage/src/store.rs`
+
+`````rust
+//! `loro_docs` / `loro_updates` 的读写与 A 事务。
+//!
+//! A 事务（ADR 0001 §3.4）在一次 SQLite 事务里完成三件事：
+//!
+//! 1. 逐个 append `loro_updates`（seq 连续，`update_id` 唯一）；
+//! 2. 以 CAS 方式推进 `loro_docs.head_seq / head_frontier / head_vv`；
+//! 3. 写 `projection_outbox.target_seq`（提醒 B 物化器）。
+//!
+//! CAS 用「该语句必须影响 1 行」的事务守卫实现：一旦 head 已被别人推进，
+//! 整笔事务回滚，**不会出现「update 落库了但 head 没动」的半截状态**。
+
+use loro::{Frontiers, VersionVector};
+use rusqlite::types::Value;
+
+use crate::actor::{AffectedGuard, Statement};
+use crate::body_doc::{BodyDoc, PendingUpdate, APP_DOC_SCHEMA, CODEC_VERSION, MIN_READER};
+use crate::error::StorageError;
+use crate::Vault;
+
+/// 文档在 `loro_docs` 里的权威行摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadState {
+    /// 文档 ID。
+    pub doc_id: String,
+    /// 已持久化的最后一个 batch seq（0 表示还没有任何 update）。
+    pub head_seq: u64,
+    /// 已持久化的 frontier（`Frontiers::encode`）。
+    pub head_frontier: Vec<u8>,
+    /// 已持久化的 VV（`VersionVector::encode`）。
+    pub head_vv: Vec<u8>,
+}
+
+impl HeadState {
+    /// 解码 frontier。
+    pub fn frontiers(&self) -> Result<Frontiers, StorageError> {
+        if self.head_frontier.is_empty() {
+            return Ok(Frontiers::default());
+        }
+        Frontiers::decode(&self.head_frontier).map_err(StorageError::from)
+    }
+
+    /// 解码 VV。全新的文档 `head_vv` 是 NULL/空，等价于空版本向量。
+    pub fn version_vector(&self) -> Result<loro::VersionVector, StorageError> {
+        if self.head_vv.is_empty() {
+            return Ok(loro::VersionVector::default());
+        }
+        loro::VersionVector::decode(&self.head_vv).map_err(StorageError::from)
+    }
+}
+
+/// `loro_docs` 的一行（含快照）。
+struct StoredDoc {
+    snapshot: Option<Vec<u8>>,
+    snapshot_seq: u64,
+    head: HeadState,
+}
+
+/// 新建一个正文文档行（`kind = 'body'`）。
+pub fn create_body_doc(vault: &Vault, doc_id: &str) -> Result<(), StorageError> {
+    vault.exec(
+        "INSERT INTO loro_docs(doc_id, kind, generation, app_doc_schema, codec_version, min_reader) \
+         VALUES(?1, 'body', 1, ?2, ?3, ?4)",
+        &[
+            Value::Text(doc_id.to_owned()),
+            Value::Integer(APP_DOC_SCHEMA),
+            Value::Text(CODEC_VERSION.to_owned()),
+            Value::Integer(MIN_READER),
+        ],
+    )?;
+    Ok(())
+}
+
+/// 为一篇笔记准备好投影行，关联它的正文文档。
+///
+/// 注意：`notes` 是**投影**（ADR 0001 §3.1），最终由结构 CRDT 的投影器写入；
+/// 本函数只是 S0 阶段的脚手架，让两阶段物化有落点，后续切片会由投影器接管。
+pub fn create_note_slot(
+    vault: &Vault,
+    note_id: &str,
+    body_doc_id: &str,
+    title: &str,
+    created_at: i64,
+) -> Result<(), StorageError> {
+    vault.exec(
+        "INSERT INTO notes(note_id, body_doc_id, title, created_at, updated_at, deleted, is_favorite, is_pinned) \
+         VALUES(?1, ?2, ?3, ?4, ?4, 0, 0, 0)",
+        &[
+            Value::Text(note_id.to_owned()),
+            Value::Text(body_doc_id.to_owned()),
+            Value::Text(title.to_owned()),
+            Value::Integer(created_at),
+        ],
+    )?;
+    Ok(())
+}
+
+/// 读 `loro_docs` 的 head 三件套；行不存在时报 [`StorageError::Corrupt`]。
+pub fn load_head(vault: &Vault, doc_id: &str) -> Result<HeadState, StorageError> {
+    let rows = vault.query(
+        "SELECT head_seq, head_frontier, head_vv FROM loro_docs WHERE doc_id = ?1",
+        &[Value::Text(doc_id.to_owned())],
+    )?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("loro_docs 缺少文档 {doc_id}"),
+        })?;
+
+    Ok(HeadState {
+        doc_id: doc_id.to_owned(),
+        head_seq: u64_of(&row, 0, "loro_docs.head_seq")?,
+        head_frontier: blob_of(&row, 1, "loro_docs.head_frontier")?,
+        head_vv: blob_of(&row, 2, "loro_docs.head_vv")?,
+    })
+}
+
+/// 读 `loro_docs.head_seq` 仍等于 `expected_head_seq` 时的 `head_vv`（远端已知 VV 的起点）。
+///
+/// 若 head 已被并发推进（CAS 必然失败、整笔事务回滚），返回空 VV 即可：它不会落库。
+fn load_head_vv_at(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+) -> Result<VersionVector, StorageError> {
+    let rows = vault.query(
+        "SELECT head_seq, head_vv FROM loro_docs WHERE doc_id = ?1",
+        &[Value::Text(doc_id.to_owned())],
+    )?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("loro_docs 缺少文档 {doc_id}"),
+        })?;
+    if u64_of(&row, 0, "loro_docs.head_seq")? != expected_head_seq {
+        return Ok(VersionVector::default());
+    }
+    match row.get(1) {
+        Some(Value::Null) | None => Ok(VersionVector::default()),
+        Some(Value::Blob(bytes)) => VersionVector::decode(bytes).map_err(StorageError::from),
+        Some(other) => Err(StorageError::Corrupt {
+            context: format!("loro_docs.head_vv 读回异常：{other:?}"),
+        }),
+    }
+}
+
+/// 读文档行 + 快照元信息。
+fn load_stored(vault: &Vault, doc_id: &str) -> Result<StoredDoc, StorageError> {
+    let rows = vault.query(
+        "SELECT snapshot, snapshot_seq, head_seq, head_frontier, head_vv FROM loro_docs WHERE doc_id = ?1",
+        &[Value::Text(doc_id.to_owned())],
+    )?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("loro_docs 缺少文档 {doc_id}"),
+        })?;
+
+    Ok(StoredDoc {
+        snapshot: optional_blob(&row, 0)?,
+        snapshot_seq: u64_of(&row, 1, "loro_docs.snapshot_seq")?,
+        head: HeadState {
+            doc_id: doc_id.to_owned(),
+            head_seq: u64_of(&row, 2, "loro_docs.head_seq")?,
+            head_frontier: blob_of(&row, 3, "loro_docs.head_frontier")?,
+            head_vv: blob_of(&row, 4, "loro_docs.head_vv")?,
+        },
+    })
+}
+
+/// 库里的 frontier 可能是 NULL（从未提交），语义等价于空 frontier。
+///
+/// 注意：`Frontiers::default().encode()` **不是**空字节，所以不能直接比较原始 bytes。
+pub(crate) fn encoded_frontier(head: &HeadState) -> Vec<u8> {
+    if head.head_frontier.is_empty() {
+        Frontiers::default().encode()
+    } else {
+        head.head_frontier.clone()
+    }
+}
+
+/// 重放所需材料：快照 + 后续 update payload + 目标 head。
+pub(crate) struct ReplayParts {
+    pub(crate) snapshot: Option<Vec<u8>>,
+    pub(crate) payloads: Vec<Vec<u8>>,
+    pub(crate) head: HeadState,
+}
+
+/// 读取重放材料（快照 + 连续 update 前缀），并校验 seq 连续、不越过快照边界。
+///
+/// `up_to_seq = Some(n)` 只重放到第 n 个 batch（固定 frontier）；`None` 重放到 head。
+pub(crate) fn load_replay_parts(
+    vault: &Vault,
+    doc_id: &str,
+    up_to_seq: Option<u64>,
+) -> Result<ReplayParts, StorageError> {
+    let stored = load_stored(vault, doc_id)?;
+    let limit = match up_to_seq {
+        Some(seq) => {
+            if seq > stored.head.head_seq {
+                return Err(StorageError::Corrupt {
+                    context: format!(
+                        "请求重放到 seq {seq}，但 {doc_id} 的 head_seq 只有 {}",
+                        stored.head.head_seq
+                    ),
+                });
+            }
+            seq
+        }
+        None => stored.head.head_seq,
+    };
+    if limit < stored.snapshot_seq {
+        return Err(StorageError::Corrupt {
+            context: format!(
+                "请求重放到 seq {limit}，但快照已经覆盖到 seq {}；不能倒着物化",
+                stored.snapshot_seq
+            ),
+        });
+    }
+
+    let rows = vault.query(
+        "SELECT seq, payload FROM loro_updates WHERE doc_id = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq",
+        &[
+            Value::Text(doc_id.to_owned()),
+            Value::Integer(i64_of(stored.snapshot_seq)?),
+            Value::Integer(i64_of(limit)?),
+        ],
+    )?;
+
+    let mut payloads = Vec::with_capacity(rows.len());
+    for (expected_seq, row) in (stored.snapshot_seq + 1..).zip(rows.iter()) {
+        let seq = u64_of(row, 0, "loro_updates.seq")?;
+        if seq != expected_seq {
+            return Err(StorageError::Corrupt {
+                context: format!(
+                    "{doc_id} 的 loro_updates 出现断档：期望 seq {expected_seq}，实际 {seq}"
+                ),
+            });
+        }
+        payloads.push(blob_of(row, 1, "loro_updates.payload")?);
+    }
+
+    let snapshot = if stored.snapshot_seq == 0 {
+        None
+    } else {
+        stored.snapshot.clone()
+    };
+
+    let mut head = stored.head;
+    if let Some(limit) = up_to_seq {
+        head = HeadState {
+            doc_id: doc_id.to_owned(),
+            head_seq: limit,
+            head_frontier: end_frontier_at(vault, doc_id, limit)?,
+            head_vv: end_vv_at(vault, doc_id, limit)?,
+        };
+    }
+
+    Ok(ReplayParts {
+        snapshot,
+        payloads,
+        head,
+    })
+}
+
+/// 从库里重放出一个 [`BodyDoc`]。
+///
+/// `up_to_seq = Some(n)` 时只重放到第 n 个 batch，用于**固定 frontier** 的 B 物化；
+/// `None` 表示重放到当前 head，并在结尾校验 frontier 与库中记录一致（不一致说明数据损坏）。
+pub fn load_body_doc(
+    vault: &Vault,
+    doc_id: &str,
+    peer_id: u64,
+    up_to_seq: Option<u64>,
+) -> Result<(BodyDoc, HeadState), StorageError> {
+    let parts = load_replay_parts(vault, doc_id, up_to_seq)?;
+    let doc = BodyDoc::restore(doc_id, peer_id, parts.snapshot.as_deref(), &parts.payloads)?;
+
+    if up_to_seq.is_none() {
+        // 启动校验：重放结果必须与库中 head_frontier 一致，否则视为损坏（不回写、不猜）
+        let replayed = doc.frontiers().encode();
+        let expected = encoded_frontier(&parts.head);
+        if replayed != expected {
+            return Err(StorageError::Corrupt {
+                context: format!(
+                    "重放 {doc_id} 得到的 frontier 与 loro_docs.head_frontier 不一致（len {} vs {}）",
+                    replayed.len(),
+                    expected.len()
+                ),
+            });
+        }
+    }
+
+    Ok((doc, parts.head))
+}
+
+/// 读某个 batch 落库时的 `end_vv`。
+pub fn end_vv_at(vault: &Vault, doc_id: &str, seq: u64) -> Result<Vec<u8>, StorageError> {
+    let rows = vault.query(
+        "SELECT end_vv FROM loro_updates WHERE doc_id = ?1 AND seq = ?2",
+        &[Value::Text(doc_id.to_owned()), Value::Integer(i64_of(seq)?)],
+    )?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("{doc_id} 缺少 seq {seq} 的 loro_updates 行"),
+        })?;
+    blob_of(&row, 0, "loro_updates.end_vv")
+}
+
+/// 读某个 batch 落库时的 `end_frontier`（B 物化的固定 frontier）。
+pub fn end_frontier_at(vault: &Vault, doc_id: &str, seq: u64) -> Result<Vec<u8>, StorageError> {
+    let rows = vault.query(
+        "SELECT end_frontier FROM loro_updates WHERE doc_id = ?1 AND seq = ?2",
+        &[Value::Text(doc_id.to_owned()), Value::Integer(i64_of(seq)?)],
+    )?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("{doc_id} 缺少 seq {seq} 的 loro_updates 行"),
+        })?;
+    blob_of(&row, 0, "loro_updates.end_frontier")
+}
+
+/// A 事务里要写入的一条 update（带它自己的 `batch_id`）。
+///
+/// 一次 flush 的连续前缀可能来自不同逻辑批次（例如慢盘合并了两次提交），
+/// 所以 `batch_id` 是**逐行**的，不能整批共用一个。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateRecord {
+    /// 该 update 所属的逻辑批次。
+    pub batch_id: String,
+    /// 增量内容。
+    pub update: PendingUpdate,
+}
+
+impl UpdateRecord {
+    /// 构造一条记录。
+    pub fn new(batch_id: impl Into<String>, update: PendingUpdate) -> Self {
+        Self {
+            batch_id: batch_id.into(),
+            update,
+        }
+    }
+}
+
+/// 把一份快照落库，记录它覆盖到的 seq 与 frontier。
+///
+/// 本切片只提供落库与「snapshot + 后续 update」重放路径；快照的生成节奏与旧 update 的
+/// 真正 GC（ADR 0001 §3.5）留给后续切片。快照不能倒退覆盖更早的 seq。
+pub fn store_snapshot(
+    vault: &Vault,
+    doc_id: &str,
+    seq: u64,
+    frontier: &[u8],
+    snapshot: &[u8],
+) -> Result<(), StorageError> {
+    if seq == 0 || seq > load_head(vault, doc_id)?.head_seq {
+        return Err(StorageError::Corrupt {
+            context: format!("快照 seq {seq} 不在 (0, head] 区间内"),
+        });
+    }
+    let affected = vault.exec(
+        "UPDATE loro_docs SET snapshot = ?2, snapshot_seq = ?3, snapshot_frontier = ?4 \
+         WHERE doc_id = ?1 AND snapshot_seq <= ?3",
+        &[
+            Value::Text(doc_id.to_owned()),
+            Value::Blob(snapshot.to_vec()),
+            Value::Integer(i64_of(seq)?),
+            Value::Blob(frontier.to_vec()),
+        ],
+    )?;
+    if affected != 1 {
+        return Err(StorageError::Corrupt {
+            context: format!("{doc_id} 的快照 seq 倒退，拒绝覆盖"),
+        });
+    }
+    Ok(())
+}
+
+/// A 事务：追加一批 update + 推进 head + 写 projection_outbox。
+///
+/// `expected_head_seq` 是调用方看到的 head（CAS 基准）；不匹配时整笔回滚并返回
+/// [`StorageError::HeadConflict`]，绝不覆盖别人的新结果。
+pub fn append_updates(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[UpdateRecord],
+) -> Result<HeadState, StorageError> {
+    append_updates_inner(
+        vault,
+        doc_id,
+        expected_head_seq,
+        records,
+        &[],
+        &[],
+        OriginMarks::AllLocal,
+    )
+}
+
+/// A 事务：追加**一条**组合 update，并把同一批 remote inbox 行标为 `integrated`。
+///
+/// Phase 1A-2 的聚合 integrate 入口：同一文档的多条 inbox 行先在内存里逐条
+/// `BodyDoc::import`，再把 `before..end` 的增量合成**一条** `UpdateRecord` 落盘；
+/// 「追加 update + 推进 head + projection_outbox + 标记 inbox 行」全部在**同一个**
+/// A 事务里（守卫要求每条 `UPDATE sync_inbox` 恰好影响 1 行，任何一行不存在/已不是
+/// `verified` 都会整笔回滚，不会出现「update 写了但 inbox 没标」的半份状态）。
+///
+/// 与 [`append_updates`] 的差别只有同事务的批量标记：
+/// - `relay_seqs` 为空时行为与 [`append_updates`] 逐字节一致（仍然只有一条记录）；
+/// - 本函数**不推进** `sync.integrated_seq`；调用方在整批正文都完成后统一调用
+///   [`crate::advance_integrated_prefix`]，避免每个 doc 组各写一次前缀；
+/// - 校验失败映射：head CAS 失败仍是 [`StorageError::HeadConflict`]；inbox 标记失败
+///   （行不存在 / 已 integrated / 已 quarantine）映射为 [`StorageError::SyncConflict`]，
+///   两种情况下 update 都没有落库；
+/// - 同事务把 `end_vv - 旧 head_vv`（= 这条远端消息实际带来的 ops）并入本机的
+///   「远端已知 VV」（`sync.remote_known_vv.<doc_id>`，non-destructive meta），
+///   供 `baseline_apply` 的 tombstone 判定区分已同步文档与 local-only 文档。
+pub fn append_updates_with_integrated_marks(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    record: &UpdateRecord,
+    log_id: &[u8; 16],
+    relay_seqs: &[u64],
+) -> Result<HeadState, StorageError> {
+    let marks: Vec<(&[u8; 16], u64)> = relay_seqs
+        .iter()
+        .map(|relay_seq| (log_id, *relay_seq))
+        .collect();
+    append_updates_inner(
+        vault,
+        doc_id,
+        expected_head_seq,
+        std::slice::from_ref(record),
+        &[],
+        &marks,
+        // engine integrate 的这条组合 update 全部来自远端消息：其 `end_vv - 旧 head_vv`
+        // 就是远端实际带来的 ops，记入「远端已知 VV」（tombstone 判定用）。
+        OriginMarks::PerRecord(&[true]),
+    )
+}
+
+/// 一次 A 事务里每条 update 的**来源标记**。
+///
+/// 这是 P2-8 修掉的类型陷阱：旧接口用 `&[bool]` 表示来源，**空切片 = 全部本地**；
+/// 而同一次调用的 `slots` 也是切片，**空切片 = 没有任何出站意图**。两个空切片含义
+/// 相反、类型相同，调用点很容易把「没有意图」写成「全部本地」或反之。这里把来源标记
+/// 收成枚举，让「空」不再是两种含义：
+///
+/// - [`OriginMarks::AllLocal`]：本批记录全部是本地写入，**不**扩大远端已知 VV；
+/// - [`OriginMarks::PerRecord`]：与 `records` **一一对应**（长度不匹配直接报
+///   [`StorageError::Corrupt`]），`true` = 该条来自远端消息，其
+///   `end_vv - 前一条 end_vv` 并入「远端已知 VV」。
+///
+/// 本地写入即使已经 ACK 也不会扩大远端已知 VV（tombstone 判定只允许更保守）。
+#[derive(Debug, Clone, Copy)]
+pub enum OriginMarks<'a> {
+    /// 全部记录都是本地写入。
+    AllLocal,
+    /// 逐条标记（必须与 records 等长）。
+    PerRecord(&'a [bool]),
+}
+
+impl<'a> OriginMarks<'a> {
+    /// 本批是否有远端条目。
+    fn any_remote(self) -> bool {
+        match self {
+            Self::AllLocal => false,
+            Self::PerRecord(marks) => marks.iter().any(|flag| *flag),
+        }
+    }
+
+    /// 第 `index` 条是否来自远端（`AllLocal` 恒为 false）。
+    fn is_remote(self, index: usize) -> bool {
+        match self {
+            Self::AllLocal => false,
+            Self::PerRecord(marks) => marks.get(index).copied().unwrap_or(false),
+        }
+    }
+
+    /// 校验来源标记与 records 的对应关系。
+    ///
+    /// `AllLocal` 不需要长度；`PerRecord` 必须与 records 等长——**空 records 配非空
+    /// marks、或 records 配空 marks 都会在这里被拒绝**，不会退化成「全部本地」。
+    fn validate(self, records_len: usize) -> Result<(), StorageError> {
+        if let Self::PerRecord(marks) = self {
+            if marks.len() != records_len {
+                return Err(StorageError::Corrupt {
+                    context: format!(
+                        "append_updates: records={records_len} \
+                         OriginMarks::PerRecord={} 必须一对一",
+                        marks.len()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A 事务内同时写出站同步意图（按位置一一对应；`None` = 该条不产生意图）。
+///
+/// 与 [`append_updates_with_sync_intents`] 相比，这里允许"某些 update 没有意图"：
+/// 一次 flush 的前缀可能混本地编辑与 remote 导入，而 remote 导入**绝不能**产生
+/// 出站意图（ADR 0009）。仍然只有**一条** A 事务，失败即整笔回滚。
+///
+/// 参数语义（P2-8 钉死）：
+/// - `slots` 空 = 本批**没有任何**出站意图（不是"每条都要一条意图"）；`None` 位 = 该条
+///   不产生意图；
+/// - `origin` 见 [`OriginMarks`]：只有远端条目会扩大远端已知 VV，本地条目永远不扩大。
+pub(crate) fn append_updates_with_intent_slots(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[UpdateRecord],
+    slots: &[Option<crate::sync_bridge::SyncIntent>],
+    origin: OriginMarks<'_>,
+) -> Result<HeadState, StorageError> {
+    append_updates_inner(
+        vault,
+        doc_id,
+        expected_head_seq,
+        records,
+        slots,
+        &[],
+        origin,
+    )
+}
+
+/// 同事务附加的 inbox 标记：`(log_id, relay_seq)`，每个都要求恰好命中一行 `verified`。
+type IntegratedMarks<'a> = &'a [(&'a [u8; 16], u64)];
+
+fn append_updates_inner(
+    vault: &Vault,
+    doc_id: &str,
+    expected_head_seq: u64,
+    records: &[UpdateRecord],
+    slots: &[Option<crate::sync_bridge::SyncIntent>],
+    integrated_marks: IntegratedMarks<'_>,
+    origin: OriginMarks<'_>,
+) -> Result<HeadState, StorageError> {
+    if records.is_empty() {
+        if !slots.is_empty() {
+            return Err(StorageError::Corrupt {
+                context: "空 update 批次不能带 sync intent".to_owned(),
+            });
+        }
+        if !integrated_marks.is_empty() {
+            return Err(StorageError::Corrupt {
+                context: "空 update 批次不能带 inbox 标记".to_owned(),
+            });
+        }
+        // `PerRecord` 配空 records 时，非空标记同样算长度不匹配（不会退化成全部本地）。
+        origin.validate(0)?;
+        return load_head(vault, doc_id);
+    }
+    if !slots.is_empty() && slots.len() != records.len() {
+        return Err(StorageError::Corrupt {
+            context: format!(
+                "append_updates: records={} intents={} 必须一对一",
+                records.len(),
+                slots.len()
+            ),
+        });
+    }
+    origin.validate(records.len())?;
+
+    // 远端已知 VV 的增量：只有 remote 条目会扩大它（`after_vv - running_vv`）。
+    //
+    // 这里只算「本批新增了哪些远端 ops」；旧值读取与 CAS 语句在构造语句阶段生成，
+    // 重试时按最新旧值重算并集，但 `added` 本身不变（head 基准没变）。
+    let remote_added = if origin.any_remote() {
+        let mut running = load_head_vv_at(vault, doc_id, expected_head_seq)?;
+        let mut known = VersionVector::new();
+        for (index, record) in records.iter().enumerate() {
+            let after = VersionVector::decode(&record.update.end_vv).map_err(StorageError::from)?;
+            if origin.is_remote(index) {
+                let added = crate::remote_known::added_since(&after, &running);
+                known = crate::remote_known::union(&known, &added);
+            }
+            running = after;
+        }
+        if known.is_empty() {
+            None
+        } else {
+            Some(known)
+        }
+    } else {
+        None
+    };
+
+    let last = &records
+        .last()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: "append_updates 收到空批次".to_owned(),
+        })?
+        .update;
+    let head_seq = expected_head_seq + records.len() as u64;
+
+    let mut statements = Vec::with_capacity(records.len() + 2 + slots.len());
+
+    // 第 0 条就是 CAS：head_seq 必须还是调用方看到的那个值。
+    // 放在最前面，过期基准会在碰到任何唯一约束之前就被守卫拦下，报 HeadConflict 而不是 UNIQUE。
+    statements.push(Statement::new(
+        "UPDATE loro_docs SET head_seq = ?2, head_frontier = ?3, head_vv = ?4 \
+         WHERE doc_id = ?1 AND head_seq = ?5",
+        vec![
+            Value::Text(doc_id.to_owned()),
+            Value::Integer(i64_of(head_seq)?),
+            Value::Blob(last.end_frontier.clone()),
+            Value::Blob(last.end_vv.clone()),
+            Value::Integer(i64_of(expected_head_seq)?),
+        ],
+    ));
+
+    for (index, record) in records.iter().enumerate() {
+        let seq = expected_head_seq + 1 + index as u64;
+        statements.push(Statement::new(
+            "INSERT INTO loro_updates(doc_id, seq, update_id, batch_id, codec_version, payload, end_frontier, end_vv) \
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                Value::Text(doc_id.to_owned()),
+                Value::Integer(i64_of(seq)?),
+                Value::Text(format!("{doc_id}#{seq}")),
+                Value::Text(record.batch_id.clone()),
+                Value::Text(CODEC_VERSION.to_owned()),
+                Value::Blob(record.update.payload.clone()),
+                Value::Blob(record.update.end_frontier.clone()),
+                Value::Blob(record.update.end_vv.clone()),
+            ],
+        ));
+    }
+
+    statements.push(Statement::new(
+        "INSERT INTO projection_outbox(doc_id, target_seq) VALUES(?1, ?2) \
+         ON CONFLICT(doc_id) DO UPDATE SET target_seq = MAX(target_seq, excluded.target_seq)",
+        vec![
+            Value::Text(doc_id.to_owned()),
+            Value::Integer(i64_of(head_seq)?),
+        ],
+    ));
+
+    for (index, slot) in slots.iter().enumerate() {
+        // `None`：这条 update 不产生出站意图（remote 导入 / adopt 等），同事务里跳过。
+        let Some(intent) = slot else {
+            continue;
+        };
+        if intent.message_id.is_empty() || intent.batch_id.is_empty() || intent.key_epoch == 0 {
+            return Err(StorageError::Corrupt {
+                context: "sync intent message/batch/epoch 非法".to_owned(),
+            });
+        }
+        let seq = expected_head_seq + 1 + index as u64;
+        statements.push(Statement::new(
+            "INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,object_id,state,ciphertext) \
+             VALUES(?1,?2,?3,?4,?5,?6,'pending',NULL)",
+            vec![
+                Value::Text(intent.message_id.clone()),
+                Value::Text(intent.batch_id.clone()),
+                Value::Text(doc_id.to_owned()),
+                Value::Integer(i64_of(seq)?),
+                Value::Integer(i64_of(intent.key_epoch)?),
+                Value::Blob(intent.object_id.to_vec()),
+            ],
+        ));
+    }
+
+    // 远端已知 VV 的 meta 写入（与 update/head 同一 A 事务；失败一起回滚）。
+    //
+    // **值 CAS**：语句里带读到的旧值，只有库中值仍是旧值才会更新（`WHERE meta.value=?old`，
+    // 旧值不存在时用 `INSERT ... WHERE NOT EXISTS`）。这样两个写者（普通 pull 的 A 事务
+    // 与 baseline apply 批次）即使都拿着同一份旧并集，后到的那个也不会把先到的扩大值
+    // 覆盖回更小的并集；CAS 不命中 → 0 行 → 守卫失败 → 整笔回滚后重读重试。
+    let remote_slot = match &remote_added {
+        Some(added) => {
+            let index = statements.len();
+            statements.push(cas_statement_or_corrupt(
+                crate::remote_known::merge_statement(vault, doc_id, added)?,
+                doc_id,
+            )?);
+            Some(index)
+        }
+        None => None,
+    };
+
+    // 同事务标记 inbox 行：每条都要求恰好影响 1 行（不存在 / 已 integrated /
+    // 已 quarantine 都会让整笔 A 事务回滚）。标记语句放在最后，避免它们的守卫先于
+    // head CAS 暴露，保证并发冲突仍然报 HeadConflict。
+    let marks_start = statements.len();
+    for (mark_log_id, relay_seq) in integrated_marks {
+        statements.push(Statement::new(
+            "UPDATE sync_inbox SET state='integrated' \
+             WHERE log_id=?1 AND relay_seq=?2 AND state='verified'",
+            vec![
+                Value::Blob(mark_log_id.to_vec()),
+                Value::Integer(i64_of(*relay_seq)?),
+            ],
+        ));
+    }
+    let mut guards = Vec::with_capacity(2 + integrated_marks.len());
+    guards.push(AffectedGuard::exactly(0, 1));
+    if let Some(index) = remote_slot {
+        guards.push(AffectedGuard::exactly(index, 1));
+    }
+    guards.extend(
+        integrated_marks
+            .iter()
+            .enumerate()
+            .map(|(index, _)| AffectedGuard::exactly(marks_start + index, 1)),
+    );
+
+    // 远端已知 VV 的 CAS 失败是**可重试**的：并发写者只是先扩大了一步，重读旧值后
+    // 把两边并集再写一次即可。重试期间 head CAS 仍在 index 0：若真的有人推进了 head，
+    // 依旧按 HeadConflict 返回，不会把「基准过期」误当成 meta 冲突。
+    const REMOTE_KNOWN_CAS_ATTEMPTS: usize = 4;
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match vault.exec_transaction(&statements, &guards) {
+            Ok(_) => {
+                return Ok(HeadState {
+                    doc_id: doc_id.to_owned(),
+                    head_seq,
+                    head_frontier: last.end_frontier.clone(),
+                    head_vv: last.end_vv.clone(),
+                });
+            }
+            // 第 0 条守卫 = head CAS。
+            Err(StorageError::GuardFailed { statement: 0, .. }) => {
+                let actual = load_head(vault, doc_id)
+                    .map(|head| head.head_seq)
+                    .unwrap_or(0);
+                return Err(StorageError::HeadConflict {
+                    doc_id: doc_id.to_owned(),
+                    expected: expected_head_seq,
+                    actual,
+                });
+            }
+            // 远端已知 VV 的值 CAS 不命中：指定下标只有它这一条守卫。
+            Err(StorageError::GuardFailed { statement, .. }) if remote_slot == Some(statement) => {
+                let Some(added) = remote_added.as_ref() else {
+                    return Err(StorageError::Corrupt {
+                        context: format!("文档 {doc_id} 的远端已知 VV CAS 守卫缺少重算依据"),
+                    });
+                };
+                if attempt >= REMOTE_KNOWN_CAS_ATTEMPTS {
+                    return Err(StorageError::SyncConflict {
+                        context: format!(
+                            "文档 {doc_id} 的远端已知 VV 值 CAS 连续 {attempt} 次被并发写者改写；\
+                             整笔 A 事务（update+head+meta）已回滚，可重试"
+                        ),
+                    });
+                }
+                let slot = remote_slot.expect("守卫命中说明 remote_slot 存在");
+                statements[slot] = cas_statement_or_corrupt(
+                    crate::remote_known::merge_statement(vault, doc_id, added)?,
+                    doc_id,
+                )?;
+            }
+            // 标记失败：update 与所有标记一起回滚；调用方必须保持 inbox verified 原样。
+            Err(StorageError::GuardFailed { statement, .. }) if statement >= marks_start => {
+                return Err(StorageError::SyncConflict {
+                    context: format!(
+                        "inbox 标记 integrated 失败（第 {} 个标记行不存在或当前不是 verified）；\
+                         整笔 A 事务（update+标记）已回滚",
+                        statement - marks_start
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// [`crate::remote_known::merge_statement`] 在 `remote_added` 非空时必然返回语句；
+/// 这里把它转成带文档上下文的损坏错误，避免业务路径 `unwrap`。
+fn cas_statement_or_corrupt(
+    statement: Option<Statement>,
+    doc_id: &str,
+) -> Result<Statement, StorageError> {
+    statement.ok_or_else(|| StorageError::Corrupt {
+        context: format!("文档 {doc_id} 的远端已知 VV 增量非空，但没有生成 CAS 语句"),
+    })
+}
+
+/// 笔记当前的物化水位（供 B 事务与测试读取）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyState {
+    /// 笔记 ID。
+    pub note_id: String,
+    /// 已物化的 body_md。
+    pub body_md: Option<String>,
+    /// 已物化的 batch seq。
+    pub body_seq: u64,
+    /// 已物化的 frontier。
+    pub body_frontier: Option<Vec<u8>>,
+}
+
+/// 读一篇笔记的物化状态。
+pub fn load_body_state(vault: &Vault, note_id: &str) -> Result<BodyState, StorageError> {
+    let rows = vault.query(
+        "SELECT body_md, body_seq, body_frontier FROM notes WHERE note_id = ?1",
+        &[Value::Text(note_id.to_owned())],
+    )?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("notes 缺少 {note_id}"),
+        })?;
+
+    let body_md = match row.first() {
+        Some(Value::Text(text)) => Some(text.clone()),
+        Some(Value::Null) | None => None,
+        Some(other) => {
+            return Err(StorageError::Corrupt {
+                context: format!("notes.body_md 类型异常：{other:?}"),
+            });
+        }
+    };
+
+    Ok(BodyState {
+        note_id: note_id.to_owned(),
+        body_md,
+        body_seq: u64_of(&row, 1, "notes.body_seq")?,
+        body_frontier: optional_blob(&row, 2)?,
+    })
+}
+
+fn i64_of(value: u64) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|_| StorageError::Corrupt {
+        context: format!("数值 {value} 超出 SQLite INTEGER 范围"),
+    })
+}
+
+fn u64_of(row: &[Value], index: usize, field: &str) -> Result<u64, StorageError> {
+    match row.get(index) {
+        Some(Value::Integer(value)) if *value >= 0 => Ok(*value as u64),
+        other => Err(StorageError::Corrupt {
+            context: format!("{field} 读回异常：{other:?}"),
+        }),
+    }
+}
+
+fn blob_of(row: &[Value], index: usize, field: &str) -> Result<Vec<u8>, StorageError> {
+    match row.get(index) {
+        Some(Value::Blob(bytes)) => Ok(bytes.clone()),
+        Some(Value::Null) | None => Ok(Vec::new()),
+        other => Err(StorageError::Corrupt {
+            context: format!("{field} 读回异常：{other:?}"),
+        }),
+    }
+}
+
+fn optional_blob(row: &[Value], index: usize) -> Result<Option<Vec<u8>>, StorageError> {
+    match row.get(index) {
+        Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
+        Some(Value::Null) | None => Ok(None),
+        other => Err(StorageError::Corrupt {
+            context: format!("期望 BLOB/NULL，实际 {other:?}"),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use loro::VersionVector;
+
+    use super::*;
+    use crate::body_doc::BodyDoc;
+    use crate::remote_known;
+
+    /// 临时 vault：目录建在 `target/tmp` 下（AGENTS §6：不用 `%TEMP%`）。
+    ///
+    /// lib 单元测试拿不到 `CARGO_TARGET_TMPDIR`（只有集成测试有），所以从
+    /// `CARGO_MANIFEST_DIR` 拼出同一个位置。
+    fn fresh_vault(prefix: &str) -> (tempfile::TempDir, Vault) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("store-origin-{prefix}"));
+        std::fs::create_dir_all(&root).expect("创建 target/tmp 下的测试根目录");
+        let dir = tempfile::Builder::new()
+            .prefix("vault-")
+            .tempdir_in(&root)
+            .expect("创建临时目录");
+        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+        (dir, vault)
+    }
+
+    fn scalar_i64(vault: &Vault, sql: &str) -> i64 {
+        let rows = vault.query(sql, &[]).expect("查询");
+        match rows.first().and_then(|row| row.first()) {
+            Some(Value::Integer(value)) => *value,
+            other => panic!("期望整数结果，实际 {other:?}"),
+        }
+    }
+
+    fn local_update(doc: &BodyDoc, base: &VersionVector) -> PendingUpdate {
+        doc.pending_update(base).expect("导出增量")
+    }
+
+    /// `OriginMarks::AllLocal`（显式类型）不扩大远端已知 VV，也不产生 outbox。
+    #[test]
+    fn all_local_origin_does_not_extend_remote_known() {
+        let (_dir, vault) = fresh_vault("all-local");
+        create_body_doc(&vault, "doc-local").expect("loro_docs 行");
+        let doc = BodyDoc::create("doc-local", 0xA1).expect("创建 BodyDoc");
+        doc.insert_scalars(0, "local").expect("本地编辑");
+        let update = local_update(&doc, &VersionVector::default());
+
+        let head = append_updates_inner(
+            &vault,
+            "doc-local",
+            0,
+            &[UpdateRecord::new("b0", update)],
+            &[],
+            &[],
+            OriginMarks::AllLocal,
+        )
+        .expect("A 事务");
+
+        assert_eq!(head.head_seq, 1);
+        assert!(
+            remote_known::load(&vault, "doc-local")
+                .expect("读远端已知")
+                .is_none(),
+            "全部本地的批次绝不能创建/扩大远端已知 VV"
+        );
+        assert_eq!(
+            scalar_i64(&vault, "SELECT count(*) FROM sync_outbox"),
+            0,
+            "slots 空 = 本批没有任何出站意图"
+        );
+    }
+
+    /// `PerRecord` 混排：只有 remote 条目的 `after - running` 记入远端已知 VV。
+    #[test]
+    fn per_record_origin_only_extends_for_remote_records() {
+        let (_dir, vault) = fresh_vault("mixed");
+        create_body_doc(&vault, "doc-mixed").expect("loro_docs 行");
+
+        let doc = BodyDoc::create("doc-mixed", 0xA1).expect("创建 BodyDoc");
+        doc.insert_scalars(0, "local").expect("本地编辑");
+        let local = local_update(&doc, &VersionVector::default());
+        let remote_doc = BodyDoc::create("doc-mixed", 0xB2).expect("创建 BodyDoc");
+        remote_doc.insert_scalars(0, "remote").expect("远端编辑");
+        doc.import(&remote_doc.export_all_updates().expect("远端 update"))
+            .expect("本地副本导入远端");
+        let local_end = VersionVector::decode(&local.end_vv).expect("本地 VV");
+        let remote = local_update(&doc, &local_end);
+        let remote_end = VersionVector::decode(&remote.end_vv).expect("远端 VV");
+        let expected = remote_known::added_since(&remote_end, &local_end);
+
+        let head = append_updates_inner(
+            &vault,
+            "doc-mixed",
+            0,
+            &[
+                UpdateRecord::new("b0", local),
+                UpdateRecord::new("b1", remote),
+            ],
+            &[],
+            &[],
+            OriginMarks::PerRecord(&[false, true]),
+        )
+        .expect("A 事务");
+
+        assert_eq!(head.head_seq, 2, "两条记录都必须落库");
+        let known = remote_known::load(&vault, "doc-mixed")
+            .expect("读远端已知")
+            .expect("有 remote 条目就必须写 meta");
+        assert_eq!(
+            known, expected,
+            "远端条目带来的 ops 必须记入，且只记入远端那一小段"
+        );
+        assert_eq!(
+            known.get(&0xA1).copied().unwrap_or(0),
+            0,
+            "本地条目（哪怕同批先落库）绝不能记入远端已知 VV"
+        );
+        assert_eq!(
+            scalar_i64(&vault, "SELECT count(*) FROM sync_outbox"),
+            0,
+            "没有传 slots 就不得写出站意图"
+        );
+    }
+
+    /// 空 `PerRecord` 不再表示「全部本地」：长度不匹配直接拒绝，且不写任何行。
+    #[test]
+    fn per_record_origin_length_mismatch_is_rejected() {
+        let (_dir, vault) = fresh_vault("mismatch");
+        create_body_doc(&vault, "doc-mismatch").expect("loro_docs 行");
+        let doc = BodyDoc::create("doc-mismatch", 0xA1).expect("创建 BodyDoc");
+        doc.insert_scalars(0, "x").expect("编辑");
+        let update = local_update(&doc, &VersionVector::default());
+        let record = UpdateRecord::new("b0", update);
+
+        let error = append_updates_inner(
+            &vault,
+            "doc-mismatch",
+            0,
+            std::slice::from_ref(&record),
+            &[],
+            &[],
+            OriginMarks::PerRecord(&[]),
+        )
+        .expect_err("空 PerRecord 配非空 records 必须报错");
+        assert!(
+            matches!(error, StorageError::Corrupt { .. }),
+            "必须是显式损坏/参数错误，实际 {error:?}"
+        );
+        assert_eq!(
+            scalar_i64(&vault, "SELECT count(*) FROM loro_updates"),
+            0,
+            "参数错误不得留下半写"
+        );
+
+        let error = append_updates_inner(
+            &vault,
+            "doc-mismatch",
+            0,
+            &[record],
+            &[],
+            &[],
+            OriginMarks::PerRecord(&[true, false]),
+        )
+        .expect_err("标记多于 records 也必须报错");
+        assert!(matches!(error, StorageError::Corrupt { .. }));
+    }
+
+    /// 值 CAS 不命中（并发写者改了 meta）→ 有界重试后返回明确 SyncConflict，
+    /// 整笔 A 事务回滚：head/update/outbox/meta 都不留半写，也绝不写入更小值。
+    ///
+    /// 注入方式：`loro_updates` 的 BEFORE INSERT 触发器在**同一事务里**把 meta 改成
+    /// 别的值（模拟「读旧值之后、CAS 之前的并发提交」）；每次重试都会再次命中，
+    /// 因此有界重试必然耗尽。
+    #[test]
+    fn stale_remote_known_cas_fails_closed_and_rolls_back() {
+        let (_dir, vault) = fresh_vault("cas");
+        create_body_doc(&vault, "doc-cas").expect("loro_docs 行");
+        let remote_doc = BodyDoc::create("doc-cas", 0xB2).expect("创建 BodyDoc");
+        remote_doc.insert_scalars(0, "remote").expect("远端编辑");
+        let update = local_update(&remote_doc, &VersionVector::default());
+        vault
+            .exec(
+                "CREATE TRIGGER remote_known_race BEFORE INSERT ON loro_updates BEGIN \
+                   INSERT OR REPLACE INTO meta(key,value) \
+                   VALUES('sync.remote_known_vv.doc-cas', X'DEADBEEF'); \
+                 END;",
+                &[],
+            )
+            .expect("安装竞态触发器");
+
+        let error = append_updates_inner(
+            &vault,
+            "doc-cas",
+            0,
+            &[UpdateRecord::new("b0", update)],
+            &[],
+            &[],
+            OriginMarks::PerRecord(&[true]),
+        )
+        .expect_err("CAS 必须失败");
+
+        match error {
+            StorageError::SyncConflict { context } => {
+                assert!(
+                    context.contains("远端已知 VV"),
+                    "错误必须点明远端已知 VV CAS：{context}"
+                );
+                assert!(context.contains("可重试"), "错误必须说明可重试：{context}");
+            }
+            other => panic!("期望 SyncConflict，实际 {other:?}"),
+        }
+        assert_eq!(load_head(&vault, "doc-cas").expect("head").head_seq, 0);
+        assert_eq!(
+            scalar_i64(&vault, "SELECT count(*) FROM loro_updates"),
+            0,
+            "整笔回滚：update 不得落库"
+        );
+        assert_eq!(
+            scalar_i64(&vault, "SELECT count(*) FROM projection_outbox"),
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &vault,
+                "SELECT count(*) FROM meta WHERE key='sync.remote_known_vv.doc-cas'"
+            ),
+            0,
+            "触发器写入随整笔回滚，失败后不残留"
+        );
+        assert!(
+            remote_known::load(&vault, "doc-cas")
+                .expect("读远端已知")
+                .is_none(),
+            "失败路径绝不能写入更小/错误的值"
+        );
+    }
+}
+
+`````
+
+
 @@SECTION `crates/storage/src/sync_bridge.rs`
 
 `````rust
@@ -49557,1797 +51552,6 @@ impl DocumentSession {
             return Err(AdoptError::TargetMismatch { field: "vv" });
         }
         Ok(())
-    }
-}
-
-`````
-
-
-@@SECTION `crates/storage/src/session/core.rs`
-
-`````rust
-//! 会话核：`EditorDocumentPort` 的串行 reducer（ADR 0003 §5）。
-//!
-//! 一个 [`DocumentSession`] = 一个正文文档的**唯一 live owner**：
-//!
-//! - 持有 live [`BodyDoc`]（Loro）、generation / session_epoch / live_rev；
-//! - 持有唯一未 ACK journal 与事件队列；
-//! - 所有编辑走 [`DocumentSession::apply`]，受理顺序**固定**（见方法文档）；
-//! - `flush` 只投递命令即返回票据，SQLite 由后台线程写（见 [`super::flush`]）。
-//!
-//! 端口协议类型在 [`super::protocol`]，本模块**不新增协议字段**（缺字段应先报告 Lead）。
-//! 远端导入路径在 [`DocumentSession::apply_remote`]，撤销/重做在
-//! [`DocumentSession::undo`] / [`DocumentSession::redo`]，都用同一个 Loro `UndoManager`。
-
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
-
-use loro::{UndoManager, VersionVector};
-use menghunote_text::UnicodeScalar;
-use rusqlite::types::Value;
-
-use super::flush::{lock, JournalHandle};
-use super::gate::ExternalCommitGate;
-use super::protocol::{
-    Applied, ChangeSource, CommandId, DeltaSplice, DocId, DurableAck, EditOutcome, EditRequest,
-    FlushReason, FlushTicket, Generation, HistoryState, LiveDelta, LiveRev, MergeInfo,
-    OpenSnapshot, PortError, RejectReason, Rejected, ScalarEdit, SessionEpoch, SessionEvent,
-    StaleBase,
-};
-use crate::body_doc::BodyDoc;
-use crate::error::StorageError;
-use crate::store;
-use crate::Vault;
-
-/// 会话配置。
-///
-/// `flush_delay` 是**测试/故障注入**用的可控慢盘延迟，生产用 `None`；
-/// `sync` 是 ADR 0009 切片 2b 的本地意图上下文，`None` = 不产生 `sync_outbox`
-/// 行（默认构建与既有调用点行为完全不变）。
-#[derive(Debug, Clone, Copy)]
-pub struct SessionOptions {
-    /// 本机 peer id（每设备唯一）。
-    pub peer_id: u64,
-    /// 会话纪元：旧会话的迟到请求会被拒。
-    pub session_epoch: SessionEpoch,
-    /// 未 ACK journal 容量（条）。满了就是背压（拒绝新写，不丢已 ACC 部分）。
-    pub journal_capacity: usize,
-    /// 一次 A 事务最多合并多少条（慢盘时 pending 会堆到这里为止）。
-    pub flush_batch: usize,
-    /// 注入的 flush 延迟（模拟慢盘）。
-    pub flush_delay: Option<Duration>,
-    /// 本地写入的同步上下文；`None` = 不产生出站意图（默认）。
-    pub sync: Option<crate::sync_bridge::SyncContext>,
-}
-
-impl Default for SessionOptions {
-    fn default() -> Self {
-        Self {
-            peer_id: 1,
-            session_epoch: SessionEpoch(1),
-            journal_capacity: 64,
-            flush_batch: 8,
-            flush_delay: None,
-            sync: None,
-        }
-    }
-}
-
-/// 一个正文文档的会话（串行 reducer）。
-///
-/// 字段对 `super::gate` 开放（`pub(crate)`）：外部提交闸门与 adopt 必须直接操作**同一份**
-/// live 文档、journal 与水位，复制状态只会制造撕裂。对外部 crate 仍然是完全私有的。
-pub struct DocumentSession {
-    pub(crate) vault: Vault,
-    pub(crate) doc_id: DocId,
-    /// 本机 peer id（重放 scratch 副本时用；不影响 import）。
-    pub(crate) peer_id: u64,
-    generation: Generation,
-    pub(crate) session_epoch: SessionEpoch,
-    pub(crate) doc: BodyDoc,
-    pub(crate) live_rev: LiveRev,
-    pub(crate) live_frontier: Vec<u8>,
-    /// 上一次写入 journal 的 VV：增量导出的起点（不在 durable 前推进）。
-    pub(crate) journal_base_vv: VersionVector,
-    pub(crate) journal: JournalHandle,
-    undo: UndoManager,
-    /// command_id 幂等缓存（只缓存终态：Applied；背压/过期不缓存）。
-    command_cache: HashMap<CommandId, EditOutcome>,
-    /// composition 深度（`> 0` 表示组合中；嵌套 begin 计数）。
-    composition_depth: u32,
-    /// composition 期间延后的远端 update（按到达顺序；结束后串行合并，不丢）。
-    deferred_remote: Vec<Vec<u8>>,
-    /// 外部提交闸门（ADR 0009 切片 3a）；无新线程/新全局状态。
-    pub(crate) gate: ExternalCommitGate,
-}
-
-impl std::fmt::Debug for DocumentSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DocumentSession")
-            .field("doc_id", &self.doc_id)
-            .field("generation", &self.generation)
-            .field("session_epoch", &self.session_epoch)
-            .field("live_rev", &self.live_rev)
-            .field("pending", &self.pending_len())
-            .finish()
-    }
-}
-
-impl DocumentSession {
-    /// 打开会话：从库里的 snapshot + updates 重放出 live 文档。
-    pub fn open(vault: &Vault, doc_id: &str, options: SessionOptions) -> Result<Self, PortError> {
-        // 同步上下文在打开时校验一次：epoch/peer 非法要尽早报错，
-        // 而不是让之后每一次 flush 都因非法 intent 失败、journal 永远重试。
-        if let Some(sync) = options.sync {
-            sync.validate().map_err(port)?;
-        }
-        let generation = load_generation(vault, doc_id)?;
-        let (doc, head) =
-            store::load_body_doc(vault, doc_id, options.peer_id, None).map_err(port)?;
-        let live_frontier = doc.frontiers().encode();
-        // 打开时没有未 ACK 条目：增量基准就是 durable 的 VV
-        let journal_base_vv = head.version_vector().map_err(port)?;
-        let journal = JournalHandle::spawn(
-            vault.clone(),
-            doc_id.to_owned(),
-            head,
-            options.journal_capacity,
-            options.flush_batch,
-            options.flush_delay,
-            options.sync,
-        );
-        let undo = doc.undo_manager();
-        Ok(Self {
-            vault: vault.clone(),
-            doc_id: doc_id.to_owned(),
-            peer_id: options.peer_id,
-            generation,
-            session_epoch: options.session_epoch,
-            doc,
-            live_rev: LiveRev(0),
-            live_frontier,
-            journal_base_vv,
-            journal,
-            undo,
-            command_cache: HashMap::new(),
-            composition_depth: 0,
-            deferred_remote: Vec::new(),
-            gate: ExternalCommitGate::default(),
-        })
-    }
-
-    /// 文档 ID。
-    pub fn doc_id(&self) -> &str {
-        &self.doc_id
-    }
-
-    /// 文档代际。
-    pub fn generation(&self) -> Generation {
-        self.generation
-    }
-
-    /// 会话纪元。
-    pub fn session_epoch(&self) -> SessionEpoch {
-        self.session_epoch
-    }
-
-    /// 当前 live 修订号（`EditRequest.base_live_rev` 的正确基准）。
-    pub fn live_rev(&self) -> LiveRev {
-        self.live_rev
-    }
-
-    /// 当前 live frontier（不透明字节）。
-    pub fn live_frontier(&self) -> &[u8] {
-        &self.live_frontier
-    }
-
-    /// 当前 live 正文（LF 归一后的 Markdown）。
-    pub fn markdown(&self) -> String {
-        self.doc.text()
-    }
-
-    /// 打开快照（调用方据此初始化自己的 Rope 镜像）。
-    pub fn snapshot(&self) -> OpenSnapshot {
-        OpenSnapshot {
-            doc_id: self.doc_id.clone(),
-            generation: self.generation,
-            session_epoch: self.session_epoch,
-            live_rev: self.live_rev,
-            live_frontier: self.live_frontier.clone(),
-            live_vv: self.doc.vv().encode(),
-            // 批次号不跨会话持久化：重启后只能确认 durable 水位（head_seq）
-            durable_batch: None,
-            durable_head_seq: self.journal.durable_head_seq(),
-            markdown: self.doc.text(),
-        }
-    }
-
-    /// 未 ACK 条数。
-    pub fn pending_len(&self) -> usize {
-        self.journal.pending_len()
-    }
-
-    /// 未 ACK update 的总字节数（调度器用：达到 64 KiB 立即 flush）。
-    pub fn pending_bytes(&self) -> usize {
-        self.journal.pending_bytes()
-    }
-
-    /// 已 durable 的 head seq。
-    pub fn durable_head_seq(&self) -> u64 {
-        self.journal.durable_head_seq()
-    }
-
-    /// 已 durable 到哪个 live 修订号。
-    pub fn durable_through(&self) -> LiveRev {
-        self.journal.durable_through()
-    }
-
-    /// 取走事件队列（Durable / Remote）。
-    pub fn events(&self) -> Vec<SessionEvent> {
-        self.journal.drain_events()
-    }
-
-    /// 等待某个 live 修订号变成 durable（测试/关闭前等待用）。
-    ///
-    /// 只消费覆盖到 `target` 的 `Durable`，其它事件留在队列里。
-    pub fn wait_for_durable(&self, target: LiveRev, timeout: Duration) -> Option<DurableAck> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let mut found = None;
-            {
-                let mut queue = lock(self.journal.events_ref());
-                let mut remaining = std::collections::VecDeque::new();
-                while let Some(event) = queue.pop_front() {
-                    match event {
-                        SessionEvent::Durable(ack)
-                            if ack.through_live_rev >= target && found.is_none() =>
-                        {
-                            found = Some(ack);
-                        }
-                        other => remaining.push_back(other),
-                    }
-                }
-                *queue = remaining;
-            }
-            if let Some(ack) = found {
-                return Some(ack);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    /// 受理一次编辑请求（顺序固定，任何一步失败都**不改 Loro**）。
-    ///
-    /// 顺序：
-    ///
-    /// 1. 校验 `doc_id` / `generation` / `session_epoch`；
-    /// 2. 按 `command_id` 幂等（终态直接返回首次结果）；
-    /// 3. 外部提交闸门 Held → `Rejected{NotReady}`（ADR 0009：Held 期间禁写，fail-closed）；
-    /// 4. composition 进行中 → `Rejected{CompositionActive}`；
-    /// 5. 校验 `edits`：升序、互不重叠、`end <= scalar_len`；`base_live_rev` 不匹配 → `Stale`；
-    /// 6. journal 容量准入（满了 → `Rejected{Backpressure}`，此时 Loro 未被触碰）；
-    /// 7. 才允许改 Loro：按**逆序** `delete + insert`，导出增量、进 journal、推进 live_rev。
-    pub fn apply(&mut self, request: EditRequest) -> EditOutcome {
-        // 1. 身份与代际
-        if request.doc_id != self.doc_id {
-            return rejected(request.command_id, RejectReason::UnknownDoc);
-        }
-        if request.generation != self.generation {
-            return rejected(request.command_id, RejectReason::WrongGeneration);
-        }
-        if request.session_epoch != self.session_epoch {
-            return rejected(request.command_id, RejectReason::WrongEpoch);
-        }
-
-        // 2. 幂等：只命中终态（背压会随 flush 解除，不能缓存）
-        if let Some(cached) = self.command_cache.get(&request.command_id) {
-            return cached.clone();
-        }
-
-        // 2.5 外部提交闸门 Held：一律拒绝新的本地正文改动（fail-closed，不碰 Loro）。
-        //     3b 负责让界面在 Held 期间禁写；存储层这里必须自己兜底。
-        if self.gate.is_held() {
-            return rejected(request.command_id, RejectReason::NotReady);
-        }
-
-        // 3. composition 闸门：组合期间拒绝其它本地正文改动（**不碰 Loro**）
-        if self.is_composing() {
-            return rejected(request.command_id, RejectReason::CompositionActive);
-        }
-
-        // 4. 区间校验 + 基准校验（都在改 Loro 之前）
-        let scalar_len = self.doc.scalar_len();
-        if validate_edits(&request.edits, scalar_len).is_err() {
-            return rejected(request.command_id, RejectReason::InvalidRange);
-        }
-        if request.base_live_rev != self.live_rev {
-            return EditOutcome::Stale(StaleBase {
-                command_id: request.command_id,
-                current_live_rev: self.live_rev,
-                compensation: None,
-            });
-        }
-
-        // 5+6. 容量准入与 Loro 修改在同一把锁内完成：
-        //      持锁期间 flush 线程只会**释放**容量，因此准入通过后 append 不可能失败。
-        let mut guard = lock(self.journal.state_ref());
-        if guard.journal.is_full() {
-            drop(guard);
-            return rejected(request.command_id, RejectReason::Backpressure);
-        }
-
-        if request.edits.is_empty() {
-            let outcome = EditOutcome::Applied(Applied {
-                command_id: request.command_id.clone(),
-                live_rev: self.live_rev,
-                live_frontier: self.live_frontier.clone(),
-                splice: DeltaSplice {
-                    at: UnicodeScalar::new(0),
-                    delete_scalars: 0,
-                    insert: String::new(),
-                },
-                local_echo: true,
-                source: ChangeSource::Local,
-                merge: MergeInfo::default(),
-            });
-            self.command_cache
-                .insert(request.command_id.clone(), outcome.clone());
-            return outcome;
-        }
-
-        // 逆序应用：后面的编辑先做，前面编辑的坐标才不会失效（协议 §「按逆序应用」）
-        self.doc.set_next_commit_origin(&request.origin);
-        if self.undo.group_start().is_err() {
-            drop(guard);
-            return rejected(request.command_id, RejectReason::NotReady);
-        }
-        for edit in request.edits.iter().rev() {
-            let start = edit.start.get();
-            let len = edit.end.get() - start;
-            if let Err(_error) = self.doc.replace_scalars(start, len, &edit.replacement) {
-                // 校验已保证范围内合法；真出错时丢弃分组，不推进任何水位
-                self.undo.group_end();
-                drop(guard);
-                return rejected(request.command_id, RejectReason::InvalidRange);
-            }
-        }
-        self.undo.group_end();
-
-        // 没有产生任何 op（例如空替换）→ 不回显、不进 journal、不推进 live_rev
-        let vv_after = self.doc.vv();
-        if vv_after == self.journal_base_vv {
-            let first = request.edits.first().map_or(0, |edit| edit.start.get());
-            let outcome = EditOutcome::Applied(Applied {
-                command_id: request.command_id.clone(),
-                live_rev: self.live_rev,
-                live_frontier: self.live_frontier.clone(),
-                splice: DeltaSplice {
-                    at: UnicodeScalar::new(first),
-                    delete_scalars: 0,
-                    insert: String::new(),
-                },
-                local_echo: true,
-                source: ChangeSource::Local,
-                merge: MergeInfo::default(),
-            });
-            self.command_cache
-                .insert(request.command_id.clone(), outcome.clone());
-            return outcome;
-        }
-
-        let update = match self.doc.pending_update(&self.journal_base_vv) {
-            Ok(update) => update,
-            Err(_) => {
-                drop(guard);
-                return rejected(request.command_id, RejectReason::NotReady);
-            }
-        };
-
-        let rev = LiveRev(self.live_rev.0 + 1);
-        // 持锁且已准入：这里不可能失败（见上面的注释），失败只可能是内部不一致
-        if JournalHandle::append(
-            &mut guard,
-            &self.doc_id,
-            "session",
-            crate::journal::JournalOrigin::Local,
-            update,
-            rev,
-        )
-        .is_err()
-        {
-            debug_assert!(false, "持锁且已准入时 journal 追加失败");
-            drop(guard);
-            return rejected(request.command_id, RejectReason::NotReady);
-        }
-        drop(guard);
-
-        self.journal_base_vv = vv_after;
-        self.live_rev = rev;
-        self.live_frontier = self.doc.frontiers().encode();
-
-        let first = request.edits.first();
-        let splice = DeltaSplice {
-            at: first.map_or(UnicodeScalar::new(0), |edit| edit.start),
-            delete_scalars: first.map_or(0, |edit| (edit.end.get() - edit.start.get()) as u64),
-            insert: first
-                .map(|edit| edit.replacement.clone())
-                .unwrap_or_default(),
-        };
-        let outcome = EditOutcome::Applied(Applied {
-            command_id: request.command_id.clone(),
-            live_rev: self.live_rev,
-            live_frontier: self.live_frontier.clone(),
-            splice,
-            // 调用方已经把自己的镜像写好了：不得再按 splice 二次应用
-            local_echo: true,
-            source: ChangeSource::Local,
-            merge: MergeInfo::default(),
-        });
-        self.command_cache
-            .insert(request.command_id.clone(), outcome.clone());
-        outcome
-    }
-
-    /// 开始一次 IME composition（可嵌套，深度计数）。
-    ///
-    /// preedit **不经过本层**：会话只记录「组合是否在进行」，不接收 preedit 文本，
-    /// 也不因 preedit 更新而阻塞。返回当前嵌套深度。
-    ///
-    /// 外部提交闸门 Held 期间**不进入组合**（fail-closed）并返回当前深度；需要显式
-    /// 错误请用 [`DocumentSession::try_begin_composition`]（3b 用）。
-    pub fn begin_composition(&mut self) -> u32 {
-        match self.try_begin_composition() {
-            Ok(depth) => depth,
-            Err(_) => self.composition_depth,
-        }
-    }
-
-    /// 开始一次 IME composition 的**可报错**版本：Held 期间返回 [`PortError`]。
-    ///
-    /// Held 期间通道已冻结，这里再开组合只会让 preedit 与提交竞争，因此直接拒绝。
-    pub fn try_begin_composition(&mut self) -> Result<u32, PortError> {
-        if self.gate.is_held() {
-            return Err(PortError::Storage(
-                "外部提交闸门 Held：拒绝开始 IME 组合".to_owned(),
-            ));
-        }
-        self.composition_depth += 1;
-        Ok(self.composition_depth)
-    }
-
-    /// 结束一次 composition；只有**最外层**结束才合并延后的远端导入。
-    ///
-    /// 重复 `end`（没有对应 `begin`）是 no-op：平台可能重复回调 cancel，
-    /// 这里不 panic、不改变状态。
-    pub fn end_composition(&mut self) -> Vec<LiveDelta> {
-        if self.composition_depth > 0 {
-            self.composition_depth -= 1;
-        }
-        if self.is_composing() {
-            return Vec::new();
-        }
-        self.merge_deferred_remote()
-    }
-
-    /// 按到达顺序串行合并延后的远端 update。
-    ///
-    /// - 背压（journal 满）时**保留剩余项**，等 `flush` 之后调用方再调一次；
-    /// - 解码/写入失败时也保留队首，不丢远端数据。
-    pub fn merge_deferred_remote(&mut self) -> Vec<LiveDelta> {
-        let mut merged = Vec::new();
-        loop {
-            if self.deferred_remote.is_empty() || !self.can_accept_remote() {
-                break;
-            }
-            let Some(update) = self.deferred_remote.first().cloned() else {
-                break;
-            };
-            match self.merge_remote_inner(&update, false) {
-                Ok(outcome) => {
-                    self.deferred_remote.remove(0);
-                    if let Some(delta) = outcome {
-                        merged.push(delta);
-                    }
-                }
-                // 保留在队首：不丢远端数据，调用方可稍后重试
-                Err(_) => break,
-            }
-        }
-        merged
-    }
-
-    /// 是否正处于 composition 中。
-    pub fn is_composing(&self) -> bool {
-        self.composition_depth > 0
-    }
-
-    /// 当前嵌套深度（0 = 不在组合中）。
-    pub fn composition_depth(&self) -> u32 {
-        self.composition_depth
-    }
-
-    /// 仍未合并的远端 update 条数。
-    pub fn deferred_remote_len(&self) -> usize {
-        self.deferred_remote.len()
-    }
-
-    fn can_accept_remote(&self) -> bool {
-        // Held 期间不合并延后的远端：闸门要求 live 水位静止，等 end 之后再合并
-        !self.journal.is_full() && !self.gate.is_held()
-    }
-
-    /// 远端导入：把 update 合进 live 文档，返回驱动镜像的 [`LiveDelta`]。
-    ///
-    /// 容量不足时拒绝（返回 `PortError::Storage`），保证「背压时 Loro 未被修改」对远端路径同样成立。
-    /// Held 期间一律拒绝（fail-closed）：调用方应在 `end_external_commit` 之后重试。
-    pub fn apply_remote(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
-        if self.gate.is_held() {
-            return Err(PortError::Storage(
-                "外部提交闸门 Held：暂不接受远端导入".to_owned(),
-            ));
-        }
-        if self.is_composing() {
-            // 组合期间延后：进队列（不丢、不报错），结束后按到达顺序串行合并
-            self.deferred_remote.push(update.to_vec());
-            return Ok(None);
-        }
-        self.merge_remote_now(update)
-    }
-
-    /// 立即合并一条远端 update（**不做** composition 判断；闸门在 [`Self::apply_remote`]）。
-    fn merge_remote_now(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
-        self.merge_remote_inner(update, true)
-    }
-
-    /// `publish = false` 时只返回 delta、不重复推进事件队列（延后合并的唯一投递口是
-    /// [`Self::end_composition`] 的返回值，避免调用方把同一条变更应用到镜像两次）。
-    fn merge_remote_inner(
-        &mut self,
-        update: &[u8],
-        publish: bool,
-    ) -> Result<Option<LiveDelta>, PortError> {
-        if self.journal.is_full() {
-            return Err(PortError::Storage(
-                "未 ACK journal 已满，暂不接受远端导入（背压）".to_owned(),
-            ));
-        }
-
-        let mut guard = lock(self.journal.state_ref());
-        let diff = match import_updates(&self.doc, std::iter::once(update)) {
-            Ok(diff) => diff,
-            Err(error) => {
-                drop(guard);
-                return Err(port(error));
-            }
-        };
-        if !diff.changed() {
-            drop(guard);
-            return Ok(None);
-        }
-
-        let splice = diff.splice();
-        let after_vv = diff.after_vv;
-        let from_rev = self.live_rev;
-        let to_rev = LiveRev(self.live_rev.0 + 1);
-
-        // 远端 op 也进 journal（A 事务落库后才算 durable）；容量已准入。
-        let pending = match self.doc.pending_update(&self.journal_base_vv) {
-            Ok(update) => update,
-            Err(error) => {
-                drop(guard);
-                return Err(port(error));
-            }
-        };
-        if JournalHandle::append(
-            &mut guard,
-            &self.doc_id,
-            "remote",
-            // 远端导入**绝不**产生出站意图（ADR 0009）；否则会把刚收到的数据推回 relay。
-            crate::journal::JournalOrigin::Remote,
-            pending,
-            to_rev,
-        )
-        .is_err()
-        {
-            drop(guard);
-            return Err(PortError::Storage("journal 追加失败".to_owned()));
-        }
-        drop(guard);
-
-        self.journal_base_vv = after_vv;
-        self.live_rev = to_rev;
-        self.live_frontier = self.doc.frontiers().encode();
-
-        let delta = LiveDelta {
-            doc_id: self.doc_id.clone(),
-            from_rev,
-            to_rev,
-            live_frontier: self.live_frontier.clone(),
-            splice,
-            cause: None,
-            source: ChangeSource::Remote,
-            merge: MergeInfo {
-                concurrent: true,
-                remote_changes: 1,
-            },
-        };
-        if publish {
-            lock(self.journal.events_ref()).push_back(SessionEvent::Remote(delta.clone()));
-        }
-        Ok(Some(delta))
-    }
-
-    /// 撤销：用**唯一** `UndoManager` 生成本地新 op（不回退 VV，也不回退远端字符）。
-    ///
-    /// 返回：
-    /// - `Ok(Some(Applied))`：已撤销并进 journal；
-    /// - `Ok(None)`：没有可撤销项（no-op undo，应提示调用方消费该项）；
-    /// - `Ok(Some(Rejected{Backpressure}))`：journal 满，**未 undo**（Loro 未被修改）；
-    /// - `Ok(Some(Rejected{NotReady}))`：外部提交闸门 Held，**未 undo**（fail-closed）。
-    pub fn undo(&mut self) -> Result<Option<EditOutcome>, PortError> {
-        // Held 期间 undo 也会改 Loro/journal：fail-closed，等 end 之后重试
-        if self.gate.is_held() {
-            return Ok(Some(rejected(
-                CommandId::from("undo"),
-                RejectReason::NotReady,
-            )));
-        }
-        // composition 期间 undo/redo 也属于「其它本地正文改动」：拒绝且不碰 Loro
-        if self.is_composing() {
-            return Ok(Some(rejected(
-                CommandId::from("undo"),
-                RejectReason::CompositionActive,
-            )));
-        }
-        // 容量准入在改 Loro 之前；准入通过后 flusher 只会释放容量，append 必然成功
-        if self.journal.is_full() {
-            return Ok(Some(rejected(
-                CommandId::from("undo"),
-                RejectReason::Backpressure,
-            )));
-        }
-        let before = self.doc.text();
-        let before_vv = self.doc.vv();
-        if self.undo.group_start().is_err() {
-            return Err(PortError::Storage("UndoManager 分组失败".to_owned()));
-        }
-        let changed = match self.undo.undo() {
-            Ok(changed) => changed,
-            Err(error) => {
-                self.undo.group_end();
-                return Err(port_loro(error));
-            }
-        };
-        self.undo.group_end();
-        if !changed || self.doc.vv() == before_vv {
-            return Ok(None);
-        }
-        Ok(Some(EditOutcome::Applied(
-            self.finish_history_change(&before, ChangeSource::Undo)?,
-        )))
-    }
-
-    /// 重做：与 [`DocumentSession::undo`] 对称。
-    pub fn redo(&mut self) -> Result<Option<EditOutcome>, PortError> {
-        if self.gate.is_held() {
-            return Ok(Some(rejected(
-                CommandId::from("redo"),
-                RejectReason::NotReady,
-            )));
-        }
-        if self.is_composing() {
-            return Ok(Some(rejected(
-                CommandId::from("redo"),
-                RejectReason::CompositionActive,
-            )));
-        }
-        if self.journal.is_full() {
-            return Ok(Some(rejected(
-                CommandId::from("redo"),
-                RejectReason::Backpressure,
-            )));
-        }
-        let before = self.doc.text();
-        let before_vv = self.doc.vv();
-        let changed = match self.undo.redo() {
-            Ok(changed) => changed,
-            Err(error) => return Err(port_loro(error)),
-        };
-        if !changed || self.doc.vv() == before_vv {
-            return Ok(None);
-        }
-        Ok(Some(EditOutcome::Applied(
-            self.finish_history_change(&before, ChangeSource::Redo)?,
-        )))
-    }
-
-    /// 撤销/重做共同的收尾：导出增量、进 journal、推进 live_rev、产出 Applied。
-    fn finish_history_change(
-        &mut self,
-        before: &str,
-        source: ChangeSource,
-    ) -> Result<Applied, PortError> {
-        let after_vv = self.doc.vv();
-        let update = self
-            .doc
-            .pending_update(&self.journal_base_vv)
-            .map_err(port)?;
-        let rev = LiveRev(self.live_rev.0 + 1);
-        let label = match source {
-            ChangeSource::Undo => "undo",
-            ChangeSource::Redo => "redo",
-            _ => "history",
-        };
-        {
-            let mut guard = lock(self.journal.state_ref());
-            // 外层已做容量准入，且持锁期间容量只增不减 → 这里不会失败
-            // undo/redo 是本机产生的新 op（不是远端回放），因此同样产生出站意图。
-            if JournalHandle::append(
-                &mut guard,
-                &self.doc_id,
-                label,
-                crate::journal::JournalOrigin::Local,
-                update,
-                rev,
-            )
-            .is_err()
-            {
-                debug_assert!(false, "持锁且已准入时 journal 追加失败");
-                return Err(PortError::Storage("journal 追加失败".to_owned()));
-            }
-        }
-        self.journal_base_vv = after_vv;
-        self.live_rev = rev;
-        self.live_frontier = self.doc.frontiers().encode();
-
-        let splice = diff_splice(before, &self.doc.text());
-        Ok(Applied {
-            command_id: format!("{label}-{}", rev.0),
-            live_rev: rev,
-            live_frontier: self.live_frontier.clone(),
-            splice,
-            // 撤销不是用户"已经写好"的输入：调用方要按 splice 更新镜像
-            local_echo: false,
-            source,
-            merge: MergeInfo::default(),
-        })
-    }
-
-    /// 撤销/重做栈状态。
-    pub fn history(&self) -> HistoryState {
-        HistoryState {
-            can_undo: self.undo.can_undo(),
-            undo_count: self.undo.undo_count(),
-            can_redo: self.undo.can_redo(),
-            redo_count: self.undo.redo_count(),
-        }
-    }
-
-    /// 受理一次 flush：同步返回票据，后台线程写 A 事务并推 `DurableAck`。
-    pub fn flush(&mut self, _reason: FlushReason) -> FlushTicket {
-        let ticket_id = self.journal.submit_ticket(self.live_rev);
-        FlushTicket {
-            ticket_id,
-            target_live_rev: self.live_rev,
-        }
-    }
-
-    /// 已 durable 的 head seq（方便测试/状态栏）。
-    pub fn vault(&self) -> &Vault {
-        &self.vault
-    }
-}
-
-fn rejected(command_id: CommandId, reason: RejectReason) -> EditOutcome {
-    EditOutcome::Rejected(Rejected { command_id, reason })
-}
-
-fn port(error: StorageError) -> PortError {
-    PortError::Storage(error.to_string())
-}
-
-/// Loro 错误同样归到端口错误（协议不泄露 Loro 类型）。
-fn port_loro(error: loro::LoroError) -> PortError {
-    PortError::Storage(error.to_string())
-}
-
-/// 区间校验：升序、互不重叠、`end <= scalar_len`。
-fn validate_edits(edits: &[ScalarEdit], scalar_len: usize) -> Result<(), ()> {
-    let mut previous_end = 0usize;
-    for (index, edit) in edits.iter().enumerate() {
-        let start = edit.start.get();
-        let end = edit.end.get();
-        if start > end || end > scalar_len {
-            return Err(());
-        }
-        if index > 0 && start < previous_end {
-            return Err(());
-        }
-        previous_end = end;
-    }
-    Ok(())
-}
-
-/// 读文档代际（`loro_docs.generation`），并确认它是正文文档。
-fn load_generation(vault: &Vault, doc_id: &str) -> Result<Generation, PortError> {
-    let rows = vault
-        .query(
-            "SELECT generation, kind FROM loro_docs WHERE doc_id = ?1",
-            &[Value::Text(doc_id.to_owned())],
-        )
-        .map_err(port)?;
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| PortError::NotOpen(doc_id.to_owned()))?;
-
-    let generation = match row.first() {
-        Some(Value::Integer(value)) if *value >= 0 => Generation(*value as u64),
-        _ => return Err(PortError::NotOpen(doc_id.to_owned())),
-    };
-    match row.get(1) {
-        Some(Value::Text(kind)) if kind == "body" => Ok(generation),
-        _ => Err(PortError::NotOpen(doc_id.to_owned())),
-    }
-}
-
-/// 一批 update 导入后的文本/版本变化（**不推进任何水位、不碰 journal**）。
-pub(crate) struct ImportDiff {
-    /// 导入前的正文。
-    pub(crate) before_text: String,
-    /// 导入后的正文（没有新 op 时与 `before_text` 相同）。
-    pub(crate) after_text: String,
-    /// 导入后的版本向量。
-    pub(crate) after_vv: VersionVector,
-    /// 是否真的产生了新的 op（以 VV 为准：文本相同也可能有纯格式 op）。
-    changed: bool,
-}
-
-impl ImportDiff {
-    /// 是否产生了新的 op。
-    pub(crate) fn changed(&self) -> bool {
-        self.changed
-    }
-
-    /// 本次变化的最小 splice（驱动调用方镜像与选区变换）。
-    pub(crate) fn splice(&self) -> DeltaSplice {
-        diff_splice(&self.before_text, &self.after_text)
-    }
-}
-
-/// 把一批 update 合进 live 文档，返回前后文本与 VV。
-///
-/// **只做 Loro 导入**：journal、水位、事件全部由调用方决定——
-/// `apply_remote` 走 journal（会产生 A 事务条目），`adopt_committed_delta` 走已 durable
-/// 路径（不进 journal、不产生 sync intent）。两条路径共用同一份导入/选区变换逻辑。
-pub(crate) fn import_updates<'a, I>(doc: &BodyDoc, updates: I) -> Result<ImportDiff, StorageError>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-{
-    let before_text = doc.text();
-    let before_vv = doc.vv();
-    for update in updates {
-        doc.import(update)?;
-    }
-    let after_vv = doc.vv();
-    let changed = after_vv != before_vv;
-    let after_text = if changed {
-        doc.text()
-    } else {
-        before_text.clone()
-    };
-    Ok(ImportDiff {
-        before_text,
-        after_text,
-        after_vv,
-        changed,
-    })
-}
-
-/// 以 scalar 为单位求「最小差异」splice（公共前缀 + 公共后缀）。
-pub(crate) fn diff_splice(before: &str, after: &str) -> DeltaSplice {
-    let before_chars: Vec<char> = before.chars().collect();
-    let after_chars: Vec<char> = after.chars().collect();
-
-    let mut prefix = 0usize;
-    while prefix < before_chars.len()
-        && prefix < after_chars.len()
-        && before_chars[prefix] == after_chars[prefix]
-    {
-        prefix += 1;
-    }
-
-    let mut suffix = 0usize;
-    while suffix < before_chars.len() - prefix
-        && suffix < after_chars.len() - prefix
-        && before_chars[before_chars.len() - 1 - suffix]
-            == after_chars[after_chars.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-
-    let delete_scalars = before_chars.len() - prefix - suffix;
-    let insert: String = after_chars[prefix..after_chars.len() - suffix]
-        .iter()
-        .collect();
-    DeltaSplice {
-        at: UnicodeScalar::new(prefix),
-        delete_scalars: delete_scalars as u64,
-        insert,
-    }
-}
-
-`````
-
-
-@@SECTION `crates/storage/src/session/schedule.rs`
-
-`````rust
-//! 存储侧调度（ADR 0003 切片 4a）：自动 flush + B 物化后台驱动。
-//!
-//! ## 自动 flush（ADR 0002 §9）
-//!
-//! - **固定窗口**：从「首次 dirty」起算 250 ms，**后续输入不重置**（不是尾缘 debounce），
-//!   否则连续输入会无限延期；
-//! - **64 KiB**：未 ACK 的 update 字节数达到阈值立即 flush；
-//! - `Ctrl+S` / 切换 / 关闭仍可显式 [`SessionDriver::flush`]；[`SessionDriver::close`] 有界排空。
-//!
-//! 时钟通过 [`Clock`] 注入：生产用 [`SystemClock`]（墙钟），测试用 [`ManualClock`]
-//! 直接 [`ManualClock::set`] 推进——不靠真睡 250 ms 碰运气。
-//!
-//! ## B 物化
-//!
-//! 只有收到 [`SessionEvent::Durable`] 之后才把 B 任务入队；后台线程按 ACK 里的
-//! `head_seq` 从**固定 frontier**调用 [`materialize_body`]（内部 `end_frontier_at` + CAS），
-//! 因此：
-//!
-//! - 不读取、不修改正在编辑的 live doc（worker 自己从库里重放）；
-//! - 旧任务迟到时 CAS 命中 0 行 → `Stale`，不会覆盖新结果；
-//! - 失败会记录在 [`DriverEvent::MaterializeFailed`]，可用 [`SessionDriver::retry_failed`] 重试。
-//!
-//! 调用方线程只做内存操作：`apply` / `flush` / `pump` 都不等待 SQLite；只有 `close`
-//! 与显式 `materialize_now` 会有界等待。
-//!
-//! ## 切片 3b：外部提交闸门 / adopt 的驱动转发
-//!
-//! [`SessionDriver`] 不重新实现闸门语义，只把 [`DocumentSession`] 的 3a API 原样转发，
-//! 并把 adopt 的结果变成**驱动事件**：
-//!
-//! - `adopt` 成功后把 `AdoptOutcome.delta` 作为 [`DriverEvent::Remote`]、把 `ack` 作为
-//!   [`DriverEvent::Durable`] 推入事件队列（顺序固定：先 Remote 再 Durable），
-//!   这样 UI 的 pump 就能在不重开文档的情况下更新镜像与 durable 水位；
-//! - **绝不**调用会 journal 的 `apply_remote`：那份 update 已经 durable，
-//!   再走一次会让 flusher 重复写库并产生多余的出站意图；
-//! - Held 期间 `apply` 的拒绝（[`super::protocol::RejectReason::NotReady`]）原样透传，
-//!   驱动不额外吞错、也不替调用方兜底。
-
-use std::collections::VecDeque;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-
-use rusqlite::types::Value;
-
-use super::core::{DocumentSession, SessionOptions};
-use super::gate::{
-    AdoptError, AdoptOutcome, AppliedHeads, ExternalCommitLease, ExternalCommitTicket, GateError,
-    GateState, PreparedCommittedDelta,
-};
-use super::protocol::{
-    DurableAck, EditOutcome, EditRequest, FlushReason, FlushTicket, HistoryState, LiveDelta,
-    LiveRev, PortError, SessionEvent,
-};
-use crate::error::StorageError;
-use crate::materialize::{materialize_body, MaterializeOutcome};
-use crate::Vault;
-
-/// 取锁；毒化也继续用内部值。
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// 可注入时钟：返回「驱动启动以来」的时长。
-pub trait Clock: Send + 'static {
-    /// 当前虚拟/墙钟时刻。
-    fn now(&self) -> Duration;
-}
-
-/// 墙钟（生产用）。
-#[derive(Debug)]
-pub struct SystemClock {
-    started: Instant,
-}
-
-impl SystemClock {
-    /// 从现在开始计时。
-    pub fn new() -> Self {
-        Self {
-            started: Instant::now(),
-        }
-    }
-}
-
-impl Default for SystemClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clock for SystemClock {
-    fn now(&self) -> Duration {
-        self.started.elapsed()
-    }
-}
-
-/// 手动时钟（测试用）：显式 `set`/`advance`，不依赖真实时间。
-#[derive(Debug, Clone)]
-pub struct ManualClock {
-    now: Arc<Mutex<Duration>>,
-}
-
-impl ManualClock {
-    /// 从 0 开始。
-    pub fn new() -> Self {
-        Self {
-            now: Arc::new(Mutex::new(Duration::ZERO)),
-        }
-    }
-
-    /// 设置到某个时刻。
-    pub fn set(&self, at: Duration) {
-        *lock(&self.now) = at;
-    }
-
-    /// 前进一段时间。
-    pub fn advance(&self, by: Duration) {
-        let mut now = lock(&self.now);
-        *now += by;
-    }
-
-    /// 读取当前时刻。
-    pub fn get(&self) -> Duration {
-        *lock(&self.now)
-    }
-}
-
-impl Default for ManualClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clock for ManualClock {
-    fn now(&self) -> Duration {
-        self.get()
-    }
-}
-
-/// 自动 flush 策略。
-#[derive(Debug, Clone, Copy)]
-pub struct FlushPolicy {
-    /// 首次 dirty 起算的固定窗口（默认 250 ms）。
-    pub interval: Duration,
-    /// 未 ACK update 字节阈值（默认 64 KiB）。
-    pub size_bytes: usize,
-}
-
-impl Default for FlushPolicy {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_millis(250),
-            size_bytes: 64 * 1024,
-        }
-    }
-}
-
-/// 驱动配置。
-#[derive(Debug, Clone, Copy)]
-pub struct DriverOptions {
-    /// 会话配置。
-    pub session: SessionOptions,
-    /// flush 策略。
-    pub policy: FlushPolicy,
-    /// 是否启动墙钟 ticker（生产 `true`；测试用假时钟时可关）。
-    pub auto_tick: bool,
-    /// ticker 间隔（默认 = `policy.interval`）。
-    pub tick_interval: Option<Duration>,
-}
-
-impl Default for DriverOptions {
-    fn default() -> Self {
-        Self {
-            session: SessionOptions::default(),
-            policy: FlushPolicy::default(),
-            auto_tick: true,
-            tick_interval: None,
-        }
-    }
-}
-
-/// 驱动向调用方推送的事件（不含请求的同步回复）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverEvent {
-    /// 已提交一张 flush 票据（后台还没写完）。
-    FlushScheduled {
-        /// 票据。
-        ticket: FlushTicket,
-        /// 触发原因。
-        reason: FlushReason,
-    },
-    /// durable 水位推进（同时会触发 B 物化入队）。
-    Durable(DurableAck),
-    /// 远端变更。
-    Remote(LiveDelta),
-    /// B 物化完成。
-    Materialized(MaterializeOutcome),
-    /// B 物化失败（已记录，可 `retry_failed` 重试）。
-    MaterializeFailed {
-        /// 笔记 ID。
-        note_id: String,
-        /// 失败信息。
-        message: String,
-    },
-}
-
-/// `close` 的排空报告。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloseReport {
-    /// 覆盖到最后一个 live_rev 的 ACK（超时为 `None`）。
-    pub durable: Option<DurableAck>,
-    /// 本次关闭过程中完成的 B 物化数。
-    pub materialized: usize,
-    /// 仍未 ACK 的编辑条数（正常情况下为 0）。
-    pub pending_edits: usize,
-    /// 仍未完成的 B 任务数（正常情况下为 0）。
-    pub pending_materialize: usize,
-    /// 是否超时（`true` 表示没排空，调用方应保留现场）。
-    pub timed_out: bool,
-}
-
-/// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MaterializeJob {
-    note_id: String,
-    doc_id: String,
-    target_seq: u64,
-}
-
-/// B 物化后台线程。
-struct Materializer {
-    sender: Option<Sender<MaterializeJob>>,
-    results: Arc<Mutex<VecDeque<MaterializeOutcome>>>,
-    errors: Arc<Mutex<VecDeque<(MaterializeJob, String)>>>,
-    pending: Arc<Mutex<usize>>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl Materializer {
-    fn spawn(vault: Vault, peer_id: u64, delay: Option<Duration>) -> Self {
-        let (sender, receiver) = channel::<MaterializeJob>();
-        let results: Arc<Mutex<VecDeque<MaterializeOutcome>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let errors: Arc<Mutex<VecDeque<(MaterializeJob, String)>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let pending = Arc::new(Mutex::new(0usize));
-
-        let worker_results = Arc::clone(&results);
-        let worker_errors = Arc::clone(&errors);
-        let worker_pending = Arc::clone(&pending);
-        let worker = thread::Builder::new()
-            .name("menghunote-materialize".to_owned())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    if let Some(delay) = delay {
-                        thread::sleep(delay);
-                    }
-                    // 运行期再解析 note_id：笔记行可能还没投影出来（失败要能记录并重试）
-                    let outcome = run_materialize(&vault, &job, peer_id);
-                    match outcome {
-                        Ok(outcome) => lock(&worker_results).push_back(outcome),
-                        Err(error) => {
-                            let message = error.to_string();
-                            lock(&worker_errors).push_back((job, message));
-                        }
-                    }
-                    let mut pending = lock(&worker_pending);
-                    *pending = pending.saturating_sub(1);
-                }
-            })
-            .ok();
-
-        Self {
-            sender: Some(sender),
-            results,
-            errors,
-            pending,
-            worker,
-        }
-    }
-
-    fn enqueue(&self, job: MaterializeJob) {
-        if let Some(sender) = self.sender.as_ref() {
-            *lock(&self.pending) += 1;
-            if sender.send(job).is_err() {
-                let mut pending = lock(&self.pending);
-                *pending = pending.saturating_sub(1);
-            }
-        }
-    }
-
-    fn pending(&self) -> usize {
-        *lock(&self.pending)
-    }
-
-    fn take_results(&self) -> Vec<MaterializeOutcome> {
-        lock(&self.results).drain(..).collect()
-    }
-
-    fn take_errors(&self) -> Vec<(MaterializeJob, String)> {
-        lock(&self.errors).drain(..).collect()
-    }
-}
-
-impl Drop for Materializer {
-    fn drop(&mut self) {
-        drop(self.sender.take());
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-/// 墙钟 ticker：按固定间隔投递 `()`，驱动 `pump` 检查固定窗口。
-struct Ticker {
-    stop: Option<Sender<()>>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl Ticker {
-    fn spawn(interval: Duration) -> (Self, Receiver<()>) {
-        let interval = interval.max(Duration::from_millis(1));
-        let (tick_sender, tick_receiver) = channel::<()>();
-        let (stop_sender, stop_receiver) = channel::<()>();
-
-        let worker = thread::Builder::new()
-            .name("menghunote-tick".to_owned())
-            .spawn(move || loop {
-                match stop_receiver.recv_timeout(interval) {
-                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if tick_sender.send(()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            })
-            .ok();
-
-        (
-            Self {
-                stop: Some(stop_sender),
-                worker,
-            },
-            tick_receiver,
-        )
-    }
-}
-
-impl Drop for Ticker {
-    fn drop(&mut self) {
-        drop(self.stop.take());
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-/// 会话驱动：会话核 + 自动 flush 调度 + B 物化后台线程。
-pub struct SessionDriver {
-    session: DocumentSession,
-    vault: Vault,
-    peer_id: u64,
-    policy: FlushPolicy,
-    clock: Box<dyn Clock>,
-    /// 首次 dirty 的虚拟时刻；`None` = 没有等待窗口的脏数据。
-    dirty_since: Option<Duration>,
-    /// 已提交 flush 覆盖到的 live_rev（避免空 flush 造成重复票据）。
-    flushed_live_rev: LiveRev,
-    materializer: Materializer,
-    /// B 失败任务（可 `retry_failed`）。
-    failed_jobs: Vec<MaterializeJob>,
-    /// 只负责保活：Drop 时停线程；逻辑上不读取。
-    _ticker: Option<Ticker>,
-    tick_receiver: Option<Receiver<()>>,
-    events: VecDeque<DriverEvent>,
-}
-
-impl std::fmt::Debug for SessionDriver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionDriver")
-            .field("doc_id", &self.session.doc_id())
-            .field("live_rev", &self.session.live_rev())
-            .field("dirty_since", &self.dirty_since)
-            .field("pending_bytes", &self.session.pending_bytes())
-            .finish()
-    }
-}
-
-impl SessionDriver {
-    /// 打开驱动（墙钟 + ticker）。
-    pub fn open(vault: &Vault, doc_id: &str, options: DriverOptions) -> Result<Self, PortError> {
-        Self::open_with_clock(vault, doc_id, options, Box::new(SystemClock::new()))
-    }
-
-    /// 打开驱动并注入时钟（测试用假时钟）。
-    pub fn open_with_clock(
-        vault: &Vault,
-        doc_id: &str,
-        options: DriverOptions,
-        clock: Box<dyn Clock>,
-    ) -> Result<Self, PortError> {
-        Self::open_with_clock_and_materialize_delay(vault, doc_id, options, clock, None)
-    }
-
-    /// 打开驱动并注入时钟 + **B 物化延迟**（测试/故障注入，与 `SessionOptions::flush_delay` 同性质）。
-    ///
-    /// 延迟是构造参数而不是 `DriverOptions` 字段：后者是公开结构体，
-    /// 加字段会让外部（editor 的 e2e 夹具）的结构体字面量编译失败。
-    pub fn open_with_clock_and_materialize_delay(
-        vault: &Vault,
-        doc_id: &str,
-        options: DriverOptions,
-        clock: Box<dyn Clock>,
-        materialize_delay: Option<Duration>,
-    ) -> Result<Self, PortError> {
-        let session = DocumentSession::open(vault, doc_id, options.session)?;
-        let materializer =
-            Materializer::spawn(vault.clone(), options.session.peer_id, materialize_delay);
-        let (ticker, tick_receiver) = if options.auto_tick {
-            let interval = options.tick_interval.unwrap_or(options.policy.interval);
-            let (ticker, receiver) = Ticker::spawn(interval);
-            (Some(ticker), Some(receiver))
-        } else {
-            (None, None)
-        };
-        Ok(Self {
-            session,
-            vault: vault.clone(),
-            peer_id: options.session.peer_id,
-            policy: options.policy,
-            clock,
-            dirty_since: None,
-            flushed_live_rev: LiveRev(0),
-            materializer,
-            failed_jobs: Vec::new(),
-            _ticker: ticker,
-            tick_receiver,
-            events: VecDeque::new(),
-        })
-    }
-
-    /// 会话核（只读能力：快照/历史/水位）。
-    pub fn session(&self) -> &DocumentSession {
-        &self.session
-    }
-
-    /// 当前 live 正文。
-    pub fn markdown(&self) -> String {
-        self.session.markdown()
-    }
-
-    /// 当前 live 修订号。
-    pub fn live_rev(&self) -> LiveRev {
-        self.session.live_rev()
-    }
-
-    /// 未 ACK update 字节数。
-    pub fn pending_bytes(&self) -> usize {
-        self.session.pending_bytes()
-    }
-
-    /// 未 ACK 编辑条数。
-    pub fn pending_edits(&self) -> usize {
-        self.session.pending_len()
-    }
-
-    /// 下一次固定窗口到期时刻（`None` 表示当前没有等待中的脏数据）。
-    pub fn next_deadline(&self) -> Option<Duration> {
-        self.dirty_since.map(|since| since + self.policy.interval)
-    }
-
-    /// 开始组合（透传会话闸门）。
-    pub fn begin_composition(&mut self) -> u32 {
-        self.session.begin_composition()
-    }
-
-    /// 结束组合：合并延后的远端导入；这些 op 已进 journal，需要计入 dirty。
-    pub fn end_composition(&mut self) -> Vec<LiveDelta> {
-        let deltas = self.session.end_composition();
-        if !deltas.is_empty() {
-            self.mark_dirty();
-        }
-        deltas
-    }
-
-    /// 背压导致延后队列没排空时，flush 之后再调一次。
-    pub fn merge_deferred_remote(&mut self) -> Vec<LiveDelta> {
-        let deltas = self.session.merge_deferred_remote();
-        if !deltas.is_empty() {
-            self.mark_dirty();
-        }
-        deltas
-    }
-
-    /// 是否正处于 composition。
-    pub fn is_composing(&self) -> bool {
-        self.session.is_composing()
-    }
-
-    /// 仍未合并的远端 update 条数。
-    pub fn deferred_remote_len(&self) -> usize {
-        self.session.deferred_remote_len()
-    }
-
-    /// 受理编辑；首次 dirty 记录窗口起点，达到 64 KiB 立即 flush。
-    pub fn apply(&mut self, request: EditRequest) -> EditOutcome {
-        let outcome = self.session.apply(request);
-        if matches!(outcome, EditOutcome::Applied(_)) {
-            self.mark_dirty();
-        }
-        outcome
-    }
-
-    /// 远端导入：同样计入 dirty（远端 op 也要落 durable）。
-    ///
-    /// **已 durable** 的外部增量不要走这里（见 [`Self::adopt_committed_delta`]）：
-    /// 这条路径会 journal 并产生出站意图。
-    pub fn apply_remote(&mut self, update: &[u8]) -> Result<Option<LiveDelta>, PortError> {
-        let delta = self.session.apply_remote(update)?;
-        if delta.is_some() {
-            self.mark_dirty();
-        }
-        Ok(delta)
-    }
-
-    // ---- 外部提交闸门 / adopt（ADR 0009 切片 3b：只转发 3a 的存储层语义）----
-
-    /// Held 期间本地写入是否被冻结（= 外部提交闸门持有中）。
-    #[must_use]
-    pub fn is_external_commit_held(&self) -> bool {
-        self.session.is_external_commit_held()
-    }
-
-    /// 当前外部提交租约（`None` = 不在 Held）。
-    #[must_use]
-    pub fn external_commit_lease(&self) -> Option<&ExternalCommitLease> {
-        self.session.external_commit_lease()
-    }
-
-    /// 登记一次外部提交（只建立票据；重复 begin 由会话拒绝）。
-    pub fn begin_external_commit(&mut self) -> Result<ExternalCommitTicket, GateError> {
-        self.session.begin_external_commit()
-    }
-
-    /// 非阻塞推进闸门：`WaitingIME` → `Flushing` → `Held(lease)`。
-    ///
-    /// 进入 Held 时顺手把调度器自己的水位对齐：闸门的成立条件就是「目标已 durable 且
-    /// journal 空闲」，因此这里不再欠这次 flush（否则下一次 pump 会为已经不脏的数据
-    /// 再投一张空票据）。
-    pub fn poll_external_commit(&mut self, ticket: &ExternalCommitTicket) -> GateState {
-        let state = self.session.poll_external_commit(ticket);
-        if let GateState::Held(lease) = &state {
-            self.dirty_since = None;
-            self.flushed_live_rev = self.flushed_live_rev.max(lease.target_live_rev());
-        }
-        state
-    }
-
-    /// adopt 一份**已 durable** 的外部增量（必须 Held 且租约匹配）。
-    ///
-    /// 成功后把增量与 ACK 变成驱动事件（**先 Remote 再 Durable**），`pump` / `tick`
-    /// 立刻能取到；失败时 live 与 durable 水位都不变（3a 保证）。
-    pub fn adopt_committed_delta(
-        &mut self,
-        lease: &ExternalCommitLease,
-        prepared: PreparedCommittedDelta,
-    ) -> Result<AdoptOutcome, AdoptError> {
-        let outcome = self.session.adopt_committed_delta(lease, prepared)?;
-        // 不调用 `apply_remote`：这份 CRDT 已经 durable，再 journal 一次会重复写库 + 产生意图。
-        self.events
-            .push_back(DriverEvent::Remote(outcome.delta.clone()));
-        self.push_durable(outcome.ack.clone());
-        // adopt 要求 journal 空闲，因此"欠一次 flush"的水位到此为止。
-        self.dirty_since = None;
-        self.flushed_live_rev = self.flushed_live_rev.max(outcome.ack.through_live_rev);
-        Ok(outcome)
-    }
-
-    /// 结束外部提交并释放闸门（`applied` 必须就是库中当前 head）。
-    ///
-    /// 失败/取消路径下 3a 会把 Held 期间已 durable 的变化交付进 live 并作为
-    /// `SessionEvent::Remote` 入队，驱动会在下一次 `pump` 转发成 [`DriverEvent::Remote`]。
-    pub fn end_external_commit(
-        &mut self,
-        lease: ExternalCommitLease,
-        applied: AppliedHeads,
-    ) -> Result<(), GateError> {
-        self.session.end_external_commit(lease, applied)
-    }
-
-    /// 放弃一次外部提交（失败/取消），同样先交付已 durable 的变化。
-    ///
-    /// 返回的错误原样来自会话（例如仍 `pending` 时 [`GateError::Pending`]）；交付的增量
-    /// 会作为会话事件由下一次 `pump` 转发，这里不重复推送，避免同一份 delta 应用两次。
-    pub fn cancel_external_commit(
-        &mut self,
-        ticket: &ExternalCommitTicket,
-    ) -> Result<(), GateError> {
-        self.session.cancel_external_commit(ticket).map(|_| ())
-    }
-
-    /// **固定窗口**：只在首次 dirty 时记录起点，后续输入不重置。
-    fn mark_dirty(&mut self) {
-        if self.dirty_since.is_none() {
-            self.dirty_since = Some(self.clock.now());
-        }
-        if self.session.pending_bytes() >= self.policy.size_bytes
-            && self.session.live_rev() > self.flushed_live_rev
-        {
-            self.flush(FlushReason::Size);
-        }
-    }
-
-    /// 撤销（转发会话核的唯一 `UndoManager`）。
-    ///
-    /// dirty 规则与 [`SessionDriver::apply`] 对齐：
-    /// - `Ok(Some(Applied))` → `mark_dirty()`（撤销也是正文改动，必须落 durable）；
-    /// - `Ok(None)`（没有可撤销项）/ `Ok(Some(Rejected))` / `Stale`（不会出现）→ **不** dirty；
-    /// - `Err(PortError)` → 原样透传，不 dirty。
-    pub fn undo(&mut self) -> Result<Option<EditOutcome>, PortError> {
-        let outcome = self.session.undo()?;
-        if matches!(&outcome, Some(EditOutcome::Applied(_))) {
-            self.mark_dirty();
-        }
-        Ok(outcome)
-    }
-
-    /// 重做；dirty 规则同 [`SessionDriver::undo`]。
-    pub fn redo(&mut self) -> Result<Option<EditOutcome>, PortError> {
-        let outcome = self.session.redo()?;
-        if matches!(&outcome, Some(EditOutcome::Applied(_))) {
-            self.mark_dirty();
-        }
-        Ok(outcome)
-    }
-
-    /// 撤销/重做栈状态（真实计数来自 Loro `UndoManager`）。
-    pub fn history(&self) -> HistoryState {
-        self.session.history()
-    }
-
-    /// 手动/按原因 flush（同步返回票据，不等待 SQLite）。
-    pub fn flush(&mut self, reason: FlushReason) -> FlushTicket {
-        let ticket = self.session.flush(reason);
-        self.flushed_live_rev = ticket.target_live_rev;
-        self.dirty_since = None;
-        self.events
-            .push_back(DriverEvent::FlushScheduled { ticket, reason });
-        ticket
-    }
-
-    /// 推进到指定虚拟时刻（测试用于精确控制固定窗口）。
-    pub fn tick(&mut self, now: Duration) -> Vec<DriverEvent> {
-        self.advance_to(now);
-        self.collect_session_events();
-        self.collect_materialize_results();
-        self.drain_events()
-    }
-
-    /// 非阻塞泵：读 ticker、检查固定窗口、收 session/B 事件。
-    pub fn pump(&mut self) -> Vec<DriverEvent> {
-        self.take_ticks();
-        let now = self.clock.now();
-        self.advance_to(now);
-        self.collect_session_events();
-        self.collect_materialize_results();
-        self.drain_events()
-    }
-
-    fn take_ticks(&mut self) {
-        let Some(receiver) = self.tick_receiver.as_ref() else {
-            return;
-        };
-        // 只做「消化信号」：固定窗口是否到期由虚拟/墙钟时刻决定
-        while receiver.try_recv().is_ok() {}
-    }
-
-    fn advance_to(&mut self, now: Duration) {
-        if let Some(since) = self.dirty_since {
-            if now >= since + self.policy.interval {
-                self.flush(FlushReason::Interval);
-            }
-        }
-    }
-
-    fn collect_session_events(&mut self) {
-        for event in self.session.events() {
-            match event {
-                SessionEvent::Durable(ack) => self.push_durable(ack),
-                SessionEvent::Remote(delta) => self.events.push_back(DriverEvent::Remote(delta)),
-            }
-        }
-    }
-
-    /// 推入一条 `Durable` 事件，并按既有约定入队 B 物化。
-    ///
-    /// 两条来源共用：flush 线程的 ACK，以及 adopt 之后由外部提交推进的 head（3b）。
-    fn push_durable(&mut self, ack: DurableAck) {
-        // DurableAck 之后才入队 B（用 ACK 的固定 head_seq，不碰 live doc）。
-        self.enqueue_materialize(&ack);
-        self.events.push_back(DriverEvent::Durable(ack));
-    }
-
-    /// DurableAck 之后才入队 B（用 ACK 的固定 head_seq，不碰 live doc）。
-    fn enqueue_materialize(&mut self, ack: &DurableAck) {
-        if ack.head_seq == 0 {
-            return;
-        }
-        let doc_id = self.session.doc_id().to_owned();
-        // note_id 只是给事件用的提示；权威解析在 worker 运行期做
-        let note_hint = lookup_note_id(&self.vault, &doc_id)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        self.materializer.enqueue(MaterializeJob {
-            note_id: note_hint,
-            doc_id,
-            target_seq: ack.head_seq,
-        });
-    }
-
-    fn collect_materialize_results(&mut self) {
-        for outcome in self.materializer.take_results() {
-            self.events.push_back(DriverEvent::Materialized(outcome));
-        }
-        for (job, message) in self.materializer.take_errors() {
-            self.events.push_back(DriverEvent::MaterializeFailed {
-                note_id: job.note_id.clone(),
-                message,
-            });
-            self.failed_jobs.push(job);
-        }
-    }
-
-    fn drain_events(&mut self) -> Vec<DriverEvent> {
-        self.events.drain(..).collect()
-    }
-
-    /// 有界排空：flush(Close) → 等 durable → 等 B 完成。
-    ///
-    /// 调用方可以是 UI 线程（关闭窗口），但必须有界：`timeout` 到了就返回并置 `timed_out`。
-    pub fn close(&mut self, timeout: Duration) -> CloseReport {
-        let target = self.session.live_rev();
-        let needs_flush = self.session.pending_len() > 0 || target > self.flushed_live_rev;
-        if needs_flush {
-            self.flush(FlushReason::Close);
-        }
-
-        let deadline = Instant::now() + timeout;
-        let mut durable: Option<DurableAck> = None;
-        let mut materialized = 0usize;
-
-        loop {
-            for event in self.pump() {
-                match event {
-                    DriverEvent::Durable(ack) if ack.through_live_rev >= target => {
-                        durable = Some(ack);
-                    }
-                    DriverEvent::Materialized(_) => materialized += 1,
-                    _ => {}
-                }
-            }
-
-            let durable_ok = durable.is_some() || !needs_flush;
-            let drained = durable_ok && self.materializer.pending() == 0;
-            if drained || Instant::now() >= deadline {
-                // 收尾：把最后一批 B 结果也计入
-                for event in self.pump() {
-                    if matches!(event, DriverEvent::Materialized(_)) {
-                        materialized += 1;
-                    }
-                }
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        CloseReport {
-            durable,
-            materialized,
-            pending_edits: self.session.pending_len(),
-            pending_materialize: self.materializer.pending(),
-            timed_out: self.session.pending_len() > 0 || self.materializer.pending() > 0,
-        }
-    }
-
-    /// 显式同步物化（启动修复/测试用）：从固定 `target_seq` 走 CAS。
-    pub fn materialize_now(
-        &mut self,
-        note_id: &str,
-        doc_id: &str,
-        target_seq: u64,
-    ) -> Result<MaterializeOutcome, StorageError> {
-        materialize_body(&self.vault, note_id, doc_id, target_seq, self.peer_id)
-    }
-
-    /// 重新入队失败的 B 任务；返回重试条数。
-    pub fn retry_failed(&mut self) -> usize {
-        let jobs = std::mem::take(&mut self.failed_jobs);
-        let count = jobs.len();
-        for job in jobs {
-            self.materializer.enqueue(job);
-        }
-        count
-    }
-
-    /// 已 durable 的 head seq。
-    pub fn durable_head_seq(&self) -> u64 {
-        self.session.durable_head_seq()
-    }
-
-    /// 等待 B 队列排空（测试/关闭辅助），返回是否排空。
-    ///
-    /// **契约**：返回 `true` 时，worker 已完成的 B 结果都已经被搬进事件队列并取走，
-    /// 之后的 `pump()` 不会再冒出「上一次等待之前就该完成」的 `Materialized` 事件。
-    /// （worker 是「先 push 结果、再减 pending」，所以 pending 归零后再泵一次才能收干净。）
-    pub fn wait_materialize(&mut self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            // 搬走已完成的结果/错误（本方法是等待辅助，事件直接丢弃）
-            for _ in self.pump() {}
-            if self.materializer.pending() == 0 {
-                // 收尾：把「pending 已减、结果刚入队」的那一批也搬走
-                for _ in self.pump() {}
-                return self.materializer.pending() == 0;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
-}
-
-/// worker 运行期：解析 note_id 后从固定 seq 物化。
-fn run_materialize(
-    vault: &Vault,
-    job: &MaterializeJob,
-    peer_id: u64,
-) -> Result<MaterializeOutcome, StorageError> {
-    let note_id = lookup_note_id(vault, &job.doc_id)?.ok_or_else(|| StorageError::Corrupt {
-        context: format!("找不到 body_doc_id={} 的笔记行，暂时无法物化", job.doc_id),
-    })?;
-    materialize_body(vault, &note_id, &job.doc_id, job.target_seq, peer_id)
-}
-
-/// `body_doc_id` → `note_id`（B 物化需要笔记行）。
-fn lookup_note_id(vault: &Vault, doc_id: &str) -> Result<Option<String>, StorageError> {
-    let rows = vault.query(
-        "SELECT note_id FROM notes WHERE body_doc_id = ?1 ORDER BY note_id LIMIT 1",
-        &[Value::Text(doc_id.to_owned())],
-    )?;
-    match rows.first().and_then(|row| row.first()) {
-        Some(Value::Text(note_id)) => Ok(Some(note_id.clone())),
-        Some(Value::Null) | None => Ok(None),
-        other => Err(StorageError::Corrupt {
-            context: format!("notes.note_id 读回异常：{other:?}"),
-        }),
     }
 }
 
@@ -58819,12 +59023,12 @@ use menghunote_storage::session::{
 use menghunote_storage::{
     abort_baseline_apply, append_updates_with_integrated_marks, apply_baseline_assets,
     apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_state,
-    begin_baseline_apply, create_note_slot, finish_baseline_apply, load_body_doc, load_head,
-    reset_baseline_apply_debug, set_sync_log_id, store_inbox_verified_batch, sync_cursor_state,
-    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc,
-    StorageError, SyncContext, UpdateRecord, Value, Vault, VerifiedInboxRow,
-    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
-    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
+    baseline_verify_failure, begin_baseline_apply, create_note_slot, finish_baseline_apply,
+    load_body_doc, load_head, mark_baseline_verify_failed, reset_baseline_apply_debug,
+    set_sync_log_id, store_inbox_verified_batch, sync_cursor_state, BaselineApplyFinish,
+    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc, StorageError, SyncContext,
+    UpdateRecord, Value, Vault, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER,
+    META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
 };
 use menghunote_text::UnicodeScalar;
 
@@ -60182,6 +60386,170 @@ fn finish_without_all_assets_is_conflict() {
         finish_baseline_apply(&vault, 4, "baseline-cursor").expect("finish"),
         BaselineApplyFinish::Applied(_)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// P1：verify 失败标记的 storage 门禁（apply / finish / finishable）
+// ---------------------------------------------------------------------------
+
+/// 失败标记存在时：
+/// - `apply_baseline_batch` 在任何解码/写事务前拒绝，且零写；
+/// - `finish_baseline_apply` 返回**带原因**的 `SyncConflict`，不是丢掉原因的 `Ok(Conflict)`；
+/// - `baseline_apply_state.finishable` 在预期集合已全齐时也必须为 false（status 仍是 staging）；
+/// - `abort_baseline_apply` 清标记后 `begin` 可重新成功。
+#[test]
+fn marker_blocks_apply_and_finish_and_finishable() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-a", "a-local");
+    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
+
+    // 先真正跑完唯一一批，让预期集合在标记之前**已全齐**（证明 finishable 的变化来自标记）。
+    let applied = apply_baseline_batch(
+        &vault,
+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
+        &[],
+    )
+    .expect("batch a");
+    assert!(applied.finishable, "标记写入前预期集合已齐，应可 finish");
+
+    let head_before = head(&vault, "doc-a");
+    let cursor_before = sync_cursor_state(&vault).expect("cursor");
+    let remote_known_before = meta_remote_known_bytes(&vault, "doc-a");
+    let updates_before = count(&vault, "SELECT count(*) FROM loro_updates", &[]);
+    let journal_rows_before = count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]);
+
+    const REASON: &str = "读回校验失败：snapshot 的 VV 未被本地 VV 覆盖";
+    mark_baseline_verify_failed(&vault, REASON).expect("写失败标记");
+    assert_eq!(
+        baseline_verify_failure(&vault).expect("读标记").as_deref(),
+        Some(REASON)
+    );
+
+    // 预期集合仍全齐（applied=1/expected=1），但 finishable 必须因标记为 false。
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal 必须保留");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.expected_docs, Some(1));
+    assert_eq!(state.applied_docs, 1);
+    assert!(
+        !state.finishable,
+        "失败标记存在时即使 expected 已全齐也不得 finishable"
+    );
+
+    // apply：用一篇新文档 doc-b 证明门禁在解码/写事务之前生效（若漏检会落 loro_docs/update）。
+    let error = apply_baseline_batch(
+        &vault,
+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
+        &[],
+    )
+    .expect_err("失败标记必须阻止 apply_baseline_batch");
+    assert!(
+        matches!(&error, StorageError::SyncConflict { .. }),
+        "应当是 SyncConflict，实际 {error:?}"
+    );
+    let message = format!("{error}");
+    assert!(message.contains(REASON), "冲突必须携带失败原因：{message}");
+    assert!(
+        message.contains("abort_baseline_apply"),
+        "冲突必须提示先 abort_baseline_apply：{message}"
+    );
+
+    // 零写：doc-b 没有任何行；doc-a 的 head/远端已知 VV 与全库 update 数不变；
+    // journal 的已应用集合与预期集合也不变。
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_docs WHERE doc_id='doc-b'",
+            &[]
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-b'",
+            &[]
+        ),
+        0
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
+        updates_before
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
+        journal_rows_before
+    );
+    assert_eq!(head(&vault, "doc-a").head_seq, head_before.head_seq);
+    assert_eq!(
+        meta_remote_known_bytes(&vault, "doc-a"),
+        remote_known_before
+    );
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.applied_docs, 1);
+    assert_eq!(state.expected_docs, Some(1));
+
+    // finish：必须是**带原因**的 SyncConflict，不能退化成 Ok(Conflict) 把原因丢掉。
+    let error = finish_baseline_apply(&vault, 5, "baseline-cursor")
+        .expect_err("失败标记必须阻止 finish_baseline_apply");
+    assert!(
+        matches!(&error, StorageError::SyncConflict { .. }),
+        "应当是 SyncConflict，实际 {error:?}"
+    );
+    let message = format!("{error}");
+    assert!(
+        message.contains(REASON),
+        "finish 冲突必须携带失败原因：{message}"
+    );
+    assert!(
+        message.contains("abort_baseline_apply"),
+        "finish 冲突必须提示先 abort_baseline_apply：{message}"
+    );
+
+    // 零写：水位/cursor/journal 全部保持 begin/上次 apply 后的状态。
+    let cursor_after = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor_after.received_seq, cursor_before.received_seq);
+    assert_eq!(cursor_after.integrated_seq, cursor_before.integrated_seq);
+    assert_eq!(
+        cursor_after.confirmed_highwater,
+        cursor_before.confirmed_highwater
+    );
+    assert_eq!(relay_cursor(&vault), None);
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.chosen_cursor, None);
+    assert_eq!(state.applied_docs, 1);
+
+    // abort 清 journal + 标记，已 merge 的正文保留；之后 begin 可重新成功。
+    assert!(abort_baseline_apply(&vault).expect("abort"));
+    assert!(
+        baseline_verify_failure(&vault).expect("读标记").is_none(),
+        "abort 必须清除失败标记"
+    );
+    assert!(baseline_apply_state(&vault).expect("state").is_none());
+    let merged = load_body_doc(&vault, "doc-a", PEER_A, None)
+        .expect("abort 后正文")
+        .0;
+    assert!(
+        merged.text().contains("a-local"),
+        "abort 只清 journal，不得删已 merge 的正文，实际={:?}",
+        merged.text()
+    );
+
+    let reopened = begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
+    assert_eq!(reopened.status, BaselineApplyStatus::Staging);
+    assert_eq!(reopened.applied_docs, 0, "abort 后 begin 应是全新 journal");
+    assert_eq!(reopened.expected_docs, Some(1));
+    assert!(
+        !reopened.finishable,
+        "新建 staging 尚未应用任何批次，不应 finishable"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -63480,6 +63848,524 @@ fn invalid_sync_context_fails_at_open_not_at_flush() {
         "epoch=0 的上下文必须在打开结构写入口时就报错"
     );
     assert_eq!(outbox_count(&vault), 0, "打开失败不得写任何 intent");
+}
+
+`````
+
+
+@@SECTION `crates/storage/tests/session_schedule.rs`
+
+`````rust
+//! 存储侧调度：固定窗口、64 KiB、Close 排空、B 物化后台驱动。
+
+mod support;
+
+use std::time::{Duration, Instant};
+
+use menghunote_storage::session::{
+    CloseReport, DocumentSession, DriverEvent, DriverOptions, DurableAck, EditRequest, FlushPolicy,
+    FlushReason, LiveRev, ManualClock, ScalarEdit, SessionDriver, SessionEpoch, SessionOptions,
+};
+use menghunote_storage::{create_note_slot, load_body_state, MaterializeOutcome, Vault};
+use support::*;
+
+fn edit(start: usize, end: usize, replacement: &str) -> ScalarEdit {
+    ScalarEdit {
+        start: menghunote_text::UnicodeScalar::new(start),
+        end: menghunote_text::UnicodeScalar::new(end),
+        replacement: replacement.to_owned(),
+    }
+}
+
+fn request(
+    session: &DocumentSession,
+    command: &str,
+    base: u64,
+    edits: Vec<ScalarEdit>,
+) -> EditRequest {
+    EditRequest {
+        doc_id: session.doc_id().to_owned(),
+        generation: session.generation(),
+        session_epoch: session.session_epoch(),
+        command_id: command.to_owned(),
+        base_live_rev: LiveRev(base),
+        edits,
+        origin: "local".to_owned(),
+        undo_group: None,
+    }
+}
+
+fn options(peer: u64) -> SessionOptions {
+    SessionOptions {
+        peer_id: peer,
+        session_epoch: SessionEpoch(11),
+        ..SessionOptions::default()
+    }
+}
+
+fn driver_options(session: SessionOptions, policy: FlushPolicy) -> DriverOptions {
+    DriverOptions {
+        session,
+        policy,
+        auto_tick: false,
+        tick_interval: None,
+    }
+}
+
+fn open_driver(vault: &Vault, clock: ManualClock, policy: FlushPolicy) -> SessionDriver {
+    SessionDriver::open_with_clock(
+        vault,
+        "doc-1",
+        driver_options(options(PEER_A), policy),
+        Box::new(clock),
+    )
+    .expect("打开驱动")
+}
+
+fn wait_durable(
+    driver: &mut SessionDriver,
+    target: LiveRev,
+    timeout: Duration,
+) -> Option<DurableAck> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for event in driver.pump() {
+            if let DriverEvent::Durable(ack) = event {
+                if ack.through_live_rev >= target {
+                    return Some(ack);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn flush_events(events: &[DriverEvent]) -> Vec<FlushReason> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DriverEvent::FlushScheduled { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn fixed_window_starts_at_first_dirty_not_last_input() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut driver = open_driver(&vault, clock.clone(), FlushPolicy::default());
+
+    // t=0 首次 dirty：窗口起点锁在 0
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    assert_eq!(
+        driver.next_deadline(),
+        Some(Duration::from_millis(250)),
+        "窗口从首次 dirty 起算"
+    );
+
+    // t=100ms 继续输入：**不重置**窗口起点
+    clock.set(Duration::from_millis(100));
+    driver.apply(request(driver.session(), "c2", 1, vec![edit(1, 1, "乙")]));
+    assert_eq!(
+        driver.next_deadline(),
+        Some(Duration::from_millis(250)),
+        "连续输入不得延期（固定窗口，不是 debounce）"
+    );
+
+    // t=249ms 还不到期
+    clock.set(Duration::from_millis(249));
+    let events = driver.tick(clock.get());
+    assert!(flush_events(&events).is_empty(), "249ms 不应 flush");
+    assert_eq!(driver.pending_edits(), 2);
+
+    // t=250ms 到期：与前一次输入无关，都会 flush
+    clock.set(Duration::from_millis(250));
+    let events = driver.tick(clock.get());
+    assert_eq!(
+        flush_events(&events),
+        vec![FlushReason::Interval],
+        "250ms 固定窗口到期必须 flush"
+    );
+    assert_eq!(driver.next_deadline(), None);
+
+    let ack = wait_durable(&mut driver, LiveRev(2), Duration::from_secs(5)).expect("DurableAck");
+    assert_eq!(ack.through_live_rev, LiveRev(2));
+    assert_eq!(driver.pending_edits(), 0);
+}
+
+#[test]
+fn continuous_input_still_meets_the_window_deadline() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut driver = open_driver(&vault, clock.clone(), FlushPolicy::default());
+
+    for (index, step) in [0u64, 60, 120, 180, 240].iter().enumerate() {
+        clock.set(Duration::from_millis(*step));
+        let start = driver.session().markdown().chars().count();
+        let command = format!("c{}", index + 1);
+        driver.apply(request(
+            driver.session(),
+            &command,
+            driver.live_rev().0,
+            vec![edit(start, start, "字")],
+        ));
+    }
+    assert_eq!(driver.next_deadline(), Some(Duration::from_millis(250)));
+
+    let events = driver.tick(Duration::from_millis(250));
+    assert_eq!(
+        flush_events(&events),
+        vec![FlushReason::Interval],
+        "首字符后 250ms 必到，不被后续输入拖后"
+    );
+    wait_durable(&mut driver, LiveRev(5), Duration::from_secs(5)).expect("DurableAck");
+}
+
+#[test]
+fn reaching_64_kib_flushes_immediately() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut driver = open_driver(&vault, clock.clone(), FlushPolicy::default());
+
+    // 小编辑不触发（默认阈值 64 KiB）
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "小")]));
+    let events = driver.pump();
+    assert!(
+        flush_events(&events).is_empty(),
+        "小编辑不应触发 Size flush"
+    );
+
+    // 一次插入 70 KiB → 立即 flush(Size)
+    let big = "x".repeat(70 * 1024);
+    driver.apply(request(driver.session(), "c2", 1, vec![edit(1, 1, &big)]));
+    let events = driver.pump();
+    assert_eq!(
+        flush_events(&events),
+        vec![FlushReason::Size],
+        "达到 64 KiB 必须立即 flush，不等定时器"
+    );
+    assert_eq!(driver.next_deadline(), None, "Size flush 也清掉窗口");
+    wait_durable(&mut driver, LiveRev(2), Duration::from_secs(5)).expect("DurableAck");
+}
+
+#[test]
+fn close_drains_pending_edits_and_materializes_body() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut driver = open_driver(&vault, clock, FlushPolicy::default());
+
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    driver.apply(request(driver.session(), "c2", 1, vec![edit(1, 1, "乙")]));
+    assert_eq!(driver.pending_edits(), 2);
+
+    let report: CloseReport = driver.close(Duration::from_secs(5));
+    assert!(!report.timed_out, "Close 必须排空：{report:?}");
+    assert_eq!(report.pending_edits, 0);
+    assert_eq!(report.pending_materialize, 0);
+    assert_eq!(report.flush_error, None, "正常关闭不得报 flush 失败");
+    assert!(
+        report.durable.is_some(),
+        "Close 要等到覆盖最后 live_rev 的 ACK"
+    );
+    assert_eq!(
+        report.durable.as_ref().expect("ack").through_live_rev,
+        LiveRev(2)
+    );
+    assert!(report.materialized >= 1, "Close 期间至少完成一次 B 物化");
+
+    let state = load_body_state(&vault, "note-1").expect("状态");
+    assert_eq!(state.body_md.as_deref(), Some("甲乙"), "B 物化必须落地");
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM projection_outbox WHERE doc_id = 'doc-1'",
+            &[]
+        ),
+        0
+    );
+}
+
+#[test]
+fn body_materialization_waits_for_durable_ack_and_uses_fixed_frontier() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut session_options = options(PEER_A);
+    session_options.flush_delay = Some(Duration::from_millis(150));
+    let mut driver = SessionDriver::open_with_clock(
+        &vault,
+        "doc-1",
+        driver_options(session_options, FlushPolicy::default()),
+        Box::new(clock),
+    )
+    .expect("打开驱动");
+
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    let ticket = driver.flush(FlushReason::Manual);
+    assert_eq!(ticket.target_live_rev, LiveRev(1));
+
+    // ACK 还没到：B 不得入队，body_md 仍是 NULL
+    let events = driver.pump();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, DriverEvent::Materialized(_))),
+        "没有 DurableAck 之前不得物化"
+    );
+    assert!(load_body_state(&vault, "note-1")
+        .expect("状态")
+        .body_md
+        .is_none());
+
+    // ACK 之后：B 用固定 head_seq=1 物化出「甲」
+    wait_durable(&mut driver, LiveRev(1), Duration::from_secs(5)).expect("DurableAck");
+    assert!(driver.wait_materialize(Duration::from_secs(5)));
+    assert_eq!(
+        load_body_state(&vault, "note-1")
+            .expect("状态")
+            .body_md
+            .as_deref(),
+        Some("甲")
+    );
+
+    // live 里继续写「乙」但没 flush：固定 frontier 的 B 仍只物化到 seq 1
+    driver.apply(request(driver.session(), "c2", 1, vec![edit(1, 1, "乙")]));
+    assert_eq!(driver.markdown(), "甲乙");
+    let events = driver.pump();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, DriverEvent::Materialized(_))),
+        "未 flush 的编辑不得触发 B"
+    );
+    assert_eq!(
+        load_body_state(&vault, "note-1")
+            .expect("状态")
+            .body_md
+            .as_deref(),
+        Some("甲"),
+        "B 只物化 durable 前缀，不读 live doc"
+    );
+
+    let report = driver.close(Duration::from_secs(5));
+    assert!(!report.timed_out);
+    assert_eq!(
+        load_body_state(&vault, "note-1")
+            .expect("状态")
+            .body_md
+            .as_deref(),
+        Some("甲乙")
+    );
+}
+
+#[test]
+fn stale_body_job_is_rejected_by_cas() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut driver = open_driver(&vault, clock, FlushPolicy::default());
+
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    driver.flush(FlushReason::Manual);
+    wait_durable(&mut driver, LiveRev(1), Duration::from_secs(5)).expect("ack1");
+    driver.apply(request(driver.session(), "c2", 1, vec![edit(1, 1, "乙")]));
+    driver.flush(FlushReason::Manual);
+    let ack = wait_durable(&mut driver, LiveRev(2), Duration::from_secs(5)).expect("ack2");
+    assert_eq!(ack.head_seq, 2, "两条 update 各占一个 seq");
+
+    // 先让后台 B 把两个 ACK 都物化完（避免与显式调用竞争）
+    assert!(
+        driver.wait_materialize(Duration::from_secs(5)),
+        "后台 B 应排空"
+    );
+    assert_eq!(
+        load_body_state(&vault, "note-1")
+            .expect("状态")
+            .body_md
+            .as_deref(),
+        Some("甲乙"),
+        "后台 B 已物化到 seq 2"
+    );
+
+    // 同一水位重跑：CAS 一行不命中 → Stale（幂等，不重复写）
+    let same = driver
+        .materialize_now("note-1", "doc-1", 2)
+        .expect("同水位重跑不报错");
+    assert!(matches!(
+        same,
+        MaterializeOutcome::Stale { body_seq: 2, .. }
+    ));
+
+    // 旧任务（seq 1）迟到：CAS 拒绝，绝不覆盖新结果
+    let stale = driver
+        .materialize_now("note-1", "doc-1", 1)
+        .expect("旧任务不报错");
+    match stale {
+        MaterializeOutcome::Stale { note_id, body_seq } => {
+            assert_eq!(note_id, "note-1");
+            assert_eq!(body_seq, 2, "库里仍是新水位");
+        }
+        other => panic!("旧任务必须被 CAS 拒绝，实际 {other:?}"),
+    }
+    assert_eq!(
+        load_body_state(&vault, "note-1")
+            .expect("状态")
+            .body_md
+            .as_deref(),
+        Some("甲乙"),
+        "旧任务不得覆盖新结果"
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM projection_outbox WHERE doc_id = 'doc-1'",
+            &[]
+        ),
+        0,
+        "物化到目标 seq 后 outbox 必须清空"
+    );
+}
+
+#[test]
+fn slow_disk_does_not_block_scheduling() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut session_options = options(PEER_A);
+    session_options.flush_delay = Some(Duration::from_millis(300));
+    let mut driver = SessionDriver::open_with_clock(
+        &vault,
+        "doc-1",
+        driver_options(session_options, FlushPolicy::default()),
+        Box::new(clock),
+    )
+    .expect("打开驱动");
+
+    let started = Instant::now();
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    let ticket = driver.flush(FlushReason::Manual);
+    let _ = driver.pump();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "慢盘下 apply/flush/pump 都不得阻塞调用方（实际 {elapsed:?}）"
+    );
+    assert_eq!(ticket.target_live_rev, LiveRev(1));
+
+    // 关闭时有界排空：慢盘 300ms 也必须在超时内完成
+    let report = driver.close(Duration::from_secs(5));
+    assert!(!report.timed_out, "Close 应在超时内排空：{report:?}");
+    assert_eq!(driver.pending_edits(), 0);
+}
+
+#[test]
+fn auto_ticker_triggers_flush_without_explicit_tick() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let policy = FlushPolicy {
+        interval: Duration::from_millis(30),
+        ..FlushPolicy::default()
+    };
+    let mut driver = SessionDriver::open(
+        &vault,
+        "doc-1",
+        DriverOptions {
+            session: options(PEER_A),
+            policy,
+            auto_tick: true,
+            tick_interval: Some(Duration::from_millis(5)),
+        },
+    )
+    .expect("打开驱动");
+
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    let ack = wait_durable(&mut driver, LiveRev(1), Duration::from_secs(3))
+        .expect("ticker 应自动触发 flush");
+    assert_eq!(ack.through_live_rev, LiveRev(1));
+    assert!(driver.wait_materialize(Duration::from_secs(3)));
+    assert_eq!(
+        load_body_state(&vault, "note-1")
+            .expect("状态")
+            .body_md
+            .as_deref(),
+        Some("甲")
+    );
+}
+
+#[test]
+fn materialize_failure_is_recorded_and_retriable() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut driver = open_driver(&vault, clock, FlushPolicy::default());
+
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    // 模拟「笔记行还没投影出来」：B 会失败
+    vault
+        .exec("DELETE FROM notes WHERE note_id = 'note-1'", &[])
+        .expect("删除笔记行");
+    driver.flush(FlushReason::Manual);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut failure = None;
+    while Instant::now() < deadline && failure.is_none() {
+        for event in driver.pump() {
+            if let DriverEvent::MaterializeFailed { note_id, message } = event {
+                failure = Some((note_id, message));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let (_note_hint, message) = failure.expect("B 失败必须被记录并上报");
+    assert!(
+        message.contains("笔记行"),
+        "失败信息要说清原因，实际：{message}"
+    );
+
+    // 补回笔记行后重试
+    create_note_slot(&vault, "note-1", "doc-1", "测试笔记", 1).expect("补回笔记行");
+    assert_eq!(driver.retry_failed(), 1, "失败任务可重试");
+    assert!(driver.wait_materialize(Duration::from_secs(5)));
+    assert_eq!(
+        load_body_state(&vault, "note-1")
+            .expect("状态")
+            .body_md
+            .as_deref(),
+        Some("甲"),
+        "重试后 B 必须成功"
+    );
+}
+
+#[test]
+fn manual_flush_cancels_the_pending_window() {
+    let (_dir, vault) = fresh_vault();
+    let _seed = seed_note(&vault, "note-1", "doc-1");
+    let clock = ManualClock::new();
+    let mut driver = open_driver(&vault, clock.clone(), FlushPolicy::default());
+
+    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "甲")]));
+    assert!(driver.next_deadline().is_some());
+    driver.flush(FlushReason::Manual);
+    assert_eq!(driver.next_deadline(), None, "手动 flush 后窗口作废");
+    let scheduled = driver.pump();
+    assert_eq!(flush_events(&scheduled), vec![FlushReason::Manual]);
+
+    // 时钟越过窗口也不会再触发第二次 flush
+    clock.set(Duration::from_secs(10));
+    let events = driver.tick(clock.get());
+    assert!(
+        flush_events(&events).is_empty(),
+        "没有新 dirty 不应重复 flush：{events:?}"
+    );
+    wait_durable(&mut driver, LiveRev(1), Duration::from_secs(5)).expect("ack");
 }
 
 `````
@@ -69767,11 +70653,18 @@ fn bootstrap_anchor_same_rev_hash_swap_is_equivocation() {
 | P1-3 Journal HeadConflict | **部分**：JournalWriter 契约/重建入口完成；生产 `session/flush.rs` 仍直接调 sink，尚未接 `JournalHeadStale` 的自动重建 | `aba4375` | `stale_head_is_terminal_then_rebuild_hands_back_entries_and_new_entries_flush`、`rebuild_sink_is_rejected_while_not_stale` |
 | P1-4 ready/count log_id | 完成 | `be5244b` | `ready_and_count_only_include_current_log_incarnation`、`ready_where_path_filters_other_log_incarnation`、`ready_without_log_id_is_empty_and_invalid_length_is_corrupt` |
 
+> **后续状态（2026-11-21 晚，评审收尾）**：生产 `session/flush.rs` 已接线，但走的**不是**
+> `JournalHeadStale` / `JournalWriter::rebuild_sink`：它的 `HeadConflict` 路径是
+> `load_head` → 仅当新 head 的 ops ⊆ 未 ACK 前缀 `end_vv` 时同字节重试一次；
+> 未知 ops fail-closed 要求重开；仍单后台 writer、无第二 journal、不重新导出增量。
+> §1 表中的“部分”与 §6.1 的“尚未自动重建”是收尾时点的状态，最终行为以
+> `crates/storage/src/journal.rs` 模块头的“两条恢复路径”为准。
+
 ### P1-1 细节
 
 - `begin_baseline_apply` 增加 `BaselineExpectation { docs, assets }`，与 journal 同事务写 `sync.baseline_expected`（本地 `meta`，非 DDL）。
 - `finish` 在任何 meta 写入前逐项比对 `baseline_apply_docs.applied=1` / `baseline_apply_assets.applied=1`；缺失/多出/集合不符 → `Conflict`，零写。
-- `finishable` 改为 `staging && expected 全齐`；无记录不可 finish。
+- `finishable` 改为 `staging && expected 全齐 && 无 verify 失败标记`；无记录不可 finish。
 - 同参数 begin 幂等；同 checkpoint 换集合 → `SyncConflict`。
 - 旧 journal 无 expected 记录 → `Conflict`（拿不到证明不推进 S）。
 
@@ -69843,6 +70736,13 @@ cargo test -p menghunote-app --features dev-sync    891 passed / 0 failed
 cargo test --workspace                             2884 passed / 0 failed
 cargo test --workspace --features menghunote-app/dev-sync 3035 passed / 0 failed
 ```
+
+> **最终复跑（2026-11-21 评审收尾）**：同一工作树的最终计数是 workspace **2900 / 0**、
+> `--features menghunote-app/dev-sync` **3051 / 0**；storage **288** / sync **636** 不变。
+> 上面的 2884 / 3035 是本文件收尾时点的批次，差异来自同轮后续新增的测试，两批计数
+> 按批次引用，不要把增量当成回归。scan 探针的批次口径：最终 release 复跑
+> **0.428 / 4.039 ms** 与 `sync-phase0-metrics.md` §8.7.4 的初次 3-run
+> **0.479 / 3.796 ms** 是两批，不要混算（详见该文件 §8.7.6）。
 
 一次环境假失败：共享 `target` 中旧 `gpui-excalidraw` build script 烘入了已删除的 `/home/dev/menghunote-p2check`；`cargo clean -p gpui-excalidraw` 后 app/workspace 全绿，与本轮改动无关。
 
@@ -69939,11 +70839,12 @@ snapshot.actual_vv ⊆ 当前本地 VV     // sub_iter 为空即通过；不是�
    `meta`，**journal 仍显示 `staging`**。后果：`BaselineApplyState.status` 无法单独表达
    "校验失败"，必须另读 `baseline_verify_failure`；UI/续跑逻辑不能把 `staging` 当成
    "可续跑"。这个不一致是记录下来的冲突，没有通过改 schema 绕过。
-2. **`finishable` 仍可能为 true**：`expected` 集合全齐时 `BaselineApplyState.finishable`
-   为 true，即使失败标记存在。`finishable` 只表示 `finish` 的完整性前提，不是"可继续"
-   判据；新增门禁只在 `begin_baseline_apply`。`apply_baseline_batch` /
-   `finish_baseline_apply` **未**额外检查标记（最小改动；bootstrap 在 verify 失败后不会再
-   调用它们）。若 Phase1B 需要更强保证，应在这两个入口也拒绝——本轮未做。
+2. **失败标记门禁已下沉（2026-11-21 review 后补）**：`apply_baseline_batch` 和
+   `finish_baseline_apply` 都会在解码/任何写之前检查 `sync.baseline_verify_failed`，有标记
+   返回带原因的 `SyncConflict`，零写；`state_from_journal` 的 `finishable` 在标记存在时
+   为 false（`staging && expected 全齐 && !verify_failed`）。因此 Phase1B 不能靠"调用方
+   自觉先走 begin"来绕过失败 journal。`baseline_apply.status` 仍只有 staging/completed，
+   失败只能通过 `baseline_verify_failure` 读取。
 3. **bootstrap 的换基线自动清理**：`reconcile_journal` 在"选择了另一份基线"时会对既有
    staging 调用 `abort_baseline_apply`（从而清掉失败标记）。这是既有的清理入口，不是绕过
    `begin` 门禁；同一基线的续跑仍然必须先显式 abort。
@@ -70866,6 +71767,38 @@ epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当�
   [`sync-review-packet-20261121.md`](sync-review-packet-20261121.md)，
   文件清单见 [`sync-phase1a-review-index.md`](sync-phase1a-review-index.md)。
 
+---
+
+## 10. 性能校准（2026-11-21 review 后）
+
+> 本节只校准**结论口径**，不改变 §9.1 的 3 s 持闸预算 / 16 MiB 机会性硬上限 /
+> `N_min` / 成本交叉；也**不表示** Phase 1B 已实现（无 `CatchUpMode`、无
+> prepare/integrate 拆分、无 snapshot merge 实测）。
+
+1. **`N_min = 25 000` 是诚实兜底，不是“保守”。** 聚合后的 5 000 条尾部 replay
+   只要 0.28 s（单文档）/ 0.76 s（20 篇）；而机会性追赶要下载/解密/验签整份快照，
+   并在闸外 `verify_imported` 重放。按 §9.4 的形状，5 MiB verify 已 2.7 s、
+   20 MiB 约 45 s（5→20 为 16.7×）。25k 以下启动快照追赶，省下的 replay 远小于
+   快照 + verify 的固定成本——这是成本交叉算出来的 floor，不是故意调高的保守值。
+2. **Phase 1B 的核心价值是 correctness，不是速度。** 当 `gc_floor > received_seq`
+   时普通 `pull` 只会 `CursorExpired`，没有可回退的增量路径；checkpoint 追赶是
+   唯一能离开过期游标的路径。速度收益只在“≥25k 事件、且差距极大”的极端场景成立；
+   近端增量继续走普通聚合 pull，不为了“快”而拉整库快照。
+3. **16× 超线性重放只是被移出持闸段，没有被消除。** detached oplog 把 5→20 MiB
+   的 storage merge 压到 35 / 110 ms（3.1×，4× 数据），但闸外 `verify_imported`
+   仍走 attached `load_body_doc` 重放大 update：5 MiB ≈2.7 s、20 MiB ≈45 s
+   （最终 release 复跑 58.8 s，同量级；5→20 约 16–17×）。因此“`gate_hold` 小”
+   不能当成“全链路 <3 s”，也不能据此放高 16 MiB 机会性上限。
+4. **大文档的每页成本被 107 KiB 基准低估。** `sync-phase0-metrics.md` §8.3.2 的
+   aggregate 每页会为每个 **touched doc** 全量 `load_body_doc` 一次；20 篇 ×
+   107 KiB 时每页 28–50 ms，但按 verify 的 20 MiB / 20 篇 ≈45 s 折算，单篇 ~1 MiB
+   的一次全量重放约 **2 s**。真实库只要有一篇 ~1 MiB 且每页都被 touched，单页成本
+   就会从 tens of ms 跳到 ~2 s；107 KiB 的基准正好绕开了这个形状，不能拿它给
+   25k / 16 MiB 阈值背书。
+5. **阈值与预算不动。** §9.1 的 3 s 持闸预算、16 MiB 机会性硬上限、`N_min =
+   25 000`、2.0×/1.5× 成本交叉全部保留；Phase 1B **未实现**，上述数字只用于
+   评审与后续设计。
+
 `````
 
 
@@ -71434,6 +72367,10 @@ cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --no
 | 5 000 | 715 / 4 285 | 20 | **0.479 ms** | 0.440–0.617 | 0.344 ms | 0.135 ms | **0.919 ms** | 20 / 0.450 ms |
 | 25 000 | 3 572 / 21 428 | 98 | **3.796 ms** | 3.779–3.829 | 3.183 ms | 0.613 ms | **4.376 ms** | 98 / 3.660 ms |
 
+> 上表是**初次 3-run、单探针批次**（§8.7.3 的 `scan-cost-run.log`，一次进程只跑本探针）。
+> 最终 release 复跑（4-run 批次）得到的是 **0.428 / 4.039 ms**（1k 0.078），两批不要混用；
+> 批次差异与口径见 §8.7.6。
+
 读法：
 
 1. **逐事件 visitor 是线性的、常数很小**：`scan_ms - log_ms` ≈ 0.019 / 0.135 / 0.613 ms，
@@ -71473,6 +72410,34 @@ cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --no
 - **时间噪声**：共享 8 vCPU 机器、load 0.1–2.4；5k 的第 3 轮 0.617 ms（比中位数高 29%），
   25k 的 prepare 曾出现一次 8.8 ms 冷启动离群值。绝对值只用于量级/线性度判断。
 - 探针**未 commit**；写作用域仅 `crates/sync/tests/phase1a_release.rs` 与本文件。
+
+#### 8.7.6 最终 release 复跑（4-run 批次）与数字口径
+
+2026-11-21 评审收尾时又跑了一次 release 批次：`phase1a_release` 的两个 ignored 探针
+（`checkpoint_validate_scan_cost` + `phase1a_baseline_apply_gate_hold`）同进程执行，
+scan 仍是同档 3 轮取中位数。这是本探针的**第 4 次运行（4-run 批次）**，不是 §8.7.4
+那一批的续测。
+
+| S | pages | `scan_ms` 中位数（4-run 批次） | raw `scan_ms` | `validate_ms` 中位数 |
+| --- | --- | --- | --- | --- |
+| 1 000 | 4 | **0.078 ms** | 0.074–0.089 | 0.525 ms |
+| 5 000 | 20 | **0.428 ms** | 0.419–0.449 | 0.848 ms |
+| 25 000 | 98 | **4.039 ms** | 3.849–4.250 | 4.594 ms |
+
+口径（两组都保留，不要混成一组）：
+
+- §8.7.4 的 **0.479 / 3.796 ms** 是**初次 3-run、单探针批次**（`scan-cost-run.log`；
+  一次进程只跑本探针，1k → 5k → 25k 串行）。
+- 本节的 **0.428 / 4.039 ms** 是**最终 release 复跑（4-run 批次）**；同一进程还并行
+  跑了 `baseline_apply` 探针，机器负载更高。25k 比初次高约 6%（4.039 vs 3.796），
+  5k 低约 11%（0.428 vs 0.479）。**这是批次/负载差异，不是 scan 代码变化**：
+  `scan_coverage_log` 两批之间未改，pages 仍严格 = `ceil(S/256)`。
+- 评审摘要（`sync-review-272k.md` / `sync-review-1m.md` 的 §0）引用的是**本节这批
+  0.428 / 4.039**；正文 §8.7.4 是初次 3-run 的 0.479 / 3.796。引用时必须带批次名，
+  不能把两组放进同一张表或算同一个中位数。
+- 绝对值仍只用于量级/线性度：1k 0.076 → 0.078、25k 3.796 → 4.039，都在共享机器
+  噪声量级内；页数（4 / 20 / 98）与“visitor 线性、页数严格 = `ceil(S/256)`”的结论
+  不受影响。
 
 `````
 
@@ -72961,10 +73926,9 @@ C（无闸并发 integrate / 会话重构）、wire/DDL 变更、自动轮换/�
 
 ---
 
-# 附录 E：完整 diff（`5d01e9e..1bededa`）
+# 附录 E：完整 diff（`5d01e9e..46b214e`）
 
-
-@@SECTION `5d01e9e..1bededa`
+@@SECTION `5d01e9e..46b214e`
 
 `````diff
 diff --git a/crates/storage/src/actor.rs b/crates/storage/src/actor.rs
@@ -73110,7 +74074,7 @@ index 6824e6c..0b4f53a 100644
      // 守卫必须在**该语句执行后立刻**校验：否则后续语句可能先撞 UNIQUE/FK，
      // 把「head 被人推进了」这个真正原因盖掉（CAS 语义要求先于任何写入冲突暴露）。
 diff --git a/crates/storage/src/baseline_apply.rs b/crates/storage/src/baseline_apply.rs
-index b44412d..8fc0656 100644
+index b44412d..c1e61d4 100644
 --- a/crates/storage/src/baseline_apply.rs
 +++ b/crates/storage/src/baseline_apply.rs
 @@ -14,11 +14,17 @@
@@ -73351,7 +74315,7 @@ index b44412d..8fc0656 100644
  }
  struct PreparedTombstone {
      doc_id: String,
-@@ -227,14 +400,71 @@ struct PreparedAsset {
+@@ -227,14 +400,81 @@ struct PreparedAsset {
      statement: Option<Statement>,
  }
  
@@ -73370,6 +74334,16 @@ index b44412d..8fc0656 100644
 +    value.extend_from_slice(VERIFY_FAILED_MAGIC);
 +    value.extend_from_slice(reason.as_bytes());
 +    vault.set_meta(META_BASELINE_VERIFY_FAILED, &value)
++}
++
++/// 失败标记存在时统一的拒绝错误：必须带原因，并明确唯一清理入口是 abort。
++fn verify_failed_conflict(reason: &str, action: &str) -> StorageError {
++    StorageError::SyncConflict {
++        context: format!(
++            "baseline 导入的读回校验已失败（{META_BASELINE_VERIFY_FAILED}: {reason}）；\
++             {action} 已拒绝且零写入，必须先 abort_baseline_apply 清理失败 journal 与标记"
++        ),
++    }
 +}
 +
 +/// 读失败标记的原因；没有标记返回 `None`。
@@ -73424,7 +74398,7 @@ index b44412d..8fc0656 100644
      let existing = load_journal(vault)?;
      if let Some(existing) = &existing {
          if existing.status == BaselineApplyStatus::Staging
-@@ -242,7 +472,16 @@ pub fn begin_baseline_apply(
+@@ -242,7 +482,16 @@ pub fn begin_baseline_apply(
              && existing.baseline_s == baseline_s
              && existing.source_cursor == source_cursor
          {
@@ -73442,7 +74416,7 @@ index b44412d..8fc0656 100644
          }
          if existing.status == BaselineApplyStatus::Staging {
              return Err(StorageError::SyncConflict {
-@@ -256,38 +495,43 @@ pub fn begin_baseline_apply(
+@@ -256,38 +505,43 @@ pub fn begin_baseline_apply(
  
      let mut statements = Vec::new();
      let mut guards = Vec::new();
@@ -73518,7 +74492,7 @@ index b44412d..8fc0656 100644
      let insert_index = statements.len();
      statements.push(Statement::new(
          "INSERT INTO baseline_apply(\
-@@ -309,6 +553,19 @@ pub fn begin_baseline_apply(
+@@ -309,6 +563,19 @@ pub fn begin_baseline_apply(
      ));
      guards.push(AffectedGuard::exactly(insert_index, 1));
  
@@ -73538,7 +74512,7 @@ index b44412d..8fc0656 100644
      match vault.exec_transaction(&statements, &guards) {
          Ok(_) => {}
          Err(StorageError::GuardFailed { .. }) => {
-@@ -325,9 +582,10 @@ pub fn begin_baseline_apply(
+@@ -325,20 +592,30 @@ pub fn begin_baseline_apply(
  
  /// 当前 staging journal 的只读状态；没有 journal 返回 `None`。
  pub fn baseline_apply_state(vault: &Vault) -> Result<Option<BaselineApplyState>, StorageError> {
@@ -73552,8 +74526,20 @@ index b44412d..8fc0656 100644
  }
  
  /// 应用一批已验证的快照文档和远端 tombstone。
-@@ -338,7 +596,7 @@ pub fn apply_baseline_batch(
++///
++/// 若存在 [`META_BASELINE_VERIFY_FAILED`] 标记，本函数在**任何解码/写事务之前**返回
++/// [`StorageError::SyncConflict`]（带原因并提示先 [`abort_baseline_apply`]），零写入。
+ pub fn apply_baseline_batch(
+     vault: &Vault,
+     docs: &[(String, Vec<u8>)],
+     tombstones: &[String],
  ) -> Result<BaselineApplyState, StorageError> {
++    // 失败标记优先于一切：journal 仍是 staging（schema 不允许新 status），但语义上
++    // 已不可续跑。必须在解码 snapshot / 开写事务之前拒绝，避免继续往失败 journal
++    // 里追加数据而让 abort 后的重跑更难判断。
++    if let Some(reason) = baseline_verify_failure(vault)? {
++        return Err(verify_failed_conflict(&reason, "apply_baseline_batch"));
++    }
      let journal = load_active_journal(vault)?;
      if docs.is_empty() && tombstones.is_empty() {
 -        return state_from_journal(&journal);
@@ -73561,7 +74547,7 @@ index b44412d..8fc0656 100644
      }
  
      let mut seen_docs = BTreeSet::new();
-@@ -484,9 +742,10 @@ pub fn apply_baseline_batch(
+@@ -484,9 +761,10 @@ pub fn apply_baseline_batch(
              }
          }
  
@@ -73575,7 +74561,7 @@ index b44412d..8fc0656 100644
          };
          prepared_docs.push(PreparedDoc {
              doc_id: doc_id.clone(),
-@@ -494,7 +753,8 @@ pub fn apply_baseline_batch(
+@@ -494,7 +772,8 @@ pub fn apply_baseline_batch(
              baseline_vv: baseline_vv.encode(),
              expected_head,
              update,
@@ -73585,7 +74571,7 @@ index b44412d..8fc0656 100644
          });
          baseline_by_doc.insert(doc_id.clone(), local_extra);
      }
-@@ -515,6 +775,8 @@ pub fn apply_baseline_batch(
+@@ -515,6 +794,8 @@ pub fn apply_baseline_batch(
      let now = now_secs()?;
      let mut statements = Vec::new();
      let mut guards = Vec::new();
@@ -73594,7 +74580,7 @@ index b44412d..8fc0656 100644
      for prepared in &prepared_docs {
          let journal_index = statements.len();
          statements.push(Statement::new(
-@@ -532,17 +794,18 @@ pub fn apply_baseline_batch(
+@@ -532,17 +813,18 @@ pub fn apply_baseline_batch(
          guards.push(AffectedGuard::exactly(journal_index, 1));
  
          // 跨 journal 保留的「远端已知 VV」：本批快照的 VV 就是远端已见过的 ops。
@@ -73621,7 +74607,7 @@ index b44412d..8fc0656 100644
  
          let Some(update) = &prepared.update else {
              if prepared.expected_head.is_none() {
-@@ -650,23 +913,42 @@ pub fn apply_baseline_batch(
+@@ -650,23 +932,42 @@ pub fn apply_baseline_batch(
      }
  
      for tombstone in &prepared_tombstones {
@@ -73672,7 +74658,7 @@ index b44412d..8fc0656 100644
      }
  
      let journal_index = statements.len();
-@@ -684,7 +966,20 @@ pub fn apply_baseline_batch(
+@@ -684,7 +985,20 @@ pub fn apply_baseline_batch(
      let transaction_started = Instant::now();
      match vault.exec_transaction(&statements, &guards) {
          Ok(_) => {}
@@ -73694,7 +74680,7 @@ index b44412d..8fc0656 100644
              return Err(StorageError::SyncConflict {
                  context: "baseline batch 期间 journal/doc head 已变化".to_owned(),
              });
-@@ -705,7 +1000,7 @@ pub fn apply_baseline_assets(
+@@ -705,7 +1019,7 @@ pub fn apply_baseline_assets(
  ) -> Result<BaselineApplyState, StorageError> {
      let journal = load_active_journal(vault)?;
      if assets.is_empty() {
@@ -73703,7 +74689,7 @@ index b44412d..8fc0656 100644
      }
  
      let mut seen_oid = BTreeSet::new();
-@@ -826,6 +1121,10 @@ pub fn apply_baseline_assets(
+@@ -826,6 +1140,10 @@ pub fn apply_baseline_assets(
  ///
  /// CAS 仍是"begin 时记录、finish 时校验"：任一字段在 finish 前被并发改写即返回
  /// [`BaselineApplyFinish::Conflict`]，整笔事务不写。
@@ -73714,7 +74700,17 @@ index b44412d..8fc0656 100644
  pub fn finish_baseline_apply(
      vault: &Vault,
      chosen_baseline_s: u64,
-@@ -839,6 +1138,14 @@ pub fn finish_baseline_apply(
+@@ -835,10 +1153,24 @@ pub fn finish_baseline_apply(
+         None => return Ok(BaselineApplyFinish::NotFound),
+         Some(journal) => journal,
+     };
++    // 失败标记必须在任何写之前拒绝，且不能退化成不带原因的 `Ok(Conflict)`：
++    // journal 仍是 staging（schema 不允许 failed），但 finish 只会推进水位/cursor，
++    // 在"导入读回校验已失败"时推进等于把未证明完整的基线当成已消费。
++    if let Some(reason) = baseline_verify_failure(vault)? {
++        return Err(verify_failed_conflict(&reason, "finish_baseline_apply"));
++    }
+     if journal.status != BaselineApplyStatus::Staging || journal.baseline_s != chosen_baseline_s {
          return Ok(BaselineApplyFinish::Conflict);
      }
  
@@ -73729,7 +74725,7 @@ index b44412d..8fc0656 100644
      // finish 前先校验 begin 时记录的旧值；任何一项被并发改写都按 Conflict 处理，不写任何行。
      let current = sync_cursor_state(vault)?;
      let current_relay_cursor = vault.get_meta(META_SYNC_RELAY_CURSOR)?;
-@@ -937,13 +1244,21 @@ pub fn finish_baseline_apply(
+@@ -937,13 +1269,21 @@ pub fn finish_baseline_apply(
      Ok(BaselineApplyFinish::Applied(state))
  }
  
@@ -73757,7 +74753,7 @@ index b44412d..8fc0656 100644
      }
      let statements = [
          Statement::new("DELETE FROM baseline_apply_docs", Vec::new()),
-@@ -953,6 +1268,17 @@ pub fn abort_baseline_apply(vault: &Vault) -> Result<bool, StorageError> {
+@@ -953,6 +1293,17 @@ pub fn abort_baseline_apply(vault: &Vault) -> Result<bool, StorageError> {
              "DELETE FROM baseline_apply WHERE singleton=1 AND status='staging'",
              Vec::new(),
          ),
@@ -73775,7 +74771,7 @@ index b44412d..8fc0656 100644
      ];
      match vault.exec_transaction(&statements, &[AffectedGuard::exactly(3, 1)]) {
          Ok(_) => Ok(true),
-@@ -1134,6 +1460,86 @@ fn load_applied_doc_digests(vault: &Vault) -> Result<BTreeMap<String, [u8; 32]>,
+@@ -1134,6 +1485,86 @@ fn load_applied_doc_digests(vault: &Vault) -> Result<BTreeMap<String, [u8; 32]>,
          .collect()
  }
  
@@ -73862,7 +74858,7 @@ index b44412d..8fc0656 100644
  fn load_active_journal(vault: &Vault) -> Result<ApplyJournal, StorageError> {
      let journal = load_journal(vault)?.ok_or_else(|| StorageError::SyncConflict {
          context: "没有 active baseline apply".to_owned(),
-@@ -1185,7 +1591,22 @@ fn load_journal(vault: &Vault) -> Result<Option<ApplyJournal>, StorageError> {
+@@ -1185,7 +1616,28 @@ fn load_journal(vault: &Vault) -> Result<Option<ApplyJournal>, StorageError> {
      }))
  }
  
@@ -73878,7 +74874,13 @@ index b44412d..8fc0656 100644
 +    };
 +    // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
 +    // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
-+    let finishable = journal.status == BaselineApplyStatus::Staging
++    //
++    // 失败标记存在时 journal 仍是 staging（schema v3 的 CHECK 只允许 staging/completed），
++    // 但语义上已不可续跑：即使预期集合全齐也必须 finishable=false，否则 UI/续跑逻辑
++    // 会把"读回校验失败"当成"可以 finish"。标记损坏返回 Corrupt，同样是 fail-closed。
++    let verify_failed = baseline_verify_failure(vault)?.is_some();
++    let finishable = !verify_failed
++        && journal.status == BaselineApplyStatus::Staging
 +        && match &expected {
 +            Some(expected) => expected_is_complete(vault, journal, expected)?,
 +            None => false,
@@ -73886,7 +74888,7 @@ index b44412d..8fc0656 100644
      Ok(BaselineApplyState {
          checkpoint_id: journal.checkpoint_id,
          baseline_s: journal.baseline_s,
-@@ -1194,7 +1615,9 @@ fn state_from_journal(journal: &ApplyJournal) -> Result<BaselineApplyState, Stor
+@@ -1194,7 +1646,9 @@ fn state_from_journal(journal: &ApplyJournal) -> Result<BaselineApplyState, Stor
          applied_docs: journal.applied_docs,
          applied_assets: journal.applied_assets,
          kept_local_edit: journal.kept_local_edit,
@@ -73969,24 +74971,26 @@ index 569c8d1..02c8aaa 100644
 +    }
 +}
 diff --git a/crates/storage/src/journal.rs b/crates/storage/src/journal.rs
-index 4aea6e6..f2d36cb 100644
+index 4aea6e6..acadd66 100644
 --- a/crates/storage/src/journal.rs
 +++ b/crates/storage/src/journal.rs
-@@ -12,12 +12,46 @@
+@@ -12,12 +12,63 @@
  //!
  //! 崩溃语义：sink 成功 = 已 durable；未 flush 的条目只在内存里，重启后自然丢掉。
  //! 因此「已 ACK 的不丢、未 ACK 的只丢连续前缀之后」由本模块与 [`crate::store`] 的 A 事务共同保证。
 +//!
-+//! # head 过期：可重试 vs 必须重建 session（P1-3 契约）
++//! # head 过期：两条恢复路径（P1-3 契约）
 +//!
 +//! journal 条目里的 `PendingUpdate` 是**追加那一刻**按当时 head 导出的字节
 +//! （`end_frontier` / `end_vv` 是那次导出的快照），**不可重算**。如果同一文档的 head
 +//! 被别的 writer 推进（同步引擎 integrate、`SessionDriver` 的 adopt、另一个 Vault
 +//! 进程……），前缀的 CAS 基准（`loro_docs.head_seq`）就永远对不上：`append_updates`
-+//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节重试多少次都不会成功**。
-+//! 这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
++//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节按旧基准重试多少次都不会
++//! 成功**。这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
 +//!
-+//! 本模块用一条明确的二分法代替无限重试：
++//! 本节先写库内契约（[`JournalWriter`]），再写生产 flusher 的实际路径；两者不要混为一谈。
++//!
++//! ## 1. `JournalWriter`：冻结 writer，调用方重建 sink / 重新导出
 +//!
 +//! - [`JournalWriter::flush`] 捕获 sink 的 [`StorageError::HeadConflict`]，**不重试**
 +//!   （0 次），立即转成终态错误 [`StorageError::JournalHeadStale`]
@@ -73996,20 +75000,35 @@ index 4aea6e6..f2d36cb 100644
 +//! - 进入 stale 之后，`flush` / `flush_all` **不再触碰数据库**，幂等地返回同一个
 +//!   stale 错误；`submit` 也返回 `JournalHeadStale`（writer 已冻结，新条目必须交给
 +//!   重建后的 writer）。因此调用方无论怎么轮询，都不会挂死、也不会刷屏重试。
-+//! - **谁负责重建**：持有 live `BodyDoc` 的会话层（`session::JournalHandle` /
-+//!   `SessionDriver`，实现在 `crate::session::flush`）。重建顺序：
-+//!   ① 先停外部写并按 ADR 0012 对账（`HeadConflict` 先停外部写、验证授权、再对账，
-+//!   然后才允许有界重放）；② 把 durable journal 重放到**新 head**（`load_body_doc` /
-+//!   `load_head`），让内存文档与库一致；③ 用新 head 的 VV 重新导出本地意图
-+//!   （`BodyDoc::pending_update`）——只有这一步得到的字节才能写；④ 用新 `head_seq`
-+//!   造一个 [`VaultJournalSink`]，调用 [`JournalWriter::rebuild_sink`] 装回去。
++//! - **谁负责重建**：持有 live `BodyDoc` 的调用方，而不是本模块。调用方必须：
++//!   ① 把 durable journal 重放到**新 head**（`load_body_doc` / `load_head`），让内存
++//!   文档与库一致；② 用新 head 的 VV 重新导出本地意图（`BodyDoc::pending_update`）——
++//!   只有这一步得到的字节才能写；③ 用新 `head_seq` 造一个 [`VaultJournalSink`]，
++//!   调用 [`JournalWriter::rebuild_sink`] 装回去。
 +//! - **未 durable 的旧条目怎么办**：`rebuild_sink` 把它们**原样交还**调用方（返回值）
 +//!   并从 writer 的 journal 里清空。它们**没有被写入、也没有被静默丢弃** —— 调用方
-+//!   必须用 ③ 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
++//!   必须用 ② 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
 +//!   并在上层报告，不能假装成功。重建后 `durable_seq` 等于新 sink 的 CAS 基准。
-+//! - **有界重试规则**：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
-+//!   重试不可能成功）；需要重放时由 session 层按 ADR 0012 做**有界**重放（一次），
-+//!   再失败就上报告需要人工处理。本模块不提供、也不会退化成无限重试。
++//!
++//! ## 2. 生产 `session/flush.rs`：兼容 head 时同字节有界重试（当前接线）
++//!
++//! 生产后台 flusher **不经过** [`JournalWriter`]：它直接在后台线程构造
++//! [`VaultJournalSink`] 并调用 `write_prefix`，因此**不会**调用
++//! [`JournalWriter::rebuild_sink`]，也不会重新导出增量。它的
++//! [`StorageError::HeadConflict`] 路径是**同一份字节前缀的有界重试**：
++//!
++//! 1. `load_head` 读回当前 `head_seq` 与 VV；
++//! 2. **仅当新 head 的 ops 全部包含在**未 ACK 前缀最后一条的 `end_vv` 里
++//!    （`prefix_vv.includes_vv(head_vv)`，即外部推进写的是本会话 live 已知的 op）时，
++//!    用新 CAS 基准重试**同一份字节前缀一次**；
++//! 3. 新 head 含本会话未知 ops、head 未前进/回退、VV 为空或解码失败、重试后仍冲突
++//!    → **fail-closed**：不写库、journal 原样保留，`last_write_error` 明确要求
++//!    「关闭并重开文档」；后续 flush 立即失败，不再碰数据库。
++//!
++//! 两条路径的共同点：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
++//! 重试同一份旧字节不可能成功）；有界重试只发生在生产 session flusher，且**仅一次**，
++//! 条件不满足就上报告，不无限重试。生产路径**没有第二 journal**：journal 仍是会话
++//! 内存里的那一条，重建的只是 sink 的 CAS 基准。
  
  use std::collections::VecDeque;
  
@@ -74020,7 +75039,7 @@ index 4aea6e6..f2d36cb 100644
  use crate::sync_bridge::{self, SyncContext, SyncIntent};
  use crate::Vault;
  
-@@ -161,6 +195,14 @@ impl PendingJournal {
+@@ -161,6 +212,14 @@ impl PendingJournal {
          }
          Ok(())
      }
@@ -74035,7 +75054,7 @@ index 4aea6e6..f2d36cb 100644
  }
  
  /// durable 落点（生产实现见 [`VaultJournalSink`]，测试可注入慢盘/失败实现）。
-@@ -168,7 +210,16 @@ pub trait DurableSink {
+@@ -168,7 +227,16 @@ pub trait DurableSink {
      /// 把一段**连续前缀**写 durable；成功返回这段里最后一条的 `seq`。
      ///
      /// 实现必须是原子的：要么整段 durable，要么什么都没写（否则会丢已 ACK 数据）。
@@ -74052,7 +75071,7 @@ index 4aea6e6..f2d36cb 100644
  }
  
  /// 一次 flush 的结果。
-@@ -180,6 +231,28 @@ pub struct FlushReport {
+@@ -180,6 +248,28 @@ pub struct FlushReport {
      pub durable_seq: u64,
  }
  
@@ -74081,7 +75100,7 @@ index 4aea6e6..f2d36cb 100644
  /// journal writer：持有 journal 与 sink，串行 flush。
  #[derive(Debug)]
  pub struct JournalWriter<S: DurableSink> {
-@@ -188,29 +261,52 @@ pub struct JournalWriter<S: DurableSink> {
+@@ -188,29 +278,52 @@ pub struct JournalWriter<S: DurableSink> {
      max_batch: usize,
      durable_seq: u64,
      flushed_entries: u64,
@@ -74135,7 +75154,7 @@ index 4aea6e6..f2d36cb 100644
          // 先拷出前缀，避免同时借用 journal 与 sink
          let prefix: Vec<JournalEntry> = self.journal.peek_prefix(self.max_batch).to_vec();
          if prefix.is_empty() {
-@@ -221,7 +317,27 @@ impl<S: DurableSink> JournalWriter<S> {
+@@ -221,7 +334,27 @@ impl<S: DurableSink> JournalWriter<S> {
          }
  
          let entries = prefix.len();
@@ -74164,7 +75183,7 @@ index 4aea6e6..f2d36cb 100644
          self.journal.ack_prefix(entries)?;
          self.durable_seq = durable_seq;
          self.flushed_entries += entries as u64;
-@@ -233,6 +349,8 @@ impl<S: DurableSink> JournalWriter<S> {
+@@ -233,6 +366,8 @@ impl<S: DurableSink> JournalWriter<S> {
      }
  
      /// flush 直到 journal 空或没有进展（一次性排空，供关闭/手动保存用）。
@@ -74173,7 +75192,7 @@ index 4aea6e6..f2d36cb 100644
      pub fn flush_all(&mut self) -> Result<usize, StorageError> {
          let mut total = 0;
          while self.journal.pending_len() > 0 {
-@@ -245,6 +363,35 @@ impl<S: DurableSink> JournalWriter<S> {
+@@ -245,6 +380,35 @@ impl<S: DurableSink> JournalWriter<S> {
          Ok(total)
      }
  
@@ -74209,7 +75228,7 @@ index 4aea6e6..f2d36cb 100644
      /// 未 ACK 条数。
      pub fn pending_len(&self) -> usize {
          self.journal.pending_len()
-@@ -343,7 +490,7 @@ impl DurableSink for VaultJournalSink {
+@@ -343,7 +507,7 @@ impl DurableSink for VaultJournalSink {
                  self.head_seq,
                  &records,
                  &[],
@@ -74218,7 +75237,7 @@ index 4aea6e6..f2d36cb 100644
              )?,
              Some(ctx) => {
                  // 一 update 一意图（remote 条目为空位）；seq 必须与 A 事务写进
-@@ -374,11 +521,16 @@ impl DurableSink for VaultJournalSink {
+@@ -374,11 +538,16 @@ impl DurableSink for VaultJournalSink {
                      self.head_seq,
                      &records,
                      &slots,
@@ -74524,8 +75543,30 @@ index 467b080..3f9bbf2 100644
 +        assert_eq!(final_vv.get(&0x10).copied(), Some(1), "旧前缀不得丢失");
 +    }
  }
+diff --git a/crates/storage/src/session/core.rs b/crates/storage/src/session/core.rs
+index 5f72cd9..afa632e 100644
+--- a/crates/storage/src/session/core.rs
++++ b/crates/storage/src/session/core.rs
+@@ -214,6 +214,17 @@ impl DocumentSession {
+         self.journal.durable_through()
+     }
+ 
++    /// 最近一次 flush 写失败的可读原因（`None` = 没有已知失败）。
++    ///
++    /// 不可恢复的失败（head 过期且无法安全自动重建）优先，文案明确提示
++    /// 「需要重开文档」；否则是最近一次普通写失败（磁盘/SQLite 等，下次写成功后清空）。
++    ///
++    /// **只读且稳定**：同一失败可以反复读取，UI 可以在状态栏/关闭报告里直接展示；
++    /// 不要求调用方先走外部提交闸门（`GateState::Failed` 只有走闸门的路径才看得到）。
++    pub fn last_write_error(&self) -> Option<String> {
++        self.journal.last_write_error()
++    }
++
+     /// 取走事件队列（Durable / Remote）。
+     pub fn events(&self) -> Vec<SessionEvent> {
+         self.journal.drain_events()
 diff --git a/crates/storage/src/session/flush.rs b/crates/storage/src/session/flush.rs
-index be36373..f97e7a4 100644
+index be36373..2b49e1d 100644
 --- a/crates/storage/src/session/flush.rs
 +++ b/crates/storage/src/session/flush.rs
 @@ -5,7 +5,14 @@
@@ -74584,7 +75625,29 @@ index be36373..f97e7a4 100644
          }));
          let events: Arc<Mutex<VecDeque<SessionEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
          let (sender, receiver) = channel::<FlushCommand>();
-@@ -305,10 +320,17 @@ fn flusher_main(
+@@ -200,6 +215,21 @@ impl JournalHandle {
+         }
+     }
+ 
++    /// 最近一次 flush 写失败的原因（**一次取锁**）。
++    ///
++    /// 优先返回 [`PendingState::unrecoverable`]：不可恢复的失败必须让 UI/调用方看到
++    /// 「需要重开文档」，不能被后到的普通写失败（字段会被覆盖）稀释；没有不可恢复失败时
++    /// 返回最近一次普通写失败（成功写入后清空）。会话核的
++    /// [`super::core::DocumentSession::last_write_error`] 与 `CloseReport.flush_error`
++    /// 都以本方法为唯一来源（闸门走 [`Self::gate_progress`]，读同一份状态的字段）。
++    pub(crate) fn last_write_error(&self) -> Option<String> {
++        let guard = lock(&self.state);
++        guard
++            .unrecoverable
++            .clone()
++            .or_else(|| guard.last_write_error.clone())
++    }
++
+     /// 外部提交 adopt / end 之后重定 durable 基准（调用方必须已持锁）。
+     ///
+     /// `loro_docs.head_*` 已由外部提交（`engine.integrate`）推进；这里把 flusher 的 CAS
+@@ -305,10 +335,17 @@ fn flusher_main(
          }
  
          let mut emitted_max: Option<LiveRev> = None;
@@ -74602,7 +75665,7 @@ index be36373..f97e7a4 100644
                  let pending = guard.journal.pending_len();
                  if pending == 0 {
                      break;
-@@ -331,12 +353,47 @@ fn flusher_main(
+@@ -331,12 +368,47 @@ fn flusher_main(
              }
              let written = match sink.write_prefix(&entries) {
                  Ok(seq) => seq,
@@ -74652,7 +75715,7 @@ index be36373..f97e7a4 100644
              };
  
              // 3) durable 之后才裁剪并推进水位
-@@ -407,3 +464,132 @@ fn flusher_main(
+@@ -407,3 +479,132 @@ fn flusher_main(
          }
      }
  }
@@ -74785,6 +75848,48 @@ index be36373..f97e7a4 100644
 +         重开前未 durable 的本地改动不会自动落库"
 +    )
 +}
+diff --git a/crates/storage/src/session/schedule.rs b/crates/storage/src/session/schedule.rs
+index 021ab85..8f6ddec 100644
+--- a/crates/storage/src/session/schedule.rs
++++ b/crates/storage/src/session/schedule.rs
+@@ -220,6 +220,12 @@ pub struct CloseReport {
+     pub pending_materialize: usize,
+     /// 是否超时（`true` 表示没排空，调用方应保留现场）。
+     pub timed_out: bool,
++    /// 关闭时仍未解决的 flush 写失败原因（`None` = 没有已知失败）。
++    ///
++    /// 取自 [`DocumentSession::last_write_error`]：不可恢复的失败（文案含
++    /// 「需要重开文档」）优先，否则是最近一次普通写失败。关闭之后会话可能被丢弃，
++    /// 调用方只能靠这份报告知道「没排空是为什么」，因此它必须随报告一起返回。
++    pub flush_error: Option<String>,
+ }
+ 
+ /// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
+@@ -468,6 +474,15 @@ impl SessionDriver {
+         self.session.pending_len()
+     }
+ 
++    /// 最近一次 flush 写失败的可读原因（转发会话核的只读快照）。
++    ///
++    /// 不可恢复的失败（「需要重开文档」）优先，否则是最新一次普通写失败；`None` = 没失败。
++    /// UI 不必等 `pump` 或走外部提交闸门就能读到它。
++    #[must_use]
++    pub fn last_write_error(&self) -> Option<String> {
++        self.session.last_write_error()
++    }
++
+     /// 下一次固定窗口到期时刻（`None` 表示当前没有等待中的脏数据）。
+     pub fn next_deadline(&self) -> Option<Duration> {
+         self.dirty_since.map(|since| since + self.policy.interval)
+@@ -785,6 +800,8 @@ impl SessionDriver {
+             pending_edits: self.session.pending_len(),
+             pending_materialize: self.materializer.pending(),
+             timed_out: self.session.pending_len() > 0 || self.materializer.pending() > 0,
++            // 关闭后会话可能被丢弃：没排空的原因必须随报告带走（不可恢复优先）。
++            flush_error: self.session.last_write_error(),
+         }
+     }
+ 
 diff --git a/crates/storage/src/store.rs b/crates/storage/src/store.rs
 index 3e04674..69e1fad 100644
 --- a/crates/storage/src/store.rs
@@ -75635,7 +76740,7 @@ index 82db021..4ab5086 100644
  }
  
 diff --git a/crates/storage/tests/baseline_apply.rs b/crates/storage/tests/baseline_apply.rs
-index 5aac713..f312f17 100644
+index 5aac713..4a4b257 100644
 --- a/crates/storage/tests/baseline_apply.rs
 +++ b/crates/storage/tests/baseline_apply.rs
 @@ -4,6 +4,7 @@ mod support;
@@ -75646,17 +76751,21 @@ index 5aac713..f312f17 100644
  use support::*;
  
  use menghunote_storage::session::{
-@@ -15,9 +16,10 @@ use menghunote_storage::{
+@@ -13,11 +14,12 @@ use menghunote_storage::session::{
+ use menghunote_storage::{
+     abort_baseline_apply, append_updates_with_integrated_marks, apply_baseline_assets,
      apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_state,
-     begin_baseline_apply, create_note_slot, finish_baseline_apply, load_body_doc, load_head,
-     reset_baseline_apply_debug, set_sync_log_id, store_inbox_verified_batch, sync_cursor_state,
+-    begin_baseline_apply, create_note_slot, finish_baseline_apply, load_body_doc, load_head,
+-    reset_baseline_apply_debug, set_sync_log_id, store_inbox_verified_batch, sync_cursor_state,
 -    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BodyDoc, SyncContext, UpdateRecord,
 -    Value, Vault, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
 -    META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
-+    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc,
-+    StorageError, SyncContext, UpdateRecord, Value, Vault, VerifiedInboxRow,
-+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
-+    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
++    baseline_verify_failure, begin_baseline_apply, create_note_slot, finish_baseline_apply,
++    load_body_doc, load_head, mark_baseline_verify_failed, reset_baseline_apply_debug,
++    set_sync_log_id, store_inbox_verified_batch, sync_cursor_state, BaselineApplyFinish,
++    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc, StorageError, SyncContext,
++    UpdateRecord, Value, Vault, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER,
++    META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
  };
  use menghunote_text::UnicodeScalar;
  
@@ -75788,7 +76897,7 @@ index 5aac713..f312f17 100644
      apply_baseline_batch(
          &vault,
          &[("doc-x".to_owned(), snapshot("doc-x", PEER_B, "remote body"))],
-@@ -1080,3 +1157,620 @@ fn tombstone_deletes_doc_integrated_through_engine_path() {
+@@ -1080,3 +1157,784 @@ fn tombstone_deletes_doc_integrated_through_engine_path() {
      );
      assert_eq!(state.kept_local_edit, 0);
  }
@@ -76012,6 +77121,170 @@ index 5aac713..f312f17 100644
 +        finish_baseline_apply(&vault, 4, "baseline-cursor").expect("finish"),
 +        BaselineApplyFinish::Applied(_)
 +    ));
++}
++
++// ---------------------------------------------------------------------------
++// P1：verify 失败标记的 storage 门禁（apply / finish / finishable）
++// ---------------------------------------------------------------------------
++
++/// 失败标记存在时：
++/// - `apply_baseline_batch` 在任何解码/写事务前拒绝，且零写；
++/// - `finish_baseline_apply` 返回**带原因**的 `SyncConflict`，不是丢掉原因的 `Ok(Conflict)`；
++/// - `baseline_apply_state.finishable` 在预期集合已全齐时也必须为 false（status 仍是 staging）；
++/// - `abort_baseline_apply` 清标记后 `begin` 可重新成功。
++#[test]
++fn marker_blocks_apply_and_finish_and_finishable() {
++    let (_dir, vault) = fresh_vault();
++    local_doc(&vault, "doc-a", "a-local");
++    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
++
++    // 先真正跑完唯一一批，让预期集合在标记之前**已全齐**（证明 finishable 的变化来自标记）。
++    let applied = apply_baseline_batch(
++        &vault,
++        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
++        &[],
++    )
++    .expect("batch a");
++    assert!(applied.finishable, "标记写入前预期集合已齐，应可 finish");
++
++    let head_before = head(&vault, "doc-a");
++    let cursor_before = sync_cursor_state(&vault).expect("cursor");
++    let remote_known_before = meta_remote_known_bytes(&vault, "doc-a");
++    let updates_before = count(&vault, "SELECT count(*) FROM loro_updates", &[]);
++    let journal_rows_before = count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]);
++
++    const REASON: &str = "读回校验失败：snapshot 的 VV 未被本地 VV 覆盖";
++    mark_baseline_verify_failed(&vault, REASON).expect("写失败标记");
++    assert_eq!(
++        baseline_verify_failure(&vault).expect("读标记").as_deref(),
++        Some(REASON)
++    );
++
++    // 预期集合仍全齐（applied=1/expected=1），但 finishable 必须因标记为 false。
++    let state = baseline_apply_state(&vault)
++        .expect("state")
++        .expect("journal 必须保留");
++    assert_eq!(state.status, BaselineApplyStatus::Staging);
++    assert_eq!(state.expected_docs, Some(1));
++    assert_eq!(state.applied_docs, 1);
++    assert!(
++        !state.finishable,
++        "失败标记存在时即使 expected 已全齐也不得 finishable"
++    );
++
++    // apply：用一篇新文档 doc-b 证明门禁在解码/写事务之前生效（若漏检会落 loro_docs/update）。
++    let error = apply_baseline_batch(
++        &vault,
++        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
++        &[],
++    )
++    .expect_err("失败标记必须阻止 apply_baseline_batch");
++    assert!(
++        matches!(&error, StorageError::SyncConflict { .. }),
++        "应当是 SyncConflict，实际 {error:?}"
++    );
++    let message = format!("{error}");
++    assert!(message.contains(REASON), "冲突必须携带失败原因：{message}");
++    assert!(
++        message.contains("abort_baseline_apply"),
++        "冲突必须提示先 abort_baseline_apply：{message}"
++    );
++
++    // 零写：doc-b 没有任何行；doc-a 的 head/远端已知 VV 与全库 update 数不变；
++    // journal 的已应用集合与预期集合也不变。
++    assert_eq!(
++        count(
++            &vault,
++            "SELECT count(*) FROM loro_docs WHERE doc_id='doc-b'",
++            &[]
++        ),
++        0
++    );
++    assert_eq!(
++        count(
++            &vault,
++            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-b'",
++            &[]
++        ),
++        0
++    );
++    assert_eq!(
++        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
++        updates_before
++    );
++    assert_eq!(
++        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
++        journal_rows_before
++    );
++    assert_eq!(head(&vault, "doc-a").head_seq, head_before.head_seq);
++    assert_eq!(
++        meta_remote_known_bytes(&vault, "doc-a"),
++        remote_known_before
++    );
++    let state = baseline_apply_state(&vault)
++        .expect("state")
++        .expect("journal");
++    assert_eq!(state.status, BaselineApplyStatus::Staging);
++    assert_eq!(state.applied_docs, 1);
++    assert_eq!(state.expected_docs, Some(1));
++
++    // finish：必须是**带原因**的 SyncConflict，不能退化成 Ok(Conflict) 把原因丢掉。
++    let error = finish_baseline_apply(&vault, 5, "baseline-cursor")
++        .expect_err("失败标记必须阻止 finish_baseline_apply");
++    assert!(
++        matches!(&error, StorageError::SyncConflict { .. }),
++        "应当是 SyncConflict，实际 {error:?}"
++    );
++    let message = format!("{error}");
++    assert!(
++        message.contains(REASON),
++        "finish 冲突必须携带失败原因：{message}"
++    );
++    assert!(
++        message.contains("abort_baseline_apply"),
++        "finish 冲突必须提示先 abort_baseline_apply：{message}"
++    );
++
++    // 零写：水位/cursor/journal 全部保持 begin/上次 apply 后的状态。
++    let cursor_after = sync_cursor_state(&vault).expect("cursor");
++    assert_eq!(cursor_after.received_seq, cursor_before.received_seq);
++    assert_eq!(cursor_after.integrated_seq, cursor_before.integrated_seq);
++    assert_eq!(
++        cursor_after.confirmed_highwater,
++        cursor_before.confirmed_highwater
++    );
++    assert_eq!(relay_cursor(&vault), None);
++    let state = baseline_apply_state(&vault)
++        .expect("state")
++        .expect("journal");
++    assert_eq!(state.status, BaselineApplyStatus::Staging);
++    assert_eq!(state.chosen_cursor, None);
++    assert_eq!(state.applied_docs, 1);
++
++    // abort 清 journal + 标记，已 merge 的正文保留；之后 begin 可重新成功。
++    assert!(abort_baseline_apply(&vault).expect("abort"));
++    assert!(
++        baseline_verify_failure(&vault).expect("读标记").is_none(),
++        "abort 必须清除失败标记"
++    );
++    assert!(baseline_apply_state(&vault).expect("state").is_none());
++    let merged = load_body_doc(&vault, "doc-a", PEER_A, None)
++        .expect("abort 后正文")
++        .0;
++    assert!(
++        merged.text().contains("a-local"),
++        "abort 只清 journal，不得删已 merge 的正文，实际={:?}",
++        merged.text()
++    );
++
++    let reopened = begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
++    assert_eq!(reopened.status, BaselineApplyStatus::Staging);
++    assert_eq!(reopened.applied_docs, 0, "abort 后 begin 应是全新 journal");
++    assert_eq!(reopened.expected_docs, Some(1));
++    assert!(
++        !reopened.finishable,
++        "新建 staging 尚未应用任何批次，不应 finishable"
++    );
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -78123,27 +79396,27 @@ index 0000000..26b0ad7
 +    assert_eq!(scalar(&vault, "SELECT count(*) FROM sync_outbox"), 0);
 +}
 diff --git a/crates/storage/tests/session_flush.rs b/crates/storage/tests/session_flush.rs
-index 2a99366..ffcf18e 100644
+index 2a99366..d00a276 100644
 --- a/crates/storage/tests/session_flush.rs
 +++ b/crates/storage/tests/session_flush.rs
-@@ -5,10 +5,13 @@ mod support;
+@@ -5,10 +5,14 @@ mod support;
  use std::time::{Duration, Instant};
  
  use menghunote_storage::session::{
 -    DocumentSession, EditOutcome, EditRequest, FlushReason, LiveRev, ScalarEdit, SessionEpoch,
--    SessionEvent, SessionOptions,
-+    DocumentSession, EditOutcome, EditRequest, ExternalCommitTicket, FlushReason, GateError,
-+    GateState, LiveRev, ScalarEdit, SessionEpoch, SessionEvent, SessionOptions,
-+};
++    DocumentSession, DriverOptions, EditOutcome, EditRequest, ExternalCommitTicket, FlushReason,
++    GateError, GateState, LiveRev, ManualClock, ScalarEdit, SessionDriver, SessionEpoch,
+     SessionEvent, SessionOptions,
+ };
+-use menghunote_storage::{load_body_state, materialize_body, BodyDoc, Vault};
 +use menghunote_storage::{
 +    append_updates, load_body_doc, load_body_state, materialize_body, BodyDoc, UpdateRecord, Value,
 +    Vault,
- };
--use menghunote_storage::{load_body_state, materialize_body, BodyDoc, Vault};
++};
  use support::*;
  
  fn options(peer: u64) -> SessionOptions {
-@@ -249,3 +252,224 @@ fn remote_event_is_pushed_to_the_queue() {
+@@ -249,3 +253,351 @@ fn remote_event_is_pushed_to_the_queue() {
          .any(|event| matches!(event, SessionEvent::Remote(delta) if delta.to_rev == LiveRev(1))));
      assert!(session.events().is_empty(), "事件队列是取走语义");
  }
@@ -78318,6 +79591,26 @@ index 2a99366..ffcf18e 100644
 +        "本地",
 +        "live 保持会话内容，靠关闭并重开文档与库对账"
 +    );
++
++    // P1：不可恢复原因必须能被会话**直接**读到（UI/驱动不必先走外部提交闸门），
++    // 且与闸门看到的是同一个字符串；反复读取与再次 flush 都不得改变它。
++    let direct = session
++        .last_write_error()
++        .expect("不可恢复失败必须能从会话读到");
++    assert_eq!(direct, message, "会话与闸门必须看到同一个失败原因");
++    assert!(
++        direct.contains("需要重开文档"),
++        "会话读到的原因必须可执行：{direct}"
++    );
++    for _ in 0..3 {
++        session.flush(FlushReason::Manual);
++        assert_eq!(
++            session.last_write_error().as_deref(),
++            Some(message.as_str()),
++            "多次读取/再次 flush 不得改变不可恢复原因"
++        );
++    }
++    assert_eq!(session.pending_len(), 1, "读取失败原因不得动 journal");
 +}
 +
 +/// P1-3 的另一个不可恢复分支：自动重建要读新 head，读不到/解码失败同样必须 fail-closed
@@ -78368,6 +79661,125 @@ index 2a99366..ffcf18e 100644
 +        "拒绝重建后不得写旧前缀"
 +    );
 +}
++
++/// 打开一个不启 ticker 的驱动（假时钟）：失败路径的收敛只靠显式 `poll`，不靠真睡。
++fn open_test_driver(vault: &Vault) -> SessionDriver {
++    SessionDriver::open_with_clock(
++        vault,
++        "doc-1",
++        DriverOptions {
++            session: options(PEER_A),
++            auto_tick: false,
++            ..DriverOptions::default()
++        },
++        Box::new(ManualClock::new()),
++    )
++    .expect("打开驱动")
++}
++
++/// 把驱动推进到「不可恢复 flush 失败」，返回闸门读到的失败原因。
++///
++/// 构造方式与 [`flush_reports_unrecoverable_after_bounded_rebuild`] 相同：外部 writer 写入
++/// 本会话 live 未知的并发 ops，自动重建必须拒绝。
++fn drive_driver_to_unrecoverable(driver: &mut SessionDriver, vault: &Vault) -> String {
++    driver.apply(request(driver.session(), "c1", 0, vec![edit(0, 0, "本地")]));
++
++    let external = BodyDoc::create("doc-1", PEER_B).expect("外部副本");
++    external.insert_scalars(0, "远端").expect("外部编辑");
++    let external_update = pending(&external, &loro::VersionVector::default()).expect("外部增量");
++    append_updates(
++        vault,
++        "doc-1",
++        0,
++        &[UpdateRecord::new("external-1", external_update)],
++    )
++    .expect("外部推进 head");
++
++    let ticket = driver.begin_external_commit().expect("begin");
++    let deadline = Instant::now() + Duration::from_secs(10);
++    loop {
++        match driver.poll_external_commit(&ticket) {
++            GateState::Failed(GateError::FlushFailed { message, .. }) => return message,
++            GateState::Flushing | GateState::WaitingIME => std::thread::yield_now(),
++            other => panic!("闸门没有给出明确失败：{other:?}"),
++        }
++        assert!(Instant::now() < deadline, "闸门 10s 内没有给出明确失败");
++    }
++}
++
++/// P1：不可恢复的 flush 失败必须能通过 `SessionDriver::last_write_error` 直接读到
++/// （UI 不必先走外部提交闸门），并且没有失败时是 `None`。
++#[test]
++fn driver_forwards_unrecoverable_flush_error() {
++    let (_dir, vault) = fresh_vault();
++    let _seed = seed_note(&vault, "note-1", "doc-1");
++    let mut driver = open_test_driver(&vault);
++    assert_eq!(
++        driver.last_write_error(),
++        None,
++        "没有失败时驱动必须返回 None"
++    );
++
++    let message = drive_driver_to_unrecoverable(&mut driver, &vault);
++    let forwarded = driver
++        .last_write_error()
++        .expect("驱动必须转发不可恢复的失败原因");
++    assert_eq!(forwarded, message, "驱动与闸门必须看到同一个原因");
++    assert!(
++        forwarded.contains("需要重开文档"),
++        "驱动读到的原因必须可执行：{forwarded}"
++    );
++    assert_eq!(
++        driver.last_write_error().as_deref(),
++        Some(forwarded.as_str()),
++        "多次读取必须稳定"
++    );
++}
++
++/// P1：`CloseReport.flush_error` 必须带出没排空的原因；报告拿到之后驱动仍可读同一个值。
++#[test]
++fn close_report_surfaces_unrecoverable_flush_error() {
++    let (_dir, vault) = fresh_vault();
++    let _seed = seed_note(&vault, "note-1", "doc-1");
++    let mut driver = open_test_driver(&vault);
++    let message = drive_driver_to_unrecoverable(&mut driver, &vault);
++
++    // 不可恢复时 `close` 必然排不空：timeout 0 也必须立刻返回（不挂住 UI）。
++    let report = driver.close(Duration::ZERO);
++    let close_error = report
++        .flush_error
++        .clone()
++        .expect("CloseReport 必须带出 flush 失败原因");
++    assert_eq!(close_error, message, "关闭报告与闸门必须一致");
++    assert!(
++        close_error.contains("需要重开文档"),
++        "CloseReport 的原因必须可执行：{close_error}"
++    );
++    assert!(report.timed_out, "不可恢复时关闭必然超时：{report:?}");
++    assert_eq!(report.pending_edits, 1, "未 ACK 条目必须原样保留");
++    assert!(
++        report.durable.is_none(),
++        "不可恢复后不得再发出 DurableAck：{report:?}"
++    );
++    // 报告拿走后驱动仍在：同一个原因必须还能读到。
++    assert_eq!(
++        driver.last_write_error(),
++        Some(close_error),
++        "关闭报告产生后原因仍须可读"
++    );
++}
+diff --git a/crates/storage/tests/session_schedule.rs b/crates/storage/tests/session_schedule.rs
+index 20e0673..6419a6e 100644
+--- a/crates/storage/tests/session_schedule.rs
++++ b/crates/storage/tests/session_schedule.rs
+@@ -212,6 +212,7 @@ fn close_drains_pending_edits_and_materializes_body() {
+     assert!(!report.timed_out, "Close 必须排空：{report:?}");
+     assert_eq!(report.pending_edits, 0);
+     assert_eq!(report.pending_materialize, 0);
++    assert_eq!(report.flush_error, None, "正常关闭不得报 flush 失败");
+     assert!(
+         report.durable.is_some(),
+         "Close 要等到覆盖最后 live_rev 的 ACK"
 diff --git a/crates/storage/tests/sync_inbox_batch.rs b/crates/storage/tests/sync_inbox_batch.rs
 index 9c04bc9..dc0352f 100644
 --- a/crates/storage/tests/sync_inbox_batch.rs

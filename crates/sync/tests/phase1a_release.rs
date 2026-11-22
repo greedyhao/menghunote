@@ -13,9 +13,15 @@
 //! 每次都用 fresh vault，结束后 journal 一律 `completed`，不会给下一次留 staging。
 //!
 //! 第二个探针 [`checkpoint_validate_scan_cost`] 测 **checkpoint validate 的 coverage
-//! 日志扫描 O(S) 成本**：FakeRelay 构造 S = 1k / 5k / 25k 条混合日志（85.7% UPDATE +
+//! 日志扫描 O(S) 成本**：FakeRelay 构造 S = 1k / 5k / 25k / 1M 条混合日志（85.7% UPDATE +
 //! 14.3% ASSET），走真实 `CheckpointWriter::prepare → validate`（不复制 scan 实现），
-//! 只打印页数/墙钟，不 assert 时间。
+//! 只打印页数/墙钟，不 assert 时间。1M 档 = 4096 页，是生产
+//! `COVERAGE_SCAN_MAX_PAGES` 的上限，只跑 1 次（常规档 3 次取中位数）。
+//!
+//! 第三个探针 [`large_doc_per_page_replay_cost`]（M3 标定）测 **一篇 1 MiB 大正文的
+//! per-page replay 成本**：每次 aggregate 页都会为每个 touched doc 全量
+//! `load_body_doc`；该探针连续重放 5 次并打印 raw/中位数，另测 snapshot 导出/恢复与
+//! 全量 `pending_update` 作参考。同样只打印、不 assert 时间。
 //!
 //! ```bash
 //! cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --nocapture
@@ -469,9 +475,17 @@ fn phase1a_baseline_apply_gate_hold() {
 // 只打印不 assert 时间；硬断言只校验覆盖到了 S、尾部 ASSET 被真实验证、页数符合 S/256。
 
 /// 探针档位（事件总数 S）。
-const SCAN_COST_S: [usize; 3] = [1_000, 5_000, 25_000];
-/// 每档重复次数（取中位数）。
+///
+/// 最后一档 `1_048_576 = 4096 × 256` 正好对应生产 `COVERAGE_SCAN_MAX_PAGES = 4096`
+/// 的页数上限（`crates/sync/src/checkpoint.rs`，私有常量）；这一档只跑 1 次，
+/// 避免 3 × 百万事件（FakeRelay 的逐页扫描本身还有 O(S²/256) 的夹具 artifact）。
+const SCAN_COST_S: [usize; 4] = [1_000, 5_000, 25_000, SCAN_COST_MAX_S];
+/// 4096 页上限对应的事件总数。
+const SCAN_COST_MAX_S: usize = 1_048_576;
+/// 常规档位重复次数（取中位数）。
 const SCAN_COST_RUNS: usize = 3;
+/// 上限档位重复次数（只跑 1 次，不取中位数）。
+const SCAN_COST_MAX_RUNS: usize = 1;
 /// 生产 `COVERAGE_SCAN_PAGE_LIMIT`（`crates/sync/src/checkpoint.rs` 私有常量 = 256）。
 /// 只用于校验探针确实按 S/256 页扫完整段；若生产改页大小，这里应同步更新。
 const SCAN_COST_PAGE_LIMIT: usize = 256;
@@ -783,12 +797,43 @@ fn median_ms(values: &[f64]) -> f64 {
     sorted[sorted.len() / 2]
 }
 
+/// 该档位的 validate 重复次数：4096 页上限档只跑 1 次，其余 3 次取中位数。
+fn scan_cost_runs(total_events: usize) -> usize {
+    if total_events >= SCAN_COST_MAX_S {
+        SCAN_COST_MAX_RUNS
+    } else {
+        SCAN_COST_RUNS
+    }
+}
+
+/// 进程峰值常驻内存（Linux `/proc/self/status` 的 `VmHWM`，MiB）。
+///
+/// 只用于给 4096 页档的夹具内存占用一个量级参考，不参与断言；其它平台返回 `None`。
+fn peak_resident_mib() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+        let kib: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib / 1024.0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 fn run_scan_cost(total_events: usize) {
+    let runs = scan_cost_runs(total_events);
+    let setup_started = Instant::now();
     let mut fixture = build_scan_cost_fixture(total_events);
+    let setup_ms = setup_started.elapsed().as_secs_f64() * 1e3;
+    let peak_rss = peak_resident_mib().map_or_else(|| "n/a".to_owned(), |mib| format!("{mib:.1}"));
     let asset_pct = fixture.asset_events as f64 * 100.0 / total_events as f64;
     eprintln!(
         "[phase1a] scan_cost setup S={total_events} asset_events={} update_events={} \
-         asset_pct={asset_pct:.1} prepare_pages={} prepare_scan_ms={:.3} prepare_log_ms={:.3}",
+         asset_pct={asset_pct:.1} prepare_pages={} prepare_scan_ms={:.3} prepare_log_ms={:.3} \
+         setup_ms={setup_ms:.3} runs={runs} peak_rss_mib={peak_rss}",
         fixture.asset_events,
         fixture.update_events,
         fixture.prepare_pages,
@@ -798,11 +843,11 @@ fn run_scan_cost(total_events: usize) {
 
     let mut pages = 0u64;
     let mut part_calls = 0u64;
-    let mut raw_scan = Vec::with_capacity(SCAN_COST_RUNS);
-    let mut raw_validate = Vec::with_capacity(SCAN_COST_RUNS);
-    let mut raw_log = Vec::with_capacity(SCAN_COST_RUNS);
-    let mut raw_part = Vec::with_capacity(SCAN_COST_RUNS);
-    for run in 0..SCAN_COST_RUNS {
+    let mut raw_scan = Vec::with_capacity(runs);
+    let mut raw_validate = Vec::with_capacity(runs);
+    let mut raw_log = Vec::with_capacity(runs);
+    let mut raw_part = Vec::with_capacity(runs);
+    for run in 0..runs {
         fixture.relay.reset_counters();
         let started = Instant::now();
         let baseline = {
@@ -844,7 +889,7 @@ fn run_scan_cost(total_events: usize) {
         part_calls = run_parts;
         eprintln!(
             "[phase1a] scan_cost S={total_events} run={run} pages={run_pages} \
-             scan_ms={scan_ms:.3} validate_ms={validate_ms:.3} log_ms={log_ms:.3} \
+             scan_ms={scan_ms:.3} log_ms={log_ms:.3} validate_ms={validate_ms:.3} \
              part_calls={run_parts} part_ms={part_ms:.3}",
         );
         raw_scan.push(scan_ms);
@@ -858,9 +903,49 @@ fn run_scan_cost(total_events: usize) {
     let log_median = median_ms(&raw_log);
     eprintln!(
         "[phase1a] scan_cost S={total_events} pages={pages} scan_ms={scan_median:.3} \
-         (median of {SCAN_COST_RUNS}; raw_scan_ms={raw_scan:?} log_ms_median={log_median:.3} \
-         validate_ms_median={validate_median:.3} validate_ms_raw={raw_validate:?} \
-         part_calls={part_calls} part_ms_raw={raw_part:?})"
+         log_ms={log_median:.3} validate_ms={validate_median:.3} runs={runs} \
+         raw_scan_ms={raw_scan:?} raw_log_ms={raw_log:?} raw_validate_ms={raw_validate:?} \
+         part_calls={part_calls} part_ms_raw={raw_part:?}"
+    );
+}
+
+#[test]
+#[ignore = "manual benchmark"]
+fn fragmented_doc_per_page_replay_cost() {
+    // 同一篇 1 MiB 正文，拆成 256 条 4 KiB update：模拟真实库中“大文档 + 多批增量”
+    // 的形状，验证 per-page `load_body_doc` 的成本是否被单条大 op 低估。
+    const FRAG_CHUNKS: usize = 256;
+    const FRAG_CHUNK_CHARS: usize = 4096;
+    const DOC_ID: &str = "large-doc-frag";
+    let (_dir, vault) = fresh_vault();
+    let doc = seed_doc(&vault, DOC_ID, LOCAL_PEER);
+    for index in 0..FRAG_CHUNKS {
+        let chunk = pseudo_text(0xF00D_0000 + index as u64, FRAG_CHUNK_CHARS);
+        let at = doc.scalar_len();
+        doc.insert_scalars(at, &chunk).expect("追加分片");
+        commit_local(&vault, &doc);
+    }
+    assert_eq!(doc.scalar_len(), FRAG_CHUNKS * FRAG_CHUNK_CHARS);
+    let update_rows = count(
+        &vault,
+        &format!("SELECT count(*) FROM loro_updates WHERE doc_id='{DOC_ID}'"),
+    );
+    assert_eq!(update_rows, FRAG_CHUNKS as i64, "必须有 256 条 update");
+
+    let mut replay_ms = Vec::with_capacity(LARGE_DOC_REPLAY_RUNS);
+    for run in 0..LARGE_DOC_REPLAY_RUNS {
+        let started = Instant::now();
+        let (loaded, head) =
+            load_body_doc(&vault, DOC_ID, LOCAL_PEER, None).expect("完整重放分片大文档");
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(loaded.scalar_len(), FRAG_CHUNKS * FRAG_CHUNK_CHARS);
+        assert_eq!(head.head_seq, FRAG_CHUNKS as u64);
+        replay_ms.push(ms);
+        eprintln!("[phase1a] frag_doc_replay run={run} replay_ms={ms:.3}");
+    }
+    eprintln!(
+        "[phase1a] frag_doc_replay doc_mib=1.000 update_rows={update_rows}          chunks={FRAG_CHUNKS} chunk_bytes={FRAG_CHUNK_CHARS}          replay_ms_raw={replay_ms:?} replay_ms_median={:.3}",
+        median_ms(&replay_ms),
     );
 }
 
@@ -870,4 +955,108 @@ fn checkpoint_validate_scan_cost() {
     for total_events in SCAN_COST_S {
         run_scan_cost(total_events);
     }
+}
+
+// ============================================================ M3 大文档 per-page replay 成本
+//
+// M3 标定：aggregate 每页（每批 pull）会为每个 **touched doc** 全量 `load_body_doc`
+// （快照 + 该 doc 全部 `loro_updates` 重放）。§8.3.2 的 20 篇 × 107 KiB 夹具没有覆盖
+// “单篇 1 MiB”这个形状；本探针造一篇确定性 1 MiB ASCII 正文（单条 insert op、
+// 单条 `loro_updates` 行），连续 5 次 `load_body_doc`，打印 raw + 中位数（首轮含
+// 冷页缓存，另给去掉首轮的 warm 中位数）；再各测一次 `pending_update(空 VV)` /
+// `export_snapshot` / 从 snapshot `BodyDoc::restore` 作为旁路参考。只打印，
+// 不 assert 时间。
+//
+// 注意：实测该形状的纯 replay ≈2 ms，远低于 §10.4 由 verify 折算的 ~2 s/篇；
+// 后者含 baseline merge 的 attached import 成本，不是本探针的纯 replay 口径。
+
+/// 大文档正文 id。
+const LARGE_DOC_ID: &str = "large-doc";
+/// 1 MiB 正文（ASCII：Loro scalar 数 == UTF-8 字节数）。
+const LARGE_DOC_CHARS: usize = 1024 * 1024;
+/// 完整重放次数（每次都是新的 `load_body_doc`，不共享 BodyDoc）。
+const LARGE_DOC_REPLAY_RUNS: usize = 5;
+
+#[test]
+#[ignore = "manual benchmark"]
+fn large_doc_per_page_replay_cost() {
+    let (_dir, vault) = fresh_vault();
+    let doc = seed_doc(&vault, LARGE_DOC_ID, LOCAL_PEER);
+    let text = pseudo_text(0x1a2b_3c4d_5e6f_7081, LARGE_DOC_CHARS);
+    assert_eq!(
+        text.len(),
+        LARGE_DOC_CHARS,
+        "ASCII 正文的字节数必须正好 1 MiB"
+    );
+    doc.insert_scalars(0, &text).expect("写 1 MiB 正文");
+    let head_seq = commit_local(&vault, &doc);
+    let update_rows = count(
+        &vault,
+        &format!("SELECT count(*) FROM loro_updates WHERE doc_id='{LARGE_DOC_ID}'"),
+    );
+    assert_eq!(update_rows, 1, "per-page replay 要的是单条大文本 op 的形状");
+    let payload_rows = vault
+        .query(
+            &format!("SELECT length(payload) FROM loro_updates WHERE doc_id='{LARGE_DOC_ID}'"),
+            &[],
+        )
+        .expect("查询 update payload 长度");
+    let payload_bytes = match payload_rows.first().and_then(|row| row.first()) {
+        Some(Value::Integer(bytes)) => *bytes,
+        other => panic!("payload 长度结果异常：{other:?}"),
+    };
+    assert!(payload_bytes > 0, "update payload 不能为空");
+
+    // 5 次完整重放：每次都是一次新的 SQLite 读取 + snapshot/update import。
+    let mut replay_ms = Vec::with_capacity(LARGE_DOC_REPLAY_RUNS);
+    let mut last_loaded: Option<BodyDoc> = None;
+    for run in 0..LARGE_DOC_REPLAY_RUNS {
+        let started = Instant::now();
+        let (loaded, head) =
+            load_body_doc(&vault, LARGE_DOC_ID, LOCAL_PEER, None).expect("完整重放大文档");
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(loaded.scalar_len(), LARGE_DOC_CHARS);
+        assert_eq!(loaded.byte_len(), LARGE_DOC_CHARS);
+        assert_eq!(head.head_seq, head_seq, "重放 head 必须与提交时一致");
+        replay_ms.push(ms);
+        last_loaded = Some(loaded);
+        eprintln!("[phase1a] large_doc_replay run={run} replay_ms={ms:.3}");
+    }
+    let loaded = last_loaded.expect("至少重放一次");
+    let replay_median = median_ms(&replay_ms);
+    let warm_median = if replay_ms.len() > 1 {
+        median_ms(&replay_ms[1..])
+    } else {
+        replay_median
+    };
+
+    // 参考项：不代表 per-page replay，只给出 snapshot / 全量 update 路径的量级。
+    let pending_started = Instant::now();
+    let pending = loaded
+        .pending_update(&loro::VersionVector::default())
+        .expect("全量 pending_update");
+    let pending_ms = pending_started.elapsed().as_secs_f64() * 1e3;
+    let snapshot_started = Instant::now();
+    let snapshot = loaded.export_snapshot().expect("导出 1 MiB 快照");
+    let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1e3;
+    let restore_started = Instant::now();
+    let restored =
+        BodyDoc::restore(LARGE_DOC_ID, LOCAL_PEER, Some(&snapshot), &[]).expect("从快照 restore");
+    let restore_ms = restore_started.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(restored.scalar_len(), LARGE_DOC_CHARS);
+
+    eprintln!(
+        "[phase1a] large_doc_replay doc_mib={:.3} text_bytes={LARGE_DOC_CHARS} \
+         loro_payload_bytes={payload_bytes} update_rows={update_rows} \
+         replay_runs={LARGE_DOC_REPLAY_RUNS} replay_ms_raw={replay_ms:?} \
+         replay_ms_median={replay_median:.3} replay_ms_warm_median={warm_median:.3}",
+        LARGE_DOC_CHARS as f64 / (1024.0 * 1024.0),
+    );
+    eprintln!(
+        "[phase1a] large_doc_replay_ref pending_update_ms={pending_ms:.3} \
+         pending_bytes={} export_snapshot_ms={snapshot_ms:.3} snapshot_bytes={} \
+         restore_from_snapshot_ms={restore_ms:.3}",
+        pending.payload.len(),
+        snapshot.len(),
+    );
 }

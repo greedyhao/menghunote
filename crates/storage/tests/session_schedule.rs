@@ -212,6 +212,7 @@ fn close_drains_pending_edits_and_materializes_body() {
     assert!(!report.timed_out, "Close 必须排空：{report:?}");
     assert_eq!(report.pending_edits, 0);
     assert_eq!(report.pending_materialize, 0);
+    assert_eq!(report.flush_error, None, "正常关闭不得报 flush 失败");
     assert!(
         report.durable.is_some(),
         "Close 要等到覆盖最后 live_rev 的 ACK"

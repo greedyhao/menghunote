@@ -220,6 +220,12 @@ pub struct CloseReport {
     pub pending_materialize: usize,
     /// 是否超时（`true` 表示没排空，调用方应保留现场）。
     pub timed_out: bool,
+    /// 关闭时仍未解决的 flush 写失败原因（`None` = 没有已知失败）。
+    ///
+    /// 取自 [`DocumentSession::last_write_error`]：不可恢复的失败（文案含
+    /// 「需要重开文档」）优先，否则是最近一次普通写失败。关闭之后会话可能被丢弃，
+    /// 调用方只能靠这份报告知道「没排空是为什么」，因此它必须随报告一起返回。
+    pub flush_error: Option<String>,
 }
 
 /// 一条 B 物化任务（只带固定 seq，不带 live 句柄）。
@@ -466,6 +472,15 @@ impl SessionDriver {
     /// 未 ACK 编辑条数。
     pub fn pending_edits(&self) -> usize {
         self.session.pending_len()
+    }
+
+    /// 最近一次 flush 写失败的可读原因（转发会话核的只读快照）。
+    ///
+    /// 不可恢复的失败（「需要重开文档」）优先，否则是最新一次普通写失败；`None` = 没失败。
+    /// UI 不必等 `pump` 或走外部提交闸门就能读到它。
+    #[must_use]
+    pub fn last_write_error(&self) -> Option<String> {
+        self.session.last_write_error()
     }
 
     /// 下一次固定窗口到期时刻（`None` 表示当前没有等待中的脏数据）。
@@ -785,6 +800,8 @@ impl SessionDriver {
             pending_edits: self.session.pending_len(),
             pending_materialize: self.materializer.pending(),
             timed_out: self.session.pending_len() > 0 || self.materializer.pending() > 0,
+            // 关闭后会话可能被丢弃：没排空的原因必须随报告带走（不可恢复优先）。
+            flush_error: self.session.last_write_error(),
         }
     }
 

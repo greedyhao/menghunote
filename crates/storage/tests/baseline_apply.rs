@@ -14,12 +14,14 @@ use menghunote_storage::session::{
 use menghunote_storage::{
     abort_baseline_apply, append_updates_with_integrated_marks, apply_baseline_assets,
     apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_state,
-    begin_baseline_apply, create_note_slot, finish_baseline_apply, load_body_doc, load_head,
+    baseline_verify_failure, begin_baseline_apply, create_note_slot, finish_baseline_apply,
+    load_body_doc, load_head, load_structure, mark_baseline_verify_failed,
     reset_baseline_apply_debug, set_sync_log_id, store_inbox_verified_batch, sync_cursor_state,
     BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc,
-    StorageError, SyncContext, UpdateRecord, Value, Vault, VerifiedInboxRow,
+    StorageError, StructureDoc, StructureWriter, SyncContext, UpdateRecord, Value, Vault,
+    VerifiedInboxRow, BASELINE_MERGE_BATCH, META_BASELINE_VERIFY_FAILED,
     META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
-    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
+    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION, STRUCTURE_DOC_ID,
 };
 use menghunote_text::UnicodeScalar;
 
@@ -1380,11 +1382,405 @@ fn finish_without_all_assets_is_conflict() {
 }
 
 // ---------------------------------------------------------------------------
+// P1：verify 失败标记的 storage 门禁（apply / finish / finishable）
+// ---------------------------------------------------------------------------
+
+/// 失败标记存在时：
+/// - `apply_baseline_batch` 在任何解码/写事务前拒绝，且零写；
+/// - `finish_baseline_apply` 返回**带原因**的 `SyncConflict`，不是丢掉原因的 `Ok(Conflict)`；
+/// - `baseline_apply_state.finishable` 在预期集合已全齐时也必须为 false（status 仍是 staging）；
+/// - `abort_baseline_apply` 清标记后 `begin` 可重新成功。
+#[test]
+fn marker_blocks_apply_and_finish_and_finishable() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-a", "a-local");
+    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
+
+    // 先真正跑完唯一一批，让预期集合在标记之前**已全齐**（证明 finishable 的变化来自标记）。
+    let applied = apply_baseline_batch(
+        &vault,
+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
+        &[],
+    )
+    .expect("batch a");
+    assert!(applied.finishable, "标记写入前预期集合已齐，应可 finish");
+
+    let head_before = head(&vault, "doc-a");
+    let cursor_before = sync_cursor_state(&vault).expect("cursor");
+    let remote_known_before = meta_remote_known_bytes(&vault, "doc-a");
+    let updates_before = count(&vault, "SELECT count(*) FROM loro_updates", &[]);
+    let journal_rows_before = count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]);
+
+    const REASON: &str = "读回校验失败：snapshot 的 VV 未被本地 VV 覆盖";
+    mark_baseline_verify_failed(&vault, REASON).expect("写失败标记");
+    assert_eq!(
+        baseline_verify_failure(&vault).expect("读标记").as_deref(),
+        Some(REASON)
+    );
+
+    // 预期集合仍全齐（applied=1/expected=1），但 finishable 必须因标记为 false。
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal 必须保留");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.expected_docs, Some(1));
+    assert_eq!(state.applied_docs, 1);
+    assert!(
+        !state.finishable,
+        "失败标记存在时即使 expected 已全齐也不得 finishable"
+    );
+
+    // 资产批也必须被同一 marker 挡住（M1）：失败 journal 语义上已冻结，不能借
+    // apply_baseline_assets 继续写 baseline_apply_assets/assets 计数。
+    let assets_before = count(&vault, "SELECT count(*) FROM assets", &[]);
+    let apply_assets_before = count(&vault, "SELECT count(*) FROM baseline_apply_assets", &[]);
+    let asset = BaselineAsset {
+        object_id: [0x7A; 32],
+        asset_hash: [0x8B; 32],
+        byte_len: 5,
+        media_type: Some("text/plain".to_owned()),
+        data: b"asset".to_vec(),
+    };
+    let asset_error = apply_baseline_assets(&vault, std::slice::from_ref(&asset))
+        .expect_err("失败标记必须阻止 apply_baseline_assets");
+    assert!(
+        matches!(&asset_error, StorageError::SyncConflict { .. }),
+        "应当是 SyncConflict，实际 {asset_error:?}"
+    );
+    let asset_message = format!("{asset_error}");
+    assert!(
+        asset_message.contains(REASON),
+        "资产冲突必须携带原因：{asset_message}"
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM assets", &[]),
+        assets_before,
+        "marker 下资产批必须零写"
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM baseline_apply_assets", &[]),
+        apply_assets_before,
+        "marker 下不得推进 baseline_apply_assets"
+    );
+
+    // apply：用一篇新文档 doc-b 证明门禁在解码/写事务之前生效（若漏检会落 loro_docs/update）。
+    let error = apply_baseline_batch(
+        &vault,
+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
+        &[],
+    )
+    .expect_err("失败标记必须阻止 apply_baseline_batch");
+    assert!(
+        matches!(&error, StorageError::SyncConflict { .. }),
+        "应当是 SyncConflict，实际 {error:?}"
+    );
+    let message = format!("{error}");
+    assert!(message.contains(REASON), "冲突必须携带失败原因：{message}");
+    assert!(
+        message.contains("abort_baseline_apply"),
+        "冲突必须提示先 abort_baseline_apply：{message}"
+    );
+
+    // 零写：doc-b 没有任何行；doc-a 的 head/远端已知 VV 与全库 update 数不变；
+    // journal 的已应用集合与预期集合也不变。
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_docs WHERE doc_id='doc-b'",
+            &[]
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-b'",
+            &[]
+        ),
+        0
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
+        updates_before
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
+        journal_rows_before
+    );
+    assert_eq!(head(&vault, "doc-a").head_seq, head_before.head_seq);
+    assert_eq!(
+        meta_remote_known_bytes(&vault, "doc-a"),
+        remote_known_before
+    );
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.applied_docs, 1);
+    assert_eq!(state.expected_docs, Some(1));
+
+    // finish：必须是**带原因**的 SyncConflict，不能退化成 Ok(Conflict) 把原因丢掉。
+    let error = finish_baseline_apply(&vault, 5, "baseline-cursor")
+        .expect_err("失败标记必须阻止 finish_baseline_apply");
+    assert!(
+        matches!(&error, StorageError::SyncConflict { .. }),
+        "应当是 SyncConflict，实际 {error:?}"
+    );
+    let message = format!("{error}");
+    assert!(
+        message.contains(REASON),
+        "finish 冲突必须携带失败原因：{message}"
+    );
+    assert!(
+        message.contains("abort_baseline_apply"),
+        "finish 冲突必须提示先 abort_baseline_apply：{message}"
+    );
+
+    // 零写：水位/cursor/journal 全部保持 begin/上次 apply 后的状态。
+    let cursor_after = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor_after.received_seq, cursor_before.received_seq);
+    assert_eq!(cursor_after.integrated_seq, cursor_before.integrated_seq);
+    assert_eq!(
+        cursor_after.confirmed_highwater,
+        cursor_before.confirmed_highwater
+    );
+    assert_eq!(relay_cursor(&vault), None);
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.chosen_cursor, None);
+    assert_eq!(state.applied_docs, 1);
+
+    // abort 清 journal + 标记，已 merge 的正文保留；之后 begin 可重新成功。
+    assert!(abort_baseline_apply(&vault).expect("abort"));
+    assert!(
+        baseline_verify_failure(&vault).expect("读标记").is_none(),
+        "abort 必须清除失败标记"
+    );
+    assert!(baseline_apply_state(&vault).expect("state").is_none());
+    let merged = load_body_doc(&vault, "doc-a", PEER_A, None)
+        .expect("abort 后正文")
+        .0;
+    assert!(
+        merged.text().contains("a-local"),
+        "abort 只清 journal，不得删已 merge 的正文，实际={:?}",
+        merged.text()
+    );
+
+    let reopened = begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
+    assert_eq!(reopened.status, BaselineApplyStatus::Staging);
+    assert_eq!(reopened.applied_docs, 0, "abort 后 begin 应是全新 journal");
+    assert_eq!(reopened.expected_docs, Some(1));
+    assert!(
+        !reopened.finishable,
+        "新建 staging 尚未应用任何批次，不应 finishable"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // P1-2：tombstone 判定与 notes 软删之间的 TOCTOU
 // ---------------------------------------------------------------------------
 
 /// 判定（事务外看到无 outbox）之后、事务执行期间插进一条 outbox：事务内重判必须把
 /// action 降级为 kept_local_edit，`notes.deleted` 保持 0。
+#[test]
+fn abort_without_journal_clears_residual_marker() {
+    let (_dir, vault) = fresh_vault();
+    mark_baseline_verify_failed(&vault, "残留 marker").expect("marker");
+    assert_eq!(
+        baseline_verify_failure(&vault).expect("read").as_deref(),
+        Some("残留 marker")
+    );
+
+    // 没有 staging journal 也必须清掉残留 marker：abort 是唯一清理入口。
+    assert!(!abort_baseline_apply(&vault).expect("abort"));
+    assert_eq!(baseline_verify_failure(&vault).expect("read"), None);
+    assert!(baseline_apply_state(&vault).expect("state").is_none());
+}
+
+#[test]
+fn abort_guard_failure_keeps_marker_for_retry() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-a", "a-local");
+    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
+    mark_baseline_verify_failed(&vault, "保持到重试").expect("marker");
+
+    // 模拟 Phase1B 并发化后才会出现的 journal 消失窗口：让第 4 条 DELETE
+    //（baseline_apply staging 行）影响 0 行，guarded 事务整体回滚。
+    vault
+        .exec(
+            "CREATE TRIGGER skip_baseline_apply_abort BEFORE DELETE ON baseline_apply \
+             WHEN OLD.singleton = 1 BEGIN SELECT RAISE(IGNORE); END",
+            &[],
+        )
+        .expect("trigger");
+    assert!(
+        !abort_baseline_apply(&vault).expect("guard failure -> false"),
+        "guard 失败必须返回 false"
+    );
+    assert_eq!(
+        baseline_verify_failure(&vault)
+            .expect("marker survives")
+            .as_deref(),
+        Some("保持到重试"),
+        "guarded 事务回滚时 marker 不能被半清"
+    );
+    assert_eq!(
+        baseline_apply_state(&vault)
+            .expect("state")
+            .expect("journal survives")
+            .status,
+        BaselineApplyStatus::Staging
+    );
+
+    vault
+        .exec("DROP TRIGGER skip_baseline_apply_abort", &[])
+        .expect("drop trigger");
+    assert!(abort_baseline_apply(&vault).expect("retry abort"));
+    assert_eq!(baseline_verify_failure(&vault).expect("marker"), None);
+}
+
+// ---------------------------------------------------------------------------
+// P1-3：损坏的失败标记（非法 BLOB）必须 fail-closed；abort 成功必须真的清掉它
+// ---------------------------------------------------------------------------
+
+/// 直接写入非法 BLOB（`mark_baseline_verify_failed` 永远产生不了这种编码）：
+/// - `baseline_verify_failure` / `baseline_apply_state` → `StorageError::Corrupt`
+///   （不能静默当成"没有失败"，否则 begin 会放行未知状态的 journal）；
+/// - `begin` / `apply` / `finish` 全部拒绝（Corrupt，不是 SyncConflict），且零写；
+/// - `abort_baseline_apply` 是失败标记的唯一清理入口：返回成功必须**真的**删掉损坏值，
+///   不能"看起来成功但坏值还在"；没有 journal 时返回 false（不是成功）也必须清掉，
+///   否则损坏值会永久阻断 begin。
+#[test]
+fn corrupt_marker_is_fail_closed_and_abort_does_not_silently_succeed() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-a", "a-local");
+    begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
+    let updates_before = count(&vault, "SELECT count(*) FROM loro_updates", &[]);
+
+    // 非法编码：缺魔数。直接写 meta，绕过 mark_baseline_verify_failed。
+    vault
+        .set_meta(META_BASELINE_VERIFY_FAILED, b"bad")
+        .expect("写损坏 marker");
+
+    // 读：必须 Corrupt（缺魔数），不能退化成 None。
+    let error = baseline_verify_failure(&vault).expect_err("损坏 marker 必须 Corrupt");
+    assert!(
+        matches!(&error, StorageError::Corrupt { .. }),
+        "应当是 Corrupt，实际 {error:?}"
+    );
+    let message = format!("{error}");
+    assert!(
+        message.contains(META_BASELINE_VERIFY_FAILED),
+        "错误必须点明损坏的 meta 键：{message}"
+    );
+    assert!(message.contains("魔数"), "错误必须说明缺魔数：{message}");
+
+    // begin / apply / finish 三处入口全部拒绝；损坏标记不能被降级成 SyncConflict/None。
+    let begin_error = begin_baseline_apply(
+        &vault,
+        &[9; 16],
+        6,
+        "other-cursor",
+        &expectation(&["doc-a"]),
+    )
+    .expect_err("损坏 marker 必须阻止 begin（即使换了基线参数）");
+    assert!(
+        matches!(&begin_error, StorageError::Corrupt { .. }),
+        "begin 应当是 Corrupt，实际 {begin_error:?}"
+    );
+    let apply_error = apply_baseline_batch(
+        &vault,
+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
+        &[],
+    )
+    .expect_err("损坏 marker 必须阻止 apply_baseline_batch");
+    assert!(
+        matches!(&apply_error, StorageError::Corrupt { .. }),
+        "apply 应当是 Corrupt，实际 {apply_error:?}"
+    );
+    let finish_error = finish_baseline_apply(&vault, 5, "baseline-cursor")
+        .expect_err("损坏 marker 必须阻止 finish_baseline_apply");
+    assert!(
+        matches!(&finish_error, StorageError::Corrupt { .. }),
+        "finish 应当是 Corrupt，实际 {finish_error:?}"
+    );
+
+    // state 读取也必须 Corrupt（不能靠猜算 finishable），journal 与数据保持零写。
+    let state_error = baseline_apply_state(&vault).expect_err("损坏 marker 下 state 必须 Corrupt");
+    assert!(
+        matches!(&state_error, StorageError::Corrupt { .. }),
+        "state 应当是 Corrupt，实际 {state_error:?}"
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM baseline_apply WHERE singleton=1 AND status='staging'",
+            &[],
+        ),
+        1,
+        "被拒绝的调用不得清掉 staging journal"
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
+        0,
+        "apply 被拒时必须零写"
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
+        updates_before,
+        "begin/apply/finish 被拒时不得追加 Loro update"
+    );
+
+    // abort（有 staging journal）：返回 true，并且成功必须真的删掉损坏 marker。
+    assert!(
+        abort_baseline_apply(&vault).expect("abort 必须成功"),
+        "有 staging journal 时 abort 必须返回 true"
+    );
+    assert_eq!(
+        baseline_verify_failure(&vault).expect("abort 后必须能读"),
+        None,
+        "abort 返回成功却留下损坏 marker = 静默失败"
+    );
+    assert!(
+        baseline_apply_state(&vault).expect("state").is_none(),
+        "abort 必须清掉 staging journal"
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM loro_updates", &[]),
+        updates_before,
+        "abort 只清 journal，不得删已 merge 的数据"
+    );
+
+    // 没有 staging journal 时 abort 返回 false（不是"成功"），但同样必须清掉损坏值，
+    // 否则该值会永久阻断后续 begin。
+    vault
+        .set_meta(META_BASELINE_VERIFY_FAILED, b"")
+        .expect("写空 marker（缺魔数）");
+    assert!(
+        matches!(
+            baseline_verify_failure(&vault).expect_err("空 marker 也必须 Corrupt"),
+            StorageError::Corrupt { .. }
+        ),
+        "空 BLOB 同样缺魔数，必须 Corrupt"
+    );
+    assert!(
+        !abort_baseline_apply(&vault).expect("没有 journal 时 abort 返回 false"),
+        "没有 staging journal 时必须返回 false（调用方不得把 false 当成功）"
+    );
+    assert_eq!(
+        baseline_verify_failure(&vault).expect("abort 后必须能读"),
+        None,
+        "false 只表示没有 journal 可中止，损坏 marker 仍必须被清掉"
+    );
+
+    // abort 清掉损坏值后，begin 恢复可用（损坏 marker 不会永久 brick 库）。
+    let reopened = begin_with(&vault, 5, "src", &expectation(&["doc-a"]));
+    assert_eq!(reopened.status, BaselineApplyStatus::Staging);
+    assert_eq!(reopened.applied_docs, 0);
+}
+
 #[test]
 fn tombstone_outbox_race_between_decision_and_transaction_keeps_note() {
     let (_dir, vault) = fresh_vault();
@@ -1772,5 +2168,273 @@ fn baseline_remote_known_write_unions_with_normal_pull_evidence() {
             &[]
         ),
         1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase1B 门禁：结构文档（`doc_id = "structure"`）的 detached local_extra 生产路径
+// ---------------------------------------------------------------------------
+
+/// Phase1B 门禁：本地已有结构树时应用 baseline 结构快照，必须真正走
+/// **detached local_extra** 分支（`existing_local_extra` 计数），而不是 attached/no-extra
+/// 或 new-doc 分支；合并后本地与基线的节点都在、父子关系与根节点数不变，本地 op 不丢。
+///
+/// 与正文用例的差别：结构文档的 `loro_docs.kind` 必须是 `'structure'`，读回走
+/// [`load_structure`]（自带重放 frontier 校验），而不是 `load_body_doc`。
+#[test]
+fn structure_doc_local_extra_merges_local_and_baseline_nodes() {
+    const LOCAL_PEER: u64 = 0x5101_0001;
+    const BASELINE_PEER: u64 = 0xB0B0_0002;
+
+    let (_dir, vault) = fresh_vault();
+
+    // 1) 本地结构：一个 folder + 一个 note，并把 note 挂到 folder 下。
+    let mut writer = StructureWriter::open(&vault, LOCAL_PEER).expect("打开结构写入口");
+    let local_folder = writer
+        .doc()
+        .create_folder("本地文件夹", 1_700_000_000)
+        .expect("创建本地文件夹");
+    let local_note = writer
+        .doc()
+        .create_note("本地笔记", 1_700_000_001)
+        .expect("创建本地笔记");
+    writer
+        .doc()
+        .move_node(
+            &local_note.node_id,
+            Some(local_folder.as_str()),
+            1_700_000_002,
+        )
+        .expect("把本地笔记挂到本地文件夹下");
+    writer.commit("local-structure").expect("提交本地结构");
+
+    let local_head = head(&vault, STRUCTURE_DOC_ID);
+    assert_eq!(local_head.head_seq, 1, "本地一次结构提交应产生一条 update");
+    // 默认 `StructureWriter::open` 不写 outbox：本用例证明 local_extra 由 VV 判定，
+    // 不依赖任何本地出站意图。
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM sync_outbox WHERE doc_id=?1",
+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
+        ),
+        0,
+        "StructureWriter::open 默认路径不得写 outbox"
+    );
+
+    // 2) baseline 结构：另一个 peer 的独立树（不同 title / note_id）。
+    let baseline = StructureDoc::create(BASELINE_PEER).expect("创建基线结构文档");
+    let baseline_folder = baseline
+        .create_folder("基线文件夹", 1_700_100_000)
+        .expect("创建基线文件夹");
+    let baseline_note = baseline
+        .create_note("基线笔记", 1_700_100_001)
+        .expect("创建基线笔记");
+    baseline
+        .move_node(
+            &baseline_note.node_id,
+            Some(baseline_folder.as_str()),
+            1_700_100_002,
+        )
+        .expect("把基线笔记挂到基线文件夹下");
+    let baseline_snapshot_bytes = baseline.export_snapshot().expect("导出基线结构快照");
+    assert_ne!(
+        local_note.note_id, baseline_note.note_id,
+        "两侧 note_id 必须可区分"
+    );
+
+    // 3) begin：预期参与集合必须含 "structure"。
+    let begin_state = begin_with(
+        &vault,
+        5,
+        "structure-cursor",
+        &expectation(&[STRUCTURE_DOC_ID]),
+    );
+    assert_eq!(begin_state.expected_docs, Some(1));
+    assert_eq!(begin_state.applied_docs, 0);
+    assert!(!begin_state.finishable, "尚未应用任何批次");
+
+    // 4) 应用快照；计数器证明走的是 detached local_extra 分支。
+    reset_baseline_apply_debug();
+    apply_baseline_batch(
+        &vault,
+        &[(STRUCTURE_DOC_ID.to_owned(), baseline_snapshot_bytes)],
+        &[],
+    )
+    .expect("应用基线结构快照");
+
+    let counters = baseline_apply_debug_counters();
+    assert!(
+        counters.existing_local_extra >= 1,
+        "结构文档必须走 local_extra 分支，实际计数 {}",
+        counters.existing_local_extra
+    );
+    assert_eq!(
+        counters.existing_local_extra, 1,
+        "本批只有一个结构文档，应恰好命中一次 local_extra"
+    );
+    assert_eq!(
+        counters.existing_no_extra, 0,
+        "不能落在 attached/no-extra 分支"
+    );
+    assert_eq!(counters.new_docs, 0, "结构文档已存在，不能走 new-doc 分支");
+    assert_eq!(counters.snapshot_imports, 1);
+    assert_eq!(
+        counters.snapshot_reimport_bytes, 0,
+        "不得二次 import 基线快照"
+    );
+    assert_eq!(counters.load_body_doc_calls, 1, "只允许一次本地重放");
+    assert!(counters.local_delta_bytes > 0, "反向导入的本地增量不能为空");
+    assert_eq!(counters.pending_update_calls, 1);
+    assert!(counters.pending_update_bytes > 0);
+
+    // 5) 读回：本地与基线节点都在，树形状保持，本地 op 没有丢。
+    let (structure, structure_head) =
+        load_structure(&vault, LOCAL_PEER).expect("读回结构文档（含 frontier 校验）");
+    assert_eq!(
+        structure_head.head_seq,
+        local_head.head_seq + 1,
+        "baseline merge 应追加一条 update，而不是覆盖本地 update"
+    );
+
+    let merged = structure.snapshot().expect("结构快照");
+
+    let local_note_node = merged
+        .nodes
+        .iter()
+        .find(|node| node.title == "本地笔记")
+        .expect("合并后缺少本地笔记");
+    assert_eq!(local_note_node.node_id, local_note.node_id);
+    assert_eq!(
+        local_note_node.note_id.as_deref(),
+        Some(local_note.note_id.as_str())
+    );
+    assert_eq!(
+        local_note_node.body_doc_id.as_deref(),
+        Some(local_note.body_doc_id.as_str())
+    );
+    assert_eq!(
+        local_note_node.parent.as_deref(),
+        Some(local_folder.as_str()),
+        "本地笔记的父子关系不能被基线覆盖"
+    );
+    assert!(local_note_node.is_note());
+    assert!(!local_note_node.deleted);
+
+    let local_folder_node = merged
+        .nodes
+        .iter()
+        .find(|node| node.title == "本地文件夹")
+        .expect("合并后缺少本地文件夹");
+    assert_eq!(local_folder_node.node_id, local_folder);
+    assert_eq!(local_folder_node.parent, None, "本地文件夹应仍在根级");
+    assert!(!local_folder_node.is_note());
+
+    let baseline_note_node = merged
+        .nodes
+        .iter()
+        .find(|node| node.title == "基线笔记")
+        .expect("合并后缺少基线笔记");
+    assert_eq!(baseline_note_node.node_id, baseline_note.node_id);
+    assert_eq!(
+        baseline_note_node.note_id.as_deref(),
+        Some(baseline_note.note_id.as_str())
+    );
+    assert_eq!(
+        baseline_note_node.parent.as_deref(),
+        Some(baseline_folder.as_str()),
+        "基线父子关系必须保留"
+    );
+    assert!(baseline_note_node.is_note());
+
+    let baseline_folder_node = merged
+        .nodes
+        .iter()
+        .find(|node| node.title == "基线文件夹")
+        .expect("合并后缺少基线文件夹");
+    assert_eq!(baseline_folder_node.node_id, baseline_folder);
+    assert_eq!(baseline_folder_node.parent, None, "基线文件夹应在根级");
+
+    // 树形状：两个根（两侧各建一个文件夹），每个根下恰好一个笔记。
+    let roots: Vec<_> = merged
+        .nodes
+        .iter()
+        .filter(|node| node.parent.is_none())
+        .collect();
+    assert_eq!(roots.len(), 2, "合并后应有两个根节点");
+    assert!(
+        !merged.nodes.iter().any(|node| node.deleted),
+        "本用例没有删除事件，合并不得产生 deleted 节点"
+    );
+    for root in roots {
+        let children: Vec<_> = merged
+            .nodes
+            .iter()
+            .filter(|node| node.parent.as_deref() == Some(root.node_id.as_str()))
+            .collect();
+        assert_eq!(children.len(), 1, "每个根文件夹下应各有一个笔记");
+        assert!(children[0].is_note());
+    }
+
+    // 本地 op 仍在库里的独立 update 中，baseline merge 是追加的第二个批次。
+    let batches: Vec<String> = vault
+        .query(
+            "SELECT batch_id FROM loro_updates WHERE doc_id=?1 ORDER BY seq",
+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
+        )
+        .expect("查询结构文档批次")
+        .into_iter()
+        .map(|row| match row.into_iter().next() {
+            Some(Value::Text(value)) => value,
+            other => panic!("结构批次 batch_id 异常：{other:?}"),
+        })
+        .collect();
+    assert_eq!(batches.len(), 2, "本地一条 + baseline merge 一条");
+    assert_eq!(batches[0], "local-structure", "本地 op 必须保留");
+    assert_eq!(batches[1], BASELINE_MERGE_BATCH);
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_docs WHERE doc_id=?1 AND kind='structure'",
+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
+        ),
+        1,
+        "baseline merge 不得改掉 kind='structure'"
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM baseline_apply_docs WHERE doc_id=?1 AND applied=1",
+            &[Value::Text(STRUCTURE_DOC_ID.to_owned())],
+        ),
+        1,
+        "journal 必须记录 structure 已应用"
+    );
+
+    // 6) finish：预期集合全齐 → Applied；只动水位/cursor，结构内容不变。
+    let outcome = finish_baseline_apply(&vault, 5, "chosen-cursor").expect("finish");
+    let BaselineApplyFinish::Applied(state) = outcome else {
+        panic!("预期集合全齐时 finish 必须 Applied：{outcome:?}");
+    };
+    assert_eq!(state.status, BaselineApplyStatus::Completed);
+    assert_eq!(state.applied_docs, 1);
+    assert_eq!(state.expected_docs, Some(1));
+    assert!(!state.finishable);
+
+    let cursor = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor.received_seq, 5);
+    assert_eq!(cursor.integrated_seq, 5);
+    assert_eq!(cursor.confirmed_highwater, Some(5));
+
+    let (after_finish, after_head) =
+        load_structure(&vault, LOCAL_PEER).expect("finish 后读回结构文档");
+    assert_eq!(
+        after_head.head_seq, structure_head.head_seq,
+        "finish 只推进水位，不得改结构 head"
+    );
+    assert_eq!(
+        after_finish.snapshot().expect("finish 后快照").nodes.len(),
+        merged.nodes.len(),
+        "finish 后节点数不变"
     );
 }

@@ -281,3 +281,39 @@ epoch/轮换跨越时先安全暂停/等待控制帧，不能把校验失败当�
   precheck/乱序/防饥饿、baseline detached merge；完整评审入口见
   [`sync-review-packet-20261121.md`](sync-review-packet-20261121.md)，
   文件清单见 [`sync-phase1a-review-index.md`](sync-phase1a-review-index.md)。
+
+---
+
+## 10. 性能校准（2026-11-21 review 后）
+
+> 本节只校准**结论口径**，不改变 §9.1 的 3 s 持闸预算 / 16 MiB 机会性硬上限 /
+> `N_min` / 成本交叉；也**不表示** Phase 1B 已实现（无 `CatchUpMode`、无
+> prepare/integrate 拆分、无 snapshot merge 实测）。
+
+1. **`N_min = 25 000` 是诚实兜底，不是“保守”。** 聚合后的 5 000 条尾部 replay
+   只要 0.28 s（单文档）/ 0.76 s（20 篇）；而机会性追赶要下载/解密/验签整份快照，
+   并在闸外 `verify_imported` 重放。按 §9.4 的形状，5 MiB verify 已 2.7 s、
+   20 MiB 约 45 s（5→20 为 16.7×）。25k 以下启动快照追赶，省下的 replay 远小于
+   快照 + verify 的固定成本——这是成本交叉算出来的 floor，不是故意调高的保守值。
+2. **Phase 1B 的核心价值是 correctness，不是速度。** 当 `gc_floor > received_seq`
+   时普通 `pull` 只会 `CursorExpired`，没有可回退的增量路径；checkpoint 追赶是
+   唯一能离开过期游标的路径。速度收益只在“≥25k 事件、且差距极大”的极端场景成立；
+   近端增量继续走普通聚合 pull，不为了“快”而拉整库快照。
+3. **16× 超线性重放只是被移出持闸段，没有被消除。** detached oplog 把 5→20 MiB
+   的 storage merge 压到 35 / 110 ms（3.1×，4× 数据），但闸外 `verify_imported`
+   仍走 attached `load_body_doc` 重放大 update：5 MiB ≈2.7 s、20 MiB ≈45 s
+   （最终 release 复跑 58.8 s，同量级；5→20 约 16–17×）。因此“`gate_hold` 小”
+   不能当成“全链路 <3 s”，也不能据此放高 16 MiB 机会性上限。
+4. **“每页 ~2 s/篇”的折算不成立；大文档成本在 verify，不在纯 replay。** M3 实测
+   （`sync-phase0-metrics.md` §8.7.7）：1 MiB 单文档、1 条大 insert 的
+   `load_body_doc` ≈2 ms；拆成 256 条 4 KiB update ≈6 ms。§10.3 的 45 s@20MiB
+   是 **baseline_apply 的 `verify_imported`**（`local` + `baseline_merge` 两行
+   update 的 attached import/merge），不是 aggregate 每页的 `load_body_doc`。
+   因此：
+   - 不能再拿“1 MiB 每页 2 s”给 25k/16 MiB 阈值背书；
+   - 也不能反过来宣称“大文档没问题”：**verify/attached merge 仍可能 45 s+**，
+     且 107 KiB 基准没有覆盖“大文档 + 多 update + 并发合并”的 verify 形状；
+   - 机会性追赶若启用，仍必须单独标定 verify 的大文档形状，不能只测 per-page replay。
+5. **阈值与预算不动。** §9.1 的 3 s 持闸预算、16 MiB 机会性硬上限、`N_min =
+   25 000`、2.0×/1.5× 成本交叉全部保留；Phase 1B **未实现**，上述数字只用于
+   评审与后续设计。

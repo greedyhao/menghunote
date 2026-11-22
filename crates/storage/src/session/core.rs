@@ -214,6 +214,17 @@ impl DocumentSession {
         self.journal.durable_through()
     }
 
+    /// 最近一次 flush 写失败的可读原因（`None` = 没有已知失败）。
+    ///
+    /// 不可恢复的失败（head 过期且无法安全自动重建）优先，文案明确提示
+    /// 「需要重开文档」；否则是最近一次普通写失败（磁盘/SQLite 等，下次写成功后清空）。
+    ///
+    /// **只读且稳定**：同一失败可以反复读取，UI 可以在状态栏/关闭报告里直接展示；
+    /// 不要求调用方先走外部提交闸门（`GateState::Failed` 只有走闸门的路径才看得到）。
+    pub fn last_write_error(&self) -> Option<String> {
+        self.journal.last_write_error()
+    }
+
     /// 取走事件队列（Durable / Remote）。
     pub fn events(&self) -> Vec<SessionEvent> {
         self.journal.drain_events()

@@ -13,16 +13,18 @@
 //! 崩溃语义：sink 成功 = 已 durable；未 flush 的条目只在内存里，重启后自然丢掉。
 //! 因此「已 ACK 的不丢、未 ACK 的只丢连续前缀之后」由本模块与 [`crate::store`] 的 A 事务共同保证。
 //!
-//! # head 过期：可重试 vs 必须重建 session（P1-3 契约）
+//! # head 过期：两条恢复路径（P1-3 契约）
 //!
 //! journal 条目里的 `PendingUpdate` 是**追加那一刻**按当时 head 导出的字节
 //! （`end_frontier` / `end_vv` 是那次导出的快照），**不可重算**。如果同一文档的 head
 //! 被别的 writer 推进（同步引擎 integrate、`SessionDriver` 的 adopt、另一个 Vault
 //! 进程……），前缀的 CAS 基准（`loro_docs.head_seq`）就永远对不上：`append_updates`
-//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节重试多少次都不会成功**。
-//! 这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
+//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节按旧基准重试多少次都不会
+//! 成功**。这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
 //!
-//! 本模块用一条明确的二分法代替无限重试：
+//! 本节先写库内契约（[`JournalWriter`]），再写生产 flusher 的实际路径；两者不要混为一谈。
+//!
+//! ## 1. `JournalWriter`：冻结 writer，调用方重建 sink / 重新导出
 //!
 //! - [`JournalWriter::flush`] 捕获 sink 的 [`StorageError::HeadConflict`]，**不重试**
 //!   （0 次），立即转成终态错误 [`StorageError::JournalHeadStale`]
@@ -32,20 +34,35 @@
 //! - 进入 stale 之后，`flush` / `flush_all` **不再触碰数据库**，幂等地返回同一个
 //!   stale 错误；`submit` 也返回 `JournalHeadStale`（writer 已冻结，新条目必须交给
 //!   重建后的 writer）。因此调用方无论怎么轮询，都不会挂死、也不会刷屏重试。
-//! - **谁负责重建**：持有 live `BodyDoc` 的会话层（`session::JournalHandle` /
-//!   `SessionDriver`，实现在 `crate::session::flush`）。重建顺序：
-//!   ① 先停外部写并按 ADR 0012 对账（`HeadConflict` 先停外部写、验证授权、再对账，
-//!   然后才允许有界重放）；② 把 durable journal 重放到**新 head**（`load_body_doc` /
-//!   `load_head`），让内存文档与库一致；③ 用新 head 的 VV 重新导出本地意图
-//!   （`BodyDoc::pending_update`）——只有这一步得到的字节才能写；④ 用新 `head_seq`
-//!   造一个 [`VaultJournalSink`]，调用 [`JournalWriter::rebuild_sink`] 装回去。
+//! - **谁负责重建**：持有 live `BodyDoc` 的调用方，而不是本模块。调用方必须：
+//!   ① 把 durable journal 重放到**新 head**（`load_body_doc` / `load_head`），让内存
+//!   文档与库一致；② 用新 head 的 VV 重新导出本地意图（`BodyDoc::pending_update`）——
+//!   只有这一步得到的字节才能写；③ 用新 `head_seq` 造一个 [`VaultJournalSink`]，
+//!   调用 [`JournalWriter::rebuild_sink`] 装回去。
 //! - **未 durable 的旧条目怎么办**：`rebuild_sink` 把它们**原样交还**调用方（返回值）
 //!   并从 writer 的 journal 里清空。它们**没有被写入、也没有被静默丢弃** —— 调用方
-//!   必须用 ③ 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
+//!   必须用 ② 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
 //!   并在上层报告，不能假装成功。重建后 `durable_seq` 等于新 sink 的 CAS 基准。
-//! - **有界重试规则**：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
-//!   重试不可能成功）；需要重放时由 session 层按 ADR 0012 做**有界**重放（一次），
-//!   再失败就上报告需要人工处理。本模块不提供、也不会退化成无限重试。
+//!
+//! ## 2. 生产 `session/flush.rs`：兼容 head 时同字节有界重试（当前接线）
+//!
+//! 生产后台 flusher **不经过** [`JournalWriter`]：它直接在后台线程构造
+//! [`VaultJournalSink`] 并调用 `write_prefix`，因此**不会**调用
+//! [`JournalWriter::rebuild_sink`]，也不会重新导出增量。它的
+//! [`StorageError::HeadConflict`] 路径是**同一份字节前缀的有界重试**：
+//!
+//! 1. `load_head` 读回当前 `head_seq` 与 VV；
+//! 2. **仅当新 head 的 ops 全部包含在**未 ACK 前缀最后一条的 `end_vv` 里
+//!    （`prefix_vv.includes_vv(head_vv)`，即外部推进写的是本会话 live 已知的 op）时，
+//!    用新 CAS 基准重试**同一份字节前缀一次**；
+//! 3. 新 head 含本会话未知 ops、head 未前进/回退、VV 为空或解码失败、重试后仍冲突
+//!    → **fail-closed**：不写库、journal 原样保留，`last_write_error` 明确要求
+//!    「关闭并重开文档」；后续 flush 立即失败，不再碰数据库。
+//!
+//! 两条路径的共同点：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
+//! 重试同一份旧字节不可能成功）；有界重试只发生在生产 session flusher，且**仅一次**，
+//! 条件不满足就上报告，不无限重试。生产路径**没有第二 journal**：journal 仍是会话
+//! 内存里的那一条，重建的只是 sink 的 CAS 基准。
 
 use std::collections::VecDeque;
 

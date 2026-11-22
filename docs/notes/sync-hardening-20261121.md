@@ -9,14 +9,20 @@
 | --- | --- | --- | --- |
 | P1-1 finish 完整性 | 完成 | `2ed485b` | `finish_without_all_docs_is_conflict`、`finish_after_full_batches_is_applied`、`begin_idempotent_replay_keeps_expected_set`、`finish_without_all_assets_is_conflict` |
 | P1-2 tombstone TOCTOU | 完成（SQL 事务内重判） | `2ed485b` | `tombstone_outbox_race_between_decision_and_transaction_keeps_note` |
-| P1-3 Journal HeadConflict | **部分**：JournalWriter 契约/重建入口完成；生产 `session/flush.rs` 仍直接调 sink，尚未接 `JournalHeadStale` 的自动重建 | `aba4375` | `stale_head_is_terminal_then_rebuild_hands_back_entries_and_new_entries_flush`、`rebuild_sink_is_rejected_while_not_stale` |
+| P1-3 Journal HeadConflict | 完成（生产已接线；不是 JournalWriter rebuild 路径，见下） | `aba4375` + `3c5ddcf` | `flush_recovers_from_head_conflict_by_rebuilding_sink`、`flush_reports_unrecoverable_after_bounded_rebuild`、`flush_reports_unrecoverable_when_new_head_is_unreadable` |
 | P1-4 ready/count log_id | 完成 | `be5244b` | `ready_and_count_only_include_current_log_incarnation`、`ready_where_path_filters_other_log_incarnation`、`ready_without_log_id_is_empty_and_invalid_length_is_corrupt` |
+
+> **P1-3 最终口径（2026-11-21 晚）**：生产 `session/flush.rs` 已接线，但走的**不是**
+> `JournalHeadStale` / `JournalWriter::rebuild_sink`：它的 `HeadConflict` 路径是
+> `load_head` → 仅当新 head 的 ops ⊆ 未 ACK 前缀 `end_vv` 时同字节重试一次；
+> 未知 ops fail-closed 要求重开；仍单后台 writer、无第二 journal、不重新导出增量。
+> 失败语义与恢复路径以 `crates/storage/src/journal.rs` 模块头“两条恢复路径”为准。
 
 ### P1-1 细节
 
 - `begin_baseline_apply` 增加 `BaselineExpectation { docs, assets }`，与 journal 同事务写 `sync.baseline_expected`（本地 `meta`，非 DDL）。
 - `finish` 在任何 meta 写入前逐项比对 `baseline_apply_docs.applied=1` / `baseline_apply_assets.applied=1`；缺失/多出/集合不符 → `Conflict`，零写。
-- `finishable` 改为 `staging && expected 全齐`；无记录不可 finish。
+- `finishable` 改为 `staging && expected 全齐 && 无 verify 失败标记`；无记录不可 finish。
 - 同参数 begin 幂等；同 checkpoint 换集合 → `SyncConflict`。
 - 旧 journal 无 expected 记录 → `Conflict`（拿不到证明不推进 S）。
 
@@ -69,7 +75,7 @@ P3 未做（本轮优先 P1/P2，且“不要挤占 P1/P2”）：
 | `received/integrated` 只连续推进 | 既有 `sync_meta` 窗口测试；P1-4 log 过滤 + P1-1 finish 完整性 |
 | `integrated >= S` 前不删 inbox / skipped_asset | P1-1 finish 完整性测试；P1-2 只软删 notes、tombstone 记 kept；未新增 prune |
 | epoch/rotation/log 异常 → Paused/错误 | 本轮未改 rotation/epoch 代码；P1-4 log 过滤避免跨代 ready |
-| HeadConflict 有界、不覆盖 head/丢数据 | P1-3 JournalHeadStale 终态 + rebuild 测试；P2-5 值 CAS 回滚 |
+| HeadConflict 有界、不覆盖 head/丢数据 | P1-3 兼容 head 有界重试 + 未知 ops fail-closed；P2-5 值 CAS 回滚 |
 | remote/adopt 不产生 outbox | P2-8 `remote_only_flush_with_empty_slots_has_no_outbox` + 既有 engine 测试 |
 | 不改 wire/relay/schema | `git diff` 无 relay/sync-proto/schema/migration；仅本地 `meta` 键 |
 
@@ -89,11 +95,19 @@ cargo test --workspace                             2884 passed / 0 failed
 cargo test --workspace --features menghunote-app/dev-sync 3035 passed / 0 failed
 ```
 
+> **最终复跑（2026-11-21 评审收尾）**：review 后新增 P1 门禁/访问器/资产批测试，当前计数
+> workspace **2913 / 0**、`--features menghunote-app/dev-sync` **3064 / 0**；
+> storage **299** / sync **638**。
+> 上面的 2884 / 3035 是本文件收尾时点的批次，差异来自同轮后续新增的测试，两批计数
+> 按批次引用，不要把增量当成回归。scan 探针的批次口径：最终 release 复跑
+> **0.428 / 4.039 ms** 与 `sync-phase0-metrics.md` §8.7.4 的初次 3-run
+> **0.479 / 3.796 ms** 是两批，不要混算（详见该文件 §8.7.6）。
+
 一次环境假失败：共享 `target` 中旧 `gpui-excalidraw` build script 烘入了已删除的 `/home/dev/menghunote-p2check`；`cargo clean -p gpui-excalidraw` 后 app/workspace 全绿，与本轮改动无关。
 
 ## 6. 需要用户决策 / 残余
 
-1. **P1-3 生产接线**：`session/flush.rs` 仍直接使用 `VaultJournalSink`，没有使用 `JournalWriter` 的新重建契约；当前会把 `HeadConflict` 记入 `last_write_error`（不静默），但不会自动重建。是否把 session flusher 接到 `JournalHeadStale`/rebuild（需要跨 gate 状态机）需用户决定；本轮未改该文件。
+1. **P1-3 生产接线已完成，UI 救济仍缺**：`session/flush.rs` 仍直接使用 `VaultJournalSink`，采用兼容 head 的同字节有界重试，不是 `JournalWriter` 的重新导出；未知外部 ops fail-closed 要求重开。`DocumentSession`/`SessionDriver::last_write_error` 与 `CloseReport.flush_error` 已让非持闸调用方读到原因，但 App 的“导出/复制 live 正文 → 重开”流程仍未接。
 2. **P2-5 baseline 冲突策略**：批次 CAS 冲突返回 `SyncConflict`，由调用方重跑整批；是否允许内层重建/重试需决策。
 3. **P2-6 兼容性**：非 BLOB `meta` 现在显式 `Corrupt`；旧库若有外部写入的 TEXT 键会拒绝同步（按“屏障键不能静默绕过”取舍）。
 4. **P2-9 行为**：本地资产损坏会中止该轮 sync（在 pull/integrate 前），修复后继续；这是 fail-closed，不是网络重试。
@@ -184,11 +198,12 @@ snapshot.actual_vv ⊆ 当前本地 VV     // sub_iter 为空即通过；不是�
    `meta`，**journal 仍显示 `staging`**。后果：`BaselineApplyState.status` 无法单独表达
    "校验失败"，必须另读 `baseline_verify_failure`；UI/续跑逻辑不能把 `staging` 当成
    "可续跑"。这个不一致是记录下来的冲突，没有通过改 schema 绕过。
-2. **`finishable` 仍可能为 true**：`expected` 集合全齐时 `BaselineApplyState.finishable`
-   为 true，即使失败标记存在。`finishable` 只表示 `finish` 的完整性前提，不是"可继续"
-   判据；新增门禁只在 `begin_baseline_apply`。`apply_baseline_batch` /
-   `finish_baseline_apply` **未**额外检查标记（最小改动；bootstrap 在 verify 失败后不会再
-   调用它们）。若 Phase1B 需要更强保证，应在这两个入口也拒绝——本轮未做。
+2. **失败标记门禁已下沉（2026-11-21 review 后补）**：`apply_baseline_batch`、`apply_baseline_assets` 和
+   `finish_baseline_apply` 都会在解码/任何写之前检查 `sync.baseline_verify_failed`，有标记
+   返回带原因的 `SyncConflict`，零写；`state_from_journal` 的 `finishable` 在标记存在时
+   为 false（`staging && expected 全齐 && !verify_failed`）。因此 Phase1B 不能靠"调用方
+   自觉先走 begin"来绕过失败 journal。`baseline_apply.status` 仍只有 staging/completed，
+   失败只能通过 `baseline_verify_failure` 读取。
 3. **bootstrap 的换基线自动清理**：`reconcile_journal` 在"选择了另一份基线"时会对既有
    staging 调用 `abort_baseline_apply`（从而清掉失败标记）。这是既有的清理入口，不是绕过
    `begin` 门禁；同一基线的续跑仍然必须先显式 abort。
@@ -234,3 +249,47 @@ cargo test -p menghunote-sync --test bootstrap \
 - 未实现 Phase1B（gate_hold 报告、更强的批次/finish 门禁等）；
 - 未 commit。
 
+
+
+## 9. 高级评审补充口径（2026-11-21）
+
+1. **P1-3 表格不再写“部分”**：§1 表已改为最终状态；历史收尾批次与最终行为分开引用，后续评审以本表/§9 为准。
+2. **abort 的两个边界已钉住**：无 staging journal 但 marker 残留时 `abort_baseline_apply` 返回 `false` 并清 marker
+   （`abort_without_journal_clears_residual_marker`）；guarded 事务失败（`AffectedGuard::exactly(3,1)` 不命中）
+   整体回滚、返回 `false`、marker 保留，调用方必须重试 abort
+   （`abort_guard_failure_keeps_marker_for_retry`，用 `RAISE(IGNORE)` 触发器模拟并发窗口）。单 writer 下
+   第二条不可达，但语义已固定；Phase 1B 并发化后不得把 `false` 当成功。
+3. **`loro_updates` 行数不是 op 数**：HeadConflict 兼容重试可能把与外部行重叠的 ops 再落一行；Loro import
+   幂等，`head_vv==live_vv` 仍成立，但“一行 = 一批逻辑写入”允许 op 重叠，**不能按行数推断 op 数/去重率**。
+4. **coverage 扫描上限未标定**：`COVERAGE_SCAN_MAX_PAGES = 4096` ≈ 1M 事件 → 4096 次串行页请求；
+   当前探针只到 25k（98 页），真实 RTT 项是 40× 外推，没有数据。机会性追赶启用前必须补 4096 页/真实
+   RTT 标定，或把上限改成可配置并默认更小。
+5. **`gc_floor` 两次请求间前进**：`load_baseline` 只给 `SyncError::Object("S 低于 GC floor")`；primary/fallback
+   双双越界时的最终映射未测。Phase 1B 应映射为可执行 `Paused`（“等待 relay 保留/重新 bootstrap”），
+   不能落成普通 Object/空转。
+6. **`verify_ns` 线程本地**：跨线程/线程池调用 `verify_imported` 时，`gate_hold` 报告若在另一线程读
+   `baseline_apply_verify_ms()` 会得到 0；Phase 1B 报告必须写明“同线程读取”，或在调用线程显式回传耗时。
+7. **“强制追赶失败绝不回退普通 pull”的语义**：`gc_floor > received` 时普通 pull 只会 `CursorExpired`，
+   回退没有功能意义；规则实质是**不得把 `Paused` 静默成空转循环**，必须把原因（游标过期/需重试/
+   等待 relay）送到 UI/调度器。
+8. **auto-abort 不得发生在持闸段**：`reconcile_journal` 的换基线 auto-abort 会写库（清 journal+marker）；
+   Phase 1B `catchup_integrate` 持闸期间若走“换基线”分支等于持闸写两遍。设计上应显式禁止，并把
+   marker/换基线映射成 `Paused` 理由，不在持闸内自动 abort 重试。
+
+9. **M4 门禁已补（2026-11-21）**：结构文档 local_extra 生产路径
+   (`structure_doc_local_extra_merges_local_and_baseline_nodes`)、SyncContext 重建
+   (`flush_rebuild_keeps_sync_intent_seq_at_new_head_plus_one`)、普通/重建后 Retryable
+   (`flush_retryable_write_failure_keeps_prefix_then_recovers`、
+   `flush_rebuild_retryable_write_failure_keeps_prefix_then_recovers`)、二次 HeadConflict
+   (`flush_reports_unrecoverable_on_second_head_conflict`)、换基线 auto-abort/rotation 拒绝
+   (`reconcile_journal_auto_aborts_bootstrap_staging_and_clears_marker`、
+   `reconcile_journal_refuses_rotation_staging_without_abort`)、损坏 marker
+   (`corrupt_marker_is_fail_closed_and_abort_does_not_silently_succeed`)。
+   head 回退分支无法用公开接口确定性构造（head_seq 只前进），已用二次冲突覆盖可构造方向。
+
+10. **M3 标定已完成（2026-11-21）**：`large_doc_per_page_replay_cost` 测 1 MiB
+    单条大 insert `load_body_doc` ≈1.975 ms（复跑 1.996），256 条 4 KiB 增量 ≈5.965 ms（复跑 5.322）；
+    `checkpoint_validate_scan_cost` 真跑 S=1,048,576（4096 页，1 run），FakeRelay
+    夹具 12.8 s（复跑 12.2 s）/峰值 RSS 202 MiB，visitor ≈33 ms。结论：per-page replay 是毫秒级，
+    §10.4 的“~2 s/篇”折算不成立；45 s@20MiB 是 verify/attached merge，不是纯 replay。
+    4096 页真实成本仍需按 `4096 × RTT + 33 ms` 标定，FakeRelay 不能外推；阈值未改。
