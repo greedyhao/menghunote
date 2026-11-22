@@ -10,6 +10,8 @@
 //! - 启动时 `body_frontier ≠ head_frontier`（或 body_seq 落后）必须重算，
 //!   见 [`scan_stale_bodies`] / [`reconcile`]。
 
+use std::time::{Duration, Instant};
+
 use rusqlite::types::Value;
 
 use crate::actor::Statement;
@@ -51,6 +53,57 @@ pub enum MaterializeOutcome {
     },
 }
 
+/// B 事务各阶段耗时（单篇；bench/诊断用）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterializeStageTimings {
+    /// 查固定 frontier（`end_frontier_at`）。
+    pub frontier: Duration,
+    /// Loro 重放/解码 + 应用 updates（`load_body_doc`）。
+    pub loro_load: Duration,
+    /// 取正文文本与 scalar 长度。
+    pub text: Duration,
+    /// SQL UPDATE + outbox DELETE + 事务提交。
+    pub sql: Duration,
+    /// 提交后发布事件。
+    pub event: Duration,
+}
+
+impl MaterializeStageTimings {
+    /// 各阶段总和。
+    pub fn total(&self) -> Duration {
+        self.frontier + self.loro_load + self.text + self.sql + self.event
+    }
+}
+
+/// 批量物化的进度（每批一次）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterializeProgress {
+    /// 已处理的笔记数（含失败/Stale）。
+    pub done: usize,
+    /// 总待处理笔记数。
+    pub total: usize,
+}
+
+/// 批量物化汇总。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MaterializeSummary {
+    /// 成功写入的篇数。
+    pub materialized: usize,
+    /// 目标不比已有结果新、未写的篇数。
+    pub stale: usize,
+    /// 准备或事务失败的篇数（失败批次继续处理）。
+    pub failed: usize,
+}
+
+struct PreparedMaterialize {
+    note_id: String,
+    doc_id: String,
+    target_seq: u64,
+    frontier: Vec<u8>,
+    body_text: String,
+    body_scalars: u64,
+}
+
 /// 一条待物化的 outbox 记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingProjection {
@@ -70,6 +123,32 @@ pub fn materialize_body(
     up_to_seq: u64,
     peer_id: u64,
 ) -> Result<MaterializeOutcome, StorageError> {
+    let mut timings = None;
+    materialize_body_impl(vault, note_id, doc_id, up_to_seq, peer_id, &mut timings)
+}
+
+/// 带阶段计时的单篇物化（bench/诊断用；不改变语义）。
+#[doc(hidden)]
+pub fn materialize_body_profiled(
+    vault: &Vault,
+    note_id: &str,
+    doc_id: &str,
+    up_to_seq: u64,
+    peer_id: u64,
+) -> Result<(MaterializeOutcome, MaterializeStageTimings), StorageError> {
+    let mut timings = Some(MaterializeStageTimings::default());
+    let outcome = materialize_body_impl(vault, note_id, doc_id, up_to_seq, peer_id, &mut timings)?;
+    Ok((outcome, timings.unwrap_or_default()))
+}
+
+fn materialize_body_impl(
+    vault: &Vault,
+    note_id: &str,
+    doc_id: &str,
+    up_to_seq: u64,
+    peer_id: u64,
+    timings: &mut Option<MaterializeStageTimings>,
+) -> Result<MaterializeOutcome, StorageError> {
     if up_to_seq == 0 {
         // 还没有任何 durable batch，正文就是空串；仍走一次写入把 body_frontier 对齐。
         let current = store::load_body_state(vault, note_id)?;
@@ -79,13 +158,44 @@ pub fn materialize_body(
         });
     }
 
-    // 固定 frontier：取该 batch 落库时记录的 end_frontier，并从同样的重放边界取文本
-    let frontier = store::end_frontier_at(vault, doc_id, up_to_seq)?;
-    let (doc, _head) = store::load_body_doc(vault, doc_id, peer_id, Some(up_to_seq))?;
-    let text = doc.text();
-    let body_scalars = doc.scalar_len() as u64;
+    let prepared = prepare_materialize(vault, note_id, doc_id, up_to_seq, peer_id, timings)?;
+    write_prepared(vault, &prepared, timings)
+}
 
-    let statements = [
+fn prepare_materialize(
+    vault: &Vault,
+    note_id: &str,
+    doc_id: &str,
+    up_to_seq: u64,
+    peer_id: u64,
+    timings: &mut Option<MaterializeStageTimings>,
+) -> Result<PreparedMaterialize, StorageError> {
+    // 固定 frontier：取该 batch 落库时记录的 end_frontier，并从同样的重放边界取文本
+    let started = Instant::now();
+    let frontier = store::end_frontier_at(vault, doc_id, up_to_seq)?;
+    add_stage(timings, |timings| timings.frontier += started.elapsed());
+
+    let started = Instant::now();
+    let (doc, _head) = store::load_body_doc(vault, doc_id, peer_id, Some(up_to_seq))?;
+    add_stage(timings, |timings| timings.loro_load += started.elapsed());
+
+    let started = Instant::now();
+    let body_text = doc.text();
+    let body_scalars = doc.scalar_len() as u64;
+    add_stage(timings, |timings| timings.text += started.elapsed());
+
+    Ok(PreparedMaterialize {
+        note_id: note_id.to_owned(),
+        doc_id: doc_id.to_owned(),
+        target_seq: up_to_seq,
+        frontier,
+        body_text,
+        body_scalars,
+    })
+}
+
+fn materialize_statements(prepared: &PreparedMaterialize) -> Result<[Statement; 2], StorageError> {
+    Ok([
         Statement::new(
             // CAS 规则：
             //  - body_seq 落后 → 正常推进；
@@ -96,42 +206,63 @@ pub fn materialize_body(
                AND (body_seq < ?3 \
                     OR (body_seq = ?3 AND (body_frontier IS NULL OR body_frontier <> ?4)))",
             vec![
-                Value::Text(note_id.to_owned()),
-                Value::Text(text),
-                Value::Integer(i64_of(up_to_seq)?),
-                Value::Blob(frontier),
-                Value::Text(doc_id.to_owned()),
+                Value::Text(prepared.note_id.clone()),
+                Value::Text(prepared.body_text.clone()),
+                Value::Integer(i64_of(prepared.target_seq)?),
+                Value::Blob(prepared.frontier.clone()),
+                Value::Text(prepared.doc_id.clone()),
             ],
         ),
         Statement::new(
             "DELETE FROM projection_outbox WHERE doc_id = ?1 AND target_seq <= ?2",
             vec![
-                Value::Text(doc_id.to_owned()),
-                Value::Integer(i64_of(up_to_seq)?),
+                Value::Text(prepared.doc_id.clone()),
+                Value::Integer(i64_of(prepared.target_seq)?),
             ],
         ),
-    ];
+    ])
+}
 
+fn write_prepared(
+    vault: &Vault,
+    prepared: &PreparedMaterialize,
+    timings: &mut Option<MaterializeStageTimings>,
+) -> Result<MaterializeOutcome, StorageError> {
+    let statements = materialize_statements(prepared)?;
+    let started = Instant::now();
     let affected = vault.exec_transaction(&statements, &[])?;
+    add_stage(timings, |timings| timings.sql += started.elapsed());
+
     if affected.first().copied().unwrap_or(0) == 1 {
         // 提交成功之后才发通知：订阅者被唤醒时读到的一定是已提交的数据。
         // `try_send` 不阻塞写；没人收 / 队列满时 storage 会置"需要全量对账"标记。
+        let started = Instant::now();
         vault.publish_event(crate::StorageEvent::BodyMaterialized {
-            note_id: note_id.to_owned(),
+            note_id: prepared.note_id.clone(),
         });
+        add_stage(timings, |timings| timings.event += started.elapsed());
         return Ok(MaterializeOutcome::Applied {
-            note_id: note_id.to_owned(),
-            body_seq: up_to_seq,
-            body_scalars,
+            note_id: prepared.note_id.clone(),
+            body_seq: prepared.target_seq,
+            body_scalars: prepared.body_scalars,
         });
     }
 
     // 没有更新说明 body_seq 已经 >= up_to_seq（或行不存在 → load_body_state 会报损坏）
-    let current = store::load_body_state(vault, note_id)?;
+    let current = store::load_body_state(vault, &prepared.note_id)?;
     Ok(MaterializeOutcome::Stale {
-        note_id: note_id.to_owned(),
+        note_id: prepared.note_id.clone(),
         body_seq: current.body_seq,
     })
+}
+
+fn add_stage(
+    timings: &mut Option<MaterializeStageTimings>,
+    update: impl FnOnce(&mut MaterializeStageTimings),
+) {
+    if let Some(timings) = timings.as_mut() {
+        update(timings);
+    }
 }
 
 /// 启动扫描：找出 `body_frontier ≠ head_frontier` 或 `body_seq` 落后的笔记。
@@ -172,6 +303,96 @@ pub fn reconcile(vault: &Vault, peer_id: u64) -> Result<Vec<MaterializeOutcome>,
         )?);
     }
     Ok(outcomes)
+}
+
+/// 批量重算：语义同 [`reconcile`]，但**每批一个 SQLite 事务**，每批回调一次进度。
+///
+/// 单篇准备失败或单批事务失败只计入 `failed`，继续处理后续批次；已提交的
+/// 批次不受影响。`batch_size=0` 按 1 处理。
+pub fn reconcile_batched(
+    vault: &Vault,
+    peer_id: u64,
+    batch_size: usize,
+    progress: &mut dyn FnMut(MaterializeProgress),
+) -> Result<MaterializeSummary, StorageError> {
+    let stale = scan_stale_bodies(vault)?;
+    let total = stale.len();
+    if total == 0 {
+        progress(MaterializeProgress { done: 0, total: 0 });
+        return Ok(MaterializeSummary::default());
+    }
+
+    let batch_size = batch_size.max(1);
+    let mut summary = MaterializeSummary::default();
+    let mut done = 0usize;
+
+    for chunk in stale.chunks(batch_size) {
+        let mut prepared = Vec::with_capacity(chunk.len());
+        for item in chunk {
+            if item.head_seq == 0 {
+                // 与单篇 materialize_body(up_to_seq=0) 一致：没有 durable batch 时不写。
+                summary.stale += 1;
+                continue;
+            }
+            let mut no_profile = None;
+            match prepare_materialize(
+                vault,
+                &item.note_id,
+                &item.doc_id,
+                item.head_seq,
+                peer_id,
+                &mut no_profile,
+            ) {
+                Ok(item) => prepared.push(item),
+                Err(_) => summary.failed += 1,
+            }
+        }
+
+        if !prepared.is_empty() {
+            let mut statements = Vec::with_capacity(prepared.len() * 2);
+            let mut statement_error = false;
+            for item in &prepared {
+                match materialize_statements(item) {
+                    Ok([update, delete_outbox]) => {
+                        statements.push(update);
+                        statements.push(delete_outbox);
+                    }
+                    Err(_) => {
+                        statement_error = true;
+                        break;
+                    }
+                }
+            }
+
+            if statement_error {
+                summary.failed += prepared.len();
+            } else {
+                match vault.exec_transaction(&statements, &[]) {
+                    Ok(affected) => {
+                        for (index, item) in prepared.iter().enumerate() {
+                            if affected.get(index * 2).copied().unwrap_or(0) == 1 {
+                                summary.materialized += 1;
+                                vault.publish_event(crate::StorageEvent::BodyMaterialized {
+                                    note_id: item.note_id.clone(),
+                                });
+                            } else {
+                                summary.stale += 1;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // 整批回滚；已完成批次已经 commit，不受影响。
+                        summary.failed += prepared.len();
+                    }
+                }
+            }
+        }
+
+        done += chunk.len();
+        progress(MaterializeProgress { done, total });
+    }
+
+    Ok(summary)
 }
 
 /// 读 `projection_outbox` 里所有待物化的文档。

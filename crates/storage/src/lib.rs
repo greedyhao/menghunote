@@ -61,8 +61,9 @@ pub use journal::{
     DurableSink, FlushReport, JournalEntry, JournalWriter, PendingJournal, VaultJournalSink,
 };
 pub use materialize::{
-    materialize_body, pending_outbox, project_pending, reconcile, scan_stale_bodies,
-    MaterializeOutcome, PendingProjection, StaleBody,
+    materialize_body, materialize_body_profiled, pending_outbox, project_pending, reconcile,
+    reconcile_batched, scan_stale_bodies, MaterializeOutcome, MaterializeProgress,
+    MaterializeStageTimings, MaterializeSummary, PendingProjection, StaleBody,
 };
 pub use migrate::SCHEMA_VERSION;
 pub use projector::{project, trashed_notes, visible_notes, NoteView, ProjectionReport};

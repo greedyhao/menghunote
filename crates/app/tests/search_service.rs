@@ -430,3 +430,51 @@ fn multiline_hits_return_every_line() {
     assert_eq!(single_hit.matched_lines, 1, "只有一处时统计为 1");
     assert_eq!(single_hit.snippets.len(), 1);
 }
+
+/// S6-2：物化走**批量**路径 —— 进度回调按批、不逐篇。
+///
+/// 判据：5 篇未物化笔记 + 批大小 200 → `Materialize` 阶段最多收到 2 条进度
+/// （逐篇实现会是 5 条），且最后一条 `done == total`。
+#[test]
+fn materialize_reports_progress_per_batch() {
+    let vault = tmp_vault("s6-batch-progress");
+    for index in 0..5 {
+        seed_unmaterialized(
+            &vault,
+            &format!("批量笔记 {index}"),
+            &format!("批量正文 anchor{index}"),
+            index as i64 + 1,
+        );
+    }
+
+    let service = SearchService::start(vault, PEER);
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut materialize_progress: Vec<(usize, usize)> = Vec::new();
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        match service.recv_timeout(Duration::from_millis(500)) {
+            Ok(SearchReply::Status(SearchStatus::Progress {
+                phase: menghunote_app::search_service::BuildPhase::Materialize,
+                done,
+                total,
+            })) => {
+                materialize_progress.push((done, total));
+            }
+            Ok(SearchReply::Status(SearchStatus::Ready | SearchStatus::Degraded(_))) => {
+                ready = true;
+                break;
+            }
+            Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(ready, "索引应就绪");
+    assert!(!materialize_progress.is_empty(), "至少要有一条物化进度");
+    assert!(
+        materialize_progress.len() <= 2,
+        "批量路径下 5 篇只该有 1–2 条进度（逐篇实现是 5 条），实际：{materialize_progress:?}"
+    );
+    let (done, total) = *materialize_progress.last().expect("非空");
+    assert_eq!(total, 5, "总数应为 5 篇未物化笔记");
+    assert_eq!(done, 5, "最后一条进度应完成全部");
+}

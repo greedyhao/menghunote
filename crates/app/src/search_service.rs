@@ -280,6 +280,12 @@ impl SearchService {
     }
 }
 
+/// 批量物化的批大小。
+///
+/// storage 侧一批一个事务：事务开销（含 `synchronous=FULL` 的 fsync）被摊到 200 篇上。
+/// 2000 篇实测：逐篇 41.8s → 批量亚秒级（storage 的 S6-1 报告同量级）。
+pub const MATERIALIZE_BATCH_SIZE: usize = 200;
+
 /// 周期对账间隔（ADR 0005：事件是主路径，周期对账兜底漏事件/进程外改动）。
 pub const PERIODIC_RECONCILE: Duration = Duration::from_secs(30);
 
@@ -306,71 +312,42 @@ fn query_backend(
     Ok((result.total, result.hits))
 }
 
-/// 物化所有 stale 正文，并在过程中上报「补齐正文 done/total」进度。
+/// 物化所有 stale 正文（**批量**），并按**批**上报「补齐正文 done/total」进度。
 ///
-/// 逐篇物化（而不是一次性 `reconcile`）是为了给 UI 确定性进度；`total` 先扫一遍
-/// stale 列表拿到，扫不到（0 篇）时直接结束。
+/// 走 `menghunote_storage::reconcile_batched`：每 [`MATERIALIZE_BATCH_SIZE`] 篇一个事务，
+/// 进度回调也是每批一次（UI 一次 drain 只 notify 一帧，不会刷屏）。
+///
+/// 失败语义（与 storage 一致）：单篇准备/事务失败**计入 `failed` 并继续**后面的批次，
+/// 只有数据库级致命错误才返回 `Err`；失败数交给调用方降级展示。
 fn reconcile_bodies_with_progress(
     vault: &Vault,
     peer_id: u64,
     replies: &Sender<SearchReply>,
-) -> Result<usize, String> {
+) -> Result<menghunote_storage::MaterializeSummary, String> {
     let started = Instant::now();
-    let stale = menghunote_storage::scan_stale_bodies(vault)
-        .map_err(|error| format!("扫描待物化正文失败：{error}"))?;
-    let total = stale.len();
-    let _ = replies.send(SearchReply::Status(SearchStatus::Progress {
-        phase: BuildPhase::Materialize,
-        done: 0,
-        total,
-    }));
-    let mut applied = 0usize;
-    for (index, item) in stale.iter().enumerate() {
-        match menghunote_storage::materialize_body(
-            vault,
-            &item.note_id,
-            &item.doc_id,
-            item.head_seq,
-            peer_id,
-        ) {
-            Ok(menghunote_storage::MaterializeOutcome::Applied { .. }) => applied += 1,
-            Ok(menghunote_storage::MaterializeOutcome::Stale { .. }) => {}
-            Err(error) => return Err(format!("正文物化失败：{error}")),
-        }
-        // 按篇上报；UI 侧一次 drain 只 notify 一帧，所以不会每篇刷一次屏。
-        let _ = replies.send(SearchReply::Status(SearchStatus::Progress {
-            phase: BuildPhase::Materialize,
-            done: index + 1,
-            total,
-        }));
-    }
+    let summary = menghunote_storage::reconcile_batched(
+        vault,
+        peer_id,
+        MATERIALIZE_BATCH_SIZE,
+        &mut |progress| {
+            let _ = replies.send(SearchReply::Status(SearchStatus::Progress {
+                phase: BuildPhase::Materialize,
+                done: progress.done,
+                total: progress.total,
+            }));
+        },
+    )
+    .map_err(|error| format!("正文物化失败：{error}"))?;
     eprintln!(
-        "[menghunote] 搜索：reconcile 完成，物化 {applied} 篇 / 检查 {total} 篇（{} ms）",
-        started.elapsed().as_millis()
+        "[menghunote] 搜索：批量物化完成，成功 {} 篇 / stale {} 篇 / 失败 {} 篇，共检查 {} 篇（{} ms，批大小 {}）",
+        summary.materialized,
+        summary.stale,
+        summary.failed,
+        summary.materialized + summary.stale + summary.failed,
+        started.elapsed().as_millis(),
+        MATERIALIZE_BATCH_SIZE
     );
-    Ok(applied)
-}
-
-/// 物化所有 stale 正文，返回**实际写入**的篇数（`Stale` 不计）。
-fn reconcile_bodies(vault: &Vault, peer_id: u64) -> Result<usize, String> {
-    let started = Instant::now();
-    let outcomes = menghunote_storage::reconcile(vault, peer_id)
-        .map_err(|error| format!("正文物化失败：{error}"))?;
-    let applied = outcomes
-        .iter()
-        .filter(|outcome| {
-            matches!(
-                outcome,
-                menghunote_storage::MaterializeOutcome::Applied { .. }
-            )
-        })
-        .count();
-    eprintln!(
-        "[menghunote] 搜索：reconcile 完成，物化 {applied} 篇 / 检查 {} 篇（{} ms）",
-        outcomes.len(),
-        started.elapsed().as_millis()
-    );
-    Ok(applied)
+    Ok(summary)
 }
 
 /// 后台线程主体：先对账，再循环消费请求 + 驱动增量。
@@ -380,6 +357,7 @@ fn worker_main(
     requests: Receiver<SearchRequest>,
     replies: Sender<SearchReply>,
 ) {
+    let worker_started = Instant::now();
     // ① 启动对账（可能较慢，UI 此时显示"索引准备中…"）。
     let _ = replies.send(SearchReply::Status(SearchStatus::Preparing));
 
@@ -391,9 +369,10 @@ fn worker_main(
     // 物化过的正文补出来。这一步在启动时做一次，之后每 [`PERIODIC_RECONCILE`] 再做。
     let mut problems: Vec<String> = Vec::new();
     match reconcile_bodies_with_progress(&vault, peer_id, &replies) {
-        Ok(applied) => {
-            if applied > 0 {
-                eprintln!("[menghunote] 搜索：启动物化 {applied} 篇正文");
+        Ok(summary) => {
+            if summary.failed > 0 {
+                // 单篇失败不阻塞建索引：索引能建多少建多少，状态上标降级。
+                problems.push(format!("索引降级：{} 篇正文物化失败", summary.failed));
             }
         }
         Err(message) => problems.push(message),
@@ -431,6 +410,10 @@ fn worker_main(
         SearchStatus::Degraded(problems.join("；"))
     };
     let _ = replies.send(SearchReply::Status(status));
+    eprintln!(
+        "[menghunote] 搜索：索引就绪（从 worker 启动起 {} ms）",
+        worker_started.elapsed().as_millis()
+    );
 
     let mut last_periodic = Instant::now();
 
@@ -450,12 +433,15 @@ fn worker_main(
         // ③ 周期对账（处理漏掉的事件 / 进程外改动）：先补物化，再让索引全量对账。
         if now.duration_since(last_periodic) >= PERIODIC_RECONCILE {
             last_periodic = now;
-            let applied = reconcile_bodies(&vault, peer_id).unwrap_or_else(|message| {
-                eprintln!("[menghunote] 搜索：周期物化失败：{message}");
-                0
-            });
-            if applied > 0 {
-                eprintln!("[menghunote] 搜索：周期物化 {applied} 篇正文");
+            match reconcile_bodies_with_progress(&vault, peer_id, &replies) {
+                Ok(summary) if summary.failed > 0 => {
+                    eprintln!(
+                        "[menghunote] 搜索：周期批量物化有 {} 篇失败",
+                        summary.failed
+                    );
+                }
+                Ok(_) => {}
+                Err(message) => eprintln!("[menghunote] 搜索：周期物化失败：{message}"),
             }
             if let Err(error) = manager.reconcile_now() {
                 eprintln!("[menghunote] 搜索：周期索引对账失败：{error}");

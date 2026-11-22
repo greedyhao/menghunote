@@ -198,6 +198,7 @@ function TypeText([string]$text) {
         Start-Sleep -Milliseconds 30
     }
 }
+
 function Focus-App {
     # Windows 前台锁：attach 到当前前台线程再 SetForegroundWindow，否则后台进程抢不到前台。
     for ($i = 0; $i -lt 40; $i++) {
@@ -503,6 +504,207 @@ switch ($Scenario) {
         Start-Sleep -Milliseconds 400
         Save-Shot ($Screenshot -replace '\.png$', '-left.png')
         Write-Output "biashit ok"
+    }
+    "searchautorequery" {
+        # 构建中先输入查询，构建完成后应**自动重查**并显示结果数（不需要再敲键）。
+        if ((Wait-ForLog "打开搜索浮层" 15000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 400
+        TypeText "000"
+        Start-Sleep -Milliseconds 15000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchautorequery ok"
+    }
+    "groupfold" {
+        # 折叠态截图 → 点分组**标题行**（y≈345 物理 = 230 逻辑）展开 → 展开态截图。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        Save-Shot ($Screenshot -replace '\.png$', '-collapsed.png')
+        LeftClick 700 345
+        Start-Sleep -Milliseconds 600
+        Save-Shot ($Screenshot -replace '\.png$', '-expanded.png')
+        Write-Output "groupfold ok"
+    }
+    "groupenter" {
+        # 预填查询（MENGHUNOTE_SEARCH_QUERY）→ Enter 应打开当前（第一）个分组。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        PressKey 0x0D
+        if ((Wait-ForLog "打开搜索结果" 5000) -lt 0) { Fail "Enter 没有打开分组结果" }
+        if ((Wait-ForLog "关闭搜索浮层" 5000) -lt 0) { Fail "打开后浮层没有关闭" }
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-opened.png')
+        Write-Output "groupenter ok"
+    }
+    "searchcount" {
+        # 总数 + 单行摘要 + 两个开关的截图（不点开关，点击不稳）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 900
+        TypeText "menghunote"
+        Start-Sleep -Milliseconds 1200
+        Save-Shot ($Screenshot -replace '\.png$', '-count.png')
+        Write-Output "searchcount ok"
+    }
+    "searchprogress" {
+        # 首建进度：批量物化后 2000 篇首建只要 2–3s，所以连拍覆盖整个窗口期
+        # （拍前把鼠标移进窗口，尽量逼一帧重绘；PrintWindow 偶尔返回缓存 surface）。
+        Start-Sleep -Milliseconds 900
+        foreach ($i in 0..5) {
+            MoveTo 700 500
+            Start-Sleep -Milliseconds 120
+            Save-Shot ($Screenshot -replace '\.png$', "-f$i.png")
+            Start-Sleep -Milliseconds 300
+        }
+        Start-Sleep -Milliseconds 3000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchprogress ok"
+    }
+    "searchautorequery" {
+        # 构建中先输入查询，构建完成后应**自动重查**并显示结果数（不需要再敲键）。
+        if ((Wait-ForLog "打开搜索浮层" 15000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 400
+        TypeText "000"
+        Start-Sleep -Milliseconds 15000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchautorequery ok"
+    }
+    "groupfold" {
+        # 折叠态截图 → 点分组**标题行**（y≈345 物理 = 230 逻辑）展开 → 展开态截图。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        Save-Shot ($Screenshot -replace '\.png$', '-collapsed.png')
+        LeftClick 700 345
+        Start-Sleep -Milliseconds 600
+        Save-Shot ($Screenshot -replace '\.png$', '-expanded.png')
+        Write-Output "groupfold ok"
+    }
+    "groupenter" {
+        # 预填查询（MENGHUNOTE_SEARCH_QUERY）→ Enter 应打开当前（第一）个分组。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        PressKey 0x0D
+        if ((Wait-ForLog "打开搜索结果" 5000) -lt 0) { Fail "Enter 没有打开分组结果" }
+        if ((Wait-ForLog "关闭搜索浮层" 5000) -lt 0) { Fail "打开后浮层没有关闭" }
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-opened.png')
+        Write-Output "groupenter ok"
+    }
+    "searchcount" {
+        # 总数 + 单行摘要 + 两个开关的截图（不点开关，点击不稳）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 900
+        TypeText "menghunote"
+        Start-Sleep -Milliseconds 1200
+        Save-Shot ($Screenshot -replace '\.png$', '-count.png')
+        Write-Output "searchcount ok"
+    }
+    "searchprogress" {
+        # 连拍；每次拍前把鼠标移到窗口内，逼一帧重绘（否则 PrintWindow 可能拿到旧 surface）。
+        Start-Sleep -Milliseconds 900
+        foreach ($i in 0..11) {
+            MoveTo 700 500
+            Start-Sleep -Milliseconds 120
+            Save-Shot ($Screenshot -replace '\.png$', "-g$i.png")
+            Start-Sleep -Milliseconds 260
+        }
+        Write-Output "searchprogress ok"
+    }
+    "searchautorequery" {
+        # 构建中先输入查询，构建完成后应**自动重查**并显示结果数（不需要再敲键）。
+        if ((Wait-ForLog "打开搜索浮层" 15000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 400
+        TypeText "000"
+        Start-Sleep -Milliseconds 15000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchautorequery ok"
+    }
+    "groupfold" {
+        # 折叠态截图 → 点分组**标题行**（y≈345 物理 = 230 逻辑）展开 → 展开态截图。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        Save-Shot ($Screenshot -replace '\.png$', '-collapsed.png')
+        LeftClick 700 345
+        Start-Sleep -Milliseconds 600
+        Save-Shot ($Screenshot -replace '\.png$', '-expanded.png')
+        Write-Output "groupfold ok"
+    }
+    "groupenter" {
+        # 预填查询（MENGHUNOTE_SEARCH_QUERY）→ Enter 应打开当前（第一）个分组。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        PressKey 0x0D
+        if ((Wait-ForLog "打开搜索结果" 5000) -lt 0) { Fail "Enter 没有打开分组结果" }
+        if ((Wait-ForLog "关闭搜索浮层" 5000) -lt 0) { Fail "打开后浮层没有关闭" }
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-opened.png')
+        Write-Output "groupenter ok"
+    }
+    "searchcount" {
+        # 总数 + 单行摘要 + 两个开关的截图（不点开关，点击不稳）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 900
+        TypeText "menghunote"
+        Start-Sleep -Milliseconds 1200
+        Save-Shot ($Screenshot -replace '\.png$', '-count.png')
+        Write-Output "searchcount ok"
+    }
+    "searchprogress" {
+        # 不依赖日志（构建很快，日志/输出有延迟）：启动后直接连拍，覆盖整个首建窗口。
+        Start-Sleep -Milliseconds 1200
+        foreach ($i in 0..11) {
+            Save-Shot ($Screenshot -replace '\.png$', "-f$i.png")
+            Start-Sleep -Milliseconds 350
+        }
+        Write-Output "searchprogress ok"
+    }
+    "searchautorequery" {
+        # 构建中先输入查询，构建完成后应**自动重查**并显示结果数（不需要再敲键）。
+        if ((Wait-ForLog "打开搜索浮层" 15000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 400
+        TypeText "000"
+        Start-Sleep -Milliseconds 15000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchautorequery ok"
+    }
+    "groupfold" {
+        # 折叠态截图 → 点分组**标题行**（y≈345 物理 = 230 逻辑）展开 → 展开态截图。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        Save-Shot ($Screenshot -replace '\.png$', '-collapsed.png')
+        LeftClick 700 345
+        Start-Sleep -Milliseconds 600
+        Save-Shot ($Screenshot -replace '\.png$', '-expanded.png')
+        Write-Output "groupfold ok"
+    }
+    "groupenter" {
+        # 预填查询（MENGHUNOTE_SEARCH_QUERY）→ Enter 应打开当前（第一）个分组。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1500
+        PressKey 0x0D
+        if ((Wait-ForLog "打开搜索结果" 5000) -lt 0) { Fail "Enter 没有打开分组结果" }
+        if ((Wait-ForLog "关闭搜索浮层" 5000) -lt 0) { Fail "打开后浮层没有关闭" }
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-opened.png')
+        Write-Output "groupenter ok"
+    }
+    "searchcount" {
+        # 总数 + 单行摘要 + 两个开关的截图（不点开关，点击不稳）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 900
+        TypeText "menghunote"
+        Start-Sleep -Milliseconds 1200
+        Save-Shot ($Screenshot -replace '\.png$', '-count.png')
+        Write-Output "searchcount ok"
+    }
+    "searchprogress" {
+        # 首建进度：开浮层后按多个时间点连拍，总能抓到"构建中"的一帧。
+        if ((Wait-ForLog "打开搜索浮层" 15000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        foreach ($delay in @(0, 200, 400, 700, 1100)) {
+            Start-Sleep -Milliseconds $delay
+            Save-Shot ($Screenshot -replace '\.png$', "-t$delay.png")
+        }
+        Start-Sleep -Milliseconds 4000
+        Save-Shot ($Screenshot -replace '\.png$', '-ready.png')
+        Write-Output "searchprogress ok"
     }
     "searchautorequery" {
         # 构建中先输入查询，构建完成后应**自动重查**并显示结果数（不需要再敲键）。

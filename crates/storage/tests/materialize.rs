@@ -6,7 +6,7 @@ use support::*;
 
 use menghunote_storage::{
     load_body_state, load_head, materialize_body, pending_outbox, project_pending, reconcile,
-    scan_stale_bodies, MaterializeOutcome,
+    reconcile_batched, scan_stale_bodies, MaterializeOutcome, MaterializeProgress,
 };
 
 /// 提交两段正文，返回编辑后的完整文本（= "A中😀e\u{301}"）。
@@ -201,4 +201,90 @@ fn project_pending_walks_outbox() {
     assert!(project_pending(&vault, PEER_A)
         .expect("B 第二轮")
         .is_empty());
+}
+
+fn seed_many(vault: &menghunote_storage::Vault, count: usize) -> Vec<(String, String)> {
+    let mut expected = Vec::with_capacity(count);
+    for index in 0..count {
+        let note_id = format!("batch-note-{index:04}");
+        let doc_id = format!("batch-doc-{index:04}");
+        let body = format!("# 批量 {index}\n\n第 {index} 篇正文，用于验证批量物化。");
+        let doc = seed_note(vault, &note_id, &doc_id);
+        doc.insert_scalars(0, &body).expect("写正文");
+        commit_now(vault, &doc, &format!("batch-{index}"));
+        expected.push((note_id, body));
+    }
+    expected
+}
+
+#[test]
+fn reconcile_batched_materializes_all_and_reports_monotonic_progress() {
+    let (_dir, vault) = fresh_vault();
+    let expected = seed_many(&vault, 200);
+    let stale = scan_stale_bodies(&vault).expect("扫描");
+    assert_eq!(stale.len(), 200);
+
+    let mut progress = Vec::new();
+    let summary = reconcile_batched(&vault, PEER_A, 50, &mut |item: MaterializeProgress| {
+        progress.push(item);
+    })
+    .expect("批量物化失败");
+
+    assert_eq!(summary.materialized, 200);
+    assert_eq!(summary.stale, 0);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(progress.len(), 4, "200/50 应回调 4 次: {progress:?}");
+    assert!(progress
+        .windows(2)
+        .all(|window| window[0].done <= window[1].done));
+    assert_eq!(
+        progress.last().copied(),
+        Some(MaterializeProgress {
+            done: 200,
+            total: 200
+        })
+    );
+
+    for (note_id, body) in &expected {
+        let state = load_body_state(&vault, note_id).expect("读状态");
+        assert_eq!(state.body_md.as_deref(), Some(body.as_str()), "{note_id}");
+    }
+    assert!(scan_stale_bodies(&vault).expect("复扫").is_empty());
+}
+
+#[test]
+fn reconcile_batched_marks_failed_item_and_continues() {
+    let (_dir, vault) = fresh_vault();
+    let expected = seed_many(&vault, 3);
+
+    // 注入坏 note：删掉目标 doc 的 A 记录，prepare（end_frontier_at）会失败。
+    vault
+        .exec(
+            "DELETE FROM loro_updates WHERE doc_id = 'batch-doc-0001'",
+            &[],
+        )
+        .expect("删除一条 A 记录");
+
+    let mut progress = Vec::new();
+    let summary = reconcile_batched(&vault, PEER_A, 1, &mut |item: MaterializeProgress| {
+        progress.push(item);
+    })
+    .expect("批量物化失败");
+
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.materialized, 2);
+    assert_eq!(summary.stale, 0);
+    assert_eq!(
+        progress.last().copied(),
+        Some(MaterializeProgress { done: 3, total: 3 })
+    );
+    for (note_id, body) in expected
+        .iter()
+        .filter(|(note_id, _)| note_id != "batch-note-0001")
+    {
+        let state = load_body_state(&vault, note_id).expect("读状态");
+        assert_eq!(state.body_md.as_deref(), Some(body.as_str()), "{note_id}");
+    }
+    let bad = load_body_state(&vault, "batch-note-0001").expect("坏 note 状态");
+    assert_eq!(bad.body_md, None, "失败批次不能写入半截结果");
 }

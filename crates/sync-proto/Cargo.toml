@@ -1,0 +1,9 @@
+[package]
+name = "menghunote-sync-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 纯类型 crate（ADR 0006 §11）：不依赖 IO/crypto/Loro/SQLite/GPUI。
+# 依赖由实现者按需添加，但必须保持这条边界。

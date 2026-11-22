@@ -262,9 +262,11 @@ menghunote/
 └─ AGENTS.md
 ```
 
-**依赖方向（ADR 0003，禁止成环，含 dev-dependency）**：
-`app → editor/storage/text/gpui`；`editor → storage/text`；`storage → text/loro/rusqlite`；
-`text → unicode-segmentation`。`storage` **不依赖** `editor`；`editor`/`storage`/`text` **不依赖** GPUI 或 `app`。
+**依赖方向（ADR 0003 + ADR 0006，禁止成环，含 dev-dependency）**：
+`app → editor/storage/text/gpui/sync`；`editor → storage/text`；`storage → text/loro/rusqlite`；
+`sync → storage + sync-proto`；`relay → sync-proto`；`sync-proto` 纯类型（serde，无 IO/crypto/Loro/SQLite）；
+`text → unicode-segmentation`。`storage` **不依赖** `editor`/`sync`；`editor`/`storage`/`text` **不依赖** GPUI；
+`relay` **不依赖** storage/Loro/Tantivy。
 
 **决策落地规则**：GPT 给出的每个架构级结论，都要在 `docs/adr/NNNN-*.md` 留一页
 （背景 / 选项 / 结论 / 后果）。这样后续执行不再重复问 GPT。
@@ -332,6 +334,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 5. ~~**撤销/重做与命令栈设计**~~ —— **已决**（并入 [ADR 0002](docs/adr/0002-editor-core.md) §8）：单一正文 `UndoManager`（本 peer）、750 ms 同向合并、远端 import 不进本地 Undo 项但须被变换、v1 100 组且不跨重启。
 6. ~~同步协议的服务器职责边界（relay-only vs 存 snapshot）~~ —— **已决**（并入 ADR 0001）：持久**密文**中继 + 密文快照/manifest；relay 不解析明文、不见密钥、不做搜索。
 7. ~~**模块边界与依赖方向（crate 拆分）**~~ —— **已决**（2026-11-09，`gpt-6.1-sol`）：见 [`docs/adr/0003-module-boundaries.md`](docs/adr/0003-module-boundaries.md)。新建 `crates/text` 收口坐标/单位；会话端口放 `storage::session`；`editor → storage/text`。
+8. ~~**同步/加密 v1 的实现契约**~~ —— **已决**（2026-11-11，`gpt-6.1-sol`，max）：见 [`docs/adr/0006-sync-v1.md`](docs/adr/0006-sync-v1.md)。输入 [`docs/briefs/0004-sync-v1.md`](docs/briefs/0004-sync-v1.md)；冻结 MNE1 信封（196B header + AAD + HKDF 域）、密钥槽/DPAPI/恢复码、Ed25519 设备鉴权 + HPKE grant、relay API/DDL/游标、两 checkpoint GC、`key_epoch` 轮换；wire 不可静默变更。
 
 ---
 
@@ -387,8 +390,12 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   **教训**：`WM_CHAR` 注入绕过 IME，自动化能打字 ≠ 输入法可用；文本输入控件必须真机验。
 - **S5 检索体验（2026-11-11，真机验收）**：总计/单行→多行摘要（命中行全量、单行 160B 截断 + 省略号）、
   `Aa` 大小写敏感与 `整词`（关=子串，trigram 召回 + 原文校验）开关、两阶段重建进度条、按笔记分组折叠（默认 3 行）。
-  索引 schema v2：**索引体积约 2.5×**、2000 篇首建「补齐正文」约 **40–50s**（逐篇物化，待批量优化）、
-  查询 p95 全量多行摘要后 **27.8–39.9ms**（仍 <50ms 门槛）。
+  索引 schema v2：**索引体积约 2.5×**；查询 p95 全量多行摘要后 **27.8–39.9ms**（仍 <50ms 门槛）。
+  **批量物化（S6）**：逐篇物化瓶颈是"每篇一个事务"（占 97.9%），改 `reconcile_batched`（200/批）后
+  2000 篇物化 46.8s→0.38s、进程启动→索引就绪 **44.2s→6.2s**；首建剩余主成本是建索引（1.7–2.4s）。
+- **同步/加密（S7）进行中（2026-11-11，ADR 0006）**：`crates/sync-proto`（MNE1 信封/CDE/错误码/limits）→
+  `crates/sync`（根/KEK/槽/DPAPI/HPKE/设备证书）→ `crates/relay`（axum+SQLite 密文中继）→ storage 桥 →
+  bootstrap/GC → 轮换 → Windows 两设备验收。v1 必做含两 checkpoint GC、恢复码、独立管理权；附件只做最小分片传输，UI 后置。
 - **UI 框架已切 GPUI Kit（2026-11-10，ADR 0004，真机验收）**：`gpui = { package = "gpui-kit", version = "=0.9.1" }`（精确 pin），
   平台入口 `gpui::platform::application()`；`text`/`editor`/`storage` **零改动**。
   探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口；迁移后三绿 329 用例 + UI smoke 10/10 + 用户真机 IME/DPI 通过。
