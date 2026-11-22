@@ -23,6 +23,7 @@ pub mod backtick;
 pub mod block;
 pub mod controller;
 pub mod error;
+pub mod frontmatter;
 pub mod input;
 pub mod markdown;
 pub mod object;

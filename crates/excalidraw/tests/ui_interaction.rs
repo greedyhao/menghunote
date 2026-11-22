@@ -780,8 +780,8 @@ fn dragging_a_rectangle_previews_the_exact_shape_it_commits() {
         .expect("a preview exists the moment you press");
     let pressed = element_bounds(&on_press);
     assert!(
-        pressed.width() > 0.0 && pressed.height() > 0.0,
-        "even a bare press previews the default-size shape, got {pressed:?}"
+        pressed.width() <= 1.0 && pressed.height() <= 1.0,
+        "a bare press must not preview the 100×100 default shape (it flashes), got {pressed:?}"
     );
 
     e.on_canvas_mouse_move(180.0, 140.0, plain());
@@ -999,4 +999,45 @@ fn resizing_a_sticky_note_tracks_the_pointer_linearly() {
         );
     }
     e.on_canvas_mouse_up(420.0, 400.0, plain());
+}
+
+#[test]
+fn middle_button_pan_uses_local_drag_delta() {
+    let mut e = Editor::new();
+    e.start_pan(100.0, 80.0);
+    e.on_canvas_mouse_move(150.0, 120.0, plain());
+    assert_eq!((e.document.scroll.x, e.document.scroll.y), (50.0, 40.0));
+    e.on_canvas_mouse_up(150.0, 120.0, plain());
+    assert!(!e.is_interacting(), "middle-button pan must end on release");
+}
+
+#[test]
+fn bare_press_does_not_flash_a_default_size_preview() {
+    use gpui_excalidraw::core::bounds::element_bounds;
+
+    let mut e = Editor::new();
+    e.set_tool(Tool::Diamond);
+    e.on_canvas_mouse_down(80.0, 80.0, plain(), 1);
+    let pressed = element_bounds(&e.drag_preview().expect("preview"));
+    assert!(
+        pressed.width() <= 1.0 && pressed.height() <= 1.0,
+        "press preview must stay tiny until the pointer moves: {pressed:?}"
+    );
+    e.on_canvas_mouse_move(90.0, 90.0, plain());
+    let small = element_bounds(&e.drag_preview().expect("preview"));
+    assert!(
+        small.width() < 20.0 && small.height() < 20.0,
+        "small drag must not jump to 100×100: {small:?}"
+    );
+    e.on_canvas_mouse_up(90.0, 90.0, plain());
+    assert_eq!(
+        e.document.scene.len(),
+        1,
+        "a real small drag still commits a shape"
+    );
+    let committed = element_bounds(e.document.scene.non_deleted().next().unwrap());
+    assert!(
+        committed.width() <= 20.0 && committed.height() <= 20.0,
+        "small drag must commit small, got {committed:?}"
+    );
 }

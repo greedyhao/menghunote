@@ -64,6 +64,8 @@ pub enum BlockKind {
     ListItem,
     /// 围栏代码块的行（开围栏、内部、闭围栏）。
     FencedCode,
+    /// 分隔线（`---` / `***` / `___`）。
+    ThematicBreak,
     /// 普通文本行（含空行、未识别行）。
     Paragraph,
 }
@@ -127,6 +129,13 @@ pub fn runs(doc: &MarkdownDocument) -> Result<Vec<BlockRun>, MarkdownError> {
             .partition_point(|line_start| *line_start <= byte)
             .saturating_sub(1)
     };
+
+    // 分隔线由语义解析器的 LineKind 给出（它没有对应 construct）。
+    for (index, info) in doc.line_infos().iter().enumerate() {
+        if info.kind == crate::MarkdownLineKind::ThematicBreak {
+            best[index] = Some((BlockKind::ThematicBreak, None));
+        }
+    }
 
     for construct in doc.constructs() {
         let span = construct.span();
@@ -214,9 +223,10 @@ fn consider(best: &mut Option<(BlockKind, Option<u8>)>, candidate: (BlockKind, O
 const fn rank(kind: BlockKind) -> u8 {
     match kind {
         BlockKind::FencedCode => 0,
-        BlockKind::Heading => 1,
-        BlockKind::ListItem => 2,
-        BlockKind::BlockQuote => 3,
-        BlockKind::Paragraph => 4,
+        BlockKind::ThematicBreak => 1,
+        BlockKind::Heading => 2,
+        BlockKind::ListItem => 3,
+        BlockKind::BlockQuote => 4,
+        BlockKind::Paragraph => 5,
     }
 }

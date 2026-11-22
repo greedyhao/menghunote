@@ -150,10 +150,10 @@ fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
 
 /// 编辑器面板左上角的正文内一个稳定右键落点（菜单位置只影响面板坐标，不影响 caret）。
 fn right_click_point(cx: &mut VisualTestContext) -> gpui::Point<gpui::Pixels> {
-    let pane = cx
-        .debug_bounds("editor-pane")
-        .expect("编辑器面板必须画出来");
-    point(pane.origin.x + px(80.0), pane.origin.y + px(20.0))
+    let editor = cx
+        .debug_bounds("editor-current-doc")
+        .expect("编辑器正文必须画出来");
+    point(editor.origin.x + px(80.0), editor.origin.y + px(20.0))
 }
 
 /// 正文前 3 行（第 2 行是正文行），以及引用/列表/围栏都不参与。
@@ -210,10 +210,10 @@ async fn right_click_opens_the_insert_menu_without_moving_the_caret(cx: &mut Tes
     cx.run_until_parked();
     assert!(cx.debug_bounds("editor-context-menu").is_some());
     // 菜单位于右键落点（local x≈80），点它的左侧空白处 = 菜单外。
-    let pane = cx
-        .debug_bounds("editor-pane")
-        .expect("编辑器面板必须画出来");
-    let outside = point(pane.origin.x + px(30.0), pane.origin.y + px(20.0));
+    let editor = cx
+        .debug_bounds("editor-current-doc")
+        .expect("编辑器正文必须画出来");
+    let outside = point(editor.origin.x + px(30.0), editor.origin.y + px(20.0));
     cx.simulate_click(outside, Modifiers::default());
     cx.run_until_parked();
     assert!(

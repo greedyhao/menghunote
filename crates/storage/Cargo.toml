@@ -12,6 +12,11 @@ menghunote-text = { path = "../text" }
 menghunote-markdown = { path = "../markdown" }
 # `bundled` 特性会静态编译一份 SQLite，不依赖系统 sqlite3.dll / 用户机器上的版本
 rusqlite = { version = "0.41", features = ["bundled"] }
+# `versions.body_zstd` 存 zstd 压缩的 UTF-8 Markdown 正文（ADR 0024 本机历史）。
+# zstd 0.14.3 早已在 lockfile 里（tantivy 的传递依赖，zstd-sys 已在根 Cargo.toml
+# 单独关掉 debug 信息以绕开本机构建环境的 D8050）；这里只显式声明同一个版本，
+# 不引入新的版本解算。
+zstd = "0.14"
 sha2 = "0.10"
 thiserror = "2"
 

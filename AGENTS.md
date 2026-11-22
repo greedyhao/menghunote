@@ -713,6 +713,64 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   周期笔记；设置字段不做失焦自动保存；设置不参与多设备同步。详见
   [`docs/notes/templates-daily-notes.md`](docs/notes/templates-daily-notes.md)。
 
+- **笔记属性 / YAML frontmatter（2026-11-19）**：
+  笔记第 0 行输入完 `---` 就**立即**补成 `---\n\n---\n`（不用 Enter）；「笔记属性」
+  面板作为正文顶部块（随正文滚动，不固定在窗口上方；可折叠、可一键清除全部属性；
+  key/value 行内编辑、添加、删除），源码 frontmatter 永远隐藏，初始 caret 落在正文起点；
+  正文起点 Backspace 不会删到隐藏的 `---`。正文里的 `---` 投影成空行 + 自绘分隔线。
+  每次提交一条整篇替换（一个撤销组），写回后 caret 回正文起点。
+  纯解析/渲染在 `crates/editor/src/model/frontmatter.rs`；面板在
+  `crates/app/src/note_properties.rs`；文案 `properties.*`。
+  测试：editor **292** / app 默认 **577** / `--features dev-sync` **728** /
+  `--no-default-features` **455**；新增 `headless_excalidraw` 9 个属性/分隔线用例。
+  已知限制：属性很多时面板整体下推正文；只支持常用 YAML 子集；编辑会重写整段
+  frontmatter（注释/空行不保留）；无类型选择器/自动补全。详见
+  [`docs/notes/note-properties.md`](docs/notes/note-properties.md)。
+
+- **笔记顶部标题 / 路径 / 前进后退（2026-11-19）**：
+  笔记主体顶部固定 header：`← →` 历史按钮 + `文件夹 / 子文件夹 / 标题` 路径面包屑 +
+  可编辑大标题；点标题进入 `RenameInput::new_note_title`，提交走与侧栏 F2 相同的
+  `commit_rename_node`，侧栏/文件名同步。历史只存 `node_id`（上限 100、forward 分支丢弃），
+  鼠标侧键 `MouseButton::Navigate(Back/Forward)` 在根视图接收，整个窗口生效。
+  selector：`note-header` / `note-path` / `note-title` / `note-title-edit` /
+  `note-nav-back` / `note-nav-forward`。
+  测试：app 默认 **577** / `--features dev-sync` **728** / `--no-default-features` **455**；
+  新增 `headless_excalidraw` 2 个 header/history 用例（该计数是当时快照，最新见 0024/0025 条目）。
+  已知限制：header 固定不随正文滚动；面包屑只读；历史不跨重启；无多标签页。详见
+  [`docs/notes/note-header-navigation.md`](docs/notes/note-header-navigation.md)。
+
+- **笔记本地编辑历史（ADR 0024 H1，2026-11-19）**：
+  笔记右键「历史记录…」→ 本机时间线覆盖层（按时间倒序，来源/标题，只读预览）；
+  「恢复为新笔记」创建根级 `原标题（历史）` 并整篇写正文，不覆盖当前、不改 CRDT 历史。
+  捕获：`AppShell` 2s 周期 timer（源文变化才写，首次打开只设基线）+ 切笔记/关窗 flush；
+  storage 用 v1 `versions` 表 + migration v4（`source`/`device_id`/`body_hash`），
+  `body_zstd` 存 zstd(UTF-8 Markdown)，`asset_hashes` 沿用 asset_gc 口径，
+  每篇保留最近 200 个版本/90 天（同事务裁剪），只追加、不查 relay。
+  selector：`note-history` / `note-history-panel` / `note-history-row-<N>` /
+  `note-history-preview` / `note-history-restore` / `note-history-close` /
+  `note-history-empty`；菜单为笔记第 2 项（`menu-item-1`，可读 `menu-item-history`）。
+  测试：storage **206** / app 默认 **592** / dev-sync **743** / no-default **470**；
+  新增 `storage/tests/history.rs` 5、`headless_note_history.rs` 6。
+  已知限制：2s 轮询不是严格 debounce；无 diff/分页/搜索/跨设备；恢复只复制正文，
+  资产字节不复制。详见 [`docs/notes/note-history.md`](docs/notes/note-history.md)。
+
+- **Excalidraw 嵌入预览（ADR 0025 后续切片，2026-11-19）**：
+  普通 Markdown 整行 `![[目标.excalidraw]]`（支持 `|别名`）解析为 `ObjectKind::Drawing`，
+  投影成一个图片式 Object（隐藏源码）；`ImageService` 用合成 key
+  `drawing://<theme>/<target>` 请求，宿主 `vault_asset_provider` 在后台线程解析目标
+  （路径唯一优先/标题唯一兜底）、读正文、`scene_json_to_png` 导出 PNG 再解码；
+  缺失/失败显示「画布笔记不存在 / 画布预览加载中… / 画布预览失败」占位。
+  单击预览发 `EditorEvent::WikiLinkRequested` 打开目标画布笔记（不移动 caret/不进源码）；
+  无悬浮工具条；混排行内、代码/引用/列表/缩进里的 `![[...]]` 不解析。
+  解析在 `crates/markdown`（`DrawingSpan`），模型在
+  `crates/editor/src/model/markdown.rs`（`MarkdownDrawing`），绘制在
+  `crates/app/src/editor/view.rs`，PNG helper 在 `crates/app/src/drawing.rs`。
+  测试：markdown **53** / editor **299** / app 默认 **592** / dev-sync **743**；
+  新增 `headless_excalidraw_embed` 2、`headless_excalidraw` 2（真实 provider 渲染 + 点击打开）。
+  已知限制：预览缓存 key 只含 theme+target（目标画布在别处改后同视图可能看到旧图）；
+  无 DPI 重新渲染；真实 Windows 像素/DPI 待验。详见
+  [`docs/notes/excalidraw-embed.md`](docs/notes/excalidraw-embed.md)。
+
 - **UI 重构：设置分类导航 / 最左侧图标栏 / 侧栏排序（2026-11-18，Obsidian 风格）**：
   **设置页（产品 AppRoot）** 从一张长卡片拆成「左侧分类导航 + 右侧只渲染当前分类」：
   `appearance`（默认）/ `language` / `templates` / `daily_notes` / `sync` / `instances` /
@@ -931,3 +989,32 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   本机 Linux 验证：`cargo check -p menghunote-app --all-targets --features dev-sync` 通过；
   app 默认 **546** / `--features dev-sync` **697**；fmt/clippy 干净。
   **Windows 真机 UI smoke（IME/DPI/窗口）仍需用户验收**；未改业务代码。
+
+- **画布笔记 / Excalidraw（2026-11-19，第一方编入模块）**：
+  vendor `gpui-excalidraw 0.1.9` 到 `crates/excalidraw`，`gpui-kit` 精确 pin 到
+  **=0.10.0**；上游 `on_scroll_wheel` 改为 `on_scroll`，`HelpIcon.svg`/`helpIcon.svg`
+  大小写冲突只保留一份并做大小写不敏感查找。应用侧 `AppAssets` 叠加手绘图标与
+  GPUI Kit 默认资产，启动注册 Excalifont/Virgil。
+  画布是**普通笔记**：标题 `.excalidraw` 后缀（大小写不敏感）即识别，正文存
+  `.excalidraw` JSON；**不新增** note kind/schema/sync 消息。打开时普通
+  `EditorView` + **内容区** Excalidraw 覆盖层（侧栏可见；vendor 命中按 `canvas`
+  原点校正 `local_point`，绘制加回原点，中键拖动平移）；保存 = 整篇 replace-all 写回正文（一条 `EditRequest`/一个撤销组），
+  关闭不保存 = 正文零变化；关闭后显示**占位页**（绝不把 JSON 源码铺到编辑区），
+  「打开画布」/再点同一行重新进画布；重命名为 `.excalidraw` 时立即重开。
+  侧栏「画布」新建 `未命名画布.excalidraw`（序号在后缀前）。
+  覆盖层只占编辑器内容区，侧栏/底栏保持可见。`![[xxx.excalidraw]]` 嵌入预览、
+  文件导入/导出 UI、真实第三方插件运行时均未做。
+  测试：app 默认 **577** / `--features dev-sync` **728** / `--no-default-features`
+  **455**；gpui-excalidraw **301**；i18n **16**；plugin-api **24**；fmt/clippy 干净。
+  **Windows 真机（DPI/输入法/画布点哪画哪/工具栏观感）尚未验。**
+
+- **应用图标（2026-11-19）**：用户提供 512×512 SVG 母版，已放
+  `crates/app/assets/app-icon.svg`；预生成 `app-icon-256.png`（运行时窗口/任务栏）、
+  `app-icon-512.png`（大图/安装包）与 `app-icon.ico`（16/24/32/48/64/128/256）。
+  `app_icon::window_icon()` 解码 PNG → `WindowOptions.icon`，失败不阻塞窗口；
+  app 不新增 SVG 运行时依赖。`build.rs` 在 **Windows 目标**用 `embed-resource` 把
+  `app-icon.rc` → `assets/app-icon.ico` 嵌进 exe（**资源 ID 必须是数字 1**，GPUI
+  Windows 后端按 `PCWSTR(1)` 取图标；MSVC 自动找 SDK `rc.exe`，GNU 回退
+  `windres`；Linux/macOS 跳过）；找不到资源编译器会明确失败，不静默无图标。
+  **Windows 真机构建仍需验**；macOS `.icns` 未做。
+  测试：`app_icon` 2 个；app 默认 **566**。

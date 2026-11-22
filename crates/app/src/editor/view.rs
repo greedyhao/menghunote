@@ -48,6 +48,8 @@ use gpui::{
     Entity, ExternalPaths, FocusHandle, Focusable, ImageSource, KeyDownEvent, MouseButton,
     MouseDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Window,
 };
+use menghunote_editor::model::frontmatter;
+use menghunote_editor::model::markdown::MarkdownDrawing;
 use menghunote_editor::{
     BacktickAction, Bias, BlockKind, DisplayByte, EditorController, EditorError, GraphemeStep,
     InputDocument, MarkdownImage, MarkdownLineKind, MarkdownMermaid, MarkdownTableAlignment,
@@ -67,6 +69,8 @@ use menghunote_storage::session::{
 };
 use menghunote_storage::MaterializeOutcome;
 
+use crate::drawing::drawing_asset_key;
+use crate::note_properties::NotePropertiesPanel;
 use crate::sidebar_rename::{RenameEvent, RenameInput};
 
 use super::clipboard::{
@@ -377,6 +381,36 @@ pub struct MermaidSnapshot {
     pub label: Option<String>,
 }
 
+/// 一个内嵌画布 Object Block 的只读快照（headless 测试断言状态/几何用）。
+///
+/// 与 [`MermaidSnapshot`] 同一定位：数据直接来自绘制路径的同源派生状态
+/// （合成资产 key → `ImageService`），不复制一套渲染逻辑。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrawingSnapshot {
+    /// 对象行行号（0 起）。
+    pub line: usize,
+    /// 整行源码跨度 `(start, end)`（UTF-8 bytes，不含行尾空白/换行）。
+    pub span: (usize, usize),
+    /// 目标笔记标题（`|` 之前）。
+    pub target: String,
+    /// 别名（`|` 之后的显示文本；没有别名时 `None`）。
+    pub alias: Option<String>,
+    /// 预览请求/解码状态（与图片共用 `ImageService`）。
+    pub state: ObjectImageState,
+    /// 就绪时的逻辑显示尺寸；未就绪为 `None`。
+    pub size: Option<(f32, f32)>,
+    /// 当前投影里的 display 区间（`None` = 没有投影成对象，源码可见）。
+    pub display: Option<(usize, usize)>,
+    /// 是否处于选中态（单击选中 / 选区相交）。
+    pub selected: bool,
+    /// 是否在显式源码模式。
+    pub editing_source: bool,
+    /// 源码是否直接可见（源码模式 / 未投影）。
+    pub source_visible: bool,
+    /// 占位文案（加载中/缺失/失败；就绪为 `None`）。
+    pub label: Option<String>,
+}
+
 /// 一次表格行列拖拽的**进行中**状态（ADR 0019 S3b5；headless/诊断可读）。
 ///
 /// 只存在一次鼠标手势的生命周期内：按下把手 → 拖动（`slot` 每次移动更新）→ 释放
@@ -507,6 +541,8 @@ pub struct EditorView {
     shared: Rc<EditorShared>,
     /// 已向下滚过的像素数（非负，0 = 文档顶部）。
     scroll_y: f32,
+    /// 笔记开头的属性面板（frontmatter 块）；由宿主创建并注入，面板只弱引用本视图。
+    properties: Option<Entity<NotePropertiesPanel>>,
     /// 上下移动时保持的视觉列（相对行首的像素）；水平定位会清空。
     preferred_x: Option<Pixels>,
     /// 拖拽锚点（按下时的 scalar）；`None` = 当前没有拖拽。
@@ -606,6 +642,7 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             shared: EditorShared::new(),
             scroll_y: 0.0,
+            properties: None,
             preferred_x: None,
             drag_anchor: None,
             focused_once: false,
@@ -837,6 +874,66 @@ impl EditorView {
         }
     }
 
+    // ---- 内嵌画布 Object Block（ADR 0025 后续切片）----
+
+    /// 画布预览的合成资产 key（含当前主题 id；provider 负责 scene JSON→PNG）。
+    fn drawing_preview_key(&self, drawing: &MarkdownDrawing) -> String {
+        drawing_asset_key(drawing.target())
+    }
+
+    /// 画布预览的状态（与图片共用 `ImageService`；未请求时是 `Missing`）。
+    fn drawing_state(&self, drawing: &MarkdownDrawing) -> ImageState {
+        self.images.state(&self.drawing_preview_key(drawing))
+    }
+
+    /// 画布对象的显示尺寸（逻辑像素）：就绪按内容宽度等比，否则占位框。
+    fn drawing_size_for_state(&self, state: &ImageState, content_width: f32) -> (f32, f32) {
+        match state {
+            ImageState::Ready(decoded) => {
+                super::object_image::fit_size(decoded.width, decoded.height, content_width)
+                    .unwrap_or((content_width, theme::OBJECT_PLACEHOLDER_HEIGHT))
+            }
+            ImageState::Loading | ImageState::Missing | ImageState::Failed(_) => (
+                content_width.min(theme::OBJECT_PLACEHOLDER_HEIGHT * 8.0),
+                theme::OBJECT_PLACEHOLDER_HEIGHT,
+            ),
+        }
+    }
+
+    /// 画布内容高度（不含上下内边距）。
+    fn drawing_content_height(&self, drawing: &MarkdownDrawing, content_width: f32) -> f32 {
+        let state = self.drawing_state(drawing);
+        self.drawing_size_for_state(&state, content_width).1
+    }
+
+    /// 画布对象的**行高**（内容高度 + 上下内边距）。布局度量与绘制共用。
+    fn drawing_row_height(&self, drawing: &MarkdownDrawing, content_width: f32) -> f32 {
+        self.drawing_content_height(drawing, content_width) + theme::OBJECT_PADDING * 2.0
+    }
+
+    /// 画布占位文案：优先 alias（显示文本），否则按状态给固定文案。
+    ///
+    /// 就绪时返回空串（画的是预览图，不叠文字）。
+    fn drawing_placeholder_label(&self, drawing: &MarkdownDrawing, state: ImageState) -> String {
+        if let Some(alias) = drawing
+            .alias()
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+        {
+            let mut text: String = alias.chars().take(80).collect();
+            if alias.chars().count() > 80 {
+                text.push('…');
+            }
+            return text;
+        }
+        match state {
+            ImageState::Loading => "画布预览加载中…".to_owned(),
+            ImageState::Missing => "画布笔记不存在".to_owned(),
+            ImageState::Failed(_) => "画布预览失败".to_owned(),
+            ImageState::Ready(_) => String::new(),
+        }
+    }
+
     // ---- Mermaid Object Block（ADR 0019 M2）----
 
     /// 从源码里取 Mermaid 围栏**之间**的内容（渲染输入，不含围栏行）。
@@ -1038,6 +1135,53 @@ impl EditorView {
             .collect()
     }
 
+    /// 内嵌画布对象的只读快照（headless 测试断言状态/占位文案用）。
+    ///
+    /// 与绘制路径同源：状态来自 `ImageService`（合成 key 含当前主题），尺寸复用
+    /// [`Self::drawing_size_for_state`]，占位文案复用
+    /// [`Self::drawing_placeholder_label`]。快照**不**主动 request。
+    #[must_use]
+    pub fn drawing_snapshots(&self) -> Vec<DrawingSnapshot> {
+        let projection = self.controller.projection();
+        let highlighted = self.highlighted_object_lines();
+        let content_width = self.object_content_width();
+        self.controller
+            .drawings()
+            .iter()
+            .map(|drawing| {
+                let state = self.drawing_state(drawing);
+                let snapshot_state = match &state {
+                    ImageState::Missing => ObjectImageState::Missing,
+                    ImageState::Loading => ObjectImageState::Loading,
+                    ImageState::Ready(_) => ObjectImageState::Ready,
+                    ImageState::Failed(_) => ObjectImageState::Failed,
+                };
+                let size = match &state {
+                    ImageState::Ready(decoded) => {
+                        super::object_image::fit_size(decoded.width, decoded.height, content_width)
+                    }
+                    _ => None,
+                };
+                let label = self.drawing_placeholder_label(drawing, state);
+                let display = projection.object_display_range(drawing.span());
+                DrawingSnapshot {
+                    line: drawing.line(),
+                    span: (drawing.span().start().get(), drawing.span().end().get()),
+                    target: drawing.target().to_owned(),
+                    alias: drawing.alias().map(str::to_owned),
+                    state: snapshot_state,
+                    size,
+                    display: display.as_ref().map(|range| (range.start, range.end)),
+                    selected: highlighted.contains(&drawing.line()),
+                    editing_source: self.controller.object_source_edit_line()
+                        == Some(drawing.line()),
+                    source_visible: display.is_none(),
+                    label: (!label.is_empty()).then_some(label),
+                }
+            })
+            .collect()
+    }
+
     // ---- 表格 Object Block（ADR 0019 S3a）----
 
     /// 表格内容高度（不含上下内边距）：表头 + 数据行 × 固定行高。
@@ -1209,7 +1353,8 @@ impl EditorView {
             .map(|_| line)
     }
 
-    /// 本帧要绘制的 Object（图片 + 表格；只含可见行；元素层把它们转成窗口坐标）。
+    /// 本帧要绘制的 Object（图片 / 表格 / Mermaid / 内嵌画布；只含可见行；
+    /// 元素层把它们转成窗口坐标）。
     ///
     /// `scroll` 是本帧实际使用的（已夹取的）滚动量；矩形在**元素局部坐标**里，
     /// 由调用方加上 `bounds.origin`。行高已经等于 `内容高 + 2 × 内边距`，
@@ -1363,6 +1508,64 @@ impl EditorView {
                         })),
                     )
                 }
+                menghunote_editor::ObjectKind::Drawing => {
+                    let Some(drawing) = self.controller.drawing_of(object) else {
+                        continue;
+                    };
+                    // 预览不在主线程解析/渲染：这里只读 `ImageService` 的状态，
+                    // 请求由 `request_object_images`（render 每帧，幂等）登记。
+                    let state = self.drawing_state(drawing);
+                    let (display_width, content_height) =
+                        self.drawing_size_for_state(&state, content_width);
+                    let rect = Bounds::new(
+                        point(px(left), px(row_top + theme::OBJECT_PADDING)),
+                        size(px(display_width), px(content_height)),
+                    );
+                    let (paint_image, paint_state, label) = match state {
+                        ImageState::Ready(decoded) => (
+                            Some(Arc::clone(&decoded.image)),
+                            ObjectPaintState::Ready,
+                            None,
+                        ),
+                        ImageState::Loading => (
+                            None,
+                            ObjectPaintState::Loading,
+                            Some(self.drawing_placeholder_label(drawing, ImageState::Loading)),
+                        ),
+                        ImageState::Missing => (
+                            None,
+                            ObjectPaintState::Missing,
+                            Some(self.drawing_placeholder_label(drawing, ImageState::Missing)),
+                        ),
+                        ImageState::Failed(error) => (
+                            None,
+                            ObjectPaintState::Failed,
+                            Some(
+                                self.drawing_placeholder_label(drawing, ImageState::Failed(error)),
+                            ),
+                        ),
+                    };
+                    let label = label.filter(|text| !text.is_empty()).map(|text| {
+                        let spans = [(text.len(), StyleKind::Plain)];
+                        super::glyph::shape_row_styled_at_with_color(
+                            window,
+                            &text,
+                            &spans,
+                            theme::OBJECT_LABEL_FONT_SIZE,
+                            false,
+                            theme::object_label_color(),
+                        )
+                    });
+                    // 与图片共用绘制载荷：都是“一张位图 + 可选占位文案”。
+                    (
+                        rect,
+                        ObjectPaintContent::Image(Box::new(super::geometry::ImagePaint {
+                            image: paint_image,
+                            label,
+                            state: paint_state,
+                        })),
+                    )
+                }
                 menghunote_editor::ObjectKind::Table => {
                     let Some(table) = self.controller.table_of(object) else {
                         continue;
@@ -1391,12 +1594,24 @@ impl EditorView {
         objects
     }
 
-    /// 请求加载当前文档里所有整行独占图片的资产（render 每帧调用，幂等）。
+    /// 请求加载当前文档里所有整行独占图片 + 内嵌画布的预览（render 每帧调用，幂等）。
+    ///
+    /// 画布用**合成资产 key**（[`drawing_asset_key`]）向同一个 `ImageService` 登记；
+    /// 真正的 scene JSON→PNG 由宿主注入的 provider 在后台线程完成，主线程只读状态。
     fn request_object_images(&self) {
         for image in self.controller.block_images() {
             if let Some(hash) = parse_asset_hash(image.dest()) {
                 self.images.request(hash);
             }
+        }
+        for object in self.controller.objects() {
+            if !object.kind().is_drawing() {
+                continue;
+            }
+            let Some(drawing) = self.controller.drawing_of(object) else {
+                continue;
+            };
+            self.images.request(&self.drawing_preview_key(drawing));
         }
     }
 
@@ -1409,7 +1624,8 @@ impl EditorView {
         settled
     }
 
-    /// 当前可见 Object（图片/表格）的**窗口坐标**矩形（`(对象行, 矩形)`，诊断/headless 测试用）。
+    /// 当前可见 Object（图片/表格/Mermaid/画布）的**窗口坐标**矩形
+    /// （`(对象行, 矩形)`，诊断/headless 测试用）。
     ///
     /// 几何来自上一帧 `LayoutFrame`（与绘制/命中同源）；对象滚出可见范围时不在列表里。
     /// 表格矩形的宽度是内容宽度、高度是整个表格高度（点击/断言都共用它）。
@@ -1754,6 +1970,27 @@ impl EditorView {
         let Some(object) = self.controller.object_at_line(line).cloned() else {
             return;
         };
+        // 内嵌画布（ADR 0025 后续切片）：点击预览 = **打开目标画布笔记**。
+        // 不移动 caret、不进源码模式、不选中对象（选中态只属于可原地绘制的对象）；
+        // 宿主已有的 wiki 打开路径会按标题/路径找到目标画布。
+        if object.kind().is_drawing() {
+            if let Some(drawing) = self.controller.drawing_of(&object) {
+                let target = drawing.target().to_owned();
+                cx.emit(EditorEvent::WikiLinkRequested {
+                    target,
+                    heading: None,
+                });
+                eprintln!(
+                    "[menghunote] 点击画布预览（行 {line}）→ 打开目标画布笔记（不改正文/caret）"
+                );
+            }
+            let had_selection = self.selected_object_line.take().is_some()
+                | self.selected_table_cell.take().is_some();
+            if had_selection {
+                cx.notify();
+            }
+            return;
+        }
         let already_selected = self.selected_object_line == Some(line);
         let text = self.controller.source_text();
         let mut caret_byte = object.span().end().get();
@@ -3405,6 +3642,113 @@ impl EditorView {
         self.request_seq != before
     }
 
+    /// 用**整篇替换**写回源文（画布笔记保存路径）。
+    ///
+    /// 语义与"全选后粘贴"完全一致：先把选区设成整篇（`0..source_scalar_len`），
+    /// 再走 [`Self::insert_text`] → `compose_replace_selection`。因此**不新建**
+    /// 第二套编辑路径：撤销组、同步 outbox、B 物化、资产引用对账全部沿用现有链路，
+    /// 一次保存 = 一条 `EditRequest` = 一个撤销组。
+    ///
+    /// 返回是否真的产生了**已受理**的请求（调用方据此决定是否关闭覆盖层）：
+    ///
+    /// - 源文已经等于 `text` → `true`（无需编辑，但保存目标已达成）；
+    /// - 持闸 / IME 组合 / 表格单元格编辑中 → `false`（正文零变化）；
+    /// - 空文本 + 空文档 → 不产生请求，但目标已达成 → `true`；
+    /// - 其余 → 以"替换后源文是否等于 `text`"为准（控制器拒绝时返回 `false`）。
+    ///
+    /// 光标在第一行末尾、且整篇只有 `---` 时，Enter 自动补成 YAML frontmatter。
+    ///
+    /// 与 Obsidian 一致：`---` + Enter → `---\n\n---\n`，caret 停在中间空行；
+    /// 属性面板随即出现。只认**文档最开头**，正文中间的 `---` 仍是水平线。
+    pub fn try_open_frontmatter(&mut self, cx: &mut Context<Self>) -> bool {
+        let source = self.controller.source_text();
+        if frontmatter::parse(&source).is_some() {
+            return false;
+        }
+        let body = if source == "---" {
+            ""
+        } else if let Some(rest) = source.strip_prefix("---\n") {
+            rest
+        } else if let Some(rest) = source.strip_prefix("---\r\n") {
+            rest
+        } else if let Some(rest) = source.strip_prefix("---") {
+            // 已有正文时用户先输入 `---`、再按 Enter；此刻 `---` 和原第一行还在
+            // 同一行（换行要等这次 Enter 才插入），所以按前缀 `---` 处理。
+            rest
+        } else {
+            return false;
+        };
+        let Ok(head_byte) = self.controller.selection().head().to_source_byte(&source) else {
+            return false;
+        };
+        // `---` 后平台可能已经把 caret 放到下一行开头（byte 4）；两种都算
+        // “刚输入完分隔符”，否则已有正文时永远不会自动补全。
+        if head_byte.get() != 3
+            && !(head_byte.get() == 4 && source.as_bytes().get(3) == Some(&b'\n'))
+        {
+            return false;
+        }
+        // 已有正文时把正文放到关闭分隔符之后；不要吞掉正文。
+        let next = format!("---\n\n---\n{body}");
+        if !self.replace_source_text(&next, cx) {
+            return false;
+        }
+        // caret 落在**关闭分隔符之后**的正文起点；中间的空 frontmatter 行是隐藏的，
+        // 不能让用户直接在里面输入（属性通过面板编辑）。
+        let body_start =
+            frontmatter::parse(&next).map_or(next.len(), |frontmatter| frontmatter.body_start);
+        let Ok(caret) = SourceByte::new(body_start).to_scalar(&next) else {
+            return false;
+        };
+        self.commit_selection(menghunote_editor::Selection::caret(caret), cx);
+        true
+    }
+
+    /// 属性面板写回后把 caret 放回正文起点（frontmatter 之后），避免整篇替换
+    /// 把滚动位置带到文末。
+    pub fn move_caret_to_body_start(&mut self, cx: &mut Context<Self>) {
+        let source = self.controller.source_text();
+        let Some(frontmatter) = frontmatter::parse(&source) else {
+            return;
+        };
+        let Ok(caret) = SourceByte::new(frontmatter.body_start).to_scalar(&source) else {
+            return;
+        };
+        self.commit_selection(menghunote_editor::Selection::caret(caret), cx);
+    }
+
+    pub fn replace_source_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.frozen_by_external_commit() || self.is_composing() || self.is_editing_table_cell() {
+            eprintln!("[menghunote] 画布保存被拒：持闸/IME 组合/单元格编辑中（正文零变化）");
+            return false;
+        }
+        let source = self.controller.source_text();
+        if source == text {
+            // 已经一致：不制造"删了又插回来"的空撤销项。
+            return true;
+        }
+        // 整篇选区用 **scalar** 坐标（`Selection` 的单位）；`source_len` 是 char 数，
+        // 不是字节数——中文/emoji 标题下两者不同，混用会把 caret 落到非边界。
+        let scalar_len = source.chars().count();
+        let selection = Selection::new(UnicodeScalar::new(0), UnicodeScalar::new(scalar_len));
+        if let Err(error) = self.controller.set_selection(selection) {
+            eprintln!("[menghunote] 画布保存：设置整篇选区失败：{error}");
+            return false;
+        }
+        // 整篇替换与对象/单元格的临时选中态无关：先清掉，避免保存后还残留工具条。
+        self.selected_object_line = None;
+        self.selected_table_cell = None;
+        self.table_axis_selection = None;
+        self.pending_enter_text_input = false;
+        self.insert_text(text, cx);
+        self.ensure_caret_visible(self.controller.selection().head());
+        let applied = self.controller.source_text() == text;
+        if !applied {
+            eprintln!("[menghunote] 画布保存：整篇替换未生效（正文保持不变）");
+        }
+        applied
+    }
+
     /// 右键菜单「插入 → 表格」：在**当前 caret/选区**处插入一张默认 GFM 表格
     /// （ADR 0019 S3b4）。
     ///
@@ -3735,6 +4079,13 @@ impl EditorView {
                                         |mermaid| self.mermaid_row_height(mermaid, content_width),
                                     )
                                 }
+                                menghunote_editor::ObjectKind::Drawing => {
+                                    self.controller.drawing_of(object).map_or(
+                                        theme::OBJECT_PLACEHOLDER_HEIGHT
+                                            + theme::OBJECT_PADDING * 2.0,
+                                        |drawing| self.drawing_row_height(drawing, content_width),
+                                    )
+                                }
                             };
                             return super::layout::LineMetric {
                                 font_size: theme::FONT_SIZE,
@@ -3753,6 +4104,9 @@ impl EditorView {
 
                 let kind = run.map_or(BlockKind::Paragraph, |run| run.kind());
                 let (mut font_size, mut line_height, mut mono) = match kind {
+                    BlockKind::ThematicBreak => {
+                        (theme::FONT_SIZE, theme::DEFAULT_LINE_HEIGHT, false)
+                    }
                     BlockKind::Heading => {
                         let level = run.and_then(|run| run.level()).unwrap_or(1);
                         let size = theme::heading_font_size(level);
@@ -4158,6 +4512,53 @@ impl EditorView {
     #[must_use]
     pub fn scroll_y(&self) -> f32 {
         self.scroll_y
+    }
+
+    /// 宿主注入属性面板；面板弱引用本视图，避免 Entity 强引用环。
+    pub fn set_properties_panel(&mut self, panel: Entity<NotePropertiesPanel>) {
+        self.properties = Some(panel);
+    }
+
+    /// 该 **display** 行首对应的源码行是否是分隔线（绘制层画横线）。
+    #[must_use]
+    pub fn is_thematic_display_row(&self, display_byte: usize) -> bool {
+        let Some(source_byte) = self
+            .controller
+            .display_to_source(DisplayByte::new(display_byte))
+        else {
+            return false;
+        };
+        let source = self.controller.source_text();
+        let source_byte = source_byte.get().min(source.len());
+        let line = source[..source_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        self.controller
+            .line_infos()
+            .get(line)
+            .is_some_and(|info| info.kind == MarkdownLineKind::ThematicBreak)
+    }
+
+    /// 属性面板占用的顶部高度（0 = 没有 frontmatter）。
+    ///
+    /// 这是面板“作为正文块”参与滚动/布局的唯一来源：`EditorElement` 把正文整体
+    /// 下移这么多，面板本身用 `-scroll_y` 平移，于是它像图片/表格一样随正文滚走。
+    #[must_use]
+    pub fn properties_inset(&self, cx: &App) -> f32 {
+        let Some(panel) = self.properties.as_ref() else {
+            return 0.0;
+        };
+        let collapsed = panel.read(cx).is_collapsed();
+        let source = self.controller.source_text();
+        let Some(frontmatter) = frontmatter::parse(&source) else {
+            return 0.0;
+        };
+        if collapsed {
+            NotePropertiesPanel::collapsed_height()
+        } else {
+            crate::note_properties::panel_height(&frontmatter)
+        }
     }
 
     /// 是否全部已 durable（状态栏 `已保存 / 保存中` 的来源）。
@@ -4895,6 +5296,10 @@ impl EditorView {
             self.cancel_composition(cx);
             return;
         }
+        if self.try_open_frontmatter(cx) {
+            self.pending_enter_text_input = true;
+            return;
+        }
         match self.controller.list_enter() {
             Ok(Some(request)) => {
                 eprintln!("[menghunote] 列表 Enter：结构编辑 {}", request.command_id);
@@ -4964,6 +5369,12 @@ impl EditorView {
         match self.controller.compose_replace_selection(text) {
             Ok(request) => {
                 self.submit_request(request);
+                // Obsidian 式：空笔记第一行刚打成 `---` 就立刻生成 frontmatter 块，
+                // 不需要再按 Enter。这里走同一套 `try_open_frontmatter`（含已有正文）。
+                if self.try_open_frontmatter(cx) {
+                    cx.notify();
+                    return;
+                }
             }
             Err(error) => eprintln!("[menghunote] 插入文本失败：{error}"),
         }
@@ -5382,6 +5793,12 @@ impl EditorView {
         let line_end = source[start..]
             .find('\n')
             .map_or(source.len(), |index| start + index);
+        // 删除范围跨过行尾（例如整段被隐藏的 frontmatter / 多行选区）：这里只处理
+        // “同一行内删掉列表 marker”的窄场景，跨行时直接放行，绝不能用
+        // `source[end..line_end]` 切出 end > line_end 的非法区间（真机 panic）。
+        if end > line_end || start > line_end {
+            return range;
+        }
         let line = &source[line_start..line_end];
         let trimmed = line.trim();
         if trimmed.is_empty()
@@ -6504,6 +6921,11 @@ impl EditorView {
             .objects()
             .iter()
             .find(|object| object.line == line)?;
+        // 内嵌画布没有工具条：单击预览直接打开目标画布笔记（ADR 0025 后续切片），
+        // 不提供「编辑源码」「放大」等原地动作。
+        if object.kind.is_drawing() {
+            return None;
+        }
         // 表格没有“放大”（ADR 0019 S3a：工具条只需要编辑源码）。
         // Mermaid 没有“放大”，但提供「重新渲染」（失败/改主题后可重试；M2）。
         let has_zoom = object.kind.is_image();
@@ -7328,6 +7750,18 @@ impl Render for EditorView {
         let axis_selection = self.render_table_axis_selection();
         let drag_ghost = self.render_table_drag_ghost();
         let element = EditorElement::new(cx.entity(), Rc::clone(&self.shared));
+        let properties_inset = self.properties_inset(cx);
+        let properties = self.properties.as_ref().map(|panel| {
+            let height = properties_inset;
+            let scroll = self.scroll_y;
+            div()
+                .absolute()
+                .top(px(-scroll))
+                .left(px(theme::PAD_X))
+                .right(px(theme::PAD_X))
+                .h(px(height))
+                .child(panel.clone())
+        });
 
         div()
             .size_full()
@@ -7347,6 +7781,7 @@ impl Render for EditorView {
                     .flex_1()
                     .w_full()
                     .min_h(px(0.0))
+                    .overflow_hidden()
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
                     // 文件拖放（ADR 0019 §2）：GPUI 把平台 CF_HDROP/IDropTarget 转成
@@ -7362,6 +7797,7 @@ impl Render for EditorView {
                         }),
                     )
                     .child(element)
+                    .when_some(properties, |this, panel| this.child(panel))
                     .when_some(axis_selection, |this, selection| this.child(selection))
                     .when_some(cell_editor, |this, editor| this.child(editor))
                     .children(drag_handles)

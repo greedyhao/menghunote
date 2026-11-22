@@ -29,6 +29,8 @@
 //!   数据行、每格源码区间与对齐方式；ADR 0019 S3a）；
 //! - [`FencedMermaidBlock`]：fenced `mermaid` 代码块的源码元数据（整块/内容跨度、
 //!   起止行、info、是否可投影成 Object；ADR 0019 M2）；
+//! - [`DrawingSpan`]：整行独占的内嵌画布笔记 `![[目标.excalidraw]]`（目标/别名
+//!   源码区间、行号；ADR 0025 后续切片）；
 //! - [`LineInfo`]：逐源码行语义（引用前缀、列表归属、是否在围栏/表格里），
 //!   供 app 做 gutter / hanging indent / 命中几何；
 //! - [`ParsedMarkdown`]：上述内容的集合，外加 `code_spans` / `unsupported_spans`
@@ -36,9 +38,11 @@
 //!
 //! # 明确不做
 //!
-//! 图片 Object、任务框点击、**表格单元格就地编辑/加行加列/拖拽**、脚注/数学/alerts、
-//! HTML 执行、任何源码归一化或重新序列化。表格只提供**只读**块树与源码区间，
-//! 渲染（Object Block / 编辑源码切换）在 editor/app（ADR 0019 S3a/S3b 的范围）。
+//! 图片 Object 渲染、任务框点击、**表格单元格就地编辑/加行加列/拖拽**、
+//! **画布预览渲染**（本 crate 只给源码区间，scene JSON→PNG 在 app 的 `drawing` 模块）、
+//! 脚注/数学/alerts、HTML 执行、任何源码归一化或重新序列化。
+//! 表格只提供**只读**块树与源码区间，渲染（Object Block / 编辑源码切换）在
+//! editor/app（ADR 0019 S3a/S3b 的范围）。
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -546,6 +550,52 @@ pub struct ImageSpan {
     pub dest: String,
 }
 
+/// 一整个**内嵌画布笔记**的源码元数据（ADR 0025 后续切片）。
+///
+/// 普通 Markdown 笔记里写一行
+///
+/// ```md
+/// ![[流程图.excalidraw]]
+/// ```
+///
+/// 就得到一条本记录：整行源码投影成一个图片式 Object Block，预览图由 app 通过
+/// 宿主注入的资产 provider 生成（本 crate 只给源码事实，不渲染、不读库）。
+///
+/// # 边界（写死，测试钉住）
+///
+/// - [`Self::span`]：整行内容区间（行内容起点 .. 行内容终点），**不含**行尾
+///   空白与换行；把它换成单行 Object 占位时，行尾换行仍留在正文里；
+/// - [`Self::target`]：`|` **之前**的源码区间（已去掉首尾空白），大小写不敏感地
+///   以 `.excalidraw` 结尾；目标原文从源码切片，不重新序列化；
+/// - [`Self::alias`]：`|` **之后**的源码区间（已去掉首尾空白）；`![[A|]]` 这类
+///   空白别名与没有别名等价；
+/// - [`Self::line`]：源码行号（0 起）；
+/// - [`Self::block`]：是否可投影成 Object Block（当前解析器只收录整行独占的行，
+///   因此恒为 `true`；保留字段与其它 Object 块保持一致，便于将来扩展）；
+/// - 不满足整行独占 / 普通段落 / 非空 `.excalidraw` 目标时**不产生记录**：该行
+///   继续按普通文本显示，绝不吞掉半行内容（与图片 `block` 判定同一策略）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawingSpan {
+    /// 整行内容区间（不含行尾空白与换行）。
+    pub span: Span,
+    /// 目标笔记区间（`|` 前，已去首尾空白；大小写不敏感地以 `.excalidraw` 结尾）。
+    pub target: Span,
+    /// 可选别名的源码区间（`|` 后，已去首尾空白）。
+    pub alias: Option<Span>,
+    /// 源码行号（0 起）。
+    pub line: usize,
+    /// 是否可投影成 Object Block（当前恒为 `true`）。
+    pub block: bool,
+}
+
+impl DrawingSpan {
+    /// 是否整行独占、可投影成 Object Block。
+    #[must_use]
+    pub const fn is_block(&self) -> bool {
+        self.block
+    }
+}
+
 /// 解析结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMarkdown {
@@ -564,6 +614,12 @@ pub struct ParsedMarkdown {
     /// 每个图片同时也出现在 [`Self::constructs`] 里（`ConstructKind::Image`）；
     /// 这里额外给出目标 URL，投影层据此判断能否渲染成 Object Block。
     pub images: Vec<ImageSpan>,
+    /// 整行独占的内嵌画布笔记（`![[目标.excalidraw]]`，ADR 0025 后续切片）。
+    ///
+    /// 只收录**可投影成 Object Block** 的整行独占写法（按 `span` 起点排序）；
+    /// 混排/行内/代码块/引用/列表/表格里的 `![[...]]` 不在此列表里，继续按普通
+    /// 文本显示。目标不以 `.excalidraw` 结尾（大小写不敏感）也不算。
+    pub drawings: Vec<DrawingSpan>,
     /// GFM 表格块（ADR 0019 S3a；按 `span` 起点排序）。
     ///
     /// 表格是**原子块**：内部行内构造不会出现在 [`Self::constructs`] 里，
@@ -1718,11 +1774,22 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // 内嵌画布（ADR 0025 后续切片）：整行独占的 `![[目标.excalidraw]]`。
+        // 依赖逐行语义（引用/列表/代码/表格归属在上面才算齐），所以放在最后扫；
+        // 原子块来源单独传进去做防御（不依赖 LineKind 一处判定）。
+        let mut drawing_excluded = code_spans.clone();
+        drawing_excluded.extend(tables.iter().map(|table| table.span));
+        drawing_excluded.extend(unsupported_spans.iter().copied());
+        let mut drawings = scan_drawings(source, &line_infos, &drawing_excluded);
+        drawings.sort_by_key(|drawing| (drawing.span.start, drawing.span.end));
+        drawings.dedup();
+
         ParsedMarkdown {
             lines: line_infos,
             lists: list_blocks,
             items,
             images,
+            drawings,
             tables,
             links,
             wiki_links,
@@ -2068,6 +2135,101 @@ fn mermaid_block_is_object(line_infos: &[LineInfo], block: &FencedMermaidBlock) 
     block.opening.start == first.content.start && block.span.end == last.content.end
 }
 
+/// 扫描整行独占的内嵌画布笔记 `![[目标.excalidraw]]`（ADR 0025 后续切片）。
+///
+/// # 判定（写死，测试钉住）
+///
+/// 1. **整行独占**：去掉行尾空白后，行内容必须以 `![[` 开始、以 `]]` 结束；
+///    行首不允许缩进（与图片/表格/围栏一致：缩进留在源码里，该行按普通段落显示）；
+/// 2. **普通段落上下文**：该行是 [`LineKind::Paragraph`]，不是引用、不在列表项里，
+///    也不在代码块/表格/未支持块（HTML）区间内；
+/// 3. **目标是画布笔记**：`|` 之前的 target 去首尾空白后非空，且**大小写不敏感**
+///    地以 `.excalidraw` 结尾；内层不允许再次出现 `[[` / `]]`（避免嵌套误判）；
+/// 4. **可选别名**：`|` 之后是别名（显示文本，去首尾空白）；空别名等价于没有别名。
+///
+/// 任一条不满足就**不产生记录**：这一行继续按普通文本显示，绝不吞掉半行内容。
+/// `span` 只覆盖 trimmed 行内容（不含行尾空白/换行），因此 Object 占位不会吞掉
+/// 行尾换行；target/alias 区间同样已 trim，端点都在 UTF-8 char 边界上。
+fn scan_drawings(source: &str, line_infos: &[LineInfo], excluded: &[Span]) -> Vec<DrawingSpan> {
+    /// 画布笔记标题后缀（大小写不敏感；`is_drawing_title` 的解析侧副本）。
+    const DRAWING_SUFFIX: &[u8] = b".excalidraw";
+    let bytes = source.as_bytes();
+    let mut drawings = Vec::new();
+    for (line, info) in line_infos.iter().enumerate() {
+        // 普通段落：标题/引用/列表/围栏/缩进代码/表格/HTML/分隔线一律不算。
+        if info.kind != LineKind::Paragraph || info.list.is_some() || !info.quote.is_empty() {
+            continue;
+        }
+        let content_start = info.content.start.min(bytes.len());
+        let content_end = info.content.end.min(bytes.len()).max(content_start);
+        let mut start = content_start;
+        let mut end = content_end;
+        while start < end && matches!(bytes[start], b' ' | b'\t') {
+            start += 1;
+        }
+        while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        // 行首缩进不投影成 Object；空行/纯空白行直接跳过。
+        if start != content_start || end <= start {
+            continue;
+        }
+        // `![[` .. `]]`（最短 `![[]]` 也放进来；空 target 在下面被拒绝）。
+        if end < start + 5 || &bytes[start..start + 3] != b"![[" || &bytes[end - 2..end] != b"]]" {
+            continue;
+        }
+        // 原子块（代码 / 表格 / 未支持块）内部不投影（逐行语义已经是兜底，这里是
+        // 防御：任一来源只要把它算成原子块，就不该再生成画布对象）。
+        if excluded
+            .iter()
+            .any(|span| span.start <= start && end <= span.end)
+        {
+            continue;
+        }
+        let inner_start = start + 3;
+        let inner_end = end - 2;
+        if inner_start >= inner_end {
+            continue;
+        }
+        // 内层不允许嵌套 `[[` / `]]`（与 wiki 链接的保守规则一致）。
+        if bytes[inner_start..inner_end]
+            .windows(2)
+            .any(|window| window == b"[[" || window == b"]]")
+        {
+            continue;
+        }
+        let pipe = bytes[inner_start..inner_end]
+            .iter()
+            .position(|byte| *byte == b'|')
+            .map(|offset| inner_start + offset);
+        let target = trim_span(source, Span::new(inner_start, pipe.unwrap_or(inner_end)));
+        if target.is_empty() {
+            continue;
+        }
+        let Some(target_text) = source.get(target.start..target.end) else {
+            continue;
+        };
+        if target_text.len() < DRAWING_SUFFIX.len()
+            || !target_text.as_bytes()[target_text.len() - DRAWING_SUFFIX.len()..]
+                .eq_ignore_ascii_case(DRAWING_SUFFIX)
+        {
+            continue;
+        }
+        let alias = pipe.and_then(|pipe| {
+            let alias = trim_span(source, Span::new(pipe + 1, inner_end));
+            (!alias.is_empty()).then_some(alias)
+        });
+        drawings.push(DrawingSpan {
+            span: Span::new(start, end),
+            target,
+            alias,
+            line,
+            block: true,
+        });
+    }
+    drawings
+}
+
 fn count_run(bytes: &[u8], start: usize, end: usize, marker: u8) -> usize {
     let mut run = 0usize;
     while start + run < end && bytes[start + run] == marker {
@@ -2311,4 +2473,155 @@ fn is_escaped(bytes: &[u8], at: usize) -> bool {
         index -= 1;
     }
     count % 2 == 1
+}
+
+// ---------------------------------------------------------------------------
+// 单元测试（ADR 0025 后续切片：`![[目标.excalidraw]]` 解析）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod drawing_tests {
+    use super::{parse, DrawingSpan, Span};
+
+    fn slice(source: &str, span: Span) -> &str {
+        &source[span.start..span.end]
+    }
+
+    fn drawings(source: &str) -> Vec<DrawingSpan> {
+        parse(source).drawings
+    }
+
+    #[test]
+    fn whole_line_drawing_records_span_target_line_and_block() {
+        let source = "前言\n\n![[流程图.excalidraw]]\n\n后文\n";
+        let found = drawings(source);
+        assert_eq!(found.len(), 1, "整行独占的画布嵌入必须解析：{source:?}");
+        let drawing = &found[0];
+        assert!(drawing.is_block());
+        assert_eq!(drawing.line, 2);
+        assert_eq!(slice(source, drawing.span), "![[流程图.excalidraw]]");
+        assert_eq!(slice(source, drawing.target), "流程图.excalidraw");
+        assert!(drawing.alias.is_none());
+        assert!(source.is_char_boundary(drawing.span.start));
+        assert!(source.is_char_boundary(drawing.span.end));
+    }
+
+    #[test]
+    fn suffix_matches_case_insensitively_and_multiple_lines_parse() {
+        for target in ["a.excalidraw", "a.EXCALIDRAW", "a.Excalidraw"] {
+            let source = format!("![[{target}]]\n");
+            let found = drawings(&source);
+            assert_eq!(found.len(), 1, "后缀必须大小写不敏感：{source:?}");
+            assert_eq!(slice(&source, found[0].target), target);
+        }
+        let source = "![[a.excalidraw]]\n![[b.excalidraw]]\n";
+        let found = drawings(source);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].line, 0);
+        assert_eq!(found[1].line, 1);
+        assert_eq!(slice(source, found[1].target), "b.excalidraw");
+    }
+
+    #[test]
+    fn alias_is_recorded_and_target_is_before_pipe() {
+        let source = "![[流程图.excalidraw|示意图]]\n";
+        let found = drawings(source);
+        assert_eq!(found.len(), 1);
+        let drawing = &found[0];
+        assert_eq!(slice(source, drawing.target), "流程图.excalidraw");
+        let alias = drawing.alias.expect("alias 必须记录");
+        assert_eq!(slice(source, alias), "示意图");
+        assert_eq!(slice(source, drawing.span), "![[流程图.excalidraw|示意图]]");
+
+        // 空白别名等价于没有别名；target 两侧空白被裁掉。
+        let source = "![[ a.excalidraw |  ]]\n";
+        let found = drawings(source);
+        assert_eq!(found.len(), 1);
+        assert_eq!(slice(source, found[0].target), "a.excalidraw");
+        assert!(found[0].alias.is_none(), "空白别名必须视为没有别名");
+    }
+
+    #[test]
+    fn mixed_line_and_non_drawing_targets_stay_plain_text() {
+        let cases = [
+            "前 ![[a.excalidraw]] 后\n",
+            "![[a.png]]\n",
+            "![[a.excalidraw.md]]\n",
+            "![[a.excalidraw\n",
+            "a.excalidraw]]\n",
+            "![[a.excalidraw]] 后\n",
+            "![[a.excalidraw]]]]\n",
+            "![[]]\n",
+            "![[|alias]]\n",
+            "![](asset://aa)\n",
+        ];
+        for source in cases {
+            assert!(
+                drawings(source).is_empty(),
+                "不应解析为画布对象：{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_indent_and_trailing_whitespace() {
+        // 行首缩进不投影（与图片/表格/围栏一致）。
+        assert!(drawings(" ![[a.excalidraw]]\n").is_empty());
+        assert!(drawings("  ![[a.excalidraw]]\n").is_empty());
+        assert!(drawings("\t![[a.excalidraw]]\n").is_empty());
+        // 行尾空白允许，但 span 不含行尾空白（不能吞掉换行/空格）。
+        let source = "![[a.excalidraw]]   \n";
+        let found = drawings(source);
+        assert_eq!(found.len(), 1);
+        assert_eq!(slice(source, found[0].span), "![[a.excalidraw]]");
+    }
+
+    #[test]
+    fn drawing_lines_inside_code_quote_list_table_and_html_are_not_parsed() {
+        let cases = [
+            "```\n![[a.excalidraw]]\n```\n",
+            "    ![[a.excalidraw]]\n",
+            "> ![[a.excalidraw]]\n",
+            "- ![[a.excalidraw]]\n",
+            "1. ![[a.excalidraw]]\n",
+            "| ![[a.excalidraw]] |\n| --- |\n| x |\n",
+            "<div>\n![[a.excalidraw]]\n</div>\n",
+            "# ![[a.excalidraw]]\n",
+        ];
+        for source in cases {
+            assert!(
+                drawings(source).is_empty(),
+                "非普通段落上下文不得解析：{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_line_endings_are_supported() {
+        let source = "前言\r\n\r\n![[a.excalidraw]]\r\n";
+        let found = drawings(source);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].line, 2);
+        assert_eq!(slice(source, found[0].span), "![[a.excalidraw]]");
+    }
+
+    #[test]
+    fn drawing_lines_do_not_become_images_or_wiki_links() {
+        // `![[...]]` 既不是普通图片（没有目标 URL），也不是 wiki 链接。
+        let source = "![[a.excalidraw]]\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.drawings.len(), 1);
+        assert!(parsed.images.is_empty(), "画布嵌入不能当成图片：{parsed:?}");
+        assert!(
+            parsed.wiki_links.is_empty(),
+            "画布嵌入不能当成 wiki 链接：{parsed:?}"
+        );
+        assert!(
+            !parsed
+                .constructs
+                .iter()
+                .any(|construct| matches!(construct.kind, super::ConstructKind::Image)),
+            "画布嵌入不能产生 Image 构造：{parsed:?}"
+        );
+    }
 }

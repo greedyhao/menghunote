@@ -161,7 +161,7 @@ async fn settings_page_switches_language_without_rebuilding_editor(cx: &mut Test
 
     // 先制造一个撤销组 + 选区 + 滚动（点编辑器会关闭设置覆盖层）。
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     cx.simulate_click(
         gpui::point(

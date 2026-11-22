@@ -8,21 +8,23 @@
 //!
 //! 因此本模块只定义“块的公共身份”：
 //!
-//! - [`ObjectKind`]：图片 / 表格 / Mermaid；
+//! - [`ObjectKind`]：图片 / 表格 / Mermaid / 画布笔记；
 //! - [`ObjectBlock`]：整块 source 区间 + 起始/结束源码行 + 在同类集合里的下标。
 //!
-//! 具体数据（图片的 `dest`/`alt`、表格的行列/对齐、Mermaid 的围栏内容/info）仍然
-//! 留在 [`crate::model::markdown::MarkdownImage`] /
-//! [`crate::model::markdown::MarkdownTable`] / [`crate::model::markdown::MarkdownMermaid`]
+//! 具体数据（图片的 `dest`/`alt`、表格的行列/对齐、Mermaid 的围栏内容/info、
+//! 画布嵌入的 target/alias）仍然留在 [`crate::model::markdown::MarkdownImage`] /
+//! [`crate::model::markdown::MarkdownTable`] / [`crate::model::markdown::MarkdownMermaid`] /
+//! [`crate::model::markdown::MarkdownDrawing`]
 //! 里，通过 [`crate::model::markdown::MarkdownDocument::object_image`] /
 //! [`crate::model::markdown::MarkdownDocument::object_table`] /
-//! [`crate::model::markdown::MarkdownDocument::object_mermaid`] 取回 —— 不复制一套
-//! 平行逻辑，也不把三种载荷塞进同一个大 enum 里让所有调用方写 `match`。
+//! [`crate::model::markdown::MarkdownDocument::object_mermaid`] /
+//! [`crate::model::markdown::MarkdownDocument::object_drawing`] 取回 —— 不复制一套
+//! 平行逻辑，也不把四种载荷塞进同一个大 enum 里让所有调用方写 `match`。
 //!
 //! # “对象行”与多行对象
 //!
-//! [`ObjectBlock::line`] 是**对象行**（object key）：图片恒等于它所在的源码行；
-//! 表格是表头行。投影的“显式源码模式”与 app 的选中/工具条都按这一个行号寻址，
+//! [`ObjectBlock::line`] 是**对象行**（object key）：图片/画布嵌入恒等于它所在的
+//! 源码行；表格是表头行。投影的“显式源码模式”与 app 的选中/工具条都按这一个行号寻址，
 //! 所以一张跨 10 行的表格也只占一个对象行。`end_line` 只用于文档/诊断
 //! （例如日志里说明“这是 3..5 行的表格”）。
 
@@ -37,6 +39,11 @@ pub enum ObjectKind {
     Table,
     /// 整块 fenced `mermaid`（普通段落上下文，ADR 0019 M2）。
     Mermaid,
+    /// 整行独占的内嵌画布笔记（`![[目标.excalidraw]]`，ADR 0025 后续切片）。
+    ///
+    /// 与图片一样是“整行源码 ↔ 一个图片式占位”；点击不是选中，而是打开目标
+    /// 画布笔记（预览图由 app 通过宿主注入的资产 provider 生成）。
+    Drawing,
 }
 
 impl ObjectKind {
@@ -58,6 +65,12 @@ impl ObjectKind {
         matches!(self, Self::Mermaid)
     }
 
+    /// 是否内嵌画布笔记对象。
+    #[must_use]
+    pub const fn is_drawing(self) -> bool {
+        matches!(self, Self::Drawing)
+    }
+
     /// 日志/诊断用的中文名（不带尺寸等渲染信息）。
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -65,6 +78,7 @@ impl ObjectKind {
             Self::Image => "图片",
             Self::Table => "表格",
             Self::Mermaid => "Mermaid",
+            Self::Drawing => "画布",
         }
     }
 }
@@ -128,7 +142,9 @@ impl ObjectBlock {
     }
 
     /// 在**同类**集合里的下标：图片对应 `MarkdownDocument::images()`，
-    /// 表格对应 `MarkdownDocument::tables()`。取载荷时用它，不要自己再扫一遍。
+    /// 表格对应 `MarkdownDocument::tables()`，Mermaid 对应
+    /// `MarkdownDocument::mermaid_blocks()`，画布嵌入对应
+    /// `MarkdownDocument::drawings()`。取载荷时用它，不要自己再扫一遍。
     #[must_use]
     pub const fn index(&self) -> usize {
         self.index

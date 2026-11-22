@@ -17,6 +17,13 @@
 #![deny(unsafe_code)]
 
 pub mod dev_vault;
+// 应用统一资产源（`with_assets`）：gpui-excalidraw 手绘图标 + GPUI Kit 默认资产。
+// 默认构建也编进来：画布笔记不依赖同步/dev-sync。
+pub mod assets;
+// 应用图标（窗口/任务栏）：SVG 母版 + 运行时 PNG 解码；不引 SVG 运行时依赖。
+pub mod app_icon;
+// 画布笔记（`.excalidraw` 标题后缀）+ Excalidraw 编辑器覆盖层（第一方编入模块）。
+pub mod drawing;
 // 第一方核心插件「日记」（Obsidian 风格）：本机 `daily-notes.json` + 今日日记
 // 路径/创建；默认构建也编进来（不依赖同步/dev-sync）。
 pub mod daily_notes;
@@ -41,6 +48,10 @@ pub mod mermaid;
 // 第一方内置模块只读注册表（ADR 0020 P2）：只投影编译期事实，没有运行时
 // 开关/设置项 UI；Sync 的编入事实跟随 `sync-ui`（默认开启）。
 pub mod modules;
+pub mod note_properties;
+// 笔记「历史记录…」时间线覆盖层（ADR 0024 H1，本机历史）：只读本地 versions 表，
+// 恢复=新建一篇新笔记（append-only）。默认构建也编进来，不依赖同步/dev-sync。
+pub mod note_history;
 // relay 模式/URL 的构建期能力闸（ADR 0013 §1）：`sync` feature 下存在；
 // 只有 `dev-sync` 构建才把 `local_dev` 视为可接受模式。
 #[cfg(feature = "sync")]

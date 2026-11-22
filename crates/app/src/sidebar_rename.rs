@@ -427,6 +427,8 @@ pub struct RenameInput {
     state: RenameState,
     focus_handle: FocusHandle,
     mode: RenameMode,
+    /// 笔记顶部的大标题：标题语义不变，只放大字号并去掉侧栏输入框的白底/边框。
+    large_title: bool,
 }
 
 impl RenameInput {
@@ -438,6 +440,20 @@ impl RenameInput {
     /// 新建表格单元格输入框：预填 `initial`，光标在**末尾**（单击单元格的默认落点）。
     pub fn new_cell_at_end(initial: &str, cx: &mut Context<Self>) -> Self {
         Self::new_with_mode(initial, RenameMode::Cell, cx)
+    }
+
+    /// 新建表格/属性输入框：Cell 语义（允许空串），但**全选**已有值，
+    /// 便于直接覆盖属性值（Obsidian 属性面板的点击即替换）。
+    pub fn new_cell_selected(initial: &str, cx: &mut Context<Self>) -> Self {
+        Self::new_with_state(RenameMode::Cell, RenameState::selecting_all(initial), cx)
+    }
+
+    /// 新建笔记顶部大标题输入框：标题语义（全选、空标题拒绝、Enter 提交），
+    /// 但画成正文标题而不是侧栏输入框。
+    pub fn new_note_title(initial: &str, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::new_with_mode(initial, RenameMode::Title, cx);
+        input.large_title = true;
+        input
     }
 
     /// 新建**设置页**输入框：标题语义，但光标在末尾、不预选。
@@ -461,7 +477,14 @@ impl RenameInput {
             state,
             focus_handle: cx.focus_handle(),
             mode,
+            large_title: false,
         }
+    }
+
+    /// 是否是笔记顶部大标题。
+    #[must_use]
+    pub fn is_large_title(&self) -> bool {
+        self.large_title
     }
 
     /// 输入框用途（绘制尺寸/提交语义都从这里来）。
@@ -831,15 +854,22 @@ impl Element for RenameElement {
     ) {
         let state = self.input.read(cx).state.clone();
         let mode = self.input.read(cx).mode();
+        let large_title = self.input.read(cx).is_large_title();
         let display = state.display();
         let font = theme::font();
         // 标题与表格单元格只差尺寸：单元格更小，并在 cell 行高里垂直居中
         // （浮层矩形就是 cell 矩形，不居中会让文字贴顶）。
         let (font_size, line_height, pad_x, top_pad) = match mode {
+            RenameMode::Title if large_title => (
+                px(28.0),
+                px(34.0),
+                px(0.0),
+                ((bounds.size.height - px(34.0)) / 2.0).max(px(0.0)),
+            ),
             RenameMode::Title => (
                 px(theme::FONT_SIZE - 1.0),
                 px(theme::LINE_HEIGHT),
-                PAD_X,
+                px(PAD_X),
                 px(0.0),
             ),
             RenameMode::Cell => {
@@ -848,7 +878,7 @@ impl Element for RenameElement {
                 (
                     px(theme::TABLE_FONT_SIZE),
                     line_height,
-                    theme::TABLE_CELL_PAD_X,
+                    px(theme::TABLE_CELL_PAD_X),
                     top_pad,
                 )
             }
@@ -856,12 +886,15 @@ impl Element for RenameElement {
 
         // 背景：**不透明白底** + 中性边框。输入框必须压住行的选中底色
         // （行可能是蓝色"当前打开"态），否则两层蓝叠在一起看不出哪段是选中。
-        let inner = Bounds::new(
-            point(bounds.origin.x + px(1.0), bounds.origin.y + px(1.0)),
-            size(bounds.size.width - px(2.0), bounds.size.height - px(2.0)),
-        );
-        window.paint_quad(gpui::fill(inner, theme::input_bg()));
-        paint_border(window, bounds, theme::input_border());
+        // 笔记大标题是正文的一部分，不要白底/边框。
+        if !large_title {
+            let inner = Bounds::new(
+                point(bounds.origin.x + px(1.0), bounds.origin.y + px(1.0)),
+                size(bounds.size.width - px(2.0), bounds.size.height - px(2.0)),
+            );
+            window.paint_quad(gpui::fill(inner, theme::input_bg()));
+            paint_border(window, bounds, theme::input_border());
+        }
 
         let runs = [TextRun {
             len: display.len(),
@@ -877,7 +910,7 @@ impl Element for RenameElement {
             &runs,
             None,
         );
-        let origin = point(bounds.origin.x + px(pad_x), bounds.origin.y + top_pad);
+        let origin = point(bounds.origin.x + pad_x, bounds.origin.y + top_pad);
 
         // 顺序很重要：**选区底色先画、文字后画**。
         // 反过来的话全选高亮会把文字整块盖住——用户看到的"空输入框只有 caret"

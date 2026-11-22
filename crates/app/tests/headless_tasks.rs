@@ -140,7 +140,7 @@ fn center(rect: gpui::Bounds<gpui::Pixels>) -> Point<gpui::Pixels> {
 /// 同时会触发一次真实 prepaint/paint，让 `task_checkbox_rects()` 有本帧几何。
 fn focus_first_line_content(cx: &mut VisualTestContext) {
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     cx.simulate_click(
         gpui::point(
@@ -168,7 +168,7 @@ async fn click_toggles_the_box_without_moving_the_caret(cx: &mut TestAppContext)
 
     let (host, cx) = open_shell(cx, vault);
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     let view = active_view(&host, cx);
 

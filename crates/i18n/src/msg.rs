@@ -114,6 +114,8 @@ define_messages! {
         NOTES = "sidebar.notes";
         NEW_NOTE = "sidebar.new_note";
         NEW_FOLDER = "sidebar.new_folder";
+        // 画布笔记（`.excalidraw`）：侧栏动作行的「画布」按钮。
+        NEW_DRAWING = "sidebar.new_drawing";
         EXPORT = "sidebar.export";
         EXPORTING = "sidebar.exporting";
         GRAPH = "sidebar.graph";
@@ -132,6 +134,26 @@ define_messages! {
         RIBBON_TEMPLATE = "sidebar.ribbon.template";
         RIBBON_GRAPH = "sidebar.ribbon.graph";
         RIBBON_SEARCH = "sidebar.ribbon.search";
+    }
+
+    // 画布笔记（`.excalidraw`）+ Excalidraw 覆盖层：bar 标题与两个按钮。
+    // 标题是**文件名语义**（`.excalidraw` 后缀），动态部分走 `{title}` 插值。
+    drawing {
+        BAR_TITLE = "drawing.bar_title";
+        SAVE = "drawing.save";
+        CLOSE = "drawing.close";
+        SAVED = "drawing.saved";
+        SAVE_FAILED = "drawing.save_failed";
+        PLACEHOLDER = "drawing.placeholder";
+        PLACEHOLDER_HINT = "drawing.placeholder_hint";
+        OPEN = "drawing.open";
+    }
+
+    // 笔记属性（YAML frontmatter 面板）。
+    properties {
+        TITLE = "properties.title";
+        ADD = "properties.add";
+        NO_VALUE = "properties.no_value";
     }
 
     editor_menu {
@@ -241,6 +263,8 @@ mod tests {
                     "settings.",
                     "sidebar.",
                     "editor.menu.",
+                    "drawing.",
+                    "properties.",
                     "status.",
                     "templates.",
                     "daily_notes.",

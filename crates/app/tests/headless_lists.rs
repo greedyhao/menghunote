@@ -113,7 +113,7 @@ async fn opening_and_closing_a_list_note_does_not_rewrite_source(cx: &mut TestAp
 
     let (host, cx) = open_shell(cx, vault);
     assert!(
-        cx.debug_bounds("editor-pane").is_some(),
+        cx.debug_bounds("editor-current-doc").is_some(),
         "编辑器面板必须画出来"
     );
     assert!(
@@ -142,7 +142,7 @@ async fn click_list_line_and_enter_creates_sibling_item(cx: &mut TestAppContext)
 
     let (host, cx) = open_shell(cx, vault);
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
 
     // 第 0 行是 h1（26px → 39px 行高），第 1 行空行（22px），第 2 行是 `- alpha`。
@@ -181,7 +181,7 @@ async fn click_nested_list_line_keeps_hanging_indent_and_level(cx: &mut TestAppC
 
     let (host, cx) = open_shell(cx, vault);
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
 
     // 第 1 行是深度 1 的嵌套 item：x 要越过 `depth*24px + bullet gutter`。
@@ -213,7 +213,7 @@ async fn backspace_on_empty_list_item_deletes_only_the_marker_space(cx: &mut Tes
 
         let (host, cx) = open_shell(cx, vault);
         let pane = cx
-            .debug_bounds("editor-pane")
+            .debug_bounds("editor-current-doc")
             .expect("编辑器面板必须画出来");
         // 空 item 在最后一行；行高按正文 22px。
         let lines = before.lines().count().max(1) as f32;
@@ -247,7 +247,7 @@ async fn deleting_the_last_list_marker_char_drops_leftover_indent(cx: &mut TestA
 
     let (host, cx) = open_shell(cx, vault);
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     let y = pane.origin.y + gpui::px(theme::PAD_Y + 22.0 + 10.0);
     let x = pane.origin.x + gpui::px(theme::PAD_X + theme::LIST_INDENT_PER_LEVEL + 40.0);
@@ -280,7 +280,7 @@ async fn ordered_item_deleted_to_plain_number_has_no_list_state(cx: &mut TestApp
 
     let (host, cx) = open_shell(cx, vault);
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     let y = pane.origin.y + gpui::px(theme::PAD_Y + 22.0 + 10.0);
     let x = pane.origin.x + gpui::px(theme::PAD_X + 50.0);

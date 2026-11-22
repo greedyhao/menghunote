@@ -23,6 +23,9 @@ use gpui::{
 };
 #[cfg(any(not(feature = "sync-ui"), feature = "dev-sync"))]
 use menghunote_app::dev_vault;
+// 应用统一资产源（画布手绘图标 + GPUI Kit 默认资产）：三条启动路径都要注册，
+// 否则 Excalidraw 工具栏/菜单渲染成空白字形。
+use menghunote_app::assets::AppAssets;
 use menghunote_app::platform;
 #[cfg(any(not(feature = "sync-ui"), feature = "dev-sync"))]
 use menghunote_app::shell::AppShell;
@@ -91,27 +94,32 @@ fn run_default_window() -> Result<()> {
     );
     let vault_label = short_vault_label(&dev.path);
     let vault = dev.vault.clone();
-    gpui::platform::application().run(move |cx: &mut App| {
-        gpui::init(cx);
-        let window_bounds = initial_window_bounds(cx);
-        let options = window_options("menghunote · 切片 7b dev vault", window_bounds);
-        let opened = cx.open_window(options, move |window, cx| {
-            println!("[menghunote] 窗口 scale_factor = {}", window.scale_factor());
-            let shell = cx.new(|cx| AppShell::new(vault.clone(), vault_label.clone(), cx));
-            let weak = shell.downgrade();
-            // 关窗只在这里排空一次，且时长有界（1500ms）；切换文档另有自己的排空。
-            window.on_window_should_close(cx, move |_window, cx| {
-                weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
-                true
+    gpui::platform::application()
+        .with_assets(AppAssets)
+        .run(move |cx: &mut App| {
+            gpui::init(cx);
+            // 手绘字体（Excalifont / Virgil）：画布笔记的文本元素用它们；
+            // 只在启动时注册一次（`add_fonts` 幂等）。
+            gpui_excalidraw::register_hand_drawn_fonts(cx);
+            let window_bounds = initial_window_bounds(cx);
+            let options = window_options("menghunote · 切片 7b dev vault", window_bounds);
+            let opened = cx.open_window(options, move |window, cx| {
+                println!("[menghunote] 窗口 scale_factor = {}", window.scale_factor());
+                let shell = cx.new(|cx| AppShell::new(vault.clone(), vault_label.clone(), cx));
+                let weak = shell.downgrade();
+                // 关窗只在这里排空一次，且时长有界（1500ms）；切换文档另有自己的排空。
+                window.on_window_should_close(cx, move |_window, cx| {
+                    weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
+                    true
+                });
+                shell
             });
-            shell
+            if let Err(error) = opened {
+                eprintln!("[menghunote] 无法创建主窗口：{error}");
+                return;
+            }
+            cx.activate(true);
         });
-        if let Err(error) = opened {
-            eprintln!("[menghunote] 无法创建主窗口：{error}");
-            return;
-        }
-        cx.activate(true);
-    });
     Ok(())
 }
 
@@ -130,23 +138,28 @@ fn run_onboarding_window() -> Result<()> {
         options.layout.config_path.display(),
         options.layout.instances_dir.display()
     );
-    gpui::platform::application().run(move |cx: &mut App| {
-        gpui::init(cx);
-        let window_bounds = initial_window_bounds(cx);
-        let options_for_window = options.clone();
-        let window_options = window_options("menghunote · 同步", window_bounds);
-        let opened = cx.open_window(window_options, move |window, cx| {
-            let root = cx.new(|cx| AppRoot::new(options_for_window, cx));
-            // 关窗分派：Working 拦截、Main 有界排空（见 `AppRoot::should_close`）。
-            AppRoot::install_close_handler(window, root.clone(), cx);
-            root
+    gpui::platform::application()
+        .with_assets(AppAssets)
+        .run(move |cx: &mut App| {
+            gpui::init(cx);
+            // 手绘字体（Excalifont / Virgil）：画布笔记的文本元素用它们；
+            // 只在启动时注册一次（`add_fonts` 幂等）。
+            gpui_excalidraw::register_hand_drawn_fonts(cx);
+            let window_bounds = initial_window_bounds(cx);
+            let options_for_window = options.clone();
+            let window_options = window_options("menghunote · 同步", window_bounds);
+            let opened = cx.open_window(window_options, move |window, cx| {
+                let root = cx.new(|cx| AppRoot::new(options_for_window, cx));
+                // 关窗分派：Working 拦截、Main 有界排空（见 `AppRoot::should_close`）。
+                AppRoot::install_close_handler(window, root.clone(), cx);
+                root
+            });
+            if let Err(error) = opened {
+                eprintln!("[menghunote] 无法创建主窗口：{error}");
+                return;
+            }
+            cx.activate(true);
         });
-        if let Err(error) = opened {
-            eprintln!("[menghunote] 无法创建主窗口：{error}");
-            return;
-        }
-        cx.activate(true);
-    });
     Ok(())
 }
 
@@ -220,43 +233,48 @@ fn run_dev_sync_window(
     let vault_label = short_vault_label(&dev.path);
     let vault = dev.vault.clone();
     let sync_context = menghunote_storage::SyncContext::new(peer, epoch);
-    gpui::platform::application().run(move |cx: &mut App| {
-        gpui::init(cx);
-        let window_bounds = initial_window_bounds(cx);
-        if let Some(display) = cx.primary_display() {
-            println!(
-                "[menghunote] 显示器 bounds = {:?}，visible = {:?}，初始窗口 = {:?}",
-                display.bounds(),
-                display.visible_bounds(),
-                window_bounds
-            );
-        }
-        let options = window_options("menghunote · 切片 7b dev vault", window_bounds);
-        let config_for_window = config.clone();
-        let opened = cx.open_window(options, move |window, cx| {
-            println!("[menghunote] 窗口 scale_factor = {}", window.scale_factor());
-            let shell = cx.new(|cx| {
-                AppShell::new_with_dev_sync_with_autosync(
-                    vault.clone(),
-                    vault_label.clone(),
-                    config_for_window.clone(),
-                    sync_context,
-                    cx,
-                )
+    gpui::platform::application()
+        .with_assets(AppAssets)
+        .run(move |cx: &mut App| {
+            gpui::init(cx);
+            // 手绘字体（Excalifont / Virgil）：画布笔记的文本元素用它们；
+            // 只在启动时注册一次（`add_fonts` 幂等）。
+            gpui_excalidraw::register_hand_drawn_fonts(cx);
+            let window_bounds = initial_window_bounds(cx);
+            if let Some(display) = cx.primary_display() {
+                println!(
+                    "[menghunote] 显示器 bounds = {:?}，visible = {:?}，初始窗口 = {:?}",
+                    display.bounds(),
+                    display.visible_bounds(),
+                    window_bounds
+                );
+            }
+            let options = window_options("menghunote · 切片 7b dev vault", window_bounds);
+            let config_for_window = config.clone();
+            let opened = cx.open_window(options, move |window, cx| {
+                println!("[menghunote] 窗口 scale_factor = {}", window.scale_factor());
+                let shell = cx.new(|cx| {
+                    AppShell::new_with_dev_sync_with_autosync(
+                        vault.clone(),
+                        vault_label.clone(),
+                        config_for_window.clone(),
+                        sync_context,
+                        cx,
+                    )
+                });
+                let weak = shell.downgrade();
+                window.on_window_should_close(cx, move |_window, cx| {
+                    weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
+                    true
+                });
+                shell
             });
-            let weak = shell.downgrade();
-            window.on_window_should_close(cx, move |_window, cx| {
-                weak.update(cx, |shell, cx| shell.close_all(cx)).ok();
-                true
-            });
-            shell
+            if let Err(error) = opened {
+                eprintln!("[menghunote] 无法创建主窗口：{error}");
+                return;
+            }
+            cx.activate(true);
         });
-        if let Err(error) = opened {
-            eprintln!("[menghunote] 无法创建主窗口：{error}");
-            return;
-        }
-        cx.activate(true);
-    });
     Ok(())
 }
 
@@ -290,6 +308,8 @@ fn window_options(title: &'static str, bounds: Bounds<gpui::Pixels>) -> WindowOp
             title: Some(SharedString::from(title)),
             ..Default::default()
         }),
+        // 应用图标（用户提供的猛虎下山 SVG 栅格化）：窗口/任务栏。
+        icon: menghunote_app::app_icon::window_icon(),
         ..Default::default()
     }
 }

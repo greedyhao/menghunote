@@ -9,7 +9,7 @@ use menghunote_storage::{
     begin_baseline_apply, finish_baseline_apply, load_body_doc, sync_cursor_state,
     BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BodyDoc, Value, Vault,
     META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
-    META_SYNC_RELAY_CURSOR,
+    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
 };
 
 fn snapshot(doc_id: &str, peer: u64, text: &str) -> Vec<u8> {
@@ -562,7 +562,7 @@ fn assets_are_idempotent_and_abort_keeps_imported_doc() {
 #[test]
 fn schema_v3_has_baseline_journal_tables() {
     let (_dir, vault) = fresh_vault();
-    assert_eq!(vault.user_version().expect("version"), 3);
+    assert_eq!(vault.user_version().expect("version"), SCHEMA_VERSION);
     for table in [
         "baseline_apply",
         "baseline_apply_docs",

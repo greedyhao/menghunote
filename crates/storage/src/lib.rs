@@ -28,7 +28,7 @@
 //! let doc = BodyDoc::create("body-1", 1)?;
 //! doc.insert_scalars(0, "A中😀e\u{301}")?;
 //! assert_eq!(doc.scalar_len(), 5);
-//! assert_eq!(vault.user_version()?, 3);
+//! assert_eq!(vault.user_version()?, 4);
 //! # Ok(())
 //! # }
 //! ```
@@ -41,6 +41,7 @@ mod body_doc;
 mod connection;
 mod error;
 mod events;
+pub mod history;
 mod index_manifest;
 mod journal;
 pub mod links;
@@ -74,6 +75,11 @@ pub use body_doc::{
 };
 pub use error::StorageError;
 pub use events::{StorageEvent, StorageEventSubscriber, DEFAULT_EVENT_QUEUE};
+pub use history::{
+    capture_note_version, list_note_versions, load_note_version, load_note_version_for_note,
+    prune_note_versions, CaptureNoteVersion, HistoryVersion, HistoryVersionSummary,
+    HISTORY_MAX_VERSIONS_PER_NOTE, HISTORY_RETENTION_DAYS, HISTORY_SOURCE_LOCAL,
+};
 pub use index_manifest::{list_index_manifest, IndexManifestRow};
 pub use journal::{
     DurableSink, FlushReport, JournalEntry, JournalOrigin, JournalWriter, PendingJournal,

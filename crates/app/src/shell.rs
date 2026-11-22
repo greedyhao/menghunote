@@ -25,8 +25,8 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, point, px, svg, AnyElement, App, Context, Entity, FocusHandle, FontWeight,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta,
-    SharedString, Size, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point,
+    Render, ScrollDelta, SharedString, Size, Window,
 };
 use menghunote_editor::EditorController;
 use menghunote_storage::rename_links::{
@@ -50,11 +50,13 @@ use crate::editor::view::EditorEvent;
 // `hint_line` / `scroll_zoom_factor` / `GraphLod` / `arrow_head` 都是纯函数，
 // UI 与测试共用同一份口径。
 use crate::daily_notes;
+use crate::drawing::{self, DrawingOverlay, DrawingOverlayEvent};
 use crate::graph::{
     arrow_head, hint_line, node_offscreen, scroll_zoom_factor, GraphLimits, GraphLod, GraphModel,
     GraphOptions, GraphScope, GraphSearch, GraphViewport, DEFAULT_LOCAL_DEPTH, GHOST_RADIUS_SCALE,
     MAX_LOCAL_DEPTH, MIN_LOCAL_DEPTH,
 };
+use crate::note_history::{NoteHistoryEvent, NoteHistoryPanel};
 use crate::search_input::{SearchInput, SearchInputEvent};
 use crate::sidebar_rename::{RenameEvent, RenameInput};
 use crate::templates::{self, TemplatePicker, TemplatePickerEvent, TemplatePickerPurpose};
@@ -63,6 +65,8 @@ use crate::templates::{self, TemplatePicker, TemplatePickerEvent, TemplatePicker
 const DEFAULT_NOTE_TITLE: &str = "未命名笔记";
 /// 新建目录的默认标题。
 const DEFAULT_FOLDER_TITLE: &str = "未命名文件夹";
+/// 新建画布笔记的默认标题（后缀由 [`drawing::DRAWING_SUFFIX`] 提供）。
+const DEFAULT_DRAWING_TITLE: &str = "未命名画布";
 /// 默认本机 peer id（与 dev 播种一致）。
 ///
 /// **默认构建 / dev-sync 未启用时保持常量 1**，行为与切片 7 完全相同；dev-sync 启用时
@@ -131,6 +135,11 @@ const INDENT_PER_DEPTH: f32 = 16.0;
 const ROW_HEIGHT: f32 = 24.0;
 /// 切换文档时旧 driver 的有界排空上限（ADR 0002 §9：`close` 必须有界）。
 const SWITCH_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// 本机历史版本的自动捕获周期（ADR 0024 §2.2：停止输入约 2 秒）。
+///
+/// 只在 active 源文与基线不同时真正写库；headless 测试用
+/// `cx.executor().advance_clock(HISTORY_CAPTURE_TICK)` 推进，不 sleep。
+const HISTORY_CAPTURE_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 /// dev-sync 的转发接口在「没有打开任何笔记」时用的明确失败文案（切片 3b）。
 #[cfg(feature = "sync-ui")]
 const NO_ACTIVE_DOC: &str = "dev-sync：当前没有打开的笔记，闸门/adopt 无处转发";
@@ -520,6 +529,12 @@ struct Editing {
     input: Entity<RenameInput>,
 }
 
+/// 编辑器顶部的前进/后退历史项（只存稳定的结构节点 ID）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryEntry {
+    node_id: String,
+}
+
 struct OpenNote {
     /// 结构节点 ID（侧栏高亮用）。
     node_id: String,
@@ -606,6 +621,12 @@ pub struct AppShell {
     tree: Vec<TreeEntry>,
     /// 当前打开的笔记；`None` 表示库里还没有可打开的笔记。
     active: Option<OpenNote>,
+    /// 浏览器式笔记历史（只存 node_id；打开失败不入栈）。
+    history: Vec<HistoryEntry>,
+    /// 当前历史位置（`history[history_index]` 是正在看的笔记）。
+    history_index: usize,
+    /// 顶部标题行内编辑（`None` = 显示标题文本）。
+    title_edit: Option<Entity<RenameInput>>,
     /// 当前笔记的反向链接（L2；打开/切换/点开面板时刷新）。
     backlinks: Vec<Backlink>,
     /// 反向链接面板是否展开。
@@ -659,6 +680,17 @@ pub struct AppShell {
     ///
     /// 默认构建也订阅：`ThemeMode::System` 下 OS 切换要立即重绘。
     appearance_subscription: Option<gpui::Subscription>,
+    /// 笔记历史时间线覆盖层（ADR 0024 H1；`None` = 关闭）。
+    history_panel: Option<Entity<NoteHistoryPanel>>,
+    /// 历史面板的事件订阅（关闭时 drop = 取消订阅）。
+    history_panel_events: Option<gpui::Subscription>,
+    /// 自动捕获的基线：`(note_id, 上次捕获/打开时的源文)`。
+    ///
+    /// 只在 active 源文与它不同时写版本（与 storage 的 `body_hash` 去重双保险）；
+    /// 打开笔记时把当前源文设为基线，保证**首次打开不会立刻写版本**。
+    history_last_source: Option<(String, String)>,
+    /// 2 秒周期的历史捕获 timer 是否已启动（只启动一次）。
+    history_timer_started: bool,
     /// dev-only 同步面板（ADR 0009 Phase 1 / 切片 1）。
     ///
     /// 只在 `sync-ui`（默认 feature）下存在；`AppShell::new` 等纯 dev vault 入口里是
@@ -728,6 +760,13 @@ pub struct AppShell {
     import_notice: Option<String>,
     /// 模板选择器（`None` = 关闭）；覆盖层实体自绘搜索/列表/键盘。
     template_picker: Option<Entity<TemplatePicker>>,
+    /// 画布覆盖层（`.excalidraw` 笔记；`None` = 关闭）。
+    ///
+    /// 打开画布笔记时创建：Excalidraw 编辑器实体 + 打开时的场景基准都在里面。
+    /// 覆盖层挂在编辑器内容区，侧栏保持可见；画布内部命中已按画布原点校正。
+    drawing: Option<Entity<DrawingOverlay>>,
+    /// 画布覆盖层的保存/关闭事件订阅（关闭时 drop = 取消订阅）。
+    drawing_events: Option<gpui::Subscription>,
     /// 选择器事件订阅（关闭时 drop = 取消订阅）。
     template_picker_events: Option<gpui::Subscription>,
     /// 关闭选择器后下一帧把焦点还给编辑器（事件回调里拿不到 `&mut Window`）。
@@ -842,6 +881,204 @@ impl AppShell {
             });
         }
         cx.notify();
+    }
+
+    // ---- 笔记历史（ADR 0024 H1）：自动捕获 + 时间线覆盖层 + 恢复为新笔记 ----
+
+    /// 启动 2 秒周期的历史捕获 timer（只启动一次）。
+    ///
+    /// 为什么用周期 timer 而不是"每次按键 debounce"：ADR 0024 §2.2 的粒度是编辑会话；
+    /// 周期检查只读一次 active 源文，没变化时零写库。headless 测试用
+    /// `cx.executor().advance_clock(2s)` 推进，不 sleep。
+    fn spawn_history_timer(&mut self, cx: &mut Context<Self>) {
+        if self.history_timer_started {
+            return;
+        }
+        self.history_timer_started = true;
+        let timers = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| loop {
+            timers.timer(HISTORY_CAPTURE_TICK).await;
+            let updated = this.update(cx, |shell, cx| {
+                shell.capture_active_history(cx);
+            });
+            if updated.is_err() {
+                // 实体已释放（窗口关闭）：结束循环，不要继续 await。
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// 当前 active 源文与基线不同才捕获一个版本（失败只提示，不影响正文）。
+    ///
+    /// 这是 2s timer / 切换笔记 / 关窗共用的唯一捕获入口；storage 侧还有
+    /// `body_hash` 去重兜底，所以重复调用不会产生重复版本。
+    fn capture_active_history(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        let note_id = active.note_id.clone();
+        let source = active.view.read(cx).source_text();
+        if self
+            .history_last_source
+            .as_ref()
+            .is_some_and(|(id, text)| id == &note_id && text == &source)
+        {
+            return;
+        }
+        let title = self
+            .tree
+            .iter()
+            .find(|entry| entry.note_id.as_deref() == Some(note_id.as_str()))
+            .map_or_else(
+                || crate::note_history::NOTE_FALLBACK_TITLE.to_owned(),
+                |entry| entry.title.clone(),
+            );
+        match menghunote_storage::capture_note_version(
+            &self.vault,
+            &note_id,
+            &title,
+            &source,
+            now_millis(),
+        ) {
+            Ok(outcome) => {
+                if outcome.captured {
+                    eprintln!(
+                        "[menghunote] 捕获历史版本 note={note_id} version={:?} 字节={}",
+                        outcome.version_id,
+                        source.len()
+                    );
+                }
+                self.history_last_source = Some((note_id, source));
+            }
+            Err(error) => {
+                eprintln!("[menghunote] 历史版本写入失败 note={note_id}：{error}");
+                if self.notice.is_none() {
+                    self.notice = Some(crate::note_history::CAPTURE_FAILED_NOTICE.to_owned());
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// 切笔记/关窗前的显式 flush（与 timer 共用去重入口）。
+    fn flush_active_history(&mut self, cx: &mut Context<Self>) {
+        self.capture_active_history(cx);
+    }
+
+    /// 打开某篇笔记的历史时间线覆盖层。
+    fn open_note_history(
+        &mut self,
+        note_id: String,
+        note_title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 同一时刻只允许一个覆盖层：重复打开直接替换（并丢弃旧订阅）。
+        self.history_panel = None;
+        self.history_panel_events = None;
+        let vault = self.vault.clone();
+        let panel = cx.new(|cx| NoteHistoryPanel::new(note_id, note_title, vault, cx));
+        let events = cx.subscribe(
+            &panel,
+            |shell, _panel, event: &NoteHistoryEvent, cx| match event {
+                NoteHistoryEvent::Closed => shell.close_note_history(cx),
+                NoteHistoryEvent::RestoreRequested { title, body } => {
+                    shell.restore_note_history(title.clone(), body.clone(), cx);
+                }
+            },
+        );
+        panel.update(cx, |panel, cx| panel.focus(window, cx));
+        eprintln!("[menghunote] 打开历史记录覆盖层");
+        self.history_panel = Some(panel);
+        self.history_panel_events = Some(events);
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 关闭历史覆盖层；下一帧把焦点还给编辑器（事件回调里拿不到 `&mut Window`）。
+    fn close_note_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_panel.take().is_none() {
+            return;
+        }
+        self.history_panel_events = None;
+        self.pending_focus_editor = !self.active_is_drawing();
+        cx.notify();
+    }
+
+    /// 历史版本「恢复为新笔记」：结构上新建一篇**根级**笔记，再把历史正文写进去。
+    ///
+    /// - 不覆盖当前笔记、不改写 CRDT 历史（ADR 0024 §2.3）；
+    /// - 标题唯一：`原标题（历史）`，冲突时复用 [`unique_title`] 的 ` 2/3…` 规则；
+    /// - 正文走 `EditorView::replace_source_text`：一次整篇替换 = 一个撤销组，
+    ///   不把正文插到 caret。
+    fn restore_note_history(
+        &mut self,
+        historical_title: String,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_note_history(cx);
+        let base = crate::note_history::restore_title(&historical_title);
+        let title = unique_title(&base, &self.tree);
+        let Some(node_id) = self.write_structure("恢复历史版本", |writer| {
+            let seed = writer.doc().create_note(&title, now_millis())?;
+            Ok(seed.node_id)
+        }) else {
+            cx.notify();
+            return;
+        };
+        self.refresh_tree();
+        self.selected_node_id = Some(node_id.clone());
+        let Some(index) = self.tree.iter().position(|entry| entry.node_id == node_id) else {
+            eprintln!("[menghunote] 恢复历史：新建笔记没有出现在结构树里");
+            self.notice = Some(crate::note_history::RESTORE_LIST_FAILED_NOTICE.to_owned());
+            cx.notify();
+            return;
+        };
+        self.open_entry(index, cx);
+        let opened = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.node_id == node_id);
+        if !opened {
+            self.notice = Some(crate::note_history::RESTORE_OPEN_FAILED_NOTICE.to_owned());
+            cx.notify();
+            return;
+        }
+        let applied = self
+            .active
+            .as_ref()
+            .map(|active| {
+                let view = active.view.clone();
+                view.update(cx, |view, cx| view.replace_source_text(&body, cx))
+            })
+            .unwrap_or(false);
+        if !applied {
+            eprintln!("[menghunote] 恢复历史：新笔记正文写入被编辑器拒绝");
+            self.notice = Some(crate::note_history::restore_rejected_notice(&title));
+            cx.notify();
+            return;
+        }
+        eprintln!(
+            "[menghunote] 已恢复为新笔记「{title}」（node={node_id}，正文 {} 字节）",
+            body.len()
+        );
+        self.notice = Some(crate::note_history::restored_notice(&title));
+        self.pending_focus_editor = !self.active_is_drawing();
+        cx.notify();
+    }
+
+    /// 历史覆盖层是否打开（headless 断言用）。
+    #[must_use]
+    pub fn note_history_open(&self) -> bool {
+        self.history_panel.is_some()
+    }
+
+    /// 历史覆盖层实体（headless 测试读取版本数/预览正文用）。
+    #[must_use]
+    pub fn note_history_entity(&self) -> Option<Entity<NoteHistoryPanel>> {
+        self.history_panel.clone()
     }
 
     // ---- 图谱覆盖层（G1/G2）：打开/关闭/交互 ----
@@ -1442,6 +1679,9 @@ impl AppShell {
             vault_label,
             tree: Vec::new(),
             active: None,
+            history: Vec::new(),
+            history_index: 0,
+            title_edit: None,
             backlinks: Vec::new(),
             backlinks_open: false,
             notice: None,
@@ -1467,6 +1707,10 @@ impl AppShell {
             activation_observed: false,
             activation_subscription: None,
             appearance_subscription: None,
+            history_panel: None,
+            history_panel_events: None,
+            history_last_source: None,
+            history_timer_started: false,
             #[cfg(feature = "sync-ui")]
             dev_sync: None,
             #[cfg(feature = "dev-sync")]
@@ -1505,6 +1749,8 @@ impl AppShell {
             import_notice: None,
             template_picker: None,
             template_picker_events: None,
+            drawing: None,
+            drawing_events: None,
             pending_focus_editor: false,
             pending_template_picker: None,
             #[cfg(feature = "sync-ui")]
@@ -1528,6 +1774,9 @@ impl AppShell {
         } else {
             eprintln!("[menghunote] 库里还没有笔记，侧栏为空（不报错）");
         }
+        // ADR 0024 H1：2 秒周期检查 active 源文是否变化；变化才写本地历史版本。
+        // 首次打开时 `open_entry` 已把当前源文设为基线，所以不会立刻写。
+        shell.spawn_history_timer(cx);
         shell
     }
 
@@ -1868,6 +2117,221 @@ impl AppShell {
         self.selected_node_id = Some(node_id);
         self.notice = None;
         cx.notify();
+    }
+
+    // ---- 画布笔记（`.excalidraw`）+ Excalidraw 覆盖层 ----
+
+    /// 侧栏「画布」：在根级新建 `未命名画布.excalidraw`（重名追加 ` 2`…，不覆盖）。
+    ///
+    /// 正文初始为空（打开时画布用空场景）；创建后立即打开并直接开覆盖层。
+    fn create_drawing(&mut self, cx: &mut Context<Self>) {
+        let title = unique_drawing_title(&self.tree);
+        let Some(node_id) = self.write_structure("新建画布", |writer| {
+            let seed = writer.doc().create_note(&title, now_millis())?;
+            Ok(seed.node_id)
+        }) else {
+            cx.notify();
+            return;
+        };
+        eprintln!("[menghunote] 新建画布「{title}」（node={node_id}），刷新后打开");
+        self.refresh_tree();
+        self.selected_node_id = Some(node_id.clone());
+        if !self.open_node_by_id(&node_id, cx) {
+            eprintln!("[menghunote] 新建的画布没有出现在结构树里（投影滞后？）");
+            self.notice = Some("新建成功，但列表里暂时看不到（稍后刷新）".to_owned());
+        }
+        cx.notify();
+    }
+
+    /// 打开画布覆盖层：用活动编辑器**当前源文**初始化 Excalidraw 场景。
+    ///
+    /// 源文是空串（新建画布）/ 损坏 JSON 时由 [`DrawingSession`] 回退空场景，
+    /// 不会 panic、也不会让覆盖层打不开。
+    fn open_drawing_overlay(&mut self, title: String, cx: &mut Context<Self>) {
+        let Some(view) = self.active.as_ref().map(|active| active.view.clone()) else {
+            return;
+        };
+        let source = view.read(cx).source_text();
+        let overlay = cx.new(|cx| DrawingOverlay::new(title.clone(), &source, cx));
+        let events = cx.subscribe(
+            &overlay,
+            |shell, overlay, event: &DrawingOverlayEvent, cx| match *event {
+                DrawingOverlayEvent::Save => shell.save_drawing_overlay(overlay.clone(), cx),
+                DrawingOverlayEvent::Close => shell.close_drawing_overlay(cx),
+            },
+        );
+        eprintln!(
+            "[menghunote] 打开画布覆盖层「{title}」（源文 {} 字节）",
+            source.len()
+        );
+        self.drawing = Some(overlay);
+        self.drawing_events = Some(events);
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 关闭画布覆盖层（**丢弃**未保存改动；正文一个字节都不动）。
+    fn close_drawing_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.drawing.take().is_none() {
+            return;
+        }
+        self.drawing_events = None;
+        // 覆盖层里的 Excalidraw 编辑器每帧会自抢焦点。画布笔记关闭后显示
+        // **占位页**（正文仍是 JSON，但绝不铺出来），所以不能把焦点还给
+        // 隐藏的 EditorView——否则用户在占位页打字会静默改 JSON。
+        self.pending_focus_editor = !self.active_is_drawing();
+        cx.notify();
+    }
+
+    /// 「保存并关闭」：把场景 JSON 一次性写回活动编辑器，然后关闭覆盖层。
+    ///
+    /// 失败（序列化失败 / 编辑器拒绝）只提示，**不关闭**覆盖层——用户还能重试，
+    /// 不会因为一次失败丢掉画布改动。
+    fn save_drawing_overlay(&mut self, overlay: Entity<DrawingOverlay>, cx: &mut Context<Self>) {
+        let Some(view) = self.active.as_ref().map(|active| active.view.clone()) else {
+            self.notice = Some(crate::ui_text::drawing_save_failed("没有打开的笔记"));
+            cx.notify();
+            return;
+        };
+        let json = match overlay.read(cx).scene_json(cx) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!("[menghunote] 画布序列化失败：{error}");
+                self.notice = Some(crate::ui_text::drawing_save_failed(&error));
+                cx.notify();
+                return;
+            }
+        };
+        let applied = view.update(cx, |view, cx| view.replace_source_text(&json, cx));
+        if !applied {
+            self.notice = Some(crate::ui_text::drawing_save_failed("编辑器未受理整篇替换"));
+            cx.notify();
+            return;
+        }
+        eprintln!("[menghunote] 画布已保存（{} 字节）", json.len());
+        self.drawing = None;
+        self.drawing_events = None;
+        // 保存后显示占位页，不把焦点交给隐藏的 JSON 编辑器。
+        self.pending_focus_editor = !self.active_is_drawing();
+        self.notice = Some(crate::ui_text::drawing_saved());
+        cx.notify();
+    }
+
+    /// 其它**全屏模态**（搜索/图谱/设置/模板选择器）打开时画布覆盖层让位。
+    ///
+    /// 让位 = 实体保留（场景与撤销栈不丢）、只是不渲染：Excalidraw 编辑器每帧会
+    /// 自抢焦点，继续渲染会抢走设置页输入框/搜索框的焦点。关闭模态后自动回来。
+    fn drawing_yields_to_modal(&self) -> bool {
+        if self.search.is_some()
+            || self.graph.is_some()
+            || self.template_picker.is_some()
+            || self.history_panel.is_some()
+        {
+            return true;
+        }
+        #[cfg(feature = "sync-ui")]
+        if self.settings_open || self.daily_template_picker.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// 画布覆盖层（内容区最上层；`None` = 关闭或让位给其它模态）。
+    fn render_drawing_overlay(&self) -> Option<AnyElement> {
+        let overlay = self.drawing.clone()?;
+        if self.drawing_yields_to_modal() {
+            return None;
+        }
+        Some(overlay.into_any_element())
+    }
+
+    /// 画布覆盖层是否打开（headless 断言用；让位给其它模态时仍为 `true`）。
+    #[must_use]
+    pub fn drawing_overlay_open(&self) -> bool {
+        self.drawing.is_some()
+    }
+
+    /// 画布覆盖层实体（headless 测试注入场景 / 断言用；`None` = 关闭）。
+    #[must_use]
+    pub fn drawing_overlay_entity(&self) -> Option<Entity<DrawingOverlay>> {
+        self.drawing.clone()
+    }
+
+    /// 当前活动笔记是否是画布笔记。
+    fn active_is_drawing(&self) -> bool {
+        let Some(active) = &self.active else {
+            return false;
+        };
+        self.tree
+            .iter()
+            .find(|entry| entry.node_id == active.node_id)
+            .is_some_and(|entry| drawing::is_drawing_title(&entry.title))
+    }
+
+    /// 重新打开当前活动画布（占位页按钮 / 同一行再次点击）。
+    fn open_active_drawing(&mut self, cx: &mut Context<Self>) {
+        if !self.active_is_drawing() {
+            return;
+        }
+        let title = self.active_title();
+        self.open_drawing_overlay(title, cx);
+    }
+
+    /// 画布关闭后的**占位页**：绝不把 `.excalidraw` JSON 当文本显示。
+    ///
+    /// 覆盖在活动 `EditorView` 上（EditorView 仍保留，保存/同步/撤销栈不丢），
+    /// 只有图标、标题与「打开画布」按钮。
+    fn render_drawing_placeholder(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("drawing-placeholder")
+            .debug_selector(|| "drawing-placeholder".to_string())
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .bg(theme::window_bg())
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .text_color(theme::text_color())
+                    .child(SharedString::from(crate::ui_text::drawing_placeholder())),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme::status_bar_text())
+                    .child(SharedString::from(
+                        crate::ui_text::drawing_placeholder_hint(),
+                    )),
+            )
+            .child(
+                div()
+                    .id("drawing-open")
+                    .debug_selector(|| "drawing-open".to_string())
+                    .mt_1()
+                    .h(px(26.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(theme::text_color())
+                    .bg(theme::selection_bg())
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .child(SharedString::from(crate::ui_text::drawing_open()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                            shell.open_active_drawing(cx);
+                        }),
+                    ),
+            )
+            .into_any_element()
     }
 
     // ---- 模板 / 日记（第一方核心插件；模板就是普通笔记）----
@@ -2405,6 +2869,24 @@ impl AppShell {
                     self.begin_rename(node_id, title, cx);
                 }
             }
+            MenuAction::History => {
+                let entry = self
+                    .tree
+                    .iter()
+                    .find(|entry| entry.node_id == node_id)
+                    .cloned();
+                let Some(entry) = entry.filter(TreeEntry::is_note) else {
+                    // 目录没有正文历史；防御性关闭菜单，不创建空面板。
+                    self.close_menu("菜单项-历史记录（非笔记）", window, cx);
+                    return;
+                };
+                let Some(note_id) = entry.note_id.clone() else {
+                    self.close_menu("菜单项-历史记录（缺 note_id）", window, cx);
+                    return;
+                };
+                self.close_menu("菜单项-历史记录", window, cx);
+                self.open_note_history(note_id, entry.title, window, cx);
+            }
             MenuAction::NewNote => {
                 self.create_note(Some(node_id), cx);
                 self.close_menu("菜单项-新建笔记", window, cx);
@@ -2580,7 +3062,11 @@ impl AppShell {
         let Some(editing) = self.editing.take() else {
             return;
         };
-        let node_id = editing.node_id;
+        self.commit_rename_node(editing.node_id, title, cx);
+    }
+
+    /// 重命名核心：侧栏行内编辑与顶部标题共用（只差输入框放在哪里）。
+    fn commit_rename_node(&mut self, node_id: String, title: String, cx: &mut Context<Self>) {
         let entry = self
             .tree
             .iter()
@@ -2601,8 +3087,20 @@ impl AppShell {
             .is_some();
         if done {
             eprintln!("[menghunote] 已重命名 node={node_id} → {title:?}");
+            // 标题可能变成/不再是画布笔记：关闭覆盖层，避免 stale 标题与场景。
+            self.close_drawing_overlay(cx);
             self.refresh_tree();
-            self.selected_node_id = Some(node_id);
+            self.selected_node_id = Some(node_id.clone());
+            // 当前打开的就是这篇、且新标题是画布：立刻重新打开画布，
+            // 不让用户看到一刻 JSON 源码。
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.node_id == node_id)
+                && drawing::is_drawing_title(&title)
+            {
+                self.open_drawing_overlay(title.clone(), cx);
+            }
             let note = entry.as_ref().filter(|entry| entry.is_note());
             if let Some(note) = note {
                 if let Some(note_id) = note.note_id.as_deref() {
@@ -2764,11 +3262,15 @@ impl AppShell {
 
     /// 真正执行删除：若删的是当前打开的笔记，**先排空关闭会话**（超时则中止删除）。
     fn perform_delete(&mut self, entry: TreeEntry, cx: &mut Context<Self>) {
+        // 画布覆盖层与活动笔记绑定：删除任何节点前先丢弃（避免 stale note）。
+        self.close_drawing_overlay(cx);
         if self
             .active
             .as_ref()
             .is_some_and(|active| active.node_id == entry.node_id)
         {
+            // 删除当前笔记前也 flush 一个历史版本（与切换/关窗同一收敛点）。
+            self.flush_active_history(cx);
             let Some(active) = self.active.take() else {
                 return;
             };
@@ -3149,6 +3651,9 @@ impl AppShell {
         if self.editing.is_some() {
             self.commit_editing_from_outside(cx);
         }
+        if self.title_edit.is_some() && !self.commit_title_edit(cx) {
+            return;
+        }
         trace_menu!(
             "[menghunote] 行点击 node={} kind={}（会 toggle/打开）",
             entry.node_id,
@@ -3163,8 +3668,21 @@ impl AppShell {
 
     /// 打开一篇笔记（或切换目录折叠）；选中态由 [`Self::on_row_click`] 负责。
     fn open_entry(&mut self, index: usize, cx: &mut Context<Self>) {
+        let _ = self.open_entry_with_history(index, true, cx);
+    }
+
+    /// 打开笔记；`record_history = false` 用于前进/后退（不重复入栈）。
+    ///
+    /// 返回是否**已经处于**目标笔记（成功打开或本来就是当前笔记）；失败/被同步闸门
+    /// 拒绝时返回 `false`，调用方不要移动历史游标。
+    fn open_entry_with_history(
+        &mut self,
+        index: usize,
+        record_history: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(entry) = self.tree.get(index).cloned() else {
-            return;
+            return false;
         };
         if entry.is_folder() {
             // 目录点击 = 折叠/展开（目录没有正文）。折叠状态只在内存里，重启回到全展开。
@@ -3176,15 +3694,22 @@ impl AppShell {
                 self.collapsed.len()
             );
             cx.notify();
-            return;
+            return false;
         }
         if self
             .active
             .as_ref()
             .is_some_and(|active| active.node_id == entry.node_id)
         {
-            return;
+            // 同一个画布笔记再点一次 = 重新打开覆盖层（「关闭（不保存）」之后没有别的入口）。
+            if drawing::is_drawing_title(&entry.title) && self.drawing.is_none() {
+                self.open_drawing_overlay(entry.title.clone(), cx);
+            }
+            return false;
         }
+        // ADR 0024 §2.2：切换笔记前先 flush 当前笔记的最后一个历史版本
+        // （active 仍是旧笔记；2s timer 之外的第二条显式收敛点）。
+        self.flush_active_history(cx);
         // dev-sync：NeedGate/持闸之后禁止打开/切换文档（同步的 integrate 会直接追加外部
         // 行，新会话会拿过期 head 基准；持闸路径 moreover 握着租约）。ADR 0012 S2a：
         // **网络阶段（Prepare）不冻结切换**——此时还没有闸门、也没有 integrate。
@@ -3205,7 +3730,7 @@ impl AppShell {
                 );
                 self.notice = Some("同步进行中，稍后再打开/切换文档".to_owned());
                 cx.notify();
-                return;
+                return false;
             }
         }
         let Some(doc_id) = entry.body_doc_id.clone() else {
@@ -3213,7 +3738,7 @@ impl AppShell {
                 "[menghunote] 节点「{}」没有 body_doc_id，跳过（结构投影异常？）",
                 entry.title
             );
-            return;
+            return false;
         };
 
         // 1) 先开新文档：失败就完全不动当前视图。
@@ -3226,7 +3751,7 @@ impl AppShell {
             Err(error) => {
                 eprintln!("[menghunote] 打开文档 {doc_id} 失败：{error:?}");
                 self.notice = Some(format!("打开「{}」失败", entry.title));
-                return;
+                return false;
             }
         };
         let controller = match EditorController::open(driver.session().snapshot()) {
@@ -3234,7 +3759,7 @@ impl AppShell {
             Err(error) => {
                 eprintln!("[menghunote] 初始化编辑器模型失败（{doc_id}）：{error}");
                 self.notice = Some(format!("打开「{}」失败", entry.title));
-                return;
+                return false;
             }
         };
         // ADR 0019 S2a：图片预览要按 `asset://<hash>` 取本地字节。EditorView 不依赖
@@ -3262,6 +3787,9 @@ impl AppShell {
                 // 点正文 = 点外部 → 确认提交
                 if shell.editing.is_some() {
                     shell.commit_editing_from_outside(cx);
+                }
+                if shell.title_edit.is_some() {
+                    shell.commit_title_edit(cx);
                 }
             }
             EditorEvent::WikiLinkRequested { target, heading } => {
@@ -3311,19 +3839,35 @@ impl AppShell {
             );
             self.notice = Some("保存未完成，稍后再切换".to_owned());
             cx.notify();
-            return;
+            return false;
         }
 
         eprintln!(
             "[menghunote] 打开笔记「{}」（node={} doc={}）",
             entry.title, entry.node_id, doc_id
         );
+        // 属性面板挂在编辑器视图里（随正文滚动）；面板弱引用视图，避免强引用环。
+        let properties =
+            cx.new(|cx| crate::note_properties::NotePropertiesPanel::new(view.downgrade(), cx));
+        view.update(cx, |view, _| view.set_properties_panel(properties));
+        let node_id = entry.node_id.clone();
+        let note_id = entry.note_id.clone().expect("已打开笔记必须有 note_id");
+        // ADR 0024：首次打开**不立刻写版本**——把当前源文设为捕获基线，之后只有
+        // 源文变化才会被 2s timer / 切换 / 关窗写入。
+        self.history_last_source = Some((note_id.clone(), view.read(cx).source_text()));
         self.active = Some(OpenNote {
-            node_id: entry.node_id,
-            note_id: entry.note_id.clone().expect("已打开笔记必须有 note_id"),
+            node_id: node_id.clone(),
+            note_id,
             view,
             _events: events,
         });
+        // 画布笔记（`.excalidraw`）：切换成功后丢弃旧覆盖层，再按新标题决定是否打开。
+        // 放在切换成功之后：切换被中止（保存未完成）时旧画布保持原样。
+        self.drawing = None;
+        self.drawing_events = None;
+        if drawing::is_drawing_title(&entry.title) {
+            self.open_drawing_overlay(entry.title.clone(), cx);
+        }
         self.refresh_backlinks();
         self.backlinks_open = false;
         // ADR 0012 S3：编辑代数按视图计（新视图从 0 开始），观测基准一起复位。
@@ -3338,7 +3882,144 @@ impl AppShell {
         // 切片 6b：活动文档变了（轮换/apply 的前置条件）。
         #[cfg(feature = "sync-ui")]
         self.dev_sync_push_active_document(cx);
+        if record_history {
+            self.record_history(node_id);
+        }
         cx.notify();
+        true
+    }
+
+    /// 记一条浏览器式历史；游标后面的 forward 分支在打开新笔记时丢弃。
+    fn record_history(&mut self, node_id: String) {
+        if self
+            .history
+            .get(self.history_index)
+            .is_some_and(|entry| entry.node_id == node_id)
+        {
+            return;
+        }
+        self.history.truncate(self.history_index + 1);
+        self.history.push(HistoryEntry { node_id });
+        if self.history.len() > 100 {
+            let overflow = self.history.len() - 100;
+            self.history.drain(0..overflow);
+            self.history_index = self.history_index.saturating_sub(overflow);
+        }
+        self.history_index = self.history.len().saturating_sub(1);
+    }
+
+    /// 前进/后退：`delta = -1` 后退，`+1` 前进；失败不移动游标。
+    fn navigate_history(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if !self.commit_title_edit(cx) {
+            return;
+        }
+        let target = self.history_index as isize + delta;
+        if target < 0 || target as usize >= self.history.len() {
+            return;
+        }
+        let target = target as usize;
+        let node_id = self.history[target].node_id.clone();
+        let Some(index) = self.tree.iter().position(|entry| entry.node_id == node_id) else {
+            self.notice = Some("历史里的笔记已不存在".to_owned());
+            cx.notify();
+            return;
+        };
+        if self.open_entry_with_history(index, false, cx) {
+            self.history_index = target;
+            eprintln!(
+                "[menghunote] 历史{} → node={node_id}（{}/{}）",
+                if delta < 0 { "后退" } else { "前进" },
+                self.history_index + 1,
+                self.history.len()
+            );
+        }
+    }
+
+    /// 当前打开笔记的标题（顶部标题行/测试用）。
+    #[must_use]
+    pub fn active_note_title(&self) -> Option<String> {
+        let active = self.active.as_ref()?;
+        self.tree
+            .iter()
+            .find(|entry| entry.node_id == active.node_id)
+            .map(|entry| entry.title.clone())
+    }
+
+    /// 当前笔记的侧栏路径（`文件夹 / 子文件夹 / 标题`）。
+    #[must_use]
+    pub fn active_note_path(&self) -> Option<String> {
+        let active = self.active.as_ref()?;
+        let mut titles = Vec::new();
+        let mut cursor = Some(active.node_id.clone());
+        while let Some(node_id) = cursor {
+            let Some(entry) = self.tree.iter().find(|entry| entry.node_id == node_id) else {
+                break;
+            };
+            titles.push(entry.title.clone());
+            cursor = entry.parent_id.clone();
+            if titles.len() > 64 {
+                break;
+            }
+        }
+        titles.reverse();
+        Some(titles.join(" / "))
+    }
+
+    /// 点顶部标题进入大标题输入框（标题语义复用侧栏的 IME 输入框）。
+    fn begin_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            return;
+        }
+        if self.editing.is_some() && !self.commit_editing_from_outside(cx) {
+            return;
+        }
+        let Some(title) = self.active_note_title() else {
+            return;
+        };
+        let input = cx.new(|cx| RenameInput::new_note_title(&title, cx));
+        cx.subscribe(
+            &input,
+            |shell, _input, event: &RenameEvent, cx| match event {
+                RenameEvent::Commit(title) => shell.commit_title_rename(title.clone(), cx),
+                RenameEvent::Blank => {
+                    shell.notice = Some("标题不能为空".to_owned());
+                    cx.notify();
+                }
+                RenameEvent::Cancel => {
+                    shell.title_edit = None;
+                    cx.notify();
+                }
+                RenameEvent::Advance { .. } | RenameEvent::Changed => {}
+            },
+        )
+        .detach();
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.title_edit = Some(input);
+        cx.notify();
+    }
+
+    /// 提交顶部标题；没有标题输入框时直接 `true`（不阻拦后续动作）。
+    fn commit_title_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(input) = self.title_edit.as_ref() else {
+            return true;
+        };
+        let title = input.read(cx).text().trim().to_owned();
+        if title.is_empty() {
+            self.notice = Some("标题不能为空".to_owned());
+            cx.notify();
+            return false;
+        }
+        self.commit_title_rename(title, cx);
+        true
+    }
+
+    fn commit_title_rename(&mut self, title: String, cx: &mut Context<Self>) {
+        self.title_edit = None;
+        let Some(node_id) = self.active.as_ref().map(|active| active.node_id.clone()) else {
+            cx.notify();
+            return;
+        };
+        self.commit_rename_node(node_id, title, cx);
     }
 
     /// 粘贴/拖放导入的结果 → 侧栏提示行（`import-error` / `import-notice`）。
@@ -3412,9 +4093,18 @@ impl AppShell {
     }
 
     pub fn close_all(&mut self, cx: &mut Context<Self>) {
+        // ADR 0024 §2.2：关窗前 flush 当前笔记的最后一个历史版本（失败只提示）。
+        //
+        // 生产入口（main.rs / AppRoot Main）已经用 `window.on_window_should_close`
+        // 调本函数；`on_should_close` 是**单回调**槽位，所以这里绝不能再注册第二个
+        // 关窗回调（会覆盖掉有界排空）。关窗/关应用的捕获统一收敛到这一处。
+        self.flush_active_history(cx);
         // dev-only 同步面板：先请求停止（非阻塞，GUI 不 join）。
         #[cfg(feature = "sync-ui")]
         self.shutdown_dev_sync(cx);
+        // 画布覆盖层与活动笔记绑定：关窗前先丢弃（不写正文，与「关闭（不保存）」同义）。
+        self.drawing = None;
+        self.drawing_events = None;
         let Some(active) = self.active.take() else {
             return;
         };
@@ -3974,6 +4664,26 @@ impl AppShell {
                     )
                     .child(
                         div()
+                            .id("sidebar-new-drawing")
+                            // 测试元数据（只读断言用）：新建画布笔记（`.excalidraw`）。
+                            .debug_selector(|| "sidebar-new-drawing".to_string())
+                            .flex_1()
+                            .h(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(crate::ui_text::sidebar_new_drawing()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    shell.create_drawing(cx);
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
                             .id("sidebar-export")
                             .flex_1()
                             .h(px(22.0))
@@ -4086,7 +4796,13 @@ impl AppShell {
                 .px_2()
                 .text_size(px(12.0))
                 .text_color(color)
-                .child(SharedString::from(label))
+                // 可读的动作 selector（`menu-item-history` 等）；外层
+                // `menu-item-<slot>` 仍保留给几何/下标断言。
+                .child(
+                    div()
+                        .debug_selector(move || format!("menu-item-{}", action.label()))
+                        .child(SharedString::from(label)),
+                )
         };
 
         Some(
@@ -4199,7 +4915,18 @@ impl AppShell {
                             } else {
                                 "删除"
                             };
-                            this.child(item(1, label, theme::danger_text(), MenuAction::Delete))
+                            this.child(item(
+                                1,
+                                crate::note_history::MENU_HISTORY_LABEL,
+                                theme::text_color(),
+                                MenuAction::History,
+                            ))
+                            .child(item(
+                                2,
+                                label,
+                                theme::danger_text(),
+                                MenuAction::Delete,
+                            ))
                         }),
                 )
                 .into_any_element(),
@@ -4903,6 +5630,62 @@ impl AppShell {
             .text_color(theme::status_bar_text())
             .child(SharedString::from(self.vault_label.clone()));
         let mut right = div().flex().flex_row().items_center().gap_2();
+        if self.active_is_drawing() {
+            let title = self.active_title();
+            right = right
+                .child(
+                    div()
+                        .debug_selector(|| "drawing-title".to_string())
+                        .max_w(px(220.0))
+                        .truncate()
+                        .text_color(theme::text_color())
+                        .child(SharedString::from(crate::ui_text::drawing_bar_title(
+                            crate::drawing::display_title(&title),
+                        ))),
+                )
+                .child(
+                    div()
+                        .id("drawing-save")
+                        .debug_selector(|| "drawing-save".to_string())
+                        .h_full()
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(theme::text_color())
+                        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                        .child(SharedString::from(crate::ui_text::drawing_save()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                if let Some(overlay) = shell.drawing.clone() {
+                                    shell.save_drawing_overlay(overlay, cx);
+                                }
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("drawing-close")
+                        .debug_selector(|| "drawing-close".to_string())
+                        .h_full()
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(theme::status_bar_text())
+                        .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                        .child(SharedString::from(crate::ui_text::drawing_close()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                shell.close_drawing_overlay(cx);
+                            }),
+                        ),
+                );
+        }
         if self.active.is_some() {
             right = right.child(
                 div()
@@ -5171,9 +5954,157 @@ impl AppShell {
         )
     }
 
+    /// 编辑器顶部：历史前进/后退 + 路径面包屑 + 可编辑大标题。
+    fn render_note_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active = self.active.as_ref()?;
+        let entry = self
+            .tree
+            .iter()
+            .find(|entry| entry.node_id == active.node_id)?;
+        let path = self
+            .active_note_path()
+            .unwrap_or_else(|| entry.title.clone());
+        let can_back = self.history_index > 0;
+        let can_forward = self.history_index + 1 < self.history.len();
+        let title = entry.title.clone();
+        let title_edit = self.title_edit.clone();
+        let back_color = if can_back {
+            theme::text_color()
+        } else {
+            theme::status_bar_text()
+        };
+        let forward_color = if can_forward {
+            theme::text_color()
+        } else {
+            theme::status_bar_text()
+        };
+        let back = div()
+            .id("note-nav-back")
+            .debug_selector(|| "note-nav-back".to_string())
+            .w(px(24.0))
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .text_size(px(15.0))
+            .text_color(back_color)
+            .when(can_back, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.navigate_history(-1, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+            })
+            .child("←");
+        let forward = div()
+            .id("note-nav-forward")
+            .debug_selector(|| "note-nav-forward".to_string())
+            .w(px(24.0))
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .text_size(px(15.0))
+            .text_color(forward_color)
+            .when(can_forward, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(theme::sidebar_selected_bg()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                            shell.navigate_history(1, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+            })
+            .child("→");
+        let title_row: AnyElement = if let Some(input) = title_edit {
+            div()
+                .debug_selector(|| "note-title-edit".to_string())
+                .h(px(48.0))
+                .w_full()
+                .child(input)
+                .into_any_element()
+        } else {
+            div()
+                .id("note-title")
+                .debug_selector(|| "note-title".to_string())
+                .h(px(48.0))
+                .w_full()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(28.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::text_color())
+                .cursor_pointer()
+                .child(SharedString::from(title))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                        shell.begin_title_edit(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .into_any_element()
+        };
+        Some(
+            div()
+                .id("note-header")
+                .debug_selector(|| "note-header".to_string())
+                .flex()
+                .flex_col()
+                .w_full()
+                .flex_shrink_0()
+                .px_3()
+                .pt_2()
+                .pb_2()
+                .border_b(px(1.0))
+                .border_color(theme::sidebar_border())
+                .bg(theme::window_bg())
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(back)
+                        .child(forward)
+                        .child(
+                            div()
+                                .id("note-path")
+                                .debug_selector(|| "note-path".to_string())
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(12.0))
+                                .text_color(theme::status_bar_text())
+                                .child(SharedString::from(path)),
+                        ),
+                )
+                .child(title_row)
+                .into_any_element(),
+        )
+    }
+
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self.active.as_ref().map(|active| active.view.clone());
+        let header = self.render_note_header(cx);
+        // 画布笔记的正文是 JSON：**永远不把源码铺到编辑区**。
+        // 覆盖层实际渲染时它盖住整窗；关闭/让位时这里用占位页盖住 EditorView。
+        let canvas_placeholder = self.active_is_drawing()
+            && !(self.drawing.is_some() && !self.drawing_yields_to_modal());
         let editor = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -5181,7 +6112,13 @@ impl AppShell {
             .min_w(px(0.0))
             // 测试元数据（只读断言用）：右侧编辑器面板（空态也存在）。
             .debug_selector(|| "editor-pane".to_string())
-            .when_some(view, |this, view| this.child(view))
+            .when_some(header, |this, header| this.child(header))
+            .when_some(view, |this, view| {
+                this.child(div().flex_1().min_h(px(0.0)).w_full().child(view))
+            })
+            .when(canvas_placeholder, |this| {
+                this.child(self.render_drawing_placeholder(cx))
+            })
             .when(self.active.is_none(), |this| {
                 this.child(
                     div()
@@ -5194,16 +6131,33 @@ impl AppShell {
                         .child(SharedString::from("没有打开的笔记（从左侧选一篇）")),
                 )
             });
+        let drawing = self.render_drawing_overlay();
         div()
+            .relative()
             .flex()
             .flex_row()
             .flex_1()
             .h_full()
             .min_w(px(0.0))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                    shell.navigate_history(-1, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                    shell.navigate_history(1, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(editor)
             .when(self.backlinks_open && self.active.is_some(), |this| {
                 this.child(self.render_backlinks_panel(cx))
             })
+            .when_some(drawing, |this, overlay| this.child(overlay))
     }
 }
 
@@ -8260,6 +9214,16 @@ impl AppShell {
 fn vault_asset_provider(vault: &Vault) -> crate::editor::object_image::SharedAssetProvider {
     let vault = vault.clone();
     std::sync::Arc::new(move |hash: &str| -> Option<Vec<u8>> {
+        // 画布嵌入（ADR 0025 后续切片）：`drawing://<theme>/<target>` 是合成 key，
+        // 不是内容寻址资产。provider 在 ImageService 的后台线程里解析目标笔记、
+        // 读取正文并渲染 PNG；找不到/损坏都返回 None（编辑器显示占位，不 panic）。
+        if let Some((theme, target)) = crate::drawing::parse_drawing_asset_key(hash) {
+            return drawing_preview_bytes(
+                &vault,
+                target,
+                crate::drawing::drawing_theme_is_dark(theme),
+            );
+        }
         let hash = asset_hash_bytes(hash)?;
         match menghunote_storage::asset_bytes(&vault, hash) {
             Ok(bytes) => bytes,
@@ -8270,6 +9234,93 @@ fn vault_asset_provider(vault: &Vault) -> crate::editor::object_image::SharedAss
             }
         }
     })
+}
+
+/// 按标题/路径解析嵌入目标，读取画布正文并渲染成 PNG。
+///
+/// 解析规则（与 wiki 链接一致的保守子集，避免歧义误开）：
+/// 1. 完整路径（大小写不敏感）唯一匹配优先；
+/// 2. 不含 `/` 时按标题（大小写不敏感）唯一匹配；
+/// 3. 其它情况（无匹配/多处同分）返回 `None` → 编辑器显示「画布笔记不存在」。
+fn drawing_preview_bytes(vault: &Vault, target: &str, dark: bool) -> Option<Vec<u8>> {
+    let target = target.trim().trim_matches('/');
+    if target.is_empty() {
+        return None;
+    }
+    let notes = match menghunote_storage::list_notes(vault) {
+        Ok(notes) => notes,
+        Err(error) => {
+            eprintln!("[menghunote] 读取画布目标失败（降级占位）：{error}");
+            return None;
+        }
+    };
+    let index = resolve_drawing_target(&notes, target)?;
+    let entry = notes.get(index)?;
+    let body_doc_id = entry.body_doc_id.as_deref()?;
+    let body = match crate::templates::read_body_source(vault, body_doc_id) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!(
+                "[menghunote] 读取画布「{}」正文失败（降级占位）：{error}",
+                entry.title
+            );
+            return None;
+        }
+    };
+    match crate::drawing::scene_json_to_png(&body, dark) {
+        Ok(png) => Some(png),
+        Err(error) => {
+            eprintln!(
+                "[menghunote] 渲染画布预览「{}」失败（降级占位）：{error}",
+                entry.title
+            );
+            None
+        }
+    }
+}
+
+/// 嵌入目标 → 笔记下标（完整路径优先、标题唯一匹配兜底）。
+fn resolve_drawing_target(notes: &[TreeEntry], target: &str) -> Option<usize> {
+    let normalized = target.to_lowercase();
+    let mut path_matches = Vec::new();
+    let mut title_matches = Vec::new();
+    for (index, entry) in notes.iter().enumerate() {
+        if !entry.is_note() {
+            continue;
+        }
+        let path = tree_path_for_entry(notes, index);
+        if path.to_lowercase() == normalized {
+            path_matches.push(index);
+        }
+        if !normalized.contains('/') && entry.title.to_lowercase() == normalized {
+            title_matches.push(index);
+        }
+    }
+    if path_matches.len() == 1 {
+        return path_matches.first().copied();
+    }
+    if path_matches.is_empty() && title_matches.len() == 1 {
+        return title_matches.first().copied();
+    }
+    None
+}
+
+/// `TreeEntry` 的完整路径（目录标题 + 笔记标题，`/` 分隔）。
+fn tree_path_for_entry(entries: &[TreeEntry], index: usize) -> String {
+    let mut titles = Vec::new();
+    let mut cursor = Some(index);
+    for _ in 0..64 {
+        let Some(entry) = cursor.and_then(|current| entries.get(current)) else {
+            break;
+        };
+        titles.push(entry.title.clone());
+        cursor = entry
+            .parent_id
+            .as_deref()
+            .and_then(|parent| entries.iter().position(|entry| entry.node_id == parent));
+    }
+    titles.reverse();
+    titles.join("/")
 }
 
 /// `asset://` 里的 64 个小写 hex → 32 字节哈希（非法长度/字符返回 `None`）。
@@ -8573,6 +9624,8 @@ impl Render for AppShell {
         let template_picker = self.template_picker.clone();
         // 图谱覆盖层：全屏、盖在编辑器上（不挤压编辑器，也不卸载它）。
         let graph = self.render_graph(window, cx);
+        // 历史时间线覆盖层（ADR 0024）：同样只盖一层，不卸载编辑器。
+        let history = self.history_panel.clone();
         // 侧栏排序菜单：根层绝对定位（侧栏是 `overflow_y_scroll`，放里面会被裁掉）。
         let sort_menu = self.render_sort_menu(cx);
         #[cfg(feature = "sync-ui")]
@@ -8627,8 +9680,9 @@ impl Render for AppShell {
         let root = root.when_some(daily_template_picker, |this, picker| this.child(picker));
         // 模板选择器在设置页之上、图谱之下（二者不会同时打开）。
         let root = root.when_some(template_picker, |this, picker| this.child(picker));
-        // 图谱在最上层：覆盖层打开时抢焦点，搜索/菜单/设置不可能同时被操作。
+        // 图谱覆盖层；历史时间线在最上层（两者不会同时打开：打开历史时菜单已关闭）。
         root.when_some(graph, |this, graph| this.child(graph))
+            .when_some(history, |this, panel| this.child(panel))
     }
 }
 
@@ -8637,6 +9691,8 @@ impl Render for AppShell {
 enum MenuAction {
     /// 行内重命名（目录与笔记都有）。
     Rename,
+    /// 打开该笔记的历史时间线覆盖层（ADR 0024 H1）。
+    History,
     /// 在目标目录里新建笔记。
     NewNote,
     /// 在目标目录里新建文件夹。
@@ -8645,7 +9701,7 @@ enum MenuAction {
     Delete,
 }
 
-/// 菜单项集合（纯函数）：目录 = 新建两项；笔记 = 删除一项。
+/// 菜单项集合（纯函数）：目录 = 重命名 + 新建两项；笔记 = 重命名 + 历史记录 + 删除。
 #[must_use]
 fn menu_items(is_folder: bool) -> &'static [MenuAction] {
     const FOLDER: [MenuAction; 3] = [
@@ -8653,7 +9709,7 @@ fn menu_items(is_folder: bool) -> &'static [MenuAction] {
         MenuAction::NewNote,
         MenuAction::NewFolder,
     ];
-    const NOTE: [MenuAction; 2] = [MenuAction::Rename, MenuAction::Delete];
+    const NOTE: [MenuAction; 3] = [MenuAction::Rename, MenuAction::History, MenuAction::Delete];
     if is_folder {
         &FOLDER
     } else {
@@ -8697,6 +9753,7 @@ impl MenuAction {
     const fn label(self) -> &'static str {
         match self {
             Self::Rename => "rename",
+            Self::History => "history",
             Self::NewNote => "new-note",
             Self::NewFolder => "new-folder",
             Self::Delete => "delete",
@@ -8861,6 +9918,29 @@ fn unique_root_title(base: &str, tree: &[TreeEntry]) -> String {
         }
     }
     base.to_owned()
+}
+
+/// 画布笔记的去重标题：`未命名画布.excalidraw`、`未命名画布 2.excalidraw`……
+///
+/// 不能直接用 [`unique_title`]：它把序号追加到**末尾**，会得到
+/// `未命名画布.excalidraw 2`——后缀不再在最后，就不再被识别为画布笔记。
+/// 这里把序号插在后缀之前，保证每个候选都仍是画布。
+#[must_use]
+fn unique_drawing_title(tree: &[TreeEntry]) -> String {
+    let base = format!("{DEFAULT_DRAWING_TITLE}{}", drawing::DRAWING_SUFFIX);
+    if !tree.iter().any(|entry| entry.title == base) {
+        return base;
+    }
+    for suffix in 2..1000 {
+        let candidate = format!(
+            "{DEFAULT_DRAWING_TITLE} {suffix}{}",
+            drawing::DRAWING_SUFFIX
+        );
+        if !tree.iter().any(|entry| entry.title == candidate) {
+            return candidate;
+        }
+    }
+    base
 }
 
 /// 当前时间戳（毫秒，i64）：结构文档的 `created_at` / `edited_at` 用。
@@ -9057,14 +10137,15 @@ mod tests {
             ],
             "目录菜单 = 重命名 + 两个新建"
         );
-        // 笔记：重命名 / 删除
+        // 笔记：重命名 / 历史记录 / 删除（ADR 0024）
         assert_eq!(
             menu_items(false),
-            &[MenuAction::Rename, MenuAction::Delete],
-            "笔记菜单 = 重命名 + 删除"
+            &[MenuAction::Rename, MenuAction::History, MenuAction::Delete],
+            "笔记菜单 = 重命名 + 历史记录 + 删除"
         );
-        // 高度随项数变化，保证夹取用对尺寸
-        assert!(menu_height(true) > menu_height(false));
+        // 目录与笔记现在都是 3 项：高度相等，夹取仍按项数计算。
+        assert_eq!(menu_height(true), menu_height(false));
+        assert_eq!(menu_height(false), 24.0 + 3.0 * 26.0 + 12.0);
     }
 
     #[test]
@@ -9120,7 +10201,7 @@ mod tests {
             ),
             Some(MenuAction::NewFolder)
         );
-        // 笔记菜单两项：重命名 / 删除；再往下就出界
+        // 笔记菜单三项：重命名 / 历史记录 / 删除；再往下就出界
         assert_eq!(
             menu_hit(
                 Point {
@@ -9141,13 +10222,24 @@ mod tests {
                 origin,
                 false
             ),
-            Some(MenuAction::Delete)
+            Some(MenuAction::History)
         );
         assert_eq!(
             menu_hit(
                 Point {
                     x: px(80.0),
                     y: px(129.0)
+                },
+                origin,
+                false
+            ),
+            Some(MenuAction::Delete)
+        );
+        assert_eq!(
+            menu_hit(
+                Point {
+                    x: px(80.0),
+                    y: px(155.0)
                 },
                 origin,
                 false

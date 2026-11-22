@@ -77,6 +77,7 @@ use menghunote_markdown::{
 use menghunote_text::{CoordError, SourceByte, SourceRange, UnicodeScalar};
 
 use crate::model::block::BlockRun;
+use crate::model::frontmatter::{self, Frontmatter};
 use crate::model::object::{ObjectBlock, ObjectKind};
 use crate::model::projection::{ProjectionMap, ProjectionPiece};
 use crate::model::selection::Selection;
@@ -626,6 +627,76 @@ impl MarkdownMermaid {
     }
 }
 
+/// 一个内嵌画布笔记（`![[目标.excalidraw]]`，ADR 0025 后续切片）。
+///
+/// 与 [`MarkdownImage`] / [`MarkdownTable`] / [`MarkdownMermaid`] 一样是**附加
+/// 元数据**：投影仍通过 [`ObjectBlock`]（`SegmentKind::Object`）实现，本类型只提供
+/// 整行源码跨度、目标/别名与行号，**不产生任何新文本**。
+///
+/// # 语义
+///
+/// - 整行源码 `![[流程图.excalidraw]]` 在 display 上被替换成**一个图片式占位**，
+///   预览图由 app 用宿主注入的资产 provider 生成（editor 不读库、不渲染）；
+/// - 点击对象 = 打开目标画布笔记（宿主负责解析标题/路径），光标不落进对象内部；
+/// - `target` 是 `|` **之前**的目标原文（已去首尾空白，大小写不敏感地以
+///   `.excalidraw` 结尾）；`alias` 是 `|` 之后的显示文本（可选，仅用于占位文案）。
+///
+/// # block 判定
+///
+/// 是否可投影成 Object 由 Markdown 解析器（[`menghunote_markdown::DrawingSpan`]）
+/// 按“整行独占 + 普通段落上下文 + 非空 `.excalidraw` 目标”判定；editor 只做坐标
+/// 换算，不重复一套平行规则。`block = false` 的嵌入不会出现在
+/// [`MarkdownDocument::drawings`] 里（继续按普通文本显示）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownDrawing {
+    span: SourceRange,
+    target: String,
+    target_span: SourceRange,
+    alias: Option<String>,
+    line: usize,
+    block: bool,
+}
+
+impl MarkdownDrawing {
+    /// 整行源码区间（`![[...]]`；不含行尾空白与换行）。
+    #[must_use]
+    pub const fn span(&self) -> SourceRange {
+        self.span
+    }
+
+    /// 目标笔记标题原文（`|` 之前，已去首尾空白；大小写不敏感地以 `.excalidraw` 结尾）。
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// 目标笔记标题在源码里的区间（用于诊断/将来重命名联动）。
+    #[must_use]
+    pub const fn target_span(&self) -> SourceRange {
+        self.target_span
+    }
+
+    /// 别名（`|` 之后的显示文本，已去首尾空白）；没有别名时 `None`。
+    ///
+    /// 只用于占位文案：预览就绪时画的是画布图，别名不参与绘制。
+    #[must_use]
+    pub fn alias(&self) -> Option<&str> {
+        self.alias.as_deref()
+    }
+
+    /// 源码行号（0 起；也是对象行）。
+    #[must_use]
+    pub const fn line(&self) -> usize {
+        self.line
+    }
+
+    /// 是否整行独占、可投影成 Object Block。
+    #[must_use]
+    pub const fn is_block(&self) -> bool {
+        self.block
+    }
+}
+
 /// Markdown 扫描 + 显现计算的全部错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkdownError {
@@ -678,13 +749,17 @@ impl From<CoordError> for MarkdownError {
 pub struct MarkdownDocument {
     source: String,
     constructs: Vec<MarkdownConstruct>,
+    /// 文档开头的 YAML frontmatter（属性面板）：源码整体隐藏，面板在 app 层。
+    frontmatter: Option<Frontmatter>,
     /// 图片构造（S2a）：object 投影与 app 的图片加载都从这里取。
     images: Vec<MarkdownImage>,
     /// 表格块（S3a）：object 投影与 app 的只读表格绘制都从这里取。
     tables: Vec<MarkdownTable>,
     /// 整块 fenced mermaid（M2）：object 投影与 app 的后台渲染从 content 取源码。
     mermaid: Vec<MarkdownMermaid>,
-    /// 全部整块 Object（图片 + 表格 + Mermaid，按 `span` 起点排序）：
+    /// 内嵌画布笔记（ADR 0025 后续切片）：object 投影、点击打开与预览 key 从这里取。
+    drawings: Vec<MarkdownDrawing>,
+    /// 全部整块 Object（图片 + 表格 + Mermaid + 画布嵌入，按 `span` 起点排序）：
     /// 投影/选中/源码切换共用。
     objects: Vec<ObjectBlock>,
     /// wiki 链接（L1）：点击/未解析样式/重命名改写用。
@@ -700,11 +775,13 @@ pub struct MarkdownDocument {
 impl MarkdownDocument {
     /// 解析源码。空文档、纯文本都返回空构造表（不报错）。
     pub fn parse(source: &str) -> Result<Self, MarkdownError> {
+        let frontmatter = frontmatter::parse(source);
         let semantic = semantic::parse(source);
         let images = collect_images(source, &semantic);
         let tables = collect_tables(source, &semantic);
         let mermaid = collect_mermaid(source, &semantic);
-        let objects = collect_objects(&images, &tables, &mermaid);
+        let drawings = collect_drawings(source, &semantic);
+        let objects = collect_objects(&images, &tables, &mermaid, &drawings);
         let wiki_links = collect_wiki_links(source, &semantic);
         let links = collect_links(source, &semantic);
         let legacy = legacy_constructs(source)?;
@@ -727,16 +804,24 @@ impl MarkdownDocument {
         });
         Ok(Self {
             source: source.to_owned(),
+            frontmatter,
             constructs,
             images,
             tables,
             mermaid,
+            drawings,
             objects,
             wiki_links,
             links,
             semantic,
             inline_fallback,
         })
+    }
+
+    /// 文档开头的 YAML frontmatter（如果存在）。
+    #[must_use]
+    pub fn frontmatter(&self) -> Option<&Frontmatter> {
+        self.frontmatter.as_ref()
     }
 
     /// 全部图片构造（按文档顺序；含无法成为 Object Block 的混排/行内图片）。
@@ -788,7 +873,13 @@ impl MarkdownDocument {
         &self.mermaid
     }
 
-    /// 全部整块 Object（图片 + 表格 + Mermaid，按源码顺序）。
+    /// 全部内嵌画布笔记（`block = true`；按文档顺序）。
+    #[must_use]
+    pub fn drawings(&self) -> &[MarkdownDrawing] {
+        &self.drawings
+    }
+
+    /// 全部整块 Object（图片 + 表格 + Mermaid + 画布嵌入，按源码顺序）。
     ///
     /// 投影、选中、源码切换、删除**只走这一条路径**；不要再按种类各写一套。
     #[must_use]
@@ -829,6 +920,15 @@ impl MarkdownDocument {
             return None;
         }
         self.mermaid.get(object.index())
+    }
+
+    /// Object 对应的画布嵌入载荷；不是画布对象时 `None`。
+    #[must_use]
+    pub fn object_drawing(&self, object: &ObjectBlock) -> Option<&MarkdownDrawing> {
+        if object.kind() != ObjectKind::Drawing {
+            return None;
+        }
+        self.drawings.get(object.index())
     }
 
     /// 新解析器的完整语义模型（列表块树 / 行信息）。
@@ -963,7 +1063,7 @@ impl MarkdownDocument {
     /// - 混排/行内图片永远不产生 Object 片段（首版保持源码，选择写死在这里）；
     /// - **Mermaid**：caret（含两端）或非空选区与 block span 相交时，该块不产生
     ///   Object 片段，源码原样可见/可编辑；移出后下一次投影重新产生 Object。
-    ///   图片/表格**不**使用这条规则（保持原来的整块选中行为）；
+    ///   图片/表格/画布**不**使用这条规则（保持原来的整块选中行为）；
     /// - 万一对象区间与隐藏/替换片段重叠（防御：不重叠是 block 判定的前提），
     ///   跳过该对象 —— 宁可不投影，也不产生错位。
     pub fn projection_pieces_with_objects(
@@ -993,6 +1093,10 @@ impl MarkdownDocument {
         cell: Option<ProjectionCellReveal>,
     ) -> Result<Vec<ProjectionPiece>, MarkdownError> {
         let mut hidden = self.hidden_ranges_for_selection_filtered(selection, false)?;
+        // frontmatter 永远不显示源码：面板在 app 层；不参与 selection 显现。
+        if let Some(frontmatter) = &self.frontmatter {
+            hidden.push(self.range(frontmatter.span.start, frontmatter.span.end)?);
+        }
         let revealed = self.list_marker_reveals(selection)?;
         // Mermaid 的“进入源码”规则（ADR 0019 §18.8）：caret/选区与 block 源码相交时，
         // 该块**不产生 Object 片段**，整段源码保持 Copy 可见/可编辑；移出后才投影。
@@ -1026,6 +1130,10 @@ impl MarkdownDocument {
             ));
         }
         for line in &self.semantic.lines {
+            // 分隔线：源码整行隐藏，绘制层在空行位置画一条横线。
+            if line.kind == crate::MarkdownLineKind::ThematicBreak {
+                hidden.push(self.range(line.content.start, line.content.end)?);
+            }
             let Some(list) = &line.list else {
                 continue;
             };
@@ -1073,9 +1181,9 @@ impl MarkdownDocument {
         }
         hidden = kept;
         let mut hidden = merge_ranges(&self.source, hidden)?;
-        // 整块 Object（图片 / 表格 / Mermaid）：不在显式源码模式里 → 原子对象片段。
+        // 整块 Object（图片 / 表格 / Mermaid / 画布）：不在显式源码模式里 → 原子对象片段。
         //
-        // 图片/表格/ Mermaid 走**同一条**路径；只有 Mermaid 额外有一条“**折叠 caret**
+        // 四类对象走**同一条**路径；只有 Mermaid 额外有一条“**折叠 caret**
         // 进入即显示源码”的规则：非空选区跨过 block 时仍保持 Object（与图片/表格
         // 一致），避免拖选经过时块突然变长。
         //
@@ -1580,13 +1688,57 @@ fn collect_mermaid(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownMerma
     blocks
 }
 
-/// 图片 + 表格 + Mermaid → 统一的 Object 列表（按源码顺序）。
+/// 新解析器的内嵌画布嵌入 → editor 的 [`MarkdownDrawing`]（ADR 0025 后续切片）。
 ///
-/// 只收 Block 块：`block = false` 的图片/表格/Mermaid 保持源码原样显示。
+/// 只收**可投影成 Object** 的整行独占写法（`block = true`）；坐标不合法（越界/
+/// 目标为空）的条目直接跳过（保守：源码原样显示）。目标/别名的 `String` 都从源码
+/// 切片得到（不重新序列化），区间已经是解析器 trim 过的。
+fn collect_drawings(source: &str, semantic: &ParsedMarkdown) -> Vec<MarkdownDrawing> {
+    let mut drawings = Vec::new();
+    for drawing in &semantic.drawings {
+        if !drawing.block {
+            continue;
+        }
+        let (Some(span), Some(target_span)) = (
+            convert_span(source, drawing.span),
+            convert_span(source, drawing.target),
+        ) else {
+            continue;
+        };
+        let Some(target) = source.get(drawing.target.start..drawing.target.end) else {
+            continue;
+        };
+        let target = target.to_owned();
+        if target.is_empty() {
+            continue;
+        }
+        let alias = drawing.alias.and_then(|alias| {
+            source
+                .get(alias.start..alias.end)
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned)
+        });
+        drawings.push(MarkdownDrawing {
+            span,
+            target,
+            target_span,
+            alias,
+            line: drawing.line,
+            block: true,
+        });
+    }
+    drawings
+}
+
+/// 图片 + 表格 + Mermaid + 画布嵌入 → 统一的 Object 列表（按源码顺序）。
+///
+/// 只收 Block 块：`block = false` 的图片/表格/Mermaid/画布嵌入保持源码原样显示。
 fn collect_objects(
     images: &[MarkdownImage],
     tables: &[MarkdownTable],
     mermaid: &[MarkdownMermaid],
+    drawings: &[MarkdownDrawing],
 ) -> Vec<ObjectBlock> {
     let mut objects = Vec::new();
     for (index, image) in images.iter().enumerate() {
@@ -1622,6 +1774,18 @@ fn collect_objects(
             mermaid.span(),
             mermaid.line(),
             mermaid.end_line(),
+            index,
+        ));
+    }
+    for (index, drawing) in drawings.iter().enumerate() {
+        if !drawing.is_block() {
+            continue;
+        }
+        objects.push(ObjectBlock::new(
+            ObjectKind::Drawing,
+            drawing.span(),
+            drawing.line(),
+            drawing.line(),
             index,
         ));
     }
@@ -2310,5 +2474,131 @@ fn detect_heading(bytes: &[u8], at: usize, end: usize) -> Option<usize> {
         Some(run_end + 1)
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 单元测试（ADR 0025 后续切片：内嵌画布 Object Block）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod drawing_tests {
+    use super::{MarkdownDocument, ObjectKind};
+    use crate::model::projection::ProjectionMap;
+    use crate::model::selection::Selection;
+    use crate::{UnicodeScalar, OBJECT_PLACEHOLDER};
+
+    const SOURCE: &str = "前言\n\n![[流程图.excalidraw]]\n\n后文\n";
+
+    fn parse(source: &str) -> MarkdownDocument {
+        MarkdownDocument::parse(source).expect("Markdown 解析不应失败")
+    }
+
+    fn project(doc: &MarkdownDocument, caret: usize, revealed: &[usize]) -> ProjectionMap {
+        ProjectionMap::from_markdown_with_lists_and_objects(
+            doc,
+            Selection::caret(UnicodeScalar::new(caret)),
+            revealed,
+        )
+    }
+
+    #[test]
+    fn drawing_is_an_object_with_target_and_line() {
+        let doc = parse(SOURCE);
+        assert_eq!(doc.drawings().len(), 1, "整行画布嵌入必须被解析");
+        let drawing = &doc.drawings()[0];
+        assert_eq!(drawing.target(), "流程图.excalidraw");
+        assert_eq!(drawing.alias(), None);
+        assert_eq!(drawing.line(), 2, "对象行 = 整行画布嵌入所在行");
+        assert!(drawing.is_block());
+        let start = SOURCE.find("![[流程图").expect("嵌入起点");
+        let end = SOURCE.find("]]\n\n后文").expect("嵌入终点") + 2;
+        assert_eq!(
+            (drawing.span().start().get(), drawing.span().end().get()),
+            (start, end)
+        );
+
+        // 统一 Object 列表：恰好一个 Drawing 对象，index 指回 drawings()[0]。
+        let objects = doc.objects();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].kind(), ObjectKind::Drawing);
+        assert!(objects[0].kind().is_drawing());
+        assert_eq!(objects[0].line(), 2);
+        assert_eq!(objects[0].span(), drawing.span());
+        assert_eq!(
+            doc.object_at_line(2).map(|object| object.kind()),
+            Some(ObjectKind::Drawing)
+        );
+        assert!(doc.object_image(&objects[0]).is_none());
+        assert!(doc.object_table(&objects[0]).is_none());
+        assert!(doc.object_mermaid(&objects[0]).is_none());
+        assert_eq!(
+            doc.object_drawing(&objects[0])
+                .map(|drawing| drawing.target()),
+            Some("流程图.excalidraw")
+        );
+    }
+
+    #[test]
+    fn drawing_projection_hides_source_and_shows_one_placeholder() {
+        let doc = parse(SOURCE);
+        let caret = SOURCE.chars().count();
+        let map = project(&doc, caret, &[]);
+        let expected = format!("前言\n\n{OBJECT_PLACEHOLDER}\n\n后文\n");
+        assert_eq!(map.display_text().as_ref(), expected);
+        let objects = map.object_segments();
+        assert_eq!(objects.len(), 1, "整行画布嵌入一个 Object 段");
+        assert_eq!(objects[0].0, doc.drawings()[0].span());
+        assert_eq!(
+            objects[0].1.end - objects[0].1.start,
+            crate::OBJECT_PLACEHOLDER_LEN
+        );
+    }
+
+    #[test]
+    fn revealed_drawing_line_shows_source_again() {
+        let doc = parse(SOURCE);
+        let caret = SOURCE.chars().count();
+        let map = project(&doc, caret, &[2]);
+        assert_eq!(
+            map.display_text().as_ref(),
+            SOURCE,
+            "显式源码模式必须逐字节显示原源码"
+        );
+    }
+
+    #[test]
+    fn alias_is_exposed_only_as_placeholder_text() {
+        let source = "![[图.excalidraw|示意图]]\n";
+        let doc = parse(source);
+        assert_eq!(doc.drawings().len(), 1);
+        assert_eq!(doc.drawings()[0].target(), "图.excalidraw");
+        assert_eq!(doc.drawings()[0].alias(), Some("示意图"));
+        let map = project(&doc, source.chars().count(), &[]);
+        assert_eq!(
+            map.display_text().as_ref(),
+            format!("{OBJECT_PLACEHOLDER}\n"),
+            "别名只用于占位文案，不进入 display 文本"
+        );
+    }
+
+    #[test]
+    fn non_drawing_embeds_stay_plain_text() {
+        for source in [
+            "前 ![[a.excalidraw]] 后\n",
+            "![[a.png]]\n",
+            "> ![[a.excalidraw]]\n",
+            "- ![[a.excalidraw]]\n",
+            "```\n![[a.excalidraw]]\n```\n",
+        ] {
+            let doc = parse(source);
+            assert!(doc.drawings().is_empty(), "不应成为画布对象：{source:?}");
+            assert!(doc.objects().is_empty(), "不应产生 Object：{source:?}");
+            let map = project(&doc, source.chars().count(), &[]);
+            assert!(
+                map.display_text().contains("![[a."),
+                "非整行/非画布嵌入的源码必须保持可见：{source:?}"
+            );
+        }
     }
 }

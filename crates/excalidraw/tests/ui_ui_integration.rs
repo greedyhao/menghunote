@@ -2330,3 +2330,159 @@ fn mermaid_editor_edits_the_source_and_closes_on_escape(cx: &mut TestAppContext)
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn inline_canvas_hit_testing_subtracts_container_origin(cx: &mut TestAppContext) {
+    use gpui_kit::{ParentElement as _, Render, Styled as _, Window, div, px};
+
+    struct InlineEditor {
+        editor: Entity<Editor>,
+    }
+
+    impl Render for InlineEditor {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            div()
+                .size_full()
+                .pt(px(40.0))
+                .pl(px(264.0))
+                .child(self.editor.clone())
+        }
+    }
+
+    let (window, content) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let bounds = gpui_kit::Bounds {
+            origin: Point::default(),
+            size: size(px(1000.0), px(700.0)),
+        };
+        let editor = cx.new(|_| Editor::new());
+        let view = cx.new(|_| InlineEditor {
+            editor: editor.clone(),
+        });
+        let (window, _content) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            move |_, _| view,
+        )
+        .expect("open test window");
+        (
+            window.downcast::<gpui_kit::base::Root>().expect("root"),
+            editor,
+        )
+    });
+
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("tool-EllipseIcon", cx);
+        // 窗口坐标 = 容器 padding (264,40) + 画布局部 (400,300)。
+        window.drag(
+            Point::new(px(664.0), px(340.0)),
+            Point::new(px(784.0), px(440.0)),
+            cx,
+        );
+        content.update(cx, |editor, _| {
+            let base = editor
+                .document
+                .scene
+                .elements
+                .last()
+                .expect("ellipse")
+                .base();
+            assert!(
+                (base.x - 400.0).abs() < 2.0 && (base.y - 300.0).abs() < 2.0,
+                "canvas hit must use local coordinates, got ({}, {})",
+                base.x,
+                base.y
+            );
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn nested_content_canvas_hit_testing_subtracts_container_origin(cx: &mut TestAppContext) {
+    use gpui_kit::{ParentElement as _, Render, Styled as _, Window, div, px};
+
+    struct Host {
+        editor: Entity<Editor>,
+    }
+
+    impl Render for Host {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            div()
+                .flex()
+                .size_full()
+                .child(div().w(px(264.0)).h_full())
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .h_full()
+                        .child(div().absolute().inset_0().child(self.editor.clone())),
+                )
+        }
+    }
+
+    let (window, content) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let bounds = gpui_kit::Bounds {
+            origin: Point::default(),
+            size: size(px(1000.0), px(700.0)),
+        };
+        let editor = cx.new(|_| Editor::new());
+        let view = cx.new(|_| Host {
+            editor: editor.clone(),
+        });
+        let (window, _) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            move |_, _| view,
+        )
+        .expect("open test window");
+        (
+            window.downcast::<gpui_kit::base::Root>().expect("root"),
+            editor,
+        )
+    });
+
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("tool-EllipseIcon", cx);
+        // 窗口坐标 = 264 侧栏 + 画布局部 (400,300)。
+        window.drag(
+            Point::new(px(664.0), px(300.0)),
+            Point::new(px(784.0), px(400.0)),
+            cx,
+        );
+        content.update(cx, |editor, _| {
+            let base = editor
+                .document
+                .scene
+                .elements
+                .last()
+                .expect("ellipse")
+                .base();
+            assert!(
+                (base.x - 400.0).abs() < 2.0 && (base.y - 300.0).abs() < 2.0,
+                "expected local-coordinate drawing at 400/300, got ({}, {})",
+                base.x,
+                base.y
+            );
+        });
+    })
+    .unwrap();
+}

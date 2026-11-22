@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui_kit::{base::StyledExt, prelude::FluentBuilder as _, *};
 
@@ -145,6 +145,11 @@ pub struct Editor {
     show_help: bool,
 
     viewport: (f64, f64),
+    /// 画布在**窗口坐标**里的原点（`canvas` paint 时更新）。
+    ///
+    /// 上游命中把 `MouseDownEvent.position` 直接当画布坐标；嵌在笔记内容区时
+    /// 必须减去这个原点，否则会整体偏移侧栏宽度。
+    canvas_origin: Rc<Cell<gpui::Point<gpui::Pixels>>>,
     image_sources: HashMap<String, Arc<RenderImage>>,
     pending_image_pick: bool,
 
@@ -273,6 +278,7 @@ impl Editor {
             find_index: 0,
             show_help: false,
             viewport: (800.0, 600.0),
+            canvas_origin: Rc::new(Cell::new(gpui::point(px(0.0), px(0.0)))),
             image_sources: HashMap::new(),
             pending_image_pick: false,
             pending_scene_open: false,
@@ -312,6 +318,25 @@ impl Editor {
             link_editing: false,
             link_input: String::new(),
         }
+    }
+
+    /// 窗口坐标 → 画布局部坐标。
+    ///
+    /// 上游所有命中都把 `MouseDownEvent.position` 当画布坐标；编辑器嵌在
+    /// 笔记内容区时，必须减去 `canvas` 元素在窗口里的原点，否则整体偏移。
+    fn local_point(&self, position: gpui::Point<gpui::Pixels>) -> gpui::Point<gpui::Pixels> {
+        let origin = self.canvas_origin.get();
+        gpui::point(position.x - origin.x, position.y - origin.y)
+    }
+
+    /// 画布局部尺寸（窗口尺寸减去画布原点；首帧原点为 0，下一帧校正）。
+    fn viewport_from_window(&self, window: &Window) -> (f64, f64) {
+        let size = window.viewport_size();
+        let origin = self.canvas_origin.get();
+        (
+            (size.width - origin.x).to_f64().max(1.0),
+            (size.height - origin.y).to_f64().max(1.0),
+        )
     }
 
     pub fn set_tool(&mut self, tool: Tool) {
@@ -645,7 +670,7 @@ impl Editor {
         }
         let start = self.drag_start?;
         let world = self.cursor_world?;
-        let (x, y, w, h) = self.drag_box(start, world, self.cursor_mods.shift);
+        let (x, y, w, h) = self.drag_box(start, world, self.cursor_mods.shift, false);
         let opts = self.current_style_options();
         Some(match self.document.tool {
             Tool::Rectangle => new_rectangle(x, y, w, h, &opts),
@@ -930,6 +955,18 @@ impl Editor {
         }
         self.pending_points.clear();
         self.cursor_world = None;
+    }
+
+    /// 中键拖动画布：开始平移（与空格/抓手工具共用 panning 状态）。
+    pub fn start_pan(&mut self, x: f32, y: f32) {
+        self.panning = true;
+        self.pan_start = Some(Point::new(x as f64, y as f64));
+        self.pan_scroll = Some(self.document.scroll);
+        self.context_menu = None;
+        self.show_menu = false;
+        self.show_prefs = false;
+        self.show_lang = false;
+        self.show_more_tools = false;
     }
 
     pub fn on_canvas_mouse_down(&mut self, x: f32, y: f32, mods: Modifiers, click_count: usize) {
@@ -1480,7 +1517,7 @@ impl Editor {
             }
             Tool::Rectangle | Tool::Diamond | Tool::Ellipse | Tool::Frame => {
                 if let Some(start) = start {
-                    let (x, y, w, h) = self.drag_box(start, world, mods.shift);
+                    let (x, y, w, h) = self.drag_box(start, world, mods.shift, true);
                     let el = match self.document.tool {
                         Tool::Rectangle => new_rectangle(x, y, w, h, &opts),
                         Tool::Diamond => new_diamond(x, y, w, h, &opts),
@@ -1492,7 +1529,7 @@ impl Editor {
             }
             Tool::StickyNote => {
                 if let Some(start) = start {
-                    let (x, y, w, h) = self.drag_box(start, world, mods.shift);
+                    let (x, y, w, h) = self.drag_box(start, world, mods.shift, true);
                     let (note, text) = new_sticky_note_with_text(x, y, w, h, &opts);
                     self.document.scene.add(note);
                     self.document.scene.add(text);
@@ -1501,7 +1538,7 @@ impl Editor {
             }
             Tool::Embeddable => {
                 if let Some(start) = start {
-                    let (x, y, w, h) = self.drag_box(start, world, mods.shift);
+                    let (x, y, w, h) = self.drag_box(start, world, mods.shift, true);
                     let element = new_embeddable(x, y, w, h, &opts);
                     let id = element.id().to_string();
                     self.document.scene.add(element);
@@ -1534,14 +1571,22 @@ impl Editor {
         }
     }
 
-    fn drag_box(&self, start: Point, world: Point, shift: bool) -> (f64, f64, f64, f64) {
+    /// `default_on_click` 只在**提交**时生效：按下瞬间/拖动中不能用 100×100
+    /// 的默认尺寸，否则会先闪一个大的预览再缩成用户拖出的小图形。
+    fn drag_box(
+        &self,
+        start: Point,
+        world: Point,
+        shift: bool,
+        default_on_click: bool,
+    ) -> (f64, f64, f64, f64) {
         let mut end = self.document.snap(world);
         if shift {
             end = crate::core::binding::constrain_square(start, end);
         }
         let mut w = (end.x - start.x).abs();
         let mut h = (end.y - start.y).abs();
-        if w < CLICK_THRESHOLD && h < CLICK_THRESHOLD {
+        if default_on_click && w < CLICK_THRESHOLD && h < CLICK_THRESHOLD {
             w = CLICK_DEFAULT_SIZE;
             h = CLICK_DEFAULT_SIZE;
         }
@@ -4723,10 +4768,7 @@ fn plain_text(s: &str) -> AnyElement {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = crate::design::Tokens::for_palette(palette_of(self.document.theme));
-        self.viewport = (
-            window.viewport_size().width.to_f64(),
-            window.viewport_size().height.to_f64(),
-        );
+        self.viewport = self.viewport_from_window(window);
         self.sync_image_sources();
         if self.pending_image_pick {
             self.pending_image_pick = false;
@@ -4876,18 +4918,34 @@ impl Render for Editor {
         } else {
             crate::properties::parse_hex(&self.document.view_background_color)
         };
+        let cursor_style = if self.panning {
+            // GPUI 的 Windows 后端只把 `PointingHand` 映射到 `IDC_HAND`；
+            // `OpenHand`/`ClosedHand` 会落到默认箭头。这里统一用 `PointingHand`，
+            // 至少保证抓手/中键拖动时不再是箭头（真正的 open/closed 手需自定义光标资源）。
+            CursorStyle::PointingHand
+        } else if self.document.view_mode || self.document.tool == Tool::Hand {
+            CursorStyle::PointingHand
+        } else if self.document.tool == Tool::Selection {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::Crosshair
+        };
+        let canvas_origin = self.canvas_origin.clone();
+        let weak_editor = cx.entity().downgrade();
         let canvas_area = div()
             .absolute()
             .top(px(0.0))
             .left(px(0.0))
             .size_full()
             .bg(view_bg)
+            .cursor(cursor_style)
             .on_mouse_down(
                 MouseButton::Left,
                 Self::act(cx, |this, e: &MouseDownEvent, _, cx| {
+                    let position = this.local_point(e.position);
                     this.on_canvas_mouse_down(
-                        e.position.x.to_f64() as f32,
-                        e.position.y.to_f64() as f32,
+                        position.x.to_f64() as f32,
+                        position.y.to_f64() as f32,
                         e.modifiers,
                         e.click_count,
                     );
@@ -4906,17 +4964,25 @@ impl Render for Editor {
                 }),
             )
             .on_mouse_down(
+                MouseButton::Middle,
+                Self::act(cx, |this, e: &MouseDownEvent, _, cx| {
+                    let position = this.local_point(e.position);
+                    this.start_pan(position.x.to_f64() as f32, position.y.to_f64() as f32);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
                 MouseButton::Right,
                 Self::act(cx, |this, e: &MouseDownEvent, _, _| {
-                    let world = this
-                        .screen_point(e.position.x.to_f64() as f32, e.position.y.to_f64() as f32);
+                    let position = this.local_point(e.position);
+                    let world =
+                        this.screen_point(position.x.to_f64() as f32, position.y.to_f64() as f32);
                     if let Some(id) = this.document.element_at(world, 5.0 / this.document.zoom)
                         && !this.document.selected.contains(&id)
                     {
                         this.document.select(&id);
                     }
-                    this.context_menu =
-                        Some(Point::new(e.position.x.to_f64(), e.position.y.to_f64()));
+                    this.context_menu = Some(Point::new(position.x.to_f64(), position.y.to_f64()));
                 }),
             )
             .on_scroll(Self::act(cx, |this, e: &ScrollEvent, _, _| {
@@ -4934,8 +5000,9 @@ impl Render for Editor {
 
                     let factor = this.document.zoom / old;
                     if factor != 1.0 {
-                        let cx_pos = e.position.x.to_f64();
-                        let cy_pos = e.position.y.to_f64();
+                        let position = this.local_point(e.position);
+                        let cx_pos = position.x.to_f64();
+                        let cy_pos = position.y.to_f64();
                         this.document.scroll.x =
                             cx_pos - (cx_pos - this.document.scroll.x) * factor;
                         this.document.scroll.y =
@@ -4950,25 +5017,94 @@ impl Render for Editor {
                 canvas(
                     move |_bounds, _window, _cx| (),
                     move |bounds, _state, window, cx| {
+                        let previous_origin = canvas_origin.replace(bounds.origin);
+                        if previous_origin != bounds.origin {
+                            // 内容区原点变化（首次排版/侧栏/窗口变化）：再排一帧，
+                            // 让 `viewport_from_window` 用正确的画布尺寸重算工具栏/缩放。
+                            window.request_animation_frame();
+                        }
+                        // `Window::paint_*` 用**窗口坐标**，不会按元素 bounds 平移；
+                        // 命中已扣掉内容区原点，这里必须把原点加回绘制坐标，否则
+                        // 图形会整体左移一个侧栏宽度（Windows 真机实测）。
+                        let paint_scroll_x = scroll_x + bounds.origin.x.to_f64();
+                        let paint_scroll_y = scroll_y + bounds.origin.y.to_f64();
+
+                        // 中键拖动可能把指针带到画布外（侧栏/状态栏），元素级
+                        // `on_mouse_up` 只在 hitbox 仍悬停时触发，会漏掉释放；
+                        // 用窗口级监听在 capture 阶段兜底结束平移。
+                        let up_editor = weak_editor.clone();
+                        let up_origin = canvas_origin.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseUpEvent,
+                                  phase: gpui_kit::DispatchPhase,
+                                  _window: &mut Window,
+                                  cx: &mut App| {
+                                if !phase.capture() || event.button != MouseButton::Middle {
+                                    return;
+                                }
+                                let origin = up_origin.get();
+                                let x = (event.position.x - origin.x).to_f64() as f32;
+                                let y = (event.position.y - origin.y).to_f64() as f32;
+                                up_editor
+                                    .update(cx, |this, cx| {
+                                        if this.panning {
+                                            this.on_canvas_mouse_up(x, y, event.modifiers);
+                                            cx.notify();
+                                        }
+                                    })
+                                    .ok();
+                            },
+                        );
+
+                        let move_editor = weak_editor.clone();
+                        let move_origin = canvas_origin.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseMoveEvent,
+                                  phase: gpui_kit::DispatchPhase,
+                                  _window: &mut Window,
+                                  cx: &mut App| {
+                                if !phase.capture() {
+                                    return;
+                                }
+                                let origin = move_origin.get();
+                                let x = (event.position.x - origin.x).to_f64() as f32;
+                                let y = (event.position.y - origin.y).to_f64() as f32;
+                                move_editor
+                                    .update(cx, |this, cx| {
+                                        if this.panning {
+                                            this.on_canvas_mouse_move(x, y, event.modifiers);
+                                            cx.notify();
+                                        }
+                                    })
+                                    .ok();
+                            },
+                        );
+
                         if show_grid {
                             crate::canvas::paint_grid(
                                 grid_size,
                                 zoom,
-                                scroll_x,
-                                scroll_y,
+                                paint_scroll_x,
+                                paint_scroll_y,
                                 (bounds.size.width.to_f64(), bounds.size.height.to_f64()),
                                 window,
                             );
                         }
                         crate::canvas::paint_scene(
-                            &scene, zoom, scroll_x, scroll_y, &images, window, cx,
+                            &scene,
+                            zoom,
+                            paint_scroll_x,
+                            paint_scroll_y,
+                            &images,
+                            window,
+                            cx,
                         );
                         if let Some(el) = &preview {
                             crate::canvas::paint_elements(
                                 std::slice::from_ref(el),
                                 zoom,
-                                scroll_x,
-                                scroll_y,
+                                paint_scroll_x,
+                                paint_scroll_y,
                                 &images,
                                 window,
                                 cx,
@@ -4976,12 +5112,22 @@ impl Render for Editor {
                         }
                         if let Some(pts) = &ink {
                             crate::canvas::paint_ink(
-                                pts, ink_width, ink_color, zoom, scroll_x, scroll_y, window,
+                                pts,
+                                ink_width,
+                                ink_color,
+                                zoom,
+                                paint_scroll_x,
+                                paint_scroll_y,
+                                window,
                             );
                         }
                         if let Some(pts) = &linear_points {
                             crate::canvas::paint_linear_handles(
-                                pts, zoom, scroll_x, scroll_y, window,
+                                pts,
+                                zoom,
+                                paint_scroll_x,
+                                paint_scroll_y,
+                                window,
                             );
                         }
                         if !pending.is_empty() {
@@ -4989,8 +5135,8 @@ impl Render for Editor {
                                 &pending,
                                 pending_cursor,
                                 zoom,
-                                scroll_x,
-                                scroll_y,
+                                paint_scroll_x,
+                                paint_scroll_y,
                                 window,
                             );
                         }
@@ -4999,21 +5145,27 @@ impl Render for Editor {
                                 b,
                                 selection_color,
                                 zoom,
-                                scroll_x,
-                                scroll_y,
+                                paint_scroll_x,
+                                paint_scroll_y,
                                 window,
                             );
                         }
                         if !laser.is_empty() {
-                            crate::canvas::paint_laser(&laser, zoom, scroll_x, scroll_y, window);
+                            crate::canvas::paint_laser(
+                                &laser,
+                                zoom,
+                                paint_scroll_x,
+                                paint_scroll_y,
+                                window,
+                            );
                         }
                         if let Some(b) = &marquee_bounds {
                             crate::canvas::paint_marquee(
                                 b,
                                 selection_color,
                                 zoom,
-                                scroll_x,
-                                scroll_y,
+                                paint_scroll_x,
+                                paint_scroll_y,
                                 window,
                             );
                         }
@@ -5022,8 +5174,8 @@ impl Render for Editor {
                                 &lasso,
                                 selection_color,
                                 zoom,
-                                scroll_x,
-                                scroll_y,
+                                paint_scroll_x,
+                                paint_scroll_y,
                                 window,
                             );
                         }
@@ -5211,6 +5363,7 @@ impl Render for Editor {
         let mut root = div()
             .size_full()
             .overflow_hidden()
+            .cursor(cursor_style)
             .bg(tokens.canvas())
             .track_focus(&focus_handle)
             .on_key_down(Self::act(cx, |this, e: &KeyDownEvent, window, cx| {
@@ -5288,9 +5441,10 @@ impl Render for Editor {
             }))
             .on_mouse_move(Self::act(cx, |this, e: &MouseMoveEvent, _, _| {
                 if this.is_interacting() {
+                    let position = this.local_point(e.position);
                     this.on_canvas_mouse_move(
-                        e.position.x.to_f64() as f32,
-                        e.position.y.to_f64() as f32,
+                        position.x.to_f64() as f32,
+                        position.y.to_f64() as f32,
                         e.modifiers,
                     );
                 }
@@ -5299,9 +5453,10 @@ impl Render for Editor {
                 MouseButton::Left,
                 Self::act(cx, |this, e: &MouseUpEvent, _, _| {
                     if this.is_interacting() {
+                        let position = this.local_point(e.position);
                         this.on_canvas_mouse_up(
-                            e.position.x.to_f64() as f32,
-                            e.position.y.to_f64() as f32,
+                            position.x.to_f64() as f32,
+                            position.y.to_f64() as f32,
                             e.modifiers,
                         );
                     }
@@ -6285,18 +6440,20 @@ impl Editor {
             .size_full()
             .occlude()
             .on_mouse_move(Self::act(cx, |this, e: &MouseMoveEvent, _, _| {
+                let position = this.local_point(e.position);
                 this.on_canvas_mouse_move(
-                    e.position.x.to_f64() as f32,
-                    e.position.y.to_f64() as f32,
+                    position.x.to_f64() as f32,
+                    position.y.to_f64() as f32,
                     e.modifiers,
                 );
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 Self::act(cx, |this, e: &MouseUpEvent, _, cx| {
+                    let position = this.local_point(e.position);
                     this.on_canvas_mouse_up(
-                        e.position.x.to_f64() as f32,
-                        e.position.y.to_f64() as f32,
+                        position.x.to_f64() as f32,
+                        position.y.to_f64() as f32,
                         e.modifiers,
                     );
                     cx.stop_propagation();
@@ -7054,12 +7211,14 @@ impl Editor {
                 .size_full()
                 .occlude()
                 .on_mouse_move(Self::act(cx, |this, e: &MouseMoveEvent, _, _| {
-                    this.update_eye_dropper((e.position.x.to_f64(), e.position.y.to_f64()));
+                    let position = this.local_point(e.position);
+                    this.update_eye_dropper((position.x.to_f64(), position.y.to_f64()));
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
                     Self::act(cx, |this, e: &MouseDownEvent, _, _| {
-                        this.update_eye_dropper((e.position.x.to_f64(), e.position.y.to_f64()));
+                        let position = this.local_point(e.position);
+                        this.update_eye_dropper((position.x.to_f64(), position.y.to_f64()));
                         this.commit_eye_dropper();
                     }),
                 )
@@ -10396,8 +10555,19 @@ impl Editor {
 
 #[cfg(test)]
 mod toolbar_tests {
+    use super::Editor;
     use super::extra_tools_trigger;
     use crate::ui::Tool;
+    use gpui_kit::{point, px};
+
+    #[test]
+    fn canvas_local_point_subtracts_origin() {
+        let editor = Editor::new();
+        editor.canvas_origin.set(point(px(264.0), px(12.0)));
+        let local = editor.local_point(point(px(300.0), px(100.0)));
+        assert_eq!(local.x, px(36.0));
+        assert_eq!(local.y, px(88.0));
+    }
 
     #[test]
     fn extra_tools_trigger_mirrors_the_active_extra_tool() {

@@ -499,7 +499,7 @@ async fn clicking_outside_commits_the_edit(cx: &mut TestAppContext) {
     let geometry = cx.update(|_window, app| view.read(app).visual_row_metrics());
     let last = geometry.last().expect("至少有一行");
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     let target_row = last.row;
     let target_y = pane.origin.y

@@ -188,6 +188,9 @@ pub struct ImagePaint {
 
 /// 一个 Object 的绘制载荷：图片像素 / GFM 表格 / Mermaid 光栅图。
 ///
+/// 内嵌画布预览**复用 [`Self::Image`]**（都是“一张位图 + 可选占位文案”，绘制路径
+/// 完全相同），不新增第四个分支。
+///
 /// 三个分支都装箱：`ShapedLine`/`TablePaint` 让 enum 本体很大，而 `ObjectPaint`
 /// 每帧按可见对象存进 `Vec`，不装箱会在滚动时反复拷贝大块内存。
 #[derive(Debug, Clone)]
@@ -211,9 +214,10 @@ pub enum ObjectPaintContent {
 /// 只占**一个**视觉行（一个占位符），因此 `line` 是表头行、`row` 是那一个视觉行。
 #[derive(Debug, Clone)]
 pub struct ObjectPaint {
-    /// 对象种类（图片 / 表格）。
+    /// 对象种类（图片 / 表格 / Mermaid / 内嵌画布）。
     pub kind: ObjectKind,
-    /// 在同类集合里的下标（图片 → `images()`；表格 → `tables()`）。
+    /// 在同类集合里的下标（图片 → `images()`；表格 → `tables()`；
+    /// Mermaid → `mermaid_blocks()`；画布 → `drawings()`）。
     pub index: usize,
     /// 对象行（图片所在行 / 表格表头行；0 起）。
     pub line: usize,

@@ -34,6 +34,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # **精确 pin**：升级必须整体对齐（kit/pre/base/component 版本互相约束），不能单边升。
 # 用依赖别名把 lib 名固定成 `gpui`，代码里 `use gpui::*` 与 `gpui::platform::` 保持不变。
 gpui = { package = "gpui-kit", version = "=0.10.0" }
+# 画布笔记（`.excalidraw`）的编辑器：vendor 的 Excalidraw 视图（MIT，见
+# `crates/excalidraw/README.md`）。默认 feature 即可（它自己精确 pin gpui-kit 0.10.0），
+# 三种构建（默认 / dev-sync / --no-default-features）都编进来；不引入新的版本解算。
+gpui-excalidraw = { path = "../excalidraw" }
 # ADR 0003 §3：app 可以依赖 editor / storage / text，反向不允许
 menghunote-editor = { path = "../editor" }
 # ADR 0020 P1：轻量 i18n（静态 catalog + 插值/复数），无 GPUI/无外部依赖。
@@ -91,3 +95,8 @@ menghunote-dev-relay = { path = "../dev-relay" }
 # 启动时读回进程 DPI 感知级别（GetThreadDpiAwarenessContext / GetDpiForSystem）。
 # 0.61 已在依赖图里（gpui 的 Windows 后端在用），特性只要 HiDpi。
 windows-sys = { version = "0.61", features = ["Win32_UI_HiDpi"] }
+
+# Windows exe 图标：build.rs 把 assets/app-icon.ico 编译进 exe。
+# 只在 Windows 目标上生效；不参与 Linux/macOS 构建。
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.12"

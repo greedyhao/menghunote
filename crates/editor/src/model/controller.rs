@@ -66,7 +66,8 @@ use crate::model::block::BlockRun;
 use crate::model::error::EditorError;
 use crate::model::input::InputDocument;
 use crate::model::markdown::{
-    MarkdownDocument, MarkdownImage, MarkdownMermaid, MarkdownTable, ProjectionCellReveal,
+    MarkdownDocument, MarkdownDrawing, MarkdownImage, MarkdownMermaid, MarkdownTable,
+    ProjectionCellReveal,
 };
 use crate::model::object::ObjectBlock;
 use crate::model::projection::ProjectionMap;
@@ -191,7 +192,7 @@ impl EditorController {
     /// `markdown` 是 LF 归一后的真源，直接作为 source；本方法不做任何归一化。
     pub fn open(snapshot: OpenSnapshot) -> Result<Self, EditorError> {
         let markdown = MarkdownDocument::parse(&snapshot.markdown)?;
-        let selection = Selection::default();
+        let selection = initial_selection(&markdown, &snapshot.markdown);
         let projection = ProjectionMap::from_markdown_with_lists(&markdown, selection);
         let style_runs = markdown.style_runs(&projection);
         let block_runs = markdown.block_runs()?;
@@ -221,7 +222,7 @@ impl EditorController {
     /// 命令序号保持单调，避免新旧会话产生相同的 `command_id`。
     pub fn adopt_snapshot(&mut self, snapshot: OpenSnapshot) -> Result<(), EditorError> {
         let markdown = MarkdownDocument::parse(&snapshot.markdown)?;
-        let selection = Selection::default();
+        let selection = initial_selection(&markdown, &snapshot.markdown);
         let projection = ProjectionMap::from_markdown_with_lists(&markdown, selection);
         let style_runs = markdown.style_runs(&projection);
         let block_runs = markdown.block_runs()?;
@@ -371,7 +372,7 @@ impl EditorController {
             .unwrap_or(false)
     }
 
-    // ---- Object Block（ADR 0019 S2a 图片 / S3a 表格）----
+    // ---- Object Block（ADR 0019 S2a 图片 / S3a 表格 / M2 Mermaid / ADR 0025 画布）----
 
     /// 全部图片构造（含混排/行内图片；app 只把 `is_block()` 的当对象渲染）。
     #[must_use]
@@ -385,7 +386,8 @@ impl EditorController {
         self.markdown.tables()
     }
 
-    /// 全部整块 Object（图片 + 表格，按源码顺序；投影/选中/源码切换的唯一入口）。
+    /// 全部整块 Object（图片 + 表格 + Mermaid + 画布嵌入，按源码顺序；
+    /// 投影/选中/源码切换的唯一入口）。
     #[must_use]
     pub fn objects(&self) -> &[ObjectBlock] {
         self.markdown.objects()
@@ -413,6 +415,21 @@ impl EditorController {
     #[must_use]
     pub fn mermaid_of(&self, object: &ObjectBlock) -> Option<&MarkdownMermaid> {
         self.markdown.object_mermaid(object)
+    }
+
+    /// 全部内嵌画布嵌入（可投影成 Object；按文档顺序）。
+    #[must_use]
+    pub fn drawings(&self) -> &[MarkdownDrawing] {
+        self.markdown.drawings()
+    }
+
+    /// Object 对应的内嵌画布载荷（不是画布对象时 `None`）。
+    ///
+    /// 点击画布对象时用它取 `target()`（宿主按标题/路径打开目标画布笔记），
+    /// 绘制/请求预览时用它取预览 key（见 `crate::drawing::drawing_asset_key`）。
+    #[must_use]
+    pub fn drawing_of(&self, object: &ObjectBlock) -> Option<&MarkdownDrawing> {
+        self.markdown.object_drawing(object)
     }
 
     /// 全部整块 fenced mermaid（可投影成 Object 的块；后台渲染按 content 取源码）。
@@ -2206,4 +2223,75 @@ fn shift_selection_through_deletions(selection: Selection, edits: &[ScalarEdit])
         UnicodeScalar::new(shift(selection.anchor().get())),
         UnicodeScalar::new(shift(selection.head().get())),
     )
+}
+
+/// 打开文档时的初始 caret：有 frontmatter 就落在正文起点，避免用户一按
+/// Backspace/输入就改到隐藏的 `---` 元数据。
+fn initial_selection(markdown: &MarkdownDocument, source: &str) -> Selection {
+    markdown
+        .frontmatter()
+        .and_then(|frontmatter| {
+            SourceByte::new(frontmatter.body_start)
+                .to_scalar(source)
+                .ok()
+        })
+        .map(Selection::caret)
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// 单元测试（ADR 0025 后续切片：`drawing_of` 取目标）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod drawing_controller_tests {
+    use super::EditorController;
+    use crate::model::object::ObjectKind;
+    use menghunote_storage::session::{BatchId, Generation, LiveRev, OpenSnapshot, SessionEpoch};
+
+    /// 构造一个最小打开快照（与 `crates/editor/tests/support` 同一组字段）。
+    fn open(source: &str) -> EditorController {
+        EditorController::open(OpenSnapshot {
+            doc_id: "body-drawing-test".to_owned(),
+            generation: Generation(3),
+            session_epoch: SessionEpoch(9),
+            live_rev: LiveRev(7),
+            live_frontier: vec![0x10, 0x20],
+            live_vv: vec![0x30],
+            durable_batch: Some(BatchId(2)),
+            durable_head_seq: 5,
+            markdown: source.to_owned(),
+        })
+        .expect("测试快照必须可打开")
+    }
+
+    #[test]
+    fn drawing_of_returns_target_line_and_kind() {
+        let source = "前言\n\n![[流程图.excalidraw]]\n";
+        let controller = open(source);
+        let objects = controller.objects();
+        assert_eq!(objects.len(), 1, "整行画布嵌入必须是一个 Object");
+        assert_eq!(objects[0].kind(), ObjectKind::Drawing);
+        assert!(objects[0].kind().is_drawing());
+        assert_eq!(objects[0].line(), 2);
+        let drawing = controller
+            .drawing_of(&objects[0])
+            .expect("画布对象必须有载荷");
+        assert_eq!(drawing.target(), "流程图.excalidraw");
+        assert_eq!(drawing.line(), 2);
+        assert!(drawing.is_block());
+        // 其它种类的访问器都不能误命中。
+        assert!(controller.image_of(&objects[0]).is_none());
+        assert!(controller.table_of(&objects[0]).is_none());
+        assert!(controller.mermaid_of(&objects[0]).is_none());
+    }
+
+    #[test]
+    fn non_block_image_does_not_expose_drawing_of() {
+        let controller = open("![图](asset://aa)\n");
+        let objects = controller.objects();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].kind(), ObjectKind::Image);
+        assert!(controller.drawing_of(&objects[0]).is_none());
+    }
 }

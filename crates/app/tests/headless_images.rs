@@ -292,13 +292,13 @@ async fn image_object_renders_selects_edits_and_deletes_whole_block(cx: &mut Tes
         display.contains(&format!("![示意](asset://{hash})")),
         "F2 在对象目标上必须进入源码模式：{display:?}"
     );
-    let pane = cx
-        .debug_bounds("editor-pane")
-        .expect("编辑器面板必须画出来");
+    let editor = cx
+        .debug_bounds("editor-current-doc")
+        .expect("编辑器正文必须画出来");
     cx.simulate_click(
         gpui::point(
-            pane.origin.x + gpui::px(theme::PAD_X + 40.0),
-            pane.origin.y + gpui::px(theme::PAD_Y + 10.0),
+            editor.origin.x + gpui::px(theme::PAD_X + 40.0),
+            editor.origin.y + gpui::px(theme::PAD_Y + 10.0),
         ),
         Modifiers::default(),
     );

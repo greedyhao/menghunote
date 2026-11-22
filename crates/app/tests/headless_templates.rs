@@ -187,7 +187,7 @@ fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
 
 fn right_click_point(cx: &mut VisualTestContext) -> gpui::Point<gpui::Pixels> {
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     point(pane.origin.x + px(80.0), pane.origin.y + px(20.0))
 }

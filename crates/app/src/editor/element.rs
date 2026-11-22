@@ -225,6 +225,36 @@ impl EditorElement {
     }
 
     /// 画正文（逐可见视觉行，跳过屏外行）。
+    /// 画分隔线：语义行被投影成空行，这里在行高中心画一条横线。
+    fn paint_thematic_breaks(
+        &self,
+        bounds: Bounds<Pixels>,
+        geometry: &EditorGeometry,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        for offset in 0..geometry.shaped.len() {
+            let row = geometry.visible_start + offset;
+            let Some(line) = geometry.frame.lines.get(row) else {
+                continue;
+            };
+            if !self.view.read(cx).is_thematic_display_row(line.bytes.start) {
+                continue;
+            }
+            let top = geometry.row_top(row);
+            let y = top + geometry.row_height(row) * 0.5;
+            let left = geometry.text_left_for_row(row);
+            let right = bounds.origin.x + bounds.size.width - px(theme::PAD_X);
+            if right <= left {
+                continue;
+            }
+            window.paint_quad(fill(
+                Bounds::new(point(left, y), size(right - left, px(1.0))),
+                theme::sidebar_border(),
+            ));
+        }
+    }
+
     fn paint_text(&self, geometry: &EditorGeometry, window: &mut Window, cx: &mut App) {
         for (offset, shaped) in geometry.shaped.iter().enumerate() {
             let row = geometry.visible_start + offset;
@@ -904,6 +934,20 @@ impl Element for EditorElement {
             font: &font,
             font_size,
         });
+        // 笔记属性面板是正文最上面的一个块：把整篇正文下移面板高度，面板自身由
+        // `EditorView::render` 用 `-scroll_y` 平移，于是它随正文一起滚走。
+        // 只改这一帧的副本，不污染 `WrapCache`（缓存键仍是纯折行结果）。
+        let top_inset = self.view.read(cx).properties_inset(cx);
+        let frame = if top_inset > 0.0 {
+            let mut shifted = (*frame).clone();
+            for top in &mut shifted.row_tops {
+                *top += top_inset;
+            }
+            shifted.content_height += top_inset;
+            Rc::new(shifted)
+        } else {
+            frame
+        };
         self.shared
             .set_viewport(bounds.size.width.as_f32(), bounds.size.height.as_f32());
 
@@ -1091,6 +1135,7 @@ impl Element for EditorElement {
             // 顺序：选区底色 → 正文 → IME 组合串 → 光标（光标永远压在最上面）。
             self.paint_selection(&geometry, selection, display_selection, window, cx);
             self.paint_text(&geometry, window, cx);
+            self.paint_thematic_breaks(bounds, &geometry, window, cx);
             self.paint_task_boxes(&geometry, window);
             self.paint_objects(bounds, &geometry, window, cx);
             self.paint_preedit(&geometry, display_caret, window, cx);

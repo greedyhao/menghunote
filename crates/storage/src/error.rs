@@ -155,6 +155,19 @@ pub enum StorageError {
         found: Vec<u8>,
     },
 
+    /// 历史版本正文的 zstd 压缩/解压失败（库里的历史快照损坏，或编码阶段内存不足）。
+    ///
+    /// 与 [`Self::Io`] 区分：这不是文件系统错误，调用方只该提示"历史版本读取失败"，
+    /// 不应把它当成库路径/权限问题。
+    #[error("历史版本编解码失败（{context}）：{source}")]
+    HistoryCodec {
+        /// 具体动作（压缩/解压）。
+        context: &'static str,
+        /// 底层 `std::io::Error`（zstd 流）。
+        #[source]
+        source: std::io::Error,
+    },
+
     /// 数据库中出现不自洽状态（缺行、seq 断档、重放结果与记录不一致等）。
     #[error("存储状态不自洽：{context}")]
     Corrupt {

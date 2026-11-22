@@ -141,7 +141,7 @@ fn object_rect(
 
 /// 编辑器正文区中心点（滚动事件必须落在元素 bounds 内）。
 fn pane_center(cx: &mut VisualTestContext) -> gpui::Point<gpui::Pixels> {
-    cx.debug_bounds("editor-pane")
+    cx.debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来")
         .center()
 }
@@ -321,7 +321,7 @@ async fn table_object_renders_selects_and_toggles_source(cx: &mut TestAppContext
         "F2 在表格对象上必须进入源码模式：{display:?}"
     );
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("编辑器面板必须画出来");
     cx.simulate_click(
         point(
@@ -420,7 +420,7 @@ async fn narrow_window_keeps_table_geometry_and_does_not_panic(cx: &mut TestAppC
     cx.simulate_resize(size(px(344.0), px(600.0)));
     cx.run_until_parked();
     let pane = cx
-        .debug_bounds("editor-pane")
+        .debug_bounds("editor-current-doc")
         .expect("窄窗口下编辑器面板仍必须画出来");
     assert!(
         pane.size.width.as_f32() > 0.0,

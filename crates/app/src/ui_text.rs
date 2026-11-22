@@ -34,6 +34,12 @@ pub fn sidebar_new_folder() -> String {
     t(msg::sidebar::NEW_FOLDER)
 }
 
+/// 侧栏「画布」（新建 `.excalidraw` 画布笔记）。
+#[must_use]
+pub fn sidebar_new_drawing() -> String {
+    t(msg::sidebar::NEW_DRAWING)
+}
+
 /// 侧栏「导出」。
 #[must_use]
 pub fn sidebar_export() -> String {
@@ -183,6 +189,58 @@ pub fn editor_menu_copy_link() -> String {
 #[must_use]
 pub fn editor_menu_copy_markdown() -> String {
     t(msg::editor_menu::COPY_MARKDOWN)
+}
+
+// ---------------------------------------------------------------------------
+// 画布笔记（`.excalidraw`）+ Excalidraw 覆盖层
+// ---------------------------------------------------------------------------
+
+/// 覆盖层顶部 bar 标题「画布 · <标题>」。
+#[must_use]
+pub fn drawing_bar_title(title: &str) -> String {
+    t_with(msg::drawing::BAR_TITLE, &[("title", title)])
+}
+
+/// 覆盖层「保存并关闭」。
+#[must_use]
+pub fn drawing_save() -> String {
+    t(msg::drawing::SAVE)
+}
+
+/// 覆盖层「关闭（不保存）」。
+#[must_use]
+pub fn drawing_close() -> String {
+    t(msg::drawing::CLOSE)
+}
+
+/// 保存成功提示。
+#[must_use]
+pub fn drawing_saved() -> String {
+    t(msg::drawing::SAVED)
+}
+
+/// 保存失败提示（`reason` 是错误原文，不翻译）。
+#[must_use]
+pub fn drawing_save_failed(reason: &str) -> String {
+    t_with(msg::drawing::SAVE_FAILED, &[("reason", reason)])
+}
+
+/// 画布关闭后的占位标题（**不显示 JSON 源码**）。
+#[must_use]
+pub fn drawing_placeholder() -> String {
+    t(msg::drawing::PLACEHOLDER)
+}
+
+/// 画布关闭后的占位说明。
+#[must_use]
+pub fn drawing_placeholder_hint() -> String {
+    t(msg::drawing::PLACEHOLDER_HINT)
+}
+
+/// 占位页「打开画布」。
+#[must_use]
+pub fn drawing_open() -> String {
+    t(msg::drawing::OPEN)
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +954,28 @@ pub fn settings_about_build(build: &str) -> String {
 #[must_use]
 pub fn settings_about_hint() -> String {
     t(msg::settings::ABOUT_HINT)
+}
+
+// ---------------------------------------------------------------------------
+// 笔记属性（YAML frontmatter 面板）
+// ---------------------------------------------------------------------------
+
+/// 属性面板标题「笔记属性」。
+#[must_use]
+pub fn properties_title() -> String {
+    t(msg::properties::TITLE)
+}
+
+/// 「添加笔记属性」。
+#[must_use]
+pub fn properties_add() -> String {
+    t(msg::properties::ADD)
+}
+
+/// 空值占位「没有值」。
+#[must_use]
+pub fn properties_no_value() -> String {
+    t(msg::properties::NO_VALUE)
 }
 
 #[cfg(test)]
