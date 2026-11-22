@@ -15,6 +15,7 @@
 
 pub mod dev_vault;
 pub mod editor;
+pub mod export;
 pub mod platform;
 pub mod shell;
 pub mod sidebar_rename;

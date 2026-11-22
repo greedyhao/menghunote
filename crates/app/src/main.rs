@@ -41,7 +41,7 @@ fn main() -> Result<()> {
     // 具体打开哪篇笔记由结构树决定，不再硬编码文档 ID。
     let vault = dev.vault.clone();
 
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui::platform::application().run(move |cx: &mut App| {
         let window_bounds = initial_window_bounds(cx);
         if let Some(display) = cx.primary_display() {
             // 修复前后对比用：DPI 未感知时这里是**物理像素**且窗口 scale=1.0；

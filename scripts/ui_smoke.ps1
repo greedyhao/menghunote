@@ -9,9 +9,10 @@
 #     不再固定 sleep。
 param(
     [string]$Exe = "target\debug\menghunote-app.exe",
-    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside", "projection", "displayedit", "cursorkeys", "blockcaret")]
+    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside", "projection", "displayedit", "cursorkeys", "blockcaret", "export", "shot", "exportstress", "quotehit")]
     [string]$Scenario = "menu",
     [string]$Screenshot = "",
+    [string]$Vault = "",
     [int]$ReadyTimeoutMs = 15000,
     [int]$PollIntervalMs = 50
 )
@@ -83,6 +84,7 @@ Write-Output ("build ok 用时 {0:N0}ms" -f $buildWatch.Elapsed.TotalMillisecond
 # ---- 2. 启动 + 轮询首帧就绪 ----
 Remove-Item $errPath -ErrorAction SilentlyContinue
 Remove-Item $outPath -ErrorAction SilentlyContinue
+if ($Vault) { $env:MENGHUNOTE_DEV_VAULT = $Vault }
 $env:MENGHUNOTE_TRACE_MENU = "1"
 $env:MENGHUNOTE_TRACE_MOUSE = "1"
 
@@ -366,11 +368,68 @@ switch ($Scenario) {
         Save-Shot ($Screenshot -replace '\.png$', '-title.png')
         Write-Output "blockcaret ok"
     }
+    "export" {
+        # 点底栏「导出」→ 等日志里的导出完成行
+        LeftClick 275 1126        # 底栏第三格（导出）中心，物理坐标（客户端）
+        $ms = Wait-ForLog "导出完成" 15000
+        $clickWatch.Stop()
+        if ($ms -lt 0) { Fail "点导出后 15s 内没有完成日志" }
+        Write-Output ("点击→导出完成 用时 {0:N0}ms" -f $ms)
+        Start-Sleep -Milliseconds 500
+        MoveTo 700 500
+        Start-Sleep -Milliseconds 400
+        Save-Shot ($Screenshot -replace '\.png$', '-done.png')
+    }
+    "shot" {
+        MoveTo 700 500
+        Start-Sleep -Milliseconds 400
+        Save-Shot $Screenshot
+        Write-Output "shot ok"
+    }
+    "exportstress" {
+        # ① 点「导出」后**立刻**动鼠标、点侧栏：证明 UI 不冻结
+        $t0 = [System.Diagnostics.Stopwatch]::StartNew()
+        LeftClick 275 1126
+        Start-Sleep -Milliseconds 60
+        MoveTo 260 260
+        Start-Sleep -Milliseconds 60
+        LeftClick 90 120           # 点侧栏第 0 行（切笔记）
+        Start-Sleep -Milliseconds 60
+        MoveTo 500 700
+        $ms = Wait-ForLog "导出完成" 120000
+        $t0.Stop()
+        if ($ms -lt 0) { Fail "120s 内没有导出完成日志" }
+        Write-Output ("点导出→完成 用时 {0:N0}ms（UI 全程可交互见日志顺序）" -f $t0.Elapsed.TotalMilliseconds)
+        Start-Sleep -Milliseconds 400
+        Save-Shot ($Screenshot -replace '\.png$', '-stress.png')
+    }
+    "quotehit" {
+        # 在引用行内点击 + 拖选：落点必须与文字对齐（缩进不能只加在绘制上）
+        LeftClick 520 645
+        Start-Sleep -Milliseconds 400
+        PressKey 0x7B          # F12 dump 选区/光标
+        Start-Sleep -Milliseconds 400
+        # 拖选：按下 → 移动 → 抬起（跨引用行）
+        MoveTo 420 645
+        Start-Sleep -Milliseconds 120
+        [UiSmoke]::mouse_event(0x0002, 0, 0, 0, [IntPtr]0)
+        Start-Sleep -Milliseconds 80
+        MoveTo 640 690
+        Start-Sleep -Milliseconds 120
+        [UiSmoke]::mouse_event(0x0004, 0, 0, 0, [IntPtr]0)
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-select.png')
+        Write-Output "quotehit ok"
+    }
     "delete" {
+        # 笔记菜单自 task-37 起是「重命名 / 删除」两项：删除是**第二项**，
+        # 菜单在 (60,40) 打开 → 表头 24 + 第一项 26 → 第二项中心 y≈103 逻辑（=154 物理）。
         RightClick 90 60
-        Start-Sleep -Milliseconds 200
-        LeftClick 201 114
-        $ms = Wait-ForLog "确认删除" 3000
+        if ((Wait-ForLog "菜单渲染" 3000) -lt 0) { Fail "右键后菜单没有渲染出来" }
+        Start-Sleep -Milliseconds 120
+        LeftClick 201 154
+        # 应用侧的日志文案是「删除待确认」（task-33 改过），不是旧脚本里写的「确认删除」
+        $ms = Wait-ForLog "删除待确认" 3000
         $clickWatch.Stop()
         if ($ms -lt 0) { Fail "笔记右键删除第一步没有进入确认态" }
         Write-Output ("点击→确认删除 用时 {0:N0}ms" -f $ms)

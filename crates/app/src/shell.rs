@@ -132,6 +132,8 @@ pub struct AppShell {
     /// 笔记菜单里的「删除」是否已进入二次确认。
     /// **不设超时**：菜单关闭即复位（比"3 秒后自动复位"更可预期）。
     menu_delete_armed: bool,
+    /// 是否正在后台导出（防重复点击）。
+    exporting: bool,
     /// 正在行内重命名的节点（含输入框实体）。
     editing: Option<Editing>,
     /// 下一帧需要把焦点给新的输入框（订阅回调里没有 `&mut Window`）。
@@ -177,6 +179,7 @@ impl AppShell {
             menu: None,
             menu_delete_armed: false,
             editing: None,
+            exporting: false,
             pending_focus_rename: false,
             menu_opened_at: None,
             menu_painted: std::cell::Cell::new(false),
@@ -406,6 +409,101 @@ impl AppShell {
                 }
             }
         }
+    }
+
+    /// 导出全部笔记为 Markdown（S3-1）。
+    ///
+    /// 源文来自 `BodyDoc::text()`（**不是** UI 的 display 文本）；写盘放在后台执行，
+    /// 避免大库卡住 UI。完成后用侧栏提示给出导出路径与成功/失败计数。
+    fn export_all(&mut self, cx: &mut Context<Self>) {
+        if self.exporting {
+            self.notice = Some("导出正在进行中…".to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(vault_dir) = self
+            .vault
+            .path()
+            .parent()
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+        else {
+            self.notice = Some("找不到库所在目录，无法导出".to_owned());
+            cx.notify();
+            return;
+        };
+        let root = vault_dir
+            .join("export")
+            .join(crate::export::timestamp_label(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or(0),
+            ));
+        // 后台导出：UI 线程只负责"开始"与"完成"，写盘全在 `background_spawn` 里。
+        //
+        // 写法要点（task-52 实测结论）：
+        // - `cx.spawn` 的 future 由**前台** executor 驱动，每帧 poll 一下就返回；
+        // - `cx.background_spawn(...)` 等价于 `background_executor().spawn(...)`，
+        //   它的 future 在后台线程池里跑，主线程只是在 `.await` 处挂起；
+        // - 因此"导出期间 UI 卡住"**不是**这套写法的问题（详见下面的实测记录）。
+        //
+        // 曾经的误判：一度以为后台导出会让 UI 停止处理事件。复核发现当时**根本原因
+        // 是自动化点击落点偏了**（点到侧栏树而不是底栏按钮），导出压根没启动，日志里
+        // 自然什么都看不到。改用正确坐标后，2000 篇导出期间点侧栏仍能立刻切换文档
+        // （`MENGHUNOTE_TRACE_MOUSE=1` 有 `mouse down` 与 `打开笔记` 日志为证）。
+        let vault = self.vault.clone();
+        let target = root.clone();
+        self.exporting = true;
+        self.notice = Some("正在导出…".to_owned());
+        trace_menu!("[menghunote] 开始导出 → {}", root.display());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let started = std::time::Instant::now();
+            let outcome = cx
+                .background_spawn(async move {
+                    std::fs::create_dir_all(&target)
+                        .map_err(|error| format!("建导出目录失败 {}：{error}", target.display()))?;
+                    crate::export::export_vault(&vault, &target)
+                        .map_err(|error| format!("导出失败：{error}"))
+                })
+                .await;
+            let elapsed = started.elapsed();
+            this.update(cx, |shell, cx| {
+                shell.exporting = false;
+                match outcome {
+                    Ok(report) => {
+                        eprintln!(
+                            "[menghunote] 导出完成：成功 {} 篇，失败 {} 条，用时 {} ms → {}",
+                            report.succeeded,
+                            report.failures.len(),
+                            elapsed.as_millis(),
+                            report.root.display()
+                        );
+                        for failure in report.failures.iter().take(3) {
+                            eprintln!("[menghunote]   失败：{failure}");
+                        }
+                        let suffix = if report.failures.is_empty() {
+                            String::new()
+                        } else {
+                            format!("，失败 {} 条", report.failures.len())
+                        };
+                        shell.notice = Some(format!(
+                            "已导出 {} 篇到 {}{suffix}",
+                            report.succeeded,
+                            report.root.display()
+                        ));
+                    }
+                    Err(message) => {
+                        eprintln!("[menghunote] 导出失败：{message}");
+                        shell.notice = Some(message);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 进入行内重命名：预填标题并**全选**，焦点交给输入框。
@@ -958,6 +1056,28 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
                                     shell.create_folder(None, cx);
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-export")
+                            .flex_1()
+                            .h(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.0))
+                            .text_color(theme::status_bar_text())
+                            .child(SharedString::from(if self.exporting {
+                                "导出中…"
+                            } else {
+                                "导出"
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    shell.export_all(cx);
                                 }),
                             ),
                     ),

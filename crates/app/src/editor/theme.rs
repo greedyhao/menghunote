@@ -160,3 +160,22 @@ pub fn code_block_font() -> Font {
     font.family = MONO_FAMILY.into();
     font
 }
+
+/// 引用块每层缩进（像素）。嵌套引用按层数累加。
+pub const QUOTE_INDENT_PER_LEVEL: f32 = 16.0;
+/// 引用块左侧竖条宽度（像素）。
+pub const QUOTE_BAR_WIDTH: f32 = 3.0;
+/// 竖条与文字之间的距离（像素）。
+pub const QUOTE_BAR_GAP: f32 = 6.0;
+
+/// 引用块左侧竖条的颜色（比正文弱，用于"这是个引用块"的视觉锚点）。
+#[must_use]
+pub fn quote_bar_color() -> Rgba {
+    rgb(0xc4c9d0)
+}
+
+/// 引用块正文颜色（略弱化，字号不变）。
+#[must_use]
+pub fn quote_text_color() -> Rgba {
+    rgb(0x57606a)
+}

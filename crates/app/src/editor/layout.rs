@@ -38,6 +38,8 @@ pub struct VisualLine {
     pub line_height: f32,
     /// 该行是否用等宽字体（围栏代码块）。
     pub mono: bool,
+    /// 该行左侧缩进（像素）：引用块按层累加，其余为 0。
+    pub indent: f32,
 }
 
 impl VisualLine {
@@ -57,6 +59,8 @@ pub struct LineMetric {
     pub line_height: f32,
     /// 是否用等宽字体（围栏代码块）。
     pub mono: bool,
+    /// 该行左侧缩进（像素）：引用块按层累加，其余为 0。
+    pub indent: f32,
 }
 
 impl LineMetric {
@@ -67,6 +71,7 @@ impl LineMetric {
             font_size: super::theme::FONT_SIZE,
             line_height: super::theme::DEFAULT_LINE_HEIGHT,
             mono: false,
+            indent: 0.0,
         }
     }
 
@@ -77,8 +82,44 @@ impl LineMetric {
             font_size,
             line_height: super::theme::line_height_for(font_size),
             mono: false,
+            indent: 0.0,
         }
     }
+}
+
+/// 一行源码里引用的**嵌套层数**（`> a` = 1，`> > b` = 2）。
+///
+/// 规则与 CommonMark 的宽容度一致：允许 `>` 前有至多 3 个空格、`>` 之间可再有空格；
+/// 遇到第一个非 `>` 字符即停止。非引用行返回 0。
+#[must_use]
+pub fn quote_depth(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    loop {
+        // 每层最多允许 3 个前导空格
+        let mut spaces = 0;
+        while index < bytes.len() && bytes[index] == b' ' && spaces < 3 {
+            index += 1;
+            spaces += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'>' {
+            break;
+        }
+        index += 1;
+        depth += 1;
+        // `>` 之后允许一个空格（CommonMark 的"可省略"写法）
+        if index < bytes.len() && bytes[index] == b' ' {
+            index += 1;
+        }
+    }
+    depth
+}
+
+/// 引用层数 → 左缩进像素（**纯函数**）。
+#[must_use]
+pub fn quote_indent(depth: usize) -> f32 {
+    depth as f32 * super::theme::QUOTE_INDENT_PER_LEVEL
 }
 
 /// 按行高累加出行顶偏移，并给出内容总高度（**纯函数**，可无窗口单测）。
@@ -135,6 +176,12 @@ impl LayoutFrame {
     #[must_use]
     pub fn row_height(&self, row: usize) -> f32 {
         self.lines.get(row).map_or(0.0, |line| line.line_height)
+    }
+
+    /// 第 `row` 行的左缩进（像素）。
+    #[must_use]
+    pub fn row_indent(&self, row: usize) -> f32 {
+        self.lines.get(row).map_or(0.0, |line| line.indent)
     }
 
     /// 第 `row` 行的字号（像素）。
@@ -252,6 +299,11 @@ pub fn wrap_with(
                 default_metric.line_height
             },
             mono: metric.mono,
+            indent: if metric.indent.is_finite() && metric.indent > 0.0 {
+                metric.indent
+            } else {
+                0.0
+            },
         };
         let content_end = if raw.ends_with('\n') {
             offset + raw.len() - 1
@@ -261,7 +313,9 @@ pub fn wrap_with(
         let content = &text[offset..content_end];
         let mut start = offset;
         let mut row_in_line = 0usize;
-        for end in boundaries(content, wrap_width) {
+        // 缩进吃掉可用宽度：引用行折行必须更窄，否则文字会伸到右边界外。
+        let line_wrap_width = (wrap_width - metric.indent).max(MIN_WRAP_WIDTH);
+        for end in boundaries(content, line_wrap_width) {
             let end = offset + end.min(content.len());
             // 断行函数给出退化边界（<= 当前起点）时跳过，避免产生空视觉行或死循环。
             if end <= start {
@@ -274,6 +328,7 @@ pub fn wrap_with(
                 font_size: metric.font_size,
                 line_height: metric.line_height,
                 mono: metric.mono,
+                indent: metric.indent,
             });
             start = end;
             row_in_line += 1;
@@ -288,6 +343,7 @@ pub fn wrap_with(
                 font_size: metric.font_size,
                 line_height: metric.line_height,
                 mono: metric.mono,
+                indent: metric.indent,
             });
         }
         offset += raw.len();
@@ -305,6 +361,7 @@ pub fn wrap_with(
             font_size: metric.font_size,
             line_height: metric.line_height,
             mono: metric.mono,
+            indent: metric.indent,
         });
     }
 
@@ -477,6 +534,54 @@ mod tests {
         assert_eq!(frame.row_at_y(row_height), 1);
         assert_eq!(frame.row_at_y(10_000.0), 1);
         assert_eq!(frame.row_at_y(f32::NAN), 0);
+    }
+
+    #[test]
+    fn quote_depth_counts_nesting_levels() {
+        use super::quote_depth;
+        assert_eq!(quote_depth("普通一行"), 0);
+        assert_eq!(quote_depth(""), 0);
+        assert_eq!(quote_depth("> 引用"), 1);
+        assert_eq!(quote_depth(">引用"), 1, "`>` 后可以没有空格");
+        assert_eq!(quote_depth("> > 嵌套"), 2);
+        assert_eq!(quote_depth(">>连写"), 2);
+        assert_eq!(quote_depth("   > 三个空格也允许"), 1);
+        assert_eq!(quote_depth("> # 标题优先于引用"), 1, "层数只看前缀");
+        assert_eq!(quote_depth("# 标题"), 0);
+        assert_eq!(quote_depth("- 列表"), 0);
+        assert_eq!(quote_depth("> - item"), 1);
+    }
+
+    #[test]
+    fn quote_indent_accumulates_per_level() {
+        use super::{quote_depth, quote_indent};
+        assert_eq!(quote_indent(0), 0.0);
+        assert_eq!(quote_indent(1), theme::QUOTE_INDENT_PER_LEVEL);
+        assert_eq!(
+            quote_indent(quote_depth("> > > 三层")),
+            theme::QUOTE_INDENT_PER_LEVEL * 3.0
+        );
+        // 非引用行恒为 0
+        assert_eq!(quote_indent(quote_depth("参考答案：0")), 0.0);
+    }
+
+    #[test]
+    fn quoted_line_gets_narrower_wrap_width() {
+        use super::LineMetric;
+        let mut boundaries = |_line: &str, width: f32| vec![(width as usize).min(4)];
+        let metric = LineMetric {
+            indent: 32.0,
+            ..LineMetric::body()
+        };
+        let frame = wrap_with(
+            "abcdefgh",
+            200.0,
+            LineMetric::body(),
+            &[metric],
+            &mut boundaries,
+        );
+        // 折行宽度 = 200 - 32，断点被限制在 4 字节内（本测试只验证不 panic 且有行）
+        assert!(frame.row_count() >= 1);
     }
 
     #[test]

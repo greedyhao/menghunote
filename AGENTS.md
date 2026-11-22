@@ -11,7 +11,7 @@
 
 | 项 | 决策 |
 | --- | --- |
-| UI 框架 | **`gpui-unofficial` 1.27 + `gpui-platform-gpui-unofficial`**（跟随 Zed 主干的非官方发布，活跃维护） |
+| UI 框架 | **`gpui-kit` 0.9.1**（门面：`gpui-pre` 0.3.12 + `gpui-base` + `gpui-component`；2026-11-10 起，见 ADR 0004） |
 | 语言 | Rust（edition 2021+） |
 | **编辑模型** | **Typora 式原位所见即所得**：编辑器内文本即 Markdown 源码（`**` 等标记真实存在，默认不绘制、光标进入时显现）；持久化真源是 SQLite 单库（见 ADR 0001）。详见 [`docs/briefs/0002-editor-core.md`](docs/briefs/0002-editor-core.md) |
 | 首要平台 | **Windows 桌面**（开发机即 Windows） |
@@ -23,27 +23,38 @@
 > 因此：**每完成一个可见特性就立刻在 Windows 上跑一遍**，不要攒到最后；
 > 平台相关代码必须收敛在 `cfg(target_os = ...)` 或独立模块内，禁止散落在业务逻辑里。
 
-> **依赖基线（已确认，勿再更换）**：
+> **依赖基线（ADR 0004，2026-11-10 切换到 GPUI Kit）**：
 > ```toml
 > [dependencies]
-> gpui-unofficial = "1.27"
-> gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "1.27.0" }
+> # 别名把 lib 名固定成 `gpui`：代码里 `use gpui::*` 与 `gpui::platform::application()` 都靠它
+> gpui = { package = "gpui-kit", version = "=0.9.1" }   # 精确 pin
 > ```
-> `gpui-unofficial` 跟随 Zed 主干，发布频繁（2026-11 仍在更新），API 形如 `gpui_platform::application()`。
-> **crates.io 上的官方 `gpui` 停在 0.2.2（2025-10），已过时，不要用。**
+> - `gpui-kit` 是 **longbridge 的 meta crate**（不是 Zed 官方再发布）：它依赖 `gpui-base 0.9.1` +
+>   `gpui-pre 0.3.12` + `gpui-component 0.9.1`，其中 **`gpui-pre` 才是 Zed 主干的再发布**
+>   （`repository = zed-industries/zed`）；
+> - 选它的理由是**未来能直接用 `gpui-component` 的组件与测试基座**，不是"比 zed 新鲜"；
+> - **升级机制（重要）**：`gpui-kit` 自己**精确 pin** 了 `gpui-pre =0.3.12`，但 `gpui-base` / `gpui-component` /
+>   `gpui-kit-assets` 在 kit 的清单里是 **caret（`^0.9.1`）**——也就是说 `cargo update -p gpui-base` 能在 kit 不动的情况下
+>   把 base 挪到 kit 未验证过的组合。真正焊死整套的是**本项目 Cargo.toml 的 `"=0.9.1"` + 提交进仓库的 `Cargo.lock`**。
+>   升级做法：**只改 `gpui-kit` 版本** → 让 cargo 重新解算整套 → 跑三绿 + UI smoke + 真机验 → 提交（含 lockfile）；
+>   **禁止**单独 `cargo update -p gpui-base` 或手工指定 base/component 版本。
+> - 平台入口从 `gpui_platform::application()` 变成 **`gpui::platform::application()`**
+>   （迁移分支 `feat/gpui-kit`；探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口）；
+> - **crates.io 上的官方 `gpui` 停在 0.2.2（2025-10），已过时，不要用。**
 
 > ⚠️ **生态分叉风险（选型前必读）**：GPUI 已分裂成**互不兼容**的多条血脉，各自的 `Element` / `Entity` 类型不能混用：
 >
 > | 血脉 | crate | 备注 |
 > | --- | --- | --- |
-> | Zed 主干（**本项目**） | `gpui-unofficial` + `gpui-platform-gpui-unofficial` | 1.27，活跃 |
+> | **Zed 主干再发布** | `gpui-pre`（+ `gpui-pre-platform` 等） | `repository = zed-industries/zed`，0.3.12 |
+> | **longbridge 组件系（本项目现状）** | `gpui-kit` → `gpui-base` / `gpui-pre` / `gpui-component` | 组件最丰富；`gpui-kit` 只是门面，**内核仍是 `gpui-pre`** |
+> | 旧基线（已弃用） | `gpui-unofficial` + `gpui-platform-gpui-unofficial` | 1.27，迁移前用；已切走，勿再引回 |
 > | Zed 官方发布 | `gpui` 0.2.2 | 停在 2025-10，过时 |
-> | longbridge 组件系 | `gpui-pre` / `gpui-fast` + `gpui-base` + `gpui-component` | **组件最丰富**（60+ 组件，47 万下载），但血缘不同 |
 > | gpui-ce 系 | `gpui_ce_components` | 另一分支 |
 >
-> **含义**：选了 `gpui-unofficial`，就**不能直接复用 `gpui-component` 的组件**。
-> 这是"重造 UI 轮子"与"换基线"之间的真实取舍，**必须先经 GPT 决策**，不要随手混用依赖。
-> 判定方法：写一个 5 行骨架直接编译验证，**不要只相信依赖图推断**。
+> **含义**：`Element` / `Entity` 等类型**只在同一血脉内兼容**；本项目现在用 `gpui-kit`
+> （内核 `gpui-pre`），可以复用 `gpui-component` 的组件，但**不能**混入 `gpui-unofficial`
+> 或 `gpui` 0.2.2 的类型。判定方法：写一个 5 行骨架直接编译验证，**不要只相信依赖图推断**。
 
 ---
 
@@ -325,8 +336,8 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 ## 8. 当前状态
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
-- **版本管理**：当前开发分支 **`dev`**（按"已验证检查点"重建的干净历史，9 个提交）；旧历史完整保留在
-  **`backup/main-wip-20261110`**（含全部 wip 与被推翻的尝试）。tag `v0.1-slice6` = 切片 6 真机验收点。
+- **版本管理**：当前开发分支 **`dev`**；旧历史完整保留在 **`backup/main-wip-20261110`**（含全部 wip 与被推翻的尝试）。
+  tag：`v0.1-slice6` = 切片 6 真机验收点；**`v0.2-gpui-kit`** = S2 投影编辑器 + 引用块 + 导出 + 切换 GPUI Kit（真机验收）。
   `target/`（20G）与本地 vault 不入库；**Lead review 一律看 `git diff`**，提交前必须三绿。
 - 已落盘：[`AGENTS.md`](AGENTS.md)、[`docs/briefs/0000-kickoff.md`](docs/briefs/0000-kickoff.md)、
   [`0001-storage-format.md`](docs/briefs/0001-storage-format.md)（**已作废**）、
@@ -359,6 +370,11 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   语义样式（粗体/斜体/行内代码/删除线/链接）→ 块级度量（h1–h6 字号、围栏代码等宽、逐行行高）。
   **编辑与移动都走 display 语义**：退格/Delete/方向键先取可见 grapheme，再映射成最小 source 区间——否则会删到
   隐藏的 `**` 或把 caret 落进标记中间。**允许删除"已显现的"标记**（此时它是可见文本，等同直接改源码）。
-  已知未做：BlockQuote 缩进/弱化色（会动 `text_left`，需与命中几何一起改）、标题外块级样式、`***`/同种定界符嵌套。
-- **S3 导出**（进行中）：整库单向导出 Markdown 到 `<vault>/export/<时间戳>/`，文件名清洗与目录结构镜像。
-  导出内容取 `BodyDoc::text()`（源文），**不是** UI 的 display 文本。
+  引用块缩进/左侧竖条已完成（`6cc6fa4`：`text_left_for_row` 收口，绘制/命中共用一套左边界）。
+  已知未做：其它块级样式（列表项符号需要 Replace/Object 段）、`***`/同种定界符嵌套、跨行行内。
+- **S3 导出已完成（2026-11-10）**：整库单向导出 Markdown 到 `<vault>/export/<时间戳>/`，文件名清洗（Windows 非法字符 / 尾空格点 / 空标题 / 大小写不敏感去重）
+  与目录结构镜像；导出取 `BodyDoc::text()`（源文）**不是** UI 的 display 文本；后台执行，2000 篇 1126ms，导出期间 UI 可交互。
+- **UI 框架已切 GPUI Kit（2026-11-10，ADR 0004，真机验收）**：`gpui = { package = "gpui-kit", version = "=0.9.1" }`（精确 pin），
+  平台入口 `gpui::platform::application()`；`text`/`editor`/`storage` **零改动**。
+  探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口；迁移后三绿 329 用例 + UI smoke 10/10 + 用户真机 IME/DPI 通过。
+  迁移/探针 worktree 与临时分支已清理；**升级必须整套对齐**，见 §1 依赖基线。

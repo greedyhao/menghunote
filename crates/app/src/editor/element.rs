@@ -108,7 +108,7 @@ impl EditorElement {
                     selected.start <= line.bytes.start,
                     selected.end >= line.bytes.end,
                     shaped.width(),
-                    geometry.text_left(),
+                    geometry.text_left_for_row(row),
                     window.scale_factor(),
                     window.bounds().size.width
                 );
@@ -117,10 +117,11 @@ impl EditorElement {
                 continue;
             };
             let top = geometry.row_top(row);
+            // 引用行的选区要从该行缩进后的左边界起算（缩进只在几何里加一次）。
             window.paint_quad(fill(
                 Bounds::new(
-                    point(geometry.text_left() + x1, top),
-                    size(x2 - x1, geometry.line_height),
+                    point(geometry.text_left_for_row(row) + x1, top),
+                    size(x2 - x1, geometry.row_height(row)),
                 ),
                 theme::selection_bg(),
             ));
@@ -211,7 +212,19 @@ impl EditorElement {
     fn paint_text(&self, geometry: &EditorGeometry, window: &mut Window, cx: &mut App) {
         for (offset, shaped) in geometry.shaped.iter().enumerate() {
             let row = geometry.visible_start + offset;
-            let origin = point(geometry.text_left(), geometry.row_top(row));
+            // 引用行有缩进：文字原点用该行自己的左边界（PAD_X 与 indent 只在这里加一次）。
+            let origin = point(geometry.text_left_for_row(row), geometry.row_top(row));
+            // 引用块左侧竖条：贴在该行文字左边界左侧。
+            if geometry.frame.row_indent(row) > 0.0 {
+                let bar_x = origin.x - px(theme::QUOTE_BAR_WIDTH + theme::QUOTE_BAR_GAP);
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bar_x, geometry.row_top(row)),
+                        size(px(theme::QUOTE_BAR_WIDTH), geometry.row_height(row)),
+                    ),
+                    theme::quote_bar_color(),
+                ));
+            }
             // 行内代码的底色是 `TextRun::background_color`，必须**单独**刷一遍；
             // `paint` 只画字形与下划线/删除线，不会画 run 背景。
             let row_height = geometry.row_height(row);
@@ -507,7 +520,7 @@ fn empty_line_highlight(
     sel_start < sel_end && line_start == line_end && sel_start <= line_start && sel_end > line_start
 }
 
-/// 一条视觉行上被选区覆盖的横向区间（相对**文字起点**，即 `geometry.text_left()`）。
+/// 一条视觉行上被选区覆盖的横向区间（相对该行文字起点，即 `geometry.text_left_for_row(row)`）。
 fn selection_span(
     line: &VisualLine,
     shaped: &ShapedLine,
@@ -524,7 +537,7 @@ fn selection_span(
 
 /// 计算一条视觉行上要画的选区区间（**纯函数**：横向位置由 `x_for_index` 注入）。
 ///
-/// 返回值是**行内相对像素**（0 = 该行文字起点）。绘制方再加 `geometry.text_left()`：
+/// 返回值是**行内相对像素**（0 = 该行文字起点）。绘制方再加 `geometry.text_left_for_row(row)`：
 /// 早期版本在这里就把 `PAD_X` 加进返回值、绘制处又加了一次，导致每条选区带整体
 /// 右移 14px（真机截图里"末行铺到右边界"就是这个）。
 ///

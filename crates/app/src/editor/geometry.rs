@@ -51,10 +51,25 @@ impl EditorGeometry {
         self.visible_start..self.visible_start + self.shaped.len()
     }
 
-    /// 文字区左边界（窗口坐标）。
+    /// 文字区**基础**左边界（窗口坐标；不含块级缩进）。
     #[must_use]
     pub fn text_left(&self) -> Pixels {
         self.origin.x + px(theme::PAD_X)
+    }
+
+    /// 第 `row` 行的文字左边界 = 基础左边界 + 该行缩进（引用块）。
+    ///
+    /// **几何与绘制都用这一个函数**，避免 `PAD_X`/缩进被加两次
+    /// （历史 bug：两处各加一次 → 选区整体右移 14px）。
+    #[must_use]
+    pub fn text_left_for_row(&self, row: usize) -> Pixels {
+        self.origin.x + px(theme::PAD_X) + px(self.frame.row_indent(row))
+    }
+
+    /// 第 `row` 行的引用左缩进（像素）。
+    #[must_use]
+    pub fn row_indent(&self, row: usize) -> Pixels {
+        px(self.frame.row_indent(row))
     }
 
     /// 第 `row` 行的行高（逐行可变：标题行更高）。
@@ -109,7 +124,7 @@ impl EditorGeometry {
     #[must_use]
     pub fn byte_at(&self, position: Point<Pixels>) -> usize {
         let row = self.row_at_y(position.y);
-        let local_x = (position.x - self.text_left()).max(px(0.0));
+        let local_x = (position.x - self.text_left_for_row(row)).max(px(0.0));
         self.byte_at_row_x(row, local_x)
             .unwrap_or_else(|| self.frame.row_bytes(row).start)
     }
@@ -139,10 +154,13 @@ impl EditorGeometry {
         let bytes = self.frame.row_bytes(row);
         let shaped = self.shaped.get(row.checked_sub(self.visible_start)?)?;
         if bytes.is_empty() {
-            return Some((row, self.text_left()));
+            return Some((row, self.text_left_for_row(row)));
         }
         let offset = byte.saturating_sub(bytes.start).min(bytes.len());
-        Some((row, self.text_left() + shaped.x_for_index(offset)))
+        Some((
+            row,
+            self.text_left_for_row(row) + shaped.x_for_index(offset),
+        ))
     }
 }
 

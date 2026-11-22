@@ -7,11 +7,10 @@ license.workspace = true
 [dependencies]
 # 应用层错误汇总（库层用 thiserror，见 AGENTS.md §4）
 anyhow = "1"
-# 依赖基线见 AGENTS.md §1，勿随意升级
-# lib name 为 `gpui`，故代码里 `use gpui::*`
-gpui-unofficial = "1.27"
-# 包名与 lib name 不同，必须用 package 别名
-gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "1.27.0" }
+# 依赖基线见 AGENTS.md §1 / ADR 0004：gpui-kit 是 gpui-pre 的门面（含 gpui-base/gpui-component）。
+# **精确 pin**：升级必须整体对齐（kit/pre/base/component 版本互相约束），不能单边升。
+# 用依赖别名把 lib 名固定成 `gpui`，代码里 `use gpui::*` 与 `gpui::platform::` 保持不变。
+gpui = { package = "gpui-kit", version = "=0.9.1" }
 # ADR 0003 §3：app 可以依赖 editor / storage / text，反向不允许
 menghunote-editor = { path = "../editor" }
 menghunote-storage = { path = "../storage" }

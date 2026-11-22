@@ -115,6 +115,10 @@ pub fn demo_markdown() -> String {
     text.push_str("普通一行，没有标记。\n");
     text.push_str("**粗体** 与 `代码` 与 # 井号。\n");
     text.push_str("*斜体* 与 ~~删除~~ 与 [链接](https://example.com)。\n\n");
+    // S2-53 验收用：引用块（单层 / 嵌套 / 带行内标记）
+    text.push_str("> 这是一段引用文字，用来验证缩进与左侧竖条。\n");
+    text.push_str("> > 这是嵌套引用，应该再右移 16px。\n");
+    text.push_str("> 引用里的 **粗体** 与 `代码`。\n\n");
     text.push_str("切片 5a 只做一件事：把 `source_text()` 按**软折行**画进 GPUI 窗口。\n");
     text.push_str("S1 是 identity 投影 —— 源码原样显示，`#`、`**`、反引号都还看得见。\n\n");
     text.push_str("单位夹具（ADR 0002 §11.1）：");

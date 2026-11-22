@@ -226,26 +226,44 @@ impl EditorView {
     /// 标题按 level 放大，围栏代码块用等宽字体，其余正文默认。
     pub(crate) fn block_metrics(&self) -> Vec<super::layout::LineMetric> {
         use menghunote_editor::BlockKind;
+        // 引用缩进要看**源码行**的前缀（`>` 的层数），投影里 `>` 是隐藏的。
+        let source = self.controller.source_text();
+        let source_lines: Vec<&str> = source.split_inclusive('\n').collect();
         self.controller
             .block_runs()
             .iter()
-            .map(|run| match run.kind() {
-                BlockKind::Heading => {
-                    let level = run.level().unwrap_or(1);
-                    let font_size = theme::heading_font_size(level);
-                    super::layout::LineMetric {
-                        font_size,
-                        line_height: theme::line_height_for(font_size),
-                        mono: false,
+            .enumerate()
+            .map(|(index, run)| {
+                // 引用行每层 16px；层数从源码行前缀数出来（`> > x` = 2 层）。
+                let indent = if run.kind() == BlockKind::BlockQuote {
+                    let line = source_lines.get(index).copied().unwrap_or("");
+                    super::layout::quote_indent(super::layout::quote_depth(line))
+                } else {
+                    0.0
+                };
+                match run.kind() {
+                    BlockKind::Heading => {
+                        let level = run.level().unwrap_or(1);
+                        let font_size = theme::heading_font_size(level);
+                        super::layout::LineMetric {
+                            font_size,
+                            line_height: theme::line_height_for(font_size),
+                            mono: false,
+                            indent,
+                        }
                     }
-                }
-                BlockKind::FencedCode => super::layout::LineMetric {
-                    font_size: theme::FONT_SIZE,
-                    line_height: theme::DEFAULT_LINE_HEIGHT,
-                    mono: true,
-                },
-                BlockKind::BlockQuote | BlockKind::ListItem | BlockKind::Paragraph => {
-                    super::layout::LineMetric::body()
+                    BlockKind::FencedCode => super::layout::LineMetric {
+                        font_size: theme::FONT_SIZE,
+                        line_height: theme::DEFAULT_LINE_HEIGHT,
+                        mono: true,
+                        indent,
+                    },
+                    BlockKind::BlockQuote | BlockKind::ListItem | BlockKind::Paragraph => {
+                        super::layout::LineMetric {
+                            indent,
+                            ..super::layout::LineMetric::body()
+                        }
+                    }
                 }
             })
             .collect()
@@ -1088,7 +1106,7 @@ impl EditorView {
             .x_for_index(offset)
         };
         Some(gpui::point(
-            geometry.text_left() + local_x,
+            geometry.text_left_for_row(row) + local_x,
             geometry.row_top(row),
         ))
     }
