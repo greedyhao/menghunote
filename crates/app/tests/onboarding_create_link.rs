@@ -1448,7 +1448,7 @@ async fn failed_auto_publish_keeps_instance_blocks_invite_then_retry_repairs(
     );
 
     // 重试发布：先关闭设置遮罩，真实建一篇笔记（发布需要活动文档持闸），再重新打开设置点按钮。
-    let close = expect_bounds(cx, "settings-cancel");
+    let close = expect_bounds(cx, "settings-close");
     cx.simulate_click(close.center(), Modifiers::default());
     cx.run_until_parked();
     let new_note = expect_bounds(cx, "sidebar-new-note");

@@ -1565,7 +1565,12 @@ fn run_restart<C: RelayClient, M: RestartManagement>(
         }
         RotationPhase::RestartPrimaryBaselineReady => {
             // primary 已 durable：绝不能重新生成 random primary（role CAS 会拒绝）。
-            let primary = baseline_from_journal(vault, &journal, BaselineRole::Primary)?;
+            let primary = baseline_from_journal(
+                vault,
+                &journal,
+                BaselineRole::Primary,
+                &plan.candidate_root,
+            )?;
             let fallback = prepare_baseline(
                 vault,
                 client,
@@ -1590,7 +1595,7 @@ fn run_restart<C: RelayClient, M: RestartManagement>(
                 .set_restart_fallback_baseline(vault, journal_baseline_from_prepared(&fallback)?)?;
             (primary, fallback)
         }
-        _ => baselines_from_journal(vault, &journal)?,
+        _ => baselines_from_journal(vault, &journal, &plan.candidate_root)?,
     };
 
     // 4. 全设备 grants：只封给控制链 active 且未吊销的设备；固定 leaf 字节先落 journal。
@@ -1880,7 +1885,7 @@ fn resume_activated_restart<M: RestartManagement>(
             ));
         }
     }
-    let (primary, fallback) = baselines_from_journal(vault, journal)?;
+    let (primary, fallback) = baselines_from_journal(vault, journal, &plan.candidate_root)?;
     let reencrypted_assets = journal
         .restart_assets
         .iter()
@@ -2091,8 +2096,7 @@ fn prepare_baseline<C: RelayClient>(
         return Err(SyncError::Object("候选基线 S 未覆盖 restart 冻结点"));
     }
     // 本地 durable receipt：T 的 commit digest 只能来自这里（绝不回 relay 取）。
-    let commit_digest =
-        checkpoint_commit_digest(request.vault_id, request.device_id, &prepared.report)?;
+    let commit_digest = checkpoint_commit_digest(&prepared.report)?;
     let evidence =
         capture_baseline_evidence(client, &plan.candidate_root, &prepared, &frozen_hashes)?;
     Ok(RestartBaseline {
@@ -2115,6 +2119,7 @@ fn baseline_from_journal(
     vault: &Vault,
     journal: &RotationJournal,
     role: BaselineRole,
+    candidate_root: &RootSecretV1,
 ) -> Result<RestartBaseline, SyncError> {
     let index = match role {
         BaselineRole::Primary => 0,
@@ -2132,11 +2137,11 @@ fn baseline_from_journal(
             "restart journal 缺本地 commit receipt：拒绝从 relay facts 重签 T",
         ));
     }
-    let receipt = crate::checkpoint::load_verified_receipt(vault, &baseline.checkpoint_id)?.ok_or(
-        SyncError::LocalCorrupt(
+    let receipt =
+        crate::checkpoint::load_verified_receipt(vault, candidate_root, &baseline.checkpoint_id)?
+            .ok_or(SyncError::LocalCorrupt(
             "restart journal 缺新修订 verified receipt：拒绝按旧 verified=true 快捷恢复",
-        ),
-    )?;
+        ))?;
     if receipt.checkpoint_id != baseline.checkpoint_id
         || receipt.commit_digest != baseline.commit_digest
         || receipt.epoch != journal.to_epoch
@@ -2161,6 +2166,7 @@ fn baseline_from_journal(
 fn baselines_from_journal(
     vault: &Vault,
     journal: &RotationJournal,
+    candidate_root: &RootSecretV1,
 ) -> Result<(RestartBaseline, RestartBaseline), SyncError> {
     if journal.baselines.len() != 2 {
         return Err(SyncError::LocalCorrupt(
@@ -2183,8 +2189,8 @@ fn baselines_from_journal(
         ));
     }
     Ok((
-        baseline_from_journal(vault, journal, BaselineRole::Primary)?,
-        baseline_from_journal(vault, journal, BaselineRole::Fallback)?,
+        baseline_from_journal(vault, journal, BaselineRole::Primary, candidate_root)?,
+        baseline_from_journal(vault, journal, BaselineRole::Fallback, candidate_root)?,
     ))
 }
 

@@ -85,6 +85,21 @@ pub const LOCAL_DIR_NAME: &str = "local";
 /// 配置文件名（产品；P2 从旧的 `dev-sync.json` 改为 `sync.json`）。
 pub const PROFILE_FILE_NAME: &str = "sync.json";
 
+/// 本机启动偏好文件名（数据根下；与 `sync.json` 分开）。
+///
+/// 只记"上次成功打开的是本地（不同步）库还是同步实例"，是**本机偏好**：
+/// 不进 vault、不参与同步；缺失/损坏按 Welcome 处理（不报错、不阻塞启动）。
+pub const STARTUP_FILE_NAME: &str = "startup.json";
+
+/// 本机启动偏好当前版本（写入时使用；读取时 `version` 字段可缺省）。
+pub const STARTUP_PREFERENCES_VERSION: u32 = 1;
+
+/// 设置页分类记忆文件名（数据根下；本机 UI 偏好，不同步、不写正文）。
+///
+/// 只记上次打开设置页时停留的分类短名（与 `SettingsSection::key()` 同一套值）；
+/// 缺失/损坏/未知 key 一律回退「外观」。
+pub const SETTINGS_UI_FILE_NAME: &str = "settings-ui.json";
+
 /// 默认实例目录（`instances/`）。
 const INSTANCES_DIR_NAME: &str = "instances";
 
@@ -337,11 +352,114 @@ impl ProfileLayout {
         self.local_dir().join(VAULT_FILE_NAME)
     }
 
+    /// 本机启动偏好路径：`<数据根>/startup.json`。
+    ///
+    /// 与 `sync.json` 分开：它只描述"上次成功打开的是本地库还是同步实例"，
+    /// 不记录实例列表、不需要迁移；缺失/损坏由启动引导按 Welcome 处理。
+    #[must_use]
+    pub fn startup_path(&self) -> PathBuf {
+        self.data_root().join(STARTUP_FILE_NAME)
+    }
+
+    /// 设置页分类记忆路径：`<数据根>/settings-ui.json`。
+    ///
+    /// 本机 UI 偏好（只记分类短名），不进 vault、不参与同步。
+    #[must_use]
+    pub fn settings_ui_path(&self) -> PathBuf {
+        self.data_root().join(SETTINGS_UI_FILE_NAME)
+    }
+
     /// 配置存储句柄。
     #[must_use]
     pub fn store(&self) -> ProfileStore {
         ProfileStore {
             path: self.config_path.clone(),
+        }
+    }
+}
+
+/// 上次成功打开的入口（本机启动偏好；不同步、不含秘密/正文）。
+///
+/// 启动引导只在**打开成功**后写它：本地库 → [`StartupMode::Local`]；
+/// 同步实例 → [`StartupMode::Sync`]。文件缺失/损坏/未知值 = 没有可恢复的入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupMode {
+    /// 本地（不同步）库（产品 `local/vault.sqlite3`；dev-sync 构建是默认 dev vault）。
+    Local,
+    /// 同步实例（`sync.json` 的 active）。
+    Sync,
+}
+
+impl StartupMode {
+    /// 稳定短名（JSON 里唯一值；也是测试/诊断字面量）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Sync => "sync",
+        }
+    }
+
+    /// 从 JSON 文本解析；缺失/不可读/损坏/未知 `mode`/未知版本一律 `None`。
+    ///
+    /// `version` 字段**可缺省**（`{"mode":"local"}` 也接受，字段最小化）；一旦给出
+    /// 就必须是 [`STARTUP_PREFERENCES_VERSION`]，避免未来格式被旧程序误读。
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        if let Some(version) = value.get("version") {
+            if version.as_u64() != Some(u64::from(STARTUP_PREFERENCES_VERSION)) {
+                return None;
+            }
+        }
+        match value.get("mode")?.as_str()? {
+            "local" => Some(Self::Local),
+            "sync" => Some(Self::Sync),
+            _ => None,
+        }
+    }
+
+    /// 序列化为稳定 JSON（写入前先落临时文件再 rename）。
+    #[must_use]
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\n  \"version\": {STARTUP_PREFERENCES_VERSION},\n  \"mode\": \"{}\"\n}}\n",
+            self.as_str()
+        )
+    }
+}
+
+/// 读取本机启动偏好；文件不存在/不可读/损坏 → `None`（不报错、不阻塞启动）。
+#[must_use]
+pub fn load_startup_mode(path: &Path) -> Option<StartupMode> {
+    let text = fs::read_to_string(path).ok()?;
+    StartupMode::parse(&text)
+}
+
+/// 原子写入本机启动偏好：同目录临时文件 → rename；失败时旧文件原样保留。
+pub fn save_startup_mode(path: &Path, mode: StartupMode) -> std::io::Result<()> {
+    write_json_file_atomically(path, &mode.to_json())
+}
+
+/// 原子写一个小 JSON 偏好文件（同目录临时文件 → `rename`）。
+///
+/// 与 `theme.json` / `language.json` / `sidebar.json` 同一套纪律：失败时旧文件原样
+/// 保留；Windows 上目标存在时 `rename` 可能失败，退化为直接覆盖写（并清掉临时文件）。
+pub(crate) fn write_json_file_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, text.as_bytes())?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let result = fs::write(path, text.as_bytes());
+            let _ = fs::remove_file(&temp);
+            result
         }
     }
 }
@@ -1753,5 +1871,82 @@ mod tests {
         assert_ne!(first, second);
         validate_instance_id(&first).expect("生成的 id 必须合法");
         validate_instance_id(&second).expect("生成的 id 必须合法");
+    }
+
+    /// 启动偏好只认 `local`/`sync`；缺失/损坏/未知值/未知版本一律 `None`（回 Welcome）。
+    #[test]
+    fn startup_mode_parses_only_known_values_and_tolerates_minimal_json() {
+        assert_eq!(
+            StartupMode::parse("{\"mode\": \"local\"}"),
+            Some(StartupMode::Local),
+            "字段最小化写法（没有 version）也必须接受"
+        );
+        assert_eq!(
+            StartupMode::parse("{\"version\": 1, \"mode\": \"sync\"}"),
+            Some(StartupMode::Sync)
+        );
+        for corrupt in [
+            "",
+            "{ broken",
+            "[]",
+            "{\"version\": 1}",
+            "{\"mode\": \"welcome\"}",
+            "{\"mode\": 1}",
+            "{\"version\": 99, \"mode\": \"local\"}",
+            "{\"version\": 1, \"mode\": null}",
+        ] {
+            assert_eq!(
+                StartupMode::parse(corrupt),
+                None,
+                "损坏/未知输入不得恢复任何入口：{corrupt:?}"
+            );
+        }
+    }
+
+    /// 启动偏好原子写入 → 读回一致；损坏文件回退 `None`；临时文件不残留。
+    #[test]
+    fn startup_mode_file_round_trips_and_corruption_falls_back() {
+        let dir = temp_dir("startup-pref");
+        let path = dir.join(STARTUP_FILE_NAME);
+        assert_eq!(load_startup_mode(&path), None, "文件不存在 = 没有偏好");
+
+        save_startup_mode(&path, StartupMode::Local).expect("写 local 失败");
+        assert_eq!(load_startup_mode(&path), Some(StartupMode::Local));
+        save_startup_mode(&path, StartupMode::Sync).expect("写 sync 失败");
+        assert_eq!(load_startup_mode(&path), Some(StartupMode::Sync));
+        let raw = std::fs::read_to_string(&path).expect("读回失败");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("必须是 JSON");
+        assert_eq!(value["version"], serde_json::json!(1));
+        assert_eq!(value["mode"], "sync");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "原子写完成后不能留下临时文件"
+        );
+
+        std::fs::write(&path, b"{ broken").expect("写坏文件失败");
+        assert_eq!(load_startup_mode(&path), None, "损坏必须回退 None");
+    }
+
+    /// 两个本机偏好文件都在数据根下（与 `local/`、`instances/` 同级）。
+    #[test]
+    fn startup_and_settings_ui_paths_live_in_the_data_root() {
+        let root = temp_dir("preference-paths");
+        let layout = ProfileLayout::new(
+            root.join("config/sync.json"),
+            root.join("data").join("instances"),
+        );
+        assert_eq!(
+            layout.startup_path(),
+            root.join("data").join(STARTUP_FILE_NAME)
+        );
+        assert_eq!(
+            layout.settings_ui_path(),
+            root.join("data").join(SETTINGS_UI_FILE_NAME)
+        );
+        assert_eq!(
+            layout.startup_path().parent(),
+            Some(layout.data_root().as_path()),
+            "启动偏好必须与本地库/实例目录同一数据根"
+        );
     }
 }

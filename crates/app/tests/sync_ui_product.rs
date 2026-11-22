@@ -16,7 +16,8 @@
 //! 4. P2 数据目录/迁移/DEV 标注（见 `product_startup_*`）；
 //! 5. **仅本地使用**：点击 `app-root-local` → Main（无同步面板/同步状态），
 //!    数据根下 `local/vault.sqlite3` 被创建；不写 `sync.json`、不建 `instances/`、
-//!    不写身份文件；空库**不播种 demo**；再次启动点同一入口复用库（内容不重置）；
+//!    不写身份文件；空库**不播种 demo**；本机 `startup.json` 记 `mode=local`，
+//!    重启后**直接回到本地 Main**（库内容不重置）；
 //! 6. 本地库打不开 → GUI Error 页（`set_error`），不静默退出。
 //!
 //! 纪律：临时目录在 `CARGO_TARGET_TMPDIR`，不 sleep，收敛点 `run_until_parked()`。
@@ -630,7 +631,16 @@ async fn product_local_entry_opens_empty_local_vault_without_sync(cx: &mut TestA
         "本地库必须能正常新建笔记"
     );
 
-    // ---- 再次启动：同一路径复用库（不重置、不重复播种） ----
+    // ---- 再次启动：本机启动偏好记 `local`，直接回到同一本地库（不重置、不重复播种） ----
+    let startup_path = layout.startup_path();
+    assert!(startup_path.is_file(), "本地打开成功必须写本机启动偏好");
+    let startup: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&startup_path).expect("读启动偏好失败"))
+            .expect("启动偏好必须是 JSON");
+    assert_eq!(
+        startup["mode"], "local",
+        "本地打开成功必须记 mode=local（不同步）"
+    );
     assert!(cx.simulate_close(), "本地 Main 允许关窗（没有同步收尾）");
     cx.run_until_parked();
     let restarted = cx.update(|window, cx| {
@@ -640,19 +650,22 @@ async fn product_local_entry_opens_empty_local_vault_without_sync(cx: &mut TestA
     cx.run_until_parked();
     assert_eq!(
         restarted.update(cx, |root, _| root.state_label()),
-        RootStateLabel::Welcome,
-        "本地库不登记 sync.json：重启后仍从 Welcome 进入（不自动占库）"
+        RootStateLabel::Main,
+        "本机启动偏好 local + 本地库存在：重启必须直接进本地 Main（不再回 Welcome）"
     );
-    let local = expect_bounds(cx, "app-root-local");
-    cx.simulate_click(local.center(), Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(
-        restarted.update(cx, |root, _| root.state_label()),
-        RootStateLabel::Main
+    assert!(
+        restarted.update(cx, |root, _| root.is_local_mode()),
+        "自动恢复的 Main 必须仍是本地（不同步）模式"
     );
+    assert!(
+        restarted.update(cx, |root, _| root.has_main_shell()),
+        "自动恢复必须构造真实 AppShell"
+    );
+    expect_bounds(cx, "app-root-main");
+    expect_bounds(cx, "app-root-local-mode");
     let shell = restarted
         .update(cx, |root, _| root.main_shell().cloned())
-        .expect("再次打开必须有 AppShell");
+        .expect("自动恢复必须有 AppShell");
     assert_eq!(
         sidebar_titles(&shell, cx).len(),
         1,

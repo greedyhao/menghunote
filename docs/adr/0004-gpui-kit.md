@@ -7,7 +7,7 @@
 ## 背景
 
 当前 UI 基线是 `gpui-unofficial 1.27` + `gpui-platform-gpui-unofficial 1.27.0`（AGENTS §1）。
-出现的新选项是 [**GPUI Kit**](https://github.com/longbridge/gpui-kit)（`gpui-kit 0.9.1`，2026-11-09）：
+出现的新选项是 [**GPUI Kit**](https://github.com/longbridge/gpui-kit)（`gpui-kit 0.10.0`，2026-11-09）：
 75+ 组件、UI 集成测试、无障碍、docking/表格/webview 等能力，自带 `<Editor>`、markdown 等示例。
 
 关键事实（已核实）：
@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | `gpui-unofficial 1.27.0` | `gpui-archipelago/gpui-unofficial` 再发布 Zed 主干 | 2026-11-04，68,744 行 |
 | `gpui-pre 0.3.12` | **`zed-industries/zed` 快照 `d2a4fb6`** | 2026-11-09，70,193 行 |
-| `gpui-kit 0.9.1` | longbridge meta crate | 门面 = `gpui-pre` + `gpui-base` + `gpui-component`（+assets） |
+| `gpui-kit 0.10.0` | longbridge meta crate | 门面 = `gpui-pre` + `gpui-base` + `gpui-component`（+assets） |
 
 - 两者同源，只差约一周 Zed 提交；**类型互不兼容，不能混用**，只能整体替换。
 - 探针（隔离 worktree，见 `task-51`）结论：`gpui-kit` 用 Cargo 别名 `gpui = { package = "gpui-kit" }` 接入后，
@@ -32,7 +32,7 @@
 
 ## 结论
 
-**选 C**：切到 `gpui-kit 0.9.1`，**精确 pin**（`=0.9.1`），不跟随每周自动升级。
+**选 C**：切到 `gpui-kit 0.10.0`，**精确 pin**（`=0.10.0`），不跟随每周自动升级。
 
 理由：
 
@@ -45,7 +45,7 @@
 1. `crates/app/Cargo.toml`：
    ```toml
    # 依赖别名保持代码里 `gpui::` 路径不变（gpui-kit 是 gpui-pre 的门面）
-   gpui = { package = "gpui-kit", version = "=0.9.1" }
+   gpui = { package = "gpui-kit", version = "=0.10.0" }
    ```
    删除 `gpui-unofficial` 与 `gpui-platform-gpui-unofficial`。
 2. `crates/app/src/main.rs`：`gpui_platform::application()` → `gpui::platform::application()`。
@@ -80,7 +80,7 @@
 
 真机验收发现：开着微软拼音时，搜索浮层的文字输入**完全无响应**，`Esc` 也被输入法消费。
 
-根因（已核源码，不是猜测）：**`gpui-component 0.9.1` 与 `gpui-base 0.9.1` 中
+根因（已核源码，不是猜测）：**`gpui-component 0.10.0` 与 `gpui-base 0.10.0` 中
 `impl EntityInputHandler for …` 为 0 处**——组件的 `Input`/`TextInput` 只处理键盘事件，**没有 IME 集成**。
 GPUI 的输入法链路要求焦点实体实现 `EntityInputHandler`（本项目 `RenameInput` 就是这样做的，
 并已被微软拼音真机验证）。
@@ -92,3 +92,12 @@ GPUI 的输入法链路要求焦点实体实现 `EntityInputHandler`（本项目
 - `gpui-component` 仍可用于**无输入法需求**的组件（列表、表格、对话框、菜单、docking 等）；
 - 自动化用 `WM_CHAR` 注入**绕过 IME**，因此"自动化能输入"**不能**作为 IME 可用的证据；
   涉及输入法的改动必须真机验（这是本项目第二次踩到"自动化覆盖不到输入法"）。
+
+## 2026-11-19 升级记录
+
+按本 ADR 的升级规则，从 `gpui-kit 0.9.1` 升到 **0.10.0**（只改 kit 版本，让 cargo 重解整套）：
+
+- `gpui-kit` / `gpui-base` / `gpui-component` / `gpui-component-macros` / `gpui-kit-assets` = 0.10.0；
+- `gpui-pre` 仍由 kit 精确 pin 在 **0.3.12**；
+- `gpui-fast*` 0.1.14 → 0.1.17；
+- 业务代码零改动，`cargo check`/clippy/app 测试通过；Windows 真机 UI smoke 待验收。

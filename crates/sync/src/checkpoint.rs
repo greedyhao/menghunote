@@ -28,7 +28,7 @@ use crate::asset_sync;
 use crate::cbor;
 use crate::device::DeviceSigningKey;
 use crate::error::SyncError;
-use crate::keys::{derive_asset_id_key, RootSecretV1};
+use crate::keys::{derive_asset_id_key, derive_checkpoint_receipt_key, RootSecretV1, Secret32};
 use crate::relay::{
     CheckpointLease, CheckpointPublish, CheckpointRef, CheckpointRole, RelayClient, RelayLogEvent,
     RelayLogKind, RelayState, SlotRecord, SlotUpload,
@@ -45,9 +45,9 @@ use menghunote_storage::{
     StructureDoc, STRUCTURE_DOC_ID,
 };
 use menghunote_sync_proto::{
-    checkpoint_signing_input, part_count_for, refs_digest_input, CheckpointCommit, ManifestAsset,
-    ManifestDoc, ManifestV1, ObjectCommit, ObjectRefV1, ObjectType, SnapshotV1, UpdateV1,
-    MAX_ASSET_RAW_BYTES,
+    checkpoint_signing_input, checkpoint_validation_input, part_count_for, refs_digest_input,
+    CheckpointCommit, CheckpointValidationV2, ManifestAsset, ManifestDoc, ManifestV1, ObjectCommit,
+    ObjectRefV1, ObjectType, SnapshotV1, UpdateV1, MAX_ASSET_RAW_BYTES,
 };
 
 /// 文档 kind（客户端约定）：结构文档 = 0，正文文档 = 1。
@@ -243,6 +243,11 @@ pub struct CheckpointReport {
     pub published_at: Option<u64>,
     /// 是否已从 relay 读回并 validate（只有 validate 过的基线才能 promote）。
     pub validated: bool,
+    /// promote 成功后签名的 `CheckpointCommit` 字节摘要（SHA256）。
+    ///
+    /// 轮换 activation T 的 `primary/fallback_commit_digest` 只能取这里——不得再用
+    /// report 的公开字段另拼一份（v2 起 commit 还绑定 `validation_digest`）。
+    pub commit_digest: Option<[u8; 32]>,
 }
 
 /// `prepare` 导出点冻结的本地事实（P0-3 绑定证据）。
@@ -333,6 +338,44 @@ struct BaselineFacts {
     coverage_verified_candidates: usize,
     /// 覆盖证明事实摘要（按 seq 排序的 `seq||oid||real_sha||byte_len||digest`）。
     coverage_proof_digest: [u8; 32],
+    /// coverage 扫描冻结的 relay active epoch。
+    coverage_epoch: u64,
+    /// 验证修订 2 的证据摘要（写进 `CheckpointCommit.validation_digest`）。
+    validation_digest: [u8; 32],
+}
+
+impl BaselineFacts {
+    /// 从不可变验证事实重建 v2 证据（用于重算/对撞 `validation_digest`）。
+    fn validation_evidence(&self, producer_device_id: &DeviceId) -> CheckpointValidationV2 {
+        CheckpointValidationV2 {
+            vault_id: self.vault_id,
+            checkpoint_id: self.checkpoint_id,
+            epoch: self.epoch,
+            covered_relay_seq: self.covered_seq,
+            coverage_epoch: self.coverage_epoch,
+            manifest_object_id: self.manifest_object_id,
+            manifest_digest: self.manifest_digest,
+            refs_digest: self.refs_digest,
+            producer_device_id: *producer_device_id,
+            imported_docs: u64::try_from(self.imported_docs).unwrap_or(u64::MAX),
+            imported_vv_digest: self.imported_vv_digest,
+            verified_assets: u64::try_from(self.verified_assets).unwrap_or(u64::MAX),
+            coverage_durable_assets: u64::try_from(self.coverage_durable_assets)
+                .unwrap_or(u64::MAX),
+            coverage_verified_candidates: u64::try_from(self.coverage_verified_candidates)
+                .unwrap_or(u64::MAX),
+            coverage_proof_digest: self.coverage_proof_digest,
+        }
+    }
+
+    /// 重算 `SHA256(checkpoint_validation_input(...))` 并与记录的摘要对撞。
+    fn recomputed_validation_digest(
+        &self,
+        producer_device_id: &DeviceId,
+    ) -> Result<[u8; 32], SyncError> {
+        let input = checkpoint_validation_input(&self.validation_evidence(producer_device_id))?;
+        Ok(Sha256::digest(input).into())
+    }
 }
 
 /// 从 relay 读回并验证通过的基线句柄；构造后只能由 [`CheckpointWriter::promote`] 提升。
@@ -1019,6 +1062,8 @@ pub struct PromotedBaseline {
     pub refs_digest: [u8; 32],
     /// relay 返回的发布时间（只有真正 publish 成功才有）。
     pub published_at: u64,
+    /// 已签名的 `CheckpointCommit` 字节 SHA256（与 relay 持久化字节逐字节一致）。
+    pub commit_digest: [u8; 32],
 }
 
 /// 从 relay 读回并验证后的 checkpoint。
@@ -1039,9 +1084,10 @@ const PREPARED_DURABLE_VERSION: u64 = 2;
 ///
 /// v1/v2 的 verified 字节只证明"旧实现的检查通过"（coverage 从未下载 ASSET），
 /// 不得作为新链的已验证基线被 restart/rotation 快捷恢复消费。v3 追加覆盖复核的
-/// 私有验证事实（durable 资产数/实证候选数/证明摘要）。旧修订**拒绝**，禁止把旧
-/// 字节改号升级。
-const VERIFIED_DURABLE_VERSION: u64 = 3;
+/// 私有验证事实（durable 资产数/实证候选数/证明摘要）。v4（task-122）再追加
+/// `coverage_epoch` 与 `validation_digest`，与签名 commit 的 v2 字段逐字节绑定。
+/// 旧修订**拒绝**，禁止把旧字节改号升级。
+const VERIFIED_DURABLE_VERSION: u64 = 4;
 
 impl PreparedCheckpoint {
     /// 把 prepare 产物（公开 report + 私有导出点事实）编码成可 durable 的字节。
@@ -1205,6 +1251,7 @@ impl PreparedCheckpoint {
                 refs_digest,
                 published_at,
                 validated,
+                commit_digest: None,
             },
             footprint: ExportFootprint {
                 checkpoint_id,
@@ -1252,6 +1299,9 @@ impl VerifiedBaseline {
                 cbor::uint(u64::try_from(facts.coverage_verified_candidates).unwrap_or(u64::MAX)),
             ),
             (14, cbor::bytes(facts.coverage_proof_digest.to_vec())),
+            // v4（task-122）：coverage 冻结 epoch + 验证修订 2 的证据摘要。
+            (15, cbor::uint(facts.coverage_epoch)),
+            (16, cbor::bytes(facts.validation_digest.to_vec())),
         ])
     }
 
@@ -1291,6 +1341,8 @@ impl VerifiedBaseline {
                 coverage_durable_assets,
                 coverage_verified_candidates,
                 coverage_proof_digest: cbor::bytes_fixed(&map, 14)?,
+                coverage_epoch: cbor::uint_field(&map, 15)?,
+                validation_digest: cbor::bytes_fixed(&map, 16)?,
             },
         })
     }
@@ -1301,10 +1353,13 @@ impl VerifiedBaseline {
 /// restart 快捷恢复（`rotation_restart::baseline_from_journal`）只认这里的新修订
 /// 回执；旧 journal 的 `verified=true` 没有这份回执 → 拒绝，必须完整重验/重建。
 pub(crate) const VERIFIED_RECEIPT_META_PREFIX: &str = "sync.checkpoint.verified_receipt.";
-/// 回执格式修订号：旧开发 vault 的回执不存在/格式不同，一律不得消费。
-const VERIFIED_RECEIPT_MAGIC: &[u8] = b"MN/cp-verified/1\0";
+/// 回执格式修订号：task-122 起 v2（带 HMAC + validation_digest）。旧 v1 一律不得消费。
+const VERIFIED_RECEIPT_MAGIC: &[u8] = b"MN/cp-verified/2\0";
 
 /// promote 成功后落盘的本地回执：把"这份基线的验证/发布事实"与 commit digest 绑定。
+///
+/// task-122：整个 body 用 `K_receipt`（epoch 根 HKDF 派生）做 HMAC-SHA256 认证；
+/// 只认 MAC 通过的字节。旧 v1（只有 SHA256 校验和）无法证明没有被本地篡改，必须拒绝。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedReceipt {
     /// checkpoint id。
@@ -1317,6 +1372,8 @@ pub(crate) struct VerifiedReceipt {
     pub(crate) covered_seq: u64,
     /// `CheckpointCommit` 编码的 SHA256（与 journal 里的 commit_digest 对齐）。
     pub(crate) commit_digest: [u8; 32],
+    /// v2 commit 的验证证据摘要（与签名 commit 逐字节绑定）。
+    pub(crate) validation_digest: [u8; 32],
 }
 
 fn verified_receipt_key(checkpoint_id: &[u8; 16]) -> String {
@@ -1327,30 +1384,38 @@ fn verified_receipt_key(checkpoint_id: &[u8; 16]) -> String {
 }
 
 impl VerifiedReceipt {
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(VERIFIED_RECEIPT_MAGIC.len() + 16 + 16 + 8 + 8 + 32 + 32);
+    fn encode(&self, key: &Secret32) -> Result<Vec<u8>, SyncError> {
+        let mut out =
+            Vec::with_capacity(VERIFIED_RECEIPT_MAGIC.len() + 16 + 16 + 8 + 8 + 32 + 32 + 32);
         out.extend_from_slice(VERIFIED_RECEIPT_MAGIC);
         out.extend_from_slice(&self.vault_id);
         out.extend_from_slice(&self.checkpoint_id);
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&self.covered_seq.to_be_bytes());
         out.extend_from_slice(&self.commit_digest);
-        let digest: [u8; 32] = Sha256::digest(&out).into();
-        out.extend_from_slice(&digest);
-        out
+        out.extend_from_slice(&self.validation_digest);
+        let mac = receipt_mac(key, crate::domain::CHECKPOINT_RECEIPT_KIND_VERIFIED, &out)?;
+        out.extend_from_slice(&mac);
+        Ok(out)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, SyncError> {
-        let fixed = VERIFIED_RECEIPT_MAGIC.len() + 16 + 16 + 8 + 8 + 32 + 32;
+    fn decode(bytes: &[u8], key: &Secret32) -> Result<Self, SyncError> {
+        let fixed = VERIFIED_RECEIPT_MAGIC.len() + 16 + 16 + 8 + 8 + 32 + 32 + 32;
         if bytes.len() != fixed || !bytes.starts_with(VERIFIED_RECEIPT_MAGIC) {
             return Err(SyncError::LocalCorrupt(
                 "verified receipt 版本不支持（旧修订必须完整重验）",
             ));
         }
-        let (body, digest) = bytes.split_at(bytes.len() - 32);
-        let expected: [u8; 32] = Sha256::digest(body).into();
-        if digest != expected {
-            return Err(SyncError::LocalCorrupt("verified receipt 摘要不符"));
+        let (body, mac) = bytes.split_at(bytes.len() - 32);
+        if !receipt_mac_verify(
+            key,
+            crate::domain::CHECKPOINT_RECEIPT_KIND_VERIFIED,
+            body,
+            mac,
+        ) {
+            return Err(SyncError::LocalCorrupt(
+                "verified receipt HMAC 不符（伪造/篡改或根不匹配）",
+            ));
         }
         let mut input = &body[VERIFIED_RECEIPT_MAGIC.len()..];
         Ok(Self {
@@ -1359,6 +1424,7 @@ impl VerifiedReceipt {
             epoch: take_u64(&mut input)?,
             covered_seq: take_u64(&mut input)?,
             commit_digest: take_array::<32>(&mut input)?,
+            validation_digest: take_array::<32>(&mut input)?,
         })
     }
 }
@@ -1366,15 +1432,22 @@ impl VerifiedReceipt {
 /// 读取本地 durable 验证回执；缺失返回 `None`（调用方必须 fail-closed）。
 pub(crate) fn load_verified_receipt(
     vault: &menghunote_storage::Vault,
+    root: &RootSecretV1,
     checkpoint_id: &[u8; 16],
 ) -> Result<Option<VerifiedReceipt>, SyncError> {
     let Some(bytes) = vault.get_meta(&verified_receipt_key(checkpoint_id))? else {
         return Ok(None);
     };
-    let receipt = VerifiedReceipt::decode(&bytes)?;
+    let key = derive_checkpoint_receipt_key(root)?;
+    let receipt = VerifiedReceipt::decode(&bytes, &key)?;
     if receipt.checkpoint_id != *checkpoint_id {
         return Err(SyncError::LocalCorrupt(
             "verified receipt 与 checkpoint id 不一致",
+        ));
+    }
+    if receipt.epoch != root.key_epoch {
+        return Err(SyncError::LocalCorrupt(
+            "verified receipt 的 epoch 与校验根不一致",
         ));
     }
     Ok(Some(receipt))
@@ -1527,12 +1600,31 @@ fn manifest_refs_for_validate(manifest: &ManifestV1) -> Vec<ObjectRefV1> {
     refs
 }
 
+/// task-122 消费者门禁：只接受当前验证修订（v2）的 `CheckpointCommit`。
+///
+/// 旧修订（v1）不是"兼容读取"：v1 的签名基线没有覆盖复核证据绑定，消费它等于静默
+/// 接受旧安全基线。所有客户端/relay 消费入口都必须先过这里；未知版本在 decode 阶段
+/// 已被 `ProtoError::UnsupportedVersion` 拒绝。
+pub(crate) fn require_current_checkpoint_validation(
+    commit: &CheckpointCommit,
+) -> Result<(), SyncError> {
+    commit
+        .require_current_validation()
+        .map_err(SyncError::Proto)
+}
+
 /// 从不可变验证事实重算 `CheckpointCommit` 摘要（restart receipt 恢复用）。
 fn checkpoint_commit_digest_from_facts(
     vault_id: VaultId,
     producer_device_id: DeviceId,
     facts: &BaselineFacts,
 ) -> Result<[u8; 32], SyncError> {
+    // 重算证据摘要并与 validate 记录的值对撞：journal/receipt 被篡改时这里先失败。
+    if facts.validation_digest != facts.recomputed_validation_digest(&producer_device_id)? {
+        return Err(SyncError::LocalCorrupt(
+            "verified 事实的 validation_digest 与重算不符",
+        ));
+    }
     let commit = CheckpointCommit {
         vault_id,
         checkpoint_id: facts.checkpoint_id,
@@ -1542,7 +1634,8 @@ fn checkpoint_commit_digest_from_facts(
         manifest_digest: facts.manifest_digest,
         refs_digest: facts.refs_digest,
         producer_device_id,
-        validation_version: 1,
+        validation_version: CheckpointCommit::CURRENT_VALIDATION_VERSION,
+        validation_digest: facts.validation_digest,
     };
     Ok(Sha256::digest(commit.encode()?).into())
 }
@@ -1722,6 +1815,7 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         let mut report = prepared.report;
         report.validated = true;
         report.published_at = Some(promoted.published_at);
+        report.commit_digest = Some(promoted.commit_digest);
         Ok(report)
     }
 
@@ -2092,6 +2186,7 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
             refs_digest,
             published_at: None,
             validated: false,
+            commit_digest: None,
         };
         let footprint = ExportFootprint {
             checkpoint_id: lease.checkpoint_id,
@@ -2382,6 +2477,7 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
             manifest_object_id: facts.manifest_object_id,
             refs_digest: facts.refs_digest,
             published_at,
+            commit_digest,
         }))
     }
 
@@ -2656,24 +2752,29 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         if state.head_seq < footprint.covered_seq {
             return Err(SyncError::Object("validate: relay head 未覆盖 S"));
         }
-        Ok(VerifiedBaseline {
-            facts: BaselineFacts {
-                vault_id: self.vault_id,
-                checkpoint_id: footprint.checkpoint_id,
-                epoch: footprint.epoch,
-                covered_seq: footprint.covered_seq,
-                cursor: format!("c{}", footprint.covered_seq),
-                manifest_object_id: manifest.object_id,
-                manifest_digest: manifest.object_digest,
-                refs_digest: report.refs_digest,
-                imported_docs: decoded.docs.len(),
-                imported_vv_digest,
-                verified_assets: decoded.assets.len(),
-                coverage_durable_assets: coverage_proof.durable_assets,
-                coverage_verified_candidates: coverage_proof.verified_candidates,
-                coverage_proof_digest: coverage_proof.proof_digest,
-            },
-        })
+        let mut facts = BaselineFacts {
+            vault_id: self.vault_id,
+            checkpoint_id: footprint.checkpoint_id,
+            epoch: footprint.epoch,
+            covered_seq: footprint.covered_seq,
+            cursor: format!("c{}", footprint.covered_seq),
+            manifest_object_id: manifest.object_id,
+            manifest_digest: manifest.object_digest,
+            refs_digest: report.refs_digest,
+            imported_docs: decoded.docs.len(),
+            imported_vv_digest,
+            verified_assets: decoded.assets.len(),
+            coverage_durable_assets: coverage_proof.durable_assets,
+            coverage_verified_candidates: coverage_proof.verified_candidates,
+            coverage_proof_digest: coverage_proof.proof_digest,
+            coverage_epoch: footprint.coverage_epoch,
+            validation_digest: [0u8; 32],
+        };
+        // task-122：验证修订 2 的证据摘要。它把覆盖复核/实际导入事实绑进生产者签名，
+        // 任何字段变化都会让 `CheckpointCommit.validation_digest` 与本地 durable 回执
+        // 对不上。旧修订没有这个字段，消费者必须显式拒绝。
+        facts.validation_digest = facts.recomputed_validation_digest(&self.device_id)?;
+        Ok(VerifiedBaseline { facts })
     }
 
     /// promote：restart 路径优先复用已 durable 的 publish receipt；否则签 commit 并 publish。
@@ -2718,16 +2819,23 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
                 "verified receipt 的 vault/epoch 与 writer 不符",
             ));
         }
+        if facts.validation_digest != facts.recomputed_validation_digest(&self.device_id)? {
+            return Err(SyncError::LocalCorrupt(
+                "verified receipt 的 validation_digest 与重算不符",
+            ));
+        }
+        let key = derive_checkpoint_receipt_key(&self.root)?;
         let receipt = VerifiedReceipt {
             checkpoint_id: facts.checkpoint_id,
             vault_id: facts.vault_id,
             epoch: facts.epoch,
             covered_seq: facts.covered_seq,
             commit_digest,
+            validation_digest: facts.validation_digest,
         };
         self.vault.set_meta(
             &verified_receipt_key(&facts.checkpoint_id),
-            &receipt.encode(),
+            &receipt.encode(&key)?,
         )?;
         Ok(())
     }
@@ -2745,6 +2853,11 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         if facts.epoch != self.root.key_epoch {
             return Err(SyncError::Object("promote: 基线 epoch 与 writer 不符"));
         }
+        if facts.validation_digest != facts.recomputed_validation_digest(&self.device_id)? {
+            return Err(SyncError::LocalCorrupt(
+                "promote: 验证事实的 validation_digest 与重算不符",
+            ));
+        }
         let commit = CheckpointCommit {
             vault_id: self.vault_id,
             checkpoint_id: facts.checkpoint_id,
@@ -2754,7 +2867,8 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
             manifest_digest: facts.manifest_digest,
             refs_digest: facts.refs_digest,
             producer_device_id: self.device_id,
-            validation_version: 1,
+            validation_version: CheckpointCommit::CURRENT_VALIDATION_VERSION,
+            validation_digest: facts.validation_digest,
         };
         let signed_commit = commit.encode()?;
         let commit_digest: [u8; 32] = Sha256::digest(&signed_commit).into();
@@ -2781,6 +2895,7 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
                 manifest_object_id: facts.manifest_object_id,
                 refs_digest: facts.refs_digest,
                 published_at: published.published_at,
+                commit_digest,
             },
             commit_digest,
         ))
@@ -3155,7 +3270,8 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
         let Some(bytes) = self.vault.get_meta(&coverage_receipt_key(checkpoint_id))? else {
             return Ok(None);
         };
-        let receipt = CoverageReceipt::decode(&bytes)?;
+        let key = derive_checkpoint_receipt_key(&self.root)?;
+        let receipt = CoverageReceipt::decode(&bytes, &key)?;
         if receipt.checkpoint_id != *checkpoint_id {
             return Err(SyncError::Object(
                 "validate: coverage receipt 与 checkpoint id 不一致",
@@ -3658,7 +3774,8 @@ impl<'a, C: RelayClient> CheckpointWriter<'a, C> {
             cursor_seq: report.cursor_seq,
             claims,
         };
-        let bytes = receipt.encode()?;
+        let key = derive_checkpoint_receipt_key(&self.root)?;
+        let bytes = receipt.encode(&key)?;
         self.vault
             .set_meta(&coverage_receipt_key(&footprint.checkpoint_id), &bytes)?;
         Ok(())
@@ -4138,6 +4255,26 @@ fn fetch_verified_asset_cached<C: RelayClient>(
     Ok(facts)
 }
 
+/// 回执 HMAC 的初始化/校验。密钥只存在于栈上，不 Debug/不落日志。
+fn receipt_mac(key: &Secret32, kind: u8, body: &[u8]) -> Result<[u8; 32], SyncError> {
+    let mut mac: Hmac<Sha256> = Hmac::new_from_slice(key.expose_slice())
+        .map_err(|_| SyncError::Object("checkpoint receipt HMAC 初始化失败"))?;
+    mac.update(crate::domain::CHECKPOINT_RECEIPT_MAC_DOMAIN);
+    mac.update(&[kind]);
+    mac.update(body);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn receipt_mac_verify(key: &Secret32, kind: u8, body: &[u8], tag: &[u8]) -> bool {
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key.expose_slice()) else {
+        return false;
+    };
+    mac.update(crate::domain::CHECKPOINT_RECEIPT_MAC_DOMAIN);
+    mac.update(&[kind]);
+    mac.update(body);
+    mac.verify_slice(tag).is_ok()
+}
+
 /// 持久 coverage receipt 里的一条**待验证候选**（不是成功覆盖证明）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CoverageClaim {
@@ -4168,9 +4305,9 @@ struct CoverageReceipt {
 
 /// coverage receipt 的 meta 键前缀（沿用现有 `meta` 表，不新增 schema）。
 const COVERAGE_RECEIPT_META_PREFIX: &str = "sync.checkpoint.coverage_receipt.";
-/// pending 候选格式版本：v2 只记录完整 ObjectCommit 候选，**不含**任何成功覆盖声明。
-/// 旧 v1（`MN/cp-coverage/1`）一律拒绝；必须重新 prepare。
-const COVERAGE_RECEIPT_MAGIC: &[u8] = b"MN/cp-pending/2\0";
+/// pending 候选格式版本：v3 只记录完整 ObjectCommit 候选，**不含**任何成功覆盖声明，
+/// 并用 `K_receipt` 做 HMAC-SHA256。旧 v1/v2（无 HMAC）一律拒绝；必须重新 prepare。
+const COVERAGE_RECEIPT_MAGIC: &[u8] = b"MN/cp-pending/3\0";
 const COVERAGE_RECEIPT_CLAIM_PENDING_ASSET: u8 = 1;
 const COVERAGE_RECEIPT_MAX_CLAIMS: usize = 4096;
 const COVERAGE_RECEIPT_MAX_CURSOR: usize = 4096;
@@ -4187,7 +4324,7 @@ fn coverage_receipt_key(checkpoint_id: &[u8; 16]) -> String {
 }
 
 impl CoverageReceipt {
-    fn encode(&self) -> Result<Vec<u8>, SyncError> {
+    fn encode(&self, key: &Secret32) -> Result<Vec<u8>, SyncError> {
         if self.cursor.len() > COVERAGE_RECEIPT_MAX_CURSOR
             || self.claims.len() > COVERAGE_RECEIPT_MAX_CLAIMS
         {
@@ -4221,20 +4358,28 @@ impl CoverageReceipt {
                 }
             }
         }
-        let digest: [u8; 32] = Sha256::digest(&out).into();
-        out.extend_from_slice(&digest);
+        let mac = receipt_mac(key, crate::domain::CHECKPOINT_RECEIPT_KIND_COVERAGE, &out)?;
+        out.extend_from_slice(&mac);
         Ok(out)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, SyncError> {
-        let fixed = COVERAGE_RECEIPT_MAGIC.len() + 16 + 16 + 16 + 8 * 4 + 4 + 4 + 32;
+    fn decode(bytes: &[u8], key: &Secret32) -> Result<Self, SyncError> {
+        // 固定部分：vault16 + cid16 + log16 + coverage_epoch/S/cursor_seq 三个 u64 +
+        // cursor_len u32 + claim_count u32 + HMAC32。
+        let fixed = COVERAGE_RECEIPT_MAGIC.len() + 16 + 16 + 16 + 8 * 3 + 4 + 4 + 32;
         if bytes.len() < fixed || !bytes.starts_with(COVERAGE_RECEIPT_MAGIC) {
             return Err(SyncError::Object("coverage receipt 结构非法"));
         }
-        let (body, digest) = bytes.split_at(bytes.len() - 32);
-        let expected: [u8; 32] = Sha256::digest(body).into();
-        if digest != expected {
-            return Err(SyncError::Object("coverage receipt 摘要不符"));
+        let (body, mac) = bytes.split_at(bytes.len() - 32);
+        if !receipt_mac_verify(
+            key,
+            crate::domain::CHECKPOINT_RECEIPT_KIND_COVERAGE,
+            body,
+            mac,
+        ) {
+            return Err(SyncError::Object(
+                "coverage receipt HMAC 不符（伪造/篡改或根不匹配）",
+            ));
         }
         let mut input = &body[COVERAGE_RECEIPT_MAGIC.len()..];
         let vault_id = take_array::<16>(&mut input)?;
@@ -4681,6 +4826,7 @@ mod tests {
                 checkpoint_id,
                 epoch: 2,
                 covered_seq: 3,
+                commit_digest: None,
                 docs: vec![DocSnapshotRef {
                     doc_id: "doc-1".to_owned(),
                     kind: KIND_BODY,
@@ -4840,7 +4986,31 @@ mod tests {
                 coverage_durable_assets: 1,
                 coverage_verified_candidates: 1,
                 coverage_proof_digest: [0x77; 32],
+                coverage_epoch: 2,
+                validation_digest: [0x99; 32],
             },
+        }
+    }
+
+    fn receipt_key() -> Secret32 {
+        derive_checkpoint_receipt_key(&RootSecretV1::new(
+            [0x11; 16],
+            2,
+            Secret32::from_array([0xAA; 32]),
+        ))
+        .expect("receipt key")
+    }
+
+    fn sample_coverage_receipt() -> CoverageReceipt {
+        CoverageReceipt {
+            vault_id: [0x11; 16],
+            checkpoint_id: [0x22; 16],
+            log_id: [0x33; 16],
+            coverage_epoch: 1,
+            covered_seq: 7,
+            cursor: "c7".to_owned(),
+            cursor_seq: 6,
+            claims: Vec::new(),
         }
     }
 
@@ -4869,7 +5039,7 @@ mod tests {
     #[test]
     fn coverage_receipt_rejects_old_magic() {
         let old = b"MN/cp-coverage/1\0covered-by-relay-claim".to_vec();
-        let error = CoverageReceipt::decode(&old).expect_err("旧 receipt 必须拒绝");
+        let error = CoverageReceipt::decode(&old, &receipt_key()).expect_err("旧 receipt 必须拒绝");
         assert!(format!("{error}").contains("结构非法"), "{error}");
     }
 
@@ -4878,7 +5048,61 @@ mod tests {
         let mut bytes = sample_verified().encode_durable().expect("verified bytes");
         // 直接构造旧格式 verified receipt 头（不是 VerifiedBaseline 的 CBOR）。
         bytes[..4].copy_from_slice(b"MN/c");
-        let error = VerifiedReceipt::decode(&bytes).expect_err("旧 receipt 头必须拒绝");
+        let error =
+            VerifiedReceipt::decode(&bytes, &receipt_key()).expect_err("旧 receipt 头必须拒绝");
         assert!(format!("{error}").contains("版本不支持"), "{error}");
+    }
+
+    #[test]
+    fn coverage_receipt_hmac_rejects_tamper_and_wrong_key() {
+        let key = receipt_key();
+        let bytes = sample_coverage_receipt().encode(&key).expect("encode");
+        assert_eq!(
+            CoverageReceipt::decode(&bytes, &key).expect("decode"),
+            sample_coverage_receipt()
+        );
+
+        // 改 body 任一字节：HMAC 必须失败（不能只靠 SHA256 校验和）。
+        let mut tampered = bytes.clone();
+        tampered[20] ^= 0x01;
+        let error = CoverageReceipt::decode(&tampered, &key).expect_err("篡改必须拒绝");
+        assert!(format!("{error}").contains("HMAC"), "{error}");
+
+        // 换根派生的密钥：同字节也不能通过。
+        let other = derive_checkpoint_receipt_key(&RootSecretV1::new(
+            [0x11; 16],
+            2,
+            Secret32::from_array([0xBB; 32]),
+        ))
+        .expect("other key");
+        assert!(CoverageReceipt::decode(&bytes, &other).is_err());
+    }
+
+    #[test]
+    fn verified_receipt_hmac_rejects_tamper_and_old_revision() {
+        let key = receipt_key();
+        let receipt = VerifiedReceipt {
+            checkpoint_id: [0x22; 16],
+            vault_id: [0x11; 16],
+            epoch: 2,
+            covered_seq: 7,
+            commit_digest: [0x33; 32],
+            validation_digest: [0x44; 32],
+        };
+        let bytes = receipt.encode(&key).expect("encode");
+        assert_eq!(
+            VerifiedReceipt::decode(&bytes, &key).expect("decode"),
+            receipt
+        );
+
+        let mut tampered = bytes.clone();
+        tampered[VERIFIED_RECEIPT_MAGIC.len() + 4] ^= 0x80;
+        let error = VerifiedReceipt::decode(&tampered, &key).expect_err("篡改必须拒绝");
+        assert!(format!("{error}").contains("HMAC"), "{error}");
+
+        // 旧 v1 magic 且无 HMAC：结构层直接拒绝。
+        let mut old = bytes.clone();
+        old[..VERIFIED_RECEIPT_MAGIC.len()].copy_from_slice(b"MN/cp-verified/1\0");
+        assert!(VerifiedReceipt::decode(&old, &key).is_err());
     }
 }

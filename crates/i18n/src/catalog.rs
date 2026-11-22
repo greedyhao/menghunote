@@ -56,7 +56,7 @@ pub const ZH_CN: &[(&str, &str)] = &[
     // ---- settings（同步区/按钮/错误提示）----
     ("settings.active_now", "当前默认"),
     ("settings.close", "关闭"),
-    ("settings.close_without_save", "关闭（不保存）"),
+    ("settings.close_without_save", "关闭（不保存 relay 修改）"),
     ("settings.copy", "复制"),
     ("settings.device_id", "device_id：{id}"),
     ("settings.error_none", "无错误"),
@@ -96,7 +96,7 @@ pub const ZH_CN: &[(&str, &str)] = &[
     ),
     (
         "settings.notice.default",
-        "修改保存后需重启应用才生效；公开 id 可复制，秘密不要分享。",
+        "relay 设置保存后需重启应用才生效；公开 id 可复制，秘密不要分享。",
     ),
     (
         "settings.plugins.daily_notes.description",
@@ -137,7 +137,7 @@ pub const ZH_CN: &[(&str, &str)] = &[
         "settings.remote_tls_consent_required",
         "切换到 remote_tls 需要显式勾选「我确认要连接远程服务器（HTTPS）」；确认不会清 pin、也不会自动信任新服务器",
     ),
-    ("settings.save", "保存模式/relay（重启后生效）"),
+    ("settings.save", "保存 relay 设置（重启后生效）"),
     ("settings.set_active", "设为默认"),
     (
         "settings.sync.dev_banner",
@@ -189,11 +189,9 @@ pub const ZH_CN: &[(&str, &str)] = &[
     ("templates.title", "模板"),
     (
         "templates.hint",
-        "模板就是普通笔记：不建独立表、不隐藏文件夹；本机设置不同步、不写正文",
+        "模板就是普通笔记：不建独立表、不隐藏文件夹；本机设置不同步、不写正文。相对日期：{{date:-1d}}（昨天）、{{date:+1w}}（7 天后）、{{date:-1m:YYYY/MM/DD}}（上个月同一天，自定义格式）",
     ),
-    ("templates.enabled", "启用模板"),
-    ("templates.disabled", "已停用"),
-    ("templates.disabled_hint", "模板插件未启用（在设置页「模板」里开启）"),
+    ("templates.disabled_hint", "模板插件未启用（在设置页「插件」里开启）"),
     ("templates.folder_label", "模板文件夹（普通目录，支持多级）"),
     ("templates.date_format_label", "日期格式"),
     ("templates.time_format_label", "时间格式"),
@@ -237,11 +235,9 @@ pub const ZH_CN: &[(&str, &str)] = &[
     ("daily_notes.title", "日记"),
     (
         "daily_notes.hint",
-        "本机设置；不同步、不写正文；日期格式里的 “/” 会生成子目录",
+        "本机设置；不同步、不写正文；日期格式里的 “/” 会生成子目录。相对日期：{{date:-1d}}（昨天）、{{date:+1d}}（明天），单位 d/w/m/y",
     ),
-    ("daily_notes.enabled", "启用日记"),
-    ("daily_notes.disabled", "已停用"),
-    ("daily_notes.disabled_hint", "日记插件未启用（在设置页「日记」里开启）"),
+    ("daily_notes.disabled_hint", "日记插件未启用（在设置页「插件」里开启）"),
     ("daily_notes.folder_label", "日记文件夹（新笔记位置）"),
     ("daily_notes.date_format_label", "日期格式（“/” 生成子目录）"),
     ("daily_notes.template_label", "日记模板路径（可选）"),
@@ -265,8 +261,28 @@ pub const ZH_CN: &[(&str, &str)] = &[
         "日期格式没有生成有效笔记名（检查「日记」设置）",
     ),
     (
+        "daily_notes.out_of_range",
+        "相对日期偏移超出范围（检查日历/日期设置）",
+    ),
+    (
         "daily_notes.write_failed",
         "结构写入被拒绝或出错（详见 stderr）",
+    ),
+    ("daily_notes.pick_template", "选择模板笔记…"),
+    ("daily_notes.template_picker_title", "选择日记模板"),
+    (
+        "daily_notes.template_picker_hint",
+        "↑/↓ 选择 · Enter 确认 · Esc 关闭",
+    ),
+    ("daily_notes.template_picker_search", "搜索"),
+    ("daily_notes.template_picker_current", "当前"),
+    (
+        "daily_notes.template_picker_empty_library",
+        "库中还没有笔记；先新建一篇笔记，再选择日记模板",
+    ),
+    (
+        "daily_notes.template_picker_empty_match",
+        "没有匹配的笔记",
     ),
     // ---- local（仅本地使用，不同步）----
     (
@@ -289,6 +305,10 @@ pub const ZH_CN: &[(&str, &str)] = &[
     ("local.mode_notice", "本地模式：不同步"),
     ("local.open_failed_title", "无法打开本地笔记库"),
     ("local.path_hint", "本地库：{path}"),
+    (
+        "local.resume_missing",
+        "上次使用的本地笔记库不存在：{path}；已回到欢迎页（不会自动新建库）",
+    ),
     (
         "local.welcome_hint",
         "在本机打开一个独立笔记库：不联网、不创建同步实例、不参与同步；空库由你自己新建笔记。",
@@ -350,7 +370,7 @@ pub const EN: &[(&str, &str)] = &[
     // ---- settings（同步区/按钮/错误提示）----
     ("settings.active_now", "Active"),
     ("settings.close", "Close"),
-    ("settings.close_without_save", "Close (without saving)"),
+    ("settings.close_without_save", "Close (discard relay changes)"),
     ("settings.copy", "Copy"),
     ("settings.device_id", "device_id: {id}"),
     ("settings.error_none", "No errors"),
@@ -390,7 +410,7 @@ pub const EN: &[(&str, &str)] = &[
     ),
     (
         "settings.notice.default",
-        "Changes take effect after restarting the app; public ids can be copied, secrets must not be shared.",
+        "Relay changes take effect after restarting the app; public ids can be copied, secrets must not be shared.",
     ),
     (
         "settings.plugins.daily_notes.description",
@@ -433,7 +453,7 @@ pub const EN: &[(&str, &str)] = &[
     ),
     (
         "settings.save",
-        "Save mode/relay (takes effect after restart)",
+        "Save relay settings (takes effect after restart)",
     ),
     ("settings.set_active", "Set as active"),
     (
@@ -486,10 +506,8 @@ pub const EN: &[(&str, &str)] = &[
     ("templates.title", "Templates"),
     (
         "templates.hint",
-        "Templates are ordinary notes: no separate table, no hidden folder; local settings are not synced and never written into note bodies",
+        "Templates are ordinary notes: no separate table, no hidden folder; local settings are not synced and never written into note bodies. Relative dates: {{date:-1d}} (yesterday), {{date:+1w}} (7 days later), {{date:-1m:YYYY/MM/DD}} (same day last month, custom format)",
     ),
-    ("templates.enabled", "Templates enabled"),
-    ("templates.disabled", "Disabled"),
     (
         "templates.disabled_hint",
         "Templates are disabled (enable them in Settings → Templates)",
@@ -552,10 +570,8 @@ pub const EN: &[(&str, &str)] = &[
     ("daily_notes.title", "Daily notes"),
     (
         "daily_notes.hint",
-        "Local settings; not synced and never written into note bodies; \"/\" in the date format creates subfolders",
+        "Local settings; not synced and never written into note bodies; \"/\" in the date format creates subfolders. Relative dates: {{date:-1d}} (yesterday), {{date:+1d}} (tomorrow); units d/w/m/y",
     ),
-    ("daily_notes.enabled", "Daily notes enabled"),
-    ("daily_notes.disabled", "Disabled"),
     (
         "daily_notes.disabled_hint",
         "Daily notes are disabled (enable them in Settings → Daily notes)",
@@ -592,8 +608,31 @@ pub const EN: &[(&str, &str)] = &[
         "The date format produced no valid note name (check Settings → Daily notes)",
     ),
     (
+        "daily_notes.out_of_range",
+        "The relative date offset is out of range (check the calendar/date settings)",
+    ),
+    (
         "daily_notes.write_failed",
         "Structural write rejected or failed (see stderr)",
+    ),
+    ("daily_notes.pick_template", "Choose template note…"),
+    (
+        "daily_notes.template_picker_title",
+        "Choose daily template",
+    ),
+    (
+        "daily_notes.template_picker_hint",
+        "↑/↓ to move · Enter to choose · Esc to close",
+    ),
+    ("daily_notes.template_picker_search", "Search"),
+    ("daily_notes.template_picker_current", "Current"),
+    (
+        "daily_notes.template_picker_empty_library",
+        "No notes in the library yet; create a note first, then choose a daily template",
+    ),
+    (
+        "daily_notes.template_picker_empty_match",
+        "No matching notes",
     ),
     // ---- local（local-only, no sync）----
     ("local.action", "Use locally only (no sync)"),
@@ -616,6 +655,10 @@ pub const EN: &[(&str, &str)] = &[
         "Unable to open the local vault",
     ),
     ("local.path_hint", "Local vault: {path}"),
+    (
+        "local.resume_missing",
+        "The local vault from last time is missing: {path}; returned to Welcome (no vault was created)",
+    ),
     (
         "local.welcome_hint",
         "Open a standalone notebook vault on this machine: no network, no sync instance, no syncing; the empty vault is yours to fill.",
@@ -735,6 +778,15 @@ mod tests {
                 let mut rest = *text;
                 while let Some(start) = rest.find('{') {
                     let after = &rest[start + 1..];
+                    // `{{...}}` 是**字面量**（模板/日记占位符语法，直接展示给用户），
+                    // 不是 `{name}` 插值：整段跳过，不参与 ALLOWED 校验。
+                    if after.starts_with('{') {
+                        let close = after[1..].find("}}").unwrap_or_else(|| {
+                            panic!("{locale:?} 的 {key} 字面量花括号未闭合：{text}")
+                        });
+                        rest = &after[1 + close + 2..];
+                        continue;
+                    }
                     let end = after
                         .find('}')
                         .unwrap_or_else(|| panic!("{locale:?} 的 {key} 占位符未闭合：{text}"));

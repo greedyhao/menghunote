@@ -599,6 +599,7 @@ fn verify_checkpoint_commit<C: RelayClient>(
         .signature
         .ok_or(SyncError::Object("bootstrap 缺 checkpoint 签名"))?;
     let commit = CheckpointCommit::decode(signed_commit)?;
+    crate::checkpoint::require_current_checkpoint_validation(&commit)?;
     if commit.vault_id != manifest.vault_id
         || commit.checkpoint_id != checkpoint.checkpoint_id
         || commit.epoch != checkpoint.epoch

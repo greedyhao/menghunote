@@ -17,6 +17,10 @@
 > two-round e2e `EXIT=0` 且打印 `TWO_ROUND_EXIT=0`。
 >
 > **v0.4 只支持修复后新建的 vault/身份/控制链**；旧开发 vault 不得复用（原因见 §3）。
+>
+> **task-122 已完成（2026-11-19，未 commit）**：`CheckpointCommit.validation_version=2`
+> （v1 解码保留、所有消费者显式拒绝）、receipt HMAC、relay GC 版本门禁已落地；
+> 完整预算框架明确未做。详见 [`docs/notes/task-122-validation-v2.md`](../notes/task-122-validation-v2.md)。
 
 > **ADR 0009 Phase 1（dev-only app 集成）完成（2026-11-13，HEAD `7f0e4fe`）**：
 > 切片 1（面板/状态机/worker）→ 2（身份/peer/intents）→ 3a（外部提交闸门 + adopt）→
@@ -96,14 +100,14 @@ Windows 侧已由用户于 2026-11-13 用 `5538344` 包实测通过（与 tag �
 ## 3. v0.4 范围与限制（必须写进 tag 说明）
 
 1. **只支持修复后新建的 vault/身份/控制链**。旧开发 vault 的本地 durable 记录会被新修订拒绝（可重 bootstrap）；但**旧签名 checkpoint 无法仅靠本地版本拒绝隔离**——`bootstrap` 仍会接受修订 1 的签名基线。未实现 `CheckpointCommit.validation_version=2` 之前，不得让旧 vault 继续自动消费旧基线；生产升级路径见 §4。
-2. `validation_version=2` 的 proto/relay 联动、receipt HMAC、relay GC 版本门禁、消费者拒绝修订 1：**全部后置**（task-122）。
+2. `validation_version=2` 的 proto/relay 联动、receipt HMAC、relay GC 版本门禁、消费者拒绝修订 1：**已由 task-122 完成**（完整预算框架未做），见 [`docs/notes/task-122-validation-v2.md`](../notes/task-122-validation-v2.md)。
 3. **不声称 Byzantine 日志完整性**：根认证只能证明「声明为 ASSET 的 seq 有真实密文」，不能证明该 seq 原本不是 UPDATE。relay 仍可隐藏/替换事件；Merkle/inclusion 后置。
 4. Linux 本地身份封装是 ADR 0008 的**开发/验证实现**：0600 裸主钥 + XChaCha20-Poly1305，安全弱于 Windows DPAPI，不宣称等价；Windows 生产仍走原始 DPAPI。
 
 ## 4. 已知后置/缺陷（事实性说明）
 
 - **task-121（relay reservation 复用）**：轮换期重加密的资产挂在 rotation reservation 上；之后普通 checkpoint 用 checkpoint reservation 重传同一 `object_id`/同字节会被 relay `PUT parts` 判 `409 ID_CONFLICT`（`crates/relay/src/objects.rs:495-501`）。two-round e2e 用 `EmptyAssets` 规避（资产覆盖由激活 pair 承担）。修复方向：同字节跨 reservation 幂等复用且不重复计费，或客户端跳过已存在对象。
-- **task-122（验证修订 2）**：`CheckpointCommit.validation_version=2` + proto/relay 编解码 + 所有消费者拒绝修订 1；receipt HMAC；relay GC 版本门禁；完整预算框架。
+- ~~**task-122（验证修订 2）**~~ **已完成（2026-11-19）**：`CheckpointCommit.validation_version=2` + proto/relay 编解码 + 所有消费者拒绝修订 1；receipt HMAC；relay GC 版本门禁。**完整预算框架明确未做**；详见 [`docs/notes/task-122-validation-v2.md`](../notes/task-122-validation-v2.md)。
 - `try_record_coverage_receipt` 仍有静默早退（仅浪费 lease/配额，不产生假覆盖）；coverage/verified receipt meta 无清理路径，长期 vault 会增长（ADR 0006 §36.4 已记）。
 - Windows 目录 fsync 明确 `PlatformUnsupported`（只声明进程 kill，不声明硬掉电）。
 - `RestartBaselineJournal` 明文 meta、与 RotationJournal 非原子（bind/fail-closed）。
@@ -166,6 +170,6 @@ Windows 重点：DPAPI identity 往返与跨 SID 失败语义、`dpapi.rs` 零�
 
 1. ~~GPT 收尾复审~~（已完成：APPROVE，tag `v0.4-sync`；整理前锚点 `321f732`，等价新提交 `61d8de4`）。
 2. Windows 实机按 §5 复跑，把结果补进本文。
-3. `task-121`（relay reservation 复用）/ `task-122`（验证修订 2 与 receipt HMAC、GC 版本门禁）。
+3. ~~`task-121`（relay reservation 复用）/ `task-122`（验证修订 2 与 receipt HMAC、GC 版本门禁）~~ **均已完成**。
 4. `task-123`（默认「仅删凭证」吊销端点 + 客户端/UI；轮换改为显式 opt-in）/ `task-124`（metadata 事件认证对账与 cursor 续读）。
 4. 历史/回收站 `task-115/116/117` 按 `docs/briefs/0006-history-and-trash.md` 排期。

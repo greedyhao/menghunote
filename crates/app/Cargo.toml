@@ -33,7 +33,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 依赖基线见 AGENTS.md §1 / ADR 0004：gpui-kit 是 gpui-pre 的门面（含 gpui-base/gpui-component）。
 # **精确 pin**：升级必须整体对齐（kit/pre/base/component 版本互相约束），不能单边升。
 # 用依赖别名把 lib 名固定成 `gpui`，代码里 `use gpui::*` 与 `gpui::platform::` 保持不变。
-gpui = { package = "gpui-kit", version = "=0.9.1" }
+gpui = { package = "gpui-kit", version = "=0.10.0" }
 # ADR 0003 §3：app 可以依赖 editor / storage / text，反向不允许
 menghunote-editor = { path = "../editor" }
 # ADR 0020 P1：轻量 i18n（静态 catalog + 插值/复数），无 GPUI/无外部依赖。
@@ -79,7 +79,7 @@ merman = { version = "=0.10.0", default-features = false, features = [
 # 原生 headless UI 测试（`#[gpui::test]` + `TestAppContext`）。
 # 与主依赖**同名同包**：feature 只在测试构建里并集生效，`cargo build -p menghunote-app`
 # 的产物不包含 test-support（不引入测试平台代码）。
-gpui = { package = "gpui-kit", version = "=0.9.1", features = ["test-support"] }
+gpui = { package = "gpui-kit", version = "=0.10.0", features = ["test-support"] }
 # 每个测试一个独立临时库；目录建在 `CARGO_TARGET_TMPDIR` 下（AGENTS.md §6 禁止用 %TEMP%）。
 tempfile = "3"
 # ADR 0009 切片 4c-1：app 的 dev-sync 启动生命周期测试需要真实进程内 relay

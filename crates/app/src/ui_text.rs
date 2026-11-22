@@ -404,18 +404,6 @@ pub fn templates_hint() -> String {
     t(msg::templates::HINT)
 }
 
-/// 「启用模板」。
-#[must_use]
-pub fn templates_enabled() -> String {
-    t(msg::templates::ENABLED)
-}
-
-/// 「已停用」。
-#[must_use]
-pub fn templates_disabled() -> String {
-    t(msg::templates::DISABLED)
-}
-
 /// 模板插件未启用时的提示。
 #[must_use]
 pub fn templates_disabled_hint() -> String {
@@ -576,18 +564,6 @@ pub fn daily_notes_hint() -> String {
     t(msg::daily_notes::HINT)
 }
 
-/// 「启用日记」。
-#[must_use]
-pub fn daily_notes_enabled() -> String {
-    t(msg::daily_notes::ENABLED)
-}
-
-/// 「已停用」。
-#[must_use]
-pub fn daily_notes_disabled() -> String {
-    t(msg::daily_notes::DISABLED)
-}
-
 /// 日记插件未启用时的提示。
 #[must_use]
 pub fn daily_notes_disabled_hint() -> String {
@@ -666,10 +642,58 @@ pub fn daily_notes_invalid_path() -> String {
     t(msg::daily_notes::INVALID_PATH)
 }
 
+/// 相对日期偏移越界（未来日历 UI 用；当前侧栏入口不会触发）。
+#[must_use]
+pub fn daily_notes_out_of_range() -> String {
+    t(msg::daily_notes::OUT_OF_RANGE)
+}
+
 /// 日记结构写入被拒绝/出错（通用原因，具体见 stderr）。
 #[must_use]
 pub fn daily_notes_write_failed() -> String {
     t(msg::daily_notes::WRITE_FAILED)
+}
+
+/// 设置页「选择模板笔记…」按钮。
+#[must_use]
+pub fn daily_notes_pick_template() -> String {
+    t(msg::daily_notes::PICK_TEMPLATE)
+}
+
+/// 笔记选择器标题「选择日记模板」。
+#[must_use]
+pub fn daily_notes_picker_title() -> String {
+    t(msg::daily_notes::PICKER_TITLE)
+}
+
+/// 笔记选择器操作提示（↑/↓/Enter/Esc）。
+#[must_use]
+pub fn daily_notes_picker_hint() -> String {
+    t(msg::daily_notes::PICKER_HINT)
+}
+
+/// 笔记选择器搜索框标签。
+#[must_use]
+pub fn daily_notes_picker_search() -> String {
+    t(msg::daily_notes::PICKER_SEARCH)
+}
+
+/// 「当前」（标记当前已选模板）。
+#[must_use]
+pub fn daily_notes_picker_current() -> String {
+    t(msg::daily_notes::PICKER_CURRENT)
+}
+
+/// 空态：库里还没有任何笔记。
+#[must_use]
+pub fn daily_notes_picker_empty_library() -> String {
+    t(msg::daily_notes::PICKER_EMPTY_LIBRARY)
+}
+
+/// 空态：搜索没有匹配的笔记。
+#[must_use]
+pub fn daily_notes_picker_empty_match() -> String {
+    t(msg::daily_notes::PICKER_EMPTY_MATCH)
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +740,12 @@ pub fn local_dev_hint() -> String {
 #[must_use]
 pub fn local_mode_notice() -> String {
     t(msg::local::MODE_NOTICE)
+}
+
+/// 启动时上次的本地库已不存在（`{path}` 是公开路径）：回 Welcome 的明确提示。
+#[must_use]
+pub fn local_resume_missing(path: &str) -> String {
+    t_with(msg::local::RESUME_MISSING, &[("path", path)])
 }
 
 /// 产品构建打开本地库失败的 Error 页标题。
@@ -925,8 +955,11 @@ mod tests {
         );
         assert_eq!(editor_menu_template(), "模板…");
         assert_eq!(templates_title(), "模板");
-        assert_eq!(templates_enabled(), "启用模板");
-        assert_eq!(templates_disabled(), "已停用");
+        assert!(
+            templates_hint().contains("{{date:-1d}}")
+                && templates_hint().contains("{{date:-1m:YYYY/MM/DD}}"),
+            "模板设置 hint 必须说明相对日期语法"
+        );
         assert_eq!(
             templates_example("2026-11-18 08:14"),
             "示例：2026-11-18 08:14（当前设置）"
@@ -940,8 +973,15 @@ mod tests {
         assert_eq!(templates_created("周记 2"), "已从模板新建「周记 2」");
         assert_eq!(templates_read_failed("io"), "读取模板正文失败：io");
         assert_eq!(daily_notes_title(), "日记");
-        assert_eq!(daily_notes_enabled(), "启用日记");
-        assert_eq!(daily_notes_disabled(), "已停用");
+        assert!(
+            daily_notes_hint().contains("{{date:-1d}}")
+                && daily_notes_hint().contains("{{date:+1d}}"),
+            "日记设置 hint 必须说明相对日期语法"
+        );
+        assert_eq!(
+            daily_notes_out_of_range(),
+            "相对日期偏移超出范围（检查日历/日期设置）"
+        );
         assert_eq!(
             daily_notes_example("日记/2026-11-18"),
             "今天的日记：日记/2026-11-18"
@@ -954,6 +994,15 @@ mod tests {
             daily_notes_template_missing("模板/日记模板"),
             "日记模板「模板/日记模板」不存在：已创建空日记（可在设置页修正路径）"
         );
+        assert_eq!(daily_notes_pick_template(), "选择模板笔记…");
+        assert_eq!(daily_notes_picker_title(), "选择日记模板");
+        assert_eq!(daily_notes_picker_search(), "搜索");
+        assert_eq!(daily_notes_picker_current(), "当前");
+        assert_eq!(
+            daily_notes_picker_empty_library(),
+            "库中还没有笔记；先新建一篇笔记，再选择日记模板"
+        );
+        assert_eq!(daily_notes_picker_empty_match(), "没有匹配的笔记");
 
         guard.reset(Locale::En);
         assert_eq!(sidebar_new_from_template(), "New from template…");
@@ -964,8 +1013,10 @@ mod tests {
         assert_eq!(settings_plugins_disabled(), "Disabled");
         assert_eq!(editor_menu_template(), "Template…");
         assert_eq!(templates_title(), "Templates");
-        assert_eq!(templates_enabled(), "Templates enabled");
-        assert_eq!(templates_disabled(), "Disabled");
+        assert!(
+            templates_hint().contains("{{date:-1d}}") && templates_hint().contains("{{date:+1w}}"),
+            "English template hint must document relative dates"
+        );
         assert_eq!(
             templates_example("2026-11-18 08:14"),
             "Example: 2026-11-18 08:14 (current settings)"
@@ -981,12 +1032,28 @@ mod tests {
             "Created \"Weekly 2\" from a template"
         );
         assert_eq!(daily_notes_title(), "Daily notes");
-        assert_eq!(daily_notes_enabled(), "Daily notes enabled");
-        assert_eq!(daily_notes_disabled(), "Disabled");
+        assert!(
+            daily_notes_hint().contains("{{date:-1d}}")
+                && daily_notes_hint().contains("{{date:+1d}}"),
+            "English daily-notes hint must document relative dates"
+        );
+        assert_eq!(
+            daily_notes_out_of_range(),
+            "The relative date offset is out of range (check the calendar/date settings)"
+        );
         assert_eq!(
             daily_notes_example("Daily/2026-11-18"),
             "Today's daily note: Daily/2026-11-18"
         );
+        assert_eq!(daily_notes_pick_template(), "Choose template note…");
+        assert_eq!(daily_notes_picker_title(), "Choose daily template");
+        assert_eq!(daily_notes_picker_search(), "Search");
+        assert_eq!(daily_notes_picker_current(), "Current");
+        assert_eq!(
+            daily_notes_picker_empty_library(),
+            "No notes in the library yet; create a note first, then choose a daily template"
+        );
+        assert_eq!(daily_notes_picker_empty_match(), "No matching notes");
     }
 
     #[test]
@@ -1004,6 +1071,10 @@ mod tests {
             local_path_hint("/data/menghunote/local/vault.sqlite3"),
             "本地库：/data/menghunote/local/vault.sqlite3"
         );
+        assert_eq!(
+            local_resume_missing("/data/menghunote/local/vault.sqlite3"),
+            "上次使用的本地笔记库不存在：/data/menghunote/local/vault.sqlite3；已回到欢迎页（不会自动新建库）"
+        );
 
         guard.reset(Locale::En);
         assert_eq!(local_action(), "Use locally only (no sync)");
@@ -1015,6 +1086,10 @@ mod tests {
         assert_eq!(
             local_path_hint("/data/menghunote/local/vault.sqlite3"),
             "Local vault: /data/menghunote/local/vault.sqlite3"
+        );
+        assert_eq!(
+            local_resume_missing("/data/menghunote/local/vault.sqlite3"),
+            "The local vault from last time is missing: /data/menghunote/local/vault.sqlite3; returned to Welcome (no vault was created)"
         );
     }
 
@@ -1048,7 +1123,7 @@ mod tests {
         assert_eq!(settings_vault_id("v1"), "vault_id：v1");
         assert_eq!(settings_sync_title(), "设置 · 同步");
         assert_eq!(settings_sync_panel_title(), "同步面板");
-        assert_eq!(settings_save(), "保存模式/relay（重启后生效）");
+        assert_eq!(settings_save(), "保存 relay 设置（重启后生效）");
 
         guard.reset(Locale::En);
         assert_eq!(
@@ -1061,7 +1136,7 @@ mod tests {
         assert_eq!(settings_sync_panel_title(), "Sync panel");
         assert_eq!(
             settings_save(),
-            "Save mode/relay (takes effect after restart)"
+            "Save relay settings (takes effect after restart)"
         );
     }
 

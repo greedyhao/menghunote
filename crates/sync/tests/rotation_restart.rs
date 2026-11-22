@@ -1284,13 +1284,11 @@ fn restart_execution_advances_epoch_and_retires_old_secrets() {
         .expect("fallback prepared");
     assert_eq!(
         activation_t.primary_commit_digest,
-        checkpoint_commit_digest(VAULT_ID, materials.device_id, &primary_prepared.report)
-            .expect("primary commit digest")
+        checkpoint_commit_digest(&primary_prepared.report).expect("primary commit digest")
     );
     assert_eq!(
         activation_t.fallback_commit_digest,
-        checkpoint_commit_digest(VAULT_ID, materials.device_id, &fallback_prepared.report)
-            .expect("fallback commit digest")
+        checkpoint_commit_digest(&fallback_prepared.report).expect("fallback commit digest")
     );
     let ids = snapshot_object_ids(primary_prepared);
     assert!(ids

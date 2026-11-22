@@ -347,6 +347,12 @@ async fn revoking_active_device_cuts_access_and_replays() {
     let after = fx.vault();
     assert_eq!(after.auth_rev, before.auth_rev + 1, "auth_rev 推进一次");
     assert_eq!(after.control_rev, before.control_rev, "control_rev 不变");
+    // task-123：默认移除 = **只吊销访问**，不得隐式轮换/换 epoch。
+    assert_eq!(
+        (after.active_epoch, after.next_epoch, after.state),
+        (before.active_epoch, before.next_epoch, before.state),
+        "独立吊销不得分配/切换 epoch，也不得进入 rotating"
+    );
     assert_eq!(
         block(|| fx.control_count()),
         control_records,
@@ -393,6 +399,23 @@ async fn revoking_active_device_cuts_access_and_replays() {
     let a_token = http_auth(&app, REALM_DEVICE, a, &fx.device_signing_key).await;
     let (status, body) = call(&app, get(&state_uri, &a_token)).await;
     assert_eq!(status, StatusCode::OK, "{}", error_code(&body));
+    // task-123：客户端可见的 `/state` 也必须证明"只吊销、未轮换"。
+    let state_fields = cbor_fields(&body);
+    assert_eq!(
+        wire::uint_field(&state_fields, 4).expect("epoch"),
+        before.active_epoch,
+        "独立吊销不得改变 wire 上的 key_epoch"
+    );
+    assert_eq!(
+        wire::text_field(&state_fields, 3).expect("state"),
+        "active",
+        "独立吊销不得让 vault 进入 rotating"
+    );
+    assert_eq!(
+        wire::uint_field(&state_fields, 5).expect("control_rev"),
+        before.control_rev,
+        "wire 上的 control_rev 不变"
+    );
     let manager_key = fx.manager_signing_key.as_ref().expect("manager key");
     let manager_subject = relay::auth::Realm::management_subject(&fx.manager_pub);
     let manager_token = http_auth(&app, REALM_MANAGEMENT, manager_subject, manager_key).await;

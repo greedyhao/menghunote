@@ -158,6 +158,13 @@ impl crate::dev_local::DevLocal {
     /// 前置条件：`identity.manager_seed` 存在（Create/恢复码设备；Join 设备明确拒绝），
     /// 且 `identity` 与 `identity_path` 描述同一份身份。
     ///
+    /// > **显式 opt-in（task-123 / ADR 0010）**：这是唯一分配新 `key_epoch`、重写旧 epoch
+    /// > 密文并冻结 vault 的入口。**移除设备默认不走这里**——默认移除是
+    /// > [`crate::dev_local::DevLocal::revoke_device`]（只删访问凭证，不换 epoch、不重加密），
+    /// > 任何"移除失败/成功后自动轮换"的串联都是错误语义。`revoke[]` 里可以（也应当）
+    /// > 包含此前已被独立吊销的设备，让 signed revoke 覆盖 status-only 撤销；这类目标不会
+    /// > 产生第二次 status 迁移（relay `revoked_count=0`），`revoke[]` 仍是永久签名事实。
+    ///
     /// > **签名与任务书的唯一差异**：多了 `identity_path`。没有它就只能做"内存推广"，
     /// > 而原子 rename 是既有生产入口的唯一提交点（半推广是不可接受的）。
     ///
@@ -499,9 +506,9 @@ impl crate::dev_local::DevLocal {
             prev_control_hash,
             expected_control_rev: control_rev + 1,
             primary_checkpoint: first.report.checkpoint_id,
-            primary_commit_digest: checkpoint_commit_digest(vault_id, device_id, &first.report)?,
+            primary_commit_digest: checkpoint_commit_digest(&first.report)?,
             fallback_checkpoint: second.report.checkpoint_id,
-            fallback_commit_digest: checkpoint_commit_digest(vault_id, device_id, &second.report)?,
+            fallback_commit_digest: checkpoint_commit_digest(&second.report)?,
             slot_set_digest: slot_digest,
             member_cert_digest: member_digest,
             grants_digest: grant_digest,

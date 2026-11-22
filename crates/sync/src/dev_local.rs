@@ -915,6 +915,14 @@ impl DevLocal {
     ///
     /// 成功后**重新拉一次成员视图**再返回，调用方（worker）可直接把最新列表投影到面板，
     /// 不需要另发一条列表命令。
+    ///
+    /// ## 这是**默认**移除路径，且**永不**轮换（task-123）
+    ///
+    /// 本调用只产生"设备访问已吊销"这一件事：返回的 [`RevokedDevice::outcome`] 里
+    /// `changed`/`auth_rev` 可能变化，`control_rev` 与 vault 的 `key_epoch` **保持不变**
+    /// （测试断言 relay `/state`、DB 与两台设备的本地身份 epoch）。它**不会**、也**不得**
+    /// 被改成隐式触发轮换：需要新 root / 重加密历史时必须由用户显式走
+    /// [`crate::dev_local::DevLocal::rotate`]（opt-in），两者的 wire 与错误语义互不复用。
     pub fn revoke_device<T: RelayTarget + ?Sized>(
         relay: &T,
         vault: &Vault,

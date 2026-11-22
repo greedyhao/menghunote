@@ -498,10 +498,14 @@ impl RenameInput {
         window.focus(&self.focus_handle, cx);
     }
 
-    /// 点击设置字段时聚焦并全选：第一次打开不预选，点进来后可以直接输入替换。
+    /// 点击设置字段时聚焦，光标落在末尾、**不选中**。
+    ///
+    /// 之前这里会 `select_all`，导致设置页里点一下字段整段文字变蓝（用户多次反馈）；
+    /// 设置字段是「继续编辑已有值」而不是「替换整个标题」，所以只放光标。
+    /// 需要全选时用 `Ctrl+A` 或拖选。
     pub fn focus_for_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus(window, cx);
-        self.state.select_all();
+        self.state.end(false);
         cx.notify();
     }
 

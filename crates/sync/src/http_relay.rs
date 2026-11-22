@@ -1841,6 +1841,7 @@ impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
         let expected_digest: Option<[u8; 32]> = match cbor::opt_bytes_field(&detail, 6)? {
             Some(commit_bytes) => {
                 let commit = CheckpointCommit::decode(&commit_bytes)?;
+                crate::checkpoint::require_current_checkpoint_validation(&commit)?;
                 if commit.checkpoint_id != *checkpoint_id
                     || commit.manifest_object_id != manifest_oid
                 {
@@ -4970,7 +4971,8 @@ mod tests {
             manifest_digest: digest,
             refs_digest: [0x11; 32],
             producer_device_id: [0x04; 16],
-            validation_version: 1,
+            validation_version: 2,
+            validation_digest: [0x5A; 32],
         };
         let mut responses = auth_responses(1200);
         // GET /checkpoints/{cid}：键 4 是 manifest_oid（不是明文），键 6 是 CheckpointCommit。

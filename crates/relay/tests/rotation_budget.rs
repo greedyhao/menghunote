@@ -370,7 +370,8 @@ fn publish_checkpoint_signed(
         manifest_digest,
         refs_digest,
         producer_device_id: fx.device,
-        validation_version: 1,
+        validation_version: 2,
+        validation_digest: [0x5A; 32],
     };
     let message = commit.encode().expect("checkpoint commit cde");
     let signing_input = proto::checkpoint_signing_input(&commit).expect("checkpoint signing input");

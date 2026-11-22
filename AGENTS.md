@@ -11,7 +11,7 @@
 
 | 项 | 决策 |
 | --- | --- |
-| UI 框架 | **`gpui-kit` 0.9.1**（门面：`gpui-pre` 0.3.12 + `gpui-base` + `gpui-component`；2026-11-10 起，见 ADR 0004） |
+| UI 框架 | **`gpui-kit` 0.10.0**（门面：`gpui-pre` 0.3.12 + `gpui-base` + `gpui-component`；2026-11-10 起，见 ADR 0004） |
 | 语言 | Rust（edition 2021+） |
 | **编辑模型** | **Typora 式原位所见即所得**：编辑器内文本即 Markdown 源码（`**` 等标记真实存在，默认不绘制、光标进入时显现）；持久化真源是 SQLite 单库（见 ADR 0001）。详见 [`docs/briefs/0002-editor-core.md`](docs/briefs/0002-editor-core.md) |
 | 首要平台 | **Windows 桌面**（开发机即 Windows） |
@@ -27,15 +27,15 @@
 > ```toml
 > [dependencies]
 > # 别名把 lib 名固定成 `gpui`：代码里 `use gpui::*` 与 `gpui::platform::application()` 都靠它
-> gpui = { package = "gpui-kit", version = "=0.9.1" }   # 精确 pin
+> gpui = { package = "gpui-kit", version = "=0.10.0" }   # 精确 pin
 > ```
-> - `gpui-kit` 是 **longbridge 的 meta crate**（不是 Zed 官方再发布）：它依赖 `gpui-base 0.9.1` +
->   `gpui-pre 0.3.12` + `gpui-component 0.9.1`，其中 **`gpui-pre` 才是 Zed 主干的再发布**
+> - `gpui-kit` 是 **longbridge 的 meta crate**（不是 Zed 官方再发布）：它依赖 `gpui-base 0.10.0` +
+>   `gpui-pre 0.3.12` + `gpui-component 0.10.0`，其中 **`gpui-pre` 才是 Zed 主干的再发布**
 >   （`repository = zed-industries/zed`）；
 > - 选它的理由是**未来能直接用 `gpui-component` 的组件与测试基座**，不是"比 zed 新鲜"；
 > - **升级机制（重要）**：`gpui-kit` 自己**精确 pin** 了 `gpui-pre =0.3.12`，但 `gpui-base` / `gpui-component` /
->   `gpui-kit-assets` 在 kit 的清单里是 **caret（`^0.9.1`）**——也就是说 `cargo update -p gpui-base` 能在 kit 不动的情况下
->   把 base 挪到 kit 未验证过的组合。真正焊死整套的是**本项目 Cargo.toml 的 `"=0.9.1"` + 提交进仓库的 `Cargo.lock`**。
+>   `gpui-kit-assets` 在 kit 的清单里是 **caret（`^0.10.0`）**——也就是说 `cargo update -p gpui-base` 能在 kit 不动的情况下
+>   把 base 挪到 kit 未验证过的组合。真正焊死整套的是**本项目 Cargo.toml 的 `"=0.10.0"` + 提交进仓库的 `Cargo.lock`**。
 >   升级做法：**只改 `gpui-kit` 版本** → 让 cargo 重新解算整套 → 跑三绿 + UI smoke + 真机验 → 提交（含 lockfile）；
 >   **禁止**单独 `cargo update -p gpui-base` 或手工指定 base/component 版本。
 > - 平台入口从 `gpui_platform::application()` 变成 **`gpui::platform::application()`**
@@ -373,11 +373,23 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > **`v0.4-sync` 已由 GPT 复审 APPROVE（原锚点 `61d8de4`；整理前 `321f732`，无必修项）并打 annotated tag**；2026-11-13 前移至 `d16f6fe`（旧锚点 `v0.4-sync-backup-20261113` → `738f3f0`）；非生产，仅 localhost 开发验收。
 > **Windows 实机已由用户于 2026-11-13 在 `5538344` 包上实测通过**（产品代码与 `v0.4-sync` tag 树一致；命令/计数未逐条留档，复跑命令见 0007 §5）。
 > v0.4 **只支持修复后新建的 vault/身份**，旧开发 vault 失效（旧签名 checkpoint 无法仅靠本地版本拒绝隔离）。
-> 后置：`task-122`（`validation_version=2`/receipt HMAC/GC 版本门禁）、`task-123`（默认删凭证吊销 + 轮换 opt-in）、`task-124`（metadata 事件认证对账/续读）。
+> 后置：`task-123`（默认删凭证吊销 + 轮换 opt-in）、`task-124`（metadata 事件认证对账/续读）。
 > `task-121`（relay reservation 复用）**已完成**（2026-11-18）：同字节跨 reservation
 > （rotation/checkpoint/普通）`PUT parts` 幂等复用、对象只存一份且不重复计费；不同字节
 > 仍 `PART_CONFLICT`，补缺失分片仍要求同一预算来源；**wire/错误码/schema 未变**。
 > 详见 [`docs/notes/task-121-relay-reservation-reuse.md`](docs/notes/task-121-relay-reservation-reuse.md)。
+> `task-122`（验证修订 2）**已完成**（2026-11-19，未 commit）：`CheckpointCommit`
+> v2 追加 `validation_digest`（`SHA256(MN/v1/checkpoint-validation\0 || CDE(...))`），
+> 9 字段 v1 仍可解码，但**所有消费者都显式拒绝**——relay publish、bootstrap、rotation apply、
+> checkpoint manifest 都 `require_current_validation()` 拒绝 v1；relay 行只落 v2，
+> bootstrap/activation/GC 只选 v2 published，GC 不足两份 v2 即 blocked；本地
+> coverage/verified receipt 升 v3/v2 并加 HMAC-SHA256，密钥
+> `HKDF(K_epoch, salt=vault_id, info=MN/v1/checkpoint-receipt-key\0)`，MAC 域
+> `MN/v1/checkpoint-receipt-mac\0`，旧回执/篡改回执一律 fail-closed。
+> **完整预算框架明确未做**（范围过大，只完成 1–3；无 quota 代码改动）。
+> 测试：sync-proto **64** / relay **380** / sync **617** / app `--features dev-sync` **680**；
+> `e2e_rotation_two_rounds` = `TWO_ROUND_EXIT=0`。详见
+> [`docs/notes/task-122-validation-v2.md`](docs/notes/task-122-validation-v2.md)。
 > Linux 开发适配见 ADR 0008（0600 裸主钥，安全弱于 DPAPI，不宣称等价）。
 > **dev-only 同步 UI（ADR 0009）Phase 1 已完成**：真实 AppShell 内面板 + 持闸 SyncOnce +
 > 活动文档 adopt；面板「发布基线」、设备列表/「移除设备（不轮换）」已接通。
@@ -421,7 +433,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > `status` 改为只读 existing-only（不迁移/不建库）。首次配置改为 Web 管理面
 > 「创建领取链接」→ App 粘贴；手工步骤见
 > [`docs/notes/dev-sync-manual-test.md`](docs/notes/dev-sync-manual-test.md) 的 S4b 章节。
-> 测试：relay 376 / sync 614 / app 默认 **522** / `--features dev-sync` **677** / `--no-default-features` **406** / i18n **16** / plugin-api **24** / storage **201** / editor 287 / markdown 45。
+> 测试：relay 380 / sync 618 / app 默认 **546** / `--features dev-sync` **697** / `--no-default-features` **418** / i18n **16** / plugin-api **24** / storage **201** / editor 287 / markdown 45。
 > **Markdown/列表（ADR 0019 S1，2026-11-16）**：新增纯 crate `crates/markdown`
 > （`pulldown-cmark = "=0.13.6"`，default-features=false），列表块树/投影/GPUI
 > gutter/hanging indent/Enter 同级与空项退出；图片 Object Block 只读预览（S2a）。
@@ -600,7 +612,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 - **同步/加密（S7）进行中（2026-11-11，ADR 0006）**：`crates/sync-proto`（MNE1 信封/CDE/错误码/limits）→
   `crates/sync`（根/KEK/槽/DPAPI/HPKE/设备证书）→ `crates/relay`（axum+SQLite 密文中继）→ storage 桥 →
   bootstrap/GC → 轮换 → Windows 两设备验收。v1 必做含两 checkpoint GC、恢复码、独立管理权；附件只做最小分片传输，UI 后置。
-- **UI 框架已切 GPUI Kit（2026-11-10，ADR 0004，真机验收）**：`gpui = { package = "gpui-kit", version = "=0.9.1" }`（精确 pin），
+- **UI 框架已切 GPUI Kit（2026-11-10，ADR 0004，真机验收）**：`gpui = { package = "gpui-kit", version = "=0.10.0" }`（精确 pin），
   平台入口 `gpui::platform::application()`；`text`/`editor`/`storage` **零改动**。
   探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口；迁移后三绿 329 用例 + UI smoke 10/10 + 用户真机 IME/DPI 通过。
   迁移/探针 worktree 与临时分支已清理；**升级必须整套对齐**，见 §1 依赖基线。
@@ -697,7 +709,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   i18n **16**；
   新增 `headless_templates` 7、`headless_notes_plugins_ui` 2（`sync-ui` 产品构建）、
   `templates` 单测 7、`daily_notes` 单测 7、`ui_text` 1；fmt/clippy 干净。
-  已知限制：路径精确/大小写敏感；日记模板路径手填（未接选择器）；无相对日期/日历/
+  已知限制：路径精确/大小写敏感；无相对日期/日历/
   周期笔记；设置字段不做失焦自动保存；设置不参与多设备同步。详见
   [`docs/notes/templates-daily-notes.md`](docs/notes/templates-daily-notes.md)。
 
@@ -753,7 +765,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   `app_root` 分类分组单测 1（`FIXED`/`PLUGIN_SECTIONS`/`ALL` 关系）；插件行改为
   Obsidian 式「标题 + 说明 + 右侧胶囊开关」（不再有按钮文字/「已启用」重复行），
   开关轨道开=accent、关=灰，`-state` 仅作开关锚点。设置字段首次打开不再预选
-  （`RenameInput::new_at_end`，光标在末尾；点击字段时才全选），避免「整页被选中」观感。
+  （`RenameInput::new_at_end`，光标在末尾；点击字段不再全选），避免「整页被选中」观感。
   fmt/clippy 干净。
   详情见 [`docs/notes/ui-refactor-settings-ribbon-sort.md`](docs/notes/ui-refactor-settings-ribbon-sort.md)。
 
@@ -824,3 +836,98 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   本地库不登记、不参与同步、无「转同步实例」导入；重启不自动进本地 Main（无配置记录，
   需再点入口）；旧 dev vault 不搬迁；UI 像素/DPI/IME 与 Windows 真机未验。
   详见 [`docs/notes/sync-product-a2.md`](docs/notes/sync-product-a2.md)。
+
+- **日记模板笔记选择器（P1 日常体验，2026-11-19，未 commit）**：
+  设置页「日记」的模板字段**保留手填输入框**（仍可精确输入任意普通笔记路径），旁边新增
+  「选择模板笔记…」按钮（`settings-daily-notes-pick-template`）。点击打开独立覆盖层
+  `DailyTemplatePicker`（与「插入模板」选择器的业务语义分离，只复用 IME 搜索框/覆盖层样式）：
+  - 候选 = 当前库**全部普通笔记**（`TreeEntry::is_note()`；不按模板文件夹过滤、不加隐藏/
+    保留名规则），按完整路径大小写不敏感字典序；每行标题 + 相对路径；
+  - 搜索框（复用 `RenameInput`，标题/路径子串匹配）、`↑/↓`、`Enter`、点击、`Esc`、
+    点空白关闭；当前 `template` 在列表里时默认选中并显示「✓ 当前」
+    （`daily-template-picker-current`）；
+  - 选中后按 `normalize_note_path` 规整 → **写回模板字段并立即原子写**
+    `daily-notes.json`（`set_preferences`）→ 关闭选择器；空库/无候选时只显示空态，
+    **不发选中事件、不写空路径、不 panic**；手填输入框仍原样可用（清空 = 无模板）。
+  固定 selector：`settings-daily-notes-pick-template`、`daily-template-picker` /
+  `-panel` / `-search` / `-list` / `-empty` / `item-<i>` / `-current`。
+  选择器由宿主持有/渲染：产品 `AppRoot` 设置页与 dev-sync `AppShell` 设置页各挂一份
+  （`AppShell` 只新增只读 `tree_snapshot()` 访问器与 UI 接线，无同步/relay/storage/
+  schema/wire 改动）；设置关闭/重新打开时清空，不残留。新增 `daily_notes.*` 7 条
+  中英文案（全部经 `ui_text`）。测试：app 默认 **522 → 526** /
+  `--features dev-sync` **677 → 680** / i18n **16**；新增
+  `headless_daily_template_picker` 2（产品构建：全库候选/搜索/Enter+点击写盘/当前标记/
+  Esc+点空白不写/关闭重开不残留/手填仍可用；两种构建：空库空态不写盘）+
+  `daily_notes` 单测 2（候选/排序/过滤）；fmt/clippy 干净。已知限制：只列当前库已有
+  普通笔记（不支持新建/虚拟候选）；路径仍精确/大小写敏感；Windows 真机像素/IME 未验；
+  AppShell 设置页宿主只做编译级覆盖（交互 e2e 走 AppRoot 设置页）。详见
+  [`docs/notes/templates-daily-notes.md`](docs/notes/templates-daily-notes.md) §8.1。
+
+- **插件启停单一入口 + 设置底栏按分类收敛 + 设置字段点击不选中（2026-11-19，ADR 0023）**：
+  设置 →「插件」页的 `settings-plugin-<id>-toggle` 是模板/日记**唯一**启停入口；插件自己的
+  设置分类（模板/日记）移除重复的「启用模板 / 启用日记」按钮、状态文本与
+  `EnabledChanged` 事件（`TemplatesSettingsEvent` 整体删除；`DailyNotesSettingsEvent`
+  只剩 `PickTemplateRequested`）。旧 selector `settings-templates-toggle` /
+  `settings-daily-notes-toggle` 及 `-state` 删除，测试改为断言不存在并通过插件页总开关
+  写盘/隐藏分类；程序化停用当前插件分类仍回退到「插件」页。
+  设置底栏不再对所有分类显示「保存模式/relay（重启后生效）」：只有「Relay」分类渲染
+  `settings-save`（文案「保存 relay 设置（重启后生效）」）、`settings-cancel`、
+  `settings-error` / `settings-notice`；其它分类只显示 `settings-close`，避免让外观/
+  语言/插件设置看起来需要保存或重启。`settings-error` 不再显示「无错误」占位；
+  relay 默认提示文案限定为 relay（中英文同步）。
+  设置字段单击**不再全选**：`RenameInput::focus_for_edit` 只聚焦并把光标放到末尾；
+  需要替换整段用 `Ctrl+A`/拖选（`headless_notes_plugins_ui` 断言单击后输入是追加）。
+  测试：app 默认 **526** / `--features dev-sync` **680**；新增
+  `docs/adr/0023-plugin-toggle-and-settings-save.md`；fmt/clippy 干净。详见 ADR 0023。
+
+- **笔记编辑历史：本地优先（2026-11-19，ADR 0024，已决待实现）**：
+  用户确认先做**本机历史**，跨设备一致时间线后置。数据源是本地 `loro_updates` + snapshot，
+  **不查询 relay 旧日志**；版本按编辑会话捕获（停止输入约 2s / 切换笔记 / 关闭窗口 /
+  同步导入完成），保存压缩正文快照与时间/设备/来源/op 范围。入口为笔记「历史记录…」时间线
+  覆盖层，点击版本只读预览；恢复默认**恢复为新笔记**（append-only，不覆盖当前、不改写
+  CRDT 历史）。v1 默认保留最近 200 个版本或 90 天，不做自动物理裁剪 UI。跨设备一致历史
+  需要独立加密 history log，后续单独排期；回收站/裁剪/归属仍按
+  `docs/briefs/0006-history-and-trash.md`。详见
+  [`docs/adr/0024-local-note-history.md`](docs/adr/0024-local-note-history.md)。
+
+- **task-123 审计：默认「只吊销」与轮换 opt-in 已在树内（2026-11-19）**：
+  ADR 0010 早已落地独立吊销：relay `POST .../devices/{device}/revoke` 只写
+  `devices.status='revoked'` + `auth_rev += 1`，**不**推进 `control_rev`、不换 epoch、
+  不冻结 vault；被移除设备 challenge/旧 token/WS/approve 全部 `403 REVOKED`，
+  同 device_id 重新 redeem `409 ID_CONFLICT`。客户端默认 `DevLocal::revoke_device` 只吊销，
+  轮换唯一入口仍是显式 `DevLocal::rotate`。本轮补验收断言（epoch/control_rev 不变、
+  重复幂等、其余设备继续同步、显式 rotate 才换 epoch、被移除设备不拿 grant）与契约注释，
+  wire/错误码/schema 未变。测试：relay **380** / sync **618** / sync-proto **64**。
+  详见 [`docs/notes/task-123-revoke-only-rotation-opt-in.md`](docs/notes/task-123-revoke-only-rotation-opt-in.md)。
+
+- **P1：本地/同步入口重启恢复 + 设置分类记忆（2026-11-19）**：
+  本机 `startup.json`（数据根，原子写/损坏回退/不同步）记录 `mode=local|sync`：
+  上次本地 → 重启直接打开 `<数据根>/local/vault.sqlite3` 进 Main（**不读 sync.json、
+  不联网、不建库**）；本地库不存在 → Welcome + `app-root-notice` 明确提示，不自动建库；
+  同步实例打开成功写 `sync`，之后沿用 active 实例自动打开。设置页分类记忆 `settings-ui.json`
+  （只存短名，原子写/损坏/未知回退 `appearance`）；已关闭插件分类 clamp 到 `plugins`，
+  且 clamp 不回写磁盘。产品 `AppRoot` 生效；`AppShell` dev-sync 设置页未改。
+  测试：app 默认 **546** / `--features dev-sync` **697**（`startup_resume` 9 产品 / 5 dev-sync，
+  onboarding_ui +1，layout/app_root 单测 +5）。详见
+  [`docs/notes/startup-resume-settings-memory.md`](docs/notes/startup-resume-settings-memory.md)。
+
+- **P1：模板/日记相对日期（2026-11-19）**：
+  `{{date:-1d}}` / `{{date:+1d}}` / `{{date:+1w}}` / `{{date:-1m}}` / `{{date:+1y}}`，
+  可带格式 `{{date:-1m:YYYY/MM/DD}}`；偏移 = 可选 `+/-` + 1–2 位数字 + `d/w/m/y`，
+  先判偏移再判格式。纯函数 `RelativeDateOffset::{parse,looks_like_offset,apply}` 与
+  `DateTimeParts::{add_days,add_months,add_years}`；跨月/跨年/闰日/月末对齐正确；
+  非法偏移（空、`+d`、`1x`、`1.5d`、`123d`、大写单位、越界）**原样保留**、不 panic。
+  日记纯 API `note_path_for_offset` / `note_path_for(offset_days)`（越界 `OutOfRange`）。
+  设置 hint 中英文说明语法；未做日历覆盖层、周期笔记、昨天/明天入口。
+  测试：headless_templates +1、templates/daily_notes 单测 +5；app 默认 **546** /
+  dev-sync **697** / i18n **16**。详见 [`docs/notes/templates-daily-notes.md`](docs/notes/templates-daily-notes.md)。
+
+- **GPUI Kit 升级 0.9.1 → 0.10.0（2026-11-19）**：
+  按 ADR 0004 的升级规则只改 `gpui-kit` 版本并让 cargo 重解整套：`gpui-kit` / `gpui-base` /
+  `gpui-component` / `gpui-component-macros` / `gpui-kit-assets` 全部 **0.10.0**，
+  `gpui-pre` 仍为 **0.3.12**（kit 自身精确 pin），`gpui-fast*` 0.1.14 → 0.1.17。
+  `crates/app/Cargo.toml` 两处 `gpui = { package = "gpui-kit", version = "=0.10.0" }`
+  （普通 + `test-support` dev-dependency），`Cargo.lock` 一并提交。
+  本机 Linux 验证：`cargo check -p menghunote-app --all-targets --features dev-sync` 通过；
+  app 默认 **546** / `--features dev-sync` **697**；fmt/clippy 干净。
+  **Windows 真机 UI smoke（IME/DPI/窗口）仍需用户验收**；未改业务代码。

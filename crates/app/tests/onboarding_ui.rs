@@ -546,6 +546,68 @@ async fn create_flow_backs_up_code_then_opens_empty_main_and_restarts(cx: &mut T
     assert_eq!(active.vault_id, vault_id);
 }
 
+/// P1 本机启动偏好（同步侧）：同步实例打开成功 → `<数据根>/startup.json` 记
+/// `{"version":1,"mode":"sync"}` → 重建 `AppRoot` 仍自动进同一实例 Main（不闪 Welcome）。
+#[gpui::test]
+async fn sync_instance_open_is_remembered_and_resumes_after_restart(cx: &mut TestAppContext) {
+    ensure_test_user_key();
+    let relay = DevRelay::start().expect("起进程内 dev relay 失败");
+    let (_dir, layout) = temp_layout("startup-sync");
+    let instance_id = "inst-startup-sync";
+    let created = create_instance(&relay, &layout, instance_id);
+    write_profile(&layout, &created, instance_id);
+    let options = AppRootOptions::for_test(layout.clone(), relay.base_url(), instance_id);
+    let (root, cx) = open_root(cx, options.clone());
+    cx.run_until_parked();
+    assert_eq!(state_of(&root, cx), RootStateLabel::Main);
+
+    let startup_path = layout.startup_path();
+    assert!(
+        startup_path.is_file(),
+        "同步实例打开成功必须写本机启动偏好：{}",
+        startup_path.display()
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&startup_path).expect("读启动偏好失败"))
+            .expect("启动偏好必须是 JSON");
+    assert_eq!(value["version"], serde_json::json!(1));
+    assert_eq!(
+        value["mode"], "sync",
+        "同步实例打开成功必须记 mode=sync（不是 local）"
+    );
+    // 启动偏好是**本机**文件：不得写进 sync.json / 同步配置。
+    let profile_raw = std::fs::read_to_string(&layout.config_path).expect("读公开配置失败");
+    let profile_json: serde_json::Value =
+        serde_json::from_str(&profile_raw).expect("公开配置必须是 JSON");
+    assert!(
+        profile_json.get("mode").is_none() && profile_json.get("section").is_none(),
+        "启动/设置偏好不得混进 sync.json：{profile_raw}"
+    );
+
+    // 重启：不点任何入口，直接回到同一同步实例 Main。
+    assert!(cx.simulate_close(), "Main 状态允许关窗（有界排空）");
+    cx.run_until_parked();
+    let restarted = cx.update(|window, cx| {
+        let options = options.clone();
+        window.replace_root(cx, move |_window, cx| AppRoot::new(options, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        state_of(&restarted, cx),
+        RootStateLabel::Main,
+        "偏好 sync + 有效 active：重启必须直接进同步 Main"
+    );
+    assert!(
+        !restarted.update(cx, |root, _| root.is_local_mode()),
+        "同步实例的 Main 不得被标成本地（不同步）模式"
+    );
+    let active = restarted
+        .update(cx, |root, _| root.active_entry().cloned())
+        .expect("自动打开的实例必须有公开条目");
+    assert_eq!(active.instance_id, instance_id);
+    assert_eq!(active.vault_id, created.vault_id);
+}
+
 /// 验收 3：配置损坏 / 身份缺失 / 库与配置错配 → Error，且不创建新库。
 #[gpui::test]
 async fn broken_config_or_identity_lands_on_error_without_rebuilding(cx: &mut TestAppContext) {
@@ -1731,10 +1793,21 @@ async fn settings_lists_public_instance_without_secret_fields(cx: &mut TestAppCo
         root.update(cx, |root, _| root.settings_is_open()),
         "点击「设置」必须打开面板"
     );
-    // 底栏（错误/提示/保存/关闭）固定在所有分类下都可见；分类内容按导航切换。
+    // 底栏：非 relay 分类只有「关闭」；relay 分类才有保存/错误/重启提示。
+    for selector in ["dev-sync-settings", "settings-nav", "settings-close"] {
+        expect_bounds(cx, selector);
+    }
+    assert!(
+        cx.debug_bounds("settings-save").is_none(),
+        "外观等即时生效分类不得显示「保存 relay」按钮"
+    );
+    assert!(
+        cx.debug_bounds("settings-error").is_none(),
+        "非 relay 分类不显示错误占位/提示"
+    );
+    open_settings_nav(cx, "relay");
+    expect_bounds(cx, "settings-relay");
     for selector in [
-        "dev-sync-settings",
-        "settings-nav",
         "settings-save",
         "settings-cancel",
         "settings-error",
@@ -1742,8 +1815,6 @@ async fn settings_lists_public_instance_without_secret_fields(cx: &mut TestAppCo
     ] {
         expect_bounds(cx, selector);
     }
-    open_settings_nav(cx, "relay");
-    expect_bounds(cx, "settings-relay");
     open_settings_nav(cx, "instances");
     expect_bounds(cx, "settings-instance-0");
     expect_bounds(cx, "settings-instance-0-active");
@@ -1797,7 +1868,7 @@ async fn settings_lists_public_instance_without_secret_fields(cx: &mut TestAppCo
             root.main_shell().map(|shell| shell.entity_id())
         })
         .expect("Main 必须有 AppShell");
-    let cancel = expect_bounds(cx, "settings-cancel");
+    let cancel = expect_bounds(cx, "settings-close");
     cx.simulate_click(cancel.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(!root.update(cx, |root, _| root.settings_is_open()));
@@ -1931,7 +2002,6 @@ async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestApp
     for selector in [
         "settings-section-templates",
         "settings-templates",
-        "settings-templates-toggle",
         "settings-templates-folder",
         "settings-templates-example",
     ] {
@@ -1943,7 +2013,6 @@ async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestApp
     for selector in [
         "settings-section-daily_notes",
         "settings-daily-notes",
-        "settings-daily-notes-toggle",
         "settings-daily-notes-folder",
         "settings-daily-notes-example",
     ] {
@@ -1994,7 +2063,7 @@ async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestApp
     expect_bounds(cx, "settings-about-build");
 
     // 会话内记住上次分类：关闭再打开仍停在「关于」。
-    let cancel = expect_bounds(cx, "settings-cancel");
+    let cancel = expect_bounds(cx, "settings-close");
     cx.simulate_click(cancel.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(
@@ -2007,7 +2076,7 @@ async fn settings_nav_switches_sections_and_keeps_old_selectors(cx: &mut TestApp
     expect_bounds(cx, "settings-section-about");
 
     // 收尾：关闭设置（不影响后续断言/关窗）。
-    let cancel = expect_bounds(cx, "settings-cancel");
+    let cancel = expect_bounds(cx, "settings-close");
     cx.simulate_click(cancel.center(), Modifiers::default());
     cx.run_until_parked();
 }
@@ -2094,7 +2163,7 @@ async fn settings_saves_relay_and_applies_after_restart(cx: &mut TestAppContext)
     );
 
     // 重启：关闭窗口（Main 有界排空）→ 新 AppRoot 用新 relay 打开同一实例。
-    let cancel = expect_bounds(cx, "settings-cancel");
+    let cancel = expect_bounds(cx, "settings-close");
     cx.simulate_click(cancel.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.simulate_close(), "Main 状态允许关窗");
@@ -2258,7 +2327,7 @@ async fn settings_switches_active_and_restarts_into_it(cx: &mut TestAppContext) 
     );
 
     // 重启 → 打开新 active B。
-    let cancel = expect_bounds(cx, "settings-cancel");
+    let cancel = expect_bounds(cx, "settings-close");
     cx.simulate_click(cancel.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.simulate_close());
@@ -2424,7 +2493,7 @@ async fn settings_cancel_keeps_main_shell_and_document(cx: &mut TestAppContext) 
     root.update(cx, |root, cx| {
         root.settings_set_relay("http://127.0.0.1:1", cx)
     });
-    let cancel = expect_bounds(cx, "settings-cancel");
+    let cancel = expect_bounds(cx, "settings-close");
     cx.simulate_click(cancel.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(!root.update(cx, |root, _| root.settings_is_open()));

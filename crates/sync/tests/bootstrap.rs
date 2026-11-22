@@ -1426,6 +1426,36 @@ fn tamper_checkpoint_signature(relay: &mut FakeRelay, index: usize) {
     checkpoint.signature.as_mut().expect("signature")[0] ^= 0x01;
 }
 
+/// task-122：把已发布基线的 commit 改写成指定的验证修订（保持字段与签名自洽），
+/// 用于证明客户端消费者会显式拒绝旧修订。
+fn rewrite_checkpoint_validation_version(
+    relay: &mut FakeRelay,
+    materials: &genesis::GenesisMaterials,
+    index: usize,
+    version: u16,
+) {
+    let checkpoint = relay
+        .published_checkpoints
+        .get(index)
+        .cloned()
+        .expect("checkpoint");
+    let signed = checkpoint.signed_commit.expect("signed commit");
+    let mut commit =
+        menghunote_sync_proto::CheckpointCommit::decode(&signed).expect("decode commit");
+    commit.validation_version = version;
+    commit.validation_digest = if version == 2 { [0x5A; 32] } else { [0u8; 32] };
+    let signed = commit.encode().expect("encode commit");
+    let signature = materials
+        .signing_key
+        .sign(&menghunote_sync_proto::checkpoint_signing_input(&commit).expect("signing input"));
+    let entry = relay
+        .published_checkpoints
+        .get_mut(index)
+        .expect("published checkpoint");
+    entry.signed_commit = Some(signed);
+    entry.signature = Some(signature);
+}
+
 fn checkpoint_asset_refs(relay: &FakeRelay, index: usize) -> Vec<[u8; 32]> {
     relay
         .published_checkpoints
@@ -1617,6 +1647,34 @@ fn corrupt_signature_on_both_baselines_fails_without_import_or_ack() {
     assert_no_sync_watermarks(&target);
 }
 
+#[test]
+fn revision_1_baselines_are_rejected_by_client_consumers() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+    assert!(relay.published_checkpoints.len() >= 2);
+    for index in 0..relay.published_checkpoints.len() {
+        rewrite_checkpoint_validation_version(&mut relay, &materials, index, 1);
+    }
+
+    let (_target_dir, target) = fresh_vault();
+    let error = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("修订 1 的签名基线必须被客户端拒绝（不得静默接受旧基线）");
+    assert!(
+        format!("{error:?}").contains("UnsupportedVersion")
+            || format!("{error}").contains("协议版本"),
+        "错误必须指向不支持的验证修订，实际：{error}"
+    );
+    assert!(list_all_docs(&target).expect("list_all_docs").is_empty());
+    assert_no_sync_watermarks(&target);
+}
+
 // ============================================================ 评审 0002 T16/T17 剩余
 // fallback 阶段仍必须真实验证 structure/codec/actual VV；任一基线腐坏即整体回退，
 // 两基线都坏必须零写入、零水位、零 journal、零 ACK。
@@ -1698,7 +1756,8 @@ fn install_manifest(
         manifest_digest,
         refs_digest,
         producer_device_id: materials.device_id,
-        validation_version: 1,
+        validation_version: 2,
+        validation_digest: [0x5A; 32],
     };
     let signed_commit = commit.encode().expect("checkpoint commit");
     let signature = materials

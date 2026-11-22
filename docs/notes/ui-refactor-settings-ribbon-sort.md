@@ -41,7 +41,9 @@
 | `templates`（插件，仅启用时） | `settings-nav-templates` | `settings-section-templates` | `settings-templates*`（第一方插件） |
 | `daily_notes`（插件，仅启用时） | `settings-nav-daily_notes` | `settings-section-daily_notes` | `settings-daily-notes*` |
 
-- **默认选中「外观」**；本次会话内记住上次分类（`AppSettingsSection` 字段，不持久化）。
+- **默认选中「外观」**；上次分类记在本机 `settings-ui.json`（2026-11-19 起持久化，
+  见 [`startup-resume-settings-memory.md`](startup-resume-settings-memory.md)），
+  缺失/损坏/未知 key 回退「外观」，已关闭的插件分类 clamp 到「插件」。
 - 左栏顺序：固定分类（外观/语言/同步/实例/Relay/安全/插件/关于）→
   `settings-nav-divider`（1px 主题线，整行不可点）→ 已启用的插件分类（模板/日记）。
   固定分类永远显示，插件分类只在对应 `enabled` 为真时显示。
@@ -55,8 +57,8 @@
 
 实现要点（`crates/app/src/onboarding/app_root.rs`）：
 
-- `SettingsSection`（10 个分类）提供 `key()` / `label()` / `is_plugin()` / `is_enabled()`
-  （文案走 `ui_text`）；导航按 `FIXED`（8 个固定）→ 分界线 → `PLUGIN_SECTIONS`（2 个插件，
+- `SettingsSection`（10 个分类）提供 `key()` / `parse()` / `label()` / `is_plugin()` /
+  `is_enabled()`（文案走 `ui_text`；`parse()` 用于本机分类记忆的未知 key 回退）；导航按 `FIXED`（8 个固定）→ 分界线 → `PLUGIN_SECTIONS`（2 个插件，
   过滤未启用）渲染；`ALL` = 固定在前、插件在后的全部枚举。
 - `render_settings` 只对 `self.settings_section` 建右侧内容；`settings-content` 是滚动容器，
   外层 `dev-sync-settings` 是 `overflow_hidden` + 窗口高度 clamp（限高保持）。

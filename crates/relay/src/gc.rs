@@ -189,6 +189,10 @@ pub fn tick(conn: &ScopeConn, clock: &dyn Clock) -> Result<GcOutcome> {
     Ok(outcome)
 }
 /// 含 unhealthy 的已发布基线（GC 专用；健康过滤由调用方做，否则损坏基线会被"跳过"而非阻止）。
+///
+/// task-122 版本门禁：只返回**当前验证修订**（v2）的 checkpoint。旧/未知修订的
+/// checkpoint 不能作为 GC 的保留根或 cut 依据；若不足两份当前修订基线，GC 必须
+/// `blocked`，不得回退到旧版本继续回收。
 pub fn published_any_newest_first(
     conn: &ScopeConn,
     epoch: u64,
@@ -197,6 +201,7 @@ pub fn published_any_newest_first(
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id FROM checkpoints
          WHERE state = 'published' AND epoch = ?1 AND vault_id = ?3
+           AND validation_version = ?4
          ORDER BY published_at DESC, rowid DESC LIMIT ?2",
     )?;
     let ids: Vec<Vec<u8>> = stmt
@@ -205,6 +210,7 @@ pub fn published_any_newest_first(
                 i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
                 i64::from(limit.max(1)),
                 conn.scope().as_slice(),
+                i64::from(menghunote_sync_proto::CHECKPOINT_COMMIT_VALIDATION_VERSION),
             ),
             |row| row.get::<_, Vec<u8>>(0),
         )?

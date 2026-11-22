@@ -545,7 +545,8 @@ fn build_baseline(
         manifest_digest,
         refs_digest,
         producer_device_id: producer.device_id,
-        validation_version: 1,
+        validation_version: 2,
+        validation_digest: [0x5A; 32],
     };
     let signed_commit = commit.encode().expect("commit encode");
     let input = checkpoint_signing_input(&commit).expect("checkpoint signing input");
@@ -3496,6 +3497,7 @@ fn collect_baseline_payload_returns_raw_loro_snapshot_bytes() {
         refs_digest: [0x98; 32],
         published_at: None,
         validated: false,
+        commit_digest: None,
     };
     let payload =
         menghunote_sync::rotation_apply::collect_baseline_payload(&mut relay, &root, &report)

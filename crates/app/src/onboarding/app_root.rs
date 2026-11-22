@@ -7,11 +7,15 @@
 //!         \-> JoinForm  -> Working -> Main（成功即写配置，无备份页）
 //!                      \-> Error（保留表单）        （保存配置失败 -> Error，可重试保存）
 //! 已有有效配置 -> Main（启动直接进入，不闪 Welcome）
+//! 本机 startup.json = local 且本地库存在 -> Main（重启直接回到本地库，不读 sync.json）
 //! Welcome -> Main（本地（不同步）库：产品 = 数据根下 local/vault.sqlite3，
 //!               dev-sync = 默认 dev vault；都没有同步面板）
 //! 任意 -> Error（配置损坏 / 身份缺失 / 库不匹配 / 实例目录被占用 / 本地库打不开）
 //! Welcome/Main -> 设置（覆盖层，不销毁 Main 的 AppShell）-> 关闭回原状态
 //! ```
+//!
+//! **打开成功后写本机启动偏好**（`startup.json`：`local`/`sync`）：只记入口、不同步、
+//! 不含正文；下次启动按它直接恢复。偏好缺失/损坏/本地库不存在 → Welcome（不报错页）。
 //!
 //! **只有真实 `Vault` + 持久身份就绪后才构造 `AppShell`**：没有占位库、假 peer、
 //! "先开空壳再补身份"（ADR 0011 决策）。Main 状态里 `AppShell` 是 `AppRoot` 的子视图，
@@ -56,12 +60,13 @@
 //! | `settings-plugin-<id>` / `-toggle` / `-state` | 「插件」分类里的第一方插件行 / 开关 / 状态（模板 `templates`、日记 `daily_notes`） |
 //! | `settings-toggle-sync` | 「同步」分类的同步面板**内容容器**（进入分类即渲染；没有展开/收起） |
 //! | `settings-instance-<i>` / `settings-instance-<i>-active` | 公开实例行 /「设为默认」控件（active 优先） |
-//! | `settings-relay` / `settings-save` / `settings-cancel` | relay 输入框 / 保存 / 关闭（不保存；保存与关闭固定在底栏） |
+//! | `settings-relay` / `settings-save` / `settings-cancel` | relay 输入框 / 保存 / 关闭（仅在「Relay」分类） |
 //! | `settings-about-version` / `settings-about-build` | 关于：版本 / 构建特性（只读） |
 //! | `settings-mode-local_dev` / `settings-mode-remote_tls` / `settings-remote-consent` | relay 模式选择 / 远程确认 |
 //! | `settings-fingerprint` / `settings-fingerprint-headline` / `settings-copy-fingerprint` | 安全指纹只读区 / 标题 / 复制公开值 |
 //! | `settings-security-category` | 当前安全暂停类别（无则「无安全暂停」） |
-//! | `settings-error` / `settings-notice` | 内联错误 / 提示（含「重启后生效」） |
+//! | `settings-close` | 非 relay 分类的关闭按钮（即时设置已保存） |
+//! | `settings-error` / `settings-notice` | relay 分类的内联错误 / 提示（含「重启后生效」） |
 //! | `settings-copy-vault-id` / `settings-copy-device-id` / `settings-copy-path` | 公开值复制按钮 |
 //! | `settings-api-version` | active 实例的 API 面（v1 setup secret / v2 票据） |
 //! | `app-root-error` / `app-root-error-message` / `app-root-retry` / `app-root-back-welcome` | Error 页 |
@@ -101,8 +106,9 @@ use super::invite::{
 use super::invite_copy::{CopyInviteEvent, CopyInviteJob, CopyInviteRequest, CopyInviteStage};
 use super::join::{JoinEvent, JoinJob, JoinOutcome, JoinRequest};
 use super::layout::{
-    generate_instance_id, DevSyncProfile, InstanceEntry, ProfileError, ProfileLayout, ProfileStore,
-    RelayApiVersion, RelayMode, VAULT_FILE_NAME,
+    generate_instance_id, load_startup_mode, save_startup_mode, write_json_file_atomically,
+    DevSyncProfile, InstanceEntry, ProfileError, ProfileLayout, ProfileStore, RelayApiVersion,
+    RelayMode, StartupMode, VAULT_FILE_NAME,
 };
 use super::lock::{InstanceLock, LOCK_FILE_NAME};
 use super::sanitize_error;
@@ -423,6 +429,16 @@ struct InvitePendingState {
     message: Option<String>,
 }
 
+/// 启动时按本机启动偏好恢复本地库的结果（只影响启动引导，不改状态机语义）。
+enum LocalResume {
+    /// 已进入 Main（`AppShell` 就绪）。
+    Opened,
+    /// 本地库文件不存在：不凭空创建，回 Welcome 并给明确提示。
+    Missing,
+    /// 本地库存在但打开失败（Error 页已由打开路径设置）。
+    Failed,
+}
+
 /// 常驻根视图。
 pub struct AppRoot {
     options: AppRootOptions,
@@ -448,13 +464,21 @@ pub struct AppRoot {
     templates_settings: Option<Entity<crate::templates::TemplatesSettingsPanel>>,
     /// 设置页「日记」区（同上）。
     daily_notes_settings: Option<Entity<crate::daily_notes::DailyNotesSettingsPanel>>,
+    /// 日记模板笔记选择器（覆盖层；设置页「选择模板笔记…」打开）。
+    daily_template_picker: Option<Entity<crate::daily_notes::DailyTemplatePicker>>,
+    /// 选择器事件订阅（关闭时 drop = 取消订阅）。
+    daily_template_picker_events: Option<gpui::Subscription>,
+    /// 事件回调里拿不到 `&mut Window`：置位后下一帧 render 创建选择器并聚焦。
+    pending_daily_template_picker: bool,
+    /// 选择器关闭后下一帧把焦点还给日记模板输入框。
+    pending_focus_daily_template: bool,
     /// 第一方插件设置面板的事件订阅（启用开关变化 → 左栏插件分类立即刷新）。
     plugin_settings_subs: Vec<gpui::Subscription>,
     /// 设置面板（overlay；Main/Welcome 都可用，关闭后回到原状态）。
     settings: Option<SettingsState>,
     /// 设置页里的「管理（V2 控制面）」区是否展开（默认收起；展开时才触发网络刷新）。
     settings_management_open: bool,
-    /// 设置页当前分类（默认「外观」；本次会话内记住，不持久化）。
+    /// 设置页当前分类（本机 `settings-ui.json` 记忆；缺失/损坏/未知 key 回退「外观」）。
     settings_section: SettingsSection,
     /// 关闭设置后要把焦点还给 Main 的编辑器（下一帧渲染时消费）。
     pending_focus_restore: bool,
@@ -507,6 +531,10 @@ impl AppRoot {
             pending_invite: None,
             templates_settings: None,
             daily_notes_settings: None,
+            daily_template_picker: None,
+            daily_template_picker_events: None,
+            pending_daily_template_picker: false,
+            pending_focus_daily_template: false,
             plugin_settings_subs: Vec::new(),
             settings: None,
             settings_management_open: false,
@@ -539,10 +567,32 @@ impl AppRoot {
         });
     }
 
-    /// 启动引导：一次性迁移旧开发目录 → 读公开配置 → 有 active 且有效就自动进 Main。
+    /// 启动引导：本机启动偏好 → 旧目录一次性迁移 → 读公开配置 → 有 active 且有效就自动进 Main。
     fn boot(&mut self, cx: &mut Context<Self>) {
         self.state = State::Welcome;
         self.error = None;
+        // 0) 本机启动偏好（不同步、不含正文）：上次成功打开的是本地库就直接回去。
+        //
+        //    - 本地库存在 → 直接进 Main：**不读 `sync.json`、不迁移旧配置**，本地使用
+        //      不被同步配置的损坏/迁移挡住，也不联网；
+        //    - 本地库不存在 → 回 Welcome + 明确提示（**不凭空创建库**）；实例列表
+        //      容错读取，不把同步配置的问题升级成错误页；
+        //    - 偏好缺失/损坏/`sync` → 沿用下面的 active 实例自动打开逻辑。
+        if self.options.allow_local_vault
+            && load_startup_mode(&self.options.layout.startup_path()) == Some(StartupMode::Local)
+        {
+            match self.resume_local_vault(cx) {
+                LocalResume::Opened | LocalResume::Failed => return,
+                LocalResume::Missing => {
+                    let path = self.local_vault_path();
+                    self.notice = Some(crate::ui_text::local_resume_missing(
+                        &path.display().to_string(),
+                    ));
+                    self.load_profile_for_welcome();
+                    return;
+                }
+            }
+        }
         // P2：旧目录（`menghunote-dev/dev-sync.json`）的一次性保守迁移。显式布局
         // （`ProfileLayout::new`）没有旧路径，因此测试/第三方注入完全不受影响。
         match self.options.layout.migrate_legacy_profile() {
@@ -576,6 +626,11 @@ impl AppRoot {
                 return;
             }
         }
+        self.load_profile_and_auto_open(cx);
+    }
+
+    /// 读公开配置：损坏/索引损坏 → Error；有 active → 尝试自动打开。
+    fn load_profile_and_auto_open(&mut self, cx: &mut Context<Self>) {
         match self.store.load() {
             Err(error) => {
                 let path = self.store.path().display().to_string();
@@ -607,6 +662,64 @@ impl AppRoot {
                     self.try_open(entry, cx);
                 }
             }
+        }
+    }
+
+    /// Welcome 的容错读盘（本机偏好 `local` 但本地库不存在时用）：
+    /// 只把可用的公开实例列表填进 `profile`，**不自动打开**、不升级成错误页。
+    fn load_profile_for_welcome(&mut self) {
+        match self.store.load() {
+            Ok(Some(profile)) => self.profile = Some(profile),
+            Ok(None) => {}
+            Err(error) => {
+                // 本次启动的主因是本地库缺失；同步配置的问题留给打开设置/重试时的
+                // 明确错误，不在这里把 Welcome 换成错误页。
+                eprintln!("[menghunote] 启动偏好为 local，但同步配置不可读：{error}");
+            }
+        }
+    }
+
+    /// 按本机启动偏好恢复上次的本地库；**只检查路径，不凭空创建库**。
+    ///
+    /// - 文件不存在 → [`LocalResume::Missing`]（调用方回 Welcome + 明确提示）；
+    /// - 打开失败 → [`LocalResume::Failed`]（打开路径已按既有语义设置 Error 页）；
+    /// - 成功 → [`LocalResume::Opened`]（Main 已就绪，且已写回 `local` 偏好）。
+    fn resume_local_vault(&mut self, cx: &mut Context<Self>) -> LocalResume {
+        if !self.local_vault_path().is_file() {
+            return LocalResume::Missing;
+        }
+        if cfg!(feature = "dev-sync") {
+            self.open_local_dev_vault(cx);
+        } else {
+            self.open_local_only_vault(cx);
+        }
+        if self.state == State::Main {
+            LocalResume::Opened
+        } else {
+            LocalResume::Failed
+        }
+    }
+
+    /// 本构建「本地」入口对应的库路径（只解析，不创建目录/文件）。
+    ///
+    /// 产品 `sync-ui` = `<数据根>/local/vault.sqlite3`；`dev-sync` 构建的「继续本地
+    /// （DEV ONLY）」= 默认 dev vault（与手动点入口完全同一条路径）。
+    fn local_vault_path(&self) -> PathBuf {
+        if cfg!(feature = "dev-sync") {
+            dev_vault::dev_vault_path()
+        } else {
+            self.options.layout.local_vault_path()
+        }
+    }
+
+    /// 记住上次成功打开的入口（本机 `startup.json`；失败只记日志，不影响本次打开）。
+    fn remember_startup_mode(&self, mode: StartupMode) {
+        let path = self.options.layout.startup_path();
+        if let Err(error) = save_startup_mode(&path, mode) {
+            eprintln!(
+                "[menghunote] 保存启动偏好失败：{}（{error}）",
+                path.display()
+            );
         }
     }
 
@@ -753,6 +866,8 @@ impl AppRoot {
                 self.notice = Some(format!("已打开实例，但记住选择失败：{error}"));
             }
         }
+        // 本机启动偏好：下次启动直接回到这个同步实例（不写进 sync.json/正文）。
+        self.remember_startup_mode(StartupMode::Sync);
         Ok(())
     }
 
@@ -962,6 +1077,11 @@ impl AppRoot {
         if self.settings.is_some() || !matches!(self.state, State::Welcome | State::Main) {
             return;
         }
+        // 重新打开设置页不残留上一次的选择器（只在设置页内可用）。
+        self.daily_template_picker = None;
+        self.daily_template_picker_events = None;
+        self.pending_daily_template_picker = false;
+        self.pending_focus_daily_template = false;
         let mut error = None;
         let profile = match self.store.load() {
             Ok(Some(profile)) => profile,
@@ -975,19 +1095,8 @@ impl AppRoot {
         };
         self.profile = Some(profile.clone());
         // 第一方插件设置区（模板/日记）：首次打开设置页时创建（面板持有 IME 输入框）。
-        // 订阅启用开关：关掉插件后左栏对应分类立即消失（不必重开设置页）。
         if self.templates_settings.is_none() {
-            let panel = cx.new(crate::templates::TemplatesSettingsPanel::new);
-            self.plugin_settings_subs.push(cx.subscribe(
-                &panel,
-                |root: &mut AppRoot,
-                 _panel: Entity<crate::templates::TemplatesSettingsPanel>,
-                 _event: &crate::templates::TemplatesSettingsEvent,
-                 cx| {
-                    root.on_plugin_enabled_changed(cx);
-                },
-            ));
-            self.templates_settings = Some(panel);
+            self.templates_settings = Some(cx.new(crate::templates::TemplatesSettingsPanel::new));
         }
         if self.daily_notes_settings.is_none() {
             let panel = cx.new(crate::daily_notes::DailyNotesSettingsPanel::new);
@@ -995,9 +1104,11 @@ impl AppRoot {
                 &panel,
                 |root: &mut AppRoot,
                  _panel: Entity<crate::daily_notes::DailyNotesSettingsPanel>,
-                 _event: &crate::daily_notes::DailyNotesSettingsEvent,
-                 cx| {
-                    root.on_plugin_enabled_changed(cx);
+                 event: &crate::daily_notes::DailyNotesSettingsEvent,
+                 cx| match *event {
+                    crate::daily_notes::DailyNotesSettingsEvent::PickTemplateRequested => {
+                        root.request_daily_template_picker(cx);
+                    }
                 },
             ));
             self.daily_notes_settings = Some(panel);
@@ -1044,6 +1155,9 @@ impl AppRoot {
             }
         });
         self.settings_management_open = false;
+        // 本机记忆：恢复到上次停留的分类（缺失/损坏/未知 key → 外观；已关闭的
+        // 插件分类由下面的 clamp 回退到「插件」）。
+        self.settings_section = load_settings_section(&self.options.layout.settings_ui_path());
         self.clamp_settings_section();
         self.settings = Some(SettingsState {
             active,
@@ -1066,6 +1180,11 @@ impl AppRoot {
             return;
         }
         self.settings_management_open = false;
+        // 设置关闭 = 选择器随之卸载，不残留到下一次打开。
+        self.daily_template_picker = None;
+        self.daily_template_picker_events = None;
+        self.pending_daily_template_picker = false;
+        self.pending_focus_daily_template = false;
         if self.state == State::Main {
             // 下一帧把焦点还给编辑器（设置打开时焦点在 relay 输入框）。
             self.pending_focus_restore = true;
@@ -1079,15 +1198,124 @@ impl AppRoot {
         self.settings.is_some()
     }
 
-    /// 设置页当前分类（默认 [`SettingsSection::Appearance`]；只记本次会话）。
+    /// 设置页「日记」区实体（测试/诊断用；`None` = 设置页还没打开过）。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn daily_notes_settings_panel(
+        &self,
+    ) -> Option<Entity<crate::daily_notes::DailyNotesSettingsPanel>> {
+        self.daily_notes_settings.clone()
+    }
+
+    /// 测试/诊断：日记模板选择器是否打开。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn daily_template_picker_is_open(&self) -> bool {
+        self.daily_template_picker.is_some()
+    }
+
+    /// 「选择模板笔记…」只发事件：这里只置位，下一帧 render 才拿得到 `&mut Window`。
+    fn request_daily_template_picker(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            return;
+        }
+        self.pending_daily_template_picker = true;
+        cx.notify();
+    }
+
+    /// 组装并打开日记模板笔记选择器（覆盖层；列出当前库**全部普通笔记**）。
+    ///
+    /// 没有打开的库（Welcome / 打开失败）时列表为空：选择器显示明确空态，
+    /// 不发 `Picked`、不写偏好（绝不写空路径）。
+    fn open_daily_template_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            return;
+        }
+        let current = crate::daily_notes::preferences().normalized_template();
+        let choices = self.daily_template_choices(cx);
+        // 上一次关闭留下的"还焦点"不能抢走新选择器的搜索焦点。
+        self.pending_focus_daily_template = false;
+        let picker =
+            cx.new(|cx| crate::daily_notes::DailyTemplatePicker::new(choices, current, cx));
+        let events = cx.subscribe(
+            &picker,
+            |root: &mut AppRoot,
+             _picker,
+             event: &crate::daily_notes::DailyTemplatePickerEvent,
+             cx| match *event {
+                crate::daily_notes::DailyTemplatePickerEvent::Picked { index } => {
+                    root.on_daily_template_picked(index, cx);
+                }
+                crate::daily_notes::DailyTemplatePickerEvent::Closed => {
+                    root.close_daily_template_picker(cx);
+                }
+            },
+        );
+        picker.update(cx, |picker, cx| picker.focus(window, cx));
+        self.daily_template_picker = Some(picker);
+        self.daily_template_picker_events = Some(events);
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 当前库的全部普通笔记（只读快照；`AppShell` 未打开 = 空）。
+    fn daily_template_choices(&self, cx: &App) -> Vec<crate::daily_notes::DailyTemplateChoice> {
+        let Some(shell) = self.main.as_ref() else {
+            return Vec::new();
+        };
+        crate::daily_notes::collect_template_choices(shell.read(cx).tree_snapshot())
+    }
+
+    /// 选中一篇笔记：写回日记模板字段并立即保存（原子写），关闭选择器。
+    fn on_daily_template_picked(&mut self, index: usize, cx: &mut Context<Self>) {
+        let path = self.daily_template_picker.as_ref().and_then(|picker| {
+            picker
+                .read(cx)
+                .choice(index)
+                .map(|choice| choice.path.clone())
+        });
+        self.close_daily_template_picker(cx);
+        let Some(path) = path else {
+            return;
+        };
+        match self.daily_notes_settings.clone() {
+            Some(panel) => {
+                panel.update(cx, |panel, cx| panel.apply_template_path(&path, cx));
+            }
+            None => {
+                // 防御路径：设置面板尚未创建时只写偏好（不 panic、不写空路径）。
+                let mut preferences = crate::daily_notes::preferences();
+                preferences.template = crate::daily_notes::normalize_note_path(&path);
+                crate::daily_notes::set_preferences(preferences);
+            }
+        }
+        self.notice = Some(crate::ui_text::daily_notes_saved());
+        cx.notify();
+    }
+
+    /// 关闭选择器并把焦点还给日记模板输入框（下一帧，等覆盖层真正卸下）。
+    fn close_daily_template_picker(&mut self, cx: &mut Context<Self>) {
+        if self.daily_template_picker.take().is_none() {
+            return;
+        }
+        self.daily_template_picker_events = None;
+        if self.settings.is_some() {
+            self.pending_focus_daily_template = true;
+        }
+        cx.notify();
+    }
+
+    /// 设置页当前分类（默认 [`SettingsSection::Appearance`]；本机 `settings-ui.json` 记忆）。
+    ///
+    /// 打开设置页时从磁盘恢复（缺失/损坏/未知 key → 外观；已关闭插件分类 → 插件）。
     #[must_use]
     pub const fn settings_section(&self) -> SettingsSection {
         self.settings_section
     }
 
-    /// 切换设置页分类（点左侧导航；只重绘，不做任何 IO）。
+    /// 切换设置页分类（点左侧导航；只重绘 + 写本机分类记忆，不做网络/配置 IO）。
     ///
-    /// 设置没打开时是 no-op（导航不存在）；同一分类重复点击也只重绘一次。
+    /// 设置没打开时是 no-op（导航不存在）；同一分类重复点击只重绘一次、不重复写盘。
     /// 已关闭的插件分类不可选中：目标回退到「插件」页（它没有导航项）。
     pub fn settings_select_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         if self.settings.is_none() {
@@ -1100,6 +1328,8 @@ impl AppRoot {
         };
         if self.settings_section != section {
             self.settings_section = section;
+            // 本机 `settings-ui.json`（只存分类短名；失败只记日志，本会话仍然生效）。
+            save_settings_section(&self.options.layout.settings_ui_path(), section);
             cx.notify();
         }
     }
@@ -1126,11 +1356,6 @@ impl AppRoot {
             }
             _ => return,
         }
-        self.after_plugin_enabled_changed(cx);
-    }
-
-    /// 插件设置面板里切换 `enabled` 后的统一收尾（事件订阅回调）。
-    fn on_plugin_enabled_changed(&mut self, cx: &mut Context<Self>) {
         self.after_plugin_enabled_changed(cx);
     }
 
@@ -1375,6 +1600,9 @@ impl AppRoot {
     }
 
     /// 「设为默认」：只改公开配置的 `active_instance`，原子写；**不热切换**当前 Main。
+    ///
+    /// 同时把本机启动入口记为 `sync`：这句「重启后生效」意味着下次启动应回到该
+    /// 实例，而不是上次的本地库（`startup.json` 只记入口，不含正文）。
     pub fn settings_set_active(&mut self, instance_id: &str, cx: &mut Context<Self>) {
         if self.settings.is_none() {
             return;
@@ -1395,6 +1623,8 @@ impl AppRoot {
                     entry.instance_id
                 ));
             }
+            // 已经是默认也要兑现「重启后打开它」：本地模式里点这一行同样切到同步入口。
+            self.remember_startup_mode(StartupMode::Sync);
             cx.notify();
             return;
         }
@@ -1427,6 +1657,8 @@ impl AppRoot {
                 cx.notify();
             });
         }
+        // 兑现「重启后生效」：下次启动走同步入口（即使当前停在本地模式）。
+        self.remember_startup_mode(StartupMode::Sync);
         cx.notify();
     }
 
@@ -2039,6 +2271,9 @@ impl AppRoot {
     /// - **`dev-sync`**：保留旧「继续本地」行为 —— 默认 dev vault（含演示树），
     ///   提示里明确 DEV ONLY（现有测试/开发路径不变）。
     ///
+    /// 打开**成功**后写本机 `startup.json`（`mode = local`，不同步、不含正文），
+    /// 下次启动直接回到同一本地库；打开失败不写偏好。
+    ///
     /// 打不开时进 GUI Error 页（[`Self::set_error`]），不静默退出。
     pub fn open_local_vault(&mut self, cx: &mut Context<Self>) {
         if !self.options.allow_local_vault {
@@ -2074,6 +2309,8 @@ impl AppRoot {
                 self.state = State::Main;
                 self.error = None;
                 self.notice = Some(crate::ui_text::local_mode_notice());
+                // 本机启动偏好：下次启动直接回到这个本地库（不写 sync.json/身份/正文）。
+                self.remember_startup_mode(StartupMode::Local);
             }
             Err(error) => {
                 let message = sanitize_error(&error, &[]);
@@ -2109,6 +2346,8 @@ impl AppRoot {
                     "本地模式：默认 dev vault（DEV ONLY，无同步面板）；同步实例请用左侧创建。"
                         .to_owned(),
                 );
+                // dev 构建的「继续本地」同样记本机启动偏好（下次启动回到同一 dev vault）。
+                self.remember_startup_mode(StartupMode::Local);
             }
             Err(error) => {
                 let message = sanitize_error(&error, &[]);
@@ -3789,6 +4028,23 @@ impl Render for AppRoot {
                 });
             }
         }
+        // 「选择模板笔记…」在事件回调里置位（没有 `&mut Window`）：这一帧创建并聚焦。
+        if std::mem::take(&mut self.pending_daily_template_picker) {
+            self.open_daily_template_picker(window, cx);
+        }
+        // 选择器关闭后把焦点还给日记模板输入框（下一帧，等覆盖层卸下）。
+        if std::mem::take(&mut self.pending_focus_daily_template) {
+            if let Some(panel) = self.daily_notes_settings.clone() {
+                if let Some(input) = panel
+                    .read(cx)
+                    .field_input(crate::daily_notes::DailyNotesField::Template)
+                {
+                    window.defer(cx, move |window, cx| {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    });
+                }
+            }
+        }
         let body: gpui::AnyElement = match self.state {
             State::Welcome => self.render_welcome(cx).into_any_element(),
             State::CreateForm => self.render_create_form(cx).into_any_element(),
@@ -3860,6 +4116,8 @@ impl Render for AppRoot {
             State::Error => self.render_error(cx).into_any_element(),
         };
         let settings = self.render_settings(window, cx);
+        // 日记模板选择器：覆盖层，挂在设置页**之上**（设置页关闭时会被清理）。
+        let daily_template_picker = self.daily_template_picker.clone();
         div()
             .relative()
             .size_full()
@@ -3870,6 +4128,7 @@ impl Render for AppRoot {
             .font_family(theme::FONT_FAMILY)
             .child(body)
             .when_some(settings, |this, settings| this.child(settings))
+            .when_some(daily_template_picker, |this, picker| this.child(picker))
     }
 }
 
@@ -4339,6 +4598,15 @@ impl SettingsSection {
         }
     }
 
+    /// 稳定短名 → 分类；未知 key 返回 `None`（调用方回退「外观」）。
+    ///
+    /// 与 [`Self::key`] 是同一套值：设置页分类记忆（`settings-ui.json`）只存短名，
+    /// 不存枚举序号（插分类不会读错）。
+    #[must_use]
+    pub fn parse(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|section| section.key() == key)
+    }
+
     /// 是否是插件分类（模板/日记；只在启用时出现在导航里）。
     #[must_use]
     pub const fn is_plugin(self) -> bool {
@@ -4382,6 +4650,49 @@ impl SettingsSection {
             SettingsSection::Templates => crate::ui_text::settings_nav_templates(),
             SettingsSection::DailyNotes => crate::ui_text::settings_nav_daily_notes(),
         }
+    }
+}
+
+/// 设置页分类偏好的版本（写入时使用；读取时 `version` 字段可缺省）。
+pub const SETTINGS_UI_PREFERENCES_VERSION: u32 = 1;
+
+/// 读取本机设置页分类记忆；缺失/不可读/损坏/未知 key → 外观。
+///
+/// 文件路径 = [`ProfileLayout::settings_ui_path`]（`<数据根>/settings-ui.json`）。
+#[must_use]
+pub fn load_settings_section(path: &Path) -> SettingsSection {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return SettingsSection::Appearance;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return SettingsSection::Appearance;
+    };
+    // `version` 可缺省（字段最小化写法也接受）；给出就必须是当前版本。
+    if let Some(version) = value.get("version") {
+        if version.as_u64() != Some(u64::from(SETTINGS_UI_PREFERENCES_VERSION)) {
+            return SettingsSection::Appearance;
+        }
+    }
+    value
+        .get("section")
+        .and_then(serde_json::Value::as_str)
+        .and_then(SettingsSection::parse)
+        .unwrap_or_default()
+}
+
+/// 原子写入本机设置页分类记忆；失败只记日志（本会话仍然生效）。
+///
+/// 不写正文、不进 vault、不参与同步。
+pub fn save_settings_section(path: &Path, section: SettingsSection) {
+    let text = format!(
+        "{{\n  \"version\": {SETTINGS_UI_PREFERENCES_VERSION},\n  \"section\": \"{}\"\n}}\n",
+        section.key()
+    );
+    if let Err(error) = write_json_file_atomically(path, &text) {
+        eprintln!(
+            "[menghunote] 保存设置页分类失败：{}（{error}）",
+            path.display()
+        );
     }
 }
 
@@ -4667,8 +4978,11 @@ impl AppRoot {
         };
 
         let has_error = error.is_some();
-        let error_text = error.unwrap_or_else(crate::ui_text::settings_error_none);
+        let error_text = error.unwrap_or_default();
         let notice_text = notice.unwrap_or_else(crate::ui_text::settings_notice_default);
+        // relay 的保存/重启提示只属于「Relay」分类；其它分类的字段都是即时生效的
+        // 本机设置（外观/语言/插件字段），底栏不能显示「保存 relay」造成误解。
+        let relay_section = self.settings_section == SettingsSection::Relay;
 
         // 同步面板作为「同步」分类的内容（唯一设置入口里同时有连接配置与同步操作）；
         // 默认构建/未启用时 `None`，整块不存在。
@@ -4987,45 +5301,66 @@ impl AppRoot {
                                 .border_color(theme::sidebar_border())
                                 .child(
                                     div()
-                                        .debug_selector(|| "settings-error".to_string())
                                         .w_full()
-                                        .text_size(px(11.0))
-                                        .text_color(if has_error {
-                                            theme::danger_text()
-                                        } else {
-                                            theme::status_bar_text()
+                                        .when(relay_section, |this| {
+                                            this.child(
+                                                div()
+                                                    .debug_selector(|| "settings-error".to_string())
+                                                    .w_full()
+                                                    .text_size(px(11.0))
+                                                    .text_color(if has_error {
+                                                        theme::danger_text()
+                                                    } else {
+                                                        theme::status_bar_text()
+                                                    })
+                                                    .child(SharedString::from(error_text)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .debug_selector(|| {
+                                                        "settings-notice".to_string()
+                                                    })
+                                                    .w_full()
+                                                    .text_size(px(11.0))
+                                                    .text_color(theme::caret_color())
+                                                    .child(SharedString::from(notice_text)),
+                                            )
                                         })
-                                        .child(SharedString::from(error_text)),
-                                )
-                                .child(
-                                    div()
-                                        .debug_selector(|| "settings-notice".to_string())
-                                        .w_full()
-                                        .text_size(px(11.0))
-                                        .text_color(theme::caret_color())
-                                        .child(SharedString::from(notice_text)),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .gap_2()
-                                        .child(action_button(
-                                            "settings-save",
-                                            crate::ui_text::settings_save(),
-                                            true,
-                                            false,
-                                            cx,
-                                            |root, cx| root.settings_save(cx),
-                                        ))
-                                        .child(action_button(
-                                            "settings-cancel",
-                                            crate::ui_text::settings_close_without_save(),
-                                            false,
-                                            false,
-                                            cx,
-                                            |root, cx| root.close_settings(cx),
-                                        )),
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .gap_2()
+                                                .when(relay_section, |this| {
+                                                    this.child(action_button(
+                                                        "settings-save",
+                                                        crate::ui_text::settings_save(),
+                                                        true,
+                                                        false,
+                                                        cx,
+                                                        |root, cx| root.settings_save(cx),
+                                                    ))
+                                                    .child(action_button(
+                                                        "settings-cancel",
+                                                        crate::ui_text::settings_close_without_save(
+                                                        ),
+                                                        false,
+                                                        false,
+                                                        cx,
+                                                        |root, cx| root.close_settings(cx),
+                                                    ))
+                                                })
+                                                .when(!relay_section, |this| {
+                                                    this.child(action_button(
+                                                        "settings-close",
+                                                        crate::ui_text::settings_close(),
+                                                        false,
+                                                        false,
+                                                        cx,
+                                                        |root, cx| root.close_settings(cx),
+                                                    ))
+                                                }),
+                                        ),
                                 ),
                         ),
                 )
@@ -6184,5 +6519,68 @@ mod tests {
         // 默认分类是「外观」（固定组第一项）。
         assert_eq!(SettingsSection::default(), SettingsSection::Appearance);
         assert_eq!(SettingsSection::default(), SettingsSection::FIXED[0]);
+    }
+
+    /// 分类短名 → 枚举往返；未知 key 明确返回 `None`（调用方回退「外观」）。
+    #[test]
+    fn settings_section_keys_round_trip_and_unknown_key_is_rejected() {
+        for section in SettingsSection::ALL {
+            assert_eq!(SettingsSection::parse(section.key()), Some(section));
+        }
+        for unknown in ["", "nope", "Appearance", "templates ", "0"] {
+            assert_eq!(SettingsSection::parse(unknown), None, "{unknown:?}");
+        }
+        // 短名唯一（导航 selector / 偏好文件都靠它）。
+        let mut seen = std::collections::HashSet::new();
+        for section in SettingsSection::ALL {
+            assert!(
+                seen.insert(section.key()),
+                "分类短名重复：{}",
+                section.key()
+            );
+        }
+    }
+
+    /// 设置分类偏好：原子写 → 读回；损坏/未知 key/未知版本 → 外观；最小字段也接受。
+    #[test]
+    fn settings_section_preference_file_round_trips_and_corruption_falls_back() {
+        let dir = temp_dir("settings-ui-pref");
+        let path = dir.join(crate::onboarding::layout::SETTINGS_UI_FILE_NAME);
+        assert_eq!(
+            load_settings_section(&path),
+            SettingsSection::Appearance,
+            "文件不存在 = 外观"
+        );
+
+        save_settings_section(&path, SettingsSection::DailyNotes);
+        assert_eq!(load_settings_section(&path), SettingsSection::DailyNotes);
+        let raw = std::fs::read_to_string(&path).expect("读回失败");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("必须是 JSON");
+        assert_eq!(value["version"], serde_json::json!(1));
+        assert_eq!(value["section"], "daily_notes");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "原子写完成后不能留下临时文件"
+        );
+
+        for corrupt in [
+            "",
+            "{ broken",
+            "{}",
+            "{\"section\":\"nope\"}",
+            "{\"version\":99,\"section\":\"language\"}",
+            "{\"version\":1}",
+            "{\"version\":1,\"section\":2}",
+        ] {
+            std::fs::write(&path, corrupt).expect("写坏文件失败");
+            assert_eq!(
+                load_settings_section(&path),
+                SettingsSection::Appearance,
+                "损坏/未知输入必须回退外观：{corrupt:?}"
+            );
+        }
+        // 字段最小化写法（没有 version）也接受。
+        std::fs::write(&path, "{\"section\":\"language\"}").expect("写最小 JSON 失败");
+        assert_eq!(load_settings_section(&path), SettingsSection::Language);
     }
 }

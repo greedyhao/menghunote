@@ -152,8 +152,6 @@ define_messages! {
     templates {
         TITLE = "templates.title";
         HINT = "templates.hint";
-        ENABLED = "templates.enabled";
-        DISABLED = "templates.disabled";
         DISABLED_HINT = "templates.disabled_hint";
         FOLDER_LABEL = "templates.folder_label";
         DATE_FORMAT_LABEL = "templates.date_format_label";
@@ -184,8 +182,6 @@ define_messages! {
     daily_notes {
         TITLE = "daily_notes.title";
         HINT = "daily_notes.hint";
-        ENABLED = "daily_notes.enabled";
-        DISABLED = "daily_notes.disabled";
         DISABLED_HINT = "daily_notes.disabled_hint";
         FOLDER_LABEL = "daily_notes.folder_label";
         DATE_FORMAT_LABEL = "daily_notes.date_format_label";
@@ -200,7 +196,15 @@ define_messages! {
         CREATE_FAILED = "daily_notes.create_failed";
         TEMPLATE_MISSING = "daily_notes.template_missing";
         INVALID_PATH = "daily_notes.invalid_path";
+        OUT_OF_RANGE = "daily_notes.out_of_range";
         WRITE_FAILED = "daily_notes.write_failed";
+        PICK_TEMPLATE = "daily_notes.pick_template";
+        PICKER_TITLE = "daily_notes.template_picker_title";
+        PICKER_HINT = "daily_notes.template_picker_hint";
+        PICKER_SEARCH = "daily_notes.template_picker_search";
+        PICKER_CURRENT = "daily_notes.template_picker_current";
+        PICKER_EMPTY_LIBRARY = "daily_notes.template_picker_empty_library";
+        PICKER_EMPTY_MATCH = "daily_notes.template_picker_empty_match";
     }
 
     // 仅本地使用（不同步）：产品入口 + dev-sync 开发入口 + 主界面提示/错误页。
@@ -212,6 +216,7 @@ define_messages! {
         PATH_HINT = "local.path_hint";
         ACTION = "local.action";
         MODE_NOTICE = "local.mode_notice";
+        RESUME_MISSING = "local.resume_missing";
         OPEN_FAILED_TITLE = "local.open_failed_title";
         DIR_LABEL = "local.dir_label";
         DEV_ACTION = "local.dev_action";

@@ -24,6 +24,7 @@ use crate::time::{secs, Clock};
 use crate::vault;
 use crate::wire;
 use menghunote_sync_proto as proto;
+use menghunote_sync_proto::CHECKPOINT_COMMIT_VALIDATION_VERSION;
 
 /// checkpoint 状态（ADR §6）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +169,11 @@ fn i64_of(value: u64, field: &'static str) -> Result<i64> {
 
 fn u64_of(value: i64, field: &'static str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::Invariant(field))
+}
+
+/// 当前生产验证修订（task-122）。GC/bootstrap/activation 只认这个版本。
+fn current_validation_version() -> i64 {
+    i64::from(CHECKPOINT_COMMIT_VALIDATION_VERSION)
 }
 
 /// 读 checkpoint 行；不存在 404。
@@ -662,6 +668,17 @@ pub fn publish(
     let checkpoint = get(conn, checkpoint_id)?;
     let now = clock.now_secs();
 
+    // task-122：publish 只接受当前验证修订（v2）。旧修订（v1）/未知版本在 decode
+    // 阶段就拒绝；这里显式拒绝 v1（relay 不保留"旧签名基线也能发布"的双读路径）。
+    // 必须在任何状态写入（含幂等返回/mark_health/GC 计划）之前失败，避免把未通过
+    // 当前验证的 checkpoint 记成 published/covered。
+    let signed_commit = proto::CheckpointCommit::decode(request.signed_commit)
+        .map_err(|_| Error::api(ErrorCode::InvalidRequest))?;
+    if signed_commit.require_current_validation().is_err() {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let validation_version = i64::from(signed_commit.validation_version);
+
     if checkpoint.state == CheckpointState::Published {
         // 幂等：同 commit 字节 → 返回原 published；不同 → CAS 冲突。
         if checkpoint.signed_commit.as_deref() == Some(request.signed_commit) {
@@ -691,7 +708,6 @@ pub fn publish(
         // S 在创建时固定，publish 不得改。
         return Err(Error::api(ErrorCode::CasConflict));
     }
-
     let refs = refs(conn, checkpoint_id)?;
     let data_refs: Vec<(Hash32, RefRole)> = refs
         .iter()
@@ -767,8 +783,8 @@ pub fn publish(
     conn.execute(
         "UPDATE checkpoints SET state = ?1, published_at = ?2, signed_commit = ?3,
                                 commit_signature = ?4, manifest_oid = ?5, refs_digest = ?6,
-                                health = 'healthy'
-         WHERE checkpoint_id = ?7 AND state = 'staging' AND vault_id = ?",
+                                validation_version = ?7, health = 'healthy'
+         WHERE checkpoint_id = ?8 AND state = 'staging' AND vault_id = ?",
         (
             target_state,
             now,
@@ -776,6 +792,7 @@ pub fn publish(
             request.signature,
             request.manifest_oid.as_slice(),
             request.refs_digest.as_slice(),
+            validation_version,
             checkpoint_id.as_slice(),
             conn.scope().as_slice(),
         ),
@@ -895,6 +912,12 @@ fn commit_binding_issues(checkpoint: &CheckpointRow) -> Vec<&'static str> {
             }
             if Some(commit.refs_digest) != checkpoint.refs_digest {
                 issues.push("commit_refs_digest_mismatch");
+            }
+            if !commit.is_current_validation() {
+                issues.push("commit_validation_version_unsupported");
+            }
+            if u64::from(commit.validation_version) != checkpoint.validation_version {
+                issues.push("commit_validation_version_mismatch");
             }
         }
     }
@@ -1264,12 +1287,18 @@ pub fn published_newest_first(conn: &ScopeConn, limit: u32) -> Result<Vec<Checkp
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id FROM checkpoints
          WHERE state = 'published' AND health != 'unhealthy' AND vault_id = ?2
+           AND validation_version = ?3
          ORDER BY published_at DESC, rowid DESC LIMIT ?1",
     )?;
     let ids: Vec<Vec<u8>> = stmt
-        .query_map((i64::from(limit.max(1)), conn.scope().as_slice()), |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?
+        .query_map(
+            (
+                i64::from(limit.max(1)),
+                conn.scope().as_slice(),
+                current_validation_version(),
+            ),
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
@@ -1291,7 +1320,7 @@ pub fn published_newest_first_for_epoch(
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id FROM checkpoints
          WHERE state = 'published' AND health != 'unhealthy' AND epoch = ?1
-           AND vault_id = ?3
+           AND vault_id = ?3 AND validation_version = ?4
          ORDER BY published_at DESC, rowid DESC LIMIT ?2",
     )?;
     let ids: Vec<Vec<u8>> = stmt
@@ -1300,6 +1329,7 @@ pub fn published_newest_first_for_epoch(
                 i64_of(epoch, "epoch")?,
                 i64::from(limit.max(1)),
                 conn.scope().as_slice(),
+                current_validation_version(),
             ),
             |row| row.get::<_, Vec<u8>>(0),
         )?
@@ -1345,8 +1375,12 @@ pub fn published_for_epoch(conn: &ScopeConn, epoch: u64) -> Result<(u64, u64)> {
     let (count, min_seq): (i64, Option<i64>) = conn.query_row(
         "SELECT COUNT(*), MIN(covered_seq) FROM checkpoints
          WHERE epoch = ?1 AND state IN ('published','candidate') AND health != 'unhealthy'
-           AND vault_id = ?",
-        (i64_of(epoch, "epoch")?, conn.scope().as_slice()),
+           AND vault_id = ? AND validation_version = ?",
+        (
+            i64_of(epoch, "epoch")?,
+            conn.scope().as_slice(),
+            current_validation_version(),
+        ),
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok((

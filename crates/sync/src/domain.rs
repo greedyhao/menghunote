@@ -24,6 +24,21 @@ pub const HKDF_ASSET_NONCE_INFO: &[u8] = b"MN/v1/asset-nonce\0";
 /// KEY_SLOT MNE1 密钥的 HKDF info 前缀（ADR §20：`MN/v1/key-slot\\0`）。
 pub const HKDF_KEY_SLOT_INFO: &[u8] = b"MN/v1/key-slot\0";
 
+/// checkpoint 本地回执 HMAC 的 HKDF info（task-122）。
+///
+/// `K_receipt = HKDF(K_epoch, salt=vault_id, info=MN/v1/checkpoint-receipt-key\0, 32)`；
+/// 只用于 coverage/verified 两类**本地 durable receipt** 的认证，不做对象加密、不进 MNE1
+/// 信封、不复用 `K_object`/`K_asset_id`/槽密钥/cursor/签名域。
+pub const HKDF_CHECKPOINT_RECEIPT_INFO: &[u8] = b"MN/v1/checkpoint-receipt-key\0";
+
+/// checkpoint 本地回执 MAC 前缀（HMAC 输入 = `本域 || kind_u8 || body`）。
+pub const CHECKPOINT_RECEIPT_MAC_DOMAIN: &[u8] = b"MN/v1/checkpoint-receipt-mac\0";
+
+/// coverage pending receipt 的 MAC kind。
+pub const CHECKPOINT_RECEIPT_KIND_COVERAGE: u8 = 1;
+/// verified（promote 成功）receipt 的 MAC kind。
+pub const CHECKPOINT_RECEIPT_KIND_VERIFIED: u8 = 2;
+
 /// Linux 本地身份封装外层 AAD 域（ADR 0008：`MN/local-wrap/v1\0`）。
 ///
 /// AAD = 本域 || 完整 30B 外层头 || 原 entropy。域体是 ASCII，末尾是一个真正的
@@ -55,6 +70,8 @@ mod tests {
             ("asset_nonce", HKDF_ASSET_NONCE_INFO),
             ("key_slot", HKDF_KEY_SLOT_INFO),
             ("local_wrap_aad", LOCAL_WRAP_AAD_DOMAIN),
+            ("checkpoint_receipt_key", HKDF_CHECKPOINT_RECEIPT_INFO),
+            ("checkpoint_receipt_mac", CHECKPOINT_RECEIPT_MAC_DOMAIN),
         ];
         for (name, domain) in all {
             assert_eq!(

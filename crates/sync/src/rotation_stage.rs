@@ -1058,5 +1058,6 @@ fn prepare_baseline_with_context<'a, C: RelayClient>(
     let promoted = writer.promote(&baseline)?;
     prepared.report.validated = true;
     prepared.report.published_at = Some(promoted.published_at);
+    prepared.report.commit_digest = Some(promoted.commit_digest);
     Ok(prepared)
 }

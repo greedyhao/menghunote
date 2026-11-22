@@ -7,10 +7,10 @@
 //! 2. 日期/时间示例行随设置变化（当前值的真实格式化结果，不是写死文案）；
 //! 3. 字段可打字：Enter 提交 → 写本机 `templates.json` / `daily-notes.json`
 //!    （原子写），再读回一致；空字段被拒绝且不写盘；
-//! 4. 「启用/停用」开关立即生效并写盘；
+//! 4. 启停只在「插件」页总开关，插件设置区不再重复开关；
 //! 5. 打开设置页不改变既有外观/语言区（它们仍在、仍可点）；
 //! 6. 「插件」分类总开关页：关闭模板/日记后左栏分类消失、写盘、重启读盘仍关闭，
-//!    停在插件自己的分类里关闭它会自动回退到「插件」页（内容非空）。
+//!    程序化停用当前插件分类会自动回退到「插件」页（内容非空）。
 //!
 //! 像素/DPI 仍必须 Windows 真机验收；这里证明状态机、持久化与 selector 契约。
 
@@ -206,8 +206,6 @@ async fn settings_page_shows_templates_and_daily_notes_sections(cx: &mut TestApp
     open_settings_nav(cx, "templates");
     for selector in [
         "settings-templates",
-        "settings-templates-toggle",
-        "settings-templates-state",
         "settings-templates-folder",
         "settings-templates-date-format",
         "settings-templates-time-format",
@@ -215,13 +213,16 @@ async fn settings_page_shows_templates_and_daily_notes_sections(cx: &mut TestApp
     ] {
         bounds_of(cx, selector);
     }
+    assert!(
+        cx.debug_bounds("settings-templates-toggle").is_none(),
+        "插件启停只保留「插件」页总开关，模板设置区不得再有开关"
+    );
+    assert!(cx.debug_bounds("settings-templates-state").is_none());
 
     // 日记分类：日记区 + 全部固定 selector。
     open_settings_nav(cx, "daily_notes");
     for selector in [
         "settings-daily-notes",
-        "settings-daily-notes-toggle",
-        "settings-daily-notes-state",
         "settings-daily-notes-folder",
         "settings-daily-notes-date-format",
         "settings-daily-notes-template",
@@ -229,6 +230,11 @@ async fn settings_page_shows_templates_and_daily_notes_sections(cx: &mut TestApp
     ] {
         bounds_of(cx, selector);
     }
+    assert!(
+        cx.debug_bounds("settings-daily-notes-toggle").is_none(),
+        "插件启停只保留「插件」页总开关，日记设置区不得再有开关"
+    );
+    assert!(cx.debug_bounds("settings-daily-notes-state").is_none());
 
     // 示例行是当前设置的真实格式化结果（默认 2026-11-18 样的形状由日期决定，
     // 只断言与 `templates::format_datetime` 的结果一致）。
@@ -244,16 +250,14 @@ async fn settings_page_shows_templates_and_daily_notes_sections(cx: &mut TestApp
         "示例文案必须包含真实格式化结果"
     );
 
-    // 点「启用/停用」：立即写盘（本机 JSON，不同步）。
-    open_settings_nav(cx, "templates");
+    // 启停只在「插件」页：总开关立即写盘（本机 JSON，不同步）。
+    open_settings_nav(cx, "plugins");
+    bounds_of(cx, "settings-section-plugins");
     assert!(templates::preferences().enabled, "默认启用");
-    click_selector(cx, "settings-templates-toggle");
+    click_selector(cx, "settings-plugin-templates-toggle");
     assert!(!templates::preferences().enabled, "点击后必须停用");
     let saved = templates::load_preferences(&templates_path);
     assert!(!saved.enabled, "停用必须写盘：{}", templates_path.display());
-    // 停在模板分类关闭它 → 自动回退到「插件」页（分类已从导航消失）；
-    // 从插件页的总开关重新打开（后续断言按默认启用）。
-    bounds_of(cx, "settings-section-plugins");
     assert!(
         cx.debug_bounds("settings-nav-templates").is_none(),
         "停用后左栏不得再显示模板分类"
@@ -262,14 +266,12 @@ async fn settings_page_shows_templates_and_daily_notes_sections(cx: &mut TestApp
     assert!(templates::preferences().enabled);
     assert!(templates::load_preferences(&templates_path).enabled);
 
-    open_settings_nav(cx, "daily_notes");
-    click_selector(cx, "settings-daily-notes-toggle");
+    click_selector(cx, "settings-plugin-daily_notes-toggle");
     assert!(!daily_notes::preferences().enabled);
     assert!(!daily_notes::load_preferences(&daily_path).enabled);
-    // 同样回退到插件页后再开启。
-    bounds_of(cx, "settings-section-plugins");
     click_selector(cx, "settings-plugin-daily_notes-toggle");
     assert!(daily_notes::preferences().enabled);
+    assert!(daily_notes::load_preferences(&daily_path).enabled);
 
     // 设置页仍打开（开关只改本机偏好，不关闭面板、不重建主界面）。
     bounds_of(cx, "dev-sync-settings");
@@ -290,8 +292,22 @@ async fn settings_fields_commit_on_enter_and_persist_atomically(cx: &mut TestApp
     open_settings(&root, cx);
     open_settings_nav(cx, "templates");
 
-    // 点字段 → 焦点进 IME 输入框（捕获相聚焦）；预填全选 → 输入替换整段。
+    // 点字段 → 焦点进 IME 输入框（捕获相聚焦）；单击**不选中**，输入追加到末尾。
     click_selector(cx, "settings-templates-folder");
+    cx.simulate_input("_X");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let saved = templates::load_preferences(&templates_path);
+    assert_eq!(
+        saved.folder, "模板_X",
+        "单击字段不得全选：输入必须追加在末尾（实际 {:?}）",
+        saved.folder
+    );
+
+    // 显式 Ctrl+A 后才替换整段。
+    click_selector(cx, "settings-templates-folder");
+    cx.simulate_keystrokes("ctrl-a");
     cx.simulate_input("我的模板");
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
@@ -310,6 +326,7 @@ async fn settings_fields_commit_on_enter_and_persist_atomically(cx: &mut TestApp
 
     // 日期格式：Enter 提交后示例行随新格式变化（真实格式化，不是写死）。
     click_selector(cx, "settings-templates-date-format");
+    cx.simulate_keystrokes("ctrl-a");
     cx.simulate_input("YYYY/MM");
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
@@ -366,6 +383,7 @@ async fn settings_fields_commit_on_enter_and_persist_atomically(cx: &mut TestApp
 
     // 日期格式里的 `/` 在示例里就是子目录形态。
     click_selector(cx, "settings-daily-notes-date-format");
+    cx.simulate_keystrokes("ctrl-a");
     cx.simulate_input("YYYY/MM/DD");
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
@@ -446,7 +464,7 @@ async fn plugins_page_toggles_hide_nav_and_persist_to_disk(cx: &mut TestAppConte
         !templates::preferences().enabled,
         "重启读取 templates.json 后模板仍是关闭"
     );
-    let cancel = bounds_of(cx, "settings-cancel");
+    let cancel = bounds_of(cx, "settings-close");
     cx.simulate_click(cancel.center(), Modifiers::default());
     cx.run_until_parked();
     open_settings(&root, cx);
@@ -491,8 +509,10 @@ async fn disabling_active_plugin_section_falls_back_to_plugins(cx: &mut TestAppC
     open_settings_nav(cx, "templates");
     assert!(templates::preferences().enabled, "默认启用");
 
-    // 用「模板」分类自己的开关关闭插件（不是插件页的开关）。
-    click_selector(cx, "settings-templates-toggle");
+    // 模拟外部/程序化启停：停在模板分类时关闭插件，必须自动回退到「插件」。
+    root.update(cx, |root, cx| {
+        root.settings_toggle_plugin(SettingsSection::Templates, cx);
+    });
     assert!(!templates::preferences().enabled);
     assert_eq!(
         root.update(cx, |root, _| root.settings_section()),

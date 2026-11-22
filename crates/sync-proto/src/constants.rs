@@ -29,6 +29,12 @@ pub const SIGN_OBJECT_COMMIT_DOMAIN: &[u8] = b"MN/v1/object-commit\0";
 pub const SIGN_DEVICE_CERT_DOMAIN: &[u8] = b"MN/v1/device-cert\0";
 /// CheckpointCommit 签名域。
 pub const SIGN_CHECKPOINT_DOMAIN: &[u8] = b"MN/v1/checkpoint\0";
+/// 验证修订 2 的证据摘要域（`validation_digest` 的输入前缀；不是签名域）。
+pub const CHECKPOINT_VALIDATION_DOMAIN: &[u8] = b"MN/v1/checkpoint-validation\0";
+/// 当前生产 `CheckpointCommit.validation_version`（task-122 起）。
+///
+/// 旧修订仍能**解码**（便于识别并显式拒绝），但不得作为基线/GC 依据。
+pub const CHECKPOINT_COMMIT_VALIDATION_VERSION: u16 = 2;
 /// 完整 activation T 的双签域（评审 0002 P1-1.4）：只用于
 /// `activation_t_signing_input`，不得与其它签名域复用。
 pub const SIGN_ACTIVATION_T_DOMAIN: &[u8] = b"MN/v1/activation-t\0";
@@ -109,6 +115,19 @@ pub fn object_commit_signing_input(commit: &ObjectCommit) -> Result<Vec<u8>, Pro
 /// CheckpointCommit 的签名输入：`MN/v1/checkpoint\0 || CDE(CheckpointCommit)`。
 pub fn checkpoint_signing_input(commit: &CheckpointCommit) -> Result<Vec<u8>, ProtoError> {
     Ok(with_domain(SIGN_CHECKPOINT_DOMAIN, &commit.encode()?))
+}
+
+/// 验证修订 2 证据摘要的待哈希输入：
+/// `MN/v1/checkpoint-validation\0 || CDE(CheckpointValidationV2)`。
+///
+/// 调用方做 `SHA256(本函数输出)` 后写入 `CheckpointCommit.validation_digest`。
+pub fn checkpoint_validation_input(
+    evidence: &crate::records::CheckpointValidationV2,
+) -> Result<Vec<u8>, ProtoError> {
+    Ok(with_domain(
+        CHECKPOINT_VALIDATION_DOMAIN,
+        &evidence.encode()?,
+    ))
 }
 
 /// 管理写签名输入：`MN/v1/manage\0 || instance || vault || request_id ||

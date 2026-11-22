@@ -376,7 +376,8 @@ mod tests {
             manifest_digest: [5u8; 32],
             refs_digest,
             producer_device_id: [6u8; 16],
-            validation_version: 1,
+            validation_version: 2,
+            validation_digest: [0x5Au8; 32],
         };
         let message = commit.encode().expect("encode");
         let input = proto::checkpoint_signing_input(&commit).expect("input");

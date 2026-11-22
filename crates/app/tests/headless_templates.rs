@@ -9,7 +9,8 @@
 //! 3. 模板文件夹不存在/为空时选择器给**明确空态**（不自动创建文件夹）；
 //! 4. 「今日日记」：不存在 → 创建目录+笔记（日期格式里的 `/` 生成子目录）、正文用
 //!    日记模板渲染；已存在 → 直接打开（不重复创建）；模板丢失 → 非阻塞提示 + 空日记；
-//! 5. 插件关闭时隐藏入口（不写正文、不 panic）。
+//! 5. 插件关闭时隐藏入口（不写正文、不 panic）；
+//! 6. 模板正文里的相对日期（`{{date:-1d}}` / `{{date:+1d}}`）按本地今天渲染。
 //!
 //! 纪律（AGENTS.md §6）：临时目录一律 `CARGO_TARGET_TMPDIR`；收敛点只用
 //! `run_until_parked()`；偏好全局状态用 `lock_for_test()` 串行。
@@ -339,6 +340,53 @@ async fn insert_template_from_context_menu_adds_one_undo_step(cx: &mut TestAppCo
     cx.simulate_keystrokes("ctrl-z");
     cx.run_until_parked();
     assert_eq!(source_of(&view, cx), before, "替换选区也必须一个撤销组");
+
+    close_shell(&host, cx);
+}
+
+/// 相对日期（P1）：模板里的 `{{date:-1d}}` / `{{date:+1d}}` 按**本地今天**偏移渲染，
+/// 与其它占位符混用时互不影响；非法偏移原样保留（纯逻辑单测已覆盖，这里只验真实插入链路）。
+#[gpui::test]
+async fn insert_template_renders_relative_dates(cx: &mut TestAppContext) {
+    let _templates = templates::lock_for_test();
+    let _daily = daily_notes::lock_for_test();
+    let prefs_dir = temp_preferences_dir();
+    _templates.reset(Some(prefs_dir.path().join(templates::TEMPLATES_FILE_NAME)));
+
+    let dir = temp_vault_dir("relative");
+    let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("打开临时 vault");
+    seed_note(&vault, "笔记", "开头\n");
+    let folder = seed_folder(&vault, "模板");
+    seed_note_in_folder(
+        &vault,
+        &folder,
+        "相对日期",
+        "昨天 {{date:-1d:YYYY-MM-DD}} 明天 {{date:+1d:YYYY-MM-DD}} 标题 {{title}}\n",
+    );
+
+    let (host, cx) = open_shell(cx, vault.clone());
+    // 启动时可能打开模板目录里的笔记，显式点开普通笔记（caret 在 0）。
+    click_tree_row(cx, tree_row(&vault, "笔记"));
+    let view = active_view(&host, cx);
+
+    let position = right_click_point(cx);
+    cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    click_selector(cx, "editor-context-insert-template");
+    click_selector(cx, "template-picker-item-0");
+
+    let today = DateTimeParts::now();
+    let yesterday = today.add_days(-1).expect("昨天必须可算");
+    let tomorrow = today.add_days(1).expect("明天必须可算");
+    assert_eq!(
+        source_of(&view, cx),
+        format!(
+            "昨天 {} 明天 {} 标题 笔记\n开头\n",
+            templates::format_datetime(&yesterday, "YYYY-MM-DD"),
+            templates::format_datetime(&tomorrow, "YYYY-MM-DD"),
+        ),
+        "模板里的相对日期必须按本地今天偏移渲染"
+    );
 
     close_shell(&host, cx);
 }

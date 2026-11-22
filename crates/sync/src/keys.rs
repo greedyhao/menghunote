@@ -192,6 +192,20 @@ pub fn derive_asset_id_key(root: &RootSecretV1) -> Result<Secret32, SyncError> {
     )
 }
 
+/// task-122：派生 checkpoint 本地回执的 HMAC 密钥。
+///
+/// 来源是**当前 checkpoint 的 epoch 根**（`K_epoch`），域分隔为
+/// `MN/v1/checkpoint-receipt-key\0` + `salt=vault_id`；每个 epoch 一个新密钥，退役根
+/// 不再可用于新回执。它**不重用**根本身、`K_object`、`K_asset_id`、槽密钥、签名私钥或
+/// relay cursor 密钥；只认证本地 durable receipt，不加密任何数据、不上 wire。
+pub fn derive_checkpoint_receipt_key(root: &RootSecretV1) -> Result<Secret32, SyncError> {
+    crate::kdf::hkdf32(
+        root.root.expose_slice(),
+        &root.vault_id,
+        crate::domain::HKDF_CHECKPOINT_RECEIPT_INFO,
+    )
+}
+
 /// ADR §20：KEY_SLOT 的 MNE1 密钥。
 ///
 /// `IKM = Argon2id(password) 或 recovery_seed`；`info = "MN/v1/key-slot\0"

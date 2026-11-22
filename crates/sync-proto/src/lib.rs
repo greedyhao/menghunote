@@ -55,10 +55,11 @@ pub use records::{
     check_device_count, device_cert_signed_bytes, grant_signed_bytes,
     management_signing_input as management_request_signing_input, object_digest_input,
     refs_digest_input, Argon2idParams, AssetPrefix, AuthRealm, Challenge, ChallengeId,
-    CheckpointCommit, CheckpointId, DeviceCertV1, DeviceId, Ed25519PublicKey, GrantAadV1,
-    HttpMethod, Kdf, ManifestAsset, ManifestDoc, ManifestV1, MessageId, ObjectCommit, ObjectId,
-    ObjectRefV1, ObjectType, RelayInstanceId, Rights, RootSecretV1, Sha256, SlotDescriptorV1,
-    SlotKind, SnapshotV1, UpdateV1, VaultId, X25519PublicKey,
+    CheckpointCommit, CheckpointId, CheckpointValidationV2, DeviceCertV1, DeviceId,
+    Ed25519PublicKey, GrantAadV1, HttpMethod, Kdf, ManifestAsset, ManifestDoc, ManifestV1,
+    MessageId, ObjectCommit, ObjectId, ObjectRefV1, ObjectType, RelayInstanceId, Rights,
+    RootSecretV1, Sha256, SlotDescriptorV1, SlotKind, SnapshotV1, UpdateV1, VaultId,
+    X25519PublicKey,
 };
 pub use rotation_records::{
     grant_package_digest, member_cert_digest, slot_set_digest, AbortBodyV1, ActivateBodyV1,

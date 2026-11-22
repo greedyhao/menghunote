@@ -412,6 +412,22 @@ async fn publish_checkpoint(
         "checkpoint refs: {}",
         error_code(&body)
     );
+    // task-122：relay publish 只接受当前验证修订（v2）的 CheckpointCommit；permissive
+    // hook 仍然要求 commit 可解码/自洽。
+    let signed_commit = relay::proto::CheckpointCommit {
+        vault_id,
+        checkpoint_id,
+        epoch: 1,
+        covered_relay_seq: covered,
+        manifest_object_id: manifest,
+        manifest_digest: [9u8; 32],
+        refs_digest: [9u8; 32],
+        producer_device_id: DEVICE,
+        validation_version: 2,
+        validation_digest: [0x5Au8; 32],
+    }
+    .encode()
+    .expect("v2 checkpoint commit");
     let publish_uri = v2(
         &vault_id,
         &format!("/checkpoints/{}/publish", b64(&checkpoint_id)),
@@ -425,7 +441,7 @@ async fn publish_checkpoint(
                 (0, wire::uint(covered)),
                 (1, wire::bytes(manifest.to_vec())),
                 (2, wire::bytes([9u8; 32].to_vec())),
-                (3, wire::bytes(b"checkpoint-commit".to_vec())),
+                (3, wire::bytes(signed_commit)),
                 (4, wire::bytes(b"signature".to_vec())),
             ],
         ),

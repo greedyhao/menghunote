@@ -16,18 +16,40 @@
 //! | `{{time}}` | 用设置里的 `time_format` 格式化本地时间 |
 //! | `{{title}}` | 目标笔记标题（插入到当前笔记 = 当前笔记标题；从模板新建 = 新标题） |
 //! | `{{date:FORMAT}}` / `{{time:FORMAT}}` | 单次覆盖格式（空格式 = 回退默认） |
+//! | `{{date:OFFSET}}` | **相对日期**：偏移后的日期按默认格式（`-1d` = 昨天） |
+//! | `{{date:OFFSET:FORMAT}}` | 相对日期 + 单次覆盖格式（`-1d:YYYY/MM/DD`） |
 //!
 //! 支持的 token：`YYYY` `YY` `MM` `M` `DD` `D` `HH` `H` `mm` `m` `ss` `s`
 //! （最长匹配；其它字符原样保留）。未知占位符（`{{foo}}`）**原样保留**，不 panic。
-//! 不做日期偏移、脚本、正则——这些明确后置。
+//!
+//! ## 相对日期语法（2026-11-19 P1）
+//!
+//! `{{date:OFFSET}}` / `{{date:OFFSET:FORMAT}}` 里的 `OFFSET`：
+//!
+//! - 可选符号 `+` / `-`（缺省 = 正数），**1–2 位** ASCII 数字，单位 `d`（天）/
+//!   `w`（周）/ `m`（月）/ `y`（年），小写、无空白：`-1d` `+2w` `-1m` `+1y`；
+//! - 例：`{{date:-1d}}` = 昨天、`{{date:+1d}}` = 明天、
+//!   `{{date:-1m:YYYY/MM/DD}}` = 上个月同一天（带格式）；
+//! - **先判偏移、再判格式**：`date:` 后的第一个冒号前是偏移，其后整体是格式
+//!   （格式里可以再有冒号，如 `-1d:YYYY:MM:DD` 或 `-1d:HH:mm`）；
+//! - **原样保留**（整段 `{{...}}` 不动、不 panic）：空偏移（`{{date::YYYY}}`）、
+//!   非法偏移（`{{date:+d}}` / `{{date:1x}}` / `{{date:1x:YYYY}}`）、偏移越界、
+//!   以及没有冒号但以 `+`/`-`/数字开头的值（这些一律按偏移尝试处理，不做字面格式）；
+//! - 兼容旧语义：`{{date:}}` = 默认格式；`{{date:YYYY-MM-DD}}` = 格式串；
+//!   格式串里的冒号仍是字面量（`{{date:YYYY:MM}}` → `2026:11`）；
+//! - 日期算术走本地墙钟日期（`chrono::NaiveDate`）：跨月/跨年/闰日正确；
+//!   月偏移**月末对齐**（`2024-01-31 +1m` → `2024-02-29`）、年偏移把 `2/29` 落到
+//!   `2/28`；时间分量（时/分/秒）不变；不做时区/夏令时换算；
+//! - `{{time:...}}` **不支持**偏移（时间偏移没有产品语义），仍只按格式渲染。
+//!
+//! 不做脚本、正则——这些明确后置。
 //!
 //! ## 选择器 / 设置面板 selector（headless 测试点击/断言用）
 //!
 //! | selector | 含义 |
 //! | --- | --- |
 //! | `settings-templates` | 设置页「模板」区根 |
-//! | `settings-templates-toggle` / `settings-templates-state` | 启用开关 / 当前状态文本 |
-//! | `settings-plugin-templates` / `-toggle` / `-state` | 「插件」分类里的模板总开关（同一份 `enabled`；由 `AppRoot` 渲染） |
+//! | `settings-plugin-templates` / `-toggle` / `-state` | 「插件」分类里的唯一启停开关（本区不再重复开关） |
 //! | `settings-templates-folder` / `-date-format` / `-time-format` | 三个输入框 |
 //! | `settings-templates-example` / `-notice` | 日期时间示例 / 保存提示 |
 //! | `template-picker` | 选择器覆盖层根 |
@@ -346,6 +368,164 @@ impl DateTimeParts {
             second: now.second(),
         }
     }
+
+    /// 按天偏移（负 = 过去）；时/分/秒不变，只推进**本地墙钟日期**。
+    ///
+    /// 跨月/跨年/闰日由公历计算（`chrono::NaiveDate`），不做时区/夏令时换算；
+    /// 公历范围外返回 `None`（调用方原样保留占位符）。
+    #[must_use]
+    pub fn add_days(self, days: i32) -> Option<Self> {
+        let date = chrono::NaiveDate::from_ymd_opt(self.year, self.month, self.day)?;
+        let shifted = date.checked_add_signed(chrono::Duration::days(i64::from(days)))?;
+        Some(self.with_date(shifted))
+    }
+
+    /// 按月偏移（负 = 过去）；目标月没有该日时取该月最后一天（月末对齐）。
+    #[must_use]
+    pub fn add_months(self, months: i32) -> Option<Self> {
+        let date = chrono::NaiveDate::from_ymd_opt(self.year, self.month, self.day)?;
+        Some(self.with_date(shift_months(date, months)?))
+    }
+
+    /// 按年偏移（负 = 过去）；`2 月 29 日` 落到平年时取 `2 月 28 日`。
+    #[must_use]
+    pub fn add_years(self, years: i32) -> Option<Self> {
+        self.add_months(years.checked_mul(12)?)
+    }
+
+    /// 只替换日期分量，保留时间分量。
+    fn with_date(self, date: chrono::NaiveDate) -> Self {
+        Self {
+            year: date.year(),
+            month: date.month(),
+            day: date.day(),
+            hour: self.hour,
+            minute: self.minute,
+            second: self.second,
+        }
+    }
+}
+
+/// 公历按月偏移；目标月没有该日时取该月最后一天（与日记「上个月同一天」一致）。
+fn shift_months(date: chrono::NaiveDate, months: i32) -> Option<chrono::NaiveDate> {
+    // 以「年 * 12 + 月序号」做整数运算，避免逐月循环；负年份用 div_euclid 归一。
+    let total = date
+        .year()
+        .checked_mul(12)?
+        .checked_add(i32::try_from(date.month0()).ok()?)?
+        .checked_add(months)?;
+    let year = total.div_euclid(12);
+    let month = u32::try_from(total.rem_euclid(12)).ok()?.checked_add(1)?;
+    let day = date.day().min(days_in_month(year, month)?);
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+}
+
+/// 公历某月的天数（`month` 1–12；非法年月返回 `None`）。
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    let first = chrono::NaiveDate::from_ymd_opt(year, month, 1)?;
+    let (next_year, next_month) = if month == 12 {
+        (year.checked_add(1)?, 1)
+    } else {
+        (year, month + 1)
+    };
+    let next = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)?;
+    u32::try_from((next - first).num_days()).ok()
+}
+
+/// 相对日期单位（`{{date:-1d}}` 里的 `d` / `w` / `m` / `y`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelativeDateUnit {
+    /// 天。
+    Day,
+    /// 周（7 天）。
+    Week,
+    /// 月（公历；目标月没有该日时取月末）。
+    Month,
+    /// 年（公历；`2/29` 落到平年时取 `2/28`）。
+    Year,
+}
+
+/// 相对日期偏移（`{{date:-1d}}` 的 `-1d`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelativeDateOffset {
+    /// 有符号数量（严格解析时绝对值 0–99）。
+    pub amount: i32,
+    /// 单位。
+    pub unit: RelativeDateUnit,
+}
+
+impl RelativeDateOffset {
+    /// 严格解析偏移表达式：`[+-]?` + **1–2 位** ASCII 数字 + `d`/`w`/`m`/`y`。
+    ///
+    /// 只接受小写单位、不接受空白/多余字符；不合法返回 `None`
+    /// （调用方据此**原样保留**整个占位符，不 panic、不猜测）。
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut characters = text.chars();
+        let mut first = characters.next()?;
+        let mut sign = 1i32;
+        if first == '+' || first == '-' {
+            if first == '-' {
+                sign = -1;
+            }
+            first = characters.next()?;
+        }
+        let mut amount = 0i32;
+        let mut digits = 0usize;
+        let mut unit: Option<RelativeDateUnit> = None;
+        for character in std::iter::once(first).chain(characters) {
+            if character.is_ascii_digit() {
+                // 单位之后不能再有数字；最多两位。
+                if unit.is_some() || digits == 2 {
+                    return None;
+                }
+                digits += 1;
+                amount = amount * 10 + i32::from(character as u8 - b'0');
+                continue;
+            }
+            if unit.is_some() {
+                return None;
+            }
+            unit = match character {
+                'd' => Some(RelativeDateUnit::Day),
+                'w' => Some(RelativeDateUnit::Week),
+                'm' => Some(RelativeDateUnit::Month),
+                'y' => Some(RelativeDateUnit::Year),
+                _ => return None,
+            };
+        }
+        if digits == 0 {
+            return None;
+        }
+        Some(Self {
+            amount: sign * amount,
+            unit: unit?,
+        })
+    }
+
+    /// 是否是「偏移尝试」：以 `+` / `-` / ASCII 数字开头。
+    ///
+    /// 用来把 `{{date:1x}}` 这类**非法偏移**（原样保留）与
+    /// `{{date:YYYY-MM-DD}}` 这类格式串（仍按格式渲染）区分开。
+    #[must_use]
+    pub fn looks_like_offset(text: &str) -> bool {
+        match text.chars().next() {
+            Some('+' | '-') => true,
+            Some(character) => character.is_ascii_digit(),
+            None => false,
+        }
+    }
+
+    /// 应用到日期分量（时间分量不变）；越界/日期非法返回 `None`。
+    #[must_use]
+    pub fn apply(self, parts: &DateTimeParts) -> Option<DateTimeParts> {
+        match self.unit {
+            RelativeDateUnit::Day => parts.add_days(self.amount),
+            RelativeDateUnit::Week => parts.add_days(self.amount.checked_mul(7)?),
+            RelativeDateUnit::Month => parts.add_months(self.amount),
+            RelativeDateUnit::Year => parts.add_years(self.amount),
+        }
+    }
 }
 
 /// 支持的时间格式 token（**最长匹配优先**，所以 4 字符在前）。
@@ -398,8 +578,9 @@ pub fn format_datetime(parts: &DateTimeParts, format: &str) -> String {
 
 /// 把模板正文里的占位符替换为实际值（未知占位符原样保留）。
 ///
-/// 只识别 `{{date}}` / `{{time}}` / `{{title}}` / `{{date:FMT}}` / `{{time:FMT}}`；
-/// 其它 `{{...}}` 与未闭合的 `{{` 一律逐字保留（不 panic、不猜测）。
+/// 只识别 `{{date}}` / `{{time}}` / `{{title}}` / `{{date:FMT}}` / `{{time:FMT}}` /
+/// `{{date:OFFSET}}` / `{{date:OFFSET:FMT}}`；其它 `{{...}}` 与未闭合的 `{{`
+/// 一律逐字保留（不 panic、不猜测）。相对日期的语法与边界见模块文档。
 #[must_use]
 pub fn render_placeholders(
     text: &str,
@@ -446,13 +627,8 @@ fn placeholder_value(
     if inner == "time" {
         return Some(format_datetime(parts, formats.time));
     }
-    if let Some(format) = inner.strip_prefix("date:") {
-        let format = if format.is_empty() {
-            formats.date
-        } else {
-            format
-        };
-        return Some(format_datetime(parts, format));
+    if let Some(rest) = inner.strip_prefix("date:") {
+        return date_override(rest, parts, formats.date);
     }
     if let Some(format) = inner.strip_prefix("time:") {
         let format = if format.is_empty() {
@@ -463,6 +639,39 @@ fn placeholder_value(
         return Some(format_datetime(parts, format));
     }
     None
+}
+
+/// `{{date:REST}}`：**先判偏移，再判格式**。
+///
+/// - `REST` 是合法偏移（`-1d`）→ 偏移后的日期按默认格式；
+/// - `REST` 是 `偏移:格式`（`-1d:YYYY/MM/DD`）→ 偏移后的日期按该格式；
+/// - 看起来是偏移但不合法（`+d` / `1x` / `1x:YYYY` / 空偏移 `:YYYY`）或偏移越界
+///   → `None`（调用方把整个占位符**原样保留**）；
+/// - 其它 → 沿用旧语义：`REST` 整体是格式串（可含冒号，如 `YYYY:MM`）。
+fn date_override(rest: &str, parts: &DateTimeParts, default_format: &str) -> Option<String> {
+    // 旧语义：空格式回退默认（`{{date:}}`）。
+    if rest.is_empty() {
+        return Some(format_datetime(parts, default_format));
+    }
+    let (head, tail) = match rest.split_once(':') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (rest, None),
+    };
+    if let Some(offset) = RelativeDateOffset::parse(head) {
+        let shifted = offset.apply(parts)?;
+        let format = match tail {
+            None | Some("") => default_format,
+            Some(format) => format,
+        };
+        return Some(format_datetime(&shifted, format));
+    }
+    // 冒号前是空串（`date::FMT`）= 空偏移；或值以 `+`/`-`/数字开头 = 非法偏移尝试。
+    // 两者都按「非法偏移」原样保留，不猜测用户意图。
+    if (tail.is_some() && head.is_empty()) || RelativeDateOffset::looks_like_offset(head) {
+        return None;
+    }
+    // 旧语义：REST 整体是格式串。
+    Some(format_datetime(parts, rest))
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,15 +1254,6 @@ pub struct TemplatesSettingsPanel {
     _subs: Vec<Subscription>,
 }
 
-/// 模板设置面板事件：设置页左栏（插件分类可见性）需要即时刷新。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TemplatesSettingsEvent {
-    /// `enabled` 变化（在本面板里打开/关闭模板插件）。
-    EnabledChanged,
-}
-
-impl gpui::EventEmitter<TemplatesSettingsEvent> for TemplatesSettingsPanel {}
-
 impl TemplatesSettingsPanel {
     /// 按当前偏好组装面板（字段 Enter 提交 → 写本机 `templates.json`）。
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -1149,15 +1349,6 @@ impl TemplatesSettingsPanel {
         cx.notify();
     }
 
-    fn toggle_enabled(&mut self, cx: &mut Context<Self>) {
-        let mut preferences = preferences();
-        preferences.enabled = !preferences.enabled;
-        set_preferences(preferences);
-        self.notice = None;
-        cx.emit(TemplatesSettingsEvent::EnabledChanged);
-        cx.notify();
-    }
-
     fn field_row(&self, field: TemplatesField) -> impl IntoElement {
         let Some(input) = self.field_input(field) else {
             return div();
@@ -1197,23 +1388,10 @@ impl TemplatesSettingsPanel {
 }
 
 impl Render for TemplatesSettingsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let preferences = preferences();
         let parts = DateTimeParts::now();
         let example = Self::example(&preferences, &parts);
-        let state_text = if preferences.enabled {
-            ui_text::templates_enabled()
-        } else {
-            ui_text::templates_disabled()
-        };
-        let (background, text) = if preferences.enabled {
-            (
-                theme::search_toggle_active(),
-                theme::search_toggle_active_text(),
-            )
-        } else {
-            (theme::menu_bg(), theme::text_color())
-        };
         div()
             .id("settings-templates")
             .debug_selector(|| "settings-templates".to_string())
@@ -1232,41 +1410,6 @@ impl Render for TemplatesSettingsPanel {
                     .text_size(px(11.0))
                     .text_color(theme::status_bar_text())
                     .child(SharedString::from(ui_text::templates_hint())),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("settings-templates-toggle")
-                            .debug_selector(|| "settings-templates-toggle".to_string())
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme::input_border())
-                            .bg(background)
-                            .text_size(px(12.0))
-                            .text_color(text)
-                            .cursor_pointer()
-                            .child(SharedString::from(state_text.clone()))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|panel, _event, _window, cx| {
-                                    panel.toggle_enabled(cx);
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "settings-templates-state".to_string())
-                            .text_size(px(11.0))
-                            .text_color(theme::status_bar_text())
-                            .child(SharedString::from(state_text)),
-                    ),
             )
             .children(
                 TemplatesField::ALL
@@ -1497,6 +1640,231 @@ mod tests {
         );
     }
 
+    // ---- 相对日期（P1）：解析 / 偏移 / 渲染 / 非法输入 ----
+
+    fn date_parts(year: i32, month: u32, day: u32) -> DateTimeParts {
+        DateTimeParts {
+            year,
+            month,
+            day,
+            hour: 8,
+            minute: 14,
+            second: 9,
+        }
+    }
+
+    #[test]
+    fn relative_offsets_parse_strictly() {
+        let offset =
+            |text: &str| RelativeDateOffset::parse(text).map(|offset| (offset.amount, offset.unit));
+        assert_eq!(offset("-1d"), Some((-1, RelativeDateUnit::Day)));
+        assert_eq!(offset("+1d"), Some((1, RelativeDateUnit::Day)));
+        assert_eq!(offset("1d"), Some((1, RelativeDateUnit::Day)));
+        assert_eq!(offset("-2w"), Some((-2, RelativeDateUnit::Week)));
+        assert_eq!(offset("-1m"), Some((-1, RelativeDateUnit::Month)));
+        assert_eq!(offset("+1y"), Some((1, RelativeDateUnit::Year)));
+        assert_eq!(offset("0d"), Some((0, RelativeDateUnit::Day)));
+        assert_eq!(offset("01d"), Some((1, RelativeDateUnit::Day)));
+        assert_eq!(offset("-99y"), Some((-99, RelativeDateUnit::Year)));
+
+        // 非法：空、缺数字、多余字符、3 位、大写单位、空白、小数、重复符号。
+        for invalid in [
+            "", "+", "-", "d", "+d", "1x", "1D", "123d", "1dd", "1.5d", " 1d", "1d ", "--1d",
+            "++1d", "+-1d", "1 d", "1W", "١d",
+        ] {
+            assert_eq!(offset(invalid), None, "必须拒绝非法偏移：{invalid:?}");
+        }
+
+        // 「偏移尝试」判定：符号/数字开头；格式串（YYYY）不是。
+        assert!(RelativeDateOffset::looks_like_offset("+1d"));
+        assert!(RelativeDateOffset::looks_like_offset("-1d"));
+        assert!(RelativeDateOffset::looks_like_offset("1x"));
+        assert!(!RelativeDateOffset::looks_like_offset("YYYY-MM-DD"));
+        assert!(!RelativeDateOffset::looks_like_offset("周记"));
+        assert!(!RelativeDateOffset::looks_like_offset(""));
+    }
+
+    #[test]
+    fn relative_offsets_shift_across_months_years_and_leap_days() {
+        let parts = date_parts(2026, 11, 18);
+        let offset = |text: &str, parts: &DateTimeParts| {
+            RelativeDateOffset::parse(text)
+                .expect("偏移必须合法")
+                .apply(parts)
+        };
+        // 天/周：跨月、跨年、闰日；时间分量保持不变。
+        assert_eq!(
+            offset("-1d", &parts),
+            Some(date_parts(2026, 11, 17)),
+            "昨天"
+        );
+        assert_eq!(offset("+1d", &parts), Some(date_parts(2026, 11, 19)));
+        assert_eq!(offset("+1w", &parts), Some(date_parts(2026, 11, 25)));
+        assert_eq!(
+            offset("+1d", &date_parts(2026, 12, 31)),
+            Some(date_parts(2027, 1, 1)),
+            "跨年"
+        );
+        assert_eq!(
+            offset("-1d", &date_parts(2027, 1, 1)),
+            Some(date_parts(2026, 12, 31)),
+            "跨年（反向）"
+        );
+        assert_eq!(
+            offset("+1d", &date_parts(2024, 2, 29)),
+            Some(date_parts(2024, 3, 1)),
+            "闰日 +1d"
+        );
+        assert_eq!(
+            offset("-1d", &date_parts(2024, 3, 1)),
+            Some(date_parts(2024, 2, 29)),
+            "闰日 -1d"
+        );
+        // 月：月末对齐（1/31 +1m → 2/29；平年 → 2/28）；-1m。
+        assert_eq!(
+            offset("-1m", &parts),
+            Some(date_parts(2026, 10, 18)),
+            "上个月同一天"
+        );
+        assert_eq!(
+            offset("+1m", &date_parts(2024, 1, 31)),
+            Some(date_parts(2024, 2, 29)),
+            "闰年月末对齐"
+        );
+        assert_eq!(
+            offset("+1m", &date_parts(2023, 1, 31)),
+            Some(date_parts(2023, 2, 28)),
+            "平年月末对齐"
+        );
+        // 年：闰日 2/29 落到 2/28；普通年份同日。
+        assert_eq!(offset("+1y", &parts), Some(date_parts(2027, 11, 18)));
+        assert_eq!(
+            offset("+1y", &date_parts(2024, 2, 29)),
+            Some(date_parts(2025, 2, 28)),
+            "闰日 +1y"
+        );
+        assert_eq!(
+            offset("-1y", &date_parts(2024, 2, 29)),
+            Some(date_parts(2023, 2, 28)),
+            "闰日 -1y"
+        );
+        // 越界/非法日期 → None（不 panic）。
+        assert_eq!(
+            offset(
+                "+1d",
+                &DateTimeParts {
+                    year: i32::MAX,
+                    ..parts
+                }
+            ),
+            None
+        );
+        assert_eq!(offset("+1d", &DateTimeParts { month: 13, ..parts }), None);
+    }
+
+    #[test]
+    fn relative_date_placeholders_render_default_and_custom_formats() {
+        let parts = parts();
+        // 默认格式（`YYYY-MM-DD`）。
+        assert_eq!(
+            render_placeholders("{{date:-1d}}", &parts, "x", formats()),
+            "2026-11-17"
+        );
+        assert_eq!(
+            render_placeholders("{{date:+1d}}", &parts, "x", formats()),
+            "2026-11-19"
+        );
+        assert_eq!(
+            render_placeholders("{{date:+1w}}", &parts, "x", formats()),
+            "2026-11-25"
+        );
+        assert_eq!(
+            render_placeholders("{{date:-1m}}", &parts, "x", formats()),
+            "2026-10-18"
+        );
+        assert_eq!(
+            render_placeholders("{{date:+1y}}", &parts, "x", formats()),
+            "2027-11-18"
+        );
+        // 带格式：偏移后的日期按自定义格式渲染（含中文/斜杠/时间 token）。
+        assert_eq!(
+            render_placeholders("{{date:-1d:YYYY/MM/DD}}", &parts, "x", formats()),
+            "2026/11/17"
+        );
+        assert_eq!(
+            render_placeholders("{{date:-1m:YYYY年M月D日}}", &parts, "x", formats()),
+            "2026年10月18日"
+        );
+        assert_eq!(
+            render_placeholders("{{date:+1d:HH:mm}}", &parts, "x", formats()),
+            "08:14",
+            "日偏移不改时间分量"
+        );
+        // 空格式段回退默认；无符号/0 偏移与现有语义一致。
+        assert_eq!(
+            render_placeholders("{{date:-1d:}}", &parts, "x", formats()),
+            "2026-11-17"
+        );
+        assert_eq!(
+            render_placeholders("{{date:0d}} {{date:2w}}", &parts, "x", formats()),
+            "2026-11-18 2026-12-02"
+        );
+        // 与现有占位符混用：date/time/title 与相对日期互不影响。
+        assert_eq!(
+            render_placeholders(
+                "{{title}}|{{date}}|{{time}}|{{date:-1d}}|{{date:+1d:YYYY/MM/DD}}",
+                &parts,
+                "周记",
+                formats()
+            ),
+            "周记|2026-11-18|08:14|2026-11-17|2026/11/19"
+        );
+        // 旧格式串兼容：冒号是字面量，不是偏移。
+        assert_eq!(
+            render_placeholders("{{date:YYYY:MM}} {{time:HH:mm}}", &parts, "x", formats()),
+            "2026:11 08:14"
+        );
+    }
+
+    #[test]
+    fn invalid_relative_offsets_are_preserved_verbatim() {
+        let parts = parts();
+        let preserved = |text: &str| {
+            assert_eq!(
+                render_placeholders(text, &parts, "x", formats()),
+                text,
+                "非法/未知偏移必须原样保留：{text:?}"
+            );
+        };
+        // 空偏移（多个冒号）/ 缺数字 / 非数字 / 大写 / 3 位 / 多余字符。
+        preserved("{{date::YYYY}}");
+        preserved("{{date::}}");
+        preserved("{{date:+d}}");
+        preserved("{{date:1x}}");
+        preserved("{{date:1x:YYYY}}");
+        preserved("{{date:-1D}}");
+        preserved("{{date:123d}}");
+        preserved("{{date:1.5d}}");
+        preserved("{{date:++1d}}");
+        preserved("{{date:2026}}");
+        // 偏移越界（年份分量超出公历可表示范围）→ 原样保留。
+        let extreme = DateTimeParts {
+            year: i32::MAX,
+            month: 12,
+            day: 31,
+            ..parts
+        };
+        assert_eq!(
+            render_placeholders("{{date:+1d}}", &extreme, "x", formats()),
+            "{{date:+1d}}"
+        );
+        // 空格式仍是旧语义（回退默认），不是「非法空偏移」。
+        assert_eq!(
+            render_placeholders("{{date:}}", &parts, "x", formats()),
+            "2026-11-18"
+        );
+    }
+
     fn entry(
         node_id: &str,
         title: &str,
@@ -1647,7 +2015,8 @@ mod tests {
 
     #[test]
     fn preferences_file_round_trip_and_corrupt_file_falls_back() {
-        let root = test_root();
+        // 独立子目录：同一测试二进制里的多个用例并行，不能删共享父目录。
+        let root = test_root().join("roundtrip");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("创建 target/tmp 失败");
         let path = root.join(TEMPLATES_FILE_NAME);

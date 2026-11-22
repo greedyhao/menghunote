@@ -1315,6 +1315,19 @@ impl ObjectCommit {
 }
 
 /// CheckpointCommit 签名载荷。
+///
+/// **wire 修订**（task-122）：
+/// - `validation_version = 1`：字段 0..8（9 项），签名只覆盖原 v1 语义；
+/// - `validation_version = 2`：追加字段 9 `validation_digest`（32B，见
+///   [`crate::CheckpointValidationV2`] / [`crate::checkpoint_validation_input`]），
+///   共 10 项。v2 是当前生产修订；旧修订仍可**解码**（用于识别/拒绝），但当前消费者
+///   必须显式拒绝，不得静默接受。
+///
+/// 解码规则是"按显式版本号 + 字段集合严格匹配"，不做任何猜测：
+/// - 9 字段 + `validation_version=1` → 合法 v1（`validation_digest` 为空零，不进 wire）；
+/// - 10 字段 + `validation_version=2` → 合法 v2；
+/// - 9 字段 + 版本 2、10 字段 + 版本 1 → 结构非法（缺/多余字段，拒绝）；
+/// - 其它版本 → [`ProtoError::UnsupportedVersion`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointCommit {
     pub vault_id: VaultId,
@@ -1326,6 +1339,8 @@ pub struct CheckpointCommit {
     pub refs_digest: Sha256,
     pub producer_device_id: DeviceId,
     pub validation_version: u16,
+    /// v2 起必填：验证修订 2 的证据摘要；v1 固定 `[0u8; 32]`，不编码进 wire。
+    pub validation_digest: Sha256,
 }
 
 impl CheckpointCommit {
@@ -1334,7 +1349,39 @@ impl CheckpointCommit {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
-        let fields = into_record_fields(decode(bytes)?, 9)?;
+        let map = decode(bytes)?;
+        let CdeValue::Map(entries) = map else {
+            return Err(ProtoError::Invalid(
+                "CheckpointCommit 必须是 map".to_owned(),
+            ));
+        };
+        let field_count = entries.len();
+        // v1 是 9 项，v2 是 10 项；其它数量在解析版本号之前就拒绝（不猜测）。
+        if field_count != 9 && field_count != 10 {
+            return Err(ProtoError::Invalid(format!(
+                "CheckpointCommit 字段数 {field_count}，期望 9（v1）或 10（v2）"
+            )));
+        }
+        let fields = into_record_fields(CdeValue::Map(entries), field_count)?;
+        let validation_version =
+            expect_u16(fields[8].clone(), "CheckpointCommit.validation_version")?;
+        let validation_digest = match validation_version {
+            1 if field_count == 9 => [0u8; 32],
+            2 if field_count == 10 => {
+                expect_bytes_n::<32>(fields[9].clone(), "CheckpointCommit.validation_digest")?
+            }
+            // 版本与字段集合必须严格匹配：9 字段的"版本 2"不能把缺失字段猜成 0，
+            // 10 字段的"版本 1"也不能丢弃多余字段。
+            1 => {
+                return Err(ProtoError::Invalid(
+                    "CheckpointCommit v1 不接受 validation_digest 字段".to_owned(),
+                ))
+            }
+            2 => {
+                return Err(ProtoError::MissingField(9));
+            }
+            other => return Err(ProtoError::UnsupportedVersion(other)),
+        };
         let value = Self {
             vault_id: expect_bytes_n::<16>(fields[0].clone(), "CheckpointCommit.vault_id")?,
             checkpoint_id: expect_bytes_n::<16>(
@@ -1356,10 +1403,8 @@ impl CheckpointCommit {
                 fields[7].clone(),
                 "CheckpointCommit.producer_device_id",
             )?,
-            validation_version: expect_u16(
-                fields[8].clone(),
-                "CheckpointCommit.validation_version",
-            )?,
+            validation_version,
+            validation_digest,
         };
         value.validate()?;
         Ok(value)
@@ -1367,7 +1412,7 @@ impl CheckpointCommit {
 
     pub fn to_cde(&self) -> Result<CdeValue, ProtoError> {
         self.validate()?;
-        Ok(CdeValue::Map(vec![
+        let mut fields = vec![
             (0, CdeValue::Bytes(self.vault_id.to_vec())),
             (1, CdeValue::Bytes(self.checkpoint_id.to_vec())),
             (2, CdeValue::UInt(self.epoch)),
@@ -1377,7 +1422,33 @@ impl CheckpointCommit {
             (6, CdeValue::Bytes(self.refs_digest.to_vec())),
             (7, CdeValue::Bytes(self.producer_device_id.to_vec())),
             (8, CdeValue::UInt(u64::from(self.validation_version))),
-        ]))
+        ];
+        if self.validation_version == 2 {
+            fields.push((9, CdeValue::Bytes(self.validation_digest.to_vec())));
+        }
+        Ok(CdeValue::Map(fields))
+    }
+
+    /// 当前生产验证修订。消费者必须用 [`Self::is_current_validation`] 显式拒绝旧修订。
+    pub const CURRENT_VALIDATION_VERSION: u16 =
+        crate::constants::CHECKPOINT_COMMIT_VALIDATION_VERSION;
+
+    /// 是否为当前验证修订（task-122 之后只有 v2 可作为基线/GC 依据）。
+    #[must_use]
+    pub fn is_current_validation(&self) -> bool {
+        self.validation_version == Self::CURRENT_VALIDATION_VERSION
+    }
+
+    /// 消费者门禁：不是当前修订就返回 [`ProtoError::UnsupportedVersion`]。
+    ///
+    /// 解码层仍允许 v1（用于识别/审计/负例），但任何"把 checkpoint 当基线/覆盖证据/
+    /// GC 依据"的路径都必须调用本方法显式拒绝旧修订，不得静默接受。
+    pub fn require_current_validation(&self) -> Result<(), ProtoError> {
+        if self.is_current_validation() {
+            Ok(())
+        } else {
+            Err(ProtoError::UnsupportedVersion(self.validation_version))
+        }
     }
 
     pub fn validate(&self) -> Result<(), ProtoError> {
@@ -1386,10 +1457,101 @@ impl CheckpointCommit {
                 "CheckpointCommit.epoch 必须 >0".to_owned(),
             ));
         }
-        if self.validation_version != 1 {
-            return Err(ProtoError::UnsupportedVersion(self.validation_version));
+        match self.validation_version {
+            1 => {
+                if self.validation_digest != [0u8; 32] {
+                    return Err(ProtoError::Invalid(
+                        "CheckpointCommit v1 的 validation_digest 必须为空零".to_owned(),
+                    ));
+                }
+            }
+            2 => {
+                if self.validation_digest == [0u8; 32] {
+                    return Err(ProtoError::Invalid(
+                        "CheckpointCommit v2 缺少 validation_digest".to_owned(),
+                    ));
+                }
+            }
+            other => return Err(ProtoError::UnsupportedVersion(other)),
         }
         Ok(())
+    }
+}
+
+/// 验证修订 2 的证据（本地/审计输入；**不直接上 wire**）。
+///
+/// 写入 `CheckpointCommit.validation_digest` 的是
+/// `SHA256(checkpoint_validation_input(self))`。它把"这份 checkpoint 的 validate
+/// 真实做过的覆盖复核事实"绑定进生产者签名：
+/// - 覆盖扫描冻结 epoch、S、manifest/refs 与生产者；
+/// - 实际导入的文档数/actual VV 摘要、实证资产数；
+/// - coverage 复核的 durable/实证候选数与证明摘要。
+///
+/// relay 只能看到 32B 摘要（无法复算，这不是问题：它不声称验证过覆盖）；客户端/测试
+/// 可从本地 `VerifiedBaseline` 事实重算并与签名 commit 对撞。旧修订没有该字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointValidationV2 {
+    pub vault_id: VaultId,
+    pub checkpoint_id: CheckpointId,
+    pub epoch: u64,
+    pub covered_relay_seq: u64,
+    /// prepare 时冻结的 relay active epoch（候选基线 = `from_epoch`）。
+    pub coverage_epoch: u64,
+    pub manifest_object_id: ObjectId,
+    pub manifest_digest: Sha256,
+    pub refs_digest: Sha256,
+    pub producer_device_id: DeviceId,
+    pub imported_docs: u64,
+    pub imported_vv_digest: Sha256,
+    pub verified_assets: u64,
+    pub coverage_durable_assets: u64,
+    pub coverage_verified_candidates: u64,
+    pub coverage_proof_digest: Sha256,
+}
+
+impl CheckpointValidationV2 {
+    /// 确定性 CDE 编码（字段 0..14）。
+    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        for (name, value) in [
+            ("epoch", self.epoch),
+            ("S", self.covered_relay_seq),
+            ("coverage_epoch", self.coverage_epoch),
+            ("imported_docs", self.imported_docs),
+            ("verified_assets", self.verified_assets),
+            ("coverage_durable_assets", self.coverage_durable_assets),
+            (
+                "coverage_verified_candidates",
+                self.coverage_verified_candidates,
+            ),
+        ] {
+            if value > i64::MAX as u64 {
+                return Err(ProtoError::Invalid(format!(
+                    "CheckpointValidationV2.{name} 超过 i64::MAX"
+                )));
+            }
+        }
+        if self.epoch == 0 || self.coverage_epoch > self.epoch {
+            return Err(ProtoError::Invalid(
+                "CheckpointValidationV2 的 coverage_epoch 必须 <= epoch 且 epoch > 0".to_owned(),
+            ));
+        }
+        encode(&CdeValue::Map(vec![
+            (0, CdeValue::Bytes(self.vault_id.to_vec())),
+            (1, CdeValue::Bytes(self.checkpoint_id.to_vec())),
+            (2, CdeValue::UInt(self.epoch)),
+            (3, CdeValue::UInt(self.covered_relay_seq)),
+            (4, CdeValue::UInt(self.coverage_epoch)),
+            (5, CdeValue::Bytes(self.manifest_object_id.to_vec())),
+            (6, CdeValue::Bytes(self.manifest_digest.to_vec())),
+            (7, CdeValue::Bytes(self.refs_digest.to_vec())),
+            (8, CdeValue::Bytes(self.producer_device_id.to_vec())),
+            (9, CdeValue::UInt(self.imported_docs)),
+            (10, CdeValue::Bytes(self.imported_vv_digest.to_vec())),
+            (11, CdeValue::UInt(self.verified_assets)),
+            (12, CdeValue::UInt(self.coverage_durable_assets)),
+            (13, CdeValue::UInt(self.coverage_verified_candidates)),
+            (14, CdeValue::Bytes(self.coverage_proof_digest.to_vec())),
+        ]))
     }
 }
 

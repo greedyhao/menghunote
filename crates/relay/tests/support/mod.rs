@@ -1366,6 +1366,7 @@ impl Fixture {
             })
             .expect("create checkpoint");
         let cid = outcome.checkpoint_id;
+        let epoch = outcome.epoch;
         let db = self.db.clone();
         db.write_blocking(move |conn| {
             checkpoints::add_refs(
@@ -1377,6 +1378,8 @@ impl Fixture {
         })
         .expect("refs");
         let covered = outcome.covered_seq;
+        let signed_commit =
+            Self::fake_v2_commit(self.vault_id, cid, epoch, covered, manifest, self.device);
         let ctx = self.device_ctx();
         let db = self.db.clone();
         let clock = self.clock.clone();
@@ -1392,13 +1395,39 @@ impl Fixture {
                     covered_seq: covered,
                     manifest_oid: manifest,
                     refs_digest: [9u8; 32],
-                    signed_commit: b"checkpoint-commit",
+                    signed_commit: &signed_commit,
                     signature: b"signature",
                 },
             )
         })
         .expect("publish checkpoint");
         cid
+    }
+
+    /// 测试 hook 用：构造一份自洽的 v2 `CheckpointCommit`（签名验证交给 permissive hook）。
+    pub fn fake_v2_commit(
+        vault_id: [u8; 16],
+        checkpoint_id: Id16,
+        epoch: u64,
+        covered_seq: u64,
+        manifest_oid: Hash32,
+        producer_device_id: [u8; 16],
+    ) -> Vec<u8> {
+        let checkpoint_id: [u8; 16] = checkpoint_id.as_slice().try_into().expect("cid");
+        proto::CheckpointCommit {
+            vault_id,
+            checkpoint_id,
+            epoch,
+            covered_relay_seq: covered_seq,
+            manifest_object_id: manifest_oid,
+            manifest_digest: [9u8; 32],
+            refs_digest: [9u8; 32],
+            producer_device_id,
+            validation_version: 2,
+            validation_digest: [0x5Au8; 32],
+        }
+        .encode()
+        .expect("fake v2 commit")
     }
 
     /// genesis 设备的 Ed25519 公钥（bootstrap 返回签名 → 测试端验签用）。
@@ -1452,7 +1481,8 @@ impl Fixture {
             manifest_digest: manifest_meta.object_digest,
             refs_digest,
             producer_device_id: self.device,
-            validation_version: 1,
+            validation_version: 2,
+            validation_digest: [0x5A; 32],
         };
         let message = commit.encode().expect("checkpoint commit cde");
         let signing_input =
@@ -1635,7 +1665,8 @@ impl Fixture {
             manifest_digest,
             refs_digest,
             producer_device_id: self.device,
-            validation_version: 1,
+            validation_version: 2,
+            validation_digest: [0x5A; 32],
         };
         let signed_commit = commit.encode().expect("candidate commit cde");
         let ctx = self.device_ctx();

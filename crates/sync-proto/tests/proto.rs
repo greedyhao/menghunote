@@ -363,6 +363,22 @@ fn sample_checkpoint() -> CheckpointCommit {
         refs_digest: [5; 32],
         producer_device_id: [6; 16],
         validation_version: 1,
+        validation_digest: [0u8; 32],
+    }
+}
+
+fn sample_checkpoint_v2() -> CheckpointCommit {
+    CheckpointCommit {
+        vault_id: [1; 16],
+        checkpoint_id: [2; 16],
+        epoch: 2,
+        covered_relay_seq: 9,
+        manifest_object_id: [3; 32],
+        manifest_digest: [4; 32],
+        refs_digest: [5; 32],
+        producer_device_id: [6; 16],
+        validation_version: 2,
+        validation_digest: [7; 32],
     }
 }
 
@@ -405,6 +421,11 @@ fn all_records_roundtrip_and_are_canonical() {
     roundtrip(&sample_commit(), ObjectCommit::encode, ObjectCommit::decode);
     roundtrip(
         &sample_checkpoint(),
+        CheckpointCommit::encode,
+        CheckpointCommit::decode,
+    );
+    roundtrip(
+        &sample_checkpoint_v2(),
         CheckpointCommit::encode,
         CheckpointCommit::decode,
     );
@@ -899,4 +920,107 @@ fn records_reject_unknown_object_and_slot_tags() {
     entries[4].1 = CdeValue::UInt(9);
     let bytes = encode_cde(&CdeValue::Map(entries)).unwrap();
     assert!(SlotDescriptorV1::decode(&bytes).is_err());
+}
+
+#[test]
+fn checkpoint_commit_v2_field_set_is_version_gated() {
+    // v2 比 v1 多一个 32B 证据摘要字段；两种修订都必须确定性往返。
+    let v1 = sample_checkpoint();
+    let v2 = sample_checkpoint_v2();
+    let v1_bytes = v1.encode().unwrap();
+    let v2_bytes = v2.encode().unwrap();
+    let CdeValue::Map(v1_entries) = decode_cde(&v1_bytes).unwrap() else {
+        panic!("checkpoint map");
+    };
+    let CdeValue::Map(v2_entries) = decode_cde(&v2_bytes).unwrap() else {
+        panic!("checkpoint map");
+    };
+    assert_eq!(v1_entries.len(), 9, "v1 只有字段 0..8");
+    assert_eq!(v2_entries.len(), 10, "v2 追加字段 9");
+    assert_eq!(CheckpointCommit::decode(&v1_bytes).unwrap(), v1);
+    assert_eq!(CheckpointCommit::decode(&v2_bytes).unwrap(), v2);
+    assert!(!v1.is_current_validation());
+    assert!(v2.is_current_validation());
+    assert!(matches!(
+        v1.require_current_validation(),
+        Err(ProtoError::UnsupportedVersion(1))
+    ));
+    assert!(v2.require_current_validation().is_ok());
+
+    // 9 字段 + 版本 2：不得把缺失的 digest 猜成 0，必须拒绝。
+    let CdeValue::Map(mut entries) = decode_cde(&v1_bytes).unwrap() else {
+        panic!("checkpoint map");
+    };
+    entries[8].1 = CdeValue::UInt(2);
+    let bytes = encode_cde(&CdeValue::Map(entries)).unwrap();
+    assert!(matches!(
+        CheckpointCommit::decode(&bytes),
+        Err(ProtoError::MissingField(9))
+    ));
+
+    // 10 字段 + 版本 1：不得丢弃多余字段静默降级。
+    let CdeValue::Map(mut entries) = decode_cde(&v2_bytes).unwrap() else {
+        panic!("checkpoint map");
+    };
+    entries[8].1 = CdeValue::UInt(1);
+    let bytes = encode_cde(&CdeValue::Map(entries)).unwrap();
+    assert!(matches!(
+        CheckpointCommit::decode(&bytes),
+        Err(ProtoError::Invalid(_))
+    ));
+}
+
+#[test]
+fn checkpoint_commit_rejects_unknown_versions() {
+    let CdeValue::Map(mut entries) = decode_cde(&sample_checkpoint_v2().encode().unwrap()).unwrap()
+    else {
+        panic!("checkpoint map");
+    };
+    for version in [0u64, 3, u16::MAX as u64] {
+        entries[8].1 = CdeValue::UInt(version);
+        let bytes = encode_cde(&CdeValue::Map(entries.clone())).unwrap();
+        match CheckpointCommit::decode(&bytes) {
+            Err(ProtoError::UnsupportedVersion(actual)) => {
+                assert_eq!(u64::from(actual), version);
+            }
+            other => panic!("版本 {version} 必须拒绝，实际 {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn checkpoint_validation_v2_digest_input_is_deterministic_and_complete() {
+    let evidence = CheckpointValidationV2 {
+        vault_id: [1; 16],
+        checkpoint_id: [2; 16],
+        epoch: 2,
+        covered_relay_seq: 9,
+        coverage_epoch: 1,
+        manifest_object_id: [3; 32],
+        manifest_digest: [4; 32],
+        refs_digest: [5; 32],
+        producer_device_id: [6; 16],
+        imported_docs: 7,
+        imported_vv_digest: [8; 32],
+        verified_assets: 9,
+        coverage_durable_assets: 10,
+        coverage_verified_candidates: 11,
+        coverage_proof_digest: [12; 32],
+    };
+    let input = checkpoint_validation_input(&evidence).expect("validation input");
+    assert_eq!(
+        input,
+        checkpoint_validation_input(&evidence.clone()).expect("deterministic")
+    );
+    assert!(input.starts_with(CHECKPOINT_VALIDATION_DOMAIN));
+    // 任一字段变化都必须改变输入（这里抽查覆盖 epoch / 资产数 / 证明摘要）。
+    let mut changed = evidence.clone();
+    changed.coverage_epoch = 2;
+    assert_ne!(input, checkpoint_validation_input(&changed).unwrap());
+    let mut changed = evidence.clone();
+    changed.coverage_verified_candidates += 1;
+    assert_ne!(input, checkpoint_validation_input(&changed).unwrap());
+    let mut changed = evidence;
+    changed.coverage_proof_digest = [13; 32];
+    assert_ne!(input, checkpoint_validation_input(&changed).unwrap());
 }

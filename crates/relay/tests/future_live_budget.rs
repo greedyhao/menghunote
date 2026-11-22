@@ -78,6 +78,14 @@ fn publish(fx: &Fixture, staged: &StagedBaseline) -> Result<(), relay::Error> {
     let cid = staged.checkpoint_id;
     let covered_seq = staged.covered_seq;
     let manifest_oid = staged.manifest_oid;
+    let signed_commit = support::Fixture::fake_v2_commit(
+        fx.vault_id,
+        cid,
+        fx.vault().active_epoch,
+        covered_seq,
+        manifest_oid,
+        fx.device,
+    );
     db.write_blocking(move |conn| {
         checkpoints::publish(
             conn,
@@ -89,7 +97,7 @@ fn publish(fx: &Fixture, staged: &StagedBaseline) -> Result<(), relay::Error> {
                 covered_seq,
                 manifest_oid,
                 refs_digest: [9u8; 32],
-                signed_commit: b"checkpoint-commit",
+                signed_commit: &signed_commit,
                 signature: b"signature",
             },
         )

@@ -798,6 +798,31 @@ fn checkpoint_prepare_validate_promote() {
         "create_checkpoint 必须走 validate+promote"
     );
     assert!(report.published_at.is_some());
+    assert!(
+        report.commit_digest.is_some(),
+        "report 必须携带 promote 实际签名的 commit 摘要（T 只能取这里）"
+    );
+
+    // task-122：生产路径签的是验证修订 2，且 validation_digest 已绑定覆盖证据。
+    let published = relay.published_checkpoints.last().expect("published");
+    let commit = menghunote_sync_proto::CheckpointCommit::decode(
+        published.signed_commit.as_deref().expect("signed commit"),
+    )
+    .expect("decode checkpoint commit");
+    assert_eq!(
+        commit.validation_version,
+        menghunote_sync_proto::CheckpointCommit::CURRENT_VALIDATION_VERSION
+    );
+    assert_ne!(
+        commit.validation_digest, [0u8; 32],
+        "v2 必须绑定验证证据摘要"
+    );
+    assert!(commit.require_current_validation().is_ok());
+    assert_eq!(
+        report.commit_digest,
+        Some(Sha256::digest(published.signed_commit.as_deref().expect("signed commit")).into()),
+        "report 的 commit 摘要必须等于 relay 持久化的签名字节 SHA256"
+    );
 }
 
 #[test]
@@ -1754,7 +1779,7 @@ fn validate_rejects_coverage_sequence_gap() {
 // epoch，不能拿 checkpoint 的 to_epoch/key_epoch 去比。
 
 const COVERAGE_RECEIPT_PREFIX: &str = "sync.checkpoint.coverage_receipt.";
-const COVERAGE_RECEIPT_MAGIC: &[u8] = b"MN/cp-pending/2\0";
+const COVERAGE_RECEIPT_MAGIC: &[u8] = b"MN/cp-pending/3\0";
 
 fn coverage_receipt_rows(vault: &menghunote_storage::Vault) -> Vec<(String, Vec<u8>)> {
     vault
@@ -1781,16 +1806,13 @@ fn coverage_receipt_rows(vault: &menghunote_storage::Vault) -> Vec<(String, Vec<
         .collect()
 }
 
-/// 改写 receipt 的 `coverage_epoch` 并重算摘要（摘要不是密钥，篡改者可重算；
-/// 门禁必须靠"与 prepare 导出点绑定"拒绝，而不是靠摘要不自洽）。
+/// 改写 receipt 的 `coverage_epoch`，**不重算 HMAC**：task-122 起回执用 epoch 根
+/// 派生的密钥认证，篡改者无法伪造（旧实现只有 SHA256 校验和，可重算）。
 fn rewrite_coverage_epoch(bytes: &mut [u8], epoch: u64) {
     assert!(bytes.starts_with(COVERAGE_RECEIPT_MAGIC), "receipt magic");
     let epoch_at = COVERAGE_RECEIPT_MAGIC.len() + 16 + 16 + 16; // vault + cid + log
     assert!(bytes.len() >= epoch_at + 8 + 32, "receipt 太短");
     bytes[epoch_at..epoch_at + 8].copy_from_slice(&epoch.to_be_bytes());
-    let body_len = bytes.len() - 32;
-    let digest: [u8; 32] = Sha256::digest(&bytes[..body_len]).into();
-    bytes[body_len..].copy_from_slice(&digest);
 }
 
 /// E1→E2 候选基线夹具：relay 仍停在 E1（日志事件全是 E1），checkpoint 用 E2 根导出。
@@ -1889,7 +1911,7 @@ fn validate_candidate_baseline_rejects_tampered_coverage_epoch() {
     let mut rows = coverage_receipt_rows(&vault);
     assert_eq!(rows.len(), 1, "prepare 必须已落 receipt");
     let (key, mut bytes) = rows.remove(0);
-    // 篡改者把 epoch 改成 2（= 当前错误实现的比较口径）并重算摘要。
+    // 篡改者把 epoch 改成 2（= 当前错误实现的比较口径）；没有 HMAC 密钥，无法重签。
     rewrite_coverage_epoch(&mut bytes, 2);
     set_meta_value(&vault, &key, bytes);
     let err = CheckpointWriter::new(

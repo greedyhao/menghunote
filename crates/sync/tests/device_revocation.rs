@@ -32,7 +32,7 @@ use menghunote_storage::{
     HeadState, StructureWriter, SyncContext, UpdateRecord, Vault,
 };
 use menghunote_sync::api_version::RelayApiVersion;
-use menghunote_sync::dev_local::{CreatedVault, DevLocal, JoinedVault};
+use menghunote_sync::dev_local::{ApplyOutcome, CreatedVault, DevLocal, JoinedVault};
 use menghunote_sync::device::{DeviceHpkeKey, DeviceSigningKey, ManagementKey};
 use menghunote_sync::device_management::{revoke_device, RevokeContext, RevokeOutcome};
 use menghunote_sync::engine::{EngineIdentity, SyncEngine};
@@ -259,6 +259,26 @@ fn assert_revoked(error: &SyncError, what: &str) {
     }
 }
 
+/// Linux 上 `LocalIdentityV1::protect` 需要每用户主钥（Windows DPAPI 是 no-op）。
+///
+/// 同一测试二进制内的多个测试并发跑，用 `OnceLock` 保证只初始化一次
+/// （与 `rotation_dev_local.rs` 同口径）。
+fn init_identity_wrap() {
+    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let result = INIT.get_or_init(|| {
+        menghunote_sync::identity_wrap::initialize_user_key().map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        panic!("初始化本地身份封装主键失败：{error}");
+    }
+}
+
+/// 把身份按 `LocalIdentityV1::protect()` 原字节落盘（`DevLocal::rotate` 的原子推广目标）。
+fn persist_identity(path: &Path, identity: &LocalIdentityV1) {
+    let blob = identity.protect().expect("保护本地身份失败");
+    std::fs::write(path, blob).expect("写本地身份失败");
+}
+
 /// A/B 两设备夹具：A create + 一篇笔记 + 发布基线 → B 用恢复码 join + 首轮同步。
 struct Fixture {
     relay: DevRelay,
@@ -452,6 +472,217 @@ fn revoke_blocks_old_client_immediately_and_a_keeps_working() {
         body_text(&fixture.b.vault, &doc_id, b_peer).contains("B 被吊销后的本地编辑"),
         "被吊销设备后续的本地编辑也仍然落在本地"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 1b) task-123：默认移除 = 只吊销（不换 epoch）；轮换只能显式 opt-in
+// ---------------------------------------------------------------------------
+
+/// 验收 task-123：
+///
+/// 1. 默认移除设备走**独立吊销**：目标立即 REVOKED、其余设备继续同步，而
+///    `key_epoch`/`control_rev`/两台设备的本地身份 epoch **全部不变**（没有隐式轮换）；
+/// 2. 重复移除幂等（`changed=false`，`auth_rev`/`epoch` 不再推进）；
+/// 3. 只有**显式**调用 [`DevLocal::rotate`] 才分配新 epoch；轮换仍把已移除设备写进
+///    signed `revoke[]`（ADR 0010），且不给它 grant；
+/// 4. 被移除设备不能借后续轮换重新入网（apply 明确 `NotGranted`、身份文件逐字节不变）。
+#[test]
+fn remove_is_revoke_only_and_rotation_is_explicit_opt_in() {
+    init_identity_wrap();
+    let mut fixture = establish("revoke-opt-in");
+    let relay_url = fixture.relay.base_url().to_owned();
+    let b_device = fixture.b.identity.device_id;
+    let a_peer = fixture.a.identity.loro_peer_id();
+    let a_epoch = fixture.a.identity.current_epoch;
+    let b_epoch = fixture.b.identity.current_epoch;
+    let doc_id = fixture.note.doc_id.clone();
+    let a_identity_path = fixture._dir.path().join("a-identity.bin");
+    let b_identity_path = fixture._dir.path().join("b-identity.bin");
+    persist_identity(&a_identity_path, &fixture.a.identity);
+    persist_identity(&b_identity_path, &fixture.b.identity);
+    let b_identity_blob = std::fs::read(&b_identity_path).expect("读 B 的本地身份失败");
+
+    // ---- 1) 默认移除：只吊销访问，不轮换、不换 epoch；其余设备继续同步。
+    let before = fresh_state(&fixture.relay, &fixture.a.identity);
+    assert_eq!(before.epoch, a_epoch, "夹具：relay 与 A 的 epoch 一致");
+    let removed =
+        DevLocal::revoke_device(&relay_url, &fixture.a.vault, &fixture.a.identity, b_device)
+            .expect("默认移除设备必须走独立吊销（不轮换）");
+    assert!(removed.outcome.changed, "首次移除必须真的改变访问状态");
+    assert_eq!(removed.outcome.target, b_device);
+    assert_eq!(
+        removed.outcome.control_rev, before.control_rev,
+        "独立吊销不得推进 control_rev"
+    );
+    assert_eq!(
+        removed.outcome.auth_rev,
+        before.auth_rev + 1,
+        "独立吊销只推进 auth_rev"
+    );
+    let after_remove = fresh_state(&fixture.relay, &fixture.a.identity);
+    assert_eq!(
+        (after_remove.epoch, after_remove.control_rev),
+        (before.epoch, before.control_rev),
+        "默认移除不得轮换：relay 的 key_epoch/control_rev 必须不变"
+    );
+    assert_eq!(
+        fixture.a.identity.current_epoch, a_epoch,
+        "A 的本地 epoch 不变"
+    );
+    assert_eq!(
+        fixture.b.identity.current_epoch, b_epoch,
+        "B 的本地 epoch 不变"
+    );
+    let b_member = removed
+        .members
+        .iter()
+        .find(|member| member.device_id == b_device)
+        .expect("成员视图必须含 B");
+    assert_eq!(b_member.status, MemberStatus::Revoked);
+    let a_member = removed
+        .members
+        .iter()
+        .find(|member| member.device_id == fixture.a.identity.device_id)
+        .expect("成员视图必须含 A");
+    assert_eq!(a_member.status, MemberStatus::Active, "A 必须仍是 Active");
+
+    // ---- 2) 重复移除幂等：changed=false，auth_rev/epoch/control_rev 不再推进。
+    let repeat =
+        DevLocal::revoke_device(&relay_url, &fixture.a.vault, &fixture.a.identity, b_device)
+            .expect("重复移除必须明确成功（已撤销）而不是报错");
+    assert!(!repeat.outcome.changed, "重复移除必须 changed=false");
+    assert_eq!(
+        (repeat.outcome.auth_rev, repeat.outcome.control_rev),
+        (removed.outcome.auth_rev, before.control_rev),
+        "重复移除不得二次推进 auth_rev/control_rev"
+    );
+    let after_repeat = fresh_state(&fixture.relay, &fixture.a.identity);
+    assert_eq!(
+        (after_repeat.epoch, after_repeat.auth_rev),
+        (before.epoch, removed.outcome.auth_rev),
+        "重复移除不得改变 epoch/auth_rev"
+    );
+
+    // ---- 3) 其他设备继续正常同步：A 同步 + 本地编辑都能落地，epoch 不变。
+    DevLocal::sync_once(&relay_url, &fixture.a.vault, &fixture.a.identity)
+        .expect("移除 B 之后 A 必须仍能同步");
+    append_body(
+        &fixture.a.vault,
+        &doc_id,
+        a_peer,
+        a_epoch,
+        "A 在移除 B 之后的本地编辑\n",
+    );
+    DevLocal::sync_once(&relay_url, &fixture.a.vault, &fixture.a.identity)
+        .expect("移除 B 之后 A 的新编辑也必须能同步");
+    let after_sync = fresh_state(&fixture.relay, &fixture.a.identity);
+    assert_eq!(after_sync.epoch, before.epoch, "同步不得隐式轮换");
+    assert_eq!(fixture.a.identity.current_epoch, a_epoch);
+
+    // 被移除设备：认证/读写全部 REVOKED（本地数据不动）。
+    let b_error = DevLocal::sync_once(&relay_url, &fixture.b.vault, &fixture.b.identity)
+        .expect_err("被移除设备的同步必须失败");
+    assert_revoked(&b_error, "B 被移除后的 sync_once");
+    assert!(
+        body_text(&fixture.b.vault, &doc_id, fixture.b.identity.loro_peer_id())
+            .contains(fixture.note.text.trim_end()),
+        "被移除设备的本地笔记必须仍可读"
+    );
+
+    // ---- 4) 只有显式 rotate 才轮换：epoch 前进一格，revoke[] 含已移除的 B。
+    let rotation = DevLocal::rotate(
+        &relay_url,
+        &fixture.a.vault,
+        &a_identity_path,
+        &mut fixture.a.identity,
+        &[b_device],
+        None,
+    )
+    .expect("显式轮换必须仍然可用（移除设备不是轮换的前置条件）");
+    assert_eq!(rotation.from_epoch, a_epoch);
+    assert_eq!(rotation.to_epoch, a_epoch + 1, "只有 opt-in 轮换才换 epoch");
+    assert_eq!(rotation.revoked, vec![b_device]);
+    assert_eq!(rotation.grants, 1, "被移除的 B 不得拿到 grant");
+    assert_eq!(
+        fixture.a.identity.current_epoch,
+        a_epoch + 1,
+        "A 必须显式推广到新 epoch"
+    );
+    let rotated = fresh_state(&fixture.relay, &fixture.a.identity);
+    assert_eq!(rotated.epoch, a_epoch + 1);
+    assert_eq!(rotated.control_rev, rotation.control_rev);
+    assert!(
+        rotated.auth_rev > removed.outcome.auth_rev,
+        "轮换（freeze/激活）必须再次推进 auth_rev"
+    );
+
+    // 已移除设备仍被写进被管理签名的 `revoke[]`（ADR 0010：signed revoke 可复算）。
+    let begin_body = menghunote_sync::rotation::begin_body(
+        rotation.from_epoch,
+        rotation.expected_control_rev,
+        &rotation.request_id,
+        &[b_device],
+    )
+    .expect("重建 signed begin body 失败");
+    {
+        use sha2::Digest as _;
+        let digest: [u8; 32] = sha2::Sha256::digest(&begin_body).into();
+        assert_eq!(
+            digest, rotation.begin_body_digest,
+            "signed begin body 必须包含已移除设备的 revoke[]"
+        );
+    }
+
+    // relay 的 `revoked_count` 只统计**本次真正的 status 迁移**（B 在轮换前已 revoked），
+    // 因此为 0；signed `revoke[]` 仍是永久事实（上面已复算）。这两者一起证明
+    // "独立吊销不依赖轮换、轮换也不会把它复活"。
+    let mut a_client = device_client(
+        &relay_url,
+        &fixture.a.identity,
+        SharedClock::new(relay_now(&fixture.relay)),
+    );
+    let view = a_client
+        .rotation(rotation.rotation_id)
+        .expect("读 rotation view 失败");
+    assert_eq!(view.state, "activated");
+    assert_eq!(view.to_epoch, a_epoch + 1);
+    assert_eq!(
+        view.revoked_count, 0,
+        "B 在轮换前已 revoked：relay 不再统计一次 status 迁移"
+    );
+
+    // ---- 5) 被移除设备不能借新轮换重新入网（NotGranted + 身份文件不变）。
+    let apply = DevLocal::apply_latest_epoch(
+        &relay_url,
+        &fixture.b.vault,
+        &b_identity_path,
+        &mut fixture.b.identity,
+    )
+    .expect("被移除设备的 apply 必须被明确拒绝，而不是 IO 错误");
+    assert_eq!(
+        apply,
+        ApplyOutcome::NotGranted {
+            device_id: b_device,
+            local_epoch: b_epoch,
+        }
+    );
+    assert_eq!(
+        std::fs::read(&b_identity_path).expect("读 B 的本地身份失败"),
+        b_identity_blob,
+        "被移除设备的身份文件必须逐字节不变（不推广、不回退）"
+    );
+    assert_eq!(fixture.b.identity.current_epoch, b_epoch);
+
+    // ---- 6) A 在新 epoch 继续正常同步。
+    append_body(
+        &fixture.a.vault,
+        &doc_id,
+        a_peer,
+        a_epoch + 1,
+        "A 在新 epoch 的本地编辑\n",
+    );
+    DevLocal::sync_once(&relay_url, &fixture.a.vault, &fixture.a.identity)
+        .expect("轮换后 A 必须仍能同步");
 }
 
 // ---------------------------------------------------------------------------

@@ -1520,6 +1520,7 @@ pub fn verify_activation_t_gate(
     // ④ checkpoint commit 自身：字段绑定 + 生产者签名。digest 只证明"同一份字节"，
     //    签名才证明生产者真的为这个 S/manifest/refs 签过。
     let commit = CheckpointCommit::decode(&input.commit.signed_commit)?;
+    crate::checkpoint::require_current_checkpoint_validation(&commit)?;
     if commit.vault_id != input.vault_id
         || commit.checkpoint_id != input.selected_checkpoint
         || commit.epoch != activation_t.to_epoch
@@ -2098,7 +2099,14 @@ fn apply_epoch_change_with_client_inner<C: RelayClient>(
         });
     };
     let baseline_commit = match CheckpointCommit::decode(&signed_commit) {
-        Ok(commit) => commit,
+        Ok(commit) => match crate::checkpoint::require_current_checkpoint_validation(&commit) {
+            Ok(()) => commit,
+            Err(error) => {
+                return Ok(ApplyOutcome::Paused {
+                    reason: error.to_string(),
+                })
+            }
+        },
         Err(error) => {
             return Ok(ApplyOutcome::Paused {
                 reason: error.to_string(),

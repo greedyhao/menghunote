@@ -22,8 +22,8 @@ use crate::slot::{
 };
 use crate::{DeviceId, ObjectId, VaultId};
 use menghunote_sync_proto::{
-    activation_t_signing_input, part_count_for, ActivationTV1, CheckpointCommit, Kdf, ObjectRefV1,
-    ObjectType, SlotDescriptorV1, SlotKind,
+    activation_t_signing_input, part_count_for, ActivationTV1, Kdf, ObjectRefV1, ObjectType,
+    SlotDescriptorV1, SlotKind,
 };
 
 /// 候选槽集合（新秘密）。
@@ -413,25 +413,15 @@ pub fn build_manager_transition(
 
 /// ADR §34：`primary_commit_digest` / `fallback_commit_digest` 的口径。
 ///
-/// `SHA256(CDE(CheckpointCommitV1))`，与 relay 持久化的 `signed_commit` 字节逐字节一致
-/// （`CheckpointWriter::promote` 用同一组字段签名发布）。
+/// `SHA256(CDE(CheckpointCommit))`，与 relay 持久化的 `signed_commit` 字节逐字节一致。
+/// task-122 起 commit 为 v2（额外绑定 `validation_digest`），因此摘要**只能**取
+/// promote 实际签名时落下的 `report.commit_digest`；不得再用公开字段另拼一份 commit。
 pub fn checkpoint_commit_digest(
-    vault_id: VaultId,
-    producer_device_id: DeviceId,
     report: &crate::checkpoint::CheckpointReport,
 ) -> Result<[u8; 32], SyncError> {
-    let commit = CheckpointCommit {
-        vault_id,
-        checkpoint_id: report.checkpoint_id,
-        epoch: report.epoch,
-        covered_relay_seq: report.covered_seq,
-        manifest_object_id: report.manifest.object_id,
-        manifest_digest: report.manifest.object_digest,
-        refs_digest: report.refs_digest,
-        producer_device_id,
-        validation_version: 1,
-    };
-    Ok(Sha256::digest(commit.encode()?).into())
+    report.commit_digest.ok_or(SyncError::Object(
+        "checkpoint report 缺 promote 后的 commit 摘要（基线尚未发布）",
+    ))
 }
 
 /// relay 存下的 `signed_commit` 字节的摘要（恢复路径拿不到 `PreparedCheckpoint` 时用）。

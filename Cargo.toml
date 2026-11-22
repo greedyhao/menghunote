@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/app",
+    # 第三方 Excalidraw 视图（MIT，vendor；依赖 gpui-kit 精确 0.10.0）。
+    "crates/excalidraw",
     "crates/storage",
     "crates/editor",
     "crates/markdown",

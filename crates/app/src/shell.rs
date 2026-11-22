@@ -740,6 +740,21 @@ pub struct AppShell {
     /// 设置页「日记」区（同上）。
     #[cfg(feature = "sync-ui")]
     daily_notes_settings: Option<Entity<crate::daily_notes::DailyNotesSettingsPanel>>,
+    /// 日记设置面板事件订阅（「选择模板笔记…」按钮）。
+    #[cfg(feature = "sync-ui")]
+    daily_notes_settings_events: Option<gpui::Subscription>,
+    /// 日记模板笔记选择器（覆盖层；只在设置页里使用）。
+    #[cfg(feature = "sync-ui")]
+    daily_template_picker: Option<Entity<crate::daily_notes::DailyTemplatePicker>>,
+    /// 日记模板选择器事件订阅（关闭时 drop = 取消订阅）。
+    #[cfg(feature = "sync-ui")]
+    daily_template_picker_events: Option<gpui::Subscription>,
+    /// 「选择模板笔记…」在事件回调里置位，下一帧 render 里创建选择器（需要窗口聚焦）。
+    #[cfg(feature = "sync-ui")]
+    pending_daily_template_picker: bool,
+    /// 选择器关闭后下一帧把焦点还给日记模板输入框。
+    #[cfg(feature = "sync-ui")]
+    pending_focus_daily_template: bool,
 }
 
 /// 右键行弹出的上下文菜单。
@@ -1342,6 +1357,14 @@ impl AppShell {
         self.tree.iter().map(|entry| entry.title.as_str()).collect()
     }
 
+    /// 当前结构树快照（只读；设置页的日记模板选择器用它列出**全部普通笔记**）。
+    ///
+    /// 只读投影，不触发任何 IO；调用方不得据此改树。
+    #[must_use]
+    pub fn tree_snapshot(&self) -> &[TreeEntry] {
+        &self.tree
+    }
+
     /// 侧栏当前排序键（测试/诊断用）。
     #[must_use]
     pub const fn sidebar_sort_key(&self) -> TreeSort {
@@ -1488,6 +1511,16 @@ impl AppShell {
             templates_settings: None,
             #[cfg(feature = "sync-ui")]
             daily_notes_settings: None,
+            #[cfg(feature = "sync-ui")]
+            daily_notes_settings_events: None,
+            #[cfg(feature = "sync-ui")]
+            daily_template_picker: None,
+            #[cfg(feature = "sync-ui")]
+            daily_template_picker_events: None,
+            #[cfg(feature = "sync-ui")]
+            pending_daily_template_picker: false,
+            #[cfg(feature = "sync-ui")]
+            pending_focus_daily_template: false,
         };
         shell.refresh_tree();
         if let Some(index) = shell.tree.iter().position(TreeEntry::is_note) {
@@ -1985,6 +2018,80 @@ impl AppShell {
             TemplatePickerPurpose::NewNote => self.create_note_from_template(&item, cx),
         }
         self.pending_focus_editor = true;
+        cx.notify();
+    }
+
+    /// 打开日记模板笔记选择器（设置页「选择模板笔记…」）。
+    ///
+    /// 列表来自当前结构树快照：**全部普通笔记**（不按模板文件夹过滤）；选择结果只写
+    /// `daily-notes.json` 的 `template`，不插入正文、不改结构树。
+    #[cfg(feature = "sync-ui")]
+    fn open_daily_template_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            return;
+        }
+        let current = crate::daily_notes::preferences().normalized_template();
+        let choices = crate::daily_notes::collect_template_choices(&self.tree);
+        // 上一次关闭留下的"还焦点"不能抢走新选择器的搜索焦点。
+        self.pending_focus_daily_template = false;
+        let picker =
+            cx.new(|cx| crate::daily_notes::DailyTemplatePicker::new(choices, current, cx));
+        let events = cx.subscribe(
+            &picker,
+            |shell: &mut AppShell,
+             _picker,
+             event: &crate::daily_notes::DailyTemplatePickerEvent,
+             cx| match *event {
+                crate::daily_notes::DailyTemplatePickerEvent::Picked { index } => {
+                    shell.on_daily_template_picked(index, cx);
+                }
+                crate::daily_notes::DailyTemplatePickerEvent::Closed => {
+                    shell.close_daily_template_picker(cx);
+                }
+            },
+        );
+        picker.update(cx, |picker, cx| picker.focus(window, cx));
+        self.daily_template_picker = Some(picker);
+        self.daily_template_picker_events = Some(events);
+        cx.notify();
+    }
+
+    /// 选中一篇普通笔记：写回日记模板字段并立即原子写盘，关闭选择器。
+    #[cfg(feature = "sync-ui")]
+    fn on_daily_template_picked(&mut self, index: usize, cx: &mut Context<Self>) {
+        let path = self.daily_template_picker.as_ref().and_then(|picker| {
+            picker
+                .read(cx)
+                .choice(index)
+                .map(|choice| choice.path.clone())
+        });
+        self.close_daily_template_picker(cx);
+        let Some(path) = path else {
+            return;
+        };
+        match self.daily_notes_settings.clone() {
+            Some(panel) => {
+                panel.update(cx, |panel, cx| panel.apply_template_path(&path, cx));
+            }
+            None => {
+                let mut preferences = crate::daily_notes::preferences();
+                preferences.template = crate::daily_notes::normalize_note_path(&path);
+                crate::daily_notes::set_preferences(preferences);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 关闭选择器，下一帧把焦点还给日记模板输入框。
+    #[cfg(feature = "sync-ui")]
+    fn close_daily_template_picker(&mut self, cx: &mut Context<Self>) {
+        if self.daily_template_picker.take().is_none() {
+            return;
+        }
+        self.daily_template_picker_events = None;
+        if self.settings_open {
+            self.pending_focus_daily_template = true;
+        }
         cx.notify();
     }
 
@@ -3333,6 +3440,11 @@ impl AppShell {
             return;
         }
         self.ensure_notes_plugin_settings(cx);
+        // 重新打开设置页不残留上一次的日记模板选择器。
+        self.daily_template_picker = None;
+        self.daily_template_picker_events = None;
+        self.pending_daily_template_picker = false;
+        self.pending_focus_daily_template = false;
         self.settings_open = true;
         self.settings_focus.focus(window, cx);
         cx.notify();
@@ -3348,8 +3460,23 @@ impl AppShell {
             self.templates_settings = Some(cx.new(crate::templates::TemplatesSettingsPanel::new));
         }
         if self.daily_notes_settings.is_none() {
-            self.daily_notes_settings =
-                Some(cx.new(crate::daily_notes::DailyNotesSettingsPanel::new));
+            let panel = cx.new(crate::daily_notes::DailyNotesSettingsPanel::new);
+            // 日记设置里的「选择模板笔记…」由本设置页宿主打开覆盖层。
+            self.daily_notes_settings_events = Some(cx.subscribe(
+                &panel,
+                |shell: &mut AppShell,
+                 _panel,
+                 event: &crate::daily_notes::DailyNotesSettingsEvent,
+                 cx| match *event {
+                    crate::daily_notes::DailyNotesSettingsEvent::PickTemplateRequested => {
+                        if shell.settings_open {
+                            shell.pending_daily_template_picker = true;
+                            cx.notify();
+                        }
+                    }
+                },
+            ));
+            self.daily_notes_settings = Some(panel);
         }
     }
 
@@ -3358,6 +3485,10 @@ impl AppShell {
     pub fn open_settings_headless(&mut self, cx: &mut Context<Self>) {
         if self.dev_sync.is_some() {
             self.ensure_notes_plugin_settings(cx);
+            self.daily_template_picker = None;
+            self.daily_template_picker_events = None;
+            self.pending_daily_template_picker = false;
+            self.pending_focus_daily_template = false;
             self.settings_open = true;
             cx.notify();
         }
@@ -3368,6 +3499,11 @@ impl AppShell {
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
         if self.settings_open {
             self.settings_open = false;
+            // 设置关闭 = 选择器随之卸载，不残留到下一次打开。
+            self.daily_template_picker = None;
+            self.daily_template_picker_events = None;
+            self.pending_daily_template_picker = false;
+            self.pending_focus_daily_template = false;
             cx.notify();
         }
     }
@@ -8388,6 +8524,25 @@ impl Render for AppShell {
         if let Some(purpose) = self.pending_template_picker.take() {
             self.open_template_picker(purpose, window, cx);
         }
+        // 设置页「选择模板笔记…」：事件回调里置位，这一帧创建选择器并聚焦。
+        #[cfg(feature = "sync-ui")]
+        if std::mem::take(&mut self.pending_daily_template_picker) {
+            self.open_daily_template_picker(window, cx);
+        }
+        // 日记模板选择器关闭后把焦点还给设置页字段（下一帧，等覆盖层卸下）。
+        #[cfg(feature = "sync-ui")]
+        if std::mem::take(&mut self.pending_focus_daily_template) {
+            if let Some(panel) = self.daily_notes_settings.clone() {
+                if let Some(input) = panel
+                    .read(cx)
+                    .field_input(crate::daily_notes::DailyNotesField::Template)
+                {
+                    window.defer(cx, move |window, cx| {
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                    });
+                }
+            }
+        }
         // 选择器关闭后把焦点还给编辑器（下一帧，等实体真正卸下）。
         if std::mem::take(&mut self.pending_focus_editor) {
             if let Some(active) = &self.active {
@@ -8422,6 +8577,9 @@ impl Render for AppShell {
         let sort_menu = self.render_sort_menu(cx);
         #[cfg(feature = "sync-ui")]
         let settings = self.render_settings(cx);
+        // 日记模板选择器：盖在设置页之上（只在设置页里使用）。
+        #[cfg(feature = "sync-ui")]
+        let daily_template_picker = self.daily_template_picker.clone();
         let root = div()
             .relative()
             .size_full()
@@ -8464,6 +8622,9 @@ impl Render for AppShell {
         // 同步设置页：只在打开时挂载面板（默认主界面不显示覆盖层）。
         #[cfg(feature = "sync-ui")]
         let root = root.when_some(settings, |this, settings| this.child(settings));
+        // 日记模板选择器在设置页之上、编辑器模板选择器之下（不会同时出现）。
+        #[cfg(feature = "sync-ui")]
+        let root = root.when_some(daily_template_picker, |this, picker| this.child(picker));
         // 模板选择器在设置页之上、图谱之下（二者不会同时打开）。
         let root = root.when_some(template_picker, |this, picker| this.child(picker));
         // 图谱在最上层：覆盖层打开时抢焦点，搜索/菜单/设置不可能同时被操作。
