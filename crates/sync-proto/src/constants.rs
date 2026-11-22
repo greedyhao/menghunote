@@ -29,6 +29,9 @@ pub const SIGN_OBJECT_COMMIT_DOMAIN: &[u8] = b"MN/v1/object-commit\0";
 pub const SIGN_DEVICE_CERT_DOMAIN: &[u8] = b"MN/v1/device-cert\0";
 /// CheckpointCommit 签名域。
 pub const SIGN_CHECKPOINT_DOMAIN: &[u8] = b"MN/v1/checkpoint\0";
+/// 完整 activation T 的双签域（评审 0002 P1-1.4）：只用于
+/// `activation_t_signing_input`，不得与其它签名域复用。
+pub const SIGN_ACTIVATION_T_DOMAIN: &[u8] = b"MN/v1/activation-t\0";
 /// cursor HMAC 域（relay 使用）。
 pub const CURSOR_HMAC_DOMAIN: &[u8] = b"MN/v1/cursor\0";
 

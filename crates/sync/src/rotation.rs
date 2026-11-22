@@ -3,7 +3,9 @@
 //! - 阶段 B：管理签 canonical `POST begin`；journal 先持久化 request_id，响应丢失时**只按
 //!   request_id 查询**，查询不可用/未找到时不盲 begin。
 //! - 阶段 C：旧根 pull+integrate 到 S（必须 `integrated_seq >= S`，received 不够），
-//!   固定 local cut L；pending outbox 由 [`RotationJournal::mark_integrated`] 拒绝。
+//!   固定 local cut L；门禁只拦 **≤S 的入站缺口** 与 **已上传未 ACK** 的更新，
+//!   冻结后继续产生的本地 `pending/encrypted` 编辑**不阻断**轮换（推广后用新 epoch
+//!   重包/上传即可）。
 //!
 //! relay 的 request_id 查询端点由 relay task-101 提供；未提供时本模块返回原错误并保持
 //! Frozen，调用方可安全重试查询。
@@ -13,6 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::cbor;
 use crate::device::{verify_signature, ManagementKey};
 use crate::error::SyncError;
+use crate::http_relay::ControlPin;
 use crate::relay::{RelayClient, RotationBegin, RotationView};
 use crate::rotation_journal::{RotationJournal, RotationPhase};
 use crate::VaultId;
@@ -68,7 +71,22 @@ impl ManagerTransitionV1 {
 
 /// 阶段 A：校验 `/control` 管理链并 pin instance/log/control head。
 ///
-/// 逐条验证 9 字段绑定、old/new 双签、rev 连续；`manager` 必须等于链尾公钥。
+/// 安全契约（三条缺陷的修复口径）：
+///
+/// 1. **信任锚**：`first_old_public` 必须是调用方从**可信本地材料**（恢复码派生的 genesis
+///    管理公钥、本地 identity/pin）拿到的 genesis 管理公钥。relay 返回的 rev1 记录只能
+///    **校验相等**，绝不覆盖锚点；锚点缺失时 fail-closed（不允许退化成"信任 relay 给的
+///    第一个公钥"）。
+/// 2. **epoch 只要求前进**：`to_epoch > from_epoch` 即合法（restart 允许 1→3 跳 epoch），
+///    rev 仍必须严格 `new_rev = old_rev + 1` 且链连续。
+/// 3. **pin 的 control hash 只能来自已验证的 `/control` 链尾**：`control_pin` 必须由调用方用
+///    `HttpRelayClient::control_head` / `HttpRelayClient::control_head_pin` 取得（含链尾
+///    `record_hash`）。journal 自带的 `control_hash` **不参与** pin；control rev 的 pin 事实
+///    是 `journal.control_rev`，必须与已验证链尾 rev 相等（低 pin / 控制链已前进一律拒绝）。
+///    同一 rev 下链尾 `record_hash` 变化（换链尾/分叉）同样拒绝。
+///
+/// 逐条验证 9 字段绑定、old/new 双签、rev 连续；链尾公钥必须等于 `current_manager`。
+#[allow(clippy::too_many_arguments)]
 pub fn verify_management_chain_and_pin<C: RelayClient>(
     vault: &Vault,
     client: &mut C,
@@ -76,19 +94,65 @@ pub fn verify_management_chain_and_pin<C: RelayClient>(
     vault_id: VaultId,
     current_manager: &ManagementKey,
     first_old_public: Option<[u8; 32]>,
+    control_pin: ControlPin,
 ) -> Result<(), SyncError> {
+    // ① 信任锚：缺失即 fail-closed，绝不拿 relay 的 rev1 或"当前管理 key"兜底。
+    let anchor = first_old_public.ok_or(SyncError::Unsupported(
+        "阶段 A 缺少 genesis 管理 key 信任锚（first_old_public / 本地 identity pin）",
+    ))?;
     let state = client.state()?;
     let chain = client.management_chain()?;
+
+    // ③ pin 只接受"已验证 `/control` 链尾"这一事实来源。
+    if control_pin.instance_id != state.instance_id {
+        return Err(SyncError::RelayWire(
+            "控制链 pin 的 relay instance 与 /state 不符",
+        ));
+    }
+    let head_hash = control_pin.record_hash.ok_or(SyncError::RelayWire(
+        "控制链 pin 缺链尾 record_hash（未经 /control 验证，不能用 journal 字段代替）",
+    ))?;
+    if control_pin.control_rev != journal.control_rev {
+        return Err(SyncError::RelayWire(
+            "已验证 /control 链尾 rev 与 rotation 冻结的 control_rev 不符（低 pin/控制链已前进）",
+        ));
+    }
+    // 同一 rotation 内已有 pin 时，同 rev 只允许逐字节相等（换链尾/替换 genesis 后重写都拒绝）。
+    if journal
+        .pinned_control_hash
+        .is_some_and(|pinned| pinned != head_hash)
+    {
+        return Err(SyncError::RelayWire(
+            "控制链同 rev 的链尾 record_hash 与本地 pin 不符（换链尾）",
+        ));
+    }
+
+    // rev1 是 genesis（无 transition/签名），rev≥2 才是管理转换；链必须按 rev 严格递增。
     let mut prev_rev = 1u64;
-    let mut prev_pub = first_old_public.unwrap_or_else(|| current_manager.public_key());
+    let mut prev_pub = anchor;
+    let mut prev_entry_rev = 0u64;
+    let mut genesis_seen = false;
     let mut last_rev = 1u64;
     for entry in &chain {
-        // rev 1 是 genesis 初始管理 key（无 transition/签名），从 rev 2 起才是管理转换。
         if entry.rev <= 1 {
-            prev_rev = 1;
-            prev_pub = entry.pubkey;
+            // relay 提供的 genesis 记录只允许出现一次、位于链首，且只能与信任锚相等。
+            if entry.rev != 1 || genesis_seen || prev_entry_rev != 0 {
+                return Err(SyncError::RelayWire(
+                    "管理链 genesis 记录非法（重复/乱序/rev!=1）",
+                ));
+            }
+            if entry.pubkey != anchor {
+                return Err(SyncError::RelayWire(
+                    "管理链 rev1 genesis 公钥与本地信任锚不符（relay 替换 genesis）",
+                ));
+            }
+            genesis_seen = true;
+            prev_entry_rev = 1;
             last_rev = 1;
             continue;
+        }
+        if entry.rev <= prev_entry_rev {
+            return Err(SyncError::RelayWire("管理链 rev 不递增"));
         }
         let transition = ManagerTransitionV1::decode(&entry.transition)?;
         if transition.vault_id != vault_id
@@ -96,7 +160,8 @@ pub fn verify_management_chain_and_pin<C: RelayClient>(
             || transition.old_rev != prev_rev
             || transition.new_rev != entry.rev
             || transition.new_rev != transition.old_rev.saturating_add(1)
-            || transition.to_epoch != transition.from_epoch.saturating_add(1)
+            // ② restart 允许跳 epoch：只要求前进，不要求 +1。
+            || transition.to_epoch <= transition.from_epoch
             || transition.new_pubkey != entry.pubkey
             || entry.old_rev != prev_rev
         {
@@ -112,16 +177,20 @@ pub fn verify_management_chain_and_pin<C: RelayClient>(
         verify_signature(&entry.pubkey, &entry.transition, &new_signature)?;
         prev_rev = entry.rev;
         prev_pub = entry.pubkey;
+        prev_entry_rev = entry.rev;
         last_rev = entry.rev;
     }
-    if let Some(last) = chain.last() {
-        if last.pubkey != current_manager.public_key() {
-            return Err(SyncError::RelayWire("管理链尾公钥与当前管理 key 不符"));
-        }
+    // 链尾必须是当前管理 key；空链等价于"从未发生管理转换"，此时 genesis 必须就是当前 key。
+    let head_pub = chain.last().map_or(anchor, |entry| entry.pubkey);
+    if head_pub != current_manager.public_key() {
+        return Err(SyncError::RelayWire("管理链尾公钥与当前管理 key 不符"));
     }
+
+    // ③ 只 pin 已验证事实：instance/log 来自本次 `/state`，control hash 来自已验证链尾，
+    // control rev 已在 freeze 时固定并与链尾 rev 核对（上面第 3 条）。
     journal.pinned_instance_id = Some(state.instance_id);
     journal.pinned_log_id = Some(state.log_id);
-    journal.pinned_control_hash = Some(journal.control_hash);
+    journal.pinned_control_hash = Some(head_hash);
     journal.control_chain_rev = Some(last_rev);
     journal.save(vault)?;
     Ok(())
@@ -302,9 +371,74 @@ fn mark_begun<C: RelayClient>(
     Ok(())
 }
 
+/// 阶段 C 的 ready 门禁（收敛到本模块，语义见下）。
+///
+/// 只允许下面两类情况阻断进入 ready：
+///
+/// 1. **≤S 的入站缺口**：`confirmed_highwater`/`integrated_seq` 未覆盖 S，或 inbox 里
+///    `relay_seq <= S` 仍有非 `integrated` 行（quarantine/因果洞/AEAD 未验）；
+/// 2. **已上传但未 ACK**：outbox `state='sent'` 的行。它们都在冻结前生成，对象依赖覆盖
+///    ≤S 的本地状态，必须等 ACK 或按新 epoch 重包后才能继续。
+///
+/// 明确**不**检查 `pending_encryption` / `pending_send`：这些是冻结后继续产生的本地编辑，
+/// 尚未上传、可以推广后重包上传，不能让轮换被持续编辑永久卡住（旧门禁的缺陷）。
+pub fn ensure_c_phase_gate(vault: &Vault, target_s: u64) -> Result<(), SyncError> {
+    let cursor = menghunote_storage::sync_cursor_state(vault)?;
+    if cursor.confirmed_highwater.unwrap_or(0) < target_s {
+        return Err(SyncError::Unsupported(
+            "rotation integrate: confirmed highwater 未覆盖 S",
+        ));
+    }
+    if cursor.integrated_seq < target_s {
+        return Err(SyncError::Unsupported(
+            "rotation integrate: integrated_seq 未到 S（received 不够）",
+        ));
+    }
+    if inbox_gap_at_or_before(vault, &cursor, target_s)? {
+        return Err(SyncError::Unsupported(
+            "rotation integrate: inbox 在 ≤S 仍有 quarantine/因果洞",
+        ));
+    }
+    if !menghunote_storage::outbox_rows(vault, menghunote_storage::SyncOutboxState::Sent, 1)?
+        .is_empty()
+    {
+        return Err(SyncError::Unsupported(
+            "rotation integrate: 存在已上传但未 ACK 的更新（≤S 未覆盖）",
+        ));
+    }
+    Ok(())
+}
+
+/// inbox 里是否有 `relay_seq <= S` 且尚未 integrated 的行（quarantine/因果洞）。
+///
+/// 正常不变量下 `integrated_seq >= S` 已经蕴含"≤S 无洞"；这里仍显式查一遍，既为防御
+/// meta 与 inbox 不一致（崩溃/手工修复），也让门禁失败原因可诊断。
+pub(crate) fn inbox_gap_at_or_before(
+    vault: &Vault,
+    cursor: &menghunote_storage::SyncCursorState,
+    target_s: u64,
+) -> Result<bool, SyncError> {
+    let Some(log_id) = cursor.log_id else {
+        return Ok(false);
+    };
+    let target = i64::try_from(target_s)
+        .map_err(|_| SyncError::LocalCorrupt("rotation integrate: S 超出 i64"))?;
+    let rows = vault.query(
+        "SELECT relay_seq FROM sync_inbox \
+         WHERE log_id=?1 AND relay_seq<=?2 AND state<>'integrated' \
+         ORDER BY relay_seq LIMIT 1",
+        &[
+            menghunote_storage::Value::Blob(log_id.to_vec()),
+            menghunote_storage::Value::Integer(target),
+        ],
+    )?;
+    Ok(!rows.is_empty())
+}
+
 /// 阶段 C：用旧根 pull+integrate 到 S，固定 local cut L。
 ///
 /// `received_seq` 不能代替 `integrated_seq`；只有本地真的 integrate 到 S 才允许继续。
+/// 通过 [`ensure_c_phase_gate`] 后按 journal 状态机推进 `Begun → Integrated`。
 pub fn integrate_to_s<C: RelayClient>(
     vault: &Vault,
     engine: &mut crate::engine::SyncEngine<'_, C>,
@@ -334,7 +468,12 @@ pub fn integrate_to_s<C: RelayClient>(
             }));
         }
     }
-    journal.mark_integrated(vault, target_s, local_cut)?;
+    // 门禁不再复用 `RotationJournal::mark_integrated`：那个实现把任何 pending/encrypted
+    // 本地编辑都当成"≤S 未覆盖"而拒绝（文件不在本次作用域）。这里按同一状态机语义
+    // （Begun → Integrated + local_cut）推进，门禁统一由 `ensure_c_phase_gate` 收口。
+    ensure_c_phase_gate(vault, target_s)?;
+    journal.advance(RotationPhase::Integrated)?;
+    journal.local_cut = Some(local_cut);
     journal.save(vault)?;
     Ok(())
 }

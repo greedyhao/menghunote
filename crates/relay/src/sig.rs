@@ -40,6 +40,8 @@ pub enum SignDomain {
     SlotActivate,
     /// `MN/v1/rotation\0`：轮换请求/激活。
     Rotation,
+    /// `MN/v1/activation-t\0`：完整 activation T 的旧/新管理 key 双签（ADR §34）。
+    ActivationT,
 }
 
 impl SignDomain {
@@ -58,6 +60,7 @@ impl SignDomain {
             Self::InviteRedeem => b"MN/v1/invite-redeem\0",
             Self::SlotActivate => b"MN/v1/slot-activate\0",
             Self::Rotation => b"MN/v1/rotation\0",
+            Self::ActivationT => proto::SIGN_ACTIVATION_T_DOMAIN,
         }
     }
 
@@ -79,6 +82,7 @@ impl SignDomain {
             Self::InviteRedeem => "invite-redeem",
             Self::SlotActivate => "slot-activate",
             Self::Rotation => "rotation",
+            Self::ActivationT => "activation-t",
         }
     }
 }
@@ -228,6 +232,7 @@ mod tests {
             SignDomain::Management,
             SignDomain::ObjectCommit,
             SignDomain::Checkpoint,
+            SignDomain::ActivationT,
         ] {
             assert!(domain.tag_ends_with_nul(), "{domain:?}");
             assert_eq!(domain.tag().last(), Some(&0u8));

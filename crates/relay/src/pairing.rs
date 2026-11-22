@@ -414,14 +414,19 @@ pub fn approve_device(
         ),
     )?;
     conn.execute(
+        // §24.2/评审 §三 4：外层管理签名（`AAD || enc || SHA256(ciphertext)` 的签名）与
+        // grant_id 必须一并落库，否则 `GET devices/self/grants/latest` 拿不到 signature64，
+        // 客户端 `verify_latest_grant` 无法验签（真实恢复/自批路径会失败）。
         "INSERT INTO device_grants(epoch, device_id, manager_rev, hpke_enc, hpke_ciphertext,
-                                   signed_header)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                                   signed_header, signature, grant_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(epoch, device_id) DO UPDATE SET
            manager_rev = excluded.manager_rev,
            hpke_enc = excluded.hpke_enc,
            hpke_ciphertext = excluded.hpke_ciphertext,
-           signed_header = excluded.signed_header",
+           signed_header = excluded.signed_header,
+           signature = excluded.signature,
+           grant_id = excluded.grant_id",
         (
             i64::try_from(vault.active_epoch).map_err(|_| Error::Invariant("epoch"))?,
             device_id.as_slice(),
@@ -429,6 +434,8 @@ pub fn approve_device(
             request.hpke_enc.as_slice(),
             request.hpke_ciphertext.as_slice(),
             signed_header.as_slice(),
+            request.grant_signature.as_slice(),
+            request.grant_id.as_slice(),
         ),
     )?;
     // 成员/证书变化进控制链（永久保留，不随密文 GC）。

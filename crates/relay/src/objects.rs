@@ -85,6 +85,7 @@ impl BudgetClass {
 pub struct ObjectRow {
     pub object_id: Hash32,
     pub message_id: Id16,
+    /// 对象生产者；ASSET 固定为 0（vault 内共享，AAD 不含 producer，§31.1）。
     pub producer: Id16,
     pub epoch: u64,
     pub object_type: ObjectType,
@@ -411,7 +412,7 @@ fn validate_reservation(
 /// `PUT part` 的请求参数（打包成一个结构，避免长参数列表掩盖调用顺序）。
 #[derive(Debug)]
 pub struct PartUpload<'a> {
-    /// 已鉴权的设备（必须等于 header 的 producer）。
+    /// 已鉴权的设备（非 ASSET 必须等于 header 的 producer；ASSET 见 §31.1 共享语义）。
     pub actor: &'a AuthContext,
     /// 路径上的 vault id（必须等于 header.vault_id）。
     pub vault_id: &'a Id16,
@@ -452,9 +453,20 @@ pub fn put_part(
         return Err(Error::api(ErrorCode::NotFound));
     }
     let actor_device = actor.device_id()?;
-    if header.producer_device_id != actor_device {
+    // §31/§31.1：ASSET 的 AAD 不含 `producer_device_id`，同步客户端把 header 里的
+    // producer 固定为 0（保证两设备上传同一资产的信封逐字节相同）。relay 对 ASSET
+    // 接受 0 或上传者本人；其他非零且不等于 actor 的值仍 403。非 ASSET 保持严格。
+    let is_asset = header.object_type == ObjectType::Asset;
+    let shared_asset_producer = is_asset && header.producer_device_id == [0u8; 16];
+    if header.producer_device_id != actor_device && !shared_asset_producer {
         return Err(Error::api(ErrorCode::Forbidden));
     }
+    // 资产由 vault 内设备共享，不记录"上传者所有权"：对象行 producer 固定 0。
+    let stored_producer = if is_asset {
+        [0u8; 16]
+    } else {
+        header.producer_device_id
+    };
     let is_candidate = check_writable_epoch(conn, &vault, &header)?;
     if is_candidate && reservation.is_none() {
         // 候选 epoch 的密文必须由轮换/checkpoint 的维护 reservation 覆盖（否则无预算归属）。
@@ -468,9 +480,12 @@ pub fn put_part(
     let existing = load_opt(conn, path_object)?;
     let (budget_class, stored_reservation, state) = match &existing {
         Some(obj) => {
+            // ASSET 行 producer 恒为 0；旧/兼容行（producer=上传者）仍允许同一上传者续传。
+            let producer_matches = obj.producer == header.producer_device_id
+                || (header.object_type == ObjectType::Asset && obj.producer == [0u8; 16]);
             let mismatch = obj.epoch != header.key_epoch
                 || obj.message_id != header.message_id
-                || obj.producer != header.producer_device_id
+                || !producer_matches
                 || obj.object_type != header.object_type
                 || obj.generation != header.generation
                 || obj.sender_seq != header.sender_seq
@@ -502,7 +517,7 @@ pub fn put_part(
                 (
                     header.object_id.as_slice(),
                     header.message_id.as_slice(),
-                    header.producer_device_id.as_slice(),
+                    stored_producer.as_slice(),
                     i64_of(header.key_epoch, "key_epoch")?,
                     header.object_type.as_i64(),
                     i64_of(header.generation, "generation")?,
@@ -572,7 +587,7 @@ pub fn put_part(
 /// `:complete` 的请求参数。
 #[derive(Debug)]
 pub struct CompleteUpload<'a> {
-    /// 已鉴权的设备（必须等于对象 producer）。
+    /// 已鉴权的设备（非 ASSET 必须等于对象 producer；ASSET 由该 actor 的 key 签名）。
     pub actor: &'a AuthContext,
     /// 路径上的 vault id。
     pub vault_id: &'a Id16,
@@ -602,9 +617,18 @@ pub fn complete(
     }
     // 一片都没上传时对象行还不存在：语义上就是 INCOMPLETE（而不是 404，避免暴露"上传进度"）。
     let object = load_opt(conn, object_id)?.ok_or_else(|| Error::api(ErrorCode::Incomplete))?;
-    if actor.device_id()? != object.producer {
+    let actor_device = actor.device_id()?;
+    // §31.1：ASSET 是 vault 内共享对象（producer=0）；complete 允许任一有效成员设备
+    // 提交，但签名仍必须由**该 actor** 的有效设备 key 给出（见下方 signer 选择）。
+    let shared_asset = object.object_type == ObjectType::Asset && object.producer == [0u8; 16];
+    if !shared_asset && actor_device != object.producer {
         return Err(Error::api(ErrorCode::Forbidden));
     }
+    let signer = if shared_asset {
+        actor_device
+    } else {
+        object.producer
+    };
 
     // 幂等：同 commit 字节 → 返回原 ACK（即使响应丢了也能重试）。
     let request_hash = sha256(commit);
@@ -643,7 +667,7 @@ pub fn complete(
 
     // 全部分片必须齐（否则 409，绝不能进 log）。
     let digest = recompute_digest(conn, &object)?;
-    let public_key = vault::device_sign_pk(conn, &object.producer)?
+    let public_key = vault::device_sign_pk(conn, &signer)?
         .ok_or_else(|| Error::Api(ApiError::new(ErrorCode::Revoked).epoch(vault.active_epoch)))?;
     let expectation = crate::sig::ObjectCommitExpectation {
         object_id,
@@ -658,7 +682,7 @@ pub fn complete(
     let check = SignatureCheck {
         domain: SignDomain::ObjectCommit,
         vault_id: &vault.vault_id,
-        device_id: Some(&object.producer),
+        device_id: Some(&signer),
         public_key: &public_key,
         message: commit,
         signature,
@@ -828,10 +852,14 @@ pub fn integrity_issues(conn: &Connection, object: &ObjectRow) -> Result<Vec<&'s
         }
         match Header::parse(&envelope) {
             Ok(header) => {
+                // §31.1：ASSET 的 producer 不在 AAD 内，确定性 header 为 0；不参与
+                // 完整性判定（envelope 字节本身已由 part/object digest 绑定）。
+                let producer_consistent = object.object_type == ObjectType::Asset
+                    || header.producer_device_id == object.producer;
                 let consistent = header.object_id == object.object_id
                     && header.key_epoch == object.epoch
                     && header.message_id == object.message_id
-                    && header.producer_device_id == object.producer
+                    && producer_consistent
                     && header.object_type == object.object_type
                     && header.generation == object.generation
                     && header.sender_seq == object.sender_seq
@@ -858,6 +886,37 @@ pub fn integrity_issues(conn: &Connection, object: &ObjectRow) -> Result<Vec<&'s
     Ok(issues)
 }
 
+/// §25.1/§34：把 `asset_objects JOIN objects` 的行转成 `ObjectRefV1`（按 object_id 升序）。
+fn collect_asset_refs<T>(rows: T) -> Result<Vec<proto::ObjectRefV1>>
+where
+    T: Iterator<Item = rusqlite::Result<(Vec<u8>, i64, i64, i64, i64, i64, Vec<u8>)>>,
+{
+    let mut refs = Vec::new();
+    for row in rows {
+        let (object_id, object_type, generation, object_epoch, part_count, plain_len, digest) =
+            row?;
+        refs.push(proto::ObjectRefV1 {
+            object_id: object_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Invariant("objects.object_id"))?,
+            object_type: proto::ObjectType::try_from(
+                u8::try_from(object_type).map_err(|_| Error::Invariant("objects.type"))?,
+            )
+            .map_err(|_| Error::Invariant("objects.type"))?,
+            generation: u64_of(generation, "objects.generation")?,
+            key_epoch: u64_of(object_epoch, "objects.epoch")?,
+            part_count: u32::try_from(part_count).map_err(|_| Error::Invariant("part_count"))?,
+            total_plain_len: u64_of(plain_len, "objects.plain_len")?,
+            object_digest: digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Invariant("objects.digest"))?,
+        });
+    }
+    Ok(refs)
+}
+
 /// §25.1：冻结时刻的资产集合摘要：`SHA256(CDE(sorted ObjectRefV1[ASSET]))`。
 /// 只使用不透明登记 + ObjectRefV1 元数据；真实文件 hash/MIME/长度不在 relay。
 pub fn asset_set_digest(conn: &Connection, epoch: u64, through_seq: u64) -> Result<Hash32> {
@@ -882,31 +941,43 @@ pub fn asset_set_digest(conn: &Connection, epoch: u64, through_seq: u64) -> Resu
             ))
         },
     )?;
-    let mut refs = Vec::new();
-    for row in rows {
-        let (object_id, object_type, generation, object_epoch, part_count, plain_len, digest) =
-            row?;
-        refs.push(proto::ObjectRefV1 {
-            object_id: object_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::Invariant("objects.object_id"))?,
-            object_type: proto::ObjectType::try_from(
-                u8::try_from(object_type).map_err(|_| Error::Invariant("objects.type"))?,
-            )
-            .map_err(|_| Error::Invariant("objects.type"))?,
-            generation: u64_of(generation, "objects.generation")?,
-            key_epoch: u64_of(object_epoch, "objects.epoch")?,
-            part_count: u32::try_from(part_count).map_err(|_| Error::Invariant("part_count"))?,
-            total_plain_len: u64_of(plain_len, "objects.plain_len")?,
-            object_digest: digest
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::Invariant("objects.digest"))?,
-        });
-    }
+    let refs = collect_asset_refs(rows)?;
     let input =
         proto::refs_digest_input(&refs).map_err(|_| Error::Invariant("asset_set_digest input"))?;
+    Ok(sha256(&input))
+}
+
+/// §34：候选 epoch（重加密）资产集合摘要：`SHA256(CDE(sorted ObjectRefV1[ASSET]))`。
+///
+/// 与冻结时的 [`asset_set_digest`] 同口径，但只取本次 rotation 在候选 epoch 下已
+/// complete 的资产（`asset_objects.rotation_id` 绑定），供 activation T 的
+/// `new_asset_set_digest` 与 relay DB 事实逐项比对。
+pub fn candidate_asset_set_digest(
+    conn: &Connection,
+    epoch: u64,
+    rotation_id: &Id16,
+) -> Result<Hash32> {
+    let mut stmt = conn.prepare(
+        "SELECT o.object_id, o.type, o.generation, o.epoch, o.part_count, o.plain_len, o.digest
+         FROM asset_objects a JOIN objects o ON o.object_id = a.object_id
+         WHERE a.epoch = ?1 AND a.state = 'active' AND a.rotation_id = ?2
+           AND o.state = 'complete' AND o.digest IS NOT NULL
+         ORDER BY o.object_id ASC",
+    )?;
+    let rows = stmt.query_map((i64_of(epoch, "epoch")?, rotation_id.as_slice()), |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+        ))
+    })?;
+    let refs = collect_asset_refs(rows)?;
+    let input = proto::refs_digest_input(&refs)
+        .map_err(|_| Error::Invariant("candidate_asset_set_digest input"))?;
     Ok(sha256(&input))
 }
 

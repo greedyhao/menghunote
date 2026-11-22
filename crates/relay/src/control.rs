@@ -15,14 +15,18 @@
 //! 事件：
 //! - [`EpochActivated`]：`0 vault,1 instance,2 rotation,3 from,4 to,5 S,
 //!   6 primary_cid,7 fallback_cid,8 activation_commit,9 member_set_hash,
-//!   10 grants_digest,11 control_rev,12 auth_rev`
+//!   10 grants_digest,11 control_rev,12 auth_rev,13 activation_t?,
+//!   14 old_t_signature?,15 new_t_signature?`（ADR §34：13–15 同时存在或全缺）
+//! - [`RotationAborted`]：`0 rotation,1 method,2 path,3 body_digest`（ADR §35.3：
+//!   abort 的完整被签事实，客户端据此重建 `management_signing_input` 并验签）
 //! - [`RotationRestarted`]：`0 old_rotation,1 new_rotation,2 from_epoch,3 old_to_epoch,
 //!   4 new_to_epoch,5 freeze_seq`
 //! - [`RevocationsAdded`]：`0 rotation,1 devices(array<bytes16>),2 restarted(bool),
 //!   3 new_rotation?(bytes16)`
 //!
-//! **协议化说明**：这些记录目前定义在 relay（`crates/sync-proto` 的改动需 Lead 另行分派，
-//! 本任务禁止私改）；客户端 decode/验证需按本节字段编号实现，后续再收敛进 `sync-proto`。
+//! **协议化说明**：record/event 的字段编号与 canonical 编解码由 `sync-proto` 冻结
+//! （`proto::SignedControlRecord` / `proto::RotationAborted`）；本模块只保留 relay
+//! 语义类型并委托给 proto，避免两处字段编号漂移。
 
 use rusqlite::Connection;
 
@@ -129,7 +133,11 @@ pub fn kind_of(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// `epoch.activated` 的 typed 事件（rid/E/S/commit hash/control_rev）。
+/// `epoch.activated` 的 typed 事件（rid/E/S/commit hash/control_rev + activation T 双签）。
+///
+/// 13–15 为 ADR §34 新增：完整 activation T 的 canonical CDE 原字节，以及旧/新管理
+/// key 对 `activation_t_signing_input(T)` 的双签。三者必须同时存在（新记录）或同时
+/// 省略（升级前的历史记录）；wire 编解码统一交给 `sync-proto`，避免两处字段编号漂移。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochActivated {
     pub vault_id: Id16,
@@ -147,48 +155,117 @@ pub struct EpochActivated {
     pub grants_digest: [u8; 32],
     pub control_rev: u64,
     pub auth_rev: u64,
+    /// 完整 activation T 的 canonical CDE 原字节。
+    pub activation_t: Option<Vec<u8>>,
+    /// 旧管理 key 对 `activation_t_signing_input(T)` 的 64B 签名。
+    pub old_t_signature: Option<Vec<u8>>,
+    /// 新管理 key 对同一输入的 64B 签名。
+    pub new_t_signature: Option<Vec<u8>>,
 }
 
 impl EpochActivated {
+    fn to_proto(&self) -> proto::EpochActivated {
+        proto::EpochActivated {
+            vault_id: self.vault_id,
+            instance_id: self.instance_id,
+            rotation_id: self.rotation_id,
+            from_epoch: self.from_epoch,
+            to_epoch: self.to_epoch,
+            covered_seq: self.covered_seq,
+            primary_checkpoint: self.primary_checkpoint,
+            fallback_checkpoint: self.fallback_checkpoint,
+            activation_commit: self.activation_commit,
+            member_set_hash: self.member_set_hash,
+            grants_digest: self.grants_digest,
+            control_rev: self.control_rev,
+            auth_rev: self.auth_rev,
+            activation_t: self.activation_t.clone(),
+            old_t_signature: self.old_t_signature.clone(),
+            new_t_signature: self.new_t_signature.clone(),
+        }
+    }
+
+    fn from_proto(event: proto::EpochActivated) -> Self {
+        Self {
+            vault_id: event.vault_id,
+            instance_id: event.instance_id,
+            rotation_id: event.rotation_id,
+            from_epoch: event.from_epoch,
+            to_epoch: event.to_epoch,
+            covered_seq: event.covered_seq,
+            primary_checkpoint: event.primary_checkpoint,
+            fallback_checkpoint: event.fallback_checkpoint,
+            activation_commit: event.activation_commit,
+            member_set_hash: event.member_set_hash,
+            grants_digest: event.grants_digest,
+            control_rev: event.control_rev,
+            auth_rev: event.auth_rev,
+            activation_t: event.activation_t,
+            old_t_signature: event.old_t_signature,
+            new_t_signature: event.new_t_signature,
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
-        proto::encode_cde(&wire::map(vec![
-            (0, wire::bytes(self.vault_id)),
-            (1, wire::bytes(self.instance_id)),
-            (2, wire::bytes(self.rotation_id)),
-            (3, wire::uint(self.from_epoch)),
-            (4, wire::uint(self.to_epoch)),
-            (5, wire::uint(self.covered_seq)),
-            (6, wire::bytes(self.primary_checkpoint)),
-            (7, wire::bytes(self.fallback_checkpoint)),
-            (8, wire::bytes(self.activation_commit)),
-            (9, wire::bytes(self.member_set_hash)),
-            (10, wire::bytes(self.grants_digest)),
-            (11, wire::uint(self.control_rev)),
-            (12, wire::uint(self.auth_rev)),
-        ]))
-        .map_err(|_| Error::Invariant("epoch activated event encode"))
+        self.to_proto()
+            .encode()
+            .map_err(|_| Error::Invariant("epoch activated event encode"))
     }
 
     /// 解码 `epoch.activated` 事件（客户端/测试按字段编号解析）。
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let value =
-            proto::decode_cde(bytes).map_err(|_| Error::api(crate::ErrorCode::InvalidRequest))?;
-        let fields = wire::value_map(&value)?;
-        Ok(Self {
-            vault_id: wire::id16_field(&fields, 0)?,
-            instance_id: wire::id16_field(&fields, 1)?,
-            rotation_id: wire::id16_field(&fields, 2)?,
-            from_epoch: wire::uint_field(&fields, 3)?,
-            to_epoch: wire::uint_field(&fields, 4)?,
-            covered_seq: wire::uint_field(&fields, 5)?,
-            primary_checkpoint: wire::id16_field(&fields, 6)?,
-            fallback_checkpoint: wire::id16_field(&fields, 7)?,
-            activation_commit: wire::hash32_field(&fields, 8)?,
-            member_set_hash: wire::hash32_field(&fields, 9)?,
-            grants_digest: wire::hash32_field(&fields, 10)?,
-            control_rev: wire::uint_field(&fields, 11)?,
-            auth_rev: wire::uint_field(&fields, 12)?,
-        })
+        proto::EpochActivated::decode(bytes)
+            .map(Self::from_proto)
+            .map_err(|_| Error::api(crate::ErrorCode::InvalidRequest))
+    }
+}
+
+/// `rotation.abort` 的 typed 事件（ADR §35.3）。
+///
+/// abort 的 canonical body 是空 map，请求 path 含 rotation id；relay 此前只持久化
+/// body + 签名，客户端无法重建管理签名输入。把被签 path/method 与 body digest
+/// 原样写进事件后，`/control` 的消费者可以独立复算并验签。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationAborted {
+    /// 被废弃的轮换 id。
+    pub rotation_id: Id16,
+    /// 管理签名覆盖的 method（abort 固定 POST）。
+    pub method: proto::HttpMethod,
+    /// 管理签名覆盖的请求 path。
+    pub path: String,
+    /// `SHA256(signed_body)`。
+    pub body_digest: [u8; 32],
+}
+
+impl RotationAborted {
+    fn to_proto(&self) -> proto::RotationAborted {
+        proto::RotationAborted {
+            rotation_id: self.rotation_id,
+            method: self.method,
+            path: self.path.clone(),
+            body_digest: self.body_digest,
+        }
+    }
+
+    fn from_proto(event: proto::RotationAborted) -> Self {
+        Self {
+            rotation_id: event.rotation_id,
+            method: event.method,
+            path: event.path,
+            body_digest: event.body_digest,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.to_proto()
+            .encode()
+            .map_err(|_| Error::Invariant("rotation aborted event encode"))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        proto::RotationAborted::decode(bytes)
+            .map(Self::from_proto)
+            .map_err(|_| Error::api(crate::ErrorCode::InvalidRequest))
     }
 }
 
@@ -290,10 +367,14 @@ mod tests {
             grants_digest: [8u8; 32],
             control_rev: 11,
             auth_rev: 12,
+            activation_t: None,
+            old_t_signature: None,
+            new_t_signature: None,
         };
         let encoded = event.encode().expect("encode");
         // 同一语义重编码必须逐字节一致（CDE 唯一性）。
         assert_eq!(encoded, event.encode().expect("re-encode"));
+        assert_eq!(EpochActivated::decode(&encoded).expect("decode"), event);
         let restarted = RotationRestarted {
             old_rotation: [1u8; 16],
             new_rotation: [2u8; 16],
@@ -316,5 +397,14 @@ mod tests {
             revoked.encode().expect("revoke"),
             revoked.encode().expect("revoke re-encode")
         );
+        let aborted = RotationAborted {
+            rotation_id: [3u8; 16],
+            method: proto::HttpMethod::Post,
+            path: "/v1/vaults/1/rotations/1/abort".to_owned(),
+            body_digest: [0xD0u8; 32],
+        };
+        let encoded = aborted.encode().expect("abort event");
+        assert_eq!(encoded, aborted.encode().expect("abort re-encode"));
+        assert_eq!(RotationAborted::decode(&encoded).expect("decode"), aborted);
     }
 }

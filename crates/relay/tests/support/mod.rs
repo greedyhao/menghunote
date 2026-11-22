@@ -162,6 +162,60 @@ impl SignatureHook for TestHook {
     }
 }
 
+/// §34：按 relay 侧事实构造一份与本次 activate 完全一致的 activation T（测试用；签名由
+/// 调用方补）。真实 relay 用 `rotations::activate` 内的同口径函数重建并逐项比对。
+pub fn activation_t_for(
+    conn: &rusqlite::Connection,
+    vault: &Vault,
+    row: &rotations::RotationRow,
+    transition: &rotations::ManagerTransition,
+    primary: &Id16,
+    fallback: &Id16,
+) -> Result<proto::ActivationTV1> {
+    let primary_row = checkpoints::get(conn, primary)?;
+    let fallback_row = checkpoints::get(conn, fallback)?;
+    let commit_digest = |checkpoint: &checkpoints::CheckpointRow| -> Result<Hash32> {
+        Ok(sha256(checkpoint.signed_commit.as_deref().ok_or(
+            Error::Invariant("test activation T: signed_commit"),
+        )?))
+    };
+    let (head_rev, prev_control_hash) = vault::control_head(conn)?;
+    let expected_control_rev = head_rev
+        .checked_add(1)
+        .ok_or(Error::Invariant("test activation T: control rev"))?;
+    let (_, grants_digest) = rotations::grants_digest(conn, row.to_epoch)?;
+    Ok(proto::ActivationTV1 {
+        vault_id: vault.vault_id,
+        instance_id: vault.instance_id,
+        rotation_id: row.rotation_id,
+        from_epoch: row.from_epoch,
+        to_epoch: row.to_epoch,
+        freeze_seq: row.freeze_seq,
+        old_manager_rev: u32::try_from(transition.old_rev)
+            .map_err(|_| Error::Invariant("test activation T: old rev"))?,
+        new_manager_rev: u32::try_from(transition.new_rev)
+            .map_err(|_| Error::Invariant("test activation T: new rev"))?,
+        new_manager_pubkey: transition.new_pubkey,
+        prev_control_hash,
+        expected_control_rev,
+        primary_cid: *primary,
+        primary_commit_digest: commit_digest(&primary_row)?,
+        fallback_cid: *fallback,
+        fallback_commit_digest: commit_digest(&fallback_row)?,
+        slot_set_digest: rotations::slot_set_digest(conn, row.to_epoch)?,
+        member_cert_digest: rotations::member_cert_digest(conn)?,
+        grants_digest,
+        old_asset_set_digest: row
+            .asset_set_digest
+            .ok_or(Error::Invariant("test activation T: asset digest"))?,
+        new_asset_set_digest: objects::candidate_asset_set_digest(
+            conn,
+            row.to_epoch,
+            &row.rotation_id,
+        )?,
+    })
+}
+
 /// 测试夹具：一个已初始化的单 vault + 单设备。
 pub struct Fixture {
     pub db: Db,
@@ -205,6 +259,15 @@ impl Fixture {
     /// 才能证明"签名绑定 canonical body"这类安全断言（弱 `TestHook` 证明不了密码学不变量）。
     pub fn with_real_manager(label: &str) -> Self {
         Self::build(label, 1024 * 1024, 2 * 1024 * 1024, Some([0x4Du8; 32]))
+    }
+
+    /// 真实管理私钥 + 指定配额（轮换 Q 门禁/预算归类用例用）。
+    pub fn with_real_manager_limits(
+        label: &str,
+        normal_limit: i64,
+        maintenance_limit: i64,
+    ) -> Self {
+        Self::build(label, normal_limit, maintenance_limit, Some([0x4Du8; 32]))
     }
 
     /// 指定配额的夹具。
@@ -268,7 +331,13 @@ impl Fixture {
         };
         let db_for_init = db.clone();
         let clock_for_init = clock.clone();
-        let hook_for_init = hook.clone();
+        // 有真实管理私钥时，genesis 证书签名也必须走真实 Ed25519 校验（不再用 TestHook
+        // 接受占位签名）；只有弱夹具（无管理私钥）保留 TestHook。
+        let hook_for_init: Arc<dyn SignatureHook> = if manager_signing_key.is_some() {
+            Arc::new(relay::verify::Ed25519Hook)
+        } else {
+            hook.clone()
+        };
         let cfg_for_init = cfg.clone();
         db_for_init
             .write_blocking(move |conn| {
@@ -336,7 +405,12 @@ impl Fixture {
 
     /// 走完整 challenge → token 流程拿一个设备 token（HTTP 测试用）。
     pub fn device_token(&self) -> String {
-        let subject = self.device;
+        self.device_token_for(&self.device)
+    }
+
+    /// 指定设备 id 的 token（自批/恢复路径测试用）。
+    pub fn device_token_for(&self, device: &Id16) -> String {
+        let subject = *device;
         let challenge = {
             let clock = self.clock.clone();
             self.db
@@ -663,6 +737,11 @@ impl Fixture {
     // ---------------- 轮换 ----------------
 
     pub fn begin_rotation(&self, revoke: &[Id16]) -> rotations::RotationView {
+        self.begin_rotation_at(revoke, [5u8; 16])
+    }
+
+    /// 指定 request_id 的 begin（多次轮换/幂等测试用；同 id 不同 body 会 409）。
+    pub fn begin_rotation_at(&self, revoke: &[Id16], request_id: Id16) -> rotations::RotationView {
         let ctx = self.manager_ctx();
         let control_rev = self.vault().control_rev;
         let active_epoch = self.vault().active_epoch;
@@ -680,9 +759,9 @@ impl Fixture {
                     revoke: &revoke,
                     expected_epoch: active_epoch,
                     expected_control_rev: control_rev,
-                    request_id: [5u8; 16],
+                    request_id,
                     path: "/v1/vaults/1/rotations",
-                    body_sha256: sha256(b"body"),
+                    body_sha256: sha256(&request_id),
                     signed: b"rotation-record",
                     signature: b"signature",
                 },
@@ -891,6 +970,10 @@ impl Fixture {
             ),
             old_signature: Some(vec![0x11; 64]),
             new_signature: Some(vec![0x22; 64]),
+            // T 由 activate_rotation_inner 在拿到被指名的 pair 后补齐（需要 DB 事实）。
+            activation_t: None,
+            old_t_signature: None,
+            new_t_signature: None,
         }
     }
 
@@ -908,9 +991,18 @@ impl Fixture {
     }
 
     pub fn activate_rotation(&self, rotation: &Id16) -> Result<rotations::ActivateOutcome> {
+        self.activate_rotation_at(rotation, [6u8; 16])
+    }
+
+    /// 指定 request_id 的 activate（多次轮换必须用不同 id，避免 dedup 回放上一轮）。
+    pub fn activate_rotation_at(
+        &self,
+        rotation: &Id16,
+        request_id: Id16,
+    ) -> Result<rotations::ActivateOutcome> {
         let row = self.rotation_view(rotation).rotation;
         let new_manager = self.default_new_manager(&row);
-        self.activate_rotation_with_manager(rotation, new_manager)
+        self.activate_rotation_inner(rotation, None, Some(new_manager), request_id)
     }
 
     /// 显式指名两个 cid 的 activate（独立性负例/多候选用例）。
@@ -932,7 +1024,12 @@ impl Fixture {
         fallback: Id16,
         new_manager: rotations::NewManager,
     ) -> Result<rotations::ActivateOutcome> {
-        self.activate_rotation_inner(rotation, Some((primary, fallback)), Some(new_manager))
+        self.activate_rotation_inner(
+            rotation,
+            Some((primary, fallback)),
+            Some(new_manager),
+            [6u8; 16],
+        )
     }
 
     /// 缺 new_manager → 必须 409（§27.2：不允许绕过新管理权要求）。
@@ -940,7 +1037,7 @@ impl Fixture {
         &self,
         rotation: &Id16,
     ) -> Result<rotations::ActivateOutcome> {
-        self.activate_rotation_inner(rotation, None, None)
+        self.activate_rotation_inner(rotation, None, None, [6u8; 16])
     }
 
     /// 不带任何候选 cid 的 activate（§28.1 条目 2：必须指名两个 cid → 409 INCOMPLETE）。
@@ -985,6 +1082,7 @@ impl Fixture {
         rotation: &Id16,
         named: Option<(Id16, Id16)>,
         new_manager: Option<rotations::NewManager>,
+        request_id: Id16,
     ) -> Result<rotations::ActivateOutcome> {
         let pair = named.or_else(|| self.candidate_pair(rotation));
         let ctx = self.manager_ctx();
@@ -996,6 +1094,28 @@ impl Fixture {
         db.write_blocking(move |conn| {
             let row = rotations::get(conn, &rotation)?;
             let (_, grants_digest) = rotations::grants_digest(conn, row.to_epoch)?;
+            // 默认在测试侧补齐与 DB 事实一致的 activation T（签名用占位值，TestHook 接受）。
+            // 负例的 transition 本身可能不合法，构造失败时留空，由真实 activate 先拒绝
+            // transition（保持各负例原本的 409 语义）。
+            let mut new_manager = new_manager;
+            if let (Some(manager), Some((primary, fallback))) = (new_manager.as_mut(), pair) {
+                if manager.activation_t.is_none() {
+                    let filled = (|| -> Option<Vec<u8>> {
+                        let transition =
+                            rotations::ManagerTransition::decode(&manager.transition).ok()?;
+                        let vault = vault::load(conn).ok()?;
+                        let activation_t =
+                            activation_t_for(conn, &vault, &row, &transition, &primary, &fallback)
+                                .ok()?;
+                        activation_t.encode().ok()
+                    })();
+                    if let Some(bytes) = filled {
+                        manager.activation_t = Some(bytes);
+                        manager.old_t_signature = Some(vec![0x33; 64]);
+                        manager.new_t_signature = Some(vec![0x44; 64]);
+                    }
+                }
+            }
             rotations::activate(
                 conn,
                 clock.as_ref(),
@@ -1003,7 +1123,7 @@ impl Fixture {
                 &ctx,
                 &rotation,
                 &rotations::ActivateRequest {
-                    request_id: [6u8; 16],
+                    request_id,
                     path: "/v1/vaults/1/rotations/1/activate",
                     body_sha256: sha256(b"activate"),
                     expected_control_rev: control_rev,
@@ -1028,7 +1148,7 @@ impl Fixture {
         rotation: &Id16,
         new_manager: rotations::NewManager,
     ) -> Result<rotations::ActivateOutcome> {
-        self.activate_rotation_inner(rotation, None, Some(new_manager))
+        self.activate_rotation_inner(rotation, None, Some(new_manager), [6u8; 16])
     }
 
     pub fn gc(&self) -> relay::gc::GcOutcome {

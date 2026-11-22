@@ -341,3 +341,205 @@ fn repack_fence_uses_sync_meta_key() {
     set_repack_required(&vault, false).expect("重开后清除");
     assert!(!repack_required(&vault).expect("最终 false"));
 }
+
+// ============================================================ 评审 0002 T12 补充
+// multi-doc 的 repack 必须逐条 CAS、互不污染；任一 SQL 点失败都回滚；
+// 原 op bytes/update_id 保留，迟到旧 ACK 不得清新 row/parts。
+
+fn update_rows(vault: &Vault, doc_id: &str) -> Vec<(u64, String, Vec<u8>)> {
+    menghunote_storage::doc_updates_since(vault, doc_id, 0)
+        .expect("doc_updates_since")
+        .into_iter()
+        .map(|update| (update.seq, update.update_id, update.payload))
+        .collect()
+}
+
+#[test]
+fn multi_doc_repack_is_per_doc_and_late_old_ack_never_clears_new_row() {
+    let (dir, vault) = fresh_vault();
+
+    // doc-1：已加密且 sent；doc-2：已加密但未发送（一覆盖一未覆盖的 outbox 形态）。
+    let doc1 = seed_note(&vault, "note-1", "doc-1");
+    doc1.insert_scalars(0, "doc one").expect("doc1 正文");
+    commit_now(&vault, &doc1, "batch-1");
+    enqueue_sync_intent(&vault, "msg-1", "batch-1", "doc-1", 1, OLD_EPOCH, &[1; 32])
+        .expect("doc1 intent");
+    store_encrypted_parts(&vault, "msg-1", OLD_EPOCH, &OLD_DIGEST, &old_parts())
+        .expect("doc1 parts");
+    assert!(mark_sent(&vault, "msg-1", OLD_EPOCH, &OLD_DIGEST).expect("doc1 sent"));
+
+    let doc2 = seed_note(&vault, "note-2", "doc-2");
+    doc2.insert_scalars(0, "doc two").expect("doc2 正文");
+    commit_now(&vault, &doc2, "batch-2");
+    enqueue_sync_intent(&vault, "msg-2", "batch-2", "doc-2", 1, OLD_EPOCH, &[2; 32])
+        .expect("doc2 intent");
+    store_encrypted_parts(&vault, "msg-2", OLD_EPOCH, &[2; 32], &old_parts()).expect("doc2 parts");
+
+    let rows1_before = update_rows(&vault, "doc-1");
+    let rows2_before = update_rows(&vault, "doc-2");
+    let candidates = outbox_repack_candidates(&vault, 2).expect("candidates");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.message_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["msg-1", "msg-2"],
+        "两条旧 epoch outbox 都必须进入候选"
+    );
+
+    // 只 repack doc-1：doc-2 的旧 row/parts/update 必须原样保留（不能整批假装原子）。
+    assert_eq!(
+        repack_outbox(
+            &vault,
+            &OutboxKey {
+                message_id: "msg-1".to_owned(),
+                epoch: OLD_EPOCH,
+                cipher_digest: OLD_DIGEST,
+            },
+            &new_spec("msg-1-new", 2, 0x21, 0x31),
+        )
+        .expect("doc1 repack"),
+        RepackOutcome::Repacked
+    );
+    assert!(outbox_row(&vault, "msg-1").expect("old doc1").is_none());
+    let old2 = outbox_row(&vault, "msg-2")
+        .expect("doc2 row")
+        .expect("doc2 旧行仍在");
+    assert_eq!(old2.key_epoch, OLD_EPOCH);
+    assert_eq!(old2.cipher_digest, Some([2; 32]));
+    assert_eq!(
+        outbox_parts(&vault, "msg-2", OLD_EPOCH)
+            .expect("doc2 parts")
+            .len(),
+        2
+    );
+    assert_eq!(
+        update_rows(&vault, "doc-1"),
+        rows1_before,
+        "doc1 原 op 不变"
+    );
+    assert_eq!(
+        update_rows(&vault, "doc-2"),
+        rows2_before,
+        "doc2 原 op 不变"
+    );
+
+    // 再 repack doc-2；随后迟到的旧 ACK 对两个旧三元组都必须 false，且新 row/parts 仍在。
+    assert_eq!(
+        repack_outbox(
+            &vault,
+            &OutboxKey {
+                message_id: "msg-2".to_owned(),
+                epoch: OLD_EPOCH,
+                cipher_digest: [2; 32],
+            },
+            &new_spec("msg-2-new", 2, 0x22, 0x32),
+        )
+        .expect("doc2 repack"),
+        RepackOutcome::Repacked
+    );
+    assert!(!mark_acked(&vault, "msg-1", OLD_EPOCH, &OLD_DIGEST).expect("旧 ACK 1"));
+    assert!(!mark_acked(&vault, "msg-2", OLD_EPOCH, &[2; 32]).expect("旧 ACK 2"));
+    for (message, object) in [("msg-1-new", 0x21u8), ("msg-2-new", 0x22u8)] {
+        let row = outbox_row(&vault, message).expect("新行").expect("存在");
+        assert_eq!(row.key_epoch, 2);
+        assert_eq!(row.object_id, Some([object; 32]));
+        assert_eq!(
+            outbox_parts(&vault, message, 2).expect("新 parts").len(),
+            2,
+            "旧 ACK 不得清新 row/parts"
+        );
+    }
+    assert_eq!(update_rows(&vault, "doc-1"), rows1_before);
+    assert_eq!(update_rows(&vault, "doc-2"), rows2_before);
+
+    // 重开：两条新行都在，旧行不会复活。
+    drop(vault);
+    let vault = open_vault(&vault_path(&dir));
+    assert!(outbox_row(&vault, "msg-1").expect("旧1").is_none());
+    assert!(outbox_row(&vault, "msg-2").expect("旧2").is_none());
+    assert!(outbox_row(&vault, "msg-1-new").expect("新1").is_some());
+    assert!(outbox_row(&vault, "msg-2-new").expect("新2").is_some());
+}
+
+#[test]
+fn repack_rolls_back_at_every_sql_statement_and_retries_cleanly() {
+    let (dir, vault) = fresh_vault();
+    seed_old_outbox(&vault);
+    assert!(mark_sent(&vault, OLD_MESSAGE, OLD_EPOCH, &OLD_DIGEST).expect("marked sent"));
+    let rows_before = update_rows(&vault, "doc-1");
+
+    // repack 事务的 4 类 SQL 点各失败一次：delete parts / delete row / insert row / insert parts。
+    let points = [
+        (
+            "fail_delete_old_parts",
+            "CREATE TRIGGER fail_delete_old_parts BEFORE DELETE ON sync_outbox_parts \
+             BEGIN SELECT RAISE(ABORT,'injected delete parts'); END;",
+        ),
+        (
+            "fail_delete_old_row",
+            "CREATE TRIGGER fail_delete_old_row BEFORE DELETE ON sync_outbox \
+             BEGIN SELECT RAISE(ABORT,'injected delete row'); END;",
+        ),
+        (
+            "fail_insert_new_row",
+            "CREATE TRIGGER fail_insert_new_row BEFORE INSERT ON sync_outbox \
+             BEGIN SELECT RAISE(ABORT,'injected insert row'); END;",
+        ),
+        (
+            "fail_insert_new_part",
+            "CREATE TRIGGER fail_insert_new_part BEFORE INSERT ON sync_outbox_parts \
+             BEGIN SELECT RAISE(ABORT,'injected insert part'); END;",
+        ),
+    ];
+    for (name, sql) in points {
+        vault.exec_batch(sql).expect("注入触发器");
+        let error = repack_outbox(&vault, &old_key(), &new_spec("msg-new", 2, 2, 8));
+        assert!(error.is_err(), "{name} 必须让 repack 失败");
+        let row = outbox_row(&vault, OLD_MESSAGE)
+            .expect("旧行查询")
+            .expect("旧行必须保留");
+        assert_eq!(row.key_epoch, OLD_EPOCH, "{name}");
+        assert_eq!(row.cipher_digest, Some(OLD_DIGEST), "{name}");
+        assert_eq!(row.state, SyncOutboxState::Sent, "{name}");
+        assert_eq!(
+            outbox_parts(&vault, OLD_MESSAGE, OLD_EPOCH)
+                .expect("旧 parts")
+                .len(),
+            2,
+            "{name}: 旧 parts 必须保留"
+        );
+        assert!(
+            outbox_row(&vault, "msg-new").expect("新行").is_none(),
+            "{name}: 不得留半条新行"
+        );
+        assert!(
+            outbox_parts(&vault, "msg-new", 2)
+                .expect("新 parts")
+                .is_empty(),
+            "{name}: 不得留半套新 parts"
+        );
+        assert_eq!(
+            update_rows(&vault, "doc-1"),
+            rows_before,
+            "{name}: 原 op 不变"
+        );
+        vault
+            .exec_batch(&format!("DROP TRIGGER {name}"))
+            .expect("撤销触发器");
+    }
+
+    // 撤销注入后重试同一 repack；重开仍保持新行/新 parts。
+    assert_eq!(
+        repack_outbox(&vault, &old_key(), &new_spec("msg-new", 2, 2, 8)).expect("恢复 repack"),
+        RepackOutcome::Repacked
+    );
+    drop(vault);
+    let vault = open_vault(&vault_path(&dir));
+    assert!(outbox_row(&vault, OLD_MESSAGE).expect("旧行").is_none());
+    assert_eq!(
+        outbox_parts(&vault, "msg-new", 2).expect("新 parts").len(),
+        2
+    );
+    assert_eq!(update_rows(&vault, "doc-1"), rows_before);
+}

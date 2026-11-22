@@ -12,12 +12,16 @@ use support::*;
 
 use menghunote_storage::{
     load_body_doc, load_head, outbox_parts, outbox_row, sync_cursor_state, StorageError,
-    SyncOutboxState, Vault,
+    SyncOutboxState, Vault, META_SYNC_LOG_ID,
 };
 use menghunote_sync::engine::{EngineIdentity, SyncEngine, RELAY_CURSOR_META};
 use menghunote_sync::relay::{PauseReason, RelayLogKind};
 use menghunote_sync::SyncError;
-use menghunote_sync_proto::{Envelope, ObjectType};
+use menghunote_sync_proto::{
+    cap_plain, encode_cde, part_count_for, CdeValue, Envelope, ObjectCommit, ObjectType,
+    ProtoError, MAX_ASSET_RAW_BYTES,
+};
+use sha2::{Digest, Sha256};
 
 fn engine<'a>(
     vault: &'a Vault,
@@ -56,6 +60,7 @@ fn publish_from(relay: &mut FakeRelay, vault: &Vault, device: &Device) -> usize 
 
 #[test]
 fn outbound_encrypt_push_ack_roundtrip() {
+    ensure_test_identity_wrap();
     let (_dir, vault) = fresh_vault();
     let device = Device::new(1);
     let mut relay = FakeRelay::new(&[&device]);
@@ -93,6 +98,7 @@ fn outbound_encrypt_push_ack_roundtrip() {
 
 #[test]
 fn push_retry_reuses_persisted_ciphertext() {
+    ensure_test_identity_wrap();
     let (_dir, vault) = fresh_vault();
     let device = Device::new(2);
     let mut relay = FakeRelay::new(&[&device]);
@@ -143,6 +149,7 @@ fn push_retry_reuses_persisted_ciphertext() {
 
 #[test]
 fn partial_success_keeps_remaining_outbox() {
+    ensure_test_identity_wrap();
     let (_dir, vault) = fresh_vault();
     let device = Device::new(3);
     let mut relay = FakeRelay::new(&[&device]);
@@ -176,6 +183,7 @@ fn partial_success_keeps_remaining_outbox() {
 
 #[test]
 fn inbound_pull_integrate_uses_local_seq_not_sender_seq() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let (_b_dir, vault_b) = fresh_vault();
     let device_a = Device::new(4);
@@ -221,6 +229,7 @@ fn inbound_pull_integrate_uses_local_seq_not_sender_seq() {
 
 #[test]
 fn out_of_order_dependency_is_durable_then_integrated() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let (_b_dir, vault_b) = fresh_vault();
     let device_a = Device::new(6);
@@ -257,6 +266,7 @@ fn out_of_order_dependency_is_durable_then_integrated() {
 
 #[test]
 fn tampered_part_or_signature_rejected_without_cursor_advance() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let (_b_dir, vault_b) = fresh_vault();
     let device_a = Device::new(8);
@@ -298,6 +308,7 @@ fn tampered_part_or_signature_rejected_without_cursor_advance() {
 
 #[test]
 fn replay_and_frozen_cursor_are_idempotent() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let (_b_dir, vault_b) = fresh_vault();
     let device_a = Device::new(10);
@@ -336,6 +347,7 @@ fn replay_and_frozen_cursor_are_idempotent() {
 
 #[test]
 fn rollback_log_id_change_and_cursor_expiry_pause() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let (_b_dir, vault_b) = fresh_vault();
     let device_a = Device::new(12);
@@ -394,6 +406,7 @@ fn rollback_log_id_change_and_cursor_expiry_pause() {
 
 #[test]
 fn truncated_log_and_unsupported_event_keep_cursor() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let device_a = Device::new(14);
     let mut relay = FakeRelay::new(&[&device_a]);
@@ -429,6 +442,7 @@ fn truncated_log_and_unsupported_event_keep_cursor() {
 
 #[test]
 fn wrong_root_missing_cert_and_missing_signature_fail() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let (_b_dir, vault_b) = fresh_vault();
     let device_a = Device::new(15);
@@ -491,6 +505,7 @@ fn wrong_root_missing_cert_and_missing_signature_fail() {
 
 #[test]
 fn integrate_defers_unknown_document() {
+    ensure_test_identity_wrap();
     let (_a_dir, vault_a) = fresh_vault();
     let (_b_dir, vault_b) = fresh_vault();
     let device_a = Device::new(17);
@@ -520,6 +535,7 @@ fn integrate_defers_unknown_document() {
 
 #[test]
 fn sync_once_covers_all_phases() {
+    ensure_test_identity_wrap();
     let (_dir, vault) = fresh_vault();
     let device = Device::new(19);
     let mut relay = FakeRelay::new(&[&device]);
@@ -545,6 +561,7 @@ fn sync_once_covers_all_phases() {
 
 #[test]
 fn head_conflict_is_retryable_and_export_retries_without_data_loss() {
+    ensure_test_identity_wrap();
     use menghunote_sync::storage_view;
 
     let (_dir, vault) = fresh_vault();
@@ -601,6 +618,7 @@ fn head_conflict_is_retryable_and_export_retries_without_data_loss() {
 
 #[test]
 fn genesis_materials_drive_full_fake_flow_with_restart() {
+    ensure_test_identity_wrap();
     use menghunote_sync::genesis;
 
     let dir = temp_dir();
@@ -686,4 +704,663 @@ fn genesis_materials_drive_full_fake_flow_with_restart() {
 
     // 管理公钥与证书链仍可校验（genesis 把 manager_pub pin 进身份）。
     materials.signed_cert.verify(&manager_pub).expect("证书链");
+}
+
+/// T01/T02/T03：freeze 后 kill/reopen，durable barrier 必须阻止旧 epoch 的 encrypt/push。
+///
+/// 屏障不依赖 RAM：`SyncEngine` 构造时从 rotation journal phase 与
+/// `sync.repack_required` 重建，只有 journal 明确 Completed/Promoted 且屏障已清才解冻。
+#[test]
+fn freeze_barrier_survives_kill_and_blocks_old_epoch_encrypt_and_push() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x61);
+    let mut relay = FakeRelay::new(&[&device]);
+    let doc = seed_doc(&vault, "doc-freeze", device.identity.peer_id);
+    doc.insert_scalars(0, "frozen body").expect("正文");
+    let message_id = uuid_like(0x71);
+    let object_id: [u8; 32] = [0x71; 32];
+    commit_with_intent(&vault, &doc, &message_id, object_id, EPOCH);
+
+    // 阶段 A：冻结并落 journal；冻结前已把一条 intent 加密成 MNE1（旧写）。
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        assert_eq!(sync.encrypt_pending(10).expect("冻结前加密"), 1);
+        sync.freeze_rotation();
+        let journal = menghunote_sync::rotation_journal::RotationJournal::freeze(
+            &vault, EPOCH, [0x71; 16], 3, [0x72; 32],
+        )
+        .expect("journal freeze");
+        assert_eq!(
+            journal.phase,
+            menghunote_sync::rotation_journal::RotationPhase::Frozen
+        );
+        // 冻结中：同一引擎必须拒绝 push。
+        assert!(matches!(
+            sync.push(),
+            Err(SyncError::Paused(PauseReason::RotationFrozen))
+        ));
+    }
+
+    // 模拟 kill：journal 已 durable，engine 重建。
+    let journal =
+        menghunote_sync::rotation_journal::RotationJournal::load(&vault).expect("journal load");
+    assert_eq!(
+        journal.expect("journal").phase,
+        menghunote_sync::rotation_journal::RotationPhase::Frozen
+    );
+    let mut restarted = engine(&vault, &mut relay, &device);
+    // 旧写（已加密行）不得在重启后解冻；新 pending 也不得再加密。
+    assert!(
+        matches!(
+            restarted.push(),
+            Err(SyncError::Paused(PauseReason::RotationFrozen))
+        ),
+        "重启后旧 epoch push 仍必须被冻结屏障拒绝"
+    );
+    let new_doc = seed_doc(&vault, "doc-freeze-2", device.identity.peer_id);
+    new_doc.insert_scalars(0, "local edit").expect("正文");
+    commit_with_intent(&vault, &new_doc, &uuid_like(0x72), [0x72; 32], EPOCH);
+    assert!(
+        matches!(
+            restarted.encrypt_pending(10),
+            Err(SyncError::Paused(PauseReason::RotationFrozen))
+        ),
+        "重启后新 pending 也不得被加密成旧 epoch 密文"
+    );
+    // 本地 A 事务编辑仍然可见（冻结不阻断本地写）。
+    let (local, _) =
+        load_body_doc(&vault, "doc-freeze-2", device.identity.peer_id, None).expect("本地文档");
+    assert_eq!(local.text(), "local edit");
+}
+
+/// 评审 0003 P1-3：I 阶段 apply phase 本身就是持久屏障。
+///
+/// 只有 `applied` 解冻；`applying`/`paused` 等（含 merge 后、promotion 前崩溃留下的
+/// `applying`）在重启后必须继续冻结旧 epoch 的 encrypt/push。
+#[test]
+fn apply_phase_alone_freezes_until_applied() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x63);
+    let mut relay = FakeRelay::new(&[&device]);
+
+    vault
+        .set_meta("sync.rotation_apply_phase", b"applying")
+        .expect("phase");
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        assert!(sync.is_rotation_frozen(), "applying phase 必须冻结");
+        assert!(matches!(
+            sync.encrypt_pending(1),
+            Err(SyncError::Paused(PauseReason::RotationFrozen))
+        ));
+    }
+
+    vault
+        .set_meta("sync.rotation_apply_phase", b"applied")
+        .expect("phase");
+    let sync = engine(&vault, &mut relay, &device);
+    assert!(
+        !sync.is_rotation_frozen(),
+        "applied 且无 repack/journal 时不得冻结"
+    );
+
+    // 未知值 fail-closed（重启后仍冻结）。
+    drop(sync);
+    vault
+        .set_meta("sync.rotation_apply_phase", b"garbage")
+        .expect("phase");
+    let sync = engine(&vault, &mut relay, &device);
+    assert!(sync.is_rotation_frozen(), "未知 phase 必须 fail-closed");
+}
+
+// ============================================================ 评审 0003 P0-B 残余
+// checkpoint 的 `ConsumedAsset` 推断已删除：ASSET 必须由 pull 在推进游标前先**真实下载
+// 并验证**，再落 durable skipped-asset 记录；重复 seq 幂等、冲突 fail-closed。
+// 伪造/损坏的 ASSET（缺 parts、错 OID/digest/长度/AEAD、明文头不自洽）必须让 pull
+// 返回 Err，且不写记录、不推游标。
+
+const ASSET_DATA: &[u8] = b"engine verified asset payload";
+
+fn skipped_asset_rows(vault: &Vault) -> Vec<(String, Vec<u8>)> {
+    vault
+        .query(
+            "SELECT key,value FROM meta WHERE substr(key,1,?1)=?2 ORDER BY key",
+            &[
+                menghunote_storage::Value::Integer("sync.skipped_asset.".len() as i64),
+                menghunote_storage::Value::Text("sync.skipped_asset.".to_owned()),
+            ],
+        )
+        .expect("读 skipped-asset meta")
+        .iter()
+        .map(|row| {
+            let key = match row.first() {
+                Some(menghunote_storage::Value::Text(key)) => key.clone(),
+                _ => panic!("skipped-asset key 类型非法"),
+            };
+            let value = match row.get(1) {
+                Some(menghunote_storage::Value::Blob(value)) => value.clone(),
+                _ => panic!("skipped-asset value 类型非法"),
+            };
+            (key, value)
+        })
+        .collect()
+}
+
+/// 真实 canonical ASSET 夹具（parts + 日志事件都由 FakeRelay 持有）。
+fn publish_device_asset(
+    relay: &mut FakeRelay,
+    device: &Device,
+    data: &[u8],
+    media_type: &str,
+) -> ([u8; 32], u64) {
+    publish_real_asset(
+        relay,
+        device.vault_id,
+        device.device_id,
+        &device.identity.signing_key,
+        &device.root,
+        data,
+        media_type,
+    )
+}
+
+/// 失败的 pull 必须零副作用：不写 skipped-asset 记录、游标/received 水位不前进。
+fn assert_asset_pull_rejected(vault: &Vault, relay: &mut FakeRelay, device: &Device) {
+    let before_cursor = cursor(vault);
+    let before_received = received(vault);
+    {
+        let mut sync = engine(vault, relay, device);
+        assert!(
+            sync.pull().is_err(),
+            "伪造/损坏的 ASSET 必须让 pull 返回 Err"
+        );
+    }
+    assert_eq!(
+        cursor(vault),
+        before_cursor,
+        "ASSET 验证失败不得推进 relay 游标"
+    );
+    assert_eq!(
+        received(vault),
+        before_received,
+        "ASSET 验证失败不得推进 received 水位"
+    );
+    assert!(
+        skipped_asset_rows(vault).is_empty(),
+        "ASSET 验证失败不得写 skipped-asset 记录"
+    );
+}
+
+/// 准备一个已绑定 log_id/游标的空库（避免 pull 在失败前写 log_id 干扰零副作用断言）。
+fn seed_asset_pull_fixture(vault: &Vault, relay: &FakeRelay) {
+    vault
+        .set_meta(META_SYNC_LOG_ID, &relay.log_id)
+        .expect("写 log_id");
+    seed_cursor(vault);
+}
+
+#[test]
+fn pull_verifies_real_asset_before_persisting_skipped_record() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x64);
+    let mut relay = FakeRelay::new(&[&device]);
+    let (object_id, seq) = publish_device_asset(&mut relay, &device, ASSET_DATA, "image/png");
+    assert_eq!(seq, 1);
+    seed_asset_pull_fixture(&vault, &relay);
+
+    // 冻结游标：模拟 relay 回显旧 token。记录必须已 durable，但游标仍停在 c0。
+    relay.freeze_next_cursor = true;
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        let first = sync.pull().expect("真实 ASSET 必须通过来源认证");
+        assert_eq!(first.events, 1);
+        assert_eq!(first.skipped, 1);
+        assert_eq!(
+            cursor(&vault).as_deref(),
+            Some("c0"),
+            "游标不得被冻结页推进"
+        );
+    }
+    let rows = skipped_asset_rows(&vault);
+    assert_eq!(rows.len(), 1, "ASSET 消费必须先落 durable 记录");
+    assert!(
+        rows[0]
+            .0
+            .contains(&menghunote_sync::base64url::encode(&relay.log_id)),
+        "记录 key 必须绑定 log_id: {}",
+        rows[0].0
+    );
+    assert!(
+        rows[0].0.ends_with("00000000000000000001"),
+        "记录 key 必须绑定 relay_seq: {}",
+        rows[0].0
+    );
+    assert!(
+        rows[0].1.windows(32).any(|window| window == object_id),
+        "记录值必须包含 object_id"
+    );
+    let real_sha: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+    assert!(
+        rows[0].1.windows(32).any(|window| window == real_sha),
+        "记录值必须包含本机验证过的 real_sha256"
+    );
+    assert!(
+        rows[0]
+            .1
+            .windows("image/png".len())
+            .any(|window| window == b"image/png"),
+        "记录值必须包含本机验证过的 MIME"
+    );
+
+    // 同一 seq 重放（游标仍是 c0）：幂等，不新增/不改写记录。
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        assert_eq!(sync.pull().expect("重放").skipped, 1);
+    }
+    assert_eq!(skipped_asset_rows(&vault), rows, "重复 seq 必须幂等");
+    assert_eq!(cursor(&vault).as_deref(), Some("c1"));
+}
+
+/// 多片 ASSET：必须逐片拉取/验证，不能只看第 0 片。
+#[test]
+fn pull_verifies_multipart_asset() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x6e);
+    let mut relay = FakeRelay::new(&[&device]);
+    let cap = menghunote_sync_proto::cap_plain(ObjectType::Asset) as usize;
+    let data = vec![0x5a; cap + 17];
+    let (object_id, _) =
+        publish_device_asset(&mut relay, &device, &data, "application/octet-stream");
+    seed_asset_pull_fixture(&vault, &relay);
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        let report = sync.pull().expect("多片 ASSET 必须逐片拉取并验证");
+        assert_eq!(report.skipped, 1);
+    }
+    assert_eq!(cursor(&vault).as_deref(), Some("c1"));
+    let rows = skipped_asset_rows(&vault);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].1.windows(32).any(|window| window == object_id));
+}
+
+/// relay 重写已消费的 ASSET seq：HMAC 通过的 durable 记录与重发事件冲突时必须
+/// `Paused(RelayHistoryRewritten)`，不得报成本地损坏，也不得覆盖原记录/推进游标。
+#[test]
+fn pull_pauses_when_relay_rewrites_consumed_asset_seq() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x70);
+    let mut relay = FakeRelay::new(&[&device]);
+    let (first_object, first_seq) =
+        publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+    assert_eq!(first_seq, 1);
+    seed_asset_pull_fixture(&vault, &relay);
+
+    // 第一次 pull：冻结游标，让记录 durable 而 cursor 停在 c0；否则第二次 pull 从
+    // c1 开始，看不到被重写的 seq=1。
+    relay.freeze_next_cursor = true;
+    {
+        let mut sync = engine(&vault, &mut relay, &device);
+        assert_eq!(
+            sync.pull().expect("真实 ASSET 必须落 durable 记录").skipped,
+            1
+        );
+    }
+    let records = skipped_asset_rows(&vault);
+    assert_eq!(records.len(), 1, "第一次 pull 必须已落 durable 记录");
+    assert_eq!(cursor(&vault).as_deref(), Some("c0"));
+
+    // 另一条真实 ASSET（不同 OID/密文），把它的日志事件重编号到 seq=1：
+    // relay 宣称"同一个 seq 当时就是另一条资产"。
+    let rewritten_data = b"rewritten asset payload";
+    let (rewritten_object, _) =
+        publish_device_asset(&mut relay, &device, rewritten_data, "image/png");
+    assert_ne!(rewritten_object, first_object);
+    let mut rewritten = relay.log.last().expect("新资产事件").clone();
+    rewritten.relay_seq = 1;
+    relay.log = vec![rewritten];
+    relay.head_seq = 1;
+
+    let before_received = received(&vault);
+    let error = {
+        let mut sync = engine(&vault, &mut relay, &device);
+        sync.pull().expect_err("relay 改写已消费 seq 必须暂停")
+    };
+    assert!(
+        matches!(error, SyncError::Paused(PauseReason::RelayHistoryRewritten)),
+        "必须是 Paused(RelayHistoryRewritten)，实际 {error:?}"
+    );
+    assert_eq!(cursor(&vault).as_deref(), Some("c0"), "暂停不得推进游标");
+    assert_eq!(
+        received(&vault),
+        before_received,
+        "暂停不得推进 received 水位"
+    );
+    assert_eq!(
+        skipped_asset_rows(&vault),
+        records,
+        "原 durable 记录不得被覆盖"
+    );
+}
+
+/// 缺 parts / `part()` 报错：事件声明了一个 relay 上没有密文的对象。
+#[test]
+fn pull_rejects_asset_without_parts() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x65);
+    let mut relay = FakeRelay::new(&[&device]);
+    relay.publish_signed_asset(&device.identity.signing_key, [0x5e; 32]);
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// 错误 OID：事件 object_id/commit 自洽，但指向不存在的密文对象。
+#[test]
+fn pull_rejects_asset_with_wrong_object_id() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x66);
+    let mut relay = FakeRelay::new(&[&device]);
+    publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+    let fake_oid = [0x9a; 32];
+    tamper_last_asset_commit(&mut relay, |commit| commit.object_id = fake_oid);
+    relay.log.last_mut().expect("asset event").object_id = Some(fake_oid);
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// 错误 object_digest：密文真实存在，但事件摘要与 parts 不符。
+#[test]
+fn pull_rejects_asset_with_wrong_object_digest() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x67);
+    let mut relay = FakeRelay::new(&[&device]);
+    publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+    tamper_last_asset_commit(&mut relay, |commit| commit.object_digest[0] ^= 0x01);
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// 错误 total_len：事件总长与固定切片规则/实际明文不符。
+#[test]
+fn pull_rejects_asset_with_wrong_total_len() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x68);
+    let mut relay = FakeRelay::new(&[&device]);
+    publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+    tamper_last_asset_commit(&mut relay, |commit| commit.total_len += 1);
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// 错误 part_count：声明 2 片，但 relay 上没有对应 parts（/ 总长也不符）。
+#[test]
+fn pull_rejects_asset_with_wrong_part_count() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x69);
+    let mut relay = FakeRelay::new(&[&device]);
+    publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+    // 固定切片规则下只要总长跨过单片容量，part_count 就必须是 2（ObjectCommit
+    // 编码会拒绝不自洽的声明）；relay 上实际只有 1 片 → 取第 1 片失败。
+    let total_len = menghunote_sync_proto::cap_plain(ObjectType::Asset) + 1;
+    tamper_last_asset_commit(&mut relay, |commit| {
+        commit.total_len = total_len;
+        commit.part_count = 2;
+    });
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// AEAD 密文翻 bit：信封仍可解码，但解密必须失败。
+#[test]
+fn pull_rejects_asset_with_corrupted_ciphertext() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x6a);
+    let mut relay = FakeRelay::new(&[&device]);
+    let (object_id, _) = publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+    let part = relay.parts.get_mut(&(object_id, 0)).expect("ASSET part");
+    // 跳过 196B MNE1 header，翻密文区第一个字节。
+    let offset = 196;
+    part[offset] ^= 0x01;
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// 明文头 MIME 与 object_id 不对应：AEAD 可解，但 canonical OID 重算不一致。
+#[test]
+fn pull_rejects_asset_plaintext_mime_not_matching_object_id() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x6b);
+    let mut relay = FakeRelay::new(&[&device]);
+    let real: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+    let byte_len = ASSET_DATA.len() as u64;
+    // object_id 按 text/plain 派生，明文头却写 image/png。
+    let object_id =
+        menghunote_sync::checkpoint::asset_object_id(&device.root, &real, byte_len, "text/plain")
+            .expect("canonical oid");
+    let plaintext = asset_plaintext_bytes(&real, byte_len, "image/png", ASSET_DATA);
+    upload_asset_plaintext(
+        &mut relay,
+        device.vault_id,
+        device.device_id,
+        &device.identity.signing_key,
+        &device.root,
+        object_id,
+        &plaintext,
+    );
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// 明文 data 长度与头声明不符。
+#[test]
+fn pull_rejects_asset_plaintext_data_len_mismatch() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x6c);
+    let mut relay = FakeRelay::new(&[&device]);
+    let real: [u8; 32] = Sha256::digest(ASSET_DATA).into();
+    let plaintext =
+        asset_plaintext_bytes(&real, ASSET_DATA.len() as u64 + 1, "text/plain", ASSET_DATA);
+    upload_asset_plaintext(
+        &mut relay,
+        device.vault_id,
+        device.device_id,
+        &device.identity.signing_key,
+        &device.root,
+        [0x77; 32],
+        &plaintext,
+    );
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+/// 明文 data 哈希与头声明不符。
+#[test]
+fn pull_rejects_asset_plaintext_data_hash_mismatch() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x6d);
+    let mut relay = FakeRelay::new(&[&device]);
+    let plaintext = asset_plaintext_bytes(
+        &[0x11; 32],
+        ASSET_DATA.len() as u64,
+        "text/plain",
+        ASSET_DATA,
+    );
+    upload_asset_plaintext(
+        &mut relay,
+        device.vault_id,
+        device.device_id,
+        &device.identity.signing_key,
+        &device.root,
+        [0x78; 32],
+        &plaintext,
+    );
+    seed_asset_pull_fixture(&vault, &relay);
+    assert_asset_pull_rejected(&vault, &mut relay, &device);
+}
+
+// ============================================================ task-118 阻断 A
+// 恶意 relay 用超大 `part_count`/`total_len` 的 ASSET 事件触发**无界分配**：读回层
+// 曾在任何校验/IO 之前执行 `Vec::with_capacity(part_count)`，分配失败是 abort（不可
+// 捕获），pull 无从 fail-closed。这里覆盖三层：wire（decode 拒绝）、读回层（先验后配）、
+// engine 入口（零副作用）。
+
+/// 手工拼 `ObjectCommit` 的 CDE 字节，绕过 `ObjectCommit::encode` 的 `validate`。
+///
+/// 攻击面是"relay 直接下发任意 CDE 字节"，不是"本机库能编码出非法声明"；负例必须能
+/// 造出编码期校验会拒绝的字段组合，才能证明解码/消费路径本身 fail-closed。
+fn asset_commit_cde_bytes(commit: &ObjectCommit) -> Vec<u8> {
+    encode_cde(&CdeValue::Map(vec![
+        (0, CdeValue::Bytes(commit.vault_id.to_vec())),
+        (1, CdeValue::Bytes(commit.object_id.to_vec())),
+        (2, CdeValue::Bytes(commit.message_id.to_vec())),
+        (3, CdeValue::UInt(u64::from(commit.object_type.as_u8()))),
+        (4, CdeValue::UInt(commit.generation)),
+        (5, CdeValue::UInt(commit.key_epoch)),
+        (6, CdeValue::UInt(commit.sender_seq)),
+        (7, CdeValue::UInt(u64::from(commit.part_count))),
+        (8, CdeValue::UInt(commit.total_len)),
+        (9, CdeValue::Bytes(commit.object_digest.to_vec())),
+    ]))
+    .expect("CDE 编码")
+}
+
+/// 超大 `part_count` = `u32::MAX`、`total_len` 与固定切片规则自洽（≈1.8e16）。
+///
+/// 这条声明在收紧前能通过 wire 校验，然后被读回层当成容量使用。pull 必须在 wire
+/// 层就 `TooLarge`，且零副作用：不写 skipped-asset 记录、不推游标/received。
+#[test]
+fn pull_rejects_asset_with_unbounded_part_count_and_total_len() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x70);
+    let mut relay = FakeRelay::new(&[&device]);
+    let (_object_id, _) = publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+
+    let total_len = u64::from(u32::MAX) * cap_plain(ObjectType::Asset);
+    let part_count = u32::try_from(part_count_for(total_len, ObjectType::Asset)).expect("片数");
+    assert_eq!(part_count, u32::MAX, "攻击声明必须与固定切片规则自洽");
+
+    {
+        let event = relay.log.last_mut().expect("ASSET 日志事件");
+        let mut commit = ObjectCommit::decode(&event.event).expect("原始 commit");
+        commit.part_count = part_count;
+        commit.total_len = total_len;
+        // 保留真实 object_id/epoch/digest：攻击点只是无界长度声明。
+        event.event = asset_commit_cde_bytes(&commit);
+    }
+    seed_asset_pull_fixture(&vault, &relay);
+    let before_cursor = cursor(&vault);
+    let before_received = received(&vault);
+    let error = {
+        let mut sync = engine(&vault, &mut relay, &device);
+        sync.pull().expect_err("超限 ASSET 必须让 pull 返回 Err")
+    };
+    assert!(
+        matches!(error, SyncError::Proto(ProtoError::TooLarge)),
+        "必须在 wire 层拒绝（不能走到分配/下载）: {error:?}"
+    );
+    assert_eq!(cursor(&vault), before_cursor, "不得推进 relay 游标");
+    assert_eq!(received(&vault), before_received, "不得推进 received 水位");
+    assert!(
+        skipped_asset_rows(&vault).is_empty(),
+        "不得写 skipped-asset 记录"
+    );
+}
+
+/// 读回层（A2）：`fetch_object` 必须在**分配/IO 之前**拒绝不合理声明。
+///
+/// 这里直接调用读回 API 而不是走 pull：wire 收紧后 pull 到不了这一层，但它是其它
+/// 调用方（checkpoint/slot/重打包）的公共入口，必须自己有界。
+#[test]
+fn fetch_object_rejects_oversized_declarations_before_allocating() {
+    ensure_test_identity_wrap();
+    let (_dir, _vault) = fresh_vault();
+    let device = Device::new(0x71);
+    let mut relay = FakeRelay::new(&[&device]);
+    let (object_id, _) = publish_device_asset(&mut relay, &device, ASSET_DATA, "text/plain");
+    let digest = [0x3c; 32];
+
+    // part_count 与固定切片规则不符（u32::MAX 但总长很小）→ 关系校验拒绝。
+    let error = menghunote_sync::upload::fetch_object(
+        &mut relay,
+        &device.root,
+        ObjectType::Asset,
+        &object_id,
+        u32::MAX,
+        128,
+        &digest,
+        &[],
+    )
+    .expect_err("part_count 与固定切片不符必须拒绝");
+    assert!(matches!(
+        error,
+        SyncError::Object("读回对象分片数与固定切片不符")
+    ));
+
+    // total_len 超 ASSET 上限（part_count 与之自洽）→ 类型上限拒绝。
+    let total_len = MAX_ASSET_RAW_BYTES as u64 + 1;
+    let part_count = u32::try_from(part_count_for(total_len, ObjectType::Asset)).expect("片数");
+    let error = menghunote_sync::upload::fetch_object(
+        &mut relay,
+        &device.root,
+        ObjectType::Asset,
+        &object_id,
+        part_count,
+        total_len,
+        &digest,
+        &[],
+    )
+    .expect_err("超上限 total_len 必须拒绝");
+    assert!(matches!(
+        error,
+        SyncError::Object("读回对象明文超出类型上限")
+    ));
+}
+
+/// engine 入口（A3）：ASSET 事件的 epoch 只要**不等于**本地根（含落后），必须在
+/// 下载之前统一报 `Paused(EpochMismatch)`。
+///
+/// 旧实现只拒绝"更新"的 relay（`event.epoch > root`），落后的 epoch 会走到取片失败
+/// 或 AEAD 失败，被报成 `Object`/`RelayApi`，与 UPDATE 路径的暂停语义不一致。
+#[test]
+fn pull_pauses_on_lagging_asset_event_epoch_before_download() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let mut device = Device::new(0x72);
+    let mut relay = FakeRelay::new(&[&device]);
+    // 事件本身是 E1 的结构合法 ASSET（无真实 parts）。
+    relay.publish_signed_asset(&device.identity.signing_key, [0x5e; 32]);
+    // 本地刚完成轮换：根与 relay 都到 E2，日志里仍是旧 E1 事件。
+    relay.epoch = 2;
+    device.root =
+        menghunote_sync::keys::RootSecretV1::new(device.vault_id, 2, device.root.root.clone());
+    seed_asset_pull_fixture(&vault, &relay);
+
+    let error = {
+        let mut sync = engine(&vault, &mut relay, &device);
+        sync.pull().expect_err("落后 epoch 的 ASSET 必须暂停")
+    };
+    assert!(
+        matches!(error, SyncError::Paused(PauseReason::EpochMismatch)),
+        "必须报 EpochMismatch（不能走到下载/AEAD）: {error:?}"
+    );
+    assert_eq!(cursor(&vault).as_deref(), Some("c0"), "不得推进游标");
+    assert_eq!(received(&vault), 0, "不得推进 received 水位");
+    assert!(
+        skipped_asset_rows(&vault).is_empty(),
+        "不得写 skipped-asset 记录"
+    );
 }

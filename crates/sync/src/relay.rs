@@ -12,7 +12,7 @@
 
 use crate::error::SyncError;
 use crate::{DeviceId, ObjectId, VaultId};
-use menghunote_sync_proto::{DeviceCertV1, ObjectCommit};
+use menghunote_sync_proto::{ActivationCommitV1, ActivationTV1, DeviceCertV1, ObjectCommit};
 
 /// 同步必须暂停的原因（ADR §5：暂停后**不得**推进游标或 ACK）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,12 @@ pub enum PauseReason {
     MissingSignature,
     /// 轮换阶段 A–C 已冻结：禁止再 push/encrypt（A 事务编辑仍可继续）。
     RotationFrozen,
+    /// relay 在同一 `relay_seq` 上返回了与本地 durable 证据不同的历史。
+    ///
+    /// 触发点是 engine 已真实下载并落盘的 ASSET（skipped-asset 记录 HMAC 通过）
+    /// 再次拉取同一 seq 时身份字段不一致：本地记录未被篡改，是 relay 重写了历史，
+    /// 必须暂停等待人工处理，不能报成本地数据损坏。
+    RelayHistoryRewritten,
 }
 
 impl core::fmt::Display for PauseReason {
@@ -43,6 +49,9 @@ impl core::fmt::Display for PauseReason {
             Self::UnsupportedEvent => "日志含本任务范围外的事件类型",
             Self::MissingSignature => "日志事件缺少 ObjectCommit 签名",
             Self::RotationFrozen => "轮换已冻结，禁止 push/encrypt",
+            Self::RelayHistoryRewritten => {
+                "relay 改写了已消费 seq 的历史（与本地 durable 证据冲突）"
+            }
         };
         f.write_str(text)
     }
@@ -225,6 +234,94 @@ pub struct SlotRecord {
     pub slot_set_rev: u64,
     /// retiring 槽的删除时间（Unix 秒）。
     pub retire_at: Option<u64>,
+}
+
+/// B 侧 latest self grant 的原始证据（外签/recipient/epoch 校验用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfGrantEvidence {
+    pub epoch: u64,
+    pub device_id: DeviceId,
+    pub manager_rev: u64,
+    pub hpke_enc: [u8; 32],
+    pub ciphertext: Vec<u8>,
+    pub signed_header: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub package_digest: Option<[u8; 32]>,
+}
+
+/// `/control` 里**已复算**的 activation T 与旧/新管理双签（ADR 0006 §34）。
+///
+/// 只有 [`RelayClient::verified_activation_t`] 的实现能产出它：T 的双签、字段合法性
+/// 与"钉在已验证控制链上"都已由实现方（真实客户端 = `HttpRelayClient`）复算过。
+/// 调用方拿到的 `None` 表示**无法复算**，绝不表示"验证通过"（必须 fail-closed）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedActivationT {
+    /// canonical CDE 解码后的 T（20 字段已校验）。
+    pub activation_t: ActivationTV1,
+    /// 旧管理 key 对 `activation_t_signing_input(T)` 的 64B 签名。
+    pub old_t_signature: Vec<u8>,
+    /// 新管理 key 对同一输入的 64B 签名。
+    pub new_t_signature: Vec<u8>,
+}
+
+/// `/control` 中一条 `epoch.activated` 的**完整授权材料**（epoch 链的一环）。
+///
+/// 设备离线跨过多个 epoch 后，本地 `current_epoch` 只会落后于链尾：latest T 的
+/// `from_epoch` 不再是本地 epoch。此时必须先沿控制链逐条验证每一环（T 双签、T 与
+/// rotation view 绑定、`ActivationCommitV1` 摘要），才能用链尾的 T 授权 apply。
+///
+/// 本结构由 [`RelayClient::epoch_activations`] 产出：实现方（真实客户端 =
+/// [`crate::http_relay::HttpRelayClient`]）负责把 T 钉在**已验证**控制链的位置上，
+/// 并把 `rotation view + primary/fallback 公开事实` 重建为 `ActivationCommitV1`；
+/// 消费方（[`crate::rotation_apply::verify_epoch_activation_chain`]）再复算全部绑定，
+/// 不信任 relay 自报。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochActivationLink {
+    /// 该 activation 记录在控制链上的 rev（必须等于 `T.expected_control_rev`）。
+    pub control_rev: u64,
+    /// 链上**前一条**记录（`control_rev - 1`）的 `record_hash`；必须等于 `T.prev_control_hash`。
+    pub prev_control_hash: [u8; 32],
+    /// `GET /rotations/{id}` 视图（必须是 `activated`）。
+    pub view: RotationView,
+    /// `/control` 里已复算的 activation T 与旧/新管理双签。
+    pub evidence: VerifiedActivationT,
+    /// 由 view + primary/fallback checkpoint 公开事实重建的 `ActivationCommitV1`。
+    ///
+    /// relay 只把它的 SHA256 记在 view 键 20；消费方必须重新编码并与该摘要逐字节比对。
+    pub activation_commit: ActivationCommitV1,
+}
+
+/// staged grant 集合的一个 leaf：relay `grants_digest` 口径下的
+/// `(device_id, SHA256(signed_header))`。
+///
+/// 设备端没有 management realm（relay `GET /rotations/{r}/grants` 仅 management 可读），
+/// 因此真实客户端通常只能证明 `grants_count == 1` 的单 leaf 情形；完整 leaf 集合只
+/// 出现在具备 management 凭据的调用方/测试夹具里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantLeafEvidence {
+    /// 收件设备。
+    pub device_id: DeviceId,
+    /// `SHA256(grant.signed_header)`（relay `grants_digest` 的叶子）。
+    pub signed_header_sha256: [u8; 32],
+}
+
+impl GrantLeafEvidence {
+    /// 从 `signed_header` 原字节构造 leaf。
+    #[must_use]
+    pub fn new(device_id: DeviceId, signed_header: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            device_id,
+            signed_header_sha256: Sha256::digest(signed_header).into(),
+        }
+    }
+}
+
+/// `GET P/checkpoints/{cid}` 返回的 manifest 明文（只读）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointManifest {
+    pub checkpoint_id: [u8; 16],
+    pub manifest_bytes: Vec<u8>,
 }
 
 /// `POST P/checkpoints` 的 writer lease。
@@ -600,6 +697,84 @@ pub trait RelayClient {
         Err(SyncError::Unsupported(
             "该 relay 客户端不支持 active 成员 HPKE 列表",
         ))
+    }
+
+    /// §30.3：控制链 typed kind（键 4）。
+    fn control_kinds(&mut self) -> Result<Vec<(u64, String)>, SyncError> {
+        Err(SyncError::Unsupported(
+            "该 relay 客户端不支持 control_kinds",
+        ))
+    }
+
+    /// B 侧 latest self grant 的原始证据。
+    fn self_grant_evidence(&mut self) -> Result<SelfGrantEvidence, SyncError> {
+        Err(SyncError::Unsupported(
+            "该 relay 客户端不支持 self_grant_evidence",
+        ))
+    }
+
+    /// `/control` 中**已复算**的 activation T 与旧/新管理双签（ADR 0006 §34）。
+    ///
+    /// 这是 B 侧 apply 的**唯一授权来源**：relay 自报的 `ActivationCommitV1` 32B hash
+    /// 只用于交叉一致性，不能代替 T。
+    ///
+    /// 默认 `Ok(None)`：表示该客户端**无法复算** T（历史控制记录不带 T，或实现方
+    /// 没有管理 realm/控制链缓存）。`None` 绝不等于"验证通过"——调用方必须
+    /// fail-closed（`Paused`，不写库、不推游标）。
+    ///
+    /// 真实 HTTP 客户端在 [`crate::http_relay::HttpRelayClient`] 里覆盖本方法，
+    /// 直接委托它的 inherent `verified_activation_t`（按 `/control` 缓存复算）。
+    fn verified_activation_t(
+        &mut self,
+        _rotation_id: [u8; 16],
+    ) -> Result<Option<VerifiedActivationT>, SyncError> {
+        Ok(None)
+    }
+
+    /// 完整 staged grant leaf 集合（证明本设备 latest grant 的 inclusion）。
+    ///
+    /// 默认 `Ok(None)`：设备端读不到 management 的 grant 清单，此时只有
+    /// `grants_count == 1`（单 leaf 即全集）能复算 `grants_digest`；其余情形
+    /// 调用方必须拒绝（无法证明 inclusion）。
+    fn grant_leaf_evidence(
+        &mut self,
+        _rotation_id: [u8; 16],
+    ) -> Result<Option<Vec<GrantLeafEvidence>>, SyncError> {
+        Ok(None)
+    }
+
+    /// `/control` 中全部 `epoch.activated` 的完整授权材料（epoch 链），按控制链 rev 升序。
+    ///
+    /// 只返回 `to_epoch > from_epoch`（调用方本地可信 epoch）的环：每环的
+    /// `view/T/activation_commit` 必须能在本地复算（见
+    /// [`crate::rotation_apply::verify_epoch_activation_chain`]）。
+    ///
+    /// 真实客户端 = [`crate::http_relay::HttpRelayClient`]：从已验证 `/control` 缓存取
+    /// T 与它在链上的位置（rev / 前一条 `record_hash`），再按 rotation/cid 重建 commit。
+    ///
+    /// **默认 `Ok(Vec::new())`**：表示该客户端无法提供可验证的链（不支持/无控制链缓存）。
+    /// 空链绝不等于"验证通过"——本地 epoch 落后 relay 时调用方必须 fail-closed（`Paused`），
+    /// 不得回退到"只信 latest rotation 的 view"。
+    fn epoch_activations(
+        &mut self,
+        _from_epoch: u64,
+    ) -> Result<Vec<EpochActivationLink>, SyncError> {
+        Ok(Vec::new())
+    }
+
+    /// 只读 checkpoint manifest（不写库）。
+    fn checkpoint_manifest(
+        &mut self,
+        _checkpoint_id: &[u8; 16],
+    ) -> Result<CheckpointManifest, SyncError> {
+        Err(SyncError::Unsupported(
+            "该 relay 客户端不支持 checkpoint_manifest",
+        ))
+    }
+
+    /// 丢弃旧 token/控制缓存；下一次请求重新认证（begin/activate 会 bump auth_rev）。
+    fn reauthenticate(&mut self) -> Result<(), SyncError> {
+        Ok(())
     }
 
     /// §30.3：`GET /rotations/current`；没有进行中的轮换返回 `None`。

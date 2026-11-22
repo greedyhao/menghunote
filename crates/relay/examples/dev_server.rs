@@ -20,6 +20,9 @@
 //! - `--reset` / `RELAY_DEV_RESET=1`
 //! - `--setup-only` / `RELAY_DEV_SETUP_ONLY=1`：不自动 genesis，只打印 setup secret 等客户端初始化
 //! - `--dev`：release 构建下的显式解锁
+//! - `--allow-plaintext` / `RELAY_DEV_ALLOW_PLAINTEXT=1`：允许非 loopback 明文监听。
+//!   **默认只允许 127.0.0.1/[::1]**（与生产 `serve` 同一门禁）；开发服务器仅用于本机联调，
+//!   对外暴露必须走反向代理 TLS，不能直接把放行验签的 dev server 暴露到网络。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,6 +63,7 @@ struct Args {
     reset: bool,
     dev: bool,
     setup_only: bool,
+    allow_plaintext: bool,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -93,6 +97,7 @@ fn usage() -> String {
            --db <path>       sqlite path (default target/tmp/relay-dev/relay.sqlite3, env RELAY_DEV_DB)\n\
            --reset           delete the sqlite file (and -wal/-shm) before starting\n\
            --setup-only      do not auto-genesis; print a setup secret for the client\n\
+           --allow-plaintext allow non-loopback plaintext listen (env RELAY_DEV_ALLOW_PLAINTEXT)\n\
            --dev             allow running in release builds (DEV ONLY)\n\
            -h, --help        print this help"
     )
@@ -107,6 +112,7 @@ fn parse_args() -> std::result::Result<Args, String> {
     let mut reset = env_flag("RELAY_DEV_RESET");
     let mut dev = false;
     let mut setup_only = env_flag("RELAY_DEV_SETUP_ONLY");
+    let mut allow_plaintext = env_flag("RELAY_DEV_ALLOW_PLAINTEXT");
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -120,6 +126,7 @@ fn parse_args() -> std::result::Result<Args, String> {
             "--reset" => reset = true,
             "--dev" => dev = true,
             "--setup-only" => setup_only = true,
+            "--allow-plaintext" => allow_plaintext = true,
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("未知参数 {other}\n\n{}", usage())),
         }
@@ -130,6 +137,7 @@ fn parse_args() -> std::result::Result<Args, String> {
         reset,
         dev,
         setup_only,
+        allow_plaintext,
     })
 }
 
@@ -285,6 +293,22 @@ fn main() {
             "refusing to start: release build without --dev.\n\
              这个 example 用完全放行的签名 hook（DEV ONLY），release 下必须显式 --dev。"
         );
+        std::process::exit(2);
+    }
+
+    // 明文门禁（与生产 `serve` 同一策略）：非 loopback 需要显式 --allow-plaintext，
+    // 且必须在建库/开端口之前拒绝（dev server 放行验签，更不能误暴露）。
+    let listen: SocketAddr = match args.listen.parse() {
+        Ok(addr) => addr,
+        Err(err) => {
+            eprintln!("invalid --listen {}: {err}", args.listen);
+            std::process::exit(2);
+        }
+    };
+    if let Err(message) =
+        relay::config::ensure_plaintext_listen_allowed(listen, args.allow_plaintext)
+    {
+        eprintln!("refusing to start: {message}");
         std::process::exit(2);
     }
 

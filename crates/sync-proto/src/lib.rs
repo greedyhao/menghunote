@@ -4,6 +4,7 @@
 //! 分隔符、固定切片、ObjectDigest/cursor 类型、错误码与 limits。
 //! 本 crate 不做 IO / crypto / Loro / SQLite / GPUI。
 
+pub mod activation_t;
 pub mod cde;
 pub mod constants;
 pub mod cursor;
@@ -13,6 +14,7 @@ pub mod limits;
 pub mod records;
 mod rotation_records;
 
+pub use activation_t::{activation_t_signing_input, ActivationTV1, ACTIVATION_T_FIELD_COUNT};
 pub use cde::CdeValue as CborValue;
 pub use cde::{decode as decode_cde, encode as encode_cde, CdeValue, MAX_CDE_BYTES};
 pub use constants::*;
@@ -39,7 +41,7 @@ pub use rotation_records::{
     grant_package_digest, member_cert_digest, slot_set_digest, AbortBodyV1, ActivateBodyV1,
     ActivationCommitV1, ApproveBodyV1, BeginBodyV1, ControlEvent, ControlKind, DeviceApproveBodyV1,
     EpochActivated, GrantStageBodyV1, GrantsBodyV1, InviteCreateBodyV1, InvitesBodyV1,
-    MemberCertDigestInputV1, NewManagerV1, RevocationsAdded, RotationAbortBodyV1,
+    MemberCertDigestInputV1, NewManagerV1, RevocationsAdded, RotationAbortBodyV1, RotationAborted,
     RotationActivateBodyV1, RotationBeginBodyV1, RotationRestarted, SignedControlRecord,
     SlotActivateBodyV1, SlotSetDigestInputV1, SlotsActivateBodyV1,
 };

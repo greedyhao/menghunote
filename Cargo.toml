@@ -48,3 +48,13 @@ debug = false
 [profile.dev.package.zstd-sys]
 debug = false
 
+# 第四个受害者（2026-11-12，crates/sync 引入 rustls 传输层）：rustls 的 ring 后端带 C 源
+# （crypto/curve25519/curve25519.c 等），cl.exe 在 build script 上下文里带 -Z7 时同样报
+#   cl : Command line error D8050 : cannot execute 'c1.dll': failed to get command line into debug records
+# 根因与上面 libsqlite3-sys / stacker / zstd-sys 相同（cargo 子进程不能写 %TEMP%）。
+# 只关该包的调试信息，Rust 侧调试信息与其它包的优化级别不受影响。
+# 复现：删掉本节 → cargo clean -p ring → cargo check -p menghunote-sync 必在 curve25519.c 处失败；
+# 换到 cargo 子进程可写 %TEMP% 的环境后本节可以删除（与前三节同步处理）。
+[profile.dev.package.ring]
+debug = false
+

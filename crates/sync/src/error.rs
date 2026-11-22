@@ -117,6 +117,46 @@ pub enum SyncError {
     #[error("DPAPI 调用失败：Win32 错误码 {0}")]
     Dpapi(u32),
 
+    /// 当前平台没有本地身份封装实现（Windows/Linux 之外明确拒绝，不回退明文）。
+    #[error("本地身份封装在当前平台不可用")]
+    LocalWrapUnsupportedPlatform,
+
+    /// Linux 本地封装 BLOB 结构非法（magic/长度/编码不符）。
+    #[error("本地封装格式非法：{0}")]
+    LocalWrapFormat(&'static str),
+
+    /// 未知的本地封装外层版本号。
+    #[error("本地封装版本未知：{0}")]
+    LocalWrapVersion(u8),
+
+    /// 未知的本地封装外层 kind。
+    #[error("本地封装类型未知：{0}")]
+    LocalWrapKind(u8),
+
+    /// 本地封装认证失败（头/nonce/密文被篡改，或 AAD 绑定的 vault/device/记录不符）。
+    #[error("本地封装认证失败：密文损坏或 entropy 不匹配")]
+    LocalWrapAuth,
+
+    /// 本地身份封装路径无法解析（环境变量缺失/相对路径/非目录等）。
+    #[error("本地主密钥路径无效：{0}")]
+    LocalKeyPath(&'static str),
+
+    /// 主密钥或其私有目录不存在（保护/解封只加载，不创建）。
+    #[error("本地主密钥缺失：{0}")]
+    LocalKeyMissing(&'static str),
+
+    /// 主密钥内容损坏（长度/尾随字节/非 32B 主钥等）。
+    #[error("本地主密钥损坏：{0}")]
+    LocalKeyCorrupt(&'static str),
+
+    /// 主密钥或目录的权限/属主/类型不安全（**不自动修复**）。
+    #[error("本地主密钥权限不安全：{0}")]
+    LocalKeyPermissions(&'static str),
+
+    /// 主密钥文件 IO 失败（创建/打开/读写/fsync/原子发布）。
+    #[error("本地主密钥 IO 失败：{0}")]
+    LocalKeyIo(String),
+
     /// 系统随机源失败。
     #[error("系统随机源失败")]
     Random,
@@ -132,6 +172,16 @@ pub enum SyncError {
     /// relay 传输层失败（连接断开、响应被截断等）。
     #[error("relay 传输失败：{0}")]
     Transport(&'static str),
+
+    /// TLS 校验/握手失败（证书链、主机名、有效期、信任根装配）。**不可重试**：
+    /// 重试不会让一张过期或错配的证书变合法。
+    #[error("TLS 校验失败：{0}")]
+    Tls(String),
+
+    /// 传输安全策略拒绝（明文 http、跨 origin 重定向、https→http 降级、非法 base_url）。
+    /// **不可重试**：策略是确定性的，重试只会重复被拒。
+    #[error("传输策略拒绝：{0}")]
+    TransportPolicy(String),
 
     /// relay 返回业务错误（CBOR 错误体 `{0:code,1:retryable,2:epoch?,3:rev?,4:hint?}`）。
     #[error("relay 拒绝：{code}")]

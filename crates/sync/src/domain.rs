@@ -24,6 +24,12 @@ pub const HKDF_ASSET_NONCE_INFO: &[u8] = b"MN/v1/asset-nonce\0";
 /// KEY_SLOT MNE1 密钥的 HKDF info 前缀（ADR §20：`MN/v1/key-slot\\0`）。
 pub const HKDF_KEY_SLOT_INFO: &[u8] = b"MN/v1/key-slot\0";
 
+/// Linux 本地身份封装外层 AAD 域（ADR 0008：`MN/local-wrap/v1\0`）。
+///
+/// AAD = 本域 || 完整 30B 外层头 || 原 entropy。域体是 ASCII，末尾是一个真正的
+/// 0x00 字节（ADR 0006 §14 口径）。
+pub const LOCAL_WRAP_AAD_DOMAIN: &[u8] = b"MN/local-wrap/v1\0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,6 +54,7 @@ mod tests {
             ("device_cert", DEVICE_CERT),
             ("asset_nonce", HKDF_ASSET_NONCE_INFO),
             ("key_slot", HKDF_KEY_SLOT_INFO),
+            ("local_wrap_aad", LOCAL_WRAP_AAD_DOMAIN),
         ];
         for (name, domain) in all {
             assert_eq!(
@@ -82,6 +89,17 @@ mod tests {
         assert_eq!(HPKE_INFO[17], 0x00);
         assert_eq!(DPAPI_ENTROPY_PREFIX, b"MN/dpapi/v1\0");
         assert_eq!(DPAPI_ENTROPY_PREFIX.len(), 12);
+        // ADR 0008 的 Linux 本地封装 AAD 域：`MN/local-wrap/v1\0` =
+        // 4d4e 2f6c 6f63 616c 2d77 7261 702f 7631 00。
+        assert_eq!(LOCAL_WRAP_AAD_DOMAIN, b"MN/local-wrap/v1\0");
+        assert_eq!(
+            LOCAL_WRAP_AAD_DOMAIN,
+            &[
+                0x4d, 0x4e, 0x2f, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x2d, 0x77, 0x72, 0x61, 0x70, 0x2f,
+                0x76, 0x31, 0x00,
+            ]
+        );
+        assert_eq!(LOCAL_WRAP_AAD_DOMAIN.len(), 17);
     }
 
     #[test]

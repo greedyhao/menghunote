@@ -19,6 +19,7 @@ use relay::api::{router, AppState};
 use relay::ids::{sha256, Hash32, Id16};
 use relay::verify::Ed25519Hook;
 use relay::wire;
+use rusqlite::OptionalExtension;
 use support::*;
 use tower::ServiceExt;
 
@@ -65,6 +66,15 @@ fn put_cbor(uri: &str, token: &str, fields: wire::Fields) -> Request<Body> {
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, wire::CONTENT_TYPE)
         .body(Body::from(cbor_body(fields)))
+        .expect("request")
+}
+
+fn get(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
         .expect("request")
 }
 
@@ -363,6 +373,76 @@ async fn abort_binds_request_id_and_control_rev_and_replays() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(replay, first, "replay 必须逐字节回放原响应");
+
+    // §35.3：abort 控制记录必须携带**完整可重建**的管理签名输入事实。
+    // relay 以前只存 canonical body（空 map）+ 签名，客户端无法重建 path 里的 rotation id。
+    let signed_record: Vec<u8> = fx
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT signed_record FROM control_commits ORDER BY rev DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .expect("最新控制记录");
+    let record =
+        relay::control::SignedControlRecord::decode(&signed_record).expect("decode control");
+    assert_eq!(record.kind, relay::control::ControlKind::RotationAbort);
+    assert_eq!(record.signed_body, cbor_body(Vec::new()));
+    let event_bytes = record.event.as_deref().expect("abort 必须带 typed 事件");
+    let event = relay::control::RotationAborted::decode(event_bytes).expect("decode abort event");
+    assert_eq!(event.rotation_id, rotation);
+    assert_eq!(event.method, relay::proto::HttpMethod::Post);
+    assert_eq!(event.path, abort_path(&fx, &rotation));
+    assert_eq!(event.body_digest, sha256(&record.signed_body));
+    // 用事件里的 method/path + 已签 body 重建管理签名输入，必须能验过真实管理 key。
+    let body_digest = sha256(
+        &relay::proto::management_request_cde(event.method, &event.path, &record.signed_body)
+            .expect("request cde"),
+    );
+    let input = relay::proto::management_signing_input(
+        &fx.vault().instance_id,
+        &fx.vault_id,
+        &record.request_id,
+        record.expected_control_rev,
+        &body_digest,
+    )
+    .expect("management signing input");
+    fx.manager_signing_key
+        .as_ref()
+        .expect("manager key")
+        .verifying_key()
+        .verify_strict(
+            &input,
+            &ed25519_dalek::Signature::from_bytes(
+                &record
+                    .signature
+                    .as_slice()
+                    .try_into()
+                    .expect("64B signature"),
+            ),
+        )
+        .expect("abort 事件必须能重建被签输入并验签");
+
+    // `/control` 必须把同一条 typed 记录**原样**返回（客户端不查 relay 库）。
+    let control_uri = format!("/v1/vaults/{}/control?after_rev=0", b64(&fx.vault_id));
+    let (status, control_body) = call(&app, get(&control_uri, &token)).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&control_body));
+    let control = response_fields(&control_body);
+    let entries = wire::array_field(&control, 0).expect("control entries");
+    let abort_entry = entries
+        .iter()
+        .map(|entry| wire::value_map(entry).expect("entry"))
+        .find(|entry| {
+            wire::opt_field(entry, 4).is_some_and(|kind| *kind == wire::text("rotation.abort"))
+        })
+        .expect("rotation.abort 控制记录");
+    assert_eq!(
+        wire::bytes_field(&abort_entry, 3).expect("signed_record"),
+        signed_record,
+        "/control 必须原样返回带 typed 事件的 abort 记录"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -742,6 +822,69 @@ async fn approve_device_binds_certificate_grant_and_request_body() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(replay, first, "replay 必须逐字节回放原响应");
+
+    // --- 修复回归：approve 必须把 grant 签名（与 signed_header/grant_id）落库，
+    // `GET devices/self/grants/latest` 返回同一份 signature64，且可用管理公钥验签。
+    let device_token = block(|| fx.device_token_for(&device));
+    let (status, latest) = call(
+        &app,
+        get(
+            &format!(
+                "/v1/vaults/{}/devices/self/grants/latest",
+                b64(&fx.vault_id)
+            ),
+            &device_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&latest));
+    let latest = response_fields(&latest);
+    assert_eq!(
+        wire::uint_field(&latest, 0).expect("epoch"),
+        vault.active_epoch
+    );
+    assert_eq!(
+        wire::bytes_field(&latest, 6).expect("signature64"),
+        grant_signature,
+        "latest grant 必须返回 approve 请求里的同一份签名"
+    );
+    assert_eq!(
+        wire::id16_field(&latest, 7).expect("grant_id"),
+        grant_id,
+        "latest grant 必须返回 grant_id"
+    );
+    // leaf manifest（signed_header）就是被签名输入：用管理公钥验签。
+    let leaf = wire::bytes_field(&latest, 5).expect("signed header");
+    assert_eq!(leaf, signed_header);
+    let manager_pub = fx
+        .manager_signing_key
+        .as_ref()
+        .expect("manager key")
+        .verifying_key();
+    manager_pub
+        .verify_strict(&leaf, &to_signature(&grant_signature))
+        .expect("latest grant 的签名必须能被管理公钥验证");
+    // DB 里也确实持久化了签名（不是响应侧临时拼的）。
+    let epoch = i64::try_from(vault.active_epoch).expect("epoch");
+    let stored: Option<Vec<u8>> = block(|| {
+        fx.db.read(move |conn| {
+            let row: Option<Option<Vec<u8>>> = conn
+                .query_row(
+                    "SELECT signature FROM device_grants WHERE epoch = ?1 AND device_id = ?2",
+                    (epoch, device.as_slice()),
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?;
+            Ok(row.flatten())
+        })
+    })
+    .expect("db grant signature");
+    assert_eq!(stored.as_deref(), Some(grant_signature.as_slice()));
+}
+
+fn to_signature(bytes: &[u8]) -> ed25519_dalek::Signature {
+    let array: [u8; 64] = bytes.try_into().expect("signature len");
+    ed25519_dalek::Signature::from_bytes(&array)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -761,12 +904,30 @@ async fn activate_rotation_consumes_manager_transition_only_from_signed_body() {
     let new_pub = new_manager.verifying_key().to_bytes();
     let old_rev = fx.vault().manager_rev;
     let transition = block(|| fx.manager_transition(&row, old_rev, old_rev + 1, new_pub));
+    let decoded_transition =
+        relay::rotations::ManagerTransition::decode(&transition).expect("decode transition");
+    // §34：complete activation T（与 DB 事实一致）由旧/新管理 key 双签。
+    let activation_t = block(|| {
+        fx.db.read(|conn| {
+            let vault = relay::vault::load(conn)?;
+            support::activation_t_for(conn, &vault, &row, &decoded_transition, &primary, &fallback)
+        })
+    })
+    .expect("activation T");
+    let activation_t_bytes = activation_t.encode().expect("T encode");
+    let activation_t_input =
+        relay::proto::activation_t_signing_input(&activation_t).expect("T signing input");
     let old_signature = old_manager.sign(&transition).to_bytes().to_vec();
     let new_signature = new_manager.sign(&transition).to_bytes().to_vec();
+    let old_t_signature = old_manager.sign(&activation_t_input).to_bytes().to_vec();
+    let new_t_signature = new_manager.sign(&activation_t_input).to_bytes().to_vec();
     let manager_map = wire::map(vec![
         (0, wire::bytes(transition.clone())),
         (1, wire::bytes(old_signature.clone())),
         (2, wire::bytes(new_signature.clone())),
+        (3, wire::bytes(activation_t_bytes)),
+        (4, wire::bytes(old_t_signature.clone())),
+        (5, wire::bytes(new_t_signature.clone())),
     ]);
     // §28.1 条目 6：activate body 还必须带整套材料摘要（expected CAS）。
     let (member_digest, grants_digest, slot_digest, asset_digest) = block(|| {

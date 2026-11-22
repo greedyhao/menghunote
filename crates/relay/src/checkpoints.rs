@@ -623,7 +623,7 @@ pub fn integrity_issues(
     Ok(issues)
 }
 
-/// 发布 checkpoint：校验 refs/摘要/签名，原子标 published 并生成持久 GC 计划。
+/// 发布 checkpoint：校验 refs/摘要/签名/未来 live，原子标 published 并生成持久 GC 计划。
 pub fn publish(
     conn: &Connection,
     clock: &dyn Clock,
@@ -724,6 +724,21 @@ pub fn publish(
     } else {
         "candidate"
     };
+    // ADR §7 / 评审 0002 P1-5 + T20 + P1-E：发布前校验"未来 live ≤ Q"。
+    //
+    // "未来 live" = 发布后最新两份 published 基线引用的 DATA + MANIFEST 对象、`log` 仍保留的
+    // UPDATE、以及同 epoch 未 retired 且未被 pair 引用的 finalized ASSET（口径见
+    // `quota::future_live_bytes`；共享对象只计一次）。超预算只拒绝（507），
+    // **不删任何安全根、不建 GC 计划**：失败发生在所有写操作之前，外层写事务整体回滚，
+    // staging checkpoint / refs / 对象 / 日志保持原样，扩容后可重试。
+    if target_state == "published" {
+        let live_after = quota::future_live_bytes(conn, checkpoint.epoch, &[*checkpoint_id])?;
+        if live_after > vault.normal_limit {
+            return Err(Error::Api(
+                ApiError::new(ErrorCode::QuotaExceeded).epoch(vault.active_epoch),
+            ));
+        }
+    }
     conn.execute(
         "UPDATE checkpoints SET state = ?1, published_at = ?2, signed_commit = ?3,
                                 commit_signature = ?4, manifest_oid = ?5, refs_digest = ?6,
@@ -747,6 +762,9 @@ pub fn publish(
     )?;
     if target_state == "published" {
         schedule_gc_plan(conn, now, checkpoint.epoch, checkpoint_id)?;
+        // 评审 0002 P1-E：发布后按真实 parts 对账——新 pair 的活对象（原维护 reservation
+        // 写入）升为 normal，旧基线/宽限副本降为 maintenance，账本 = 真实 parts。
+        quota::recompute(conn)?;
     }
     Ok(PublishOutcome {
         checkpoint_id: *checkpoint_id,
@@ -919,6 +937,19 @@ pub fn promote_named_candidates(
     {
         return Err(Error::api(ErrorCode::CasConflict));
     }
+    // 评审 0002 P1-5 / P1-E：rotation candidate activate 的 Q 门禁。此前只有 active
+    // publish 校验 future_live≤Q，activate 可把维护 reservation 写出的候选 pair 直接
+    // promote 成 live，令 activate 后 live 超 Q、账本永久高于 Q。这里在**任何 promotion
+    // 效果之前**（abort 未指名候选、改 state、建 GC 计划都由调用方在同一事务后续执行）
+    // 用与 publish 同一 `quota::future_live_bytes` 计算 prospect pair；超 Q → 507、
+    // 不删任何安全根，事务整体回滚后可扩容重试。
+    let prospective = quota::future_live_bytes(conn, epoch, &[*primary_id, *fallback_id])?;
+    let vault = vault::load(conn)?;
+    if prospective > vault.normal_limit {
+        return Err(Error::Api(
+            ApiError::new(ErrorCode::QuotaExceeded).epoch(vault.active_epoch),
+        ));
+    }
     // 未指名的候选作废（永不 promote/复用）。
     conn.execute(
         "UPDATE checkpoints SET state = 'aborted'
@@ -957,16 +988,29 @@ pub struct PruneOutcome {
     pub retired_objects: u64,
 }
 
-/// 剪枝已不是"最新两份"的旧 checkpoint：
-/// - 每个 epoch 保留最新两份 published（即使超过 7 天也不剪）；
-/// - 仍被有效 bootstrap lease 引用的不剪；
-/// - 只有 `published_at <= now - 7d` 才剪（7 天密文宽限，与槽 14 天期限**分开**）；
-/// - 非 active epoch 必须已 retired/aborted 才允许剪，避免误伤候选；
-/// - 剪枝 = 删 `checkpoint_refs` + state='pruned'，**保留** signed_commit/commit_signature/
-///   manifest_oid/refs_digest（签名骨架可审计）；
-/// - 旧 epoch 的 snapshot/manifest 对象在无任何 refs 后清 parts（保留 tombstone 行）。
-pub fn prune_retired(conn: &Connection, now: i64) -> Result<PruneOutcome> {
+/// 旧 epoch / 候选垃圾的**破坏性**回收（§S7-35）。
+///
+/// 调用前提：调用方（`gc::tick`）已确认 active epoch 的两份保留根健康；本函数不再
+/// 自行判断"能不能删"，只负责"删什么"。degraded/不足两份健康基线时不得调用。
+///
+/// 规则：
+/// - `keep` = active epoch 当前两份健康基线，永不剪；
+/// - 有效 bootstrap lease 引用的 checkpoint 不剪（客户端可能正在读）；
+/// - 进行中的轮换（`rotation_id_for_epoch` 命中）的候选 epoch 不剪；
+/// - 其余 `published/staging/candidate/aborted` 在 7 天密文宽限后一律剪（**不再**对每个
+///   retired epoch 无条件保留最后两份 full 基线）；
+/// - 剪枝 = 清 `checkpoint_refs` + state='pruned'，**保留** checkpoint 行与
+///   signed_commit/commit_signature/manifest_oid/refs_digest 签名骨架（可审计，不参与
+///   bootstrap——bootstrap 只查 state='published'）；
+/// - 对象回收：无任何 checkpoint refs、无 log 行、完成超过 7 天的对象删 parts 并标
+///   `budget_class='retired'`（行保留 tombstone）。只回收**旧 epoch** 的对象（含
+///   **ASSET 副本** 与 update/snapshot/manifest）；active epoch 的孤儿对象一律后置，
+///   不在这里回收（同 epoch 孤儿删除仍按评审"可后置"处理）。
+/// - ASSET 对象被回收时同步把 `asset_objects.state` 标 `retired`（历史事实保留，但
+///   枚举不再声称密文可用）。
+pub fn prune_retired(conn: &Connection, now: i64, keep: &[Id16]) -> Result<PruneOutcome> {
     let vault = vault::load(conn)?;
+    let cutoff = now - secs::GC_GRACE;
     let mut leased: Vec<Id16> = Vec::new();
     {
         let mut stmt = conn.prepare(
@@ -988,103 +1032,125 @@ pub fn prune_retired(conn: &Connection, now: i64) -> Result<PruneOutcome> {
             }
         }
     }
-    let mut epochs: Vec<u64> = {
+    let rows: Vec<(Id16, u64, String, Option<i64>, i64)> = {
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT epoch FROM checkpoints WHERE state = 'published' ORDER BY epoch ASC",
+            "SELECT checkpoint_id, epoch, state, published_at, created_at FROM checkpoints
+             WHERE state IN ('published','staging','candidate','aborted')
+             ORDER BY epoch ASC, rowid ASC",
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
         let mut out = Vec::new();
-        for row in rows {
-            out.push(u64_of(row?, "checkpoints.epoch")?);
+        for row in mapped {
+            let (id, epoch, state, published_at, created_at) = row?;
+            out.push((
+                id.as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Invariant("checkpoint_id"))?,
+                u64_of(epoch, "checkpoints.epoch")?,
+                state,
+                published_at,
+                created_at,
+            ));
         }
         out
     };
-    epochs.sort_unstable();
     let mut outcome = PruneOutcome::default();
-    for epoch in epochs {
+    for (checkpoint_id, epoch, _state, published_at, created_at) in rows {
+        if keep.contains(&checkpoint_id) || leased.contains(&checkpoint_id) {
+            continue;
+        }
         if epoch != vault.active_epoch {
+            // 轮换进行中的候选 epoch 可能是客户端还在 prepare/validate 的材料。
+            if crate::rotations::rotation_id_for_epoch(conn, epoch)?.is_some() {
+                continue;
+            }
             match vault::epoch_state(conn, epoch)? {
                 Some(vault::EpochState::Retired) | Some(vault::EpochState::Aborted) => {}
                 _ => continue,
             }
         }
-        let ids: Vec<Id16> = {
-            let mut stmt = conn.prepare(
-                "SELECT checkpoint_id FROM checkpoints
-                 WHERE epoch = ?1 AND state = 'published'
-                 ORDER BY published_at DESC, rowid DESC",
-            )?;
-            let rows = stmt.query_map([i64_of(epoch, "epoch")?], |row| row.get::<_, Vec<u8>>(0))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(
-                    row?.as_slice()
-                        .try_into()
-                        .map_err(|_| Error::Invariant("checkpoint_id"))?,
-                );
-            }
-            out
-        };
-        for checkpoint_id in ids.into_iter().skip(2) {
-            if leased.contains(&checkpoint_id) {
-                continue;
-            }
-            let checkpoint = get(conn, &checkpoint_id)?;
-            let Some(published_at) = checkpoint.published_at else {
-                continue;
-            };
-            if published_at > now - secs::GC_GRACE {
-                continue;
-            }
-            let refs_in = refs(conn, &checkpoint_id)?;
-            conn.execute(
-                "DELETE FROM checkpoint_refs WHERE checkpoint_id = ?1",
-                [checkpoint_id.as_slice()],
-            )?;
-            conn.execute(
-                "UPDATE checkpoints SET state = 'pruned' WHERE checkpoint_id = ?1",
-                [checkpoint_id.as_slice()],
-            )?;
-            outcome.pruned_checkpoints += 1;
-            for (object_id, _role) in refs_in {
-                let Some(object) = objects::load_opt(conn, &object_id)? else {
-                    continue;
-                };
-                if object.epoch == vault.active_epoch
-                    || object.budget_class == objects::BudgetClass::Retired
-                {
-                    continue;
-                }
-                if !matches!(
-                    object.object_type,
-                    ObjectType::Snapshot | ObjectType::Manifest
-                ) {
-                    continue;
-                }
-                let still_referenced: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM checkpoint_refs WHERE object_id = ?1",
-                    [object_id.as_slice()],
-                    |row| row.get(0),
-                )?;
-                if still_referenced != 0 {
-                    continue;
-                }
-                conn.execute(
-                    "DELETE FROM object_parts WHERE object_id = ?1",
-                    [object_id.as_slice()],
-                )?;
-                conn.execute(
-                    "UPDATE objects SET budget_class = 'retired' WHERE object_id = ?1",
-                    [object_id.as_slice()],
-                )?;
-                outcome.retired_objects += 1;
-            }
+        let stamp = published_at.unwrap_or(created_at);
+        if stamp > cutoff {
+            continue;
         }
+        conn.execute(
+            "DELETE FROM checkpoint_refs WHERE checkpoint_id = ?1",
+            [checkpoint_id.as_slice()],
+        )?;
+        conn.execute(
+            "UPDATE checkpoints SET state = 'pruned' WHERE checkpoint_id = ?1",
+            [checkpoint_id.as_slice()],
+        )?;
+        outcome.pruned_checkpoints += 1;
     }
+    outcome.retired_objects = retire_unreferenced_objects(conn, vault.active_epoch, cutoff)?;
     Ok(outcome)
 }
 
-/// §24.1：abort 候选 epoch 的全部 checkpoint（staging 与 candidate 一并作废）。
+/// 回收"无 refs、无 log、完成超过 7 天"的对象 parts；见 [`prune_retired`] 的规则说明。
+fn retire_unreferenced_objects(conn: &Connection, active_epoch: u64, cutoff: i64) -> Result<u64> {
+    let mut stmt = conn.prepare(
+        "SELECT o.object_id, o.epoch, o.type FROM objects o
+         WHERE o.state = 'complete'
+           AND o.budget_class != 'retired'
+           AND o.type BETWEEN 1 AND 4
+           AND o.completed_at IS NOT NULL
+           AND o.completed_at <= ?1
+           AND NOT EXISTS (SELECT 1 FROM checkpoint_refs r WHERE r.object_id = o.object_id)
+           AND NOT EXISTS (SELECT 1 FROM log l WHERE l.object_id = o.object_id)
+           AND o.epoch NOT IN (SELECT to_epoch FROM rotations WHERE state IN ('frozen','staging'))
+           AND o.epoch != ?2",
+    )?;
+    let rows = stmt.query_map((cutoff, i64_of(active_epoch, "epoch")?), |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut collected: Vec<(Hash32, u64, i64)> = Vec::new();
+    for row in rows {
+        let (object_id, epoch, object_type) = row?;
+        collected.push((
+            object_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Invariant("objects.object_id"))?,
+            u64_of(epoch, "objects.epoch")?,
+            object_type,
+        ));
+    }
+    let mut retired = 0u64;
+    for (object_id, epoch, object_type) in collected {
+        conn.execute(
+            "DELETE FROM object_parts WHERE object_id = ?1",
+            [object_id.as_slice()],
+        )?;
+        conn.execute(
+            "UPDATE objects SET budget_class = 'retired' WHERE object_id = ?1",
+            [object_id.as_slice()],
+        )?;
+        // ASSET 副本：登记行保留为历史事实，但不再声称密文可用。
+        if object_type == ObjectType::Asset.as_i64() {
+            conn.execute(
+                "UPDATE asset_objects SET state = 'retired'
+                 WHERE epoch = ?1 AND object_id = ?2",
+                (i64_of(epoch, "epoch")?, object_id.as_slice()),
+            )?;
+        }
+        retired += 1;
+    }
+    Ok(retired)
+}
+
 pub fn abort_candidates(conn: &Connection, epoch: u64) -> Result<u64> {
     let changed = conn.execute(
         "UPDATE checkpoints SET state = 'aborted'

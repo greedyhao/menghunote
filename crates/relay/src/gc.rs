@@ -48,37 +48,22 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
     let mut outcome = GcOutcome::default();
     quota::expire_stale_reservations(conn, now)?;
     let vault = vault::load(conn)?;
-    // §25.2：到期旧槽必须真正删行 + 删 body/parts（不依赖是否有 GC 计划）。
+    // §25.2：到期旧槽必须由 tick 真正执行（14 天期限，与 7 天密文 GC 计划**分开**，
+    // 不依赖是否有 GC 计划；即使当前根不足两份也照常执行）。
     outcome.purged_slots = slots::purge_retired_slots(conn, now)?;
-    // §28.1 条目 9 / 评审 §一 10：旧 checkpoint 无根/lease 后 prune（清 refs、保留签名骨架）。
-    // 7 天密文宽限在这里执行，与旧槽 14 天期限**分开**。
-    let pruned = checkpoints::prune_retired(conn, now)?;
-    outcome.pruned_checkpoints = pruned.pruned_checkpoints;
-    outcome.retired_pruned_objects = pruned.retired_objects;
 
-    // 1) 到期计划里最大的 cut_seq。
-    let eligible_cut: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(cut_seq) FROM gc_plans WHERE eligible_at <= ?1",
-            [now],
-            |row| row.get(0),
-        )
-        .unwrap_or(None);
-    let Some(eligible_cut) = eligible_cut else {
-        // prune 可能删了 parts：账本必须对账后再返回。
-        if outcome.pruned_checkpoints > 0 {
-            quota::recompute(conn)?;
-        }
-        return Ok(outcome);
-    };
-    let eligible_cut = u64::try_from(eligible_cut).map_err(|_| Error::Invariant("gc cut_seq"))?;
-    outcome.cut_seq = eligible_cut;
-
-    // 2) 两份最新 published 基线（含 unhealthy：损坏的基线本身必须阻止前进，而不是被跳过）。
-    // §24.1：GC 只看 active epoch 的 committed pair；候选/aborted 永不参与。
-    let baselines = published_any_newest_first(conn, vault.active_epoch, 2)?;
+    // §S7-35 要求 1：**先验证保留根**（active epoch 最新两份 published）健康，
+    // 再做任何破坏性回收；degraded/不足两份健康基线 → 一律不删、floor 不动。
+    let mut baselines = published_any_newest_first(conn, vault.active_epoch, 2)?;
+    if baselines.len() > 2 {
+        baselines.truncate(2);
+    }
     if baselines.len() < 2 {
         outcome.blocked = true;
+        // 旧槽清理可能已删 parts：即使随后判定 degraded，账本也必须先对账。
+        if outcome.purged_slots > 0 {
+            quota::recompute(conn)?;
+        }
         return Ok(outcome);
     }
     for checkpoint in &baselines {
@@ -95,11 +80,43 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
         }
     }
     if outcome.blocked {
-        // 已发布的基线损坏：绝不推进 gc_floor（§13.3）。
+        // 根不健康：不剪 checkpoint/对象、不删日志、不推进 floor（§13.3 / 评审 0002）。
+        // 旧槽 14 天 TTL 已在上面独立执行（§25.2）；若它删了 parts，账本必须对账。
+        if outcome.purged_slots > 0 {
+            quota::recompute(conn)?;
+        }
         return Ok(outcome);
     }
 
-    // 3) floor = min(到期 cut, 较旧基线 S, 有效 lease floor)。
+    // §S7-35 要求 2–4：旧 epoch / 候选垃圾回收（7 天密文宽限；retired epoch 不再无条件
+    // 保留最后两份 full 基线；含跨 epoch ASSET 副本）。
+    let keep: Vec<Id16> = baselines.iter().map(|cp| cp.checkpoint_id).collect();
+    let pruned = checkpoints::prune_retired(conn, now, &keep)?;
+    outcome.pruned_checkpoints += pruned.pruned_checkpoints;
+    outcome.retired_pruned_objects += pruned.retired_objects;
+
+    // 1) 到期计划里最大的 cut_seq。
+    let eligible_cut: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(cut_seq) FROM gc_plans WHERE eligible_at <= ?1",
+            [now],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+    let Some(eligible_cut) = eligible_cut else {
+        // prune/槽 TTL 可能删了 parts：账本必须对账后再返回。
+        if outcome.pruned_checkpoints > 0
+            || outcome.retired_pruned_objects > 0
+            || outcome.purged_slots > 0
+        {
+            quota::recompute(conn)?;
+        }
+        return Ok(outcome);
+    };
+    let eligible_cut = u64::try_from(eligible_cut).map_err(|_| Error::Invariant("gc cut_seq"))?;
+    outcome.cut_seq = eligible_cut;
+
+    // 2) floor = min(到期 cut, 较旧基线 S, 有效 lease floor)。
     let older_seq = baselines
         .iter()
         .map(|c| c.covered_seq)
@@ -111,13 +128,19 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
     }
     outcome.floor = floor;
     if floor <= vault.gc_floor {
+        if outcome.pruned_checkpoints > 0
+            || outcome.retired_pruned_objects > 0
+            || outcome.purged_slots > 0
+        {
+            quota::recompute(conn)?;
+        }
         return Ok(outcome);
     }
 
-    // 4) 删日志前缀。
+    // 3) 删日志前缀。
     outcome.deleted_log_rows = log::delete_prefix(conn, floor)?;
 
-    // 5) 无根引用的 update 对象：清密文、保留行（幂等 tombstone；ADR §6 末段）。
+    // 4) 无根引用的 update 对象：清密文、保留行（幂等 tombstone；ADR §6 末段）。
     let candidates: Vec<Vec<u8>> = {
         let mut stmt = conn.prepare(
             "SELECT o.object_id FROM objects o
@@ -141,6 +164,12 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
         outcome.retired_update_objects += 1;
     }
 
+    // 5) 日志前缀删完后**再回收一次**：旧 epoch 的 ASSET/UPDATE 副本此前因 log 行还在
+    //    而被保留，现在可安全清 parts（跨 epoch 副本不因"同 epoch 孤儿后置"而豁免）。
+    let pruned_after = checkpoints::prune_retired(conn, now, &keep)?;
+    outcome.pruned_checkpoints += pruned_after.pruned_checkpoints;
+    outcome.retired_pruned_objects += pruned_after.retired_objects;
+
     // 6) 从未 finalize 的暂存对象：24h 可删（ADR §7）。
     outcome.deleted_staging_objects =
         objects::cleanup_staging(conn, now - secs::STAGING_RETENTION)?;
@@ -153,7 +182,6 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
     )?;
     Ok(outcome)
 }
-
 /// 含 unhealthy 的已发布基线（GC 专用；健康过滤由调用方做，否则损坏基线会被"跳过"而非阻止）。
 pub fn published_any_newest_first(
     conn: &Connection,

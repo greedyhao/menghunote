@@ -58,7 +58,7 @@ fn main() -> AnyResult<()> {
     );
 
     // 1. 恢复码自批（管理 token → invite → redeem → approve）。
-    let mut transport = StdTcpTransport::new(&relay)?;
+    let mut transport = StdTcpTransport::new_local_dev(&relay)?;
     let enrolled =
         recovery_enroll::self_enroll(&mut transport, &relay, vault_id, &recovery_code, now_secs())?;
     for step in &enrolled.steps {
@@ -68,7 +68,7 @@ fn main() -> AnyResult<()> {
 
     // 2. 设备 token + /bootstrap + manifest/snapshot/asset 导入。
     let mut client = HttpRelayClient::new(
-        StdTcpTransport::new(&relay)?,
+        StdTcpTransport::new_local_dev(&relay)?,
         HttpRelayConfig {
             base_url: relay.clone(),
             vault_id,

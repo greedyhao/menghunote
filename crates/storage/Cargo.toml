@@ -10,6 +10,7 @@ loro = "1.17.1"
 menghunote-text = { path = "../text" }
 # `bundled` 特性会静态编译一份 SQLite，不依赖系统 sqlite3.dll / 用户机器上的版本
 rusqlite = { version = "0.41", features = ["bundled"] }
+sha2 = "0.10"
 thiserror = "2"
 
 [dev-dependencies]

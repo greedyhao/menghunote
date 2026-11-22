@@ -1,7 +1,8 @@
 //! 轮换 P1：候选 epoch 的新 KEY_SLOT、slot_set_digest 与全 active 设备 grants。
 //!
 //! 槽必须用**新秘密**（新 password / 新 `R'`），AAD 闭包与最终上传 header 逐字段一致；
-//! KEY_SLOT 走 `K_slot_mne` 且带 `?reservation=`。
+//! 槽体 AAD 的 `message_id = slot_id[..16]`、长度取根 CDE 明文长度（与 genesis /
+//! `recovery_enroll` 标准读取路径同口径）；KEY_SLOT 走 `K_slot_mne` 且带 `?reservation=`。
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -11,16 +12,19 @@ use crate::error::SyncError;
 use crate::kdf;
 use crate::keys::RootSecretV1;
 use crate::recovery::RecoverySeed;
-use crate::relay::{RelayClient, SlotUpload};
+use crate::relay::{FrozenAssetRef, RelayClient, SlotUpload};
 use crate::rotation::ManagerTransitionV1;
 use crate::rotation_journal::JournalBaseline;
+use crate::rotation_stage::ReencryptedAsset;
 use crate::slot::{
     context_hash, validate_slot_descriptor, KeySlotV1, PROTOCOL_VERSION,
     WRAP_SUITE_XCHACHA20_POLY1305,
 };
 use crate::{DeviceId, ObjectId, VaultId};
-use menghunote_sync_proto::ObjectType;
-use menghunote_sync_proto::{Kdf, SlotDescriptorV1, SlotKind};
+use menghunote_sync_proto::{
+    activation_t_signing_input, part_count_for, ActivationTV1, CheckpointCommit, Kdf, ObjectRefV1,
+    ObjectType, SlotDescriptorV1, SlotKind,
+};
 
 /// 候选槽集合（新秘密）。
 pub struct CandidateSlots {
@@ -83,35 +87,21 @@ pub fn generate_candidate_slots(
     let recovery_seed = RecoverySeed::generate(rng)?;
     let recovery_code = recovery_seed.to_code()?;
     let root = candidate_root.clone();
-    let password_message = crate::random::array::<16>(rng)?;
+    let aad = slot_aad(device_id);
     let password = KeySlotV1::wrap_password(
         &password_descriptor,
         new_password.as_bytes(),
         &root,
-        &slot_aad(vault_id, device_id, password_message),
+        &aad,
         rng,
     )?;
-    let recovery_message = crate::random::array::<16>(rng)?;
-    let recovery = KeySlotV1::wrap_recovery(
-        &recovery_descriptor,
-        &recovery_seed,
-        &root,
-        &slot_aad(vault_id, device_id, recovery_message),
-        rng,
-    )?;
-    // 自检：新秘密必须各自解回同一候选根。
+    let recovery =
+        KeySlotV1::wrap_recovery(&recovery_descriptor, &recovery_seed, &root, &aad, rng)?;
+    // 自检：新秘密必须各自解回同一候选根（AAD 与标准 reader 同口径）。
     if !password
-        .unwrap_password(
-            new_password.as_bytes(),
-            &slot_aad(vault_id, device_id, password_message),
-        )?
+        .unwrap_password(new_password.as_bytes(), &aad)?
         .ct_eq(&root)
-        || !recovery
-            .unwrap_recovery(
-                &recovery_seed,
-                &slot_aad(vault_id, device_id, recovery_message),
-            )?
-            .ct_eq(&root)
+        || !recovery.unwrap_recovery(&recovery_seed, &aad)?.ct_eq(&root)
     {
         return Err(SyncError::Unwrap);
     }
@@ -127,20 +117,29 @@ pub fn generate_candidate_slots(
     })
 }
 
-/// 与 `upload_slot_with_reservation` 写入 header 完全一致的 AAD 构造器。
+/// 与 genesis / 标准 reader 逐字节一致的槽体 AAD 构造器。
+///
+/// 口径（`genesis::build_materials` 包槽体、`recovery_enroll::unwrap_recovery_slot`
+/// 读回重建，两边相同）：
+/// - `message_id = slot_id[..16]`（**不是**随机值，也不是 MNE 层的 message_id）；
+/// - 长度字段取根 CDE 明文长度（`plaintext_len` / `plaintext_len + 16`）；
+/// - 其余字段与 `upload::upload_object` 写 KEY_SLOT header 时一致。
+///
+/// 轮换产出的新槽将来要能被标准 reader 用新口令/新恢复码解回；这里任何字段漂移都会
+/// 让新槽"写得进、读不回"。
 fn slot_aad(
-    vault_id: VaultId,
     device_id: DeviceId,
-    message_id: [u8; 16],
 ) -> impl Fn(&SlotDescriptorV1, &[u8; 24], usize) -> Result<Vec<u8>, SyncError> {
     move |descriptor, nonce, plaintext_len| {
+        let mut message_id = [0u8; 16];
+        message_id.copy_from_slice(&descriptor.slot_id[..16]);
         let header = menghunote_sync_proto::EnvelopeHeader {
             protocol_version: menghunote_sync_proto::PROTOCOL_VERSION,
             header_len: menghunote_sync_proto::HEADER_LEN as u16,
             object_type: ObjectType::KeySlot,
             cipher_suite: menghunote_sync_proto::CIPHER_SUITE_XCHACHA20_POLY1305,
             flags: 0,
-            vault_id,
+            vault_id: descriptor.vault_id,
             object_id: descriptor.slot_id,
             message_id,
             producer_device_id: device_id,
@@ -150,8 +149,10 @@ fn slot_aad(
             part_index: 0,
             part_count: 1,
             total_plaintext_len: plaintext_len as u64,
-            this_plaintext_len: plaintext_len as u32,
-            ciphertext_len: (plaintext_len + 16) as u32,
+            this_plaintext_len: u32::try_from(plaintext_len)
+                .map_err(|_| SyncError::Descriptor("槽根明文长度超出 u32"))?,
+            ciphertext_len: u32::try_from(plaintext_len + 16)
+                .map_err(|_| SyncError::Descriptor("槽密文长度超出 u32"))?,
             context_hash: context_hash(descriptor)?,
             nonce: *nonce,
         };
@@ -266,38 +267,191 @@ pub fn slot_set_digest(descriptors: &[SlotDescriptorV1]) -> Result<[u8; 32], Syn
     Ok(Sha256::digest(&input).into())
 }
 
-/// 阶段 G：构造 9 字段 manager transition 并让旧/新管理 key 双签同一 CDE。
+/// 完整 activation T（ADR 0006 §34）各字段在**客户端**的逐项来源。
+///
+/// 这里不保存任何秘密：全部是公开标识/摘要。字段与 `ActivationTV1` 的 20 个整数键
+/// 一一对应，`build_activation_t` 只做类型收窄与结构校验，不做网络/存储 IO。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationTMaterial {
+    pub vault_id: VaultId,
+    pub instance_id: [u8; 16],
+    pub rotation_id: [u8; 16],
+    pub from_epoch: u64,
+    pub to_epoch: u64,
+    /// 冻结截止 S（= `rotation.freeze_seq`）。
+    pub freeze_seq: u64,
+    pub old_manager_rev: u64,
+    pub new_manager_rev: u64,
+    pub new_manager_public: [u8; 32],
+    /// 激活前控制链链尾 `record_hash`（relay `/control` 已验证链的最后一跳）。
+    pub prev_control_hash: [u8; 32],
+    /// **激活后**控制链 rev（= 当前链尾 rev + 1；relay `bind_activation_t` 的 CAS 口径）。
+    pub expected_control_rev: u64,
+    pub primary_checkpoint: [u8; 16],
+    /// `SHA256(CDE(CheckpointCommitV1))`，即 relay 的 `signed_commit` 摘要。
+    pub primary_commit_digest: [u8; 32],
+    pub fallback_checkpoint: [u8; 16],
+    pub fallback_commit_digest: [u8; 32],
+    /// 候选 epoch staging 槽集合摘要（`slot_set_digest` 口径）。
+    pub slot_set_digest: [u8; 32],
+    /// 控制链 active 成员证书集合摘要（`member_cert_digest` 口径）。
+    pub member_cert_digest: [u8; 32],
+    /// 候选 epoch 完整 grants 包摘要（`grant_package_digest` 口径）。
+    pub grants_digest: [u8; 32],
+    /// 旧 epoch 冻结资产集合摘要（relay frozen `asset_set_digest`）。
+    pub old_asset_set_digest: [u8; 32],
+    /// 候选 epoch 重加密资产集合摘要（relay `candidate_asset_set_digest` 口径）。
+    pub new_asset_set_digest: [u8; 32],
+}
+
+/// ADR 0006 §34：从本地材料构造完整的 20 字段 activation T。
+///
+/// 只做字段装配与 `ActivationTV1::validate`（epoch/rev 单调、非全零、SQLite 上界）；
+/// 与 relay 事实的逐项比对由 relay `bind_activation_t` 与客户端 `/control` 复算共同完成。
+pub fn build_activation_t(material: &ActivationTMaterial) -> Result<ActivationTV1, SyncError> {
+    let old_manager_rev = u32::try_from(material.old_manager_rev)
+        .map_err(|_| SyncError::Object("activation T: old_manager_rev 超出 u32"))?;
+    let new_manager_rev = u32::try_from(material.new_manager_rev)
+        .map_err(|_| SyncError::Object("activation T: new_manager_rev 超出 u32"))?;
+    let record = ActivationTV1 {
+        vault_id: material.vault_id,
+        instance_id: material.instance_id,
+        rotation_id: material.rotation_id,
+        from_epoch: material.from_epoch,
+        to_epoch: material.to_epoch,
+        freeze_seq: material.freeze_seq,
+        old_manager_rev,
+        new_manager_rev,
+        new_manager_pubkey: material.new_manager_public,
+        prev_control_hash: material.prev_control_hash,
+        expected_control_rev: material.expected_control_rev,
+        primary_cid: material.primary_checkpoint,
+        primary_commit_digest: material.primary_commit_digest,
+        fallback_cid: material.fallback_checkpoint,
+        fallback_commit_digest: material.fallback_commit_digest,
+        slot_set_digest: material.slot_set_digest,
+        member_cert_digest: material.member_cert_digest,
+        grants_digest: material.grants_digest,
+        old_asset_set_digest: material.old_asset_set_digest,
+        new_asset_set_digest: material.new_asset_set_digest,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// 阶段 G：构造 9 字段 manager transition + 完整 activation T，并让旧/新管理 key
+/// 分别对 `transition` 与 `MN/v1/activation-t\0 || CDE(T)` 各签一次。
+///
+/// `NewManagerV1` 的 3–5 字段（T + 旧/新 T 双签）永远一起填充；activate 路径不得再传
+/// `None`（relay 对缺 T 的请求一律 409）。
 #[allow(clippy::too_many_arguments)]
 pub fn build_manager_transition(
-    vault_id: VaultId,
-    instance_id: [u8; 16],
-    rotation_id: [u8; 16],
-    from_epoch: u64,
-    to_epoch: u64,
-    old_manager_rev: u64,
-    new_manager_rev: u64,
-    new_manager_public: [u8; 32],
-    freeze_seq: u64,
+    material: &ActivationTMaterial,
     old_manager: &ManagementKey,
     new_manager: &ManagementKey,
 ) -> Result<menghunote_sync_proto::NewManagerV1, SyncError> {
     let transition = ManagerTransitionV1 {
-        vault_id,
-        instance_id,
-        rotation_id,
-        from_epoch,
-        to_epoch,
-        old_rev: old_manager_rev,
-        new_rev: new_manager_rev,
-        new_pubkey: new_manager_public,
-        covered_seq: freeze_seq,
+        vault_id: material.vault_id,
+        instance_id: material.instance_id,
+        rotation_id: material.rotation_id,
+        from_epoch: material.from_epoch,
+        to_epoch: material.to_epoch,
+        old_rev: material.old_manager_rev,
+        new_rev: material.new_manager_rev,
+        new_pubkey: material.new_manager_public,
+        covered_seq: material.freeze_seq,
     }
     .encode()?;
+    let activation_t = build_activation_t(material)?;
+    let t_signing_input = activation_t_signing_input(&activation_t)?;
     Ok(menghunote_sync_proto::NewManagerV1 {
         old_signature: Some(old_manager.sign(&transition).to_vec()),
         new_signature: Some(new_manager.sign(&transition).to_vec()),
         transition,
+        activation_t: Some(activation_t.encode()?),
+        old_t_signature: Some(old_manager.sign(&t_signing_input).to_vec()),
+        new_t_signature: Some(new_manager.sign(&t_signing_input).to_vec()),
     })
+}
+
+/// ADR §34：`primary_commit_digest` / `fallback_commit_digest` 的口径。
+///
+/// `SHA256(CDE(CheckpointCommitV1))`，与 relay 持久化的 `signed_commit` 字节逐字节一致
+/// （`CheckpointWriter::promote` 用同一组字段签名发布）。
+pub fn checkpoint_commit_digest(
+    vault_id: VaultId,
+    producer_device_id: DeviceId,
+    report: &crate::checkpoint::CheckpointReport,
+) -> Result<[u8; 32], SyncError> {
+    let commit = CheckpointCommit {
+        vault_id,
+        checkpoint_id: report.checkpoint_id,
+        epoch: report.epoch,
+        covered_relay_seq: report.covered_seq,
+        manifest_object_id: report.manifest.object_id,
+        manifest_digest: report.manifest.object_digest,
+        refs_digest: report.refs_digest,
+        producer_device_id,
+        validation_version: 1,
+    };
+    Ok(Sha256::digest(commit.encode()?).into())
+}
+
+/// relay 存下的 `signed_commit` 字节的摘要（恢复路径拿不到 `PreparedCheckpoint` 时用）。
+#[must_use]
+pub fn signed_commit_digest(signed_commit: &[u8]) -> [u8; 32] {
+    Sha256::digest(signed_commit).into()
+}
+
+/// relay `objects::candidate_asset_set_digest` 同口径：
+/// `SHA256(CDE(sorted ObjectRefV1[type=ASSET]))`，取**候选 epoch**本次 rotation 已
+/// complete 的重加密资产集合（`ReencryptedAsset` 的全部字段足以重建 `ObjectRefV1`）。
+pub fn candidate_asset_set_digest(
+    epoch: u64,
+    assets: &[ReencryptedAsset],
+) -> Result<[u8; 32], SyncError> {
+    let mut refs = Vec::with_capacity(assets.len());
+    for asset in assets {
+        if asset.media_type.is_empty() || asset.media_type.len() > 255 {
+            return Err(SyncError::Object("候选资产 MIME 长度非法"));
+        }
+        let total_plain_len = 42u64
+            .checked_add(asset.media_type.len() as u64)
+            .and_then(|value| value.checked_add(asset.byte_len))
+            .ok_or(SyncError::Object("候选资产明文长度溢出"))?;
+        let part_count = u32::try_from(part_count_for(total_plain_len, ObjectType::Asset))
+            .map_err(|_| SyncError::Object("候选资产 part_count 超出 u32"))?;
+        refs.push(ObjectRefV1 {
+            object_id: asset.object_id,
+            object_type: ObjectType::Asset,
+            generation: 0,
+            key_epoch: epoch,
+            part_count,
+            total_plain_len,
+            object_digest: asset.object_digest,
+        });
+    }
+    let input = menghunote_sync_proto::refs_digest_input(&refs)?;
+    Ok(Sha256::digest(&input).into())
+}
+
+/// relay `objects::asset_set_digest` / 冻结源 `source_digest` 同口径：
+/// `SHA256(CDE(sorted ObjectRefV1[type=ASSET]))`，取旧 epoch 冻结时点的完整 finalized 集合。
+pub fn frozen_asset_set_digest(refs: &[FrozenAssetRef]) -> Result<[u8; 32], SyncError> {
+    let mut object_refs = Vec::with_capacity(refs.len());
+    for reference in refs {
+        object_refs.push(ObjectRefV1 {
+            object_id: reference.object_id,
+            object_type: ObjectType::Asset,
+            generation: reference.generation,
+            key_epoch: reference.key_epoch,
+            part_count: reference.part_count,
+            total_plain_len: reference.total_plain_len,
+            object_digest: reference.object_digest,
+        });
+    }
+    let input = menghunote_sync_proto::refs_digest_input(&object_refs)?;
+    Ok(Sha256::digest(&input).into())
 }
 
 /// 候选基线/槽绑定记录（journal 持久化用）。

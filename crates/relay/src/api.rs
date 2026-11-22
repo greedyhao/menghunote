@@ -160,6 +160,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/vaults/{vault}/rotations/{rotation}/grants",
             get(list_rotation_grants),
         )
+        // §35.4：设备 realm 只读的完整 leaf manifest（B 侧 inclusion 校验）。
+        // 必须注册在 `{device}` 动态段之前，避免 `leaves` 被当成设备 id。
+        .route(
+            "/v1/vaults/{vault}/rotations/{rotation}/grants/leaves",
+            get(list_rotation_grant_leaves),
+        )
         .route(
             "/v1/vaults/{vault}/rotations/{rotation}/assets",
             get(list_rotation_assets),
@@ -2059,12 +2065,17 @@ async fn activate_rotation(
     let canonical = CanonicalBody::parse(&fields, 0)?;
     let request_id = wire::id16_field(&fields, 1)?;
     let expected_control_rev = wire::uint_field(&fields, 2)?;
+    // §34：new_manager 还要携带完整 activation T 与旧/新管理 key 的双签（3/4/5）。
+    // 缺失与否由 `rotations::activate` 统一判 409；这里只拒绝类型错误（400）。
     let new_manager = match management::opt_map_field(&fields, 3, &canonical, 0)? {
         None => None,
         Some(map) => Some(NewManager {
             transition: wire::bytes_field(&map, 0)?,
             old_signature: wire::opt_bytes_field(&map, 1)?,
             new_signature: wire::opt_bytes_field(&map, 2)?,
+            activation_t: wire::opt_bytes_field(&map, 3)?,
+            old_t_signature: wire::opt_bytes_field(&map, 4)?,
+            new_t_signature: wire::opt_bytes_field(&map, 5)?,
         }),
     };
     let primary_checkpoint = canonical.opt_id16(1)?;
@@ -2398,6 +2409,66 @@ async fn list_rotation_grants(
         (0, wire::array(entries)),
         (1, cbor_bytes(view.grants_digest)),
         (2, cbor_uint(view.grants_count)),
+    ]))
+}
+
+/// §35.4：设备 realm 可读的**最小 leaf 证据**：`{0: device_id,1: SHA256(signed_header),
+/// 2: signed_header}`。
+///
+/// 只暴露 inclusion 校验所需字段（不含 HPKE 密文/签名），并让设备端自己复算
+/// `SHA256(signed_header)`，不必信任 relay 自报的 digest。
+fn grant_leaf_evidence_fields(grant: &rotations::GrantRow) -> wire::CdeValue {
+    wire::map(vec![
+        (0, cbor_bytes(grant.device_id)),
+        (1, cbor_bytes(sha256(&grant.signed_header))),
+        (2, cbor_bytes(grant.signed_header.clone())),
+    ])
+}
+
+/// §35.4：`GET /v1/vaults/{v}/rotations/{r}/grants/leaves`。
+///
+/// 与 `/grants` 的区别：**设备 realm** 可读，但只允许：
+/// - active 设备（`authenticate` 已按 `devices.status` 拒绝吊销/未知设备）；
+/// - 该 rotation 的成员（存在该 epoch 的 grant 行，防跨轮换枚举）；
+/// - rotation 处于 `staging`/`activated`（frozen 尚未收齐、aborted 已删 grant，
+///   都不能作为 inclusion 证据）。
+///
+/// 响应：`{0: leaves[], 1: grants_digest, 2: grants_count, 3: to_epoch,
+/// 4: rotation_state, 5: rotation_id}`。客户端必须用返回的 leaf 复算
+/// `grants_digest`（`SHA256(concat(sorted(device_id || SHA256(signed_header))))`），
+/// 不得信任 relay 自报的 digest。
+async fn list_rotation_grant_leaves(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, rotation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    let rotation_id = parse_id16(&rotation_id)?;
+    let actor = require_device(&state, &headers)?;
+    let requester = actor.device_id()?;
+    let (view, grants) = state.db.read(move |conn| {
+        require_vault(conn, &vault_id)?;
+        let view = rotations::view(conn, &rotation_id)?;
+        if !matches!(
+            view.rotation.state,
+            rotations::RotationState::Staging | rotations::RotationState::Activated
+        ) {
+            return Err(Error::api(ErrorCode::InvalidState));
+        }
+        let grants = rotations::list_grants(conn, view.rotation.to_epoch)?;
+        if !grants.iter().any(|grant| grant.device_id == requester) {
+            return Err(Error::api(ErrorCode::Forbidden));
+        }
+        Ok((view, grants))
+    })?;
+    let entries: Vec<wire::CdeValue> = grants.iter().map(grant_leaf_evidence_fields).collect();
+    Ok(cbor_ok(vec![
+        (0, wire::array(entries)),
+        (1, cbor_bytes(view.grants_digest)),
+        (2, cbor_uint(view.grants_count)),
+        (3, cbor_uint(view.rotation.to_epoch)),
+        (4, wire::text(view.rotation.state.as_str())),
+        (5, cbor_bytes(rotation_id)),
     ]))
 }
 

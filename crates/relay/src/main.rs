@@ -9,14 +9,18 @@
 //!
 //! 配置（`serve --config`）是扁平 TOML：
 //! ```toml
-//! listen = "127.0.0.1:18080"
+//! listen = "127.0.0.1:18080"                  # 默认只允许 loopback；对外入口走 TLS 反向代理
 //! db = "/var/lib/menghunote/relay.sqlite3"   # 必须绝对路径
+//! allow_plaintext = false                     # 非 loopback 明文监听必须显式置 true（有风险）
 //! normal_limit = 4294967296                   # Q（默认 4GiB）
 //! maintenance_limit = 8589934592              # 峰值 Q+R（默认 2Q）
 //! cursor_key = "…64 hex…"                     # 可选；与 cursor_key_path 二选一
 //! cursor_key_path = "cursor.key"              # 可选；相对路径按配置文件目录解析
 //! max_snapshot_bytes = 67108864               # 可选；默认 64MiB
 //! ```
+//!
+//! **明文门禁**：`listen` 非 loopback 且未显式 `allow_plaintext = true` 时拒绝启动并打印
+//! 反向代理/TLS 部署示例（见 [`relay::config::ensure_plaintext_listen_allowed`]）。
 //!
 //! 请求日志只打 `method path -> status`，**不含** body/query/header（可能含密文/秘密）。
 
@@ -61,8 +65,20 @@ fn usage() -> &'static str {
   menghunote-relay --help
 
 配置字段（serve --config，扁平 TOML）:
-  listen（必填）、db（必填，绝对路径）、normal_limit、maintenance_limit、
-  cursor_key 或 cursor_key_path、max_snapshot_bytes
+  listen（必填）、db（必填，绝对路径）、allow_plaintext（默认 false）、
+  normal_limit、maintenance_limit、cursor_key 或 cursor_key_path、max_snapshot_bytes
+
+TLS 部署（relay 自身只讲明文 HTTP；默认只允许 loopback）:
+  默认 listen = \"127.0.0.1:18080\" 或 \"[::1]:18080\"；对外入口由同机反向代理终止 TLS，例如 nginx：
+    server {
+      listen 443 ssl;
+      ssl_certificate     /etc/menghunote/fullchain.pem;
+      ssl_certificate_key /etc/menghunote/privkey.pem;
+      location / { proxy_pass http://127.0.0.1:18080; proxy_http_version 1.1; }
+    }
+  客户端配置 https://your.domain（证书必须匹配 hostname 且未过期）。
+  非 loopback（0.0.0.0 / 内网 IP）明文监听会被拒绝；确认在受信任私网/隧道内才可显式
+  allow_plaintext = true（bearer token 与元数据将明文传输）。
 "
 }
 
@@ -72,6 +88,9 @@ fn usage() -> &'static str {
 struct ServeConfig {
     listen: String,
     db: PathBuf,
+    /// 非 loopback 地址上的明文监听必须显式允许（默认 false：只允许 loopback 明文）。
+    #[serde(default)]
+    allow_plaintext: bool,
     #[serde(default)]
     normal_limit: Option<i64>,
     #[serde(default)]
@@ -88,6 +107,7 @@ struct ServeConfig {
 #[derive(Debug)]
 struct ValidatedServe {
     listen: SocketAddr,
+    allow_plaintext: bool,
     config: RelayConfig,
 }
 
@@ -100,6 +120,8 @@ impl ServeConfig {
                 self.listen
             )
         })?;
+        // 明文门禁先于任何 IO：非 loopback 且未显式允许时直接拒绝启动。
+        relay::config::ensure_plaintext_listen_allowed(listen, self.allow_plaintext)?;
         if self.db.as_os_str().is_empty() {
             return Err("db 不能为空".to_string());
         }
@@ -160,7 +182,11 @@ impl ServeConfig {
         if let Some(key) = cursor_key {
             config = config.with_cursor_key(key);
         }
-        Ok(ValidatedServe { listen, config })
+        Ok(ValidatedServe {
+            listen,
+            allow_plaintext: self.allow_plaintext,
+            config,
+        })
     }
 }
 
@@ -317,6 +343,12 @@ fn serve(config_path: &Path, dev: bool) -> Result<(), String> {
         .map_err(|err| format!("配置文件 {} 解析失败: {err}", config_path.display()))?;
     let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let validated = raw.validate(base_dir)?;
+    if validated.allow_plaintext && !validated.listen.ip().is_loopback() {
+        eprintln!(
+            "[relay] 警告：allow_plaintext=true 且监听非 loopback 地址 {}：明文入口只应存在于受信任私网/本机反向代理之后",
+            validated.listen
+        );
+    }
 
     let db_path = validated.config.db.path.clone();
     let db = Db::open(validated.config.db.clone(), Arc::new(SystemClock))

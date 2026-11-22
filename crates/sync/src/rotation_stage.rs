@@ -61,7 +61,7 @@ pub fn reencrypt_assets<C: RelayClient>(
             return Err(SyncError::Object("冻结资产字节与元数据不一致"));
         }
         let plaintext = asset_plaintext(&real, meta.byte_len, &meta.media_type, &data)?;
-        let object_id = asset_object_id(new_root, &real)?;
+        let object_id = asset_object_id(new_root, &real, meta.byte_len, &meta.media_type)?;
         let message_id = asset_message_id(new_root, &object_id)?;
         let object = if let Some(reservation) = reservation {
             crate::upload::upload_object_with_reservation(
@@ -223,6 +223,8 @@ pub fn verify_snapshot_integrity(snapshot: &SnapshotV1) -> Result<(), SyncError>
     let doc = loro::LoroDoc::new();
     doc.import(&snapshot.loro_snapshot_bytes)
         .map_err(|_| SyncError::Object("快照 Loro 数据非法"))?;
+    // 标志位与 VV 都不是 full-history 证据：Loro shallow snapshot 必须单独拒绝。
+    crate::checkpoint::ensure_snapshot_full_history(&doc)?;
     let actual = doc.oplog_vv();
     let claimed = if snapshot.vv.is_empty() {
         loro::VersionVector::new()
@@ -427,7 +429,7 @@ pub fn reencrypt_frozen_assets<C: RelayClient>(
         let (real, byte_len, media_type) = decode_asset_plaintext(&payload)?;
         let plaintext =
             asset_plaintext(&real, byte_len, &media_type, payload_asset_data(&payload)?)?;
-        let object_id = asset_object_id(new_root, &real)?;
+        let object_id = asset_object_id(new_root, &real, byte_len, &media_type)?;
         let message_id = asset_message_id(new_root, &object_id)?;
         let object = if let Some(reservation) = reservation {
             crate::upload::upload_object_with_reservation(
@@ -475,7 +477,7 @@ pub fn reencrypt_frozen_assets<C: RelayClient>(
     Ok((out, digest, total))
 }
 
-fn payload_asset_data(payload: &[u8]) -> Result<&[u8], SyncError> {
+pub(crate) fn payload_asset_data(payload: &[u8]) -> Result<&[u8], SyncError> {
     if payload.len() < 42 {
         return Err(SyncError::Object("资产明文过短"));
     }
@@ -772,7 +774,7 @@ pub fn plan_grants(
 }
 
 /// 解码 asset plaintext 前缀（32B real sha + BE64 len + BE16 mime len + mime + data）。
-fn decode_asset_plaintext(bytes: &[u8]) -> Result<([u8; 32], u64, String), SyncError> {
+pub(crate) fn decode_asset_plaintext(bytes: &[u8]) -> Result<([u8; 32], u64, String), SyncError> {
     if bytes.len() < 42 {
         return Err(SyncError::Object("资产明文过短"));
     }
@@ -823,8 +825,10 @@ pub fn stage_grants<T: crate::http_relay::HttpTransport>(
     let (token, _) =
         crate::recovery_enroll::management_token(transport, base, vault_id, manager, now)?;
     for leaf in leaves {
+        // URL 里的 `{device_id}` 只是设备维度；body 键 0 是**真实 grant_id**（grant AAD
+        // 里绑定的那个），relay 按 grant_id 验签/落库，不能拿 device_id 顶替。
         let body = menghunote_sync_proto::GrantStageBodyV1 {
-            grant_id: leaf.device_id,
+            grant_id: leaf.grant_id,
             hpke_enc: leaf.hpke_enc,
             hpke_ciphertext: leaf.ciphertext.clone(),
             signed_header: leaf.signed_header.clone(),
@@ -901,6 +905,103 @@ pub fn prepare_new_epoch_baseline_with_role<'a, C: RelayClient>(
     assets: &'a dyn AssetSource,
     role: Option<&str>,
 ) -> Result<crate::checkpoint::PreparedCheckpoint, SyncError> {
+    prepare_baseline_with_context(
+        vault,
+        client,
+        vault_id,
+        device_id,
+        signing_key,
+        new_root,
+        peer_id,
+        assets,
+        role,
+        None,
+        None,
+    )
+}
+
+/// 同上，但显式传入候选 epoch 的 coverage 验证根（**旧 active 根**）。
+///
+/// 候选基线在 `from_epoch` 冻结点导出：`<= S` 的 ASSET 日志事件用旧根加密，而
+/// manifest refs 里的资产用新 epoch 根加密。缺旧根时 validate 必须暂停/报错，
+/// 绝不拿新根去"猜"。
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_new_epoch_baseline_with_role_and_coverage_root<'a, C: RelayClient>(
+    vault: &'a Vault,
+    client: &'a mut C,
+    vault_id: VaultId,
+    device_id: DeviceId,
+    signing_key: DeviceSigningKey,
+    new_root: RootSecretV1,
+    peer_id: u64,
+    assets: &'a dyn AssetSource,
+    role: Option<&str>,
+    coverage_root: &RootSecretV1,
+) -> Result<crate::checkpoint::PreparedCheckpoint, SyncError> {
+    prepare_baseline_with_context(
+        vault,
+        client,
+        vault_id,
+        device_id,
+        signing_key,
+        new_root,
+        peer_id,
+        assets,
+        role,
+        None,
+        Some(coverage_root.clone()),
+    )
+}
+
+/// restart 候选基线：额外把 rotation/CAS 交给 writer，使 create intent 与
+/// upload/validate/promote 各阶段进度都 durable（评审 0003 P1-D）。
+///
+/// 与 [`prepare_new_epoch_baseline_with_role`] 不同，本入口要求 writer 在
+/// create 之前持久 per-role intent；崩溃/重试按同一 request_id/cid 恢复，绝不 fresh create。
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_restart_baseline_with_role<'a, C: RelayClient>(
+    vault: &'a Vault,
+    client: &'a mut C,
+    vault_id: VaultId,
+    device_id: DeviceId,
+    signing_key: DeviceSigningKey,
+    new_root: RootSecretV1,
+    peer_id: u64,
+    assets: &'a dyn AssetSource,
+    role: &str,
+    rotation_id: [u8; 16],
+    expected_control_rev: u64,
+    coverage_root: &RootSecretV1,
+) -> Result<crate::checkpoint::PreparedCheckpoint, SyncError> {
+    prepare_baseline_with_context(
+        vault,
+        client,
+        vault_id,
+        device_id,
+        signing_key,
+        new_root,
+        peer_id,
+        assets,
+        Some(role),
+        Some((rotation_id, expected_control_rev)),
+        Some(coverage_root.clone()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_baseline_with_context<'a, C: RelayClient>(
+    vault: &'a Vault,
+    client: &'a mut C,
+    vault_id: VaultId,
+    device_id: DeviceId,
+    signing_key: DeviceSigningKey,
+    new_root: RootSecretV1,
+    peer_id: u64,
+    assets: &'a dyn AssetSource,
+    role: Option<&str>,
+    restart_baseline: Option<([u8; 16], u64)>,
+    coverage_root: Option<RootSecretV1>,
+) -> Result<crate::checkpoint::PreparedCheckpoint, SyncError> {
     let mut writer = CheckpointWriter::new(
         vault,
         client,
@@ -913,5 +1014,18 @@ pub fn prepare_new_epoch_baseline_with_role<'a, C: RelayClient>(
     if let Some(role) = role {
         writer = writer.with_role(role);
     }
-    writer.prepare(assets)
+    if let Some((rotation_id, expected_control_rev)) = restart_baseline {
+        writer = writer.with_restart_baseline(rotation_id, expected_control_rev);
+    }
+    if let Some(coverage_root) = coverage_root {
+        writer = writer.with_coverage_root(coverage_root);
+    }
+    // ADR §32：候选基线同样必须 prepare → validate（真读回/导入）→ promote（签名发布）。
+    // 返回的 PreparedCheckpoint 已标记 validated，供阶段 E 继续采集独立证据。
+    let mut prepared = writer.prepare(assets)?;
+    let baseline = writer.validate(&prepared)?;
+    let promoted = writer.promote(&baseline)?;
+    prepared.report.validated = true;
+    prepared.report.published_at = Some(promoted.published_at);
+    Ok(prepared)
 }

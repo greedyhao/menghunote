@@ -43,7 +43,7 @@ fn migration_v1_to_v2_is_idempotent_and_adds_sync_tables() {
     }
 
     let vault = Vault::open(&path).expect("打开并升级");
-    assert_eq!(vault.user_version().expect("版本"), 2);
+    assert_eq!(vault.user_version().expect("版本"), 3);
 
     let columns = |vault: &Vault| -> Vec<String> {
         vault
@@ -80,7 +80,7 @@ fn migration_v1_to_v2_is_idempotent_and_adds_sync_tables() {
         .expect("count")[0][0]
         .clone();
     let vault = Vault::open(&path).expect("reopen2");
-    assert_eq!(vault.user_version().expect("version"), 2);
+    assert_eq!(vault.user_version().expect("version"), 3);
     let after = vault
         .query(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",

@@ -692,6 +692,7 @@ fn limits_and_nul_domains_are_frozen() {
         SIGN_MANAGE_DOMAIN,
         SIGN_OBJECT_COMMIT_DOMAIN,
         SIGN_CHECKPOINT_DOMAIN,
+        SIGN_ACTIVATION_T_DOMAIN,
     ] {
         assert_eq!(domain.last(), Some(&0x00), "{domain:?}");
         assert!(domain_ends_with_nul(domain));
@@ -829,6 +830,56 @@ fn fixed_caps_are_enforced_at_1mib_4mib_64mib() {
     key_slot.this_plaintext_len = 4097;
     key_slot.ciphertext_len = 4097 + 16;
     assert!(matches!(key_slot.validate(), Err(ProtoError::TooLarge)));
+}
+
+/// task-118 阻断 A（A1）：ASSET 的 `ObjectCommit.total_len` 必须有 64MiB 上界。
+///
+/// `part_count_for` 只约束 `part_count` 与 `total_len` 的**关系**，不约束上界；缺这条
+/// 时恶意 relay 可以用 `part_count=u32::MAX`（≈0.9TB 容量）让消费端在分配处 abort。
+/// wire 层必须在 encode/decode 双方向都 fail-closed。
+#[test]
+fn asset_object_commit_enforces_64mib_total_len() {
+    fn asset_commit(total_len: u64) -> ObjectCommit {
+        let mut commit = sample_commit();
+        commit.object_type = ObjectType::Asset;
+        commit.generation = 0;
+        commit.sender_seq = 0;
+        commit.total_len = total_len;
+        commit.part_count = part_count_for(total_len, ObjectType::Asset) as u32;
+        commit
+    }
+
+    let max = MAX_ASSET_RAW_BYTES as u64;
+    assert!(
+        asset_commit(max).validate().is_ok(),
+        "等于上限必须合法：{:?}",
+        asset_commit(max).validate()
+    );
+
+    // 超上限一个字节：即使 part_count 与固定切片规则自洽也必须 TooLarge。
+    let over = asset_commit(max + 1);
+    assert!(matches!(over.validate(), Err(ProtoError::TooLarge)));
+    assert!(matches!(over.encode(), Err(ProtoError::TooLarge)));
+
+    // 攻击形状：`part_count=u32::MAX`、`total_len` 与之自洽（≈1.8e16）。必须验证
+    // **decode** 也拒绝 relay 下发的这份声明（不能只靠本机 encode 端校验）。
+    let total_len = u64::from(u32::MAX) * cap_plain(ObjectType::Asset);
+    assert_eq!(
+        part_count_for(total_len, ObjectType::Asset),
+        u64::from(u32::MAX),
+        "攻击声明必须与固定切片规则自洽"
+    );
+    let CdeValue::Map(mut entries) = asset_commit(max).to_cde().expect("合法 ASSET commit")
+    else {
+        panic!("commit map");
+    };
+    entries[7].1 = CdeValue::UInt(u64::from(u32::MAX));
+    entries[8].1 = CdeValue::UInt(total_len);
+    let bytes = encode_cde(&CdeValue::Map(entries)).expect("CDE 编码");
+    assert!(matches!(
+        ObjectCommit::decode(&bytes),
+        Err(ProtoError::TooLarge)
+    ));
 }
 
 #[test]

@@ -13,7 +13,7 @@ use rusqlite::{Connection, Transaction};
 use crate::error::StorageError;
 
 /// 本程序支持的最高 schema 版本。
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 单步迁移：把库从 `version - 1` 升到 `version`。
 struct Migration {
@@ -36,6 +36,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "S7 同步桥",
         run: migrate_v2,
+    },
+    Migration {
+        version: 3,
+        name: "S7 已验证基线应用 journal",
+        run: migrate_v3,
     },
 ];
 
@@ -94,4 +99,9 @@ fn migrate_v1(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 /// migration v2：同步 outbox parts / inbox / 本地 cursor（ADR 0006 §5）。
 fn migrate_v2(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(include_str!("schema/v2.sql"))
+}
+
+/// migration v3：已验证基线分批 merge 的 staging journal（ADR 0006 §28.2 阶段 I）。
+fn migrate_v3(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(include_str!("schema/v3.sql"))
 }

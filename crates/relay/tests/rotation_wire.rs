@@ -7,6 +7,7 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -19,6 +20,7 @@ use relay::control::{EpochActivated, SignedControlRecord};
 use relay::envelope::ObjectType;
 use relay::error::ErrorCode;
 use relay::ids::{sha256, Id16};
+use relay::proto::ActivationTV1;
 use relay::verify::Ed25519Hook;
 use relay::wire;
 use support::*;
@@ -57,6 +59,15 @@ fn get(uri: &str, token: &str) -> Request<Body> {
         .expect("request")
 }
 
+/// 不带 token 的 GET（认证负例）。
+fn get_no_token(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request")
+}
+
 fn post_cbor(uri: &str, token: Option<&str>, fields: wire::Fields) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
@@ -84,6 +95,57 @@ fn b64(bytes: &[u8]) -> String {
 
 fn url(fx: &Fixture, suffix: &str) -> String {
     format!("/v1/vaults/{}{suffix}", b64(&fx.vault_id))
+}
+
+/// §35.4：设备 realm 的 grant leaf manifest 端点。
+fn leaves_url(fx: &Fixture, rotation: &Id16) -> String {
+    url(fx, &format!("/rotations/{}/grants/leaves", b64(rotation)))
+}
+
+/// 断言 leaf manifest 的字段可复算，并且数量/轮换/状态与预期一致。
+///
+/// `grants_digest` 口径：`SHA256(concat(sorted(device_id || SHA256(signed_header))))`。
+fn assert_leaf_manifest(
+    fields: &wire::Fields,
+    rotation: &Id16,
+    expected_state: &str,
+    expected_count: usize,
+) {
+    let leaves = wire::array_field(fields, 0).expect("leaves");
+    assert_eq!(leaves.len(), expected_count);
+    let mut preimage = Vec::new();
+    for leaf in &leaves {
+        let leaf = wire::value_map(leaf).expect("leaf");
+        let device_id = wire::id16_field(&leaf, 0).expect("leaf device");
+        let signed_header = wire::bytes_field(&leaf, 2).expect("signed header");
+        let digest = wire::hash32_field(&leaf, 1).expect("header digest");
+        assert_eq!(
+            digest,
+            sha256(&signed_header),
+            "leaf 的 signed_header_sha256 必须可复算"
+        );
+        preimage.push((device_id, digest));
+    }
+    preimage.sort_by_key(|(device_id, _)| *device_id);
+    let mut concat = Vec::new();
+    for (device_id, digest) in preimage {
+        concat.extend_from_slice(&device_id);
+        concat.extend_from_slice(&digest);
+    }
+    assert_eq!(
+        wire::hash32_field(fields, 1).expect("grants digest"),
+        sha256(&concat),
+        "返回的 leaf 必须能复算 grants_digest"
+    );
+    assert_eq!(
+        u64::try_from(leaves.len()).expect("leaves len"),
+        wire::uint_field(fields, 2).expect("grants_count")
+    );
+    assert_eq!(
+        wire::text_field(fields, 4).expect("rotation state"),
+        expected_state
+    );
+    assert_eq!(wire::id16_field(fields, 5).expect("rotation id"), *rotation);
 }
 
 fn begin_body(
@@ -200,51 +262,133 @@ fn prepare_rotation(fx: &Fixture, rotation: &Id16) -> (Id16, Id16) {
     (primary, fallback)
 }
 
-/// 通过 HTTP 用真实管理签名 activate（材料必须先由 [`prepare_rotation`] 就绪）。
-async fn activate_via_http(fx: &Fixture, app: &axum::Router, rotation: &Id16) -> Vec<u8> {
+/// 一次 activate 的材料（transition + T + 真实旧/新管理双签）。
+///
+/// ADR §34：T 的每个字段都按 relay 侧事实构造；负例在副本上篡改后重新双签，
+/// 用来证明"签名有效但绑定不一致"同样被 409 拒绝。
+struct ActivationMaterials {
+    transition: Vec<u8>,
+    old_transition_signature: Vec<u8>,
+    new_transition_signature: Vec<u8>,
+    activation_t: ActivationTV1,
+    new_manager: SigningKey,
+}
+
+impl ActivationMaterials {
+    fn manager_map(
+        &self,
+        activation_t_bytes: &[u8],
+        old_t_signature: &[u8],
+        new_t_signature: &[u8],
+    ) -> wire::CdeValue {
+        wire::map(vec![
+            (0, wire::bytes(self.transition.clone())),
+            (1, wire::bytes(self.old_transition_signature.clone())),
+            (2, wire::bytes(self.new_transition_signature.clone())),
+            (3, wire::bytes(activation_t_bytes.to_vec())),
+            (4, wire::bytes(old_t_signature.to_vec())),
+            (5, wire::bytes(new_t_signature.to_vec())),
+        ])
+    }
+}
+
+static ACTIVATE_REQUEST: AtomicU64 = AtomicU64::new(0x6000);
+
+fn next_request_id() -> Id16 {
+    let value = ACTIVATE_REQUEST.fetch_add(1, Ordering::SeqCst);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&value.to_be_bytes());
+    id
+}
+
+/// 按 T 记录重新签名（旧 key 来自 fixture，新 key 来自本次 activate 材料）。
+fn resign_activation_t(
+    fx: &Fixture,
+    materials: &ActivationMaterials,
+    activation_t: &ActivationTV1,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let bytes = activation_t.encode().expect("T encode");
+    let input = relay::proto::activation_t_signing_input(activation_t).expect("T signing input");
+    let old_manager = fx.manager_signing_key.as_ref().expect("manager key");
+    let old_signature = old_manager.sign(&input).to_bytes().to_vec();
+    let new_signature = materials.new_manager.sign(&input).to_bytes().to_vec();
+    (bytes, old_signature, new_signature)
+}
+
+fn activation_materials(
+    fx: &Fixture,
+    rotation: &Id16,
+    primary: Id16,
+    fallback: Id16,
+) -> ActivationMaterials {
     let row = block(|| fx.rotation_view(rotation).rotation);
-    let primary = row.primary_checkpoint;
-    let _ = primary;
-    let candidates = block(|| {
-        fx.db
-            .read(|conn| checkpoints::candidates_for_epoch(conn, row.to_epoch))
-    })
-    .expect("candidates");
-    let (primary, fallback) = (candidates[0].checkpoint_id, candidates[1].checkpoint_id);
     let old_manager = fx.manager_signing_key.as_ref().expect("manager key");
     let new_manager = SigningKey::from_bytes(&[0x77u8; 32]);
     let new_pub = new_manager.verifying_key().to_bytes();
     let old_rev = fx.vault().manager_rev;
     let transition = block(|| fx.manager_transition(&row, old_rev, old_rev + 1, new_pub));
-    let old_signature = old_manager.sign(&transition).to_bytes().to_vec();
-    let new_signature = new_manager.sign(&transition).to_bytes().to_vec();
-    let manager_map = wire::map(vec![
-        (0, wire::bytes(transition)),
-        (1, wire::bytes(old_signature)),
-        (2, wire::bytes(new_signature)),
-    ]);
-    let (member_digest, grants_digest, slot_digest, asset_digest) = block(|| {
+    let decoded_transition =
+        relay::rotations::ManagerTransition::decode(&transition).expect("decode transition");
+    let activation_t = block(|| {
+        fx.db.read(|conn| {
+            let vault = relay::vault::load(conn)?;
+            support::activation_t_for(conn, &vault, &row, &decoded_transition, &primary, &fallback)
+        })
+    })
+    .expect("activation T");
+    let old_transition_signature = old_manager.sign(&transition).to_bytes().to_vec();
+    let new_transition_signature = new_manager.sign(&transition).to_bytes().to_vec();
+    ActivationMaterials {
+        transition,
+        old_transition_signature,
+        new_transition_signature,
+        activation_t,
+        new_manager,
+    }
+}
+
+fn activate_body(
+    fx: &Fixture,
+    rotation: &Id16,
+    manager_map: wire::CdeValue,
+    primary: Id16,
+    fallback: Id16,
+) -> Vec<u8> {
+    let row = block(|| fx.rotation_view(rotation).rotation);
+    let (member_digest, grants_digest, slot_digest) = block(|| {
         fx.db.read(|conn| {
             Ok((
                 relay::rotations::member_cert_digest(conn)?,
                 relay::rotations::grants_digest(conn, row.to_epoch)?.1,
                 relay::rotations::slot_set_digest(conn, row.to_epoch)?,
-                relay::rotations::get(conn, rotation)?.asset_set_digest,
             ))
         })
     })
     .expect("digests");
-    let body = cbor_body(vec![
-        (0, manager_map.clone()),
+    cbor_body(vec![
+        (0, manager_map),
         (1, wire::bytes(primary)),
         (2, wire::bytes(fallback)),
         (3, wire::bytes(member_digest)),
         (4, wire::bytes(grants_digest)),
         (5, wire::bytes(slot_digest)),
-        (6, wire::bytes(asset_digest.expect("begin 冻结资产摘要"))),
-    ]);
+        (
+            6,
+            wire::bytes(row.asset_set_digest.expect("begin 冻结资产摘要")),
+        ),
+    ])
+}
+
+/// 用真实管理签名提交一次 activate（body 与 outer 的 new_manager 逐字节一致）。
+async fn post_activate(
+    fx: &Fixture,
+    app: &axum::Router,
+    rotation: &Id16,
+    body: Vec<u8>,
+    manager_map: wire::CdeValue,
+) -> (StatusCode, Vec<u8>) {
     let control_rev = fx.vault().control_rev;
-    let request_id = [0x51u8; 16];
+    let request_id = next_request_id();
     let signature = fx.sign_management(
         relay::proto::HttpMethod::Post,
         &url(fx, &format!("/rotations/{}/activate", b64(rotation))),
@@ -259,7 +403,7 @@ async fn activate_via_http(fx: &Fixture, app: &axum::Router, rotation: &Id16) ->
         (3, manager_map),
     ];
     let token = block(|| fx.manager_token());
-    let (status, resp) = call(
+    call(
         app,
         post_cbor(
             &url(fx, &format!("/rotations/{}/activate", b64(rotation))),
@@ -267,9 +411,98 @@ async fn activate_via_http(fx: &Fixture, app: &axum::Router, rotation: &Id16) ->
             outer,
         ),
     )
+    .await
+}
+
+/// 断言一次 activate 被 409 拒绝，且 `manager_rev` / `active_epoch` 完全不推进。
+#[allow(clippy::too_many_arguments)]
+async fn expect_activate_conflict(
+    fx: &Fixture,
+    app: &axum::Router,
+    rotation: &Id16,
+    primary: Id16,
+    fallback: Id16,
+    expected_manager_rev: u64,
+    expected_epoch: u64,
+    manager_map: wire::CdeValue,
+) {
+    let body = activate_body(fx, rotation, manager_map.clone(), primary, fallback);
+    let (status, resp) = post_activate(fx, app, rotation, body, manager_map).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", error_code(&resp));
+    assert_eq!(
+        error_code(&resp),
+        "CAS_CONFLICT",
+        "T 绑定失败必须是 409 CAS_CONFLICT"
+    );
+    let vault = fx.vault();
+    assert_eq!(
+        vault.manager_rev, expected_manager_rev,
+        "不得推进 manager_rev"
+    );
+    assert_eq!(vault.active_epoch, expected_epoch, "不得切换 active_epoch");
+}
+
+/// 篡改 T 的某个字段后**重新用旧/新管理 key 双签**：签名有效，但绑定必须失败。
+#[allow(clippy::too_many_arguments)]
+async fn expect_tampered_t_conflict(
+    fx: &Fixture,
+    app: &axum::Router,
+    rotation: &Id16,
+    primary: Id16,
+    fallback: Id16,
+    expected_manager_rev: u64,
+    expected_epoch: u64,
+    materials: &ActivationMaterials,
+    mutate: impl FnOnce(&mut ActivationTV1),
+) {
+    let mut tampered = materials.activation_t.clone();
+    mutate(&mut tampered);
+    let (bytes, old_signature, new_signature) = resign_activation_t(fx, materials, &tampered);
+    let manager_map = materials.manager_map(&bytes, &old_signature, &new_signature);
+    expect_activate_conflict(
+        fx,
+        app,
+        rotation,
+        primary,
+        fallback,
+        expected_manager_rev,
+        expected_epoch,
+        manager_map,
+    )
     .await;
+}
+
+fn without_manager_keys(manager_map: wire::CdeValue, keys: &[u64]) -> wire::CdeValue {
+    let wire::CdeValue::Map(entries) = manager_map else {
+        panic!("new_manager 必须是 map");
+    };
+    wire::CdeValue::Map(
+        entries
+            .into_iter()
+            .filter(|(key, _)| !keys.contains(key))
+            .collect(),
+    )
+}
+async fn activate_via_http(
+    fx: &Fixture,
+    app: &axum::Router,
+    rotation: &Id16,
+) -> (Vec<u8>, ActivationMaterials) {
+    let row = block(|| fx.rotation_view(rotation).rotation);
+    let candidates = block(|| {
+        fx.db
+            .read(|conn| checkpoints::candidates_for_epoch(conn, row.to_epoch))
+    })
+    .expect("candidates");
+    let (primary, fallback) = (candidates[0].checkpoint_id, candidates[1].checkpoint_id);
+    let materials = activation_materials(fx, rotation, primary, fallback);
+    let (t_bytes, old_t_signature, new_t_signature) =
+        resign_activation_t(fx, &materials, &materials.activation_t);
+    let manager_map = materials.manager_map(&t_bytes, &old_t_signature, &new_t_signature);
+    let body = activate_body(fx, rotation, manager_map.clone(), primary, fallback);
+    let (status, resp) = post_activate(fx, app, rotation, body, manager_map).await;
     assert_eq!(status, StatusCode::OK, "{}", error_code(&resp));
-    resp
+    (resp, materials)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -289,6 +522,12 @@ async fn rotation_view_exposes_full_facts_and_typed_control_records() {
 
     // r view 全量字段（device realm 可读）。
     let device = block(|| fx.device_token());
+    // §35.4：staging 阶段 active 设备可读完整 leaf manifest，且可复算 grants_digest。
+    let (status, leaves_resp) = call(&app, get(&leaves_url(&fx, &rotation), &device)).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&leaves_resp));
+    assert_leaf_manifest(&fields_of(&leaves_resp), &rotation, "staging", 1);
+    let staging_grants_digest =
+        wire::hash32_field(&fields_of(&leaves_resp), 1).expect("staging grants digest");
     let manager = block(|| fx.manager_token());
     let (status, resp) = call(
         &app,
@@ -408,8 +647,8 @@ async fn rotation_view_exposes_full_facts_and_typed_control_records() {
         .verify_strict(&input, &to_signature(&record.signature))
         .expect("控制记录签名必须可验证");
 
-    // 完成激活后：epoch.activated 事件显式带 rid/E/S/commit hash/control_rev。
-    let activate_resp = activate_via_http(&fx, &app, &rotation).await;
+    // 完成激活后：epoch.activated 事件显式带 rid/E/S/commit hash/control_rev + activation T 双签。
+    let (activate_resp, materials) = activate_via_http(&fx, &app, &rotation).await;
     let activate_fields = fields_of(&activate_resp);
     let activation_commit = wire::hash32_field(&activate_fields, 6).expect("commit");
     let activated_row = block(|| fx.rotation_view(&rotation).rotation);
@@ -456,14 +695,449 @@ async fn rotation_view_exposes_full_facts_and_typed_control_records() {
         event.control_rev,
         wire::uint_field(&activate_fields, 1).expect("control rev")
     );
+    // §34：/control 返回的 T 必须能被 ActivationTV1::decode，并由旧/新管理 key 复算验签。
+    let t_bytes = event.activation_t.as_deref().expect("事件必须携带 T");
+    let activation_t = ActivationTV1::decode(t_bytes).expect("T decode");
+    assert_eq!(activation_t, materials.activation_t);
+    let t_input = relay::proto::activation_t_signing_input(&activation_t).expect("T signing input");
+    let expected_old_t_signature = fx
+        .manager_signing_key
+        .as_ref()
+        .expect("manager key")
+        .sign(&t_input)
+        .to_bytes()
+        .to_vec();
+    let expected_new_t_signature = materials.new_manager.sign(&t_input).to_bytes().to_vec();
+    assert_eq!(
+        event.old_t_signature.as_deref(),
+        Some(expected_old_t_signature.as_slice()),
+        "事件旧 key 双签必须原样持久化"
+    );
+    assert_eq!(
+        event.new_t_signature.as_deref(),
+        Some(expected_new_t_signature.as_slice()),
+        "事件新 key 双签必须原样持久化"
+    );
+    fx.manager_signing_key
+        .as_ref()
+        .expect("manager key")
+        .verifying_key()
+        .verify_strict(
+            &t_input,
+            &to_signature(
+                event
+                    .old_t_signature
+                    .as_deref()
+                    .expect("旧 key 对 T 的签名"),
+            ),
+        )
+        .expect("旧管理 key 的 T 签名必须可复算验证");
+    materials
+        .new_manager
+        .verifying_key()
+        .verify_strict(
+            &t_input,
+            &to_signature(
+                event
+                    .new_t_signature
+                    .as_deref()
+                    .expect("新 key 对 T 的签名"),
+            ),
+        )
+        .expect("新管理 key 的 T 签名必须可复算验证");
+    assert_eq!(activation_t.primary_cid, activated_primary);
+    assert_eq!(activation_t.fallback_cid, activated_fallback);
+    assert_eq!(activation_t.expected_control_rev, event.control_rev);
     let rotation_row = block(|| fx.rotation_view(&rotation).rotation);
     assert_eq!(rotation_row.activation_commit, Some(activation_commit));
     assert_eq!(rotation_row.activated_control_rev, Some(event.control_rev));
+
+    // §35.4：激活后 endpoint 仍只返回该 rotation 的完整 leaf manifest（state=activated），
+    // 且 grants_digest 与 staging 阶段逐字节一致（B 侧 inclusion 证据不随激活漂移）。
+    let leaves_token = block(|| fx.device_token());
+    let (status, leaves_after) = call(&app, get(&leaves_url(&fx, &rotation), &leaves_token)).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&leaves_after));
+    assert_leaf_manifest(&fields_of(&leaves_after), &rotation, "activated", 1);
+    assert_eq!(
+        wire::hash32_field(&fields_of(&leaves_after), 1).expect("activated grants digest"),
+        staging_grants_digest,
+        "激活不得改变已锁定 grants_digest"
+    );
 }
 
 fn to_signature(bytes: &[u8]) -> ed25519_dalek::Signature {
     let array: [u8; 64] = bytes.try_into().expect("signature len");
     ed25519_dalek::Signature::from_bytes(&array)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_t_rejects_tampering_missing_fields_and_wrong_keys_without_state_change() {
+    let fx = block(|| Fixture::with_real_manager("wire-activation-t"));
+    let app = app_ed25519(&fx);
+    let manager = block(|| fx.manager_token());
+    let (request, _) = begin_request(&fx, &manager, [0x31u8; 16]);
+    let (status, first) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&first));
+    let rotation = wire::id16_field(&wire::value_map(&fields_of(&first)[0].1).expect("view"), 0)
+        .expect("rotation id");
+    let (primary, fallback) = prepare_rotation(&fx, &rotation);
+    let old_rev = fx.vault().manager_rev;
+    let epoch = fx.vault().active_epoch;
+    let materials = activation_materials(&fx, &rotation, primary, fallback);
+    let (valid_t, valid_old_signature, valid_new_signature) =
+        resign_activation_t(&fx, &materials, &materials.activation_t);
+    let valid_map = materials.manager_map(&valid_t, &valid_old_signature, &valid_new_signature);
+
+    // 缺 T / 缺任一 T 签名 / T 不是 ActivationTV1 CDE / T 签名非 64B → 409。
+    let missing_sets: [&[u64]; 3] = [&[3], &[4], &[5]];
+    for missing in missing_sets {
+        expect_activate_conflict(
+            &fx,
+            &app,
+            &rotation,
+            primary,
+            fallback,
+            old_rev,
+            epoch,
+            without_manager_keys(valid_map.clone(), missing),
+        )
+        .await;
+    }
+    let bad_t = materials.manager_map(
+        b"not-an-activation-t",
+        &valid_old_signature,
+        &valid_new_signature,
+    );
+    expect_activate_conflict(
+        &fx, &app, &rotation, primary, fallback, old_rev, epoch, bad_t,
+    )
+    .await;
+    let short_signature =
+        materials.manager_map(&valid_t, &valid_old_signature[..63], &valid_new_signature);
+    expect_activate_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        short_signature,
+    )
+    .await;
+
+    // 错 key：T 的两份签名各自由正确的旧/新管理 key 验证，第三方签名 → 409。
+    let t_input =
+        relay::proto::activation_t_signing_input(&materials.activation_t).expect("T signing input");
+    let imposter = SigningKey::from_bytes(&[0x66u8; 32]);
+    let wrong_old_signature = imposter.sign(&t_input).to_bytes().to_vec();
+    let wrong_new_signature = imposter.sign(&t_input).to_bytes().to_vec();
+    for manager_map in [
+        materials.manager_map(&valid_t, &wrong_old_signature, &valid_new_signature),
+        materials.manager_map(&valid_t, &valid_old_signature, &wrong_new_signature),
+    ] {
+        expect_activate_conflict(
+            &fx,
+            &app,
+            &rotation,
+            primary,
+            fallback,
+            old_rev,
+            epoch,
+            manager_map,
+        )
+        .await;
+    }
+
+    // 逐字段篡改 T 后重新双签（签名有效、绑定不一致）→ 409。
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.vault_id[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.instance_id[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.rotation_id[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.from_epoch += 1;
+            t.to_epoch += 2;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.to_epoch += 1;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.freeze_seq += 1;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.old_manager_rev += 1;
+            t.new_manager_rev += 1;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.new_manager_pubkey[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.prev_control_hash[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.expected_control_rev += 1;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.primary_cid[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.primary_commit_digest[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.fallback_cid[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.fallback_commit_digest[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.slot_set_digest[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.member_cert_digest[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.grants_digest[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.old_asset_set_digest[0] ^= 0xFF;
+        },
+    )
+    .await;
+    expect_tampered_t_conflict(
+        &fx,
+        &app,
+        &rotation,
+        primary,
+        fallback,
+        old_rev,
+        epoch,
+        &materials,
+        |t| {
+            t.new_asset_set_digest[0] ^= 0xFF;
+        },
+    )
+    .await;
+
+    // 所有拒绝都不推进状态：轮换仍停在 staging、两份候选未被 promote。
+    assert_eq!(
+        block(|| fx.rotation_view(&rotation).rotation.state),
+        relay::rotations::RotationState::Staging,
+        "被拒绝的 activate 不得改变 rotation 状态"
+    );
+
+    // 合法 T（与 DB 事实逐项一致 + 旧/新双签）通过。
+    let (status, resp) = post_activate(
+        &fx,
+        &app,
+        &rotation,
+        activate_body(&fx, &rotation, valid_map.clone(), primary, fallback),
+        valid_map,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&resp));
+    assert_eq!(fx.vault().active_epoch, epoch + 1);
+    assert_eq!(fx.vault().manager_rev, old_rev + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -872,4 +1546,509 @@ async fn degraded_bootstrap_reads_single_baseline_while_gc_blocks() {
     let outcome = block(|| fx.gc());
     assert!(outcome.blocked, "{outcome:?}");
     assert_eq!(fx.vault().gc_floor, 0);
+}
+
+// ============================================================ 评审 0002 T06
+// activate 在每个 SQL 点失败后的全有或全无 + commit 后丢回复的 exact 恢复。
+//
+// 真实 SQLite/WAL + 真实 Ed25519 管理双签 + 真实 axum HTTP；故障点用 TRIGGER 注入。
+// 失败后 vault/epoch/rotation/manager_keys/control/checkpoints/slots/reservation/log/dedup
+// 必须逐项不变；撤销注入后同一 request_id/body 必须成功并可原样回放。
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivateFacts {
+    manager_rev: u64,
+    active_epoch: u64,
+    next_epoch: u64,
+    state: String,
+    control_rev: u64,
+    auth_rev: u64,
+    head_seq: u64,
+    manager_keys: i64,
+    controls: i64,
+    dedup: i64,
+    control_log: i64,
+    rotation_state: String,
+    primary_checkpoint: Option<Vec<u8>>,
+    fallback_checkpoint: Option<Vec<u8>>,
+    activation_commit: Option<Vec<u8>>,
+    epoch1_state: String,
+    epoch2_state: String,
+    slots_active: i64,
+    slots_staging: i64,
+    primary_state: String,
+    fallback_state: String,
+    reservation_state: String,
+    gc_plans: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_facts(fx: &Fixture, rotation: &Id16, primary: Id16, fallback: Id16) -> ActivateFacts {
+    let vault = fx.vault();
+    fx.db
+        .read(move |conn| {
+            let epoch_state = |epoch: u64| -> rusqlite::Result<String> {
+                conn.query_row(
+                    "SELECT state FROM epochs WHERE epoch = ?1",
+                    [i64::try_from(epoch).expect("epoch")],
+                    |row| row.get(0),
+                )
+            };
+            let count =
+                |sql: &str| -> rusqlite::Result<i64> { conn.query_row(sql, [], |row| row.get(0)) };
+            let (rotation_state, primary_checkpoint, fallback_checkpoint, activation_commit) = conn
+                .query_row(
+                    "SELECT state, primary_checkpoint, fallback_checkpoint, activation_commit
+                     FROM rotations WHERE rotation_id = ?1",
+                    [rotation.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                        ))
+                    },
+                )?;
+            let checkpoint_state = |cid: &Id16| -> rusqlite::Result<String> {
+                conn.query_row(
+                    "SELECT state FROM checkpoints WHERE checkpoint_id = ?1",
+                    [cid.as_slice()],
+                    |row| row.get(0),
+                )
+            };
+            Ok(ActivateFacts {
+                manager_rev: vault.manager_rev,
+                active_epoch: vault.active_epoch,
+                next_epoch: vault.next_epoch,
+                state: format!("{:?}", vault.state),
+                control_rev: vault.control_rev,
+                auth_rev: vault.auth_rev,
+                head_seq: vault.head_seq,
+                manager_keys: count("SELECT COUNT(*) FROM manager_keys")?,
+                controls: count("SELECT COUNT(*) FROM control_commits")?,
+                dedup: count("SELECT COUNT(*) FROM dedup")?,
+                control_log: count("SELECT COUNT(*) FROM log WHERE kind = 'control'")?,
+                rotation_state,
+                primary_checkpoint,
+                fallback_checkpoint,
+                activation_commit,
+                epoch1_state: epoch_state(1)?,
+                epoch2_state: epoch_state(2)?,
+                slots_active: count("SELECT COUNT(*) FROM key_slots WHERE state = 'active'")?,
+                slots_staging: count("SELECT COUNT(*) FROM key_slots WHERE state = 'staging'")?,
+                primary_state: checkpoint_state(&primary)?,
+                fallback_state: checkpoint_state(&fallback)?,
+                reservation_state: conn.query_row(
+                    "SELECT state FROM maintenance_reservations
+                     WHERE purpose = 'rotation' AND resource_id = ?1",
+                    [rotation.as_slice()],
+                    |row| row.get(0),
+                )?,
+                gc_plans: count("SELECT COUNT(*) FROM gc_plans")?,
+            })
+        })
+        .expect("activate facts")
+}
+
+fn install_fault_trigger(fx: &Fixture, sql: &str) {
+    let sql = sql.to_owned();
+    fx.raw_write(move |conn| {
+        conn.execute_batch(&sql)?;
+        Ok(())
+    })
+    .expect("安装故障注入触发器");
+}
+
+fn drop_fault_trigger(fx: &Fixture, name: &str) {
+    let sql = format!("DROP TRIGGER {name}");
+    fx.raw_write(move |conn| {
+        conn.execute_batch(&sql)?;
+        Ok(())
+    })
+    .expect("撤销故障注入触发器");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_http_request(
+    fx: &Fixture,
+    rotation: &Id16,
+    body: &[u8],
+    manager_map: &wire::CdeValue,
+    request_id: Id16,
+    control_rev: u64,
+    signature: &[u8],
+    token: &str,
+) -> Request<Body> {
+    let outer = vec![
+        (
+            0,
+            Fixture::signed_wrapper(body.to_vec(), signature.to_vec()),
+        ),
+        (1, wire::bytes(request_id)),
+        (2, wire::uint(control_rev)),
+        (3, manager_map.clone()),
+    ];
+    post_cbor(
+        &url(fx, &format!("/rotations/{}/activate", b64(rotation))),
+        Some(token),
+        outer,
+    )
+}
+
+/// 为任意管理公钥签发真实 Ed25519 管理 token（激活后新管理 key 的认证路径）。
+fn manager_token_for_key(fx: &Fixture, key: &SigningKey) -> String {
+    let public = key.verifying_key().to_bytes();
+    let subject = relay::auth::Realm::management_subject(&public);
+    let clock = fx.clock.clone();
+    let challenge = fx
+        .db
+        .write_blocking(move |conn| {
+            relay::auth::create_challenge(
+                conn,
+                clock.as_ref(),
+                relay::auth::Realm::Management,
+                &subject,
+            )
+        })
+        .expect("management challenge");
+    let instance = fx.vault().instance_id;
+    let challenge_wire = relay::proto::Challenge {
+        pv: 1,
+        relay_instance_id: instance,
+        origin_sha256: sha256(b"http://relay.test"),
+        vault_id: fx.vault_id,
+        realm: relay::proto::AuthRealm::Management,
+        subject,
+        challenge_id: challenge.challenge_id,
+        nonce: challenge.nonce,
+        expires_at: u64::try_from(challenge.expires_at).expect("expires_at"),
+    };
+    let message = challenge_wire.encode().expect("challenge encode");
+    let signing_input = relay::proto::auth_signing_input(&challenge_wire).expect("signing input");
+    let signature = key.sign(&signing_input).to_bytes().to_vec();
+    let challenge_id = challenge.challenge_id;
+    let clock = fx.clock.clone();
+    fx.db
+        .write_blocking(move |conn| {
+            relay::auth::issue_token(
+                conn,
+                clock.as_ref(),
+                &Ed25519Hook,
+                &challenge_id,
+                &message,
+                &signature,
+            )
+        })
+        .expect("management token")
+        .token
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activate_is_all_or_nothing_at_each_sql_point_and_replays_exact_request() {
+    let fx = block(|| Fixture::with_real_manager("wire-activate-sql"));
+    let app = app_ed25519(&fx);
+
+    // 真实 begin（HTTP + 管理签名）。
+    let manager = block(|| fx.manager_token());
+    let begin_id = [0x5A; 16];
+    let (request, _body) = begin_request(&fx, &manager, begin_id);
+    let (status, first) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&first));
+    let rotation = wire::id16_field(&wire::value_map(&fields_of(&first)[0].1).expect("view"), 0)
+        .expect("rotation id");
+
+    // 候选材料（真实 relay 事务；grant/槽用测试 hook 准备，activate 本身走 Ed25519）。
+    let (primary, fallback) = prepare_rotation(&fx, &rotation);
+    let materials = block(|| activation_materials(&fx, &rotation, primary, fallback));
+    let (t_bytes, old_t_signature, new_t_signature) =
+        resign_activation_t(&fx, &materials, &materials.activation_t);
+    let manager_map = materials.manager_map(&t_bytes, &old_t_signature, &new_t_signature);
+    let body = block(|| activate_body(&fx, &rotation, manager_map.clone(), primary, fallback));
+
+    let initial = block(|| activate_facts(&fx, &rotation, primary, fallback));
+    let control_rev = initial.control_rev;
+    let activate_id = [0x6B; 16];
+    let signature = block(|| {
+        fx.sign_management(
+            relay::proto::HttpMethod::Post,
+            &url(&fx, &format!("/rotations/{}/activate", b64(&rotation))),
+            activate_id,
+            control_rev,
+            &body,
+        )
+    });
+
+    // 每个 activate 事务内的 SQL 点各失败一次。
+    let points: &[(&str, &str)] = &[
+        (
+            "fail_manager_keys",
+            "CREATE TRIGGER fail_manager_keys BEFORE INSERT ON manager_keys \
+             BEGIN SELECT RAISE(ABORT,'injected manager_keys'); END;",
+        ),
+        (
+            "fail_manager_rev",
+            "CREATE TRIGGER fail_manager_rev BEFORE UPDATE ON vault \
+             WHEN NEW.manager_rev <> OLD.manager_rev \
+             BEGIN SELECT RAISE(ABORT,'injected manager_rev'); END;",
+        ),
+        (
+            "fail_slots_retire",
+            "CREATE TRIGGER fail_slots_retire BEFORE UPDATE ON key_slots \
+             BEGIN SELECT RAISE(ABORT,'injected slots'); END;",
+        ),
+        (
+            "fail_epoch_switch",
+            "CREATE TRIGGER fail_epoch_switch BEFORE UPDATE ON epochs \
+             WHEN NEW.state = 'active' BEGIN SELECT RAISE(ABORT,'injected epoch'); END;",
+        ),
+        (
+            "fail_rotation_activated",
+            "CREATE TRIGGER fail_rotation_activated BEFORE UPDATE ON rotations \
+             WHEN NEW.state = 'activated' \
+             BEGIN SELECT RAISE(ABORT,'injected rotation state'); END;",
+        ),
+        (
+            "fail_vault_switch",
+            "CREATE TRIGGER fail_vault_switch BEFORE UPDATE ON vault \
+             WHEN NEW.active_epoch <> OLD.active_epoch \
+             BEGIN SELECT RAISE(ABORT,'injected active epoch'); END;",
+        ),
+        (
+            "fail_activation_control",
+            "CREATE TRIGGER fail_activation_control BEFORE INSERT ON control_commits \
+             BEGIN SELECT RAISE(ABORT,'injected control'); END;",
+        ),
+        (
+            "fail_activation_reservation",
+            "CREATE TRIGGER fail_activation_reservation BEFORE UPDATE ON maintenance_reservations \
+             BEGIN SELECT RAISE(ABORT,'injected reservation'); END;",
+        ),
+        (
+            "fail_promote_checkpoints",
+            "CREATE TRIGGER fail_promote_checkpoints BEFORE UPDATE ON checkpoints \
+             BEGIN SELECT RAISE(ABORT,'injected checkpoint'); END;",
+        ),
+        (
+            "fail_gc_plan",
+            "CREATE TRIGGER fail_gc_plan BEFORE INSERT ON gc_plans \
+             BEGIN SELECT RAISE(ABORT,'injected gc plan'); END;",
+        ),
+        (
+            "fail_activation_dedup",
+            "CREATE TRIGGER fail_activation_dedup BEFORE INSERT ON dedup \
+             BEGIN SELECT RAISE(ABORT,'injected dedup'); END;",
+        ),
+    ];
+    for (name, sql) in points {
+        block(|| install_fault_trigger(&fx, sql));
+        let token = block(|| fx.manager_token());
+        let (status, response) = call(
+            &app,
+            activate_http_request(
+                &fx,
+                &rotation,
+                &body,
+                &manager_map,
+                activate_id,
+                control_rev,
+                &signature,
+                &token,
+            ),
+        )
+        .await;
+        assert!(
+            !status.is_success(),
+            "注入点 {name} 必须让 activate 失败，实际 {status} {}",
+            error_code(&response)
+        );
+        assert_eq!(
+            block(|| activate_facts(&fx, &rotation, primary, fallback)),
+            initial,
+            "注入点 {name} 失败后不得留下任何部分事实"
+        );
+        block(|| drop_fault_trigger(&fx, name));
+    }
+
+    // 撤销全部注入后，同一 request_id/body 必须成功。
+    let stale_token = block(|| fx.manager_token());
+    let token = stale_token.clone();
+    let (status, response) = call(
+        &app,
+        activate_http_request(
+            &fx,
+            &rotation,
+            &body,
+            &manager_map,
+            activate_id,
+            control_rev,
+            &signature,
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&response));
+
+    let applied = block(|| activate_facts(&fx, &rotation, primary, fallback));
+    assert_eq!(applied.manager_rev, initial.manager_rev + 1);
+    assert_eq!(applied.active_epoch, initial.active_epoch + 1);
+    assert_eq!(applied.next_epoch, initial.next_epoch);
+    assert_eq!(applied.state, "Active");
+    assert_eq!(applied.control_rev, initial.control_rev + 1);
+    assert_eq!(applied.auth_rev, initial.auth_rev + 1);
+    assert_eq!(
+        applied.head_seq, initial.head_seq,
+        "activate 不再把 control 事件写入数据日志（control 只进控制链）"
+    );
+    assert_eq!(applied.manager_keys, initial.manager_keys + 1);
+    assert_eq!(applied.controls, initial.controls + 1);
+    assert_eq!(applied.dedup, initial.dedup + 1);
+    assert_eq!(applied.control_log, initial.control_log);
+    assert_eq!(applied.rotation_state, "activated");
+    assert_eq!(applied.primary_checkpoint.as_deref(), Some(&primary[..]));
+    assert_eq!(applied.fallback_checkpoint.as_deref(), Some(&fallback[..]));
+    assert_eq!(applied.activation_commit.as_ref().map(Vec::len), Some(32));
+    assert_eq!(applied.epoch1_state, "retired");
+    assert_eq!(applied.epoch2_state, "active");
+    assert_eq!(applied.slots_active, 2, "候选 password/recovery 槽上线");
+    assert_eq!(applied.slots_staging, 0);
+    assert_eq!(applied.primary_state, "published");
+    assert_eq!(applied.fallback_state, "published");
+    assert_eq!(applied.reservation_state, "complete");
+    assert_eq!(applied.gc_plans, initial.gc_plans + 1);
+
+    // commit 后"丢回复"：旧管理签名/旧 token 必须失效（fail-closed）。
+    let (status, refused) = call(
+        &app,
+        activate_http_request(
+            &fx,
+            &rotation,
+            &body,
+            &manager_map,
+            activate_id,
+            control_rev,
+            &signature,
+            &stale_token,
+        ),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "激活后旧 manager token/签名不得再认证，实际 {status} {}",
+        error_code(&refused)
+    );
+    assert_eq!(
+        block(|| activate_facts(&fx, &rotation, primary, fallback)),
+        applied,
+        "被拒绝的旧签名重放必须零效应"
+    );
+
+    // exact request 查询走**新管理 key**：必须回放原始响应字节，且零新增事实。
+    let new_manager_token = block(|| manager_token_for_key(&fx, &materials.new_manager));
+    let lookup = format!(
+        "{}?request_id={}",
+        url(&fx, "/rotations/current"),
+        relay::ids::hex_lower(activate_id.as_slice())
+    );
+    let (status, stored) = call(&app, get(&lookup, &new_manager_token)).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&stored));
+    let stored = fields_of(&stored);
+    assert_eq!(
+        wire::bytes_field(&stored, 1).expect("stored response"),
+        response,
+        "exact request 必须回放激活的原始响应字节"
+    );
+    assert_eq!(
+        wire::text_field(&stored, 2).expect("scope"),
+        "management/activate"
+    );
+    assert_eq!(
+        block(|| activate_facts(&fx, &rotation, primary, fallback)),
+        applied
+    );
+
+    // 重启（新连接）仍持正确 active epoch / manager rev / 激活 commit。
+    let db = {
+        let cfg = fx.cfg.clone();
+        let clock = fx.clock.clone();
+        block(|| relay::db::Db::open(cfg.db.clone(), clock)).expect("reopen")
+    };
+    let (epoch, manager_rev, rotation_state, commit) = db
+        .read(move |conn| {
+            let vault = relay::vault::load(conn)?;
+            let (state, commit): (String, Option<Vec<u8>>) = conn.query_row(
+                "SELECT state, activation_commit FROM rotations WHERE rotation_id = ?1",
+                [rotation.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok((vault.active_epoch, vault.manager_rev, state, commit))
+        })
+        .expect("reopen facts");
+    assert_eq!(epoch, applied.active_epoch);
+    assert_eq!(manager_rev, applied.manager_rev);
+    assert_eq!(rotation_state, "activated");
+    assert_eq!(commit.as_deref(), applied.activation_commit.as_deref());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_leaf_manifest_rejects_no_token_revoked_and_non_member_device() {
+    let fx = block(|| Fixture::with_real_manager("wire-leaves-auth"));
+    let app = app_ed25519(&fx);
+    let rotation = block(|| fx.begin_rotation(&[]).rotation.rotation_id);
+    let row = block(|| fx.rotation_view(&rotation).rotation);
+    block(|| fx.publish_candidate_baselines(row.to_epoch));
+    block(|| fx.stage_grant(&rotation, &fx.device));
+    assert_eq!(
+        block(|| fx.rotation_view(&rotation).rotation.state),
+        relay::rotations::RotationState::Staging
+    );
+
+    // 无 token：认证前就拒绝（不得泄露 rotation 是否存在）。
+    let (status, body) = call(&app, get_no_token(&leaves_url(&fx, &rotation))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{}", error_code(&body));
+
+    // active 但不在该 rotation 的成员集合：403，不能借设备 realm 枚举别人的 grant。
+    let outsider = [0x6fu8; 16];
+    block(|| fx.add_device(outsider));
+    let outsider_token = block(|| fx.device_token_for(&outsider));
+    let (status, body) = call(&app, get(&leaves_url(&fx, &rotation), &outsider_token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", error_code(&body));
+    assert_eq!(error_code(&body), "FORBIDDEN");
+
+    // 已吊销设备：即使旧 token 还没到期也必须拒绝（auth_rev/status 双门禁）。
+    let device_token = block(|| fx.device_token());
+    let device = fx.device;
+    block(|| {
+        fx.db
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE devices SET status = 'revoked' WHERE device_id = ?1",
+                    [device.as_slice()],
+                )?;
+                Ok(())
+            })
+            .expect("revoke device")
+    });
+    let (status, body) = call(&app, get(&leaves_url(&fx, &rotation), &device_token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", error_code(&body));
+    assert_eq!(error_code(&body), "REVOKED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_leaf_manifest_rejects_frozen_and_aborted_rotation() {
+    let fx = block(|| Fixture::new("wire-leaves-state"));
+    let app = app_ed25519(&fx);
+    let rotation = block(|| fx.begin_rotation(&[]).rotation.rotation_id);
+    let token = block(|| fx.device_token());
+
+    // frozen：grant 还没收齐，不能当作完整 inclusion 证据。
+    let (status, body) = call(&app, get(&leaves_url(&fx, &rotation), &token)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", error_code(&body));
+    assert_eq!(error_code(&body), "INVALID_STATE");
+
+    // aborted：staged grant 已删，同样不能返回"空 leaf 全集"。
+    block(|| fx.abort_rotation(&rotation).expect("abort"));
+    let (status, body) = call(&app, get(&leaves_url(&fx, &rotation), &token)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", error_code(&body));
+    assert_eq!(error_code(&body), "INVALID_STATE");
 }

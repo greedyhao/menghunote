@@ -20,6 +20,12 @@
 //! `--dir`；再次运行同一 `--dir` 即走"重启续传"分支，不会重复 genesis。
 //!
 //! 不做：新设备 bootstrap 全量恢复、checkpoint、轮换、TLS。
+//!
+//! 本文件同时被 `e2e_rotation_verify`（`cargo run -p menghunote-sync --example
+//! e2e_rotation_verify`）以 `#[path] mod` 复用：可调用入口是
+//! `run`/`run_with`（`main` 只负责 parse + 退出码），外置 relay 的 CLI 行为不变。
+
+#![allow(dead_code)]
 
 use std::env;
 use std::error::Error as StdError;
@@ -53,8 +59,19 @@ type AnyResult<T> = Result<T, Box<dyn StdError>>;
 const DOCS: [&str; 2] = ["note-1", "note-2"];
 const DOC_AFTER_RESTART: &str = "note-3";
 
+/// CLI 缺省口令（`--password` 未给时）；仅用于包 e2e 槽，不是安全边界。
+pub const DEFAULT_PASSWORD: &str = "e2e-password";
+
+/// 一次 localhost e2e 的结论摘要（`e2e_rotation_verify` 串联两阶段时打印用）。
+#[derive(Debug, Clone, Copy)]
+pub struct Summary {
+    pub vault_id: VaultId,
+    pub device_id: DeviceId,
+    pub integrated_seq: u64,
+}
+
 fn main() -> ExitCode {
-    match run() {
+    match run_cli() {
         Ok(()) => {
             println!("[e2e] OK");
             ExitCode::SUCCESS
@@ -64,6 +81,32 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// CLI 入口：parse_args → [`run_with`]；旧参数/退出码契约不变。
+fn run_cli() -> AnyResult<()> {
+    let args = parse_args()?;
+    let summary = run_with(
+        &args.relay,
+        Some(args.setup_secret.as_str()),
+        &args.dir,
+        &args.password,
+        args.genesis_only,
+    )?;
+    println!(
+        "[e2e] summary vault={} device={} integrated={}",
+        ids::hex_of(&summary.vault_id),
+        ids::hex_of(&summary.device_id),
+        summary.integrated_seq
+    );
+    Ok(())
+}
+
+/// 可调用入口（`e2e_rotation_verify` 用）：缺省口令、非 `--genesis-only`。
+///
+/// `setup_secret` 只在**首次** genesis 需要；重启分支（目录已有身份）可为 `None`。
+pub fn run(relay: &str, setup_secret: Option<&str>, dir: &Path) -> AnyResult<Summary> {
+    run_with(relay, setup_secret, dir, DEFAULT_PASSWORD, false)
 }
 
 struct Args {
@@ -128,18 +171,24 @@ fn now_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn run() -> AnyResult<()> {
-    let args = parse_args().map_err(std::io::Error::other)?;
-    fs::create_dir_all(&args.dir)?;
-    let vault_path = args.dir.join("vault.sqlite3");
-    let identity_path = args.dir.join("identity.bin");
-    let meta_path = args.dir.join("identity.meta");
+/// 完整参数版：保留 `--password` / `--genesis-only` 的旧 CLI 行为。
+pub fn run_with(
+    relay: &str,
+    setup_secret: Option<&str>,
+    dir: &Path,
+    password: &str,
+    genesis_only: bool,
+) -> AnyResult<Summary> {
+    fs::create_dir_all(dir)?;
+    let vault_path = dir.join("vault.sqlite3");
+    let identity_path = dir.join("identity.bin");
+    let meta_path = dir.join("identity.meta");
 
     let first_run = !(identity_path.exists() && meta_path.exists());
     println!(
         "[e2e] relay={} dir={} first_run={first_run}",
-        args.relay,
-        args.dir.display()
+        relay,
+        dir.display()
     );
 
     let (
@@ -152,15 +201,15 @@ fn run() -> AnyResult<()> {
         genesis_cursor,
         genesis_slots,
     ) = if first_run {
-        let mut transport = StdTcpTransport::new(&args.relay)?;
-        let mut rng = OsRandom;
-        let outcome = genesis::run(
-            &mut transport,
-            &args.setup_secret,
-            &args.password,
-            now_secs(),
-            &mut rng,
+        // 首次 genesis 必须拿 setup secret；非首次（重启续传）不需要。
+        let setup_secret = setup_secret.ok_or(
+            "首次 genesis 需要 setup secret（--setup/--setup-secret 或 RELAY_SETUP_SECRET）",
         )?;
+        // 首次初始化：Linux 用户主密钥（Windows no-op）。重启分支只 load，不初始化。
+        menghunote_sync::identity_wrap::initialize_user_key()?;
+        let mut transport = StdTcpTransport::new_local_dev(relay)?;
+        let mut rng = OsRandom;
+        let outcome = genesis::run(&mut transport, setup_secret, password, now_secs(), &mut rng)?;
         let identity_blob = outcome.identity.protect()?;
         fs::write(&identity_path, &identity_blob)?;
         fs::write(
@@ -172,19 +221,19 @@ fn run() -> AnyResult<()> {
             ),
         )?;
         fs::write(
-            args.dir.join("slot-password.bin"),
+            dir.join("slot-password.bin"),
             outcome.materials.password_slot.wrapped_bytes(),
         )?;
         fs::write(
-            args.dir.join("slot-password.desc.bin"),
+            dir.join("slot-password.desc.bin"),
             outcome.materials.password_slot.descriptor.encode()?,
         )?;
         fs::write(
-            args.dir.join("slot-recovery.bin"),
+            dir.join("slot-recovery.bin"),
             outcome.materials.recovery_slot.wrapped_bytes(),
         )?;
         fs::write(
-            args.dir.join("slot-recovery.desc.bin"),
+            dir.join("slot-recovery.desc.bin"),
             outcome.materials.recovery_slot.descriptor.encode()?,
         )?;
         println!(
@@ -203,7 +252,7 @@ fn run() -> AnyResult<()> {
         );
         // dev e2e：把恢复码写到目录里供 e2e_bootstrap 分离进程使用（生产不得这样做）。
         fs::write(
-            args.dir.join("recovery-code.txt"),
+            dir.join("recovery-code.txt"),
             outcome.materials.recovery_code.as_str(),
         )?;
         println!(
@@ -268,15 +317,19 @@ fn run() -> AnyResult<()> {
         )
     };
 
-    if args.genesis_only {
+    if genesis_only {
         println!("[e2e] --genesis-only：身份/槽已落盘，停止在联网同步之前");
-        return Ok(());
+        return Ok(Summary {
+            vault_id,
+            device_id,
+            integrated_seq: 0,
+        });
     }
 
     let mut client = HttpRelayClient::new(
-        StdTcpTransport::new(&args.relay)?,
+        StdTcpTransport::new_local_dev(relay)?,
         HttpRelayConfig {
-            base_url: args.relay.clone(),
+            base_url: relay.to_owned(),
             vault_id,
             device_id,
             manager_pub,
@@ -374,15 +427,19 @@ fn run() -> AnyResult<()> {
     // 模拟重启：重新打开 Vault（游标在 meta 里）+ 重新认证。
     drop(client);
     let vault = Vault::open(&vault_path)?;
-    if args.genesis_only {
+    if genesis_only {
         println!("[e2e] --genesis-only：身份/槽已落盘，停止在联网同步之前");
-        return Ok(());
+        return Ok(Summary {
+            vault_id,
+            device_id,
+            integrated_seq: 0,
+        });
     }
 
     let mut client = HttpRelayClient::new(
-        StdTcpTransport::new(&args.relay)?,
+        StdTcpTransport::new_local_dev(relay)?,
         HttpRelayConfig {
-            base_url: args.relay.clone(),
+            base_url: relay.to_owned(),
             vault_id,
             device_id,
             manager_pub,
@@ -441,7 +498,7 @@ fn run() -> AnyResult<()> {
             peer_id,
         );
         let secrets = menghunote_sync::checkpoint::SlotSecrets {
-            password: Some(args.password.as_str()),
+            password: Some(password),
             recovery_seed: Some(&recovery_seed),
         };
         let slots = writer.upload_initial_slots(&password_slot, &recovery_slot, &secrets)?;
@@ -451,12 +508,12 @@ fn run() -> AnyResult<()> {
         );
     }
 
-    let empty_path = args.dir.join("empty-vault.sqlite3");
+    // 第二份 checkpoint：主 vault、不含资产（验证 EmptyAssets 路径与无资产基线）。
+    // 注意：不能再用"全新空库"生成覆盖 relay head 的 checkpoint——那会假覆盖 S，
+    // validate 现在会正确拒绝；空库必须先有游标并真实拉取到 S。
     {
-        let empty_vault = Vault::open(&empty_path)?;
-        ensure_structure_row(&empty_vault)?;
         let mut writer = CheckpointWriter::new(
-            &empty_vault,
+            &vault,
             &mut client,
             vault_id,
             device_id,
@@ -467,7 +524,7 @@ fn run() -> AnyResult<()> {
         let report = writer.create_checkpoint(&EmptyAssets)?;
         let verified = writer.read_back(&report)?;
         println!(
-            "[e2e] checkpoint(empty) id={} S={} docs={} assets={} verified_docs={} manifest_checked={}",
+            "[e2e] checkpoint(no-assets) id={} S={} docs={} assets={} verified_docs={} manifest_checked={}",
             ids::hex_of(&report.checkpoint_id),
             report.covered_seq,
             report.docs.len(),
@@ -523,7 +580,11 @@ fn run() -> AnyResult<()> {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default()
     );
-    Ok(())
+    Ok(Summary {
+        vault_id,
+        device_id,
+        integrated_seq: state.integrated_seq,
+    })
 }
 
 fn vault_doc_exists(vault: &Vault, doc_id: &str) -> Result<bool, Box<dyn StdError>> {

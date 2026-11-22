@@ -340,6 +340,16 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 
 ## 8. 当前状态
 
+> **同步/加密 v1 交接入口（2026-11-13）**：见 [`docs/briefs/0007-sync-handoff.md`](docs/briefs/0007-sync-handoff.md)。
+> 三个阻断已修：ASSET 来源认证（`5b07242`/`2ed4d87`/`c4453ef`/`9aa07f0`）、post-activation 基线消费（`bf24185`）、
+> 同一 durable E1 跨两轮 e2e（`58117dc`，自包含进程内 relay，`TWO_ROUND_EXIT=0`）。
+> 本机（Linux）基线：`cargo test --workspace --exclude menghunote-app` = **1006 passed**；sync = **417 passed**。
+> **`v0.4-sync` 已由 GPT 复审 APPROVE（锚点 `321f732`，无必修项）并打 annotated tag**；非生产，仅 localhost 开发验收。
+> Windows 实机复跑（DPAPI/MSVC/`cargo test --all` + 三条 `cargo run -p menghunote-sync --example ...` e2e）仍待补，见 0007 §5；补验失败不提升发布，退至已知良好旧 tag 或修复后新 tag。
+> v0.4 **只支持修复后新建的 vault/身份**，旧开发 vault 失效（旧签名 checkpoint 无法仅靠本地版本拒绝隔离）。
+> 后置：`task-121`（relay reservation 复用）、`task-122`（`validation_version=2`/receipt HMAC/GC 版本门禁）。
+> Linux 开发适配见 ADR 0008（0600 裸主钥，安全弱于 DPAPI，不宣称等价）。
+
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
 - **版本管理**：当前开发分支 **`dev`**（2026-11-11 重建：折叠全部 `wip:`，0 wip，36 条提交）；
   旧历史保留：**`backup/main-wip-20261110`**（首个基线）、**`backup/dev-wip-20261111`**（重命名/搜索 wip）、

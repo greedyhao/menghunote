@@ -8,6 +8,18 @@ license.workspace = true
 menghunote-storage = { path = "../storage" }
 menghunote-sync-proto = { path = "../sync-proto" }
 
+# relay 的传输层 TLS（评审 0002「生产阻断」）：客户端必须真实校验证书链/主机名/有效期。
+# - 选 rustls 而不是 native-tls/openssl：纯 Rust、无 OpenSSL 系统依赖（Windows 免装/免交叉
+#   编译工具链），且本仓已通过 gpui-pre-reqwest → hyper-rustls → rustls 0.23 传递依赖 ring，
+#   显式启用同一后端不新增编译负担；
+# - default-features = false 避免 rustls 的默认 aws-lc-rs 后端（需 C/cmake/NASM，且会与本仓
+#   现有 ring 后端并存）；只启用 ring + std + tls12；
+# - rustls-native-certs 读系统证书存储（Windows 用 schannel 提供的根证书，Linux/macOS 用
+#   SSL_CERT_FILE/SSL_CERT_DIR 或平台存储），比把 webpki-roots 的 Mozilla 根打进二进制更贴近
+#   系统信任策略；测试/私有 CA 可用 `StdTcpTransport::with_extra_roots` 注入。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+
 # 密钥派生与 AEAD（ADR 0006 §2/§3）：
 # - Argon2id 是口令 KEK 的唯一 KDF（m=64MiB/t=3/p=1，salt16/out32）；
 # - HKDF-SHA256 分用途子密钥（域分隔符见 domain.rs，§14 要求真正的 0x00 结尾）；
@@ -53,6 +65,16 @@ hmac = "0.12"
 [dev-dependencies]
 # 测试临时目录必须落在 CARGO_TARGET_TMPDIR（本机 cargo 子进程不能写 %TEMP%）。
 tempfile = "3"
+# TLS 测试用自签 CA / 叶子证书（含过期、错 hostname 场景）：只在测试里生成，不进生产依赖。
+# ring 后端与 rustls 共用同一套 crypto provider，不额外引入 C 编译。
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+# task-120：examples/e2e_rotation_two_rounds 的**进程内** relay（不再依赖外部 dev_server 脚本）。
+# 只用于 example/测试脚手架；生产 sync 依然只经 HTTP 访问 relay，不链接 relay crate。
+# 版本与 relay 保持一致（axum 0.8 / tokio 1），避免同一 crates 出现两份解析版本。
+menghunote-relay = { path = "../relay" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+axum = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI（CryptProtectData/CryptUnprotectData，CurrentUser，ADR 0006 §3）。
@@ -62,3 +84,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_System_Memory",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux 本地身份封装（ADR 0008）：安全敏感文件操作需要 O_NOFOLLOW / fstat /
+# renameat2(RENAME_NOREPLACE) / 目录 fsync；std 不暴露这些，rustix 是最小且纯 Rust 的
+# 选择（Cargo.lock 已有 1.1.6，不新增依赖树）。`fs` 提供文件/目录原语，`process`
+# 仅用于 `geteuid()` 校验主密钥属主（Linux 上没有稳定的 std 等价物）。
+rustix = { version = "1.1", features = ["fs", "process"] }

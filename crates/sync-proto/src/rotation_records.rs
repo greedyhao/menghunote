@@ -4,16 +4,18 @@
 //! 本模块只做 canonical 编解码与 digest 的**字节输入**，不做 SHA-256、不碰 SQLite。
 //!
 //! `SignedControlRecord` 的 `event` 保存 relay 事件 CDE 原字节；客户端按 kind 用
-//! [`EpochActivated::decode`]、[`RotationRestarted::decode`]、[`RevocationsAdded::decode`] 解码。
+//! [`EpochActivated::decode`]、[`RotationRestarted::decode`]、[`RevocationsAdded::decode`]、
+//! [`RotationAborted::decode`] 解码。
 
 use std::collections::BTreeMap;
 
+use crate::activation_t::ActivationTV1;
 use crate::cde::{
     decode, encode, expect_array, expect_bool, expect_bytes, expect_bytes_n, expect_i64_max,
-    expect_text, into_record_fields, CdeValue,
+    expect_text, expect_u8, into_record_fields, CdeValue,
 };
 use crate::error::ProtoError;
-use crate::records::DeviceId;
+use crate::records::{DeviceId, HttpMethod};
 
 pub type Sha256 = [u8; 32];
 pub type CheckpointId = [u8; 16];
@@ -117,8 +119,8 @@ pub struct SignedControlRecord {
     pub expected_control_rev: u64,
     pub signed_body: Vec<u8>,
     pub signature: Vec<u8>,
-    /// 可选 typed 事件 CDE 原字节（kind=epoch.activated / rotation.restarted /
-    /// rotation.revoked-more 时存在）。
+    /// 可选 typed 事件 CDE 原字节（kind=epoch.activated / rotation.abort /
+    /// rotation.restarted / rotation.revoked-more 时存在）。
     pub event: Option<Vec<u8>>,
 }
 
@@ -164,7 +166,7 @@ impl SignedControlRecord {
         Ok(record)
     }
 
-    /// 按 kind 解码 event；kind 为 begin/abort 或 event 缺失时返回 `Ok(None)`。
+    /// 按 kind 解码 event；kind 为 begin 或 event 缺失时返回 `Ok(None)`。
     pub fn decoded_event(&self) -> Result<Option<ControlEvent>, ProtoError> {
         let Some(bytes) = &self.event else {
             return Ok(None);
@@ -173,15 +175,18 @@ impl SignedControlRecord {
             ControlKind::EpochActivated => {
                 ControlEvent::EpochActivated(EpochActivated::decode(bytes)?)
             }
+            ControlKind::RotationAbort => {
+                ControlEvent::RotationAborted(RotationAborted::decode(bytes)?)
+            }
             ControlKind::RotationRestarted => {
                 ControlEvent::RotationRestarted(RotationRestarted::decode(bytes)?)
             }
             ControlKind::RevocationsAdded => {
                 ControlEvent::RevocationsAdded(RevocationsAdded::decode(bytes)?)
             }
-            ControlKind::RotationBegin | ControlKind::RotationAbort => {
+            ControlKind::RotationBegin => {
                 return Err(ProtoError::Invalid(
-                    "rotation.begin/abort 不应带 typed event".to_owned(),
+                    "rotation.begin 不应带 typed event".to_owned(),
                 ));
             }
         };
@@ -190,14 +195,82 @@ impl SignedControlRecord {
 }
 
 /// `SignedControlRecord` 携带的 typed 事件。
+///
+/// `EpochActivated` 现在携带 T 与双签（ADR §34），比其它变体大；这是低频控制
+/// 事件的解码结果，不值得为 288B 引入 Box 间接层与 API 变更。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlEvent {
     EpochActivated(EpochActivated),
+    RotationAborted(RotationAborted),
     RotationRestarted(RotationRestarted),
     RevocationsAdded(RevocationsAdded),
 }
 
-/// `epoch.activated`（relay `EpochActivated`，键 0..12）。
+/// `rotation.abort` 的 typed 事件（键 0..3）：重建管理签名输入所需的**完整被签事实**。
+///
+/// 背景（ADR 0006 §35.3）：abort 的请求 path 含 rotation id，而 canonical body 是
+/// 空 map；relay 只存 body + 签名时，客户端无法重建
+/// `management_signing_input(instance, vault, request_id, expected_rev,
+/// SHA256(CDE{method, path, body}))`。本事件把 path/method/body digest 一起写进控制记录，
+/// 使 abort 变成**可验签事实**而不是"结构上像签名"的记录。
+///
+/// 字段：
+/// - 0 rotation_id(bytes16)：被废弃的轮换 id（必须与 path 中的 id 一致）；
+/// - 1 method(uint)：管理签名标签（GET=1..DELETE=5；abort 固定 POST=2）；
+/// - 2 path(text)：被签名的请求 path（`/v1/vaults/{v}/rotations/{r}/abort`）；
+/// - 3 body_digest(bytes32)：`SHA256(record.signed_body)`，用于交叉校验 body 未被替换。
+///
+/// **安全边界**：事件本身不单独被签名；它只是把签名输入所需的公开事实显式化。
+/// 客户端必须用 `record.signed_body` 复用同一 digest 重建签名输入再验管理签名，
+/// 事件字段任一被改都会让验签失败（或被 path/digest 一致性检查拒绝）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationAborted {
+    /// 被废弃的轮换 id。
+    pub rotation_id: RotationId,
+    /// 管理签名覆盖的 HTTP method（abort 固定 [`HttpMethod::Post`]）。
+    pub method: HttpMethod,
+    /// 管理签名覆盖的请求 path。
+    pub path: String,
+    /// `SHA256(record.signed_body)`。
+    pub body_digest: Sha256,
+}
+
+impl RotationAborted {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        encode(&record_map(vec![
+            (0, CdeValue::Bytes(self.rotation_id.to_vec())),
+            (1, CdeValue::UInt(u64::from(u8::from(self.method)))),
+            (2, CdeValue::Text(self.path.clone())),
+            (3, CdeValue::Bytes(self.body_digest.to_vec())),
+        ]))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
+        let fields = into_record_fields(decode(bytes)?, 4)?;
+        let mut fields = fields
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (index as u64, value))
+            .collect::<BTreeMap<_, _>>();
+        Ok(Self {
+            rotation_id: take_id16(&mut fields, 0, "RotationAborted.rotation_id")?,
+            method: HttpMethod::try_from(expect_u8(
+                take(&mut fields, 1)?,
+                "RotationAborted.method",
+            )?)?,
+            path: expect_text(take(&mut fields, 2)?, "RotationAborted.path")?,
+            body_digest: take_hash32(&mut fields, 3, "RotationAborted.body_digest")?,
+        })
+    }
+}
+
+/// `epoch.activated`（relay `EpochActivated`，键 0..15，13–15 可省略）。
+///
+/// ADR 0006 §34：新记录必须携带本次激活的完整 activation T（`ActivationTV1` 的
+/// canonical CDE 原字节）与旧/新管理 key 对 `activation_t_signing_input(T)` 的双签，
+/// 客户端据此从 `/control` 独立复算并验签。13–15 全体省略只用于兼容升级前的历史
+/// 控制记录（它们不带 T，客户端应视为"无法复算"而不是"复算通过"）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochActivated {
     pub vault_id: [u8; 16],
@@ -214,6 +287,12 @@ pub struct EpochActivated {
     pub grants_digest: Sha256,
     pub control_rev: u64,
     pub auth_rev: u64,
+    /// 13：complete activation T 的 canonical CDE 原字节。
+    pub activation_t: Option<Vec<u8>>,
+    /// 14：旧管理 key 对 `activation_t_signing_input(T)` 的 64B 签名。
+    pub old_t_signature: Option<Vec<u8>>,
+    /// 15：新管理 key 对同一输入的 64B 签名。
+    pub new_t_signature: Option<Vec<u8>>,
 }
 
 impl EpochActivated {
@@ -223,8 +302,50 @@ impl EpochActivated {
         self.activation_commit
     }
 
+    /// T 与双签必须同时存在；存在时签名各 64B，且 T 内的重复事实必须与本事件一致。
+    fn check_activation_t_attachment(&self) -> Result<(), ProtoError> {
+        let (Some(bytes), Some(old), Some(new)) = (
+            &self.activation_t,
+            &self.old_t_signature,
+            &self.new_t_signature,
+        ) else {
+            if self.activation_t.is_none()
+                && self.old_t_signature.is_none()
+                && self.new_t_signature.is_none()
+            {
+                return Ok(());
+            }
+            return Err(ProtoError::Invalid(
+                "EpochActivated 的 activation_t 与双签必须同时存在".to_owned(),
+            ));
+        };
+        if old.len() != 64 || new.len() != 64 {
+            return Err(ProtoError::Invalid(
+                "EpochActivated 的 T 双签必须各 64 字节".to_owned(),
+            ));
+        }
+        let activation_t = ActivationTV1::decode(bytes)?;
+        let matches = activation_t.vault_id == self.vault_id
+            && activation_t.instance_id == self.instance_id
+            && activation_t.rotation_id == self.rotation_id
+            && activation_t.from_epoch == self.from_epoch
+            && activation_t.to_epoch == self.to_epoch
+            && activation_t.freeze_seq == self.covered_seq
+            && activation_t.primary_cid == self.primary_checkpoint
+            && activation_t.fallback_cid == self.fallback_checkpoint
+            && activation_t.grants_digest == self.grants_digest
+            && activation_t.expected_control_rev == self.control_rev;
+        if !matches {
+            return Err(ProtoError::Invalid(
+                "EpochActivated 与 activation_t 的重复事实不一致".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
-        encode(&record_map(vec![
+        self.check_activation_t_attachment()?;
+        let mut fields = vec![
             (0, CdeValue::Bytes(self.vault_id.to_vec())),
             (1, CdeValue::Bytes(self.instance_id.to_vec())),
             (2, CdeValue::Bytes(self.rotation_id.to_vec())),
@@ -238,17 +359,37 @@ impl EpochActivated {
             (10, CdeValue::Bytes(self.grants_digest.to_vec())),
             (11, CdeValue::UInt(self.control_rev)),
             (12, CdeValue::UInt(self.auth_rev)),
-        ]))
+        ];
+        if let Some(activation_t) = &self.activation_t {
+            // `check_activation_t_attachment` 已确保 14/15 同时存在。
+            fields.push((13, CdeValue::Bytes(activation_t.clone())));
+            fields.push((
+                14,
+                CdeValue::Bytes(
+                    self.old_t_signature.clone().ok_or_else(|| {
+                        ProtoError::Invalid("EpochActivated.old_t_signature".into())
+                    })?,
+                ),
+            ));
+            fields.push((
+                15,
+                CdeValue::Bytes(
+                    self.new_t_signature.clone().ok_or_else(|| {
+                        ProtoError::Invalid("EpochActivated.new_t_signature".into())
+                    })?,
+                ),
+            ));
+        }
+        encode(&record_map(fields))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
-        let fields = into_record_fields(decode(bytes)?, 13)?;
-        let mut fields = fields
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| (index as u64, value))
-            .collect::<BTreeMap<_, _>>();
-        Ok(Self {
+        let mut fields = optional_fields(
+            decode(bytes)?,
+            &(0..=15).collect::<Vec<_>>(),
+            &(0..=12).collect::<Vec<_>>(),
+        )?;
+        let record = Self {
             vault_id: take_id16(&mut fields, 0, "EpochActivated.vault_id")?,
             instance_id: take_id16(&mut fields, 1, "EpochActivated.instance_id")?,
             rotation_id: take_id16(&mut fields, 2, "EpochActivated.rotation_id")?,
@@ -262,7 +403,21 @@ impl EpochActivated {
             grants_digest: take_hash32(&mut fields, 10, "EpochActivated.grants_digest")?,
             control_rev: take_uint(&mut fields, 11, "EpochActivated.control_rev")?,
             auth_rev: take_uint(&mut fields, 12, "EpochActivated.auth_rev")?,
-        })
+            activation_t: fields
+                .remove(&13)
+                .map(|value| expect_bytes(value, "EpochActivated.activation_t"))
+                .transpose()?,
+            old_t_signature: fields
+                .remove(&14)
+                .map(|value| expect_bytes(value, "EpochActivated.old_t_signature"))
+                .transpose()?,
+            new_t_signature: fields
+                .remove(&15)
+                .map(|value| expect_bytes(value, "EpochActivated.new_t_signature"))
+                .transpose()?,
+        };
+        record.check_activation_t_attachment()?;
+        Ok(record)
     }
 }
 
@@ -500,12 +655,116 @@ impl RotationBeginBodyV1 {
     }
 }
 
-/// activate body 里的管理权转换包装（键 0 transition / 1 old_sig? / 2 new_sig?）。
+/// activate body 里的管理权转换包装
+/// （键 0 transition / 1 old_sig? / 2 new_sig? / 3 activation_t? / 4 old_t_sig? / 5 new_t_sig?）。
+///
+/// ADR 0006 §34：完整 activation T（canonical CDE）与旧/新管理 key 对该 T 的双签随
+/// `new_manager` 一起传输。3–5 在 wire 上**必须同时存在或全缺**（全缺只用于渐进接入
+/// 的客户端与历史 body；relay 执行 activate 时三者必填，缺任一 → 409）。1/2 保留既有
+/// 可选语义（管理权转换双签，relay 自行校验）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewManagerV1 {
     pub transition: Vec<u8>,
     pub old_signature: Option<Vec<u8>>,
     pub new_signature: Option<Vec<u8>>,
+    /// 3：complete activation T 的 canonical CDE 原字节。
+    pub activation_t: Option<Vec<u8>>,
+    /// 4：旧管理 key 对 `activation_t_signing_input(T)` 的 64B 签名。
+    pub old_t_signature: Option<Vec<u8>>,
+    /// 5：新管理 key 对同一输入的 64B 签名。
+    pub new_t_signature: Option<Vec<u8>>,
+}
+
+impl NewManagerV1 {
+    /// 3–5 同时存在或全缺；存在时两份 T 签名各 64B、T 必须是可解码的 `ActivationTV1`。
+    fn validate(&self) -> Result<(), ProtoError> {
+        let present = [
+            self.activation_t.is_some(),
+            self.old_t_signature.is_some(),
+            self.new_t_signature.is_some(),
+        ];
+        if present.iter().all(|value| !value) {
+            return Ok(());
+        }
+        if !present.iter().all(|value| *value) {
+            return Err(ProtoError::Invalid(
+                "NewManagerV1 的 activation_t 与旧/新 T 签名必须同时存在".to_owned(),
+            ));
+        }
+        let activation_t = self
+            .activation_t
+            .as_deref()
+            .ok_or_else(|| ProtoError::Invalid("NewManagerV1.activation_t".to_owned()))?;
+        ActivationTV1::decode(activation_t)?;
+        for (name, signature) in [
+            ("NewManagerV1.old_t_signature", &self.old_t_signature),
+            ("NewManagerV1.new_t_signature", &self.new_t_signature),
+        ] {
+            let signature = signature
+                .as_deref()
+                .ok_or_else(|| ProtoError::Invalid(name.to_owned()))?;
+            if signature.len() != 64 {
+                return Err(ProtoError::Invalid(format!(
+                    "{name} 必须是 64 字节，实际 {}",
+                    signature.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn to_cde(&self) -> Result<CdeValue, ProtoError> {
+        self.validate()?;
+        let mut fields = vec![(0, CdeValue::Bytes(self.transition.clone()))];
+        for (key, signature) in [
+            (1u64, &self.old_signature),
+            (2, &self.new_signature),
+            (3, &self.activation_t),
+            (4, &self.old_t_signature),
+            (5, &self.new_t_signature),
+        ] {
+            if let Some(value) = signature {
+                fields.push((key, CdeValue::Bytes(value.clone())));
+            }
+        }
+        Ok(record_map(fields))
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        encode(&self.to_cde()?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
+        Self::from_fields(optional_fields(decode(bytes)?, &[0, 1, 2, 3, 4, 5], &[0])?)
+    }
+
+    fn from_fields(mut fields: BTreeMap<u64, CdeValue>) -> Result<Self, ProtoError> {
+        let record = Self {
+            transition: expect_bytes(take(&mut fields, 0)?, "NewManagerV1.transition")?,
+            old_signature: fields
+                .remove(&1)
+                .map(|value| expect_bytes(value, "NewManagerV1.old_signature"))
+                .transpose()?,
+            new_signature: fields
+                .remove(&2)
+                .map(|value| expect_bytes(value, "NewManagerV1.new_signature"))
+                .transpose()?,
+            activation_t: fields
+                .remove(&3)
+                .map(|value| expect_bytes(value, "NewManagerV1.activation_t"))
+                .transpose()?,
+            old_t_signature: fields
+                .remove(&4)
+                .map(|value| expect_bytes(value, "NewManagerV1.old_t_signature"))
+                .transpose()?,
+            new_t_signature: fields
+                .remove(&5)
+                .map(|value| expect_bytes(value, "NewManagerV1.new_t_signature"))
+                .transpose()?,
+        };
+        record.validate()?;
+        Ok(record)
+    }
 }
 
 /// `POST /rotations/{r}/activate` 的 canonical body（键 0..6，均可省略）。
@@ -524,14 +783,7 @@ impl RotationActivateBodyV1 {
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut fields = Vec::new();
         if let Some(manager) = &self.new_manager {
-            let mut manager_fields = vec![(0, CdeValue::Bytes(manager.transition.clone()))];
-            if let Some(signature) = &manager.old_signature {
-                manager_fields.push((1, CdeValue::Bytes(signature.clone())));
-            }
-            if let Some(signature) = &manager.new_signature {
-                manager_fields.push((2, CdeValue::Bytes(signature.clone())));
-            }
-            fields.push((0, record_map(manager_fields)));
+            fields.push((0, manager.to_cde()?));
         }
         if let Some(id) = self.primary_checkpoint {
             fields.push((1, CdeValue::Bytes(id.to_vec())));
@@ -559,21 +811,11 @@ impl RotationActivateBodyV1 {
         let new_manager = fields
             .remove(&0)
             .map(|value| {
-                let mut manager = optional_fields(value, &[0, 1, 2], &[0])?;
-                Ok::<_, ProtoError>(NewManagerV1 {
-                    transition: expect_bytes(
-                        take(&mut manager, 0)?,
-                        "RotationActivateBodyV1.new_manager.transition",
-                    )?,
-                    old_signature: manager
-                        .remove(&1)
-                        .map(|value| expect_bytes(value, "RotationActivateBodyV1.old_signature"))
-                        .transpose()?,
-                    new_signature: manager
-                        .remove(&2)
-                        .map(|value| expect_bytes(value, "RotationActivateBodyV1.new_signature"))
-                        .transpose()?,
-                })
+                NewManagerV1::from_fields(optional_fields(
+                    value,
+                    &[0, 1, 2, 3, 4, 5],
+                    &[0, 3, 4, 5],
+                )?)
             })
             .transpose()?;
         Ok(Self {

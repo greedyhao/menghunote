@@ -13,11 +13,11 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::auth::{self, AuthContext, ManagementProof};
 use crate::checkpoints;
 use crate::control::{
-    self, ControlKind, EpochActivated, RevocationsAdded, RotationRestarted, SignedControlRecord,
+    self, ControlKind, EpochActivated, RevocationsAdded, RotationAborted, RotationRestarted,
+    SignedControlRecord,
 };
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{sha256, Hash32, Id16};
-use crate::log::{self, LogKind};
 use crate::objects;
 use crate::sig::{
     require, EpochGrantInput, Expectation, SignDomain, SignatureCheck, SignatureHook,
@@ -120,13 +120,19 @@ pub struct GrantInput<'a> {
     pub manager_rev: u64,
 }
 
-/// 管理公钥转换（旧/新管理 key 双签记录）。
-#[derive(Debug)]
+/// 管理公钥转换（旧/新管理 key 双签记录 + 完整 activation T 双签）。
+#[derive(Debug, Clone)]
 pub struct NewManager {
     /// §27.2 的 `ManagerTransitionV1` CDE 字节（绑定 vault/instance/rotation/epoch/revs/pubkey/S）。
     pub transition: Vec<u8>,
     pub old_signature: Option<Vec<u8>>,
     pub new_signature: Option<Vec<u8>>,
+    /// ADR §34：完整 activation T 的 canonical CDE 字节（activate 必填）。
+    pub activation_t: Option<Vec<u8>>,
+    /// 旧管理 key 对 `activation_t_signing_input(T)` 的 64B 签名。
+    pub old_t_signature: Option<Vec<u8>>,
+    /// 新管理 key 对同一输入的 64B 签名。
+    pub new_t_signature: Option<Vec<u8>>,
 }
 
 /// §27.2：管理权转换记录（CDE 整数键 map，旧/新管理 key 双签同一份字节）。
@@ -915,6 +921,66 @@ pub fn activate(
         new_manager.old_signature.as_deref(),
         new_manager.new_signature.as_deref(),
     )?;
+
+    // ADR §34：完整 activation T 必填，旧/新管理 key 必须对同一
+    // `MN/v1/activation-t\0 || CDE(T)` 双签，且 T 的每个字段与请求材料/DB 事实逐项一致。
+    // 任一不符 → 409；此时尚未写 manager_keys/vault/epoch（promote 也在同一事务里回滚）。
+    let activation_t_bytes = new_manager
+        .activation_t
+        .as_deref()
+        .ok_or_else(|| Error::api(ErrorCode::CasConflict))?;
+    let activation_t = proto::ActivationTV1::decode(activation_t_bytes)
+        .map_err(|_| Error::api(ErrorCode::CasConflict))?;
+    let t_signing_input = proto::activation_t_signing_input(&activation_t)
+        .map_err(|_| Error::api(ErrorCode::CasConflict))?;
+    verify_activation_t_signature(
+        hook,
+        &vault.vault_id,
+        &old_pub,
+        &t_signing_input,
+        new_manager.old_t_signature.as_deref(),
+    )?;
+    verify_activation_t_signature(
+        hook,
+        &vault.vault_id,
+        &transition.new_pubkey,
+        &t_signing_input,
+        new_manager.new_t_signature.as_deref(),
+    )?;
+    let (head_rev, prev_control_hash) = vault::control_head(conn)?;
+    let expected_control_rev = head_rev
+        .checked_add(1)
+        .ok_or(Error::Invariant("control rev"))?;
+    if request.expected_control_rev.checked_add(1) != Some(expected_control_rev) {
+        return Err(Error::api(ErrorCode::CasConflict));
+    }
+    let activation_facts = ActivationTFacts {
+        prev_control_hash,
+        expected_control_rev,
+        primary_commit_digest: checkpoint_commit_digest(&pair.primary)?,
+        fallback_commit_digest: checkpoint_commit_digest(&pair.fallback)?,
+        slot_set_digest: actual_slots,
+        member_cert_digest: actual_member,
+        grants_digest: actual_grants,
+        old_asset_set_digest: rotation
+            .asset_set_digest
+            .ok_or_else(|| Error::api(ErrorCode::CasConflict))?,
+        new_asset_set_digest: objects::candidate_asset_set_digest(
+            conn,
+            rotation.to_epoch,
+            rotation_id,
+        )?,
+    };
+    bind_activation_t(
+        &activation_t,
+        &vault,
+        &rotation,
+        rotation_id,
+        &transition,
+        &pair,
+        &activation_facts,
+    )?;
+
     conn.execute(
         "INSERT INTO manager_keys(rev, pubkey, transition, old_rev, old_signature,
                                   new_signature, created_at)
@@ -1004,6 +1070,9 @@ pub fn activate(
         grants_digest,
         control_rev,
         auth_rev,
+        activation_t: Some(activation_t_bytes.to_vec()),
+        old_t_signature: new_manager.old_t_signature.clone(),
+        new_t_signature: new_manager.new_t_signature.clone(),
     }
     .encode()?;
     let rev = append_control_record(
@@ -1034,22 +1103,19 @@ pub fn activate(
             rotation_id.as_slice(),
         ),
     )?;
-    // log 的 control 事件也带 typed `EpochActivated`（客户端从日志首读即可识别）。
-    log::append(
-        conn,
-        now,
-        LogKind::Control,
-        None,
-        rotation.to_epoch,
-        &event,
-        Some(request.signature),
-    )?;
+    // control 事件不进数据日志：它属于已签控制链（`control_commits`），
+    // 而数据日志的 `head_seq`/S 只应包含 UPDATE/ASSET。把 control 塞进 log 会让
+    // coverage 必须信任 relay 自报的 kind（评审 0003 P0-B 的假覆盖洞）。
     // 轮换 reservation 完成（剩余维护额度归还；已写数据保留）。
     conn.execute(
         "UPDATE maintenance_reservations SET state = 'complete'
          WHERE purpose = 'rotation' AND resource_id = ?1 AND state = 'active'",
         [rotation_id.as_slice()],
     )?;
+    // 评审 0002 P1-E：激活后按真实 parts 对账——新 pair（原维护 reservation 写入）升为
+    // normal，旧 epoch 宽限副本/退役中槽降为 maintenance；否则下一轮维护预算会被已 live
+    // 的对象永久占用。activate 前的 Q 门禁保证 normal_bytes 不会超过 Q。
+    crate::quota::recompute(conn)?;
     Ok(ActivateOutcome {
         epoch: rotation.to_epoch,
         control_rev,
@@ -1115,6 +1181,16 @@ pub fn abort(
     if !vault::epoch_revoked_once(conn, rotation.from_epoch)? {
         vault::set_state(conn, vault::VaultState::Active)?;
     }
+    // §35.3：abort 记录必须带可重建管理签名输入的 typed 事件（rid/method/path/body
+    // digest）。否则客户端只能 fail-closed，无法把 abort 当作已验签事实。
+    // body_digest 直接由**落库的 signed_body** 复算，避免信任调用方另一份摘要。
+    let event = RotationAborted {
+        rotation_id: *rotation_id,
+        method: proto::HttpMethod::Post,
+        path: request.path.to_owned(),
+        body_digest: sha256(request.signed),
+    }
+    .encode()?;
     append_control_record(
         conn,
         now,
@@ -1124,7 +1200,7 @@ pub fn abort(
         request.expected_control_rev,
         request.signed,
         request.signature,
-        None,
+        Some(event),
     )?;
     let _ = hook;
     let _ = vault;
@@ -1419,6 +1495,97 @@ fn verify_manager_transition(
 ) -> Result<()> {
     verify_manager_signature(hook, vault_id, old_public_key, transition, old_signature)?;
     verify_manager_signature(hook, vault_id, new_public_key, transition, new_signature)
+}
+
+/// §34：一把管理 key 对 `MN/v1/activation-t\0 || CDE(T)` 的签名（缺/非 64B/错 key → 409）。
+fn verify_activation_t_signature(
+    hook: &dyn SignatureHook,
+    vault_id: &Id16,
+    public_key: &[u8; 32],
+    signing_input: &[u8],
+    signature: Option<&[u8]>,
+) -> Result<()> {
+    let signature = signature.ok_or_else(|| Error::api(ErrorCode::CasConflict))?;
+    if signature.len() != 64 {
+        return Err(Error::api(ErrorCode::CasConflict));
+    }
+    let check = SignatureCheck {
+        domain: SignDomain::ActivationT,
+        vault_id,
+        device_id: None,
+        public_key,
+        message: signing_input,
+        signature,
+        expect: &Expectation::None,
+    };
+    require(hook, &check, ErrorCode::CasConflict)
+}
+
+/// §34：activation T 内每个字段实际对应的 relay 事实。
+struct ActivationTFacts {
+    prev_control_hash: Hash32,
+    expected_control_rev: u64,
+    primary_commit_digest: Hash32,
+    fallback_commit_digest: Hash32,
+    slot_set_digest: Hash32,
+    member_cert_digest: Hash32,
+    grants_digest: Hash32,
+    old_asset_set_digest: Hash32,
+    new_asset_set_digest: Hash32,
+}
+
+/// §34：T 的每个字段都必须与请求材料 / DB 事实逐项一致；任何一项不符 → 409（零写入）。
+///
+/// 这里覆盖 20 个字段的全部绑定：vault/instance/rotation/from/to/S、旧/新管理 rev 与
+/// 新公钥、链尾控制哈希与期望 rev、两条基线的 cid + commit 摘要、槽/成员证书/grant/
+/// 旧+新资产集合摘要。
+fn bind_activation_t(
+    activation_t: &proto::ActivationTV1,
+    vault: &vault::Vault,
+    rotation: &RotationRow,
+    rotation_id: &Id16,
+    transition: &ManagerTransition,
+    pair: &checkpoints::CandidatePair,
+    facts: &ActivationTFacts,
+) -> Result<()> {
+    let old_rev =
+        u32::try_from(transition.old_rev).map_err(|_| Error::api(ErrorCode::CasConflict))?;
+    let new_rev =
+        u32::try_from(transition.new_rev).map_err(|_| Error::api(ErrorCode::CasConflict))?;
+    let matches = activation_t.vault_id == vault.vault_id
+        && activation_t.instance_id == vault.instance_id
+        && activation_t.rotation_id == *rotation_id
+        && activation_t.from_epoch == rotation.from_epoch
+        && activation_t.to_epoch == rotation.to_epoch
+        && activation_t.freeze_seq == rotation.freeze_seq
+        && activation_t.old_manager_rev == old_rev
+        && activation_t.new_manager_rev == new_rev
+        && activation_t.new_manager_pubkey == transition.new_pubkey
+        && activation_t.prev_control_hash == facts.prev_control_hash
+        && activation_t.expected_control_rev == facts.expected_control_rev
+        && activation_t.primary_cid == pair.primary.checkpoint_id
+        && activation_t.fallback_cid == pair.fallback.checkpoint_id
+        && activation_t.primary_commit_digest == facts.primary_commit_digest
+        && activation_t.fallback_commit_digest == facts.fallback_commit_digest
+        && activation_t.slot_set_digest == facts.slot_set_digest
+        && activation_t.member_cert_digest == facts.member_cert_digest
+        && activation_t.grants_digest == facts.grants_digest
+        && activation_t.old_asset_set_digest == facts.old_asset_set_digest
+        && activation_t.new_asset_set_digest == facts.new_asset_set_digest;
+    if !matches {
+        return Err(Error::api(ErrorCode::CasConflict));
+    }
+    Ok(())
+}
+
+/// §34 的 `*_commit_digest` 口径：`SHA256(CDE(CheckpointCommitV1))`，即 relay 存下的
+/// `signed_commit` 字节的 SHA-256（`promote_named_candidates` 已确认其存在且与行绑定）。
+fn checkpoint_commit_digest(checkpoint: &checkpoints::CheckpointRow) -> Result<Hash32> {
+    let signed = checkpoint
+        .signed_commit
+        .as_deref()
+        .ok_or_else(|| Error::api(ErrorCode::CasConflict))?;
+    Ok(sha256(signed))
 }
 
 /// abort 请求。

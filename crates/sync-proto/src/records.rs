@@ -1292,6 +1292,12 @@ impl ObjectCommit {
             {
                 return Err(ProtoError::TooLarge)
             }
+            // 与 `ObjectRefV1`/`AssetRefV1` 同口径：ASSET 明文上限 64MiB。缺这条时
+            // `part_count=u32::MAX` + 自洽的 `total_len` 能通过 wire 校验并被消费端当成
+            // 分配长度（`part_count_for` 只约束关系、不约束上界）。
+            ObjectType::Asset if self.total_len > MAX_ASSET_RAW_BYTES as u64 => {
+                return Err(ProtoError::TooLarge)
+            }
             ObjectType::Manifest
                 if self.total_len > crate::limits::MAX_MANIFEST_CDE_BYTES as u64 =>
             {

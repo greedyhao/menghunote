@@ -22,14 +22,36 @@ use menghunote_sync::relay::{
 };
 use menghunote_sync::{DeviceId, ObjectId, VaultId};
 use menghunote_sync_proto::{
-    checkpoint_signing_input, refs_digest_input, CheckpointCommit, DeviceCertV1, ObjectRefV1,
-    ObjectType, Rights, SlotDescriptorV1, SlotKind,
+    checkpoint_signing_input, object_commit_signing_input, refs_digest_input, CheckpointCommit,
+    DeviceCertV1, ObjectCommit, ObjectRefV1, ObjectType, Rights, SlotDescriptorV1, SlotKind,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 pub const VAULT_ID: VaultId = [0x5a; 16];
 pub const EPOCH: u64 = 1;
+
+/// 让本测试二进制具备可用的本地身份封装（Linux 用户主密钥）。
+///
+/// 测试进程首次调用时设置**独立、vault 之外**的 `XDG_DATA_HOME`
+/// （`CARGO_TARGET_TMPDIR/xdg-<pid>`），再调用生产入口
+/// [`menghunote_sync::identity_wrap::initialize_user_key`]；之后所有
+/// `identity.protect/unprotect` / `RotationJournal::save/load` 调用完全走生产路径，
+/// **没有**测试旁路。`OnceLock` 防止多测试线程并发竞态；Windows 上初始化为 no-op。
+pub fn ensure_test_identity_wrap() {
+    static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    READY.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            let dir =
+                Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("xdg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("创建测试 XDG_DATA_HOME");
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+        menghunote_sync::identity_wrap::initialize_user_key()
+            .expect("初始化测试用户主密钥（Linux 本地封装）");
+    });
+}
 
 /// 在 `target/tmp` 下建临时目录。
 pub fn temp_dir() -> TempDir {
@@ -180,6 +202,143 @@ pub fn commit_local(vault: &Vault, doc: &BodyDoc) -> u64 {
     state.head_seq
 }
 
+/// 手工构造 ASSET 明文前缀，格式与 `checkpoint::asset_plaintext` 一致：
+/// `32B real_sha256 || BE64 byte_len || BE16 mime_len || MIME || data`。
+///
+/// 集成测试拿不到 crate 私有构造函数，所以夹具按同一格式手工拼；负例需要构造
+/// "明文头与 object_id 不对应"的字节，正好也要求夹具能独立控制每个字段。
+pub fn asset_plaintext_bytes(
+    real_sha256: &[u8; 32],
+    byte_len: u64,
+    media_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(42 + media_type.len() + data.len());
+    out.extend_from_slice(real_sha256);
+    out.extend_from_slice(&byte_len.to_be_bytes());
+    out.extend_from_slice(&(media_type.len() as u16).to_be_bytes());
+    out.extend_from_slice(media_type.as_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// 用给定 `object_id` 上传任意 ASSET 明文，并让 FakeRelay 发布对应日志事件。
+///
+/// 返回 `(object_id, relay_seq)`。负例可借此构造"AEAD 可解但明文头不 canonical"
+/// 的对象（object_id 与 MIME/长度/数据摘要不对应）。
+pub fn upload_asset_plaintext(
+    relay: &mut FakeRelay,
+    vault_id: VaultId,
+    producer_device_id: DeviceId,
+    signing_key: &DeviceSigningKey,
+    root: &RootSecretV1,
+    object_id: ObjectId,
+    plaintext: &[u8],
+) -> (ObjectId, u64) {
+    let message_id =
+        menghunote_sync::upload::asset_message_id(root, &object_id).expect("ASSET message_id");
+    let uploaded = menghunote_sync::upload::upload_object(
+        relay,
+        vault_id,
+        producer_device_id,
+        signing_key,
+        root,
+        ObjectType::Asset,
+        object_id,
+        message_id,
+        0,
+        0,
+        plaintext,
+        &[],
+        None,
+    )
+    .expect("上传 ASSET 对象");
+    assert_eq!(uploaded.object_id, object_id);
+    let seq = relay.log.last().expect("ASSET 日志事件").relay_seq;
+    (object_id, seq)
+}
+
+/// 上传一个**canonical** 真实 ASSET（数据/长度/MIME/object_id 自洽）并发布日志事件。
+///
+/// 返回 `(object_id, relay_seq)`。这是 engine pull 来源认证的正例夹具。
+pub fn publish_real_asset(
+    relay: &mut FakeRelay,
+    vault_id: VaultId,
+    producer_device_id: DeviceId,
+    signing_key: &DeviceSigningKey,
+    root: &RootSecretV1,
+    data: &[u8],
+    media_type: &str,
+) -> (ObjectId, u64) {
+    let real: [u8; 32] = Sha256::digest(data).into();
+    let byte_len = data.len() as u64;
+    let object_id = menghunote_sync::checkpoint::asset_object_id(root, &real, byte_len, media_type)
+        .expect("资产 object_id");
+    let plaintext = asset_plaintext_bytes(&real, byte_len, media_type, data);
+    upload_asset_plaintext(
+        relay,
+        vault_id,
+        producer_device_id,
+        signing_key,
+        root,
+        object_id,
+        &plaintext,
+    )
+}
+
+/// 发布一条**声明完全自洽、但没有真实密文对象**的 ASSET 日志事件。
+///
+/// 用于"恶意 relay 把不存在的资产伪报成 ASSET"的负例：commit 的 message_id 按根
+/// 确定性派生、分片/长度自洽，prepare 会记录 pending 候选，validate 必须真实下载
+/// 失败（NOT_FOUND）。
+pub fn publish_asset_declaration(
+    relay: &mut FakeRelay,
+    signing_key: &DeviceSigningKey,
+    root: &RootSecretV1,
+    object_id: ObjectId,
+) -> u64 {
+    let message_id =
+        menghunote_sync::upload::asset_message_id(root, &object_id).expect("ASSET message_id");
+    let commit = ObjectCommit {
+        vault_id: relay.vault_id,
+        object_id,
+        message_id,
+        object_type: ObjectType::Asset,
+        generation: 0,
+        key_epoch: relay.epoch,
+        sender_seq: 0,
+        part_count: 1,
+        total_len: 128,
+        object_digest: [0x3c; 32],
+    };
+    let signed = commit.encode().expect("ASSET ObjectCommit 编码");
+    let signature =
+        signing_key.sign(&object_commit_signing_input(&commit).expect("ASSET 签名输入"));
+    let seq = relay.head_seq + 1;
+    relay.log.push(RelayLogEvent {
+        relay_seq: seq,
+        kind: RelayLogKind::Asset,
+        object_id: Some(object_id),
+        epoch: relay.epoch,
+        event: signed,
+        signature: Some(signature),
+    });
+    relay.head_seq = seq;
+    seq
+}
+
+/// 篡改 FakeRelay 最近一条 ASSET 日志事件里的 `ObjectCommit`（模拟恶意 relay 声明）。
+///
+/// 只改事件字节，不动已上传的真实 parts/对象——正是"字段自洽但没有真实对象/字段与
+/// 对象不符"的攻击面。
+pub fn tamper_last_asset_commit(relay: &mut FakeRelay, mutate: impl FnOnce(&mut ObjectCommit)) {
+    let event = relay.log.last_mut().expect("ASSET 日志事件");
+    assert_eq!(event.kind, RelayLogKind::Asset, "最后一条必须是 ASSET");
+    let mut commit = ObjectCommit::decode(&event.event).expect("ASSET ObjectCommit 解码");
+    mutate(&mut commit);
+    event.event = commit.encode().expect("ASSET ObjectCommit 编码");
+}
+
 /// 给引擎预热游标（真实流程由 bootstrap 写；测试从空日志的 c0 开始）。
 pub fn seed_cursor(vault: &Vault) {
     vault
@@ -234,12 +393,19 @@ pub struct FakeRelay {
     pub acks: Vec<(u64, u64, u64)>,
     /// 每次 `put_part` 的记录（重试字节一致性断言）。
     pub put_history: Vec<(ObjectId, u32, Vec<u8>)>,
+    /// 每次 `part`（GET）的记录：`(object_id, part_no)`（读回次数断言）。
+    pub part_gets: Vec<(ObjectId, u32)>,
     /// 指定对象在 `submit_updates` 中失败一次/永久。
     pub fail_submit: HashMap<ObjectId, &'static str>,
     /// 下一次 `log` 返回传输错误（模拟截断）。
     pub truncate_next_log: bool,
     /// 下一次 `log` 把 `next_cursor` 回显为请求游标（模拟 relay 不推进游标）。
     pub freeze_next_cursor: bool,
+    /// 允许为候选 epoch（`self.epoch + 1`）创建 checkpoint。
+    ///
+    /// 真实 relay 在 vault `Rotating` 且目标 epoch `Staged` 时允许候选基线；
+    /// checkpoint coverage 测试需要"relay 仍停在 E1、候选 checkpoint 属于 E2"。
+    pub allow_candidate_epoch: bool,
     /// 所有 `part` 返回的首字节翻转（模拟篡改）。
     pub tamper_parts: bool,
     /// 日志事件里的签名翻转（模拟伪造签名）。
@@ -268,6 +434,14 @@ pub struct FakeRelay {
     pub frozen_asset_digest: Option<[u8; 32]>,
     /// 候选 checkpoint 状态（阶段 E）。
     pub checkpoint_status: HashMap<[u8; 16], CheckpointStatus>,
+    /// `/control` 键 4 的 typed kind（B 侧 epoch 检测）。
+    pub control_kinds: Vec<(u64, String)>,
+    /// latest self grant 证据（B 侧 orchestrator）。
+    pub self_grant: Option<menghunote_sync::relay::SelfGrantEvidence>,
+    /// checkpoint id → manifest 明文（只读）。
+    pub checkpoint_manifests: HashMap<[u8; 16], Vec<u8>>,
+    /// `/control` activation 链（`epoch_activations` 的注入证据）。
+    pub epoch_activations: Vec<menghunote_sync::relay::EpochActivationLink>,
 }
 
 impl FakeRelay {
@@ -290,9 +464,11 @@ impl FakeRelay {
             certs,
             acks: Vec::new(),
             put_history: Vec::new(),
+            part_gets: Vec::new(),
             fail_submit: HashMap::new(),
             truncate_next_log: false,
             freeze_next_cursor: false,
+            allow_candidate_epoch: false,
             tamper_parts: false,
             tamper_signature: false,
             tamper_commit: false,
@@ -308,12 +484,44 @@ impl FakeRelay {
             frozen_assets: Vec::new(),
             frozen_asset_digest: None,
             checkpoint_status: HashMap::new(),
+            control_kinds: Vec::new(),
+            self_grant: None,
+            checkpoint_manifests: HashMap::new(),
+            epoch_activations: Vec::new(),
         }
+    }
+
+    /// 某个对象被 GET 的片数（读回次数断言）。
+    pub fn part_get_count(&self, object_id: &ObjectId) -> usize {
+        self.part_gets
+            .iter()
+            .filter(|(recorded, _)| recorded == object_id)
+            .count()
+    }
+
+    /// 复制一条日志事件但不重编号（构造"重复序号"负例）。
+    pub fn duplicate_log_event(&mut self, index: usize) {
+        let event = self.log[index].clone();
+        self.log.insert(index + 1, event);
     }
 
     /// 直接追加一个 asset 事件（验证"范围外事件必须暂停"）。
     pub fn publish_asset(&mut self, object_id: ObjectId) {
         self.publish_event(RelayLogKind::Asset, object_id);
+    }
+
+    /// 追加一条**结构合法**的 ASSET 日志事件（engine pull 会解码 ObjectCommit 并落
+    /// skipped-asset 记录）。返回分配到的 relay_seq。
+    pub fn publish_signed_asset(
+        &mut self,
+        signing_key: &DeviceSigningKey,
+        object_id: ObjectId,
+    ) -> u64 {
+        let seq = self.head_seq + 1;
+        let event = signed_asset_event(signing_key, self.vault_id, self.epoch, object_id, seq);
+        self.head_seq = seq;
+        self.log.push(event);
+        seq
     }
 
     /// 发布任意类型的日志事件（用于 unsupported 分支测试）。
@@ -349,6 +557,43 @@ fn parse_cursor(cursor: &str) -> Result<u64, menghunote_sync::SyncError> {
         .strip_prefix('c')
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or(menghunote_sync::SyncError::RelayWire("游标格式非法"))
+}
+
+/// 构造一条结构合法的 ASSET 日志事件。
+///
+/// engine 对 ASSET 事件不验签（资产信封的 producer 被规范化为 0，日志事件里拿不到
+/// 生产者公钥），但仍会解码 `ObjectCommit` 并校验 type/object_id/epoch；因此测试夹具
+/// 必须给出可解码、字段自洽的 commit。签名一并带上以贴近真实 relay。
+pub fn signed_asset_event(
+    signing_key: &DeviceSigningKey,
+    vault_id: VaultId,
+    epoch: u64,
+    object_id: ObjectId,
+    relay_seq: u64,
+) -> RelayLogEvent {
+    let commit = ObjectCommit {
+        vault_id,
+        object_id,
+        message_id: [0x5a; 16],
+        object_type: ObjectType::Asset,
+        generation: 0,
+        key_epoch: epoch,
+        sender_seq: 0,
+        part_count: 1,
+        total_len: 128,
+        object_digest: [0x3c; 32],
+    };
+    let signed = commit.encode().expect("ASSET ObjectCommit 编码");
+    let signature =
+        signing_key.sign(&object_commit_signing_input(&commit).expect("ASSET 签名输入"));
+    RelayLogEvent {
+        relay_seq,
+        kind: RelayLogKind::Asset,
+        object_id: Some(object_id),
+        epoch,
+        event: signed,
+        signature: Some(signature),
+    }
 }
 
 impl RelayClient for FakeRelay {
@@ -420,6 +665,7 @@ impl RelayClient for FakeRelay {
         object_id: &ObjectId,
         part_no: u32,
     ) -> Result<Vec<u8>, menghunote_sync::SyncError> {
+        self.part_gets.push((*object_id, part_no));
         let mut bytes = self.parts.get(&(*object_id, part_no)).cloned().ok_or(
             menghunote_sync::SyncError::RelayApi {
                 code: "NOT_FOUND".to_owned(),
@@ -632,9 +878,12 @@ impl RelayClient for FakeRelay {
                 },
             });
         }
-        // relay 只把 UPDATE / ASSET 写进 log；SNAPSHOT/MANIFEST/KEY_SLOT 仅通过
-        // checkpoint refs 被引用（与真实 relay objects::complete 一致）。
-        let relay_seq = if matches!(commit.object_type, ObjectType::Update | ObjectType::Asset) {
+        // relay 只把 **active epoch** 的 UPDATE / ASSET 写进 log；SNAPSHOT/MANIFEST/
+        // KEY_SLOT 仅通过 checkpoint refs 被引用，候选 epoch（key_epoch != 当前 active
+        // epoch）的对象也只是候选材料，不进入 active 日志（与真实 relay 一致）。
+        let relay_seq = if matches!(commit.object_type, ObjectType::Update | ObjectType::Asset)
+            && commit.key_epoch == self.epoch
+        {
             let relay_seq = self.head_seq + 1;
             self.head_seq = relay_seq;
             let kind = if commit.object_type == ObjectType::Asset {
@@ -780,7 +1029,10 @@ impl RelayClient for FakeRelay {
             return Err(relay_api("BUSY", true));
         }
         let target_epoch = epoch.unwrap_or(self.epoch);
-        if target_epoch != self.epoch {
+        // 真实 relay 在 vault `Rotating` 时允许为任意 **Staged** 候选 epoch 建基线
+        // （active epoch 本身不变；可能已有上一轮被废弃的候选 epoch）。
+        let candidate_epoch = target_epoch > self.epoch && self.allow_candidate_epoch;
+        if target_epoch != self.epoch && !candidate_epoch {
             return Err(relay_api("EPOCH", false));
         }
         let mut checkpoint_id = [0u8; 16];
@@ -834,15 +1086,22 @@ impl RelayClient for FakeRelay {
                     ) {
                         return Err(relay_api("INVALID_REQUEST", false));
                     }
-                    if !checkpoint.data_refs.contains(&reference.object_id) {
-                        checkpoint.data_refs.push(reference.object_id);
+                    if checkpoint.data_refs.contains(&reference.object_id) {
+                        // 真实 relay 对同 object_id + 同 role 的重复 ref 直接跳过。
+                        continue;
                     }
+                    checkpoint.data_refs.push(reference.object_id);
                 }
                 CheckpointRole::Manifest => {
-                    if object.commit.object_type != ObjectType::Manifest
-                        || checkpoint.manifest_ref.is_some()
-                    {
+                    if object.commit.object_type != ObjectType::Manifest {
                         return Err(relay_api("INVALID_REQUEST", false));
+                    }
+                    if checkpoint.manifest_ref == Some(reference.object_id) {
+                        // 同上：同 manifest 重放是幂等的。
+                        continue;
+                    }
+                    if checkpoint.manifest_ref.is_some() {
+                        return Err(relay_api("CAS_CONFLICT", false));
                     }
                     checkpoint.manifest_ref = Some(reference.object_id);
                 }
@@ -1072,6 +1331,46 @@ impl RelayClient for FakeRelay {
             .collect::<Vec<_>>();
         keys.sort_by_key(|(device_id, _)| *device_id);
         Ok(keys)
+    }
+
+    fn control_kinds(&mut self) -> Result<Vec<(u64, String)>, menghunote_sync::SyncError> {
+        Ok(self.control_kinds.clone())
+    }
+
+    fn epoch_activations(
+        &mut self,
+        from_epoch: u64,
+    ) -> Result<Vec<menghunote_sync::relay::EpochActivationLink>, menghunote_sync::SyncError> {
+        // 模拟真实客户端的过滤：只返回本地 epoch 之后（to_epoch > from_epoch）的环。
+        Ok(self
+            .epoch_activations
+            .iter()
+            .filter(|link| link.evidence.activation_t.to_epoch > from_epoch)
+            .cloned()
+            .collect())
+    }
+
+    fn self_grant_evidence(
+        &mut self,
+    ) -> Result<menghunote_sync::relay::SelfGrantEvidence, menghunote_sync::SyncError> {
+        self.self_grant
+            .clone()
+            .ok_or_else(|| menghunote_sync::SyncError::Unsupported("FakeRelay 未配置 self grant"))
+    }
+
+    fn checkpoint_manifest(
+        &mut self,
+        checkpoint_id: &[u8; 16],
+    ) -> Result<menghunote_sync::relay::CheckpointManifest, menghunote_sync::SyncError> {
+        let manifest_bytes = self
+            .checkpoint_manifests
+            .get(checkpoint_id)
+            .cloned()
+            .ok_or_else(|| menghunote_sync::SyncError::Unsupported("FakeRelay 无 manifest"))?;
+        Ok(menghunote_sync::relay::CheckpointManifest {
+            checkpoint_id: *checkpoint_id,
+            manifest_bytes,
+        })
     }
 
     fn rotation_assets(

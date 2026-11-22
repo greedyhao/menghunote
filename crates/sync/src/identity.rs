@@ -1,4 +1,8 @@
-//! 本地身份 BLOB（ADR 0006 §3），只以 DPAPI 保护后落盘。
+//! 本地身份 BLOB（ADR 0006 §3），只经 [`crate::identity_wrap`] 封装后落盘。
+//!
+//! Windows 为 DPAPI（CurrentUser）；Linux 为用户主密钥 + XChaCha20-Poly1305
+//! （外层格式见 ADR 0008）。两种平台的 entropy 口径相同：
+//! `b"MN/dpapi/v1\0" || vault_id || device_id`。
 //!
 //! 结构（整数键 0..11，optional 省略，编码用 `sync-proto` 的 CDE）：
 //!
@@ -17,18 +21,29 @@
 //! 11 pending_rotation? map   （轮换中的候选根材料，ADR §8 步 1）
 //! ```
 //!
+//! 轮换后的**历史根 / 管理 rev** 不在上面这份固定清单里：它们单独存
+//! [`IDENTITY_ROTATION_STATE_META`] 的同 entropy DPAPI 记录（[`IdentityRotationStateV1`]）。
+//! 原因有二：
+//!
+//! - 身份 BLOB 的字段号是 `0..11` 的严格清单，新增字段会破坏仓内其它结构体字面量构造点；
+//! - 历史根只服务于"旧 epoch outbox 重包"这一跨重启需求，生命周期比身份 BLOB 短
+//!   （repack 完成后可清），独立记录更容易做崩溃一致性（见 promotion 的写入顺序）。
+//!
 //! 这是**本地**格式（DPAPI 内层，不上 wire），但沿用 CDE 编码规则：确定性、整数键升序、
 //! 定长字节用 byte string。秘密字段在编码后立即擦除中间 `CdeValue` 副本；比 wire 记录
 //! 多一道零化，因为这里装的都是长期私钥。
 //!
-//! 跨用户/跨 SID 的 DPAPI 失败是预期行为，见 [`crate::dpapi`] 模块文档。
+//! 跨用户/跨 SID 的 DPAPI 失败是预期行为，见 [`crate::dpapi`] 模块文档；
+//! Linux 主钥文件被删除/权限被改坏时同样显式失败（`LocalKey*`），不回退 DPAPI/明文。
 
 use crate::dpapi;
 use crate::error::SyncError;
+use crate::identity_wrap;
 use crate::ids::PeerId;
-use crate::keys::Secret32;
+use crate::keys::{RootSecretV1, Secret32};
 use crate::{DeviceId, VaultId};
 use core::iter::Peekable;
+use menghunote_storage::Vault;
 use menghunote_sync_proto::CdeValue;
 use std::vec::IntoIter;
 use zeroize::Zeroizing;
@@ -72,7 +87,177 @@ impl PendingRotationV1 {
     }
 }
 
-/// DPAPI 包裹的本地身份（ADR §3 的字段清单）。
+/// 轮换退役的历史 epoch 根（按 epoch 索引，秘密）。
+///
+/// 推广只把新根写进 [`LocalIdentityV1::current_root`]；旧根必须保留到本地旧 outbox
+/// 重包完成（阶段 J）为止，否则 rename/重启后无法再解开旧 epoch 的 parts。
+#[derive(Clone)]
+pub struct HistoricalRootV1 {
+    /// 该根对应的 `key_epoch`（与对象 header 的 epoch 一致）。
+    pub epoch: u64,
+    /// 已退役的根材料。
+    pub root: Secret32,
+}
+
+impl HistoricalRootV1 {
+    /// 构造一条历史根记录。
+    #[must_use]
+    pub fn new(epoch: u64, root: Secret32) -> Self {
+        Self { epoch, root }
+    }
+
+    fn to_cde(&self) -> CdeValue {
+        CdeValue::Map(vec![
+            (0, CdeValue::UInt(self.epoch)),
+            (1, CdeValue::Bytes(self.root.expose_slice().to_vec())),
+        ])
+    }
+
+    fn from_cde(value: CdeValue) -> Result<Self, SyncError> {
+        let mut fields = crate::wire::expect_exact::<2>(crate::wire::entries_of(value)?)?;
+        Ok(Self {
+            epoch: crate::wire::expect_uint(fields.remove(0), "identity.previous_root.epoch")?,
+            root: crate::wire::expect_secret32(fields.remove(0), "identity.previous_root.root")?,
+        })
+    }
+}
+
+/// 身份随轮换演进的旁路状态（经 `identity_wrap` 封装，存 `meta`）。
+///
+/// 语义上与身份同源（entropy 相同），但独立编码；`current_epoch` 必须与该身份一致，
+/// 否则视为崩溃残留的"未来"记录而被忽略（见 promotion 的写入顺序）。
+pub struct IdentityRotationStateV1 {
+    /// 与 [`LocalIdentityV1::current_epoch`] 对齐；不一致即过期。
+    pub current_epoch: u64,
+    /// 控制链 rev（**不是**管理 key rev）。
+    pub control_rev: u64,
+    /// 管理 key rev（独立单调计数，不能写进 `control_rev`）。
+    pub manager_rev: u64,
+    /// 已退役但仍需用于解旧 outbox 的根（至少含最近一个旧根）。
+    pub previous_roots: Vec<HistoricalRootV1>,
+}
+
+impl IdentityRotationStateV1 {
+    /// 读旁路状态；不存在返回 `None`。
+    pub fn load(
+        vault: &Vault,
+        vault_id: &VaultId,
+        device_id: &DeviceId,
+    ) -> Result<Option<Self>, SyncError> {
+        let Some(blob) = vault.get_meta(IDENTITY_ROTATION_STATE_META)? else {
+            return Ok(None);
+        };
+        let plaintext = identity_wrap::unprotect(&blob, &dpapi::entropy_for(vault_id, device_id))?;
+        Ok(Some(Self::decode(&plaintext)?))
+    }
+
+    /// 读"当前身份的"旁路状态；`current_epoch` 不匹配时返回 `None`（崩溃残留）。
+    pub fn load_current(
+        vault: &Vault,
+        identity: &LocalIdentityV1,
+    ) -> Result<Option<Self>, SyncError> {
+        Ok(Self::load(vault, &identity.vault_id, &identity.device_id)?
+            .filter(|state| state.current_epoch == identity.current_epoch))
+    }
+
+    /// 经本地封装（Windows DPAPI / Linux 用户主钥）保护后写回旁路状态。
+    pub fn save(
+        &self,
+        vault: &Vault,
+        vault_id: &VaultId,
+        device_id: &DeviceId,
+    ) -> Result<(), SyncError> {
+        let plaintext = Zeroizing::new(self.encode()?);
+        let blob = identity_wrap::protect(&plaintext, &dpapi::entropy_for(vault_id, device_id))?;
+        vault.set_meta(IDENTITY_ROTATION_STATE_META, &blob)?;
+        Ok(())
+    }
+
+    /// 按 epoch 取历史根。
+    #[must_use]
+    pub fn root_for_epoch(&self, epoch: u64) -> Option<&Secret32> {
+        self.previous_roots
+            .iter()
+            .find(|entry| entry.epoch == epoch)
+            .map(|entry| &entry.root)
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, SyncError> {
+        let mut value = CdeValue::Map(vec![
+            (0, CdeValue::UInt(self.current_epoch)),
+            (1, CdeValue::UInt(self.control_rev)),
+            (2, CdeValue::UInt(self.manager_rev)),
+            (
+                3,
+                CdeValue::Array(
+                    self.previous_roots
+                        .iter()
+                        .map(HistoricalRootV1::to_cde)
+                        .collect(),
+                ),
+            ),
+        ]);
+        let encoded = crate::wire::encode(&value)?;
+        // 中间 CdeValue 里有根材料：编码完立刻擦除。
+        crate::wire::zeroize_value(&mut value);
+        Ok(encoded)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, SyncError> {
+        let fields = crate::wire::expect_exact::<4>(crate::wire::decode_entries(bytes)?)?;
+        let CdeValue::Array(items) = &fields[3] else {
+            return Err(SyncError::Cde("identity.rotation previous_roots 不是数组"));
+        };
+        let mut previous_roots = Vec::with_capacity(items.len());
+        for item in items {
+            previous_roots.push(HistoricalRootV1::from_cde(item.clone())?);
+        }
+        Ok(Self {
+            current_epoch: crate::wire::expect_uint(
+                fields[0].clone(),
+                "identity.rotation.current_epoch",
+            )?,
+            control_rev: crate::wire::expect_uint(
+                fields[1].clone(),
+                "identity.rotation.control_rev",
+            )?,
+            manager_rev: crate::wire::expect_uint(
+                fields[2].clone(),
+                "identity.rotation.manager_rev",
+            )?,
+            previous_roots,
+        })
+    }
+}
+
+/// 旁路状态的 `meta` 键。
+pub const IDENTITY_ROTATION_STATE_META: &str = "sync.identity.rotation_state";
+
+/// 取指定 epoch 的根（当前 epoch 用身份里的根，其余查旁路历史）。
+///
+/// 阶段 J 重包旧 outbox 时，调用方必须先用它拿到**旧 epoch** 的 [`RootSecretV1`]，
+/// 不能用 `new_root` 猜。
+pub fn root_secret_for_epoch(
+    vault: &Vault,
+    identity: &LocalIdentityV1,
+    epoch: u64,
+) -> Result<Option<RootSecretV1>, SyncError> {
+    if epoch == identity.current_epoch {
+        return Ok(Some(RootSecretV1::new(
+            identity.vault_id,
+            epoch,
+            identity.current_root.clone(),
+        )));
+    }
+    let Some(state) = IdentityRotationStateV1::load_current(vault, identity)? else {
+        return Ok(None);
+    };
+    Ok(state
+        .root_for_epoch(epoch)
+        .map(|root| RootSecretV1::new(identity.vault_id, epoch, root.clone())))
+}
+
+/// 本地封装的本地身份（ADR §3 的字段清单；平台分派见 [`crate::identity_wrap`]）。
 ///
 /// 不含 `Debug` 派生：手写 `Debug` 只打印非秘密字段，秘密一律 `<redacted>`。
 pub struct LocalIdentityV1 {
@@ -208,22 +393,22 @@ impl LocalIdentityV1 {
         })
     }
 
-    /// 用 DPAPI（CurrentUser）保护整份身份。
+    /// 经平台本地封装保护整份身份（Windows DPAPI / Linux 用户主钥）。
     ///
     /// 明文序列化缓冲包在 `Zeroizing` 里，加密后立即清零。
     pub fn protect(&self) -> Result<Vec<u8>, SyncError> {
         let plaintext = Zeroizing::new(self.encode()?);
-        dpapi::protect(&plaintext, &self.entropy())
+        identity_wrap::protect(&plaintext, &self.entropy())
     }
 
-    /// 解封 DPAPI BLOB 并解析；`vault_id`/`device_id` 必须与 BLOB 内容一致
+    /// 解封平台本地封装 BLOB 并解析；`vault_id`/`device_id` 必须与 BLOB 内容一致
     /// （entropy 已经绑定它们，这里再校验一次结构，防错配）。
     pub fn unprotect(
         blob: &[u8],
         vault_id: &VaultId,
         device_id: &DeviceId,
     ) -> Result<Self, SyncError> {
-        let plaintext = dpapi::unprotect(blob, &dpapi::entropy_for(vault_id, device_id))?;
+        let plaintext = identity_wrap::unprotect(blob, &dpapi::entropy_for(vault_id, device_id))?;
         let identity = Self::decode(&plaintext)?;
         if identity.vault_id != *vault_id || identity.device_id != *device_id {
             return Err(SyncError::Identity(
@@ -417,6 +602,123 @@ mod tests {
     }
 
     #[test]
+    fn rotation_state_roundtrips_previous_roots() {
+        let old_a = Secret32::from_array([0x71; 32]);
+        let old_b = Secret32::from_array([0x61; 32]);
+        let state = IdentityRotationStateV1 {
+            current_epoch: 8,
+            control_rev: 12,
+            manager_rev: 5,
+            previous_roots: vec![
+                HistoricalRootV1::new(7, old_a.clone()),
+                HistoricalRootV1::new(6, old_b.clone()),
+            ],
+        };
+        let bytes = state.encode().unwrap();
+        let back = IdentityRotationStateV1::decode(&bytes).unwrap();
+        assert_eq!(back.current_epoch, 8);
+        assert_eq!(back.control_rev, 12);
+        assert_eq!(back.manager_rev, 5);
+        assert_eq!(back.previous_roots.len(), 2);
+        assert!(back.root_for_epoch(7).unwrap().ct_eq(&old_a));
+        assert!(back.root_for_epoch(6).unwrap().ct_eq(&old_b));
+        assert!(back.root_for_epoch(8).is_none());
+        // 编码确定性 + 截断/尾随/未知字段拒绝
+        assert_eq!(bytes, back.encode().unwrap());
+        assert!(IdentityRotationStateV1::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(IdentityRotationStateV1::decode(&long).is_err());
+        let mut entries = crate::wire::decode_entries(&bytes).unwrap();
+        entries.push((4, CdeValue::UInt(0)));
+        let bad = crate::wire::encode(&CdeValue::Map(entries)).unwrap();
+        assert!(IdentityRotationStateV1::decode(&bad).is_err());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn rotation_state_is_wrapped_and_epoch_scoped() {
+        crate::test_support::ensure_local_wrap();
+        let base = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("target/tmp"));
+        std::fs::create_dir_all(&base).expect("target/tmp");
+        let dir = tempfile::Builder::new()
+            .prefix("identity-rotation-")
+            .tempdir_in(&base)
+            .expect("临时目录");
+        let vault = Vault::open(dir.path().join("vault.sqlite3")).expect("vault");
+        let identity = fixture(false, false, 81);
+        let old_root = Secret32::from_array([0x72; 32]);
+        let state = IdentityRotationStateV1 {
+            current_epoch: identity.current_epoch,
+            control_rev: 9,
+            manager_rev: 4,
+            previous_roots: vec![HistoricalRootV1::new(
+                identity.current_epoch - 1,
+                old_root.clone(),
+            )],
+        };
+        state
+            .save(&vault, &identity.vault_id, &identity.device_id)
+            .expect("save");
+        // 本地封装密文里不能出现根的明文
+        let blob = vault
+            .get_meta(IDENTITY_ROTATION_STATE_META)
+            .expect("meta")
+            .expect("blob");
+        assert!(
+            !blob
+                .windows(32)
+                .any(|window| window == old_root.expose_slice()),
+            "旁路状态必须以本地封装密文落盘"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(&blob[..4], b"MNKW", "Linux 旁路状态必须带 MNKW 外层头");
+        let loaded = IdentityRotationStateV1::load_current(&vault, &identity)
+            .expect("load")
+            .expect("state");
+        assert_eq!(loaded.control_rev, 9);
+        assert_eq!(loaded.manager_rev, 4);
+        // 当前 epoch 用身份里的根，旧 epoch 用历史根
+        let current = root_secret_for_epoch(&vault, &identity, identity.current_epoch)
+            .expect("current")
+            .expect("current root");
+        assert_eq!(current.key_epoch, identity.current_epoch);
+        assert!(current.root.ct_eq(&identity.current_root));
+        let old = root_secret_for_epoch(&vault, &identity, identity.current_epoch - 1)
+            .expect("old")
+            .expect("old root");
+        assert!(old.root.ct_eq(&old_root));
+        assert!(
+            root_secret_for_epoch(&vault, &identity, identity.current_epoch + 1)
+                .expect("miss")
+                .is_none()
+        );
+        // 崩溃残留：旁路状态 epoch 领先身份时整条记录视为过期
+        let future = IdentityRotationStateV1 {
+            current_epoch: identity.current_epoch + 1,
+            control_rev: 10,
+            manager_rev: 5,
+            previous_roots: vec![HistoricalRootV1::new(
+                identity.current_epoch,
+                old_root.clone(),
+            )],
+        };
+        future
+            .save(&vault, &identity.vault_id, &identity.device_id)
+            .expect("save future");
+        assert!(IdentityRotationStateV1::load_current(&vault, &identity)
+            .expect("load")
+            .is_none());
+        assert!(
+            root_secret_for_epoch(&vault, &identity, identity.current_epoch - 1)
+                .expect("stale")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn entropy_binds_vault_and_device() {
         let identity = fixture(false, false, 78);
         let entropy = identity.entropy();
@@ -430,12 +732,36 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
-    fn dpapi_identity_roundtrip() {
+    fn local_identity_roundtrip_is_platform_wrapped() {
+        crate::test_support::ensure_local_wrap();
         let identity = fixture(true, true, 79);
         let blob = identity.protect().unwrap();
         assert!(!blob.is_empty());
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(&blob[..4], b"MNKW");
+            assert_eq!(blob[4], 1, "外层 version");
+            assert_eq!(blob[5], 1, "外层 kind=LinuxKeyFile");
+        }
+        // 无明文旁路：种子/根等长期私钥不得出现在落盘 BLOB 里。
+        for secret in [
+            identity.ed25519_seed.expose_slice(),
+            identity.x25519_secret.expose_slice(),
+            identity.current_root.expose_slice(),
+            identity
+                .pending_rotation
+                .as_ref()
+                .unwrap()
+                .candidate_root
+                .expose_slice(),
+        ] {
+            assert!(
+                !blob.windows(secret.len()).any(|window| window == secret),
+                "身份 BLOB 泄露了秘密明文"
+            );
+        }
         let opened =
             LocalIdentityV1::unprotect(&blob, &identity.vault_id, &identity.device_id).unwrap();
         assert_eq!(opened.device_id, identity.device_id);
@@ -449,19 +775,38 @@ mod tests {
         assert!(LocalIdentityV1::unprotect(&blob, &identity.vault_id, &[0x99; 16]).is_err());
         // 换 vault_id 必须失败
         assert!(LocalIdentityV1::unprotect(&blob, &[0x98; 16], &identity.device_id).is_err());
+        // 密文/标签被篡改必须失败
+        let mut tampered = blob;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(
+            LocalIdentityV1::unprotect(&tampered, &identity.vault_id, &identity.device_id).is_err()
+        );
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn dpapi_identity_is_unavailable_off_windows() {
+    fn linux_rejects_bare_windows_dpapi_blob() {
+        crate::test_support::ensure_local_wrap();
+        let identity = fixture(false, false, 80);
+        // Windows DPAPI 裸包没有 MNKW 头：Linux 必须显式拒绝，绝不回退 DPAPI/明文。
+        assert!(matches!(
+            LocalIdentityV1::unprotect(&[0x01u8; 128], &identity.vault_id, &identity.device_id),
+            Err(SyncError::LocalWrapFormat(_))
+        ));
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    #[test]
+    fn local_wrap_is_unavailable_off_supported_platforms() {
         let identity = fixture(false, false, 80);
         assert!(matches!(
             identity.protect(),
-            Err(SyncError::DpapiUnavailable)
+            Err(SyncError::LocalWrapUnsupportedPlatform)
         ));
         assert!(matches!(
             LocalIdentityV1::unprotect(b"blob", &identity.vault_id, &identity.device_id),
-            Err(SyncError::DpapiUnavailable)
+            Err(SyncError::LocalWrapUnsupportedPlatform)
         ));
     }
 }

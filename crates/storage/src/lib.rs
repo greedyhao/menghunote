@@ -28,13 +28,14 @@
 //! let doc = BodyDoc::create("body-1", 1)?;
 //! doc.insert_scalars(0, "A中😀e\u{301}")?;
 //! assert_eq!(doc.scalar_len(), 5);
-//! assert_eq!(vault.user_version()?, 2);
+//! assert_eq!(vault.user_version()?, 3);
 //! # Ok(())
 //! # }
 //! ```
 
 mod actor;
 mod asset_store;
+mod baseline_apply;
 mod body_doc;
 mod connection;
 mod error;
@@ -57,6 +58,11 @@ pub use actor::{AffectedGuard, Row, Statement, Vault};
 pub use asset_store::{
     asset_meta_by_hash, insert_asset, link_asset_ref, list_asset_refs, set_asset_orphan_since,
     unlink_asset_ref, AssetRef,
+};
+pub use baseline_apply::{
+    abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, baseline_apply_state,
+    begin_baseline_apply, finish_baseline_apply, BaselineApplyFinish, BaselineApplyState,
+    BaselineApplyStatus, BaselineAsset, BASELINE_MERGE_BATCH, META_SYNC_RELAY_CURSOR,
 };
 pub use body_doc::{
     BodyDoc, PendingUpdate, APP_DOC_SCHEMA, BODY_CONTAINER, CODEC_VERSION, MIN_READER,

@@ -1,8 +1,10 @@
 //! 生产 CLI 的进程级测试：真跑 `menghunote-relay` 二进制（不绑生产端口、不联网）。
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_menghunote-relay");
 
@@ -191,4 +193,115 @@ fn serve_refuses_uninitialized_database() {
     );
     assert!(db.exists(), "拒绝启动前已建库（会话内可继续 init）");
     cleanup(&db);
+}
+
+#[test]
+fn serve_rejects_non_loopback_plaintext_without_explicit_allow() {
+    let db = tmp_path("non-loopback-plaintext");
+    let dir = db.parent().expect("parent").to_path_buf();
+    let config = dir.join("plaintext.toml");
+    let body = format!("listen = \"0.0.0.0:0\"\ndb = \"{}\"\n", toml_path(&db));
+    std::fs::write(&config, body).expect("write config");
+
+    let output = run(&["serve", "--config", &config.to_string_lossy()], None);
+    assert!(!output.status.success(), "非 loopback 明文必须拒绝启动");
+    let message = stderr(&output);
+    assert!(message.contains("allow_plaintext"), "{message}");
+    assert!(
+        message.contains("反向代理"),
+        "要给出 TLS 部署做法：{message}"
+    );
+    assert!(
+        !db.exists(),
+        "明文门禁必须在打开/创建数据库之前拒绝（不能留半初始化文件）"
+    );
+    cleanup(&db);
+}
+
+/// 子进程守卫：任何 panic 路径都先杀掉 relay，避免测试失败后留下孤儿进程
+/// （孤儿会持有端口/库文件，还可能拖住 CI 的进程树等待）。
+struct ChildGuard {
+    child: std::process::Child,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn serve_non_loopback_plaintext_starts_after_explicit_allow() {
+    let db = tmp_path("allow-plaintext");
+    let db_arg = db.to_string_lossy().into_owned();
+    let output = run(&["init", "--db", &db_arg], None);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let dir = db.parent().expect("parent").to_path_buf();
+    let config = dir.join("serve.toml");
+    let body = format!(
+        "listen = \"0.0.0.0:0\"\ndb = \"{}\"\nallow_plaintext = true\n",
+        toml_path(&db)
+    );
+    std::fs::write(&config, body).expect("write config");
+
+    let config_arg = config.to_string_lossy().into_owned();
+    let child = Command::new(BIN)
+        .args(["serve", "--config", config_arg.as_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn relay");
+    let mut guard = ChildGuard { child };
+    let mut stdout = BufReader::new(guard.child.stdout.take().expect("stdout"));
+
+    // 等启动横幅（blocking read_line 是明确收敛点，不是 sleep）。
+    let mut port = None;
+    let mut banner = String::new();
+    for _ in 0..20 {
+        let mut line = String::new();
+        if stdout.read_line(&mut line).expect("read stdout") == 0 {
+            break;
+        }
+        banner.push_str(&line);
+        if let Some(rest) = line.split("listening on http://").nth(1) {
+            let authority = rest
+                .split(|c: char| c.is_whitespace() || c == '（')
+                .next()
+                .unwrap_or("");
+            port = authority
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok());
+            if port.is_some() {
+                break;
+            }
+        }
+    }
+    let Some(port) = port else {
+        panic!("启动后没有打印 listening 横幅：{banner}");
+    };
+
+    // 显式允许后确实能接受连接并讲 HTTP（服务端会回 401/404 之类的 CBOR 错误体，
+    // 只断言状态行；body 可能不是 UTF-8，必须按字节读）。
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect allowed server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .write_all(
+            b"GET /v1/vaults/AAAA/state HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    drop(stdout);
+    drop(guard);
+    cleanup(&db);
+
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 "),
+        "显式 allow_plaintext 后必须能讲 HTTP：{response}"
+    );
 }

@@ -229,6 +229,9 @@ fn rotation_freeze_blocks_old_epoch_writes_then_activate_switches_epoch() {
         transition: fx.manager_transition(&row, 0, 2, [9u8; 32]),
         old_signature: Some(b"old".to_vec()),
         new_signature: Some(b"new".to_vec()),
+        activation_t: None,
+        old_t_signature: None,
+        new_t_signature: None,
     };
     let err = fx
         .activate_rotation_with_manager(&rotation_id, stale)
@@ -246,6 +249,9 @@ fn rotation_freeze_blocks_old_epoch_writes_then_activate_switches_epoch() {
         transition: tampered,
         old_signature: Some(b"old".to_vec()),
         new_signature: Some(b"new".to_vec()),
+        activation_t: None,
+        old_t_signature: None,
+        new_t_signature: None,
     };
     let err = fx
         .activate_rotation_with_manager(&rotation_id, bad_bind)
@@ -257,6 +263,9 @@ fn rotation_freeze_blocks_old_epoch_writes_then_activate_switches_epoch() {
         transition: fx.manager_transition(&row, 1, 2, [9u8; 32]),
         old_signature: None,
         new_signature: None,
+        activation_t: None,
+        old_t_signature: None,
+        new_t_signature: None,
     };
     let err = fx
         .activate_rotation_with_manager(&rotation_id, single_signed)
@@ -816,12 +825,46 @@ fn asset_registry_survives_log_gc_and_two_rotations() {
     let outcome = fx.gc();
     assert!(!outcome.blocked, "{outcome:?}");
     assert!(outcome.deleted_log_rows > 0, "日志前缀应被回收");
+    // §S7-35：旧 epoch 的跨 epoch ASSET 副本在 log 前缀 GC 后必须被真正回收
+    // （登记行保留为历史事实，但 state='retired'，枚举不再声称密文可用）。
     let listed_gc = fx
         .db
         .read(|conn| relay::objects::list_assets(conn, 1, i64::MAX as u64, None, 100))
         .expect("list assets after gc");
-    assert_eq!(listed_gc.len(), 1, "log GC 后资产枚举不得丢失");
-    assert_eq!(listed_gc[0].object_id, asset_id);
+    assert!(
+        listed_gc.is_empty(),
+        "旧 epoch 资产副本必须被回收: {listed_gc:?}"
+    );
+    let asset_object = fx.object_row(&asset_id);
+    assert_eq!(
+        asset_object.budget_class,
+        relay::objects::BudgetClass::Retired,
+        "旧 epoch 资产对象只留 tombstone"
+    );
+    let (state, parts): (String, i64) = fx
+        .db
+        .read(|conn| {
+            let state: String = conn.query_row(
+                "SELECT state FROM asset_objects WHERE epoch = 1 AND object_id = ?1",
+                [asset_id.as_slice()],
+                |row| row.get(0),
+            )?;
+            let parts: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM object_parts WHERE object_id = ?1",
+                [asset_id.as_slice()],
+                |row| row.get(0),
+            )?;
+            Ok((state, parts))
+        })
+        .expect("asset registry");
+    assert_eq!(state, "retired", "登记行保留但标记 retired");
+    assert_eq!(parts, 0, "资产密文必须被清");
+    // epoch1 的资产副本已回收，但 active epoch（3）不受影响。
+    let listed_active = fx
+        .db
+        .read(|conn| relay::objects::list_assets(conn, 3, i64::MAX as u64, None, 100))
+        .expect("list active epoch assets");
+    assert!(listed_active.is_empty(), "本用例 active epoch 没有资产");
 }
 
 #[test]

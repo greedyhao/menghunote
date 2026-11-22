@@ -4,7 +4,8 @@
 //!
 //! - 根密钥 / 口令 KEK / 恢复码（Argon2id + HKDF，Bech32m `mnrec`）；
 //! - 密钥槽（`sync-proto` 的 `SlotDescriptorV1`）、wrap/unwrap、改口令纯逻辑；
-//! - DPAPI（仅 Windows，CurrentUser）本地身份 BLOB；
+//! - 本地身份 BLOB 封装（[`identity_wrap`]）：Windows DPAPI（CurrentUser），
+//!   Linux 用户主密钥文件 + XChaCha20-Poly1305（ADR 0008）；
 //! - 设备 Ed25519/X25519 身份、`DeviceCertV1`（`sync-proto` 类型）、独立管理密钥、
 //!   邀请令牌、设备指纹；
 //! - HPKE（RFC 9180 base mode：X25519-HKDF-SHA256 / HKDF-SHA256 / ChaCha20Poly1305）。
@@ -12,13 +13,15 @@
 //! 边界（ADR §11）：不做网络、不做 SQLite、不碰 GPUI。**wire 类型与 CDE 编码的真源是
 //! `menghunote-sync-proto`**（header/AAD/记录/KDF 联合体/域常量），本 crate 不另写一套；
 //! 它只负责"把待编码字节算成 SHA/签名/HPKE/AEAD"，以及本 crate 私有的本地结构
-//! （DPAPI 身份 BLOB、HPKE grant AAD）经同一 CDE 编码器编码。
+//! （本地身份 BLOB、HPKE grant AAD）经同一 CDE 编码器编码。
 //!
-//! **秘密纪律**：口令、根、恢复种子、私钥一律包在 [`keys::Secret32`]（`Zeroizing`）里，
-//! 这些类型不实现 `Debug`/`Display`；错误类型只带定位信息，不带秘密。
+//! **秘密纪律**：口令、根、恢复种子、私钥、Linux 用户主密钥一律包在
+//! [`keys::Secret32`] / `Zeroizing` 里，这些类型不实现 `Debug`/`Display`；错误类型只带
+//! 定位信息，不带秘密。
 //!
-//! 平台：DPAPI 只在 Windows 可用；非 Windows 编译通过但调用明确返回
-//! [`error::SyncError::DpapiUnavailable`]，**不假装成功**。
+//! 平台（[`identity_wrap`] 分派）：Windows 用 DPAPI（ADR 0006 §3）；Linux 用用户主密钥
+//! 文件（ADR 0008，安全性弱于 DPAPI）；其它平台编译通过但调用明确返回
+//! [`error::SyncError::LocalWrapUnsupportedPlatform`]，**不假装成功、不回退明文**。
 
 // 除 DPAPI 的 Win32 FFI（`dpapi.rs` 内 `#[allow(unsafe_code)]`）外，本 crate 不用 unsafe。
 #![deny(unsafe_code)]
@@ -35,7 +38,9 @@ pub mod error;
 pub mod genesis;
 pub mod hpke;
 pub mod http_relay;
+pub mod http_transport;
 pub mod identity;
+pub mod identity_wrap;
 pub mod ids;
 pub mod kdf;
 pub mod keys;
@@ -45,7 +50,10 @@ pub mod recovery_enroll;
 pub mod relay;
 pub mod rotation;
 pub mod rotation_activate;
+pub mod rotation_apply;
 pub mod rotation_journal;
+pub mod rotation_repack;
+pub mod rotation_restart;
 pub mod rotation_slots;
 pub mod rotation_stage;
 pub mod slot;

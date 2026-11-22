@@ -17,6 +17,9 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+// `peak_rss_mib` 的 Windows 实现用 PowerShell 取峰值内存（Linux 读 /proc/self/status），
+// 因此 gate 在 windows 上，避免非 Windows 构建出现 unused import。
+#[cfg(windows)]
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

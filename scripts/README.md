@@ -59,3 +59,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ui_smoke.ps1 -Scenar
 | `MENGHUNOTE_TRACE_MENU=1` | 行右键 / 菜单打开 / 菜单渲染 / 菜单关闭原因 |
 
 默认都不输出，`cargo run` 的 stderr 保持干净。
+
+## e2e（Rust example，跨平台，无 shell 编排）
+
+同步/轮换 e2e 全部是**自包含 Rust example**：进程内启动真实 axum relay（临时 SQLite +
+`FakeClock`，仅 loopback 放行验签、`127.0.0.1:0`），不需要 PowerShell/bash，也不需要外部
+`dev_server`。Windows 上只要有 cargo 即可，一条命令即验收（退出码 0 + 末尾标记）：
+
+```bash
+cargo run -p menghunote-sync --example e2e_rotation_verify       # 两阶段 localhost+rotation，末尾 VERIFY_EXIT=0
+cargo run -p menghunote-sync --example e2e_rotation_two_devices  # 末尾 TWO_DEVICE_EXIT=0
+cargo run -p menghunote-sync --example e2e_rotation_two_rounds   # 末尾 TWO_ROUND_EXIT=0
+```
+
+旧的 `e2e_rotation_two_rounds.ps1` / `e2e_rotation_verify.ps1` / `e2e_rotation_two_devices.ps1`
+已全部删除（被上面的自包含 example 取代）。`e2e_localhost`、`e2e_rotation` 仍是底层 example，
+保留 `--relay` + `--setup` 的**外部** relay 模式（也可由 `e2e_rotation_verify` 在进程内调用）。
