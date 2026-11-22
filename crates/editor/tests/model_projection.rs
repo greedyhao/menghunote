@@ -1,6 +1,6 @@
-//! `ProjectionMap` 的 identity 行为与段表结构测试（ADR 0002 §4 / ADR 0003 §7 切片 3）。
+//! `ProjectionMap` 的结构 / identity / 段表查询测试。
 //!
-//! S1 只承诺 identity；这里同时锁住"查询走段表、不是整篇偏移差"这一结构要求。
+//! S2-2 的真实省略与偏置语义见 `projection_markdown.rs`；这里保留 S1 结构契约。
 
 use menghunote_editor::{
     DisplayByte, ProjectionError, ProjectionMap, Segment, SegmentKind, SourceByte, SourceRange,
@@ -21,33 +21,37 @@ fn identity_maps_source_to_display_one_to_one() {
     assert_eq!(map.segments()[0].kind(), SegmentKind::Copy);
     assert_eq!(map.segments()[0].display_len(), 11);
     assert_eq!(map.source_len(), 11);
-    assert_eq!(map.display_len(), 11);
+    assert_eq!(map.display_len().get(), 11);
+    assert_eq!(map.display_text().as_ref(), text);
 
     // scalar 边界表（ADR 0002 §11.1 夹具）。
     for at in [0usize, 1, 4, 8, 9, 11] {
         assert_eq!(
-            map.display_byte(SourceByte::new(at)),
-            Ok(DisplayByte::new(at)),
+            map.display_byte_at_source(SourceByte::new(at)),
+            Some(DisplayByte::new(at)),
             "source {at} → display"
         );
         assert_eq!(
-            map.source_byte(DisplayByte::new(at)),
-            Ok(SourceByte::new(at)),
+            map.source_byte_at_display(DisplayByte::new(at)),
+            Some(SourceByte::new(at)),
             "display {at} → source"
         );
     }
 }
 
 #[test]
-fn identity_rejects_out_of_bounds() {
+fn identity_queries_report_out_of_bounds_as_none() {
     let map = ProjectionMap::identity("abc").expect("identity 投影");
+    assert_eq!(map.display_byte_at_source(SourceByte::new(4)), None);
+    assert_eq!(map.source_byte_at_display(DisplayByte::new(4)), None);
+    // 端点（文档尾）仍是合法位置。
     assert_eq!(
-        map.display_byte(SourceByte::new(4)),
-        Err(ProjectionError::SourceByteOutOfBounds { offset: 4, len: 3 })
+        map.display_byte_at_source(SourceByte::new(3)),
+        Some(DisplayByte::new(3))
     );
     assert_eq!(
-        map.source_byte(DisplayByte::new(4)),
-        Err(ProjectionError::DisplayByteOutOfBounds { offset: 4, len: 3 })
+        map.source_byte_at_display(DisplayByte::new(0)),
+        Some(SourceByte::new(0))
     );
 }
 
@@ -55,15 +59,20 @@ fn identity_rejects_out_of_bounds() {
 fn empty_document_is_an_empty_map() {
     let map = ProjectionMap::identity("").expect("空文档也合法");
     assert!(map.segments().is_empty());
+    assert!(map.is_identity());
     assert_eq!(map.source_len(), 0);
-    assert_eq!(map.display_len(), 0);
+    assert_eq!(map.display_len().get(), 0);
+    assert_eq!(map.display_text().as_ref(), "");
     assert_eq!(
-        map.display_byte(SourceByte::new(0)),
-        Ok(DisplayByte::new(0))
+        map.display_byte_at_source(SourceByte::new(0)),
+        Some(DisplayByte::new(0))
     );
-    assert_eq!(map.source_byte(DisplayByte::new(0)), Ok(SourceByte::new(0)));
-    assert!(map.display_byte(SourceByte::new(1)).is_err());
-    assert!(map.source_byte(DisplayByte::new(1)).is_err());
+    assert_eq!(
+        map.source_byte_at_display(DisplayByte::new(0)),
+        Some(SourceByte::new(0))
+    );
+    assert_eq!(map.display_byte_at_source(SourceByte::new(1)), None);
+    assert_eq!(map.source_byte_at_display(DisplayByte::new(1)), None);
 }
 
 #[test]
@@ -80,21 +89,22 @@ fn queries_use_the_segment_table_not_a_global_byte_delta() {
         .expect("连续覆盖的段表");
 
     assert!(!map.is_identity());
-    assert_eq!(map.display_len(), 2);
+    assert_eq!(map.display_len().get(), 2);
+    assert_eq!(map.display_text().as_ref(), "ac");
     assert_eq!(
-        map.display_byte(SourceByte::new(2)),
-        Ok(DisplayByte::new(1)),
+        map.display_byte_at_source(SourceByte::new(2)),
+        Some(DisplayByte::new(1)),
         "若得到 2 说明用了整篇偏移差"
     );
     assert_eq!(
-        map.display_byte(SourceByte::new(1)),
-        Err(ProjectionError::UnsupportedSegment(SegmentKind::Elide)),
-        "隐藏区间内部点属于 S2 多对一语义，S1 不猜"
+        map.display_byte_at_source(SourceByte::new(1)),
+        Some(DisplayByte::new(1)),
+        "省略段内部/段首取 Before（省略段起点）"
     );
     assert_eq!(
-        map.source_byte(DisplayByte::new(1)),
-        Ok(SourceByte::new(2)),
-        "显示边界 1 对应可见段起点（After bias 的自然结果）"
+        map.source_byte_at_display(DisplayByte::new(1)),
+        Some(SourceByte::new(2)),
+        "display 接缝取 After（下一可见段的 source 起点）"
     );
 }
 

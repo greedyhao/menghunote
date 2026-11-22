@@ -4,7 +4,11 @@
 //!
 //! - 持有打开快照（[`OpenSnapshot`]）与 Rope 镜像；镜像只按**确认**增量更新；
 //! - source selection（anchor / head 都是 [`UnicodeScalar`]）；
-//! - S1 identity 投影（[`ProjectionMap`]）；
+//! - Markdown 语义扫描（[`MarkdownDocument`]）+ 当前显示投影（[`ProjectionMap`]）：
+//!   source 变时重解析；selection 变时只重建投影（caret 进入构造会展开标记，
+//!   因此**移动 caret 不改 source 但可能改 display 长度**，app 据此决定是否重排）；
+//! - 语义样式区间（`StyleRun`，display 坐标）：随投影一起重建，app 每帧直接借用；
+//! - 块级语义区间（`BlockRun`，source 坐标）：每行一个 run，仅 source 变时重建；
 //! - 生成本地编辑请求（[`EditRequest`]）；本地输入**乐观写入**镜像一次，
 //!   `Applied.local_echo = true` 时只确认不再二次应用；
 //! - IME 输入文档（[`InputDocument`]）与 preedit：preedit 永不进入 source；
@@ -29,18 +33,41 @@
 //! - 背压（[`RejectReason::Backpressure`]）不销毁状态：请求未被受理，镜像的乐观
 //!   输入与 pending 都保留，可用同一 `EditRequest` 重试；
 //! - 组合期间收到镜像变化会直接取消组合（preedit 不重映射，也不产生编辑）。
+//!
+//! ## 投影重建时机与代价（S2-3a）
+//!
+//! 控制器**急切**维护 `source → MarkdownDocument → ProjectionMap` 三者同步：
+//!
+//! - **source 变**（本地编辑、IME 提交、远端 delta、undo/redo）：重扫 Markdown
+//!   并重建投影与语义样式区间（`refresh_markdown`）；
+//! - **selection 变**（移动 caret / 设选区）：复用已缓存的 `MarkdownDocument`，
+//!   只重建投影与样式区间（`refresh_projection`），不重解析；
+//! - **块级语义 `block_runs`** 只依赖 source，随 `refresh_markdown` 重建；
+//!   selection 变化**不**触发它（标题级别 / 块类型与 caret 无关）；
+//! - 读 API（[`EditorController::display_text`] / `projection` / 双向映射）只借用
+//!   当前结果，**不做惰性重建**；任何变更返回后三者都已同步。
+//!
+//! **v1 代价**：每次编辑 / caret 移动都做一次 O(n) 的全量重建（扫描 + 段表）。
+//! 对当前目标（桌面笔记、单篇文档）可接受；后续可做增量 Markdown 扫描（按行/块
+//! 失效重扫）与按块投影缓存，对外 API 不变。注意 caret 移动虽不改 source，仍会
+//! 因显现/隐藏构造而改变 `display_len`，app 必须按 `display_len` 变化决定重排。
+
+use std::borrow::Cow;
 
 use menghunote_storage::session::{
     Applied, CommandId, DeltaSplice, DurableAck, EditOutcome, EditRequest, Generation, LiveDelta,
     LiveRev, OpenSnapshot, RejectReason, ScalarEdit, SessionEpoch,
 };
-use menghunote_text::{units, SourceByte, UnicodeScalar};
+use menghunote_text::{units, DisplayByte, SourceByte, UnicodeScalar};
 use ropey::Rope;
 
+use crate::model::block::BlockRun;
 use crate::model::error::EditorError;
 use crate::model::input::InputDocument;
+use crate::model::markdown::MarkdownDocument;
 use crate::model::projection::ProjectionMap;
 use crate::model::selection::Selection;
+use crate::model::style::StyleRun;
 
 /// 本地编辑在 `EditRequest.origin` 里的标记（会话用于排除后台变更）。
 const LOCAL_ORIGIN: &str = "local";
@@ -80,8 +107,15 @@ struct PreeditState {
 pub struct EditorController {
     snapshot: OpenSnapshot,
     mirror: Rope,
+    /// 最近一次 source 的 Markdown 扫描结果；source 变时重建。
+    markdown: MarkdownDocument,
     selection: Selection,
+    /// 当前显示投影表；source 或 selection 变时重建。
     projection: ProjectionMap,
+    /// 当前投影下的语义样式区间；与 projection 同步重建。
+    style_runs: Vec<StyleRun>,
+    /// 块级语义（每行一个 run）；**只在 source 变化时重建**，selection 不影响。
+    block_runs: Vec<BlockRun>,
     preedit: Option<PreeditState>,
     next_command_seq: u64,
     pending: Option<CommandId>,
@@ -91,17 +125,24 @@ pub struct EditorController {
 }
 
 impl EditorController {
-    /// 用 `OpenSnapshot.markdown` 建立镜像与 identity 投影。
+    /// 用 `OpenSnapshot.markdown` 建立镜像、语义扫描、显示投影与样式区间。
     ///
     /// `markdown` 是 LF 归一后的真源，直接作为 source；本方法不做任何归一化。
     pub fn open(snapshot: OpenSnapshot) -> Result<Self, EditorError> {
-        let projection = ProjectionMap::identity(&snapshot.markdown)?;
+        let markdown = MarkdownDocument::parse(&snapshot.markdown)?;
+        let selection = Selection::default();
+        let projection = ProjectionMap::from_markdown(&markdown, selection);
+        let style_runs = markdown.style_runs(&projection);
+        let block_runs = markdown.block_runs()?;
         let mirror = Rope::from_str(&snapshot.markdown);
         Ok(Self {
             snapshot,
             mirror,
-            selection: Selection::default(),
+            markdown,
+            selection,
             projection,
+            style_runs,
+            block_runs,
             preedit: None,
             next_command_seq: 0,
             pending: None,
@@ -114,11 +155,18 @@ impl EditorController {
     ///
     /// 命令序号保持单调，避免新旧会话产生相同的 `command_id`。
     pub fn adopt_snapshot(&mut self, snapshot: OpenSnapshot) -> Result<(), EditorError> {
-        let projection = ProjectionMap::identity(&snapshot.markdown)?;
+        let markdown = MarkdownDocument::parse(&snapshot.markdown)?;
+        let selection = Selection::default();
+        let projection = ProjectionMap::from_markdown(&markdown, selection);
+        let style_runs = markdown.style_runs(&projection);
+        let block_runs = markdown.block_runs()?;
         self.mirror = Rope::from_str(&snapshot.markdown);
         self.snapshot = snapshot;
-        self.selection = Selection::default();
+        self.markdown = markdown;
+        self.selection = selection;
         self.projection = projection;
+        self.style_runs = style_runs;
+        self.block_runs = block_runs;
         self.preedit = None;
         self.pending = None;
         self.needs_resync = false;
@@ -174,10 +222,76 @@ impl EditorController {
         self.selection
     }
 
-    /// 当前 identity 投影表。
+    /// 当前显示投影表（source 或 selection 变时已重建）。
     #[must_use]
     pub fn projection(&self) -> &ProjectionMap {
         &self.projection
+    }
+
+    /// 当前投影下的语义样式区间（display 坐标，完整覆盖显示文本）。
+    ///
+    /// runs 与 `projection()` 同步重建：source 变（编辑/IME 提交/远端/undo/redo）
+    /// 或 selection 变（caret 进出构造）后都保持正确；无样式位置为
+    /// `StyleKind::Plain`。app 每帧直接借用，不重复计算。
+    #[must_use]
+    pub fn style_runs(&self) -> &[StyleRun] {
+        &self.style_runs
+    }
+
+    /// 块级语义区间（source 坐标，每行一个 run，完整覆盖 `[0, source_len)`）。
+    ///
+    /// **只在 source 变化时重建**：移动 caret / 改 selection 不会改变块级结构，
+    /// 缓存保持有效。标题级别只能通过本 API 获得（`level = Some(1..=6)`）；
+    /// 具体字号由 app 主题决定。
+    #[must_use]
+    pub fn block_runs(&self) -> &[BlockRun] {
+        &self.block_runs
+    }
+
+    /// 当前逻辑显示文本（Markdown 标记按当前 selection 隐藏/显现）。
+    ///
+    /// 与 `self.projection().display_text()` 同源；任何编辑 / 选择变更返回后都已同步。
+    #[must_use]
+    pub fn display_text(&self) -> Cow<'_, str> {
+        self.projection.display_text()
+    }
+
+    /// 当前逻辑显示长度（UTF-8 bytes，强类型 [`DisplayByte`]）。
+    ///
+    /// 注意：移动 caret 不改 source，但可能显现/隐藏构造，从而改变本值；
+    /// app 应据此决定是否重新排版。
+    #[must_use]
+    pub fn display_len(&self) -> DisplayByte {
+        self.projection.display_len()
+    }
+
+    /// source byte → display byte（偏置规则见 [`ProjectionMap`]）。
+    #[must_use]
+    pub fn source_to_display(&self, source: SourceByte) -> Option<DisplayByte> {
+        self.projection.display_byte_at_source(source)
+    }
+
+    /// display byte → source byte（偏置规则见 [`ProjectionMap`]）。
+    #[must_use]
+    pub fn display_to_source(&self, display: DisplayByte) -> Option<SourceByte> {
+        self.projection.source_byte_at_display(display)
+    }
+
+    /// 把当前 source 选区映射到 display 坐标，返回**有序**的 `(start, end)`。
+    ///
+    /// 两端按 [`ProjectionMap`] 的 source→display 偏置收敛；折叠选区返回空区间。
+    /// scalar 越界（理论上不会发生，selection 恒被校验）或换算失败时返回 `None`。
+    #[must_use]
+    pub fn selection_in_display(&self) -> Option<(DisplayByte, DisplayByte)> {
+        let source = self.markdown.source();
+        let start = self.selection.start().to_source_byte(source).ok()?;
+        let end = self.selection.end().to_source_byte(source).ok()?;
+        let start = self.projection.display_byte_at_source(start)?;
+        let end = self.projection.display_byte_at_source(end)?;
+        if start.get() > end.get() {
+            return None;
+        }
+        Some((start, end))
     }
 
     /// 在等确认的命令 ID（S1 单飞行）。
@@ -229,6 +343,8 @@ impl EditorController {
         self.check_scalar(selection.anchor())?;
         self.check_scalar(selection.head())?;
         self.selection = selection;
+        // 选择变 → 只重建投影（复用 MarkdownDocument）；caret 进出构造会改变隐藏集合。
+        self.refresh_projection();
         Ok(())
     }
 
@@ -258,6 +374,7 @@ impl EditorController {
             target
         };
         self.selection = Selection::new(anchor, target);
+        self.refresh_projection();
         Ok(())
     }
 
@@ -596,8 +713,12 @@ impl EditorController {
                 self.mirror.insert(start, &edit.replacement);
             }
         }
-        self.refresh_projection()?;
-        self.update_caret_after_edits(edits)
+        // 先更新 caret（依赖新文本的 scalar 长度），再按新 selection 重建投影；
+        // 两步都执行完再返回错误，避免 source 已变而投影仍停在旧文本。
+        let caret_result = self.update_caret_after_edits(edits);
+        let projection_result = self.refresh_markdown();
+        caret_result?;
+        projection_result
     }
 
     /// 光标落在最后一条编辑（`start` 最大）的替换文本之后，且要计入前面编辑的净位移。
@@ -630,10 +751,26 @@ impl EditorController {
         Ok(())
     }
 
-    fn refresh_projection(&mut self) -> Result<(), EditorError> {
+    /// source 变：全量重扫 Markdown + 按当前 selection 重建投影。
+    ///
+    /// v1 代价 O(source_len)；后续可增量重扫（见模块文档）。
+    fn refresh_markdown(&mut self) -> Result<(), EditorError> {
         let text = self.mirror.to_string();
-        self.projection = ProjectionMap::identity(&text)?;
+        self.markdown = MarkdownDocument::parse(&text).map_err(EditorError::Markdown)?;
+        // 块级语义只依赖 source：与投影一起在 source 变化时重建。
+        self.block_runs = self.markdown.block_runs()?;
+        self.refresh_projection();
         Ok(())
+    }
+
+    /// selection 变：复用已缓存的 MarkdownDocument，只重建投影与样式区间。
+    ///
+    /// 投影 / 样式构造都不会失败（选区非法时 `ProjectionMap::from_markdown`
+    /// 保守退回 identity）。
+    fn refresh_projection(&mut self) {
+        self.projection = ProjectionMap::from_markdown(&self.markdown, self.selection);
+        let style_runs = self.markdown.style_runs(&self.projection);
+        self.style_runs = style_runs;
     }
 
     fn apply_applied(&mut self, applied: Applied) -> Result<OutcomeEffect, EditorError> {
@@ -694,7 +831,7 @@ impl EditorController {
         self.selection = transform_selection(self.selection, at, end, inserted);
         // 组合基准已改变；S1 不猜测重映射，直接取消组合（不产生任何 ScalarEdit）。
         self.preedit = None;
-        self.refresh_projection()
+        self.refresh_markdown()
     }
 
     /// 计算相邻 grapheme 边界。

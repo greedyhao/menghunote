@@ -44,7 +44,7 @@ const DEACTIVATE_GUARD: std::time::Duration = std::time::Duration::from_millis(5
 /// 菜单刚打开后的"手势余波"窗口：这段时间内的遮罩点击不关菜单。
 const OPEN_GUARD: std::time::Duration = std::time::Duration::from_millis(100);
 /// `MENGHUNOTE_TRACE_MOUSE=1` 时才输出窗口级鼠标日志（排查输入链路用）。
-fn trace_mouse_enabled() -> bool {
+pub(crate) fn trace_mouse_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("MENGHUNOTE_TRACE_MOUSE").is_some_and(|v| v != "0"))
 }

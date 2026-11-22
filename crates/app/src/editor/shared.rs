@@ -16,20 +16,46 @@ use std::sync::Arc;
 use gpui::{px, Bounds, Font, IndentAdjustment, LineFragment, Pixels, Point, TextSystem};
 
 use super::geometry::EditorGeometry;
-use super::layout::{self, LayoutFrame};
+use super::layout::{self, LayoutFrame, LineMetric};
 
-/// 折行缓存：文本 / 折行宽度 / 行高都不变时直接复用上一帧结果。
+/// 一次折行请求（参数较多，收成结构体免得调用点一排位置参数看错顺序）。
+pub struct WrapRequest<'a> {
+    /// 布局文本（display）。
+    pub text: &'a str,
+    /// 折行宽度（像素）。
+    pub wrap_width: f32,
+    /// 缺省（正文）度量。
+    pub default_metric: LineMetric,
+    /// 逐源码行度量（块级语义给出）。
+    pub metrics: &'a [LineMetric],
+    /// 字体系统。
+    pub text_system: &'a Arc<TextSystem>,
+    /// 主字体。
+    pub font: &'a Font,
+    /// 正文字号。
+    pub font_size: Pixels,
+}
+
+/// 折行缓存：文本 / 折行宽度 / **逐行度量** 都不变时直接复用上一帧结果。
 #[derive(Default)]
 struct WrapCache {
     frame: Option<Rc<LayoutFrame>>,
 }
 
 impl WrapCache {
-    fn get(&self, text: &str, wrap_width: f32, line_height: f32) -> Option<Rc<LayoutFrame>> {
+    /// 缓存命中要求：文本、折行宽度、**逐行度量（字号/行高）** 都一致。
+    ///
+    /// 度量必须进键：标题换级（h1↔h2）或换主题都会改变字号，只按文本比对会复用
+    /// 旧度量，出现"文字变大但行高没变"这类错位。
+    fn get(&self, text: &str, wrap_width: f32, metrics: &[LineMetric]) -> Option<Rc<LayoutFrame>> {
         let frame = self.frame.as_ref()?;
         let hit = frame.text == text
             && (frame.wrap_width - wrap_width).abs() < 0.5
-            && (frame.line_height - line_height).abs() < 0.01;
+            && frame.metrics.len() == metrics.len()
+            && frame.metrics.iter().zip(metrics).all(|(a, b)| {
+                (a.font_size - b.font_size).abs() < 0.01
+                    && (a.line_height - b.line_height).abs() < 0.01
+            });
         hit.then(|| Rc::clone(frame))
     }
 }
@@ -61,16 +87,17 @@ impl EditorShared {
     /// 断行用 GPUI 的 `LineWrapper`：与 `Text` 元素同一套规则（字体回退、词边界、
     /// CJK 断行），因此"折行宽度"和"实际 shaping 宽度"来自同一个字体系统，
     /// 不需要自己按字符平均宽度估算。
-    pub fn frame(
-        &self,
-        text: &str,
-        wrap_width: f32,
-        line_height: f32,
-        text_system: &Arc<TextSystem>,
-        font: &Font,
-        font_size: Pixels,
-    ) -> Rc<LayoutFrame> {
-        if let Some(frame) = self.cache.borrow().get(text, wrap_width, line_height) {
+    pub fn frame(&self, request: WrapRequest<'_>) -> Rc<LayoutFrame> {
+        let WrapRequest {
+            text,
+            wrap_width,
+            default_metric,
+            metrics,
+            text_system,
+            font,
+            font_size,
+        } = request;
+        if let Some(frame) = self.cache.borrow().get(text, wrap_width, metrics) {
             return frame;
         }
 
@@ -88,7 +115,8 @@ impl EditorShared {
         let frame = Rc::new(layout::wrap_with(
             text,
             wrap_width,
-            line_height,
+            default_metric,
+            metrics,
             &mut boundaries,
         ));
         self.cache.borrow_mut().frame = Some(Rc::clone(&frame));

@@ -15,6 +15,7 @@
 //! 本切片只做 **S1 identity 投影**：`source_text()` 原样显示（`#` / `**` 不隐藏），
 //! 不隐藏标记、不做 IME、不改写文本。
 
+pub mod display_edit;
 pub mod element;
 pub mod geometry;
 pub mod glyph;

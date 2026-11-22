@@ -46,8 +46,8 @@ use gpui::{
     MouseDownEvent, Pixels, Render, SharedString, Window,
 };
 use menghunote_editor::{
-    EditorController, EditorError, GraphemeStep, InputDocument, Selection, SourceByte,
-    UnicodeScalar,
+    DisplayByte, EditorController, EditorError, GraphemeStep, InputDocument, Selection, SourceByte,
+    StyleKind, UnicodeScalar,
 };
 use menghunote_storage::session::{
     CloseReport, DriverEvent, EditOutcome, EditRequest, LiveDelta, RejectReason, SessionDriver,
@@ -216,6 +216,88 @@ impl EditorView {
         self.controller.source_text()
     }
 
+    /// 布局用文本：**display**（Markdown 标记按当前 selection 隐藏/显现）。
+    pub(crate) fn display_text(&self) -> String {
+        self.controller.display_text().into_owned()
+    }
+
+    /// 逐**源码行**的度量（字号/行高/是否等宽），来自块级语义 `block_runs()`。
+    ///
+    /// 标题按 level 放大，围栏代码块用等宽字体，其余正文默认。
+    pub(crate) fn block_metrics(&self) -> Vec<super::layout::LineMetric> {
+        use menghunote_editor::BlockKind;
+        self.controller
+            .block_runs()
+            .iter()
+            .map(|run| match run.kind() {
+                BlockKind::Heading => {
+                    let level = run.level().unwrap_or(1);
+                    let font_size = theme::heading_font_size(level);
+                    super::layout::LineMetric {
+                        font_size,
+                        line_height: theme::line_height_for(font_size),
+                        mono: false,
+                    }
+                }
+                BlockKind::FencedCode => super::layout::LineMetric {
+                    font_size: theme::FONT_SIZE,
+                    line_height: theme::DEFAULT_LINE_HEIGHT,
+                    mono: true,
+                },
+                BlockKind::BlockQuote | BlockKind::ListItem | BlockKind::Paragraph => {
+                    super::layout::LineMetric::body()
+                }
+            })
+            .collect()
+    }
+
+    /// 本帧的语义样式段（display 字节区间，完整覆盖全文）。
+    pub(crate) fn style_runs_display(&self) -> Vec<(std::ops::Range<usize>, StyleKind)> {
+        self.controller
+            .style_runs()
+            .iter()
+            .map(|run| (run.start().get()..run.end().get(), run.kind()))
+            .collect()
+    }
+
+    /// 当前选区在 **display** 坐标下的字节区间（`None` = 换算失败，不画）。
+    pub(crate) fn selection_in_display_range(&self) -> Option<std::ops::Range<usize>> {
+        let (start, end) = self.controller.selection_in_display()?;
+        Some(start.get()..end.get())
+    }
+
+    /// 光标在 **display** 坐标下的字节位置。
+    pub(crate) fn display_caret(&self) -> Option<usize> {
+        let source = self.source_byte_of_scalar(self.controller.selection().head())?;
+        self.controller
+            .source_to_display(SourceByte::new(source))
+            .map(|display| display.get())
+    }
+
+    /// source scalar → source 字节。
+    fn source_byte_of_scalar(&self, scalar: UnicodeScalar) -> Option<usize> {
+        let text = self.controller.source_text();
+        scalar.to_source_byte(&text).ok().map(|byte| byte.get())
+    }
+
+    /// source scalar → display 字节（布局坐标系）。
+    fn display_byte_of_scalar(&self, scalar: UnicodeScalar) -> Option<usize> {
+        let source = self.source_byte_of_scalar(scalar)?;
+        self.controller
+            .source_to_display(SourceByte::new(source))
+            .map(|display| display.get())
+    }
+
+    /// display 字节（布局坐标系）→ source scalar。
+    fn scalar_at_display_byte(&self, display: usize) -> Option<UnicodeScalar> {
+        let source = self
+            .controller
+            .display_to_source(DisplayByte::new(display))?
+            .get();
+        let text = self.controller.source_text();
+        scalar_of_byte(&text, source)
+    }
+
     /// 当前 source selection。
     #[must_use]
     pub fn selection(&self) -> Selection {
@@ -307,15 +389,27 @@ impl EditorView {
     /// 左键按下：命中 → 落光标，并开始一次可能的拖拽。
     pub fn begin_pointer_selection(
         &mut self,
-        byte: usize,
+        display_byte: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 入参是**布局（display）字节**：先在 display 空间吸附 grapheme，
+        // 再经投影回到 source scalar（隐藏标记后 display 比 source 短）。
+        let display_byte = self.snap_display_byte(display_byte);
+        let Some(scalar) = self.scalar_at_display_byte(display_byte) else {
+            return;
+        };
         let text = self.controller.source_text();
-        let byte = self.snap_byte(byte, &text);
+        let byte = self.snap_byte(self.source_byte_of_scalar(scalar).unwrap_or(0), &text);
         let Some(scalar) = scalar_of_byte(&text, byte) else {
             return;
         };
+        if crate::shell::trace_mouse_enabled() {
+            eprintln!(
+                "[menghunote] 命中 display_byte={display_byte} → source_byte={byte} → scalar #{}",
+                scalar.get()
+            );
+        }
         self.drag_anchor = Some(scalar);
         self.preferred_x = None;
         window.focus(&self.focus_handle, cx);
@@ -324,13 +418,12 @@ impl EditorView {
     }
 
     /// 拖拽移动：anchor 保持，head 跟着鼠标。
-    pub fn extend_selection_to(&mut self, byte: usize, cx: &mut Context<Self>) {
+    pub fn extend_selection_to(&mut self, display_byte: usize, cx: &mut Context<Self>) {
         let Some(anchor) = self.drag_anchor else {
             return;
         };
-        let text = self.controller.source_text();
-        let byte = self.snap_byte(byte, &text);
-        let Some(head) = scalar_of_byte(&text, byte) else {
+        let display_byte = self.snap_display_byte(display_byte);
+        let Some(head) = self.scalar_at_display_byte(display_byte) else {
             return;
         };
         self.preferred_x = None;
@@ -441,18 +534,43 @@ impl EditorView {
         }
     }
 
-    /// 左右：按 **grapheme** 移动（由控制器实现，app 不重算 grapheme）。
+    /// 左右：按 **display** 上的 grapheme 移动（隐藏标记不参与落点）。
+    ///
+    /// 不能直接用控制器的 source 语义 `move_grapheme`：隐藏态下构造末尾按左键会一步
+    /// 落进 `**` 的两个 `*` 之间，把标记劈开。这里先在 display 上取相邻可见 grapheme，
+    /// 再映射回 source；映射失败就**保持原 caret**（不跳到 0）。
     fn move_grapheme(&mut self, step: GraphemeStep, extend: bool, cx: &mut Context<Self>) {
-        match self.controller.move_grapheme(step, extend) {
-            Ok(()) => {
-                self.preferred_x = None;
-                let selection = self.controller.selection();
-                self.ensure_caret_visible(selection.head());
-                self.log_caret(selection);
-                cx.notify();
-            }
-            Err(error) => eprintln!("[menghunote] 光标移动失败：{error}"),
+        if self.is_composing() {
+            self.cancel_composition(cx);
         }
+        let anchor = self.controller.selection().anchor();
+        let display = self.display_text();
+        let Some(caret) = self.display_caret() else {
+            return;
+        };
+        // 已在构造内部（标记可见）时 display 里就含标记，按 display 走即会正常经过 `*`。
+        let Some(target) = super::display_edit::step_target(&display, caret, step) else {
+            return; // 文档边界：保持原 caret
+        };
+        let Some(scalar) = self.scalar_at_display_byte(target) else {
+            eprintln!("[menghunote] 光标移动：display {target} 映射不到 source，保持原 caret");
+            return;
+        };
+        if crate::shell::trace_mouse_enabled() {
+            eprintln!(
+                "[menghunote] 左右移动：display {caret} → {target} → scalar #{}",
+                scalar.get()
+            );
+        }
+        let next = if extend {
+            Selection::new(anchor, scalar)
+        } else {
+            Selection::caret(scalar)
+        };
+        self.preferred_x = None;
+        self.ensure_caret_visible(scalar);
+        self.log_caret(next);
+        self.commit_selection(next, cx);
     }
 
     /// 上下：按**视觉行**移动，并尽量保持视觉列（`preferred_x`）。
@@ -460,9 +578,8 @@ impl EditorView {
         let Some(geometry) = self.shared.geometry() else {
             return;
         };
-        let text = self.controller.source_text();
         let selection = self.controller.selection();
-        let Some(head_byte) = source_byte_of(&text, selection.head()) else {
+        let Some(head_byte) = self.display_byte_of_scalar(selection.head()) else {
             return;
         };
         let frame = &geometry.frame;
@@ -473,7 +590,9 @@ impl EditorView {
         let last_row = frame.row_count().saturating_sub(1);
         let target_row = super::layout::vertical_target(row, delta, last_row);
         let target_byte = self.byte_at_row_x(frame, target_row, x, window);
-        let Some(target) = scalar_of_byte(&text, frame.snap_byte_to_grapheme(target_byte)) else {
+        let target_byte = frame.snap_byte_to_grapheme(target_byte);
+        let Some(target) = self.scalar_at_display_byte(target_byte) else {
+            eprintln!("[menghunote] 上下移动：display {target_byte} 映射不到 source，保持原 caret");
             return;
         };
         self.preferred_x = Some(x);
@@ -495,7 +614,13 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let rows = self.shared.geometry().map_or(1, |geometry| {
-            super::layout::rows_per_page(geometry.viewport_height, theme::LINE_HEIGHT)
+            super::layout::rows_per_page_mixed(
+                &geometry.frame,
+                geometry
+                    .frame
+                    .row_top_offset(geometry.frame.row_at_y(geometry.scroll_y)),
+                geometry.viewport_height,
+            )
         });
         self.move_rows(if forward { rows } else { -rows }, extend, window, cx);
     }
@@ -512,15 +637,15 @@ impl EditorView {
         let Some(geometry) = self.shared.geometry() else {
             return;
         };
-        let text = self.controller.source_text();
         let selection = self.controller.selection();
-        let Some(head_byte) = source_byte_of(&text, selection.head()) else {
+        let Some(head_byte) = self.display_byte_of_scalar(selection.head()) else {
             return;
         };
         let row = geometry.frame.row_of_byte(head_byte);
         let bytes = geometry.frame.row_bytes(row);
         let target_byte = if to_end { bytes.end } else { bytes.start };
-        let Some(target) = scalar_of_byte(&text, geometry.frame.snap_byte_to_grapheme(target_byte))
+        let Some(target) =
+            self.scalar_at_display_byte(geometry.frame.snap_byte_to_grapheme(target_byte))
         else {
             return;
         };
@@ -603,6 +728,31 @@ impl EditorView {
         cx.notify();
     }
 
+    /// 本次删除在 **source** 坐标下的最小区间（display 取相邻可见 grapheme）。
+    ///
+    /// 有选区时删选区；否则按方向取显示上相邻的一个 grapheme。跨构造的选区会把
+    /// 段内标记一起删掉——这是允许的（用户显式选中的是真实文本）。
+    fn display_delete_source_range(
+        &mut self,
+        step: GraphemeStep,
+    ) -> Option<menghunote_editor::SourceRange> {
+        let projection = self.controller.projection();
+        let (start, end) = match self.controller.selection_in_display() {
+            Some((start, end)) if start != end => (start.get(), end.get()),
+            _ => {
+                let display = self.display_text();
+                let caret = self.display_caret()?;
+                let range = match step {
+                    GraphemeStep::Backward => super::display_edit::grapheme_before(&display, caret),
+                    GraphemeStep::Forward => super::display_edit::grapheme_after(&display, caret),
+                }?;
+                let range = super::display_edit::non_empty(range)?;
+                (range.start, range.end)
+            }
+        };
+        projection.source_range_of_display_range(DisplayByte::new(start)..DisplayByte::new(end))
+    }
+
     /// 退格 / Delete：走与普通输入**完全相同**的一条路径。
     ///
     /// 删哪一段由 [`EditorController::delete_backward`] / [`EditorController::delete_forward`]
@@ -614,10 +764,43 @@ impl EditorView {
         if self.is_composing() {
             self.cancel_composition(cx);
         }
-        let outcome = match step {
-            GraphemeStep::Backward => self.controller.delete_backward(),
-            GraphemeStep::Forward => self.controller.delete_forward(),
+        // 先按 **display** 定位要删的那一段，再映射回 source 最小区间。
+        // 直接走 source 的 `delete_*` 会在构造边界啃掉隐藏标记（S2-5 的 bug）。
+        let Some(source_range) = self.display_delete_source_range(step) else {
+            eprintln!(
+                "[menghunote] 删除（{step:?}）：display 上无可删单元（边界 / 空区间），不产生请求"
+            );
+            cx.notify();
+            return;
         };
+        // 把目标区间设成选区：控制器"有选区删选区"的那条路径会精确删掉它，
+        // 不需要 app 自己拼 `ScalarEdit`。
+        let text = self.controller.source_text();
+        let start = SourceByte::new(source_range.start().get()).to_scalar(&text);
+        let end = SourceByte::new(source_range.end().get()).to_scalar(&text);
+        let (Ok(start), Ok(end)) = (start, end) else {
+            eprintln!("[menghunote] 删除（{step:?}）：源区间换算 scalar 失败，放弃本次删除");
+            cx.notify();
+            return;
+        };
+        if start == end {
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.controller.set_selection(Selection::new(start, end)) {
+            eprintln!("[menghunote] 删除（{step:?}）：设置待删选区失败：{error}");
+            cx.notify();
+            return;
+        }
+        let deleted = text
+            .get(source_range.start().get()..source_range.end().get())
+            .unwrap_or("")
+            .to_owned();
+        eprintln!(
+            "[menghunote] 删除（{step:?}）：source {:?} → 删掉 {deleted:?}",
+            source_range
+        );
+        let outcome = self.controller.delete_backward();
         match outcome {
             Ok(Some(request)) => {
                 // 日志里带上 EditRequest 的形状：一次删除永远只有 1 个 ScalarEdit
@@ -881,14 +1064,28 @@ impl EditorView {
     ) -> Option<gpui::Point<Pixels>> {
         let geometry = self.shared.geometry()?;
         let frame = &geometry.frame;
-        let row = frame.row_of_byte(byte.min(frame.text.len()));
+        // 入参是 source 字节；布局是 display，所以先映射再定位。
+        let byte = self
+            .controller
+            .source_to_display(SourceByte::new(byte))?
+            .get()
+            .min(frame.text.len());
+        let row = frame.row_of_byte(byte);
         let bytes = frame.row_bytes(row);
         let offset = byte.saturating_sub(bytes.start).min(bytes.len());
         let slice = &frame.text[bytes];
         let local_x = if slice.is_empty() {
             px(0.0)
         } else {
-            super::glyph::shape_row(window, slice).x_for_index(offset)
+            let spans = geometry.spans_for_row(row);
+            super::glyph::shape_row_styled_at(
+                window,
+                slice,
+                &spans,
+                geometry.frame.row_font_size(row),
+                geometry.frame.lines[row].mono,
+            )
+            .x_for_index(offset)
         };
         Some(gpui::point(
             geometry.text_left() + local_x,
@@ -898,7 +1095,18 @@ impl EditorView {
 
     /// 窗口坐标 → 源码字节（几何命中，与本切片点击一致）。
     pub(crate) fn source_byte_at_point(&self, position: gpui::Point<Pixels>) -> Option<usize> {
-        Some(self.shared.geometry()?.byte_at(position))
+        let display = self.shared.geometry()?.byte_at(position);
+        self.controller
+            .display_to_source(DisplayByte::new(display))
+            .map(|source| source.get())
+    }
+
+    /// 在 **display** 空间把字节吸附到 grapheme 边界（折行表里有现成边界）。
+    fn snap_display_byte(&self, byte: usize) -> usize {
+        match self.shared.geometry() {
+            Some(geometry) => geometry.frame.snap_byte_to_grapheme(byte),
+            None => byte,
+        }
     }
 
     /// 源码字节 → 虚拟输入文档的 UTF-16 序号。
@@ -955,14 +1163,13 @@ impl EditorView {
         let Some(geometry) = self.shared.geometry() else {
             return;
         };
-        let text = self.controller.source_text();
-        let Ok(byte) = selection.head().to_source_byte(&text) else {
+        let Some(byte) = self.display_byte_of_scalar(selection.head()) else {
             return;
         };
         eprintln!(
             "[menghunote] 光标 scalar #{} → 视觉行 {}（选区 {}..{}）",
             selection.head().get(),
-            geometry.frame.row_of_byte(byte.get()),
+            geometry.frame.row_of_byte(byte),
             selection.start().get(),
             selection.end().get()
         );
@@ -973,15 +1180,15 @@ impl EditorView {
         let Some(geometry) = self.shared.geometry() else {
             return;
         };
-        let text = self.controller.source_text();
-        let Some(byte) = source_byte_of(&text, head) else {
+        let Some(byte) = self.display_byte_of_scalar(head) else {
             return;
         };
         let row = geometry.frame.row_of_byte(byte);
-        self.scroll_y = super::layout::scroll_to_reveal(
+        // 行高逐行不同：用该行自己的行顶/行高做最小滚动。
+        self.scroll_y = super::layout::scroll_to_reveal_range(
             self.scroll_y,
-            row,
-            theme::LINE_HEIGHT,
+            geometry.frame.row_top_offset(row),
+            geometry.frame.row_height(row),
             geometry.viewport_height,
         );
         self.clamp_scroll();
@@ -1017,7 +1224,9 @@ impl EditorView {
         if slice.is_empty() {
             return bytes.start;
         }
-        let shaped = super::glyph::shape_row(window, slice);
+        let spans = self.spans_for_row(row);
+        let (font_size, mono) = self.row_metrics(row);
+        let shaped = super::glyph::shape_row_styled_at(window, slice, &spans, font_size, mono);
         let index = shaped.closest_index_for_x(x.max(px(0.0)));
         bytes.start + index.min(slice.len())
     }
@@ -1032,11 +1241,33 @@ impl EditorView {
     ) -> Pixels {
         let bytes = frame.row_bytes(row);
         let offset = byte.saturating_sub(bytes.start).min(bytes.len());
-        let slice = &frame.text[bytes];
+        let slice = &frame.text[bytes.clone()];
         if slice.is_empty() {
             return px(0.0);
         }
-        super::glyph::shape_row(window, slice).x_for_index(offset)
+        let spans = self.spans_for_row(row);
+        let (font_size, mono) = self.row_metrics(row);
+        super::glyph::shape_row_styled_at(window, slice, &spans, font_size, mono)
+            .x_for_index(offset)
+    }
+
+    /// 第 `row` 行的 `(字号, 是否等宽)`（来自上一帧几何；没有几何时用正文默认）。
+    fn row_metrics(&self, row: usize) -> (f32, bool) {
+        self.shared
+            .geometry()
+            .map_or((theme::FONT_SIZE, false), |geometry| {
+                (
+                    geometry.frame.row_font_size(row),
+                    geometry.frame.lines.get(row).is_some_and(|line| line.mono),
+                )
+            })
+    }
+
+    /// 第 `row` 行的样式分段（来自上一帧几何；没有几何时按纯文本处理）。
+    fn spans_for_row(&self, row: usize) -> Vec<(usize, StyleKind)> {
+        self.shared
+            .geometry()
+            .map_or_else(Vec::new, |geometry| geometry.spans_for_row(row))
     }
 
     /// 状态栏左侧文案：保存状态 / 光标 / 显示行数。
@@ -1134,11 +1365,6 @@ impl Render for EditorView {
                     .child(SharedString::from(HINT)),
             )
     }
-}
-
-/// scalar → 源码字节；失败返回 `None`（调用方只是跳过这次操作）。
-fn source_byte_of(text: &str, scalar: UnicodeScalar) -> Option<usize> {
-    scalar.to_source_byte(text).ok().map(|byte| byte.get())
 }
 
 /// 源码字节 → scalar；非 scalar 边界返回 `None`。

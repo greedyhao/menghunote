@@ -9,7 +9,7 @@
 #     不再固定 sleep。
 param(
     [string]$Exe = "target\debug\menghunote-app.exe",
-    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside")]
+    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside", "projection", "displayedit", "cursorkeys", "blockcaret")]
     [string]$Scenario = "menu",
     [string]$Screenshot = "",
     [int]$ReadyTimeoutMs = 15000,
@@ -169,14 +169,20 @@ function Save-Shot([string]$path) {
     [UiSmoke]::GetWindowRect($h, [ref]$rect) | Out-Null
     $w = $rect.Right - $rect.Left
     $hh = $rect.Bottom - $rect.Top
-    $bmp = New-Object System.Drawing.Bitmap($w, $hh)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $hdc = $g.GetHdc()
-    [UiSmoke]::PrintWindow($h, $hdc, 2) | Out-Null
-    $g.ReleaseHdc($hdc)
-    $g.Dispose()
-    $bmp.Save($path)
-    $bmp.Dispose()
+    # PrintWindow 可能拿到上一帧 surface：抓两次，用第二次的位图。
+    foreach ($pass in 1, 2) {
+        $bmp = New-Object System.Drawing.Bitmap($w, $hh)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $hdc = $g.GetHdc()
+        [UiSmoke]::PrintWindow($h, $hdc, 2) | Out-Null
+        $g.ReleaseHdc($hdc)
+        $g.Dispose()
+        if ($pass -eq 2) {
+            $bmp.Save($path)
+        }
+        $bmp.Dispose()
+        if ($pass -eq 1) { Start-Sleep -Milliseconds 250 }
+    }
     Write-Output "shot=$path"
 }
 
@@ -290,6 +296,75 @@ switch ($Scenario) {
         $clickWatch.Stop()
         if ($ms -lt 0) { Fail "点外部后没有提交" }
         Write-Output ("点外部→落库 用时 {0:N0}ms" -f $ms)
+    }
+    "projection" {
+        # 打开演示笔记后：点正文空白处（caret 离开标题/强调）→ 截图；再点进强调行 → 截图
+        LeftClick 60 1000
+        Start-Sleep -Milliseconds 600
+        PressKey 0x7B   # F12：dump 当前选区（用于核对 caret 落点）
+        Start-Sleep -Milliseconds 700
+        Save-Shot ($Screenshot -replace '\.png$', '-a-hidden.png')
+        # 再点进「**粗体** / `代码`」那一行，标记应显现
+        # 点进 `**粗体**` 内部（文字区左边界 ≈ 物理 351，粗体在 351..400）
+        LeftClick 362 138
+        Start-Sleep -Milliseconds 500
+        PressKey 0x7B
+        MoveTo 700 500          # 移动鼠标触发一次重绘，避免 PrintWindow 拿到旧帧
+        Start-Sleep -Milliseconds 900
+        Save-Shot ($Screenshot -replace '\.png$', '-b-shown.png')
+        Write-Output "projection shots ok"
+    }
+    "displayedit" {
+        # ① caret 停在「**粗体**」的"粗"之前 → Delete 应删"粗"而不是隐藏的 *
+        LeftClick 352 138
+        Start-Sleep -Milliseconds 400
+        PressKey 0x2E
+        Start-Sleep -Milliseconds 600
+        # ② 先点远处让标记隐藏，再把 caret 放到「粗体」在**隐藏态**的末尾
+        #    （此时刚过"体"的下一个可见字符是空格，不是 *）→ Delete 应删空格
+        LeftClick 60 1000
+        Start-Sleep -Milliseconds 400
+        LeftClick 404 138
+        Start-Sleep -Milliseconds 400
+        PressKey 0x2E
+        Start-Sleep -Milliseconds 600
+        # ③ 退格：caret 放在"斜体"之前 → 应删前一个可见字符而不是标记
+        LeftClick 352 178
+        Start-Sleep -Milliseconds 400
+        PressKey 0x08
+        Start-Sleep -Milliseconds 600
+        MoveTo 700 500
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-after.png')
+        Write-Output "displayedit ok"
+    }
+    "cursorkeys" {
+        # caret 放到构造之后（隐藏态），按左键应落在"体"之后而不是两个 * 之间
+        LeftClick 60 1000
+        Start-Sleep -Milliseconds 400
+        LeftClick 352 138          # 停在「粗」之前（隐藏态）
+        Start-Sleep -Milliseconds 400
+        PressKey 0x27              # Right：过"粗"
+        Start-Sleep -Milliseconds 300
+        PressKey 0x27              # Right：过"体" → 应在 ** 之前
+        Start-Sleep -Milliseconds 300
+        PressKey 0x27              # Right：跳过隐藏的 **，落到空格之后
+        Start-Sleep -Milliseconds 300
+        PressKey 0x25              # Left：回到"体"之后（不应回到 * 之间）
+        Start-Sleep -Milliseconds 600
+        MoveTo 700 500
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-keys.png')
+        Write-Output "cursorkeys ok"
+    }
+    "blockcaret" {
+        # 点标题行内部：caret 高度应与标题行高一致；同时验证命中不偏移
+        LeftClick 470 55
+        Start-Sleep -Milliseconds 600
+        MoveTo 700 500
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-title.png')
+        Write-Output "blockcaret ok"
     }
     "delete" {
         RightClick 90 60

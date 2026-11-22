@@ -1,23 +1,56 @@
 //! 逻辑显示投影（ADR 0002 §4）：每块一个 `Vec<Segment>`，**不用"偏移差"**。
 //!
-//! ## 本切片的范围
+//! ## 段模型
 //!
-//! S1 只承诺 **identity 投影**（source == display，不隐藏 Markdown 标记）：段表里
-//! 恒为一条 [`SegmentKind::Copy`]。但结构与查询都按 ADR 0002 §4 的最终形态实现——
-//! 源区间 / 显示 byte 区间 / kind / 边界 bias 都逐段记录，查询通过**段表定位**再
-//! 段内换算，绝不使用 `display = source + 常数偏移` 这类近似。
+//! - [`SegmentKind::Copy`]：可见段，source 与 display 逐字节相同（等宽）；
+//! - [`SegmentKind::Elide`]：省略段，source 非空、display 宽度为 0
+//!   （Markdown 标记被隐藏）；
+//! - `Replace` / `Object` 仍为后续切片预留，本层不生成，查询遇到时返回 `None`
+//!   （构造器 `from_segments` 也会拒绝它们）。
 //!
-//! `Elide` / `Replace` / `Object` 的段类型与构造器先预留（供 S2 使用）；S2 的
-//! 多对一映射语义（隐藏标记的边界 bias）尚未实现，查询命中这些段时返回
-//! [`ProjectionError::UnsupportedSegment`]，**不猜**。
+//! 段表**完整、有序、无重叠**地覆盖 `[0, source_len)`，且 display 区间连续；
+//! 查询一律先在段表里定位、再段内换算，绝不用"display = source + 常数偏移"。
 //!
-//! ADR 0002 §4 里段还记录"所属构造"（construct）：该字段要等 S2 的解析器一起
-//! 引入，S1 没有消费者，先不造空类型，只保留 kind / 边界 bias 两个维度。
+//! ## 偏置规则（写死，测试钉住）
+//!
+//! 多对一必然有歧义，这里明确选择：
+//!
+//! 1. **source → display**（[`ProjectionMap::display_byte_at_source`]）：
+//!    - source 落在 `Elide` 段**内部**（或正好在段首）→ 取该省略段的**起点**
+//!      （也就是左侧/Before，映射到隐藏内容之前的 display 位置）；
+//!    - source 正好在省略段**末尾**（下一可见段起点）→ 取下一可见段起点
+//!      （右侧/After，display 位置相同）；
+//!    - source == `source_len`（文档尾）→ display 末尾；
+//!    - 越界 → `None`（不静默返回 0）。
+//! 2. **display → source**（[`ProjectionMap::source_byte_at_display`]）：
+//!    - display 落在 `Copy` 段内部 → 段内线性换算；
+//!    - display 正好在"隐藏内容被抹掉"的接缝（前一可见段末尾 == 后一可见段开头）→
+//!      取**右侧**（After）：下一可见段的 source 起点；
+//!    - display == `display_len`（显示末尾端点）→ `source_len`（**定义**为文档尾）；
+//!    - 越界 → `None`。
+//! 3. **display 区间 → source 区间**（[`ProjectionMap::source_range_of_display_range`]）：
+//!    - 起点用 After 偏置、终点用 Before 偏置，得到**最小** source 区间：
+//!      只包含显示范围对应的可见文字，以及**严格位于其内部**的省略段；
+//!      两端紧邻的隐藏标记不包含；
+//!    - 空 display 区间 → 折叠到 After 偏置的 source 位置；
+//!    - 端点倒序 / 越界 → `None`。
+//!
+//! ## 可见性不变量
+//!
+//! display 串 = 所有 `Copy` 段 source 内容的拼接（用 [`ProjectionMap::display_text`]
+//! 直接取）；`Elide` 段不贡献任何 display 长度。可见位置满足
+//! display → source → display 往返一致（source → display 在省略段边界是多对一，
+//! 不承诺反解）。
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 
 use menghunote_text::{units, DisplayByte, SourceByte, SourceRange};
+
+use crate::model::markdown::MarkdownDocument;
+use crate::model::selection::Selection;
 
 /// 段类型（ADR 0002 §4 的最小集合）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,15 +59,15 @@ pub enum SegmentKind {
     Copy,
     /// source 非空、display 为空（隐藏的 Markdown 标记）。
     Elide,
-    /// 转义 / 换行显示替代等：display 文本与 source 不同。
+    /// 转义 / 换行显示替代等：display 文本与 source 不同（后续切片）。
     Replace,
-    /// widget / 图片等对象，对应完整源码范围。
+    /// widget / 图片等对象，对应完整源码范围（后续切片）。
     Object,
 }
 
 /// 多对一区间的边界取向（ADR 0002 §4：隐藏区间的内部点没有唯一逆像）。
 ///
-/// S1 的 identity 段一律 [`BoundaryBias::After`]；真正使用它的是 S2 的 Elide/Replace。
+/// `Copy` 段内部无歧义；只有省略段边界用它区分左右侧。规则见模块文档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BoundaryBias {
     /// 取靠前（左）一侧。
@@ -70,8 +103,6 @@ impl Segment {
     }
 
     /// 构造 Elide 段：source 非空、显示宽度为零。
-    ///
-    /// S1 不生成这种段（identity 没有隐藏），这里只为 S2 与结构测试预留。
     pub fn elide(source: SourceRange, display_at: DisplayByte) -> Result<Self, ProjectionError> {
         if source.is_empty() {
             return Err(ProjectionError::InvalidLayout(
@@ -111,7 +142,7 @@ impl Segment {
         self.kind
     }
 
-    /// 边界 bias（S2 使用）。
+    /// 边界 bias（历史预留字段；真实偏置规则见模块文档）。
     #[must_use]
     pub const fn bias(self) -> BoundaryBias {
         self.bias
@@ -126,42 +157,72 @@ impl Segment {
 
 /// 一段文本的投影表。
 ///
-/// 字段私有：只能经 [`ProjectionMap::identity`] / [`ProjectionMap::from_segments`]
-/// 构造，因此恒满足"段按 source 与 display 双向连续覆盖全文"的不变量。
+/// 字段私有：只能经 [`ProjectionMap::identity`] /
+/// [`ProjectionMap::from_markdown`] / [`ProjectionMap::from_segments`] 构造，
+/// 因此恒满足"段双向连续覆盖 + display 拼接一致"的不变量。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionMap {
     source_len: usize,
-    display_len: usize,
+    display_byte_len: usize,
+    /// 逻辑显示串（所有 Copy 段拼接；Elide 不出现）。缓存在这里供渲染直接借用。
+    display: String,
     segments: Vec<Segment>,
 }
 
 impl ProjectionMap {
-    /// S1 的 identity 投影：整篇一条 Copy 段（空文档零段）。
+    /// identity 投影：整篇一条 Copy 段（空文档零段）。
     pub fn identity(source: &str) -> Result<Self, ProjectionError> {
         let source_len = units::byte_len(source);
-        if source_len == 0 {
-            return Ok(Self {
-                source_len: 0,
-                display_len: 0,
-                segments: Vec::new(),
-            });
+        let mut segments = Vec::new();
+        if source_len > 0 {
+            let range =
+                SourceRange::within(source, SourceByte::new(0), SourceByte::new(source_len))
+                    .map_err(|_| {
+                        ProjectionError::InvalidLayout("identity 的 source 端点必须是 scalar 边界")
+                    })?;
+            segments.push(Segment::copy(range, DisplayByte::new(0))?);
         }
-        let range = SourceRange::within(source, SourceByte::new(0), SourceByte::new(source_len))
-            .map_err(|_| {
-                ProjectionError::InvalidLayout("identity 的 source 端点必须是 scalar 边界")
-            })?;
-        let segment = Segment::copy(range, DisplayByte::new(0))?;
-        Ok(Self {
-            source_len,
-            display_len: source_len,
-            segments: vec![segment],
-        })
+        Self::from_segments(source, segments)
     }
 
-    /// 由显式段表构造（S2 与结构测试用）。
+    /// **由 Markdown 语义扫描结果构造真实投影**（S2-2）。
+    ///
+    /// 隐藏区间来自 [`MarkdownDocument::hidden_ranges_for_selection`]：选区（含
+    /// 折叠 caret）相交/覆盖的构造会显现，其余构造的标记进入 `Elide` 段。
+    ///
+    /// 选区坐标非法（越界）时**保守地不隐藏任何内容**（等价 identity），
+    /// 不会 panic；需要显式错误的调用方可用 [`ProjectionMap::try_from_markdown`]。
+    #[must_use]
+    pub fn from_markdown(doc: &MarkdownDocument, selection: Selection) -> Self {
+        match Self::try_from_markdown(doc, selection) {
+            Ok(projection) => projection,
+            // 防御：正常选区下不可达（Markdown 隐藏区间必然在 source 内且有序）。
+            // 万一发生，退回 identity（宁可不隐藏，也不隐藏错误内容）。
+            Err(_) => Self::identity(doc.source()).unwrap_or_else(|_| Self {
+                source_len: doc.source_len(),
+                display_byte_len: 0,
+                display: String::new(),
+                segments: Vec::new(),
+            }),
+        }
+    }
+
+    /// 严格版本：选区坐标非法或隐藏区间布局异常时返回错误。
+    pub fn try_from_markdown(
+        doc: &MarkdownDocument,
+        selection: Selection,
+    ) -> Result<Self, ProjectionError> {
+        let hidden = doc
+            .hidden_ranges_for_selection(selection)
+            .map_err(|_| ProjectionError::InvalidLayout("选区坐标无法换算到 source byte"))?;
+        Self::project(doc.source(), &hidden)
+    }
+
+    /// 由显式段表构造（结构测试 / 后续 Replace 用）。
     ///
     /// 校验：段按 source 与 display 都从 0 起连续覆盖；Copy 段两侧宽度相等；
-    /// 端点落在 scalar 边界；空文档只允许空段表。
+    /// Elide 段 display 宽度为零；端点落在 scalar 边界；空文档只允许空段表。
+    /// 本层只接受 `Copy` / `Elide`（`Replace` / `Object` 尚未实现）。
     pub fn from_segments(source: &str, segments: Vec<Segment>) -> Result<Self, ProjectionError> {
         let source_len = units::byte_len(source);
         if source_len == 0 && !segments.is_empty() {
@@ -170,6 +231,8 @@ impl ProjectionMap {
 
         let mut source_cursor = 0usize;
         let mut display_cursor = 0usize;
+        let mut display = String::new();
+
         for segment in &segments {
             if segment.source.start().get() != source_cursor {
                 return Err(ProjectionError::InvalidLayout(
@@ -184,15 +247,29 @@ impl ProjectionMap {
             units::check_scalar_boundary(source, segment.source.end().get())
                 .map_err(|_| ProjectionError::InvalidLayout("source 段终点不在 scalar 边界上"))?;
 
-            if segment.kind == SegmentKind::Copy && segment.source.len() != segment.display_len() {
-                return Err(ProjectionError::InvalidLayout(
-                    "Copy 段的 source / display 宽度必须相等",
-                ));
-            }
-            if segment.kind == SegmentKind::Elide && segment.display_len() != 0 {
-                return Err(ProjectionError::InvalidLayout(
-                    "Elide 段的 display 宽度必须为零",
-                ));
+            match segment.kind {
+                SegmentKind::Copy => {
+                    if segment.source.len() != segment.display_len() {
+                        return Err(ProjectionError::InvalidLayout(
+                            "Copy 段的 source / display 宽度必须相等",
+                        ));
+                    }
+                    display.push_str(
+                        &source[segment.source.start().get()..segment.source.end().get()],
+                    );
+                }
+                SegmentKind::Elide => {
+                    if segment.display_len() != 0 {
+                        return Err(ProjectionError::InvalidLayout(
+                            "Elide 段的 display 宽度必须为零",
+                        ));
+                    }
+                }
+                SegmentKind::Replace | SegmentKind::Object => {
+                    return Err(ProjectionError::InvalidLayout(
+                        "本层只支持 Copy / Elide 段（Replace / Object 尚未实现）",
+                    ));
+                }
             }
 
             source_cursor = segment.source.end().get();
@@ -202,11 +279,61 @@ impl ProjectionMap {
         if source_cursor != source_len {
             return Err(ProjectionError::InvalidLayout("段表未完整覆盖 source"));
         }
+        if display.len() != display_cursor {
+            return Err(ProjectionError::InvalidLayout(
+                "display 拼接长度与段表游标不一致",
+            ));
+        }
         Ok(Self {
             source_len,
-            display_len: display_cursor,
+            display_byte_len: display_cursor,
+            display,
             segments,
         })
+    }
+
+    /// 由 source + 隐藏区间构造段表；隐藏区间必须有序、非空、在 source 内。
+    fn project(source: &str, hidden: &[SourceRange]) -> Result<Self, ProjectionError> {
+        let source_len = units::byte_len(source);
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut source_cursor = 0usize;
+        let mut display_cursor = 0usize;
+
+        for range in hidden {
+            let start = range.start().get();
+            let end = range.end().get();
+            if start < source_cursor || start >= end || end > source_len {
+                return Err(ProjectionError::InvalidLayout(
+                    "隐藏区间必须有序、非空、互不重叠且在 source 范围内",
+                ));
+            }
+            if start > source_cursor {
+                let visible = Self::source_range(source, source_cursor, start)?;
+                let segment = Segment::copy(visible, DisplayByte::new(display_cursor))?;
+                display_cursor = segment.display_end().get();
+                segments.push(segment);
+            }
+            let elided = Self::source_range(source, start, end)?;
+            segments.push(Segment::elide(elided, DisplayByte::new(display_cursor))?);
+            source_cursor = end;
+        }
+
+        if source_cursor < source_len {
+            let visible = Self::source_range(source, source_cursor, source_len)?;
+            let segment = Segment::copy(visible, DisplayByte::new(display_cursor))?;
+            segments.push(segment);
+        }
+
+        Self::from_segments(source, segments)
+    }
+
+    fn source_range(
+        source: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<SourceRange, ProjectionError> {
+        SourceRange::within(source, SourceByte::new(start), SourceByte::new(end))
+            .map_err(|_| ProjectionError::InvalidLayout("投影段端点不在 scalar 边界上"))
     }
 
     /// source 长度（UTF-8 bytes）。
@@ -215,10 +342,18 @@ impl ProjectionMap {
         self.source_len
     }
 
-    /// 逻辑显示串长度（UTF-8 bytes）。
+    /// 逻辑显示串长度，强类型 [`DisplayByte`]。
     #[must_use]
-    pub const fn display_len(&self) -> usize {
-        self.display_len
+    pub const fn display_len(&self) -> DisplayByte {
+        DisplayByte::new(self.display_byte_len)
+    }
+
+    /// 逻辑显示串（省略段不出现）。
+    ///
+    /// 直接借用内部缓存，渲染层无需重新拼接。
+    #[must_use]
+    pub fn display_text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.display.as_str())
     }
 
     /// 段表（只读）。
@@ -237,74 +372,138 @@ impl ProjectionMap {
         })
     }
 
-    /// source byte → 逻辑显示 byte。
+    /// source byte → 逻辑显示 byte（Option 版）。
     ///
-    /// 先在**段表**里二分定位，再在段内换算；不使用整篇偏移差。
-    pub fn display_byte(&self, source: SourceByte) -> Result<DisplayByte, ProjectionError> {
+    /// 偏置规则见模块文档：省略段内部取段起点；文档尾取 display 末尾；越界 `None`。
+    #[must_use]
+    pub fn display_byte_at_source(&self, source: SourceByte) -> Option<DisplayByte> {
         let at = source.get();
         if at > self.source_len {
-            return Err(ProjectionError::SourceByteOutOfBounds {
-                offset: at,
-                len: self.source_len,
-            });
+            return None;
         }
-        // 空文档（零段）唯一合法点。
-        if self.segments.is_empty() {
-            return Ok(DisplayByte::new(0));
-        }
-        // 尾边界直接取最后一段的 display_end（避免把"文档末尾"误当成段内点）。
         if at == self.source_len {
-            let last = self.segments.last();
-            return Ok(last.map_or(DisplayByte::new(0), |segment| segment.display_end()));
+            return Some(DisplayByte::new(self.display_byte_len));
         }
-
+        if self.segments.is_empty() {
+            // 空文档只有 (0, 0) 一个点。
+            return Some(DisplayByte::new(0));
+        }
         let index = self
             .segments
             .partition_point(|segment| segment.source.start().get() <= at);
-        let segment = index
-            .checked_sub(1)
-            .and_then(|index| self.segments.get(index))
-            .ok_or(ProjectionError::InvalidLayout("source 点没有落在任何段内"))?;
+        let segment = self.segments.get(index.checked_sub(1)?)?;
         match segment.kind {
-            SegmentKind::Copy => {
-                let offset = at - segment.source.start().get();
-                Ok(DisplayByte::new(segment.display_start().get() + offset))
-            }
-            other => Err(ProjectionError::UnsupportedSegment(other)),
+            SegmentKind::Copy => Some(DisplayByte::new(
+                segment.display_start().get() + (at - segment.source.start().get()),
+            )),
+            // 省略段内部（含段首）：Before 偏置 → 段起点对应的 display 位置。
+            SegmentKind::Elide => Some(segment.display_start()),
+            _ => None,
         }
     }
 
-    /// 逻辑显示 byte → source byte。
-    pub fn source_byte(&self, display: DisplayByte) -> Result<SourceByte, ProjectionError> {
+    /// 逻辑显示 byte → source byte（Option 版）。
+    ///
+    /// 接缝处取右侧（After）；`display_len` 端点定义为 `source_len`；越界 `None`。
+    #[must_use]
+    pub fn source_byte_at_display(&self, display: DisplayByte) -> Option<SourceByte> {
         let at = display.get();
-        if at > self.display_len {
-            return Err(ProjectionError::DisplayByteOutOfBounds {
-                offset: at,
-                len: self.display_len,
-            });
+        if at > self.display_byte_len {
+            return None;
+        }
+        if at == self.display_byte_len {
+            return Some(SourceByte::new(self.source_len));
         }
         if self.segments.is_empty() {
-            return Ok(SourceByte::new(0));
+            return Some(SourceByte::new(0));
         }
-        if at == self.display_len {
-            let last = self.segments.last();
-            return Ok(last.map_or(SourceByte::new(0), |segment| segment.source.end()));
-        }
-
         let index = self
             .segments
             .partition_point(|segment| segment.display_start().get() <= at);
-        let segment = index
-            .checked_sub(1)
-            .and_then(|index| self.segments.get(index))
-            .ok_or(ProjectionError::InvalidLayout("display 点没有落在任何段内"))?;
+        let segment = self.segments.get(index.checked_sub(1)?)?;
+        match segment.kind {
+            SegmentKind::Copy => Some(SourceByte::new(
+                segment.source.start().get() + (at - segment.display_start().get()),
+            )),
+            // 只有尾部零宽段会走到这里；保守取段起点（正常不可达）。
+            SegmentKind::Elide => Some(segment.source.start()),
+            _ => None,
+        }
+    }
+
+    /// display 区间的**左端**在 source 上的位置（Before 偏置）。
+    fn source_byte_before_display(&self, at: usize) -> Option<SourceByte> {
+        let at = at.min(self.display_byte_len);
+        if at == 0 {
+            return Some(SourceByte::new(0));
+        }
+        if self.segments.is_empty() {
+            return None;
+        }
+        if at == self.display_byte_len {
+            // 末尾端点：取最后一个可见段末尾（不吞掉尾部隐藏标记）。
+            return self
+                .segments
+                .iter()
+                .rev()
+                .find(|segment| segment.kind == SegmentKind::Copy)
+                .map(|segment| segment.source.end())
+                .or_else(|| Some(SourceByte::new(0)));
+        }
+        // 第一个 display_end > at 的段。
+        let index = self
+            .segments
+            .partition_point(|segment| segment.display_end().get() <= at);
+        let segment = self.segments.get(index)?;
         match segment.kind {
             SegmentKind::Copy => {
-                let offset = at - segment.display_start().get();
-                Ok(SourceByte::new(segment.source.start().get() + offset))
+                if at <= segment.display_start().get() {
+                    // 接缝：取前一个可见段的末尾。
+                    self.segments[..index]
+                        .iter()
+                        .rev()
+                        .find(|previous| previous.kind == SegmentKind::Copy)
+                        .map(|previous| previous.source.end())
+                        .or_else(|| Some(SourceByte::new(0)))
+                } else {
+                    Some(SourceByte::new(
+                        segment.source.start().get() + (at - segment.display_start().get()),
+                    ))
+                }
             }
-            other => Err(ProjectionError::UnsupportedSegment(other)),
+            _ => self.segments[index..]
+                .iter()
+                .find(|next| next.kind == SegmentKind::Copy)
+                .map(|next| next.source.start()),
         }
+    }
+
+    /// display 区间 → 最小 source 区间。
+    ///
+    /// 起点用 After 偏置、终点用 Before 偏置：严格位于区间内部的省略段会被包含，
+    /// 两端紧邻的隐藏标记不包含。空区间折叠为 After 偏置的 source 点；端点倒序 /
+    /// 越界返回 `None`。
+    #[must_use]
+    pub fn source_range_of_display_range(&self, range: Range<DisplayByte>) -> Option<SourceRange> {
+        let start_at = range.start.get();
+        let end_at = range.end.get();
+        if start_at > end_at || end_at > self.display_byte_len {
+            return None;
+        }
+        if start_at == end_at {
+            let at = if start_at == self.display_byte_len {
+                SourceByte::new(self.source_len)
+            } else {
+                self.source_byte_at_display(DisplayByte::new(start_at))?
+            };
+            return SourceRange::new(at, at, self.source_len).ok();
+        }
+        let start = self.source_byte_at_display(DisplayByte::new(start_at))?;
+        let end = self.source_byte_before_display(end_at)?;
+        if start.get() > end.get() {
+            return None;
+        }
+        SourceRange::new(start, end, self.source_len).ok()
     }
 }
 
@@ -315,7 +514,7 @@ pub enum ProjectionError {
     SourceByteOutOfBounds { offset: usize, len: usize },
     /// 逻辑显示 byte 越界。
     DisplayByteOutOfBounds { offset: usize, len: usize },
-    /// 该段类型需要 S2 的多对一语义，S1 拒绝猜测。
+    /// 该段类型需要尚未实现的语义，拒绝猜测。
     UnsupportedSegment(SegmentKind),
     /// 段表布局不合法（构造期校验）。
     InvalidLayout(&'static str),
@@ -333,7 +532,7 @@ impl fmt::Display for ProjectionError {
                 write!(f, "display byte {offset} 越界（display 长度 {len}）")
             }
             Self::UnsupportedSegment(kind) => {
-                write!(f, "{kind:?} 段的多对一映射属于 S2，S1 不做猜测")
+                write!(f, "{kind:?} 段的映射尚未实现，拒绝猜测")
             }
             Self::InvalidLayout(reason) => write!(f, "投影段表布局非法：{reason}"),
             Self::Overflow => write!(f, "投影偏移相加溢出"),

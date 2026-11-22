@@ -24,7 +24,7 @@ use menghunote_editor::units;
 pub const MIN_WRAP_WIDTH: f32 = 64.0;
 
 /// 一个视觉行：源码字节区间 + 它属于哪一条源码行。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VisualLine {
     /// 源码行序号（按 `\n` 切分，0 起）。
     pub source_line: usize,
@@ -32,6 +32,12 @@ pub struct VisualLine {
     pub row_in_line: usize,
     /// 该视觉行显示的源码字节区间（**不含**行尾换行符）。
     pub bytes: Range<usize>,
+    /// 该视觉行的字号（像素）——标题更大、正文默认。
+    pub font_size: f32,
+    /// 该视觉行的行高（像素），由字号算出；**行高逐行可变**。
+    pub line_height: f32,
+    /// 该行是否用等宽字体（围栏代码块）。
+    pub mono: bool,
 }
 
 impl VisualLine {
@@ -40,6 +46,55 @@ impl VisualLine {
     pub fn is_empty_line(&self) -> bool {
         self.bytes.is_empty()
     }
+}
+
+/// 一条源码行的度量（字号 + 行高），由块级语义决定。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineMetric {
+    /// 该行字号（像素）。
+    pub font_size: f32,
+    /// 该行行高（像素）。
+    pub line_height: f32,
+    /// 是否用等宽字体（围栏代码块）。
+    pub mono: bool,
+}
+
+impl LineMetric {
+    /// 正文默认度量。
+    #[must_use]
+    pub fn body() -> Self {
+        Self {
+            font_size: super::theme::FONT_SIZE,
+            line_height: super::theme::DEFAULT_LINE_HEIGHT,
+            mono: false,
+        }
+    }
+
+    /// 按字号构造（行高按主题系数换算）。
+    #[must_use]
+    pub fn with_font_size(font_size: f32) -> Self {
+        Self {
+            font_size,
+            line_height: super::theme::line_height_for(font_size),
+            mono: false,
+        }
+    }
+}
+
+/// 按行高累加出行顶偏移，并给出内容总高度（**纯函数**，可无窗口单测）。
+#[must_use]
+pub fn accumulate_row_tops(heights: &[f32]) -> (Vec<f32>, f32) {
+    let mut tops = Vec::with_capacity(heights.len());
+    let mut acc = 0.0_f32;
+    for height in heights {
+        tops.push(acc);
+        acc += if height.is_finite() && *height > 0.0 {
+            *height
+        } else {
+            1.0
+        };
+    }
+    (tops, acc)
 }
 
 /// 一整篇文档的折行结果（可整帧缓存）。
@@ -51,10 +106,16 @@ pub struct LayoutFrame {
     pub lines: Vec<VisualLine>,
     /// 全文 grapheme 起始字节（升序，含 `0` 与 `text.len()`）。
     pub graphemes: Vec<usize>,
-    /// 固定行高（像素）。
-    pub line_height: f32,
+    /// 每行顶部的累计偏移（像素，长度 = `lines.len()`；`row_tops[0] == 0`）。
+    ///
+    /// 行高逐行不同，所以行顶**必须累加**，不能再用 `行号 × 行高`。
+    pub row_tops: Vec<f32>,
+    /// 内容总高度（像素）。
+    pub content_height: f32,
     /// 折行宽度（像素），用于缓存命中判断。
     pub wrap_width: f32,
+    /// 本次折行用的逐行度量（缓存键的一部分：换级/换主题必须重排）。
+    pub metrics: Vec<LineMetric>,
 }
 
 impl LayoutFrame {
@@ -67,7 +128,28 @@ impl LayoutFrame {
     /// 文档内容总高度（像素）。
     #[must_use]
     pub fn content_height(&self) -> f32 {
-        self.row_count() as f32 * self.line_height
+        self.content_height
+    }
+
+    /// 第 `row` 行的行高（像素）。
+    #[must_use]
+    pub fn row_height(&self, row: usize) -> f32 {
+        self.lines.get(row).map_or(0.0, |line| line.line_height)
+    }
+
+    /// 第 `row` 行的字号（像素）。
+    #[must_use]
+    pub fn row_font_size(&self, row: usize) -> f32 {
+        self.lines.get(row).map_or(0.0, |line| line.font_size)
+    }
+
+    /// 第 `row` 行的顶部偏移（相对内容顶部）。
+    #[must_use]
+    pub fn row_top_offset(&self, row: usize) -> f32 {
+        self.row_tops
+            .get(row)
+            .copied()
+            .unwrap_or(self.content_height)
     }
 
     /// 第 `row` 行的源码字节区间。
@@ -83,9 +165,12 @@ impl LayoutFrame {
         if !y.is_finite() || y <= 0.0 {
             return 0;
         }
-        let row = (y / self.line_height.max(1.0)).floor();
-        // `as usize` 对 NaN / 负数 / 超大值都是饱和的，这里只需再夹上界。
-        (row as usize).min(last)
+        // 行高逐行不同：在累计行顶里二分（`row_tops` 严格递增）。
+        let row = self
+            .row_tops
+            .partition_point(|top| *top <= y)
+            .saturating_sub(1);
+        row.min(last)
     }
 
     /// 源码字节 `byte` 落在哪一视觉行。
@@ -138,7 +223,8 @@ impl LayoutFrame {
 pub fn wrap_with(
     text: &str,
     wrap_width: f32,
-    line_height: f32,
+    default_metric: LineMetric,
+    metrics: &[LineMetric],
     boundaries: &mut dyn FnMut(&str, f32) -> Vec<usize>,
 ) -> LayoutFrame {
     let wrap_width = if wrap_width.is_finite() {
@@ -146,17 +232,27 @@ pub fn wrap_with(
     } else {
         MIN_WRAP_WIDTH
     };
-    let line_height = if line_height.is_finite() {
-        line_height.max(1.0)
-    } else {
-        1.0
-    };
     let graphemes = units::grapheme_boundaries(text);
     let mut lines = Vec::new();
     let mut source_line = 0usize;
     let mut offset = 0usize;
 
     for raw in text.split_inclusive('\n') {
+        // 该源码行的度量：调用方按块级语义给出，缺省用正文度量。
+        let metric = metrics.get(source_line).copied().unwrap_or(default_metric);
+        let metric = LineMetric {
+            font_size: if metric.font_size.is_finite() && metric.font_size > 0.0 {
+                metric.font_size
+            } else {
+                default_metric.font_size
+            },
+            line_height: if metric.line_height.is_finite() && metric.line_height > 0.0 {
+                metric.line_height
+            } else {
+                default_metric.line_height
+            },
+            mono: metric.mono,
+        };
         let content_end = if raw.ends_with('\n') {
             offset + raw.len() - 1
         } else {
@@ -175,6 +271,9 @@ pub fn wrap_with(
                 source_line,
                 row_in_line,
                 bytes: start..end,
+                font_size: metric.font_size,
+                line_height: metric.line_height,
+                mono: metric.mono,
             });
             start = end;
             row_in_line += 1;
@@ -186,6 +285,9 @@ pub fn wrap_with(
                 source_line,
                 row_in_line,
                 bytes: start..content_end,
+                font_size: metric.font_size,
+                line_height: metric.line_height,
+                mono: metric.mono,
             });
         }
         offset += raw.len();
@@ -195,19 +297,28 @@ pub fn wrap_with(
     // 空文档 / 以换行结尾时补最后一行，光标才有一个可落的空行
     // （与编辑器惯例一致：`"a\n"` 有 2 个视觉行）。
     if text.is_empty() || text.ends_with('\n') {
+        let metric = metrics.get(source_line).copied().unwrap_or(default_metric);
         lines.push(VisualLine {
             source_line,
             row_in_line: 0,
             bytes: text.len()..text.len(),
+            font_size: metric.font_size,
+            line_height: metric.line_height,
+            mono: metric.mono,
         });
     }
+
+    let heights: Vec<f32> = lines.iter().map(|line| line.line_height).collect();
+    let (row_tops, content_height) = accumulate_row_tops(&heights);
 
     LayoutFrame {
         text: text.to_owned(),
         lines,
         graphemes,
-        line_height,
+        row_tops,
+        content_height,
         wrap_width,
+        metrics: metrics.to_vec(),
     }
 }
 
@@ -249,6 +360,53 @@ pub fn scroll_to_reveal(scroll: f32, row: usize, line_height: f32, viewport_heig
     }
 }
 
+/// 让 `[row_top, row_top + row_height)` 落进视口所需的滚动量（行高可变版）。
+#[must_use]
+pub fn scroll_to_reveal_range(
+    scroll: f32,
+    row_top: f32,
+    row_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    if !row_top.is_finite()
+        || !row_height.is_finite()
+        || row_height <= 0.0
+        || !viewport_height.is_finite()
+    {
+        return scroll.max(0.0);
+    }
+    let current = if scroll.is_finite() {
+        scroll.max(0.0)
+    } else {
+        0.0
+    };
+    let bottom = row_top + row_height;
+    if row_top < current {
+        row_top
+    } else if bottom > current + viewport_height {
+        bottom - viewport_height
+    } else {
+        current
+    }
+}
+
+/// PageUp/PageDown 的步长：从 `start_top` 起按**真实行高**累加，数出放得下几行。
+#[must_use]
+pub fn rows_per_page_mixed(frame: &LayoutFrame, start_top: f32, viewport_height: f32) -> i64 {
+    if !viewport_height.is_finite() || viewport_height <= 0.0 {
+        return 1;
+    }
+    let budget = start_top.max(0.0) + viewport_height;
+    let start_row = frame.row_at_y(start_top.max(0.0));
+    let mut rows = 0_i64;
+    let mut row = start_row;
+    while row < frame.row_count() && frame.row_top_offset(row) < budget {
+        rows += 1;
+        row += 1;
+    }
+    rows.max(1)
+}
+
 /// 上下移动 / 翻页的目标视觉行（夹在 `[0, last_row]`，不会越界也不会回绕）。
 #[must_use]
 pub fn vertical_target(row: usize, delta: i64, last_row: usize) -> usize {
@@ -275,6 +433,7 @@ pub fn rows_per_page(viewport_height: f32, line_height: f32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::theme;
 
     /// 假断行：每 `step` 个字节切一段（只在 char 边界切，避免造出非法 UTF-8 区间）。
     fn fake_boundaries(step: usize) -> impl FnMut(&str, f32) -> Vec<usize> {
@@ -294,7 +453,7 @@ mod tests {
 
     fn wrap(text: &str, step: usize) -> LayoutFrame {
         let mut boundaries = fake_boundaries(step);
-        wrap_with(text, 200.0, 20.0, &mut boundaries)
+        wrap_with(text, 200.0, LineMetric::body(), &[], &mut boundaries)
     }
 
     #[test]
@@ -313,10 +472,39 @@ mod tests {
         assert_eq!(frame.lines[0].bytes, 0..2);
         assert_eq!(frame.lines[1].bytes, 3..5);
         assert_eq!(frame.row_at_y(0.0), 0);
-        assert_eq!(frame.row_at_y(19.9), 0);
-        assert_eq!(frame.row_at_y(20.0), 1);
+        let row_height = frame.row_height(0);
+        assert_eq!(frame.row_at_y(row_height - 0.1), 0);
+        assert_eq!(frame.row_at_y(row_height), 1);
         assert_eq!(frame.row_at_y(10_000.0), 1);
         assert_eq!(frame.row_at_y(f32::NAN), 0);
+    }
+
+    #[test]
+    fn mixed_metrics_accumulate_row_tops() {
+        // 第一行 h1（26 → 39 行高），第二行正文（15 → 22 行高），第三行空行
+        let metrics = [
+            LineMetric::with_font_size(26.0),
+            LineMetric::body(),
+            LineMetric::body(),
+        ];
+        let mut boundaries = |_line: &str, _width: f32| Vec::new();
+        let frame = wrap_with(
+            "标题\n正文\n",
+            200.0,
+            LineMetric::body(),
+            &metrics,
+            &mut boundaries,
+        );
+        assert_eq!(frame.row_count(), 3);
+        let h1 = theme::line_height_for(26.0);
+        let body = frame.row_height(1);
+        assert_eq!(frame.row_top_offset(0), 0.0);
+        assert_eq!(frame.row_top_offset(1), h1);
+        assert_eq!(frame.row_top_offset(2), h1 + body);
+        assert_eq!(frame.content_height(), h1 + body * 2.0);
+        // 命中：落在第一行内任意 y 都还是第 0 行
+        assert_eq!(frame.row_at_y(h1 - 0.5), 0);
+        assert_eq!(frame.row_at_y(h1 + 0.5), 1);
     }
 
     #[test]
@@ -378,7 +566,7 @@ mod tests {
     fn degenerate_boundaries_are_ignored() {
         // 断行函数返回 0 与越界值：不能产生空视觉行或越界切片
         let mut boundaries = |_line: &str, _width: f32| vec![0usize, 2, usize::MAX];
-        let frame = wrap_with("abcdef", 200.0, 20.0, &mut boundaries);
+        let frame = wrap_with("abcdef", 200.0, LineMetric::body(), &[], &mut boundaries);
         assert_eq!(frame.row_count(), 2);
         assert_eq!(frame.lines[0].bytes, 0..2);
         assert_eq!(frame.lines[1].bytes, 2..6);
@@ -472,7 +660,7 @@ mod tests {
             assert!(width >= MIN_WRAP_WIDTH);
             Vec::new()
         };
-        let frame = wrap_with("abc", 1.0, 20.0, &mut boundaries);
+        let frame = wrap_with("abc", 1.0, LineMetric::body(), &[], &mut boundaries);
         assert_eq!(frame.wrap_width, MIN_WRAP_WIDTH);
         assert_eq!(frame.row_count(), 1);
     }

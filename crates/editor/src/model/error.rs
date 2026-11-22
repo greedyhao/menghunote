@@ -11,6 +11,7 @@ use std::fmt;
 use menghunote_storage::session::{CommandId, LiveRev, RejectReason};
 use menghunote_text::CoordError;
 
+use crate::model::markdown::MarkdownError;
 use crate::model::projection::ProjectionError;
 
 /// 编辑器纯模型的全部错误。
@@ -20,6 +21,8 @@ pub enum EditorError {
     Coord(CoordError),
     /// 投影映射失败。
     Projection(ProjectionError),
+    /// Markdown 语义扫描失败（正常文本不会触发；防御性分支）。
+    Markdown(MarkdownError),
     /// source 标量序号越界（控制器内部校验）。
     ScalarOutOfBounds { index: usize, len: usize },
     /// 还有一条本地命令在等确认（S1 单飞行；切片 4 再接批量与补偿）。
@@ -93,6 +96,7 @@ impl fmt::Display for EditorError {
         match self {
             Self::Coord(err) => write!(f, "坐标换算失败：{err}"),
             Self::Projection(err) => write!(f, "投影映射失败：{err}"),
+            Self::Markdown(err) => write!(f, "Markdown 语义扫描失败：{err}"),
             Self::ScalarOutOfBounds { index, len } => {
                 write!(f, "标量序号 {index} 越界（source 共 {len} 个 scalar）")
             }
@@ -165,6 +169,7 @@ impl Error for EditorError {
         match self {
             Self::Coord(err) => Some(err),
             Self::Projection(err) => Some(err),
+            Self::Markdown(err) => Some(err),
             _ => None,
         }
     }
@@ -179,5 +184,11 @@ impl From<CoordError> for EditorError {
 impl From<ProjectionError> for EditorError {
     fn from(error: ProjectionError) -> Self {
         Self::Projection(error)
+    }
+}
+
+impl From<MarkdownError> for EditorError {
+    fn from(error: MarkdownError) -> Self {
+        Self::Markdown(error)
     }
 }

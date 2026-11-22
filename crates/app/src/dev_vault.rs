@@ -107,6 +107,14 @@ pub fn dev_vault_path() -> PathBuf {
 pub fn demo_markdown() -> String {
     let mut text = String::new();
     text.push_str("# menghunote · dev 演示笔记\n\n");
+    text.push_str("## 二级标题\n\n");
+    text.push_str("### 三级标题\n\n");
+    text.push_str("```\nfn main() {\n    println!(\"code block\");\n}\n```\n\n");
+    // S2-3b 验收用：标题 / 强调 / 行内代码三种构造各放一行，
+    // caret 不在构造里时标记必须隐藏，进入时显现。
+    text.push_str("普通一行，没有标记。\n");
+    text.push_str("**粗体** 与 `代码` 与 # 井号。\n");
+    text.push_str("*斜体* 与 ~~删除~~ 与 [链接](https://example.com)。\n\n");
     text.push_str("切片 5a 只做一件事：把 `source_text()` 按**软折行**画进 GPUI 窗口。\n");
     text.push_str("S1 是 identity 投影 —— 源码原样显示，`#`、`**`、反引号都还看得见。\n\n");
     text.push_str("单位夹具（ADR 0002 §11.1）：");

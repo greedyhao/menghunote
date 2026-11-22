@@ -15,7 +15,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{px, Pixels, Point, ShapedLine};
+use menghunote_editor::StyleKind;
 
+use super::glyph;
 use super::layout::LayoutFrame;
 use super::theme;
 
@@ -31,10 +33,15 @@ pub struct EditorGeometry {
     pub scroll_y: f32,
     /// 绘制区域原点（窗口坐标）。
     pub origin: Point<Pixels>,
-    /// 行高（等于 `frame.line_height`，存成 `Pixels` 少一次转换）。
+    /// **默认**行高（正文）；逐行行高请用 [`Self::row_height`]。
     pub line_height: Pixels,
     /// 绘制区域高度（像素）。
     pub viewport_height: f32,
+    /// 本帧的语义样式段（**display** 字节区间，完整覆盖全文）。
+    ///
+    /// 绘制与命中都从这里取"这一行怎么分段"，保证两边 shaping 完全一致
+    /// （粗体会让字变宽，命中若用无样式 shaping 会偏）。
+    pub styles: Rc<Vec<(Range<usize>, StyleKind)>>,
 }
 
 impl EditorGeometry {
@@ -50,10 +57,37 @@ impl EditorGeometry {
         self.origin.x + px(theme::PAD_X)
     }
 
-    /// 第 `row` 行在窗口坐标里的上边。
+    /// 第 `row` 行的行高（逐行可变：标题行更高）。
+    #[must_use]
+    pub fn row_height(&self, row: usize) -> Pixels {
+        px(self.frame.row_height(row))
+    }
+
+    /// 第 `row` 行的字号（逐行可变）。
+    #[must_use]
+    pub fn row_font_size(&self, row: usize) -> Pixels {
+        px(self.frame.row_font_size(row))
+    }
+
+    /// 第 `row` 行在窗口坐标里的上边（按累计行顶，**不是** `行号 × 行高`）。
     #[must_use]
     pub fn row_top(&self, row: usize) -> Pixels {
-        self.origin.y + px(theme::PAD_Y) - px(self.scroll_y) + self.line_height * row as f32
+        self.origin.y + px(theme::PAD_Y) - px(self.scroll_y) + px(self.frame.row_top_offset(row))
+    }
+
+    /// 滚动后可见的视觉行区间（半开）：从 `scroll_y` 顶端开始，直到填满视口。
+    ///
+    /// 行高逐行不同，所以不能用 `视口高 / 行高` 估；这里按累计行顶走一遍。
+    #[must_use]
+    pub fn rows_in_view(&self, scroll_y: f32, viewport_height: f32) -> Range<usize> {
+        let top = scroll_y.max(0.0);
+        let bottom = top + viewport_height.max(0.0);
+        let first = self.frame.row_at_y(top);
+        let mut last = first;
+        while last < self.frame.row_count() && self.frame.row_top_offset(last) < bottom {
+            last += 1;
+        }
+        first..last.max(first + 1).min(self.frame.row_count())
     }
 
     /// 窗口坐标 `y` 落在哪一视觉行，夹到可见范围内。
@@ -92,6 +126,12 @@ impl EditorGeometry {
         Some(bytes.start + index.min(bytes.len()))
     }
 
+    /// 第 `row` 行的样式分段 `(字节数, 种类)`（总长等于该行字节数）。
+    #[must_use]
+    pub fn spans_for_row(&self, row: usize) -> Vec<(usize, StyleKind)> {
+        glyph::line_spans(&self.styles, self.frame.row_bytes(row))
+    }
+
     /// 光标（源码字节 `byte`）所在行的窗口坐标 `(row, x)`；不在可见范围时返回 `None`。
     #[must_use]
     pub fn caret_row_x(&self, byte: usize) -> Option<(usize, Pixels)> {
@@ -119,7 +159,8 @@ mod tests {
         Rc::new(super::super::layout::wrap_with(
             &text,
             200.0,
-            20.0,
+            super::super::layout::LineMetric::body(),
+            &[],
             &mut boundaries,
         ))
     }
@@ -135,6 +176,7 @@ mod tests {
             origin: point(px(0.0), px(0.0)),
             line_height: px(20.0),
             viewport_height: 220.0,
+            styles: Rc::new(Vec::new()),
         };
         assert!(geometry.visible_rows().is_empty());
         assert_eq!(geometry.row_at_y(px(0.0)), 10);
@@ -142,10 +184,10 @@ mod tests {
         // 屏外行没有 shaping 结果，不能给出字节
         assert_eq!(geometry.byte_at_row_x(20, px(1.0)), None);
         assert_eq!(geometry.caret_row_x(0), None);
-        // 第 11 行（下标 11）的上边 = 顶部内边距 - 滚动 + 11 × 行高
+        // 第 11 行（下标 11）的上边 = 顶部内边距 - 滚动 + **累计行顶**（行高逐行可变）
         assert_eq!(
             geometry.row_top(11),
-            px(0.0) + px(theme::PAD_Y) - px(200.0) + px(220.0)
+            px(0.0) + px(theme::PAD_Y) - px(200.0) + px(geometry.frame.row_top_offset(11))
         );
     }
 }

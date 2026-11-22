@@ -22,7 +22,7 @@ use gpui::{
     IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     ScrollEvent, ShapedLine, Style, TextAlign, Window,
 };
-use menghunote_editor::{units, Selection, UnicodeScalar};
+use menghunote_editor::{units, Selection};
 
 use super::geometry::EditorGeometry;
 use super::layout::VisualLine;
@@ -64,10 +64,12 @@ impl EditorElement {
         &self,
         geometry: &EditorGeometry,
         selection: Selection,
+        display_selection: Option<Range<usize>>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(selected) = scalar_range(geometry, selection) else {
+        // display 坐标的选区直接来自投影表；换算失败就不画（不静默回退 0）。
+        let Some(selected) = display_selection else {
             return;
         };
         // 只在被请求的那一帧 dump（`update` 需要可变借用）
@@ -129,34 +131,40 @@ impl EditorElement {
     ///
     /// preedit **不在布局里**（`LayoutFrame` 只描述 source），所以这里按光标位置临时
     /// shaping 一次并画在光标右侧；组合串通常很短，超出行宽时由 content mask 裁掉。
-    fn paint_preedit(&self, geometry: &EditorGeometry, window: &mut Window, cx: &mut App) {
-        let (preedit, head, text) = {
-            let view = self.view.read(cx);
-            (
-                view.preedit_text().map(str::to_owned),
-                view.selection().head(),
-                view.source_text(),
-            )
-        };
+    fn paint_preedit(
+        &self,
+        geometry: &EditorGeometry,
+        display_caret: Option<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let preedit = self.view.read(cx).preedit_text().map(str::to_owned);
         let Some(preedit) = preedit else {
             return;
         };
-        let Ok(caret) = head.to_source_byte(&text) else {
+        // preedit 不进 display_text，但**位置**按 display 坐标算（标记可能被隐藏）。
+        let Some(caret) = display_caret else {
             return;
         };
-        let Some((row, x)) = geometry.caret_row_x(caret.get()) else {
+        let Some((row, x)) = geometry.caret_row_x(caret) else {
             return;
         };
         let sanitized = super::view::sanitize_single_line(&preedit);
         if sanitized.is_empty() {
             return;
         }
-        let shaped = super::glyph::shape_row(window, &sanitized);
+        let shaped = super::glyph::shape_row_styled_at(
+            window,
+            &sanitized,
+            &[],
+            geometry.frame.row_font_size(row),
+            geometry.frame.lines[row].mono,
+        );
         let top = geometry.row_top(row);
         // 组合串用主色 + 下划线，和已提交文本区分开。
         if let Err(error) = shaped.paint(
             point(x, top),
-            geometry.line_height,
+            geometry.row_height(row),
             TextAlign::Left,
             None,
             window,
@@ -177,14 +185,23 @@ impl EditorElement {
     }
 
     /// 画光标竖线（最后画，保证压在文本与 preedit 之上）。
-    fn paint_caret(&self, geometry: &EditorGeometry, selection: Selection, window: &mut Window) {
-        let Some(caret) = scalar_to_byte(&geometry.frame.text, selection.head()) else {
+    fn paint_caret(
+        &self,
+        geometry: &EditorGeometry,
+        display_caret: Option<usize>,
+        window: &mut Window,
+    ) {
+        let Some(caret) = display_caret else {
             return;
         };
         if let Some((row, x)) = geometry.caret_row_x(caret) {
             let top = geometry.row_top(row);
+            // 标题行的 caret 要和该行行高一致，不能再用统一行高。
             window.paint_quad(fill(
-                Bounds::new(point(x, top), size(px(CARET_WIDTH), geometry.line_height)),
+                Bounds::new(
+                    point(x, top),
+                    size(px(CARET_WIDTH), geometry.row_height(row)),
+                ),
                 theme::caret_color(),
             ));
         }
@@ -195,15 +212,17 @@ impl EditorElement {
         for (offset, shaped) in geometry.shaped.iter().enumerate() {
             let row = geometry.visible_start + offset;
             let origin = point(geometry.text_left(), geometry.row_top(row));
+            // 行内代码的底色是 `TextRun::background_color`，必须**单独**刷一遍；
+            // `paint` 只画字形与下划线/删除线，不会画 run 背景。
+            let row_height = geometry.row_height(row);
+            if let Err(error) =
+                shaped.paint_background(origin, row_height, TextAlign::Left, None, window, cx)
+            {
+                eprintln!("[menghunote] 绘制样式底色失败：{error}");
+            }
             // 单行绘制失败只影响这一行：记录到 stderr，不 panic、不 unwrap。
-            if let Err(error) = shaped.paint(
-                origin,
-                geometry.line_height,
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            ) {
+            if let Err(error) = shaped.paint(origin, row_height, TextAlign::Left, None, window, cx)
+            {
                 eprintln!("[menghunote] 绘制视觉行 {row} 失败：{error}");
             }
         }
@@ -328,22 +347,28 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let text = self.view.read(cx).source_text();
+        // 布局用 **display 文本**（Markdown 标记按当前 selection 隐藏/显现）。
+        // `WrapCache` 按文本比对，因此"caret 进入/离开构造导致 display 变长变短"
+        // 会自动让缓存失效并重排——不需要再单独记 `display_len`。
+        let text = self.view.read(cx).display_text();
         let scroll_y = self.view.read(cx).scroll_y();
         let font = theme::font();
         let font_size = px(theme::FONT_SIZE);
-        let line_height = px(theme::LINE_HEIGHT);
+        let line_height = px(theme::DEFAULT_LINE_HEIGHT);
         let wrap_width =
             (bounds.size.width.as_f32() - theme::PAD_X * 2.0).max(super::layout::MIN_WRAP_WIDTH);
+        // 块级度量（标题字号 / 代码块等宽）：连同文本一起进 `WrapCache` 的键。
+        let metrics = self.view.read(cx).block_metrics();
 
-        let frame = self.shared.frame(
-            &text,
+        let frame = self.shared.frame(super::shared::WrapRequest {
+            text: &text,
             wrap_width,
-            line_height.as_f32(),
-            cx.text_system(),
-            &font,
+            default_metric: super::layout::LineMetric::body(),
+            metrics: &metrics,
+            text_system: cx.text_system(),
+            font: &font,
             font_size,
-        );
+        });
         self.shared
             .set_viewport(bounds.size.width.as_f32(), bounds.size.height.as_f32());
 
@@ -352,14 +377,31 @@ impl Element for EditorElement {
             0.0,
             (frame.content_height() - bounds.size.height.as_f32()).max(0.0),
         );
-        let rows_in_view = (bounds.size.height / line_height).ceil().max(1.0) as usize;
-        let first = ((scroll / line_height.as_f32()).floor().max(0.0) as usize)
-            .min(row_count.saturating_sub(1));
-        let last = (first + rows_in_view + 1).min(row_count);
+        // 行高逐行不同：可见范围按累计行顶算，再多取一行 overscan。
+        let first = frame.row_at_y(scroll).min(row_count.saturating_sub(1));
+        let viewport_bottom = scroll + bounds.size.height.as_f32() + frame.row_height(first);
+        let mut last = first;
+        while last < row_count && frame.row_top_offset(last) < viewport_bottom {
+            last += 1;
+        }
+        let last = last.max(first + 1).min(row_count);
 
+        // 语义样式（display 坐标，完整覆盖）：绘制与命中都用它分段 shaping。
+        // 注意：样式随 caret 变化（进入/离开构造），所以**每帧**都要按当前 runs 重新
+        // shaping；`WrapCache` 只缓存折行（纯文本函数），不会把样式缓存住。
+        let styles = Rc::new(self.view.read(cx).style_runs_display());
         let shaped = frame.lines[first..last]
             .iter()
-            .map(|line| super::glyph::shape_row(window, &frame.text[line.bytes.clone()]))
+            .map(|line| {
+                let spans = super::glyph::line_spans(&styles, line.bytes.clone());
+                super::glyph::shape_row_styled_at(
+                    window,
+                    &frame.text[line.bytes.clone()],
+                    &spans,
+                    line.font_size,
+                    line.mono,
+                )
+            })
             .collect();
 
         let geometry = Rc::new(EditorGeometry {
@@ -370,6 +412,7 @@ impl Element for EditorElement {
             origin: bounds.origin,
             line_height,
             viewport_height: bounds.size.height.as_f32(),
+            styles,
         });
         self.shared.set_geometry(Rc::clone(&geometry));
         // 正文 hitbox：prepaint 阶段插入（与绘制矩形一致），paint 阶段绑定光标样式。
@@ -393,15 +436,25 @@ impl Element for EditorElement {
         let Some(geometry) = prepaint.clone() else {
             return;
         };
-        let selection = self.view.read(cx).selection();
+        // 布局坐标系是 **display**（隐藏标记后变短），所以绘制一律用 display 坐标：
+        // source 选区/光标先经 `ProjectionMap` 映射（可能跨多个省略段，
+        // 不能假设 display 与 source 线性对应）。
+        let (selection, display_selection, display_caret) = {
+            let view = self.view.read(cx);
+            (
+                view.selection(),
+                view.selection_in_display_range(),
+                view.display_caret(),
+            )
+        };
 
         // 文字不能画到画布外面（最后一个视觉行可能只有半行高）。
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             // 顺序：选区底色 → 正文 → IME 组合串 → 光标（光标永远压在最上面）。
-            self.paint_selection(&geometry, selection, window, cx);
+            self.paint_selection(&geometry, selection, display_selection, window, cx);
             self.paint_text(&geometry, window, cx);
-            self.paint_preedit(&geometry, window, cx);
-            self.paint_caret(&geometry, selection, window);
+            self.paint_preedit(&geometry, display_caret, window, cx);
+            self.paint_caret(&geometry, display_caret, window);
         });
 
         self.register_handlers(bounds, geometry, window);
@@ -436,50 +489,15 @@ impl Element for EditorElement {
     }
 }
 
-/// 把光标 / 选区端点的 `UnicodeScalar` 换成源码字节；失败时退回 `0`。
-///
-/// 正常路径不会失败（端点由控制器校验过），失败只可能是"帧内文本与控制器
-/// 不同源"的瞬态，退回到行首是安全的选择。
-fn scalar_to_byte(text: &str, scalar: UnicodeScalar) -> Option<usize> {
-    scalar.to_source_byte(text).ok().map(|byte| byte.get())
-}
-
-/// 选区端点的字节区间；两端任一换算失败返回 `None`（**不再静默回退 0**）。
-///
-/// 旧实现用 `map_or(0, ...)` 把"scalar 换算失败"吞成 0，正好会画出"首行从文字区
-/// 左边界开始"的假选区，且看不出是错的。现在失败即拒绝绘制并留痕。
-fn scalar_range(geometry: &EditorGeometry, selection: Selection) -> Option<Range<usize>> {
-    let text = geometry.frame.text.as_str();
-    let start = scalar_to_byte(text, selection.start());
-    let end = scalar_to_byte(text, selection.end());
-    match (start, end) {
-        (Some(start), Some(end)) => Some(start.min(end)..start.max(end)),
-        (start, end) => {
-            eprintln!(
-                "[menghunote] 选区端点换算失败，本帧不画选区：start={:?} end={:?}（scalar #{:?}..#{:?}，文本 {} scalar）",
-                start,
-                end,
-                selection.start().get(),
-                selection.end().get(),
-                units::scalar_len(text)
-            );
-            None
-        }
-    }
-}
-
 /// 空行是否该画一条"选区窄高亮"。
 ///
 /// 三个条件缺一不可：
 ///
 /// 1. **选区非零宽**（`sel_start < sel_end`）：折叠光标不是选区，它由
 ///    [`EditorElement::paint_caret`] 单独画，不该有任何底色 —— 这正是
-///    "光标停在空行时右侧冒出浅蓝块"的根因（空行 `start == end`，
-///    零宽选区同时满足旧的覆盖判定）。
+///    "光标停在空行时右侧冒出浅蓝块"的根因（空行 `start == end`，零宽选区同时满足旧的覆盖判定）。
 /// 2. 该视觉行**确实是空行**（`line_start == line_end`）。
 /// 3. 选区**覆盖**它，按半开区间判定：`sel_start <= line_start && sel_end > line_start`。
-///    用 `>` 而不是 `>=`：选区 `2..5` 停在字节 5 之前，不包含位置 5 上的空行，
-///    画高亮会让人以为"空行也被选中了"。
 fn empty_line_highlight(
     sel_start: usize,
     sel_end: usize,
@@ -490,8 +508,6 @@ fn empty_line_highlight(
 }
 
 /// 一条视觉行上被选区覆盖的横向区间（相对**文字起点**，即 `geometry.text_left()`）。
-///
-/// 只负责取几何参数；判定与计算都在 [`selection_span_with`]（纯函数，可无窗口单测）。
 fn selection_span(
     line: &VisualLine,
     shaped: &ShapedLine,
@@ -510,9 +526,9 @@ fn selection_span(
 ///
 /// 返回值是**行内相对像素**（0 = 该行文字起点）。绘制方再加 `geometry.text_left()`：
 /// 早期版本在这里就把 `PAD_X` 加进返回值、绘制处又加了一次，导致每条选区带整体
-/// 右移 14px、整行选区还会溢出到右边界之外（真机截图里"末行铺到右边界"就是这个）。
+/// 右移 14px（真机截图里"末行铺到右边界"就是这个）。
 ///
-/// 返回 `None` 表示**不画任何选区底色**。
+/// 返回 `None` 表示**不画任何选区底色**。参数一律是 **display 字节**（布局坐标系）。
 fn selection_span_with(
     line_start: usize,
     line_end: usize,

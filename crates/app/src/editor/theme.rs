@@ -113,3 +113,50 @@ pub fn input_selection() -> Rgba {
 pub fn input_caret() -> Rgba {
     rgb(0x1f2328)
 }
+
+/// 行内代码的底色（浅灰，压在窗口底色上仍可读）。
+#[must_use]
+pub fn code_bg() -> Rgba {
+    rgb(0xeff1f3)
+}
+
+/// 链接文字色（与正文区分，再配合下划线）。
+#[must_use]
+pub fn link_color() -> Rgba {
+    rgb(0x0969da)
+}
+
+/// 等宽字体族（行内代码用）；找不到时退回编辑器主字体。
+pub const MONO_FAMILY: &str = "Consolas";
+
+/// 行高系数：`line_height = font_size * LINE_HEIGHT_FACTOR`（四舍五入到整像素）。
+pub const LINE_HEIGHT_FACTOR: f32 = 1.5;
+
+/// 正文行高（= [`FONT_SIZE`] × 系数，保持早先的 22px 视觉）。
+pub const DEFAULT_LINE_HEIGHT: f32 = 22.0;
+
+/// 标题各级字号（h1..h6）。块级渲染用它，**不要**在业务代码里写字号。
+#[must_use]
+pub fn heading_font_size(level: u8) -> f32 {
+    match level {
+        1 => 26.0,
+        2 => 22.0,
+        3 => 19.0,
+        4 => 17.0,
+        _ => 16.0,
+    }
+}
+
+/// 某一字号对应的行高（固定系数，四舍五入）。
+#[must_use]
+pub fn line_height_for(font_size: f32) -> f32 {
+    (font_size * LINE_HEIGHT_FACTOR).round().max(1.0)
+}
+
+/// 围栏代码块里用的字体（等宽）。
+#[must_use]
+pub fn code_block_font() -> Font {
+    let mut font = font();
+    font.family = MONO_FAMILY.into();
+    font
+}

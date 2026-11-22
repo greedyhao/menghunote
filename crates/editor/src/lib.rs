@@ -24,7 +24,8 @@
 //! - [`EditorController`]：Rope 镜像 + source selection + 当前 `live_rev`；
 //!   **只按确认 delta 更新一次**（`Applied.local_echo = true` 时不再按 `splice`
 //!   二次应用，[`LiveDelta`] 必应用）；
-//! - [`ProjectionMap`]：S1 只做 identity，但结构按 ADR 0002 §4 预留 `Vec<Segment>`；
+//! - [`ProjectionMap`]：identity + Markdown 省略投影（真实 display ↔ source 双向映射）；
+//! - [`MarkdownDocument`]：Markdown 语义扫描 + 可隐藏标记区间（投影层的输入）；
 //! - [`InputDocument`]：source 在选区处替换成 preedit 的**临时**输入文档；
 //!   preedit 永不进入 source，也不产生 `ScalarEdit`；
 //! - grapheme 只作为交互边界（`unicode-segmentation` 在 `menghunote-text`），
@@ -83,8 +84,11 @@ pub use menghunote_text::{
 
 pub mod model;
 
+pub use model::block::{BlockKind, BlockRun};
 pub use model::controller::{EditorController, GraphemeStep, OutcomeEffect};
 pub use model::error::EditorError;
 pub use model::input::InputDocument;
+pub use model::markdown::{ConstructKind, MarkdownConstruct, MarkdownDocument, MarkdownError};
 pub use model::projection::{BoundaryBias, ProjectionError, ProjectionMap, Segment, SegmentKind};
 pub use model::selection::Selection;
+pub use model::style::{StyleKind, StyleRun};
