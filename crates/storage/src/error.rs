@@ -16,6 +16,27 @@ pub enum StorageError {
     #[error("SQLite 操作失败：{0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// 只读快照在 `busy_timeout` 内没拿到读锁（写事务长时间占用）。
+    ///
+    /// 读路径**不做无限重试**：调用方（search）应当退避后重开快照，或改用
+    /// `reconcile_required` 走全量对账，而不是在这里阻塞写线程。
+    #[error("只读快照在 {busy_timeout_ms}ms 内未获得读锁（{context}）：请退避后重试或走全量对账")]
+    SnapshotBusy {
+        /// 出错的具体动作（打开/查询/解码）。
+        context: &'static str,
+        /// 该连接实际使用的 `busy_timeout`。
+        busy_timeout_ms: u32,
+    },
+
+    /// 索引清单里某列的类型不符合 schema 预期（说明库被外部改坏或 schema 漂移）。
+    #[error("索引清单列 [{column}] 类型异常：{found}")]
+    ManifestShape {
+        /// 列名。
+        column: &'static str,
+        /// 实际读到的 SQLite 类型。
+        found: &'static str,
+    },
+
     /// 迁移失败：带上目标版本与迁移名称，便于定位是哪一级迁移脚本出错。
     #[error("迁移到 schema v{version}（{name}）失败：{source}")]
     Migration {

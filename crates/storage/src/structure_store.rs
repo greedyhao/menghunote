@@ -95,6 +95,11 @@ impl StructureWriter {
             self.head = new_head;
         }
 
-        project(&self.vault, &self.doc, self.head.head_seq)
+        let report = project(&self.vault, &self.doc, self.head.head_seq)?;
+        // 整棵树投完再发一条"结构变了"：按单篇发会让订阅者重复全量对账，
+        // 而结构提交本来就是整棵树投影，`note_id = None` 更诚实。
+        self.vault
+            .publish_event(crate::StorageEvent::StructureProjected { note_id: None });
+        Ok(report)
     }
 }

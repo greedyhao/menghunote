@@ -1,0 +1,14 @@
+[package]
+name = "menghunote-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 中文分词检索（探针已验证：本机 Windows 可编译；见 task-55 / ADR 0005）。
+tantivy = "0.27"
+# default-dict 提供 cang_jie::jieba_rs::Jieba::new() 的默认中文词典。
+cang-jie = { version = "0.22", features = ["default-dict"] }
+# 只读依赖：后续 S4 增量/对账从 storage 的 IndexManifestRow 取版本水位。
+menghunote-storage = { path = "../storage" }
+thiserror = "2"

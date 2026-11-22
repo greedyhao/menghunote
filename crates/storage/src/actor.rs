@@ -106,6 +106,13 @@ enum Command {
         /// 结果回传通道：每条语句的影响行数。
         reply: Reply<Vec<usize>>,
     },
+    /// 读取一条 meta（键值，BLOB）。
+    GetMeta {
+        /// 键（命名空间由调用方约定，storage 不理解语义）。
+        key: String,
+        /// 结果回传通道。
+        reply: Reply<Option<Vec<u8>>>,
+    },
     /// 读取 `PRAGMA user_version`。
     UserVersion {
         /// 结果回传通道。
@@ -124,13 +131,19 @@ pub struct Vault {
 
 /// 句柄之间共享的状态。
 #[derive(Debug)]
-struct Shared {
+pub(crate) struct Shared {
     /// 命令发送端；关闭时取走并丢弃，工作线程的 `recv` 随之返回错误。
     tx: Mutex<Option<Sender<Command>>>,
     /// 工作线程句柄，只在最后一个句柄析构时 join。
     worker: Mutex<Option<JoinHandle<()>>>,
     /// 数据库文件路径。
     path: PathBuf,
+    /// 变更通知的订阅者槽位（`(id, sender)`）。
+    pub(crate) event_slots: Mutex<Vec<crate::events::EventSlot>>,
+    /// 分配订阅者 id 用。
+    pub(crate) next_event_slot: std::sync::atomic::AtomicU64,
+    /// 「事件送不出去、请做全量对账」的粘性标记。
+    pub(crate) reconcile_required: std::sync::atomic::AtomicBool,
 }
 
 impl Vault {
@@ -167,6 +180,9 @@ impl Vault {
                     tx: Mutex::new(Some(tx)),
                     worker: Mutex::new(Some(handle)),
                     path,
+                    event_slots: crate::events::new_slots(),
+                    next_event_slot: std::sync::atomic::AtomicU64::new(0),
+                    reconcile_required: std::sync::atomic::AtomicBool::new(false),
                 }),
             }),
             Ok(Err(error)) => {
@@ -189,6 +205,54 @@ impl Vault {
     /// vault 数据库文件路径。
     pub fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    /// 打开一条**只读快照**连接（WAL 下与写路径并发，不占写 actor）。
+    ///
+    /// 语义见 [`crate::ReadSnapshot`]：只保证读到"已提交"的数据；忙则返回
+    /// [`StorageError::SnapshotBusy`]，不做无限重试。
+    pub fn open_read_snapshot(&self) -> Result<crate::ReadSnapshot, StorageError> {
+        crate::ReadSnapshot::open(&self.inner.path)
+    }
+
+    /// 订阅轻量变更事件（容量 = 队列上限）。
+    ///
+    /// 发布走 `try_send`：队列满 / 无订阅者时不会阻塞写，而是置"需要全量对账"标记。
+    pub fn subscribe_events(&self, capacity: usize) -> crate::StorageEventSubscriber {
+        self.inner.subscribe_events(capacity)
+    }
+
+    /// 取走并清除"事件没送到、请做全量对账"的标记。
+    pub fn take_reconcile_required(&self) -> bool {
+        self.inner.take_reconcile_required()
+    }
+
+    /// 读一条 meta（键值 BLOB）；不存在返回 `None`。
+    pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.call(|reply| Command::GetMeta {
+            key: key.to_owned(),
+            reply,
+        })
+    }
+
+    /// 写一条 meta：**走写 actor 的小事务**（`INSERT ... ON CONFLICT`），不绕过 actor。
+    pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        self.exec_transaction(
+            &[Statement::new(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                vec![Value::Text(key.to_owned()), Value::Blob(value.to_vec())],
+            )],
+            &[AffectedGuard::exactly(0, 1)],
+        )?;
+        Ok(())
+    }
+
+    /// 发布一条变更事件（内部用；B 物化与结构投影提交后调用）。
+    ///
+    /// 返回成功投递的订阅者数量；`0` 说明没人收到，已置"需要全量对账"标记。
+    pub(crate) fn publish_event(&self, event: crate::StorageEvent) -> usize {
+        self.inner.publish_event(event)
     }
 
     /// 当前 schema 版本（`PRAGMA user_version`）。
@@ -313,9 +377,35 @@ fn handle_command(conn: &Connection, command: Command) {
         } => {
             let _ = reply.send(exec_transaction(conn, &statements, &guards));
         }
+        Command::GetMeta { key, reply } => {
+            let _ = reply.send(get_meta(conn, &key));
+        }
         Command::UserVersion { reply } => {
             let _ = reply.send(migrate::user_version(conn));
         }
+    }
+}
+
+/// 读一条 meta。
+fn get_meta(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+    let mut statement = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+    let mut rows = statement.query([key])?;
+    match rows.next()? {
+        None => Ok(None),
+        Some(row) => match row.get::<usize, Value>(0)? {
+            Value::Blob(blob) => Ok(Some(blob)),
+            Value::Text(text) => Ok(Some(text.into_bytes())),
+            other => Err(StorageError::ManifestShape {
+                column: "meta.value",
+                found: match other {
+                    Value::Null => "NULL",
+                    Value::Integer(_) => "INTEGER",
+                    Value::Real(_) => "REAL",
+                    Value::Text(_) => "TEXT",
+                    Value::Blob(_) => "BLOB",
+                },
+            }),
+        },
     }
 }
 

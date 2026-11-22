@@ -13,6 +13,8 @@ anyhow = "1"
 gpui = { package = "gpui-kit", version = "=0.9.1" }
 # ADR 0003 §3：app 可以依赖 editor / storage / text，反向不允许
 menghunote-editor = { path = "../editor" }
+# 检索（S4-2b）：UI 只拿类型（Hit/SearchStatus），真正的 IndexManager 在后台线程里
+menghunote-search = { path = "../search" }
 menghunote-storage = { path = "../storage" }
 
 [target.'cfg(windows)'.dependencies]

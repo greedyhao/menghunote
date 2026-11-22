@@ -42,6 +42,10 @@ fn main() -> Result<()> {
     let vault = dev.vault.clone();
 
     gpui::platform::application().run(move |cx: &mut App| {
+        // gpui-component 的组件（Input / List）依赖主题与全局状态，
+        // 必须先 `gpui::init(cx)`（= gpui-kit 的门面初始化，内部调 gpui_component::init）。
+        // 漏掉这一步组件不会报错，只会"什么都不显示"。
+        gpui::init(cx);
         let window_bounds = initial_window_bounds(cx);
         if let Some(display) = cx.primary_display() {
             // 修复前后对比用：DPI 未感知时这里是**物理像素**且窗口 scale=1.0；

@@ -75,3 +75,20 @@
 
 - 探针报告：`task-51`（隔离 worktree `../menghunote-kit-probe`，分支 `probe/gpui-kit`，未合并）；
 - GPT 评估：推荐"隔离风险验证、主线不动"；本次探针证明迁移成本极低后，人类拍板整体切换。
+
+## 追加（2026-11-11）：组件能力边界——**文本输入必须自绘**
+
+真机验收发现：开着微软拼音时，搜索浮层的文字输入**完全无响应**，`Esc` 也被输入法消费。
+
+根因（已核源码，不是猜测）：**`gpui-component 0.9.1` 与 `gpui-base 0.9.1` 中
+`impl EntityInputHandler for …` 为 0 处**——组件的 `Input`/`TextInput` 只处理键盘事件，**没有 IME 集成**。
+GPUI 的输入法链路要求焦点实体实现 `EntityInputHandler`（本项目 `RenameInput` 就是这样做的，
+并已被微软拼音真机验证）。
+
+结论与约束：
+
+- **文本输入类控件一律自绘**（复用 `RenameInput` 的 UTF-16 / preedit / caret 做法），
+  不要把 `gpui-component` 的 `Input` 用在需要输入法的地方；
+- `gpui-component` 仍可用于**无输入法需求**的组件（列表、表格、对话框、菜单、docking 等）；
+- 自动化用 `WM_CHAR` 注入**绕过 IME**，因此"自动化能输入"**不能**作为 IME 可用的证据；
+  涉及输入法的改动必须真机验（这是本项目第二次踩到"自动化覆盖不到输入法"）。

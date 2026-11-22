@@ -233,7 +233,7 @@ impl RenameState {
 
     /// 组合串在"显示串"里的 UTF-16 范围。
     #[must_use]
-    fn marked_utf16(&self) -> Option<Range<usize>> {
+    pub(crate) fn marked_utf16(&self) -> Option<Range<usize>> {
         let marked = self.marked.as_ref()?;
         if marked.preedit.is_empty() {
             return None;
@@ -311,12 +311,12 @@ fn next_boundary(text: &str, at: usize) -> usize {
 }
 
 /// byte → UTF-16 偏移。
-fn byte_to_utf16(text: &str, byte: usize) -> usize {
+pub(crate) fn byte_to_utf16(text: &str, byte: usize) -> usize {
     text[..byte.min(text.len())].encode_utf16().count()
 }
 
 /// UTF-16 偏移 → byte（落点必须在字符边界上）。
-fn utf16_to_byte(text: &str, utf16: usize) -> Option<usize> {
+pub(crate) fn utf16_to_byte(text: &str, utf16: usize) -> Option<usize> {
     let mut seen = 0;
     for (index, ch) in text.char_indices() {
         if seen == utf16 {
@@ -366,6 +366,25 @@ impl RenameInput {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let extend = modifiers.shift;
+
+        // 与搜索框共用同一套快捷键语义（`Ctrl+A` 全选；组合态忽略）。
+        match crate::text_shortcuts::shortcut_action(
+            &event.keystroke,
+            self.state.marked_utf16().is_some(),
+        ) {
+            crate::text_shortcuts::ShortcutAction::SelectAll => {
+                self.state.select_all();
+                cx.notify();
+                window.prevent_default();
+                return;
+            }
+            crate::text_shortcuts::ShortcutAction::ClipboardUnsupported => {
+                window.prevent_default();
+                return;
+            }
+            crate::text_shortcuts::ShortcutAction::None => {}
+        }
+
         match key {
             "enter" => {
                 if self.state.marked.is_some() {

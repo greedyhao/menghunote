@@ -301,6 +301,8 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 >    同因还有 `[profile.dev.package.stacker] debug = false`（`loro → pest → pest_stack_guard → stacker`，
 >    stacker 带 `src/arch/windows.c`）。**今后任何带 C 源的新依赖撞到 D8050，都按同样方式单包覆盖并注明理由**，
 >    不要用全局 `debug = false`（会连 Rust 依赖的调试信息一起关掉）。
+>    2026-11-10 又命中第三个：`zstd-sys`（`tantivy → zstd`），已加 `[profile.dev.package.zstd-sys] debug = false`；
+>    注意探针用的独立 crate 不触发，**只有本仓 target 下会撞**。
 > 2. 测试临时目录用 `CARGO_TARGET_TMPDIR`（`target/tmp`），**不要**用 `tempfile::tempdir()`。
 
 > ⚠️ **别让管道吞掉退出码**：`cargo build | tail -40` 的退出码来自 `tail`，构建失败也会显示成功。
@@ -336,7 +338,8 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 ## 8. 当前状态
 
 - **脚手架已就位**：Cargo workspace + `crates/app`（空窗口），依赖基线**已编译验证通过**。
-- **版本管理**：当前开发分支 **`dev`**；旧历史完整保留在 **`backup/main-wip-20261110`**（含全部 wip 与被推翻的尝试）。
+- **版本管理**：当前开发分支 **`dev`**（2026-11-11 重建：折叠全部 `wip:`，0 wip，36 条提交）；
+  旧历史保留两份备份：**`backup/main-wip-20261110`**（首个基线）与 **`backup/dev-wip-20261111`**（含重命名/搜索的 wip 段）。
   tag：`v0.1-slice6` = 切片 6 真机验收点；**`v0.2-gpui-kit`** = S2 投影编辑器 + 引用块 + 导出 + 切换 GPUI Kit（真机验收）。
   `target/`（20G）与本地 vault 不入库；**Lead review 一律看 `git diff`**，提交前必须三绿。
 - 已落盘：[`AGENTS.md`](AGENTS.md)、[`docs/briefs/0000-kickoff.md`](docs/briefs/0000-kickoff.md)、
@@ -374,6 +377,12 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   已知未做：其它块级样式（列表项符号需要 Replace/Object 段）、`***`/同种定界符嵌套、跨行行内。
 - **S3 导出已完成（2026-11-10）**：整库单向导出 Markdown 到 `<vault>/export/<时间戳>/`，文件名清洗（Windows 非法字符 / 尾空格点 / 空标题 / 大小写不敏感去重）
   与目录结构镜像；导出取 `BodyDoc::text()`（源文）**不是** UI 的 display 文本；后台执行，2000 篇 1126ms，导出期间 UI 可交互。
+- **S4 检索已完成（2026-11-11，真机验收）**：`crates/search`（Tantivy 0.27 + cang-jie `ForSearch`，
+  analyzer = 去空白 token + LowerCaser）+ `IndexManager`（代目录 + meta 指针发布、启动对账、
+  查询前新快照做墓碑终检并扩候选、事件增量 + debounce）；app 侧 Ctrl+K 浮层、**自绘 IME 输入**
+  （`search_input.rs`；`gpui-component` 的 Input 无 `EntityInputHandler`，文本输入必须自绘）、
+  snippet 高亮、↑/↓/Enter/点击跳转、点空白关闭、Ctrl+A 全选（Ctrl+C/X/V 明确 v1 不做）。
+  **教训**：`WM_CHAR` 注入绕过 IME，自动化能打字 ≠ 输入法可用；文本输入控件必须真机验。
 - **UI 框架已切 GPUI Kit（2026-11-10，ADR 0004，真机验收）**：`gpui = { package = "gpui-kit", version = "=0.9.1" }`（精确 pin），
   平台入口 `gpui::platform::application()`；`text`/`editor`/`storage` **零改动**。
   探针结论：0 签名变化、0 trait 不匹配、仅 1 处平台入口；迁移后三绿 329 用例 + UI smoke 10/10 + 用户真机 IME/DPI 通过。

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/storage", "crates/editor", "crates/text"]
+members = ["crates/app", "crates/storage", "crates/editor", "crates/text", "crates/search"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,3 +31,11 @@ debug = false
 # 复现方式：删掉本节 → `cargo clean -p stacker && cargo build -p menghunote-storage`。
 [profile.dev.package.stacker]
 debug = false
+
+# 第三个受害者：tantivy 默认启用 zstd 压缩，zstd-sys 的 C 源在 build script 上下文
+# 同样带 `-Z7` 时必报 D8050（2026-11-10 实测，crates/search 引入）。同因只关该包
+# 调试信息，不影响 Rust 侧与优化级别。复现：删掉本节 → cargo clean -p zstd-sys →
+# cargo check -p menghunote-search 必在 zstd/lib 的 .c 文件处失败。
+[profile.dev.package.zstd-sys]
+debug = false
+

@@ -93,6 +93,22 @@ pub enum EditorEvent {
     RenameRequested,
     /// 正文被按下鼠标：宿主可用它取消行内编辑。
     PointerDown,
+    /// 按了 `Ctrl+K` / `Ctrl+F`：请宿主打开搜索浮层。
+    SearchRequested,
+}
+
+/// 这个按键是不是"打开搜索"的快捷键（**纯函数**，便于单测）。
+///
+/// 规则：`Ctrl` + `K` 或 `Ctrl` + `F`，且**不带** Alt / Shift / Cmd。
+/// 显式排除 Shift 是为了不和"Ctrl+Shift+F"这类全局搜索/格式化快捷键撞车。
+#[must_use]
+pub fn is_search_shortcut(keystroke: &gpui::Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    modifiers.control
+        && !modifiers.alt
+        && !modifiers.shift
+        && !modifiers.platform
+        && matches!(keystroke.key.as_str(), "k" | "f")
 }
 
 impl gpui::EventEmitter<EditorEvent> for EditorView {}
@@ -472,6 +488,23 @@ impl EditorView {
     /// （按词移动、命令面板等）。
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let modifiers = event.keystroke.modifiers;
+        if std::env::var_os("MENGHUNOTE_TRACE_MENU").is_some() {
+            eprintln!(
+                "[menghunote] key down keystroke={:?} ctrl={} alt={} shift={} platform={}",
+                event.keystroke.key,
+                modifiers.control,
+                modifiers.alt,
+                modifiers.shift,
+                modifiers.platform
+            );
+        }
+
+        // Ctrl+K / Ctrl+F：请宿主打开搜索浮层（编辑器不管浮层，只发事件）。
+        if is_search_shortcut(&event.keystroke) {
+            cx.emit(EditorEvent::SearchRequested);
+            window.prevent_default();
+            return;
+        }
 
         // F2：请宿主重命名侧栏选中项（编辑器自己不管侧栏，只发事件）。
         if !modifiers.control
@@ -1404,4 +1437,29 @@ fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
         byte -= 1;
     }
     byte
+}
+
+#[cfg(test)]
+mod search_shortcut_tests {
+    use super::is_search_shortcut;
+    use gpui::Keystroke;
+
+    fn keystroke(text: &'static str) -> Keystroke {
+        Keystroke::parse(text).expect("按键解析失败")
+    }
+
+    #[test]
+    fn ctrl_k_and_ctrl_f_open_search() {
+        assert!(is_search_shortcut(&keystroke("ctrl-k")));
+        assert!(is_search_shortcut(&keystroke("ctrl-f")));
+    }
+
+    #[test]
+    fn other_modifier_combinations_do_not_open_search() {
+        assert!(!is_search_shortcut(&keystroke("k")), "裸 k 是打字");
+        assert!(!is_search_shortcut(&keystroke("alt-k")));
+        assert!(!is_search_shortcut(&keystroke("ctrl-shift-k")));
+        assert!(!is_search_shortcut(&keystroke("ctrl-alt-f")));
+        assert!(!is_search_shortcut(&keystroke("ctrl-j")));
+    }
 }

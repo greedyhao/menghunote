@@ -134,6 +134,12 @@ pub struct AppShell {
     menu_delete_armed: bool,
     /// 是否正在后台导出（防重复点击）。
     exporting: bool,
+    /// 下一帧要打开搜索浮层（事件回调里没有 `&mut Window`）。
+    pending_search: bool,
+    /// `MENGHUNOTE_SEARCH_ON_START` 只用一次（关闭后不再自动开）。
+    search_auto_used: bool,
+    /// 搜索浮层（`None` = 关闭）。
+    search: Option<Entity<crate::search_overlay::SearchOverlay>>,
     /// 正在行内重命名的节点（含输入框实体）。
     editing: Option<Editing>,
     /// 下一帧需要把焦点给新的输入框（订阅回调里没有 `&mut Window`）。
@@ -166,6 +172,78 @@ struct ContextMenu {
 }
 
 impl AppShell {
+    /// 打开搜索浮层（`Ctrl+K` / `Ctrl+F`）。
+    ///
+    /// 创建与聚焦都在这里做：事件回调里拿不到 `&mut Window`，所以由 render 的
+    /// "待打开"标记转进来一次。
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            return;
+        }
+        let weak = cx.weak_entity();
+        // 打开一条结果：按 note_id 在树里找节点 → 复用 open_entry；找不到说明笔记已删。
+        let on_open: crate::search_overlay::OpenHandler = {
+            let weak = weak.clone();
+            std::rc::Rc::new(move |note_id: &str, window: &mut Window, cx: &mut App| {
+                let Some(shell) = weak.upgrade() else {
+                    return;
+                };
+                shell.update(cx, |shell, cx| {
+                    let index = shell
+                        .tree
+                        .iter()
+                        .position(|entry| entry.note_id.as_deref() == Some(note_id));
+                    match index {
+                        Some(index) => {
+                            eprintln!(
+                                "[menghunote] 打开搜索结果 note={note_id}（树节点 #{index}）"
+                            );
+                            shell.open_entry(index, cx);
+                            shell.close_search(window, cx);
+                        }
+                        None => {
+                            // 笔记已删：留在浮层里，给一行提示。
+                            eprintln!("[menghunote] 搜索结果已失效 note={note_id}（树里找不到）");
+                            shell.notice = Some("笔记已不存在".to_owned());
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+        };
+        let on_close: crate::search_overlay::CloseHandler =
+            std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
+                if let Some(shell) = weak.upgrade() {
+                    shell.update(cx, |shell, cx| {
+                        shell.close_search(window, cx);
+                    });
+                }
+            });
+        let vault = self.vault.clone();
+        let overlay = cx.new(|cx| {
+            crate::search_overlay::SearchOverlay::new(vault, window, cx, on_open, on_close)
+        });
+        overlay.update(cx, |overlay, cx| overlay.focus_input(window, cx));
+        trace_menu!("[menghunote] 打开搜索浮层");
+        self.search = Some(overlay);
+        cx.notify();
+    }
+
+    /// 关闭搜索浮层并把焦点还给正文编辑器。
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_none() {
+            return;
+        }
+        trace_menu!("[menghunote] 关闭搜索浮层");
+        // 焦点回到编辑器：`EntityInputHandler` 重新成为输入目标，编辑器 IME 状态无需重建。
+        if let Some(active) = &self.active {
+            active.view.update(cx, |_view, cx| {
+                cx.focus_self(window);
+            });
+        }
+        cx.notify();
+    }
+
     /// 组装根视图：读一次树，并打开第一篇可打开的笔记。
     pub fn new(vault: Vault, vault_label: String, cx: &mut Context<Self>) -> Self {
         let mut shell = Self {
@@ -180,6 +258,9 @@ impl AppShell {
             menu_delete_armed: false,
             editing: None,
             exporting: false,
+            pending_search: false,
+            search_auto_used: false,
+            search: None,
             pending_focus_rename: false,
             menu_opened_at: None,
             menu_painted: std::cell::Cell::new(false),
@@ -800,6 +881,12 @@ impl AppShell {
                     shell.commit_editing_from_outside(cx);
                 }
             }
+            EditorEvent::SearchRequested => {
+                // 编辑器只发事件；窗口在宿主手里（事件回调拿不到 `&mut Window`），
+                // 因此置一个待打开标记，下一帧 render 里真正创建浮层。
+                shell.pending_search = true;
+                cx.notify();
+            }
         });
 
         // 2) 再排空旧文档：超时则**中止切换**，不许静默丢编辑。
@@ -1293,8 +1380,23 @@ impl Render for AppShell {
                 }));
         }
 
+        // 开发开关：自动打开一次搜索浮层（给 UI 冒烟/截图用，正常运行时不存在）。
+        // 快捷键 `Ctrl+K` 在自动化环境里注不进去（前台被别的窗口占着，见 AGENTS §6），
+        // 所以留这个开关让脚本能稳定截到浮层。
+        if !self.search_auto_used && std::env::var_os("MENGHUNOTE_SEARCH_ON_START").is_some() {
+            self.search_auto_used = true;
+            self.pending_search = true;
+        }
+        // 「请打开搜索」在事件回调里置位，这里才拿得到 `&mut Window`。
+        if self.pending_search {
+            self.pending_search = false;
+            self.open_search(window, cx);
+        }
+
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main();
+        // 浮层同样渲染在根层（侧栏会裁剪子元素）。
+        let search = self.search.clone();
         // 菜单渲染在**根层**：侧栏是 `overflow_y_scroll`，放里面会被裁掉。
         let popup = self.render_menu(window, cx);
         div()
@@ -1334,6 +1436,7 @@ impl Render for AppShell {
             .child(sidebar)
             .child(main)
             .when_some(popup, |this, popup| this.child(popup))
+            .when_some(search, |this, search| this.child(search))
     }
 }
 

@@ -9,7 +9,7 @@
 #     不再固定 sleep。
 param(
     [string]$Exe = "target\debug\menghunote-app.exe",
-    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside", "projection", "displayedit", "cursorkeys", "blockcaret", "export", "shot", "exportstress", "quotehit")]
+    [ValidateSet("menu", "delete", "toggle", "rename", "renamecancel", "f2", "renameoutside", "projection", "displayedit", "cursorkeys", "blockcaret", "export", "shot", "exportstress", "quotehit", "search", "searchreal")]
     [string]$Scenario = "menu",
     [string]$Screenshot = "",
     [string]$Vault = "",
@@ -38,6 +38,8 @@ public class UiSmoke {
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -87,6 +89,7 @@ Remove-Item $outPath -ErrorAction SilentlyContinue
 if ($Vault) { $env:MENGHUNOTE_DEV_VAULT = $Vault }
 $env:MENGHUNOTE_TRACE_MENU = "1"
 $env:MENGHUNOTE_TRACE_MOUSE = "1"
+if ($Scenario -in @('search', 'searchreal')) { $env:MENGHUNOTE_SEARCH_ON_START = "1" }
 
 $exePath = Join-Path $repo $Exe
 $launchWatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -194,6 +197,49 @@ function TypeText([string]$text) {
         [UiSmoke]::PostMessage($h, 0x0102, [IntPtr][int][char]$ch, [IntPtr]0) | Out-Null
         Start-Sleep -Milliseconds 30
     }
+}
+function Focus-App {
+    # Windows 前台锁：attach 到当前前台线程再 SetForegroundWindow，否则后台进程抢不到前台。
+    for ($i = 0; $i -lt 40; $i++) {
+        $fg = [UiSmoke]::GetForegroundWindow()
+        if ($fg -eq $h) { return $true }
+        $fgThread = [UiSmoke]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)
+        $me = [UiSmoke]::GetCurrentThreadId()
+        $attached = $false
+        if ($fgThread -ne 0 -and $fgThread -ne $me) {
+            $attached = [UiSmoke]::AttachThreadInput($me, $fgThread, $true)
+        }
+        [UiSmoke]::SetForegroundWindow($h) | Out-Null
+        [UiSmoke]::BringWindowToTop($h) | Out-Null
+        if ($attached) { [UiSmoke]::AttachThreadInput($me, $fgThread, $false) | Out-Null }
+        Start-Sleep -Milliseconds 50
+    }
+    return ([UiSmoke]::GetForegroundWindow() -eq $h)
+}
+function PressCtrlKey([int]$vk) {
+    # 本机前台被 DSH GUI 占着，keybd_event 的按键会落到前台窗口而不是被测窗口。
+    # 折中：keybd_event 只按 **Ctrl**（更新全局键状态），K 的 WM_KEYDOWN/UP 直接
+    # PostMessage 给被测窗口。必须先确认 Ctrl 真的按下去了再发 K，否则会偶发
+    # 收到 ctrl=false（实测过一次，按太快）。
+    [UiSmoke]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
+    for ($i = 0; $i -lt 40; $i++) {
+        # `GetKeyState` 只反映**本线程**队列里的键状态，注入的按键看不到；必须用全局异步状态。
+        if (([UiSmoke]::GetAsyncKeyState(0x11) -band 0x8000) -ne 0) { break }
+        Start-Sleep -Milliseconds 20
+    }
+    Start-Sleep -Milliseconds 80
+    [UiSmoke]::PostMessage($h, 0x0100, [IntPtr]$vk, [IntPtr]0) | Out-Null
+    Start-Sleep -Milliseconds 80
+    [UiSmoke]::PostMessage($h, 0x0101, [IntPtr]$vk, [IntPtr]0) | Out-Null
+    Start-Sleep -Milliseconds 60
+    [UiSmoke]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+}
+function PressRealKey([int]$vk) {
+    [UiSmoke]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 30
+    [UiSmoke]::keybd_event([byte]$vk, 0, 2, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
 }
 function PressKey([int]$vk) {
     [UiSmoke]::PostMessage($h, 0x0100, [IntPtr]$vk, [IntPtr]0) | Out-Null
@@ -420,6 +466,35 @@ switch ($Scenario) {
         Start-Sleep -Milliseconds 500
         Save-Shot ($Screenshot -replace '\.png$', '-select.png')
         Write-Output "quotehit ok"
+    }
+    "search" {
+        # 自绘输入（IME 版）的 Esc 路径：浮层打开后打字 → Esc 关闭 → 编辑器继续可输入。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 800
+        TypeText "menghunote"
+        Start-Sleep -Milliseconds 600
+        Save-Shot ($Screenshot -replace '\.png$', '-typed.png')
+        PressKey 0x1B              # Esc：组合外 → 关浮层
+        if ((Wait-ForLog "关闭搜索浮层" 5000) -lt 0) { Fail "Esc 没有关闭搜索浮层" }
+        Start-Sleep -Milliseconds 400
+        TypeText "ZZ"
+        Start-Sleep -Milliseconds 500
+        Save-Shot ($Screenshot -replace '\.png$', '-after.png')
+        Write-Output "search ok"
+    }
+    "searchreal" {
+        # 真实索引：后台线程先对账，再查（打字用 ASCII，CJK 查询由集成测试覆盖）。
+        if ((Wait-ForLog "打开搜索浮层" 8000) -lt 0) { Fail "搜索浮层没有自动打开" }
+        Start-Sleep -Milliseconds 1200
+        TypeText "menghunote"
+        Start-Sleep -Milliseconds 1200
+        Save-Shot ($Screenshot -replace '\.png$', '-hits.png')
+        PressKey 0x0D              # Enter 打开第一条
+        if ((Wait-ForLog "打开搜索结果" 5000) -lt 0) { Fail "Enter 没有打开选中结果" }
+        if ((Wait-ForLog "关闭搜索浮层" 5000) -lt 0) { Fail "打开后浮层没有关闭" }
+        Start-Sleep -Milliseconds 600
+        Save-Shot ($Screenshot -replace '\.png$', '-opened.png')
+        Write-Output "searchreal ok"
     }
     "delete" {
         # 笔记菜单自 task-37 起是「重命名 / 删除」两项：删除是**第二项**，

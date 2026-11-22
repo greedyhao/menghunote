@@ -179,3 +179,21 @@ pub fn quote_bar_color() -> Rgba {
 pub fn quote_text_color() -> Rgba {
     rgb(0x57606a)
 }
+
+/// 搜索结果里高亮片段的底色（浅黄，和正文区分开）。
+#[must_use]
+pub fn search_highlight_bg() -> Rgba {
+    rgb(0xfff1b8)
+}
+
+/// 高亮片段的文字色（保持与正文一致的深浅，避免"高亮处反而看不清"）。
+#[must_use]
+pub fn search_highlight_text() -> Rgba {
+    rgb(0x24292f)
+}
+
+/// 索引降级/查询失败的提示色。
+#[must_use]
+pub fn search_warn_text() -> Rgba {
+    rgb(0xb35900)
+}

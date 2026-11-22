@@ -37,10 +37,13 @@ mod actor;
 mod body_doc;
 mod connection;
 mod error;
+mod events;
+mod index_manifest;
 mod journal;
 mod materialize;
 mod migrate;
 mod projector;
+mod read_snapshot;
 pub mod session;
 mod store;
 mod structure;
@@ -52,6 +55,8 @@ pub use body_doc::{
     BodyDoc, PendingUpdate, APP_DOC_SCHEMA, BODY_CONTAINER, CODEC_VERSION, MIN_READER,
 };
 pub use error::StorageError;
+pub use events::{StorageEvent, StorageEventSubscriber, DEFAULT_EVENT_QUEUE};
+pub use index_manifest::{list_index_manifest, IndexManifestRow};
 pub use journal::{
     DurableSink, FlushReport, JournalEntry, JournalWriter, PendingJournal, VaultJournalSink,
 };
@@ -61,6 +66,7 @@ pub use materialize::{
 };
 pub use migrate::SCHEMA_VERSION;
 pub use projector::{project, trashed_notes, visible_notes, NoteView, ProjectionReport};
+pub use read_snapshot::ReadSnapshot;
 pub use rusqlite::types::Value;
 pub use store::{
     append_updates, create_body_doc, create_note_slot, end_frontier_at, end_vv_at, load_body_doc,

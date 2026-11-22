@@ -176,3 +176,15 @@ B 的计算调度、缓存优化、UI 细节、旧路径别名。
 ## 10. 一句话
 
 **先把两套单位/坐标收成 `text` 的唯一实现（含 storage 侧迁移），这个门禁过了，才开 session 与 UI。**
+
+---
+
+## 11. 追加（2026-11-10）：第 5 个成员 `crates/search`
+
+- 新增 **`crates/search`（package `menghunote-search`）**：检索索引与查询（Tantivy 0.27 + cang-jie 0.22）。
+- 依赖方向：**`app → search → storage`**；`search` 不得依赖 `app`/`editor`/GPUI；`storage`/`editor`/`text`
+  **不得依赖** `search`（含 dev-dependency）。
+- `storage` 对 search 只暴露**只读投影快照**、`meta` 指针读写、以及轻量变更通知；
+  **storage 不得知道 Tantivy / IndexWriter**。
+- 将来 MCP/CLI → `search`/`storage`，不反向依赖 `app`。
+- 细节（索引代、fingerprint、新鲜度协议、删除硬保证、v1 范围）见 [ADR 0005](0005-search-index.md)。

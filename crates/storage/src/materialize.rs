@@ -114,6 +114,11 @@ pub fn materialize_body(
 
     let affected = vault.exec_transaction(&statements, &[])?;
     if affected.first().copied().unwrap_or(0) == 1 {
+        // 提交成功之后才发通知：订阅者被唤醒时读到的一定是已提交的数据。
+        // `try_send` 不阻塞写；没人收 / 队列满时 storage 会置"需要全量对账"标记。
+        vault.publish_event(crate::StorageEvent::BodyMaterialized {
+            note_id: note_id.to_owned(),
+        });
         return Ok(MaterializeOutcome::Applied {
             note_id: note_id.to_owned(),
             body_seq: up_to_seq,
