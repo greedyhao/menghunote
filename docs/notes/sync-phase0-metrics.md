@@ -461,3 +461,141 @@ merge 是超线性的；**不能**把该倍率外推到 128 MiB 上限。
 - 常规回归（非 ignored）未改：`crates/sync/tests/engine.rs`、
   `crates/storage/tests/sync_inbox_batch.rs` 仍覆盖批量 ack/冲突/前缀语义；
   本次只新增/扩展 ignored 的 release 基准。
+
+### 8.7 `checkpoint validate` 覆盖日志扫描（S = 1k / 5k / 25k，2026-11-21）
+
+> 任务 4 P1 探针：`crates/sync/tests/phase1a_release.rs::checkpoint_validate_scan_cost`
+> （`#[ignore = "manual benchmark"]`）。只加基准与文档：**不改**生产
+> `scan_coverage_log`，不改 relay / `sync-proto` / schema，未 commit。
+
+#### 8.7.1 目的与口径
+
+`CheckpointWriter::prepare` 在 coverage 有缺口时会把 pending receipt 落盘，
+`validate` 的 `ensure_coverage_proven` 再从持久游标沿 relay 日志**连续扫到 S**
+（每页 256 条，`COVERAGE_SCAN_MAX_PAGES = 4096`）。本探针只量这段**真实扫描**随 S 的
+墙钟与页数：不复制 scan 实现，而是在测试侧用 `CountingRelay` 包装 FakeRelay，
+统计真实 `scan_coverage_log` 发起的 `RelayClient::log` 调用（validate 仍走生产
+`CheckpointWriter::validate`）。
+
+| 指标 | 口径 |
+| --- | --- |
+| `S` | relay 日志事件总数 = checkpoint 的 `covered_seq` |
+| `pages` | validate 期间真实 `log()` 调用次数（从持久游标 `c0` 扫到 S，应 = `ceil(S/256)`） |
+| `scan_ms` | 第一次 `log()` 开始到最后一次 `log()` 返回的墙钟跨度；含页间逐事件核对（visitor），**不含**最后一页返回之后的 visitor（≤256 条） |
+| `log_ms` | 仅 `log()` 内部（FakeRelay 取页 + 克隆事件）的墙钟 |
+| `visitor ≈` | `scan_ms - log_ms`：逐事件序号/证据核对开销 |
+| `validate_ms` | 整个 `validate` 墙钟（含 manifest/快照读回导入、尾部 ASSET 下载实证、coverage scan） |
+| `prepare_*` | prepare 阶段 `try_record_coverage_receipt` 的同口径扫描（单次、含首扫冷启动，不是中位数） |
+
+#### 8.7.2 夹具与测量方式（FakeRelay + 真 SQLite）
+
+- 每个 S 新建 fresh vault（`CARGO_TARGET_TMPDIR` 下真 SQLite）+ `ensure_structure_row`
+  + 1 篇小正文（`prepare` 需要可导出的本地快照/head VV，与 coverage 无关）；
+  `RELAY_CURSOR_META = "c0"`、`sync.log_id` 与 FakeRelay 一致。
+- relay 日志合成 `1..=S` 条：
+  - `1..=S-1`：`seq % 7 == 0` 的发布为 ASSET（`publish_event` 的 dummy 事件），
+    其余为 UPDATE（`publish_event`）；这一段都在本地 **integrated 连续前缀**内
+    （直接写 `sync.integrated_seq = S-1`，合成值）。
+  - 第 S 条是 `publish_real_asset` 发出的**真实 ASSET**（1 part、可解密、
+    明文 `coverage scan cost tail asset`）。
+  - 整体 ASSET 占比 **14.3%**（143 / 715 / 3 572 条），落在 10–20% 要求内。
+- 因此 `local_coverage` 把 `1..=S-1` 视为已消费前缀，唯一缺口是第 S 条 ASSET：
+  `prepare` 会扫一遍日志并落 pending receipt；`validate` 再从 `c0` 扫一遍、
+  逐条核对 receipt 候选，并对尾部 ASSET 真实下载/解密/AEAD 验证。
+- 每档同一夹具连续 `validate` 3 次（`prepare` 只做一次；每次 validate 前清零计数器），
+  取中位数；一次进程内 3 档串行（1k → 5k → 25k）。
+- 硬断言（与时间无关）：`covered_seq == S`、`coverage_verified_candidates == 1`、
+  `coverage_durable_assets == 0`、每次 validate 的 `pages == ceil(S/256)`。
+  **只打印不 assert 时间。**
+
+环境：Linux 6.8.0-149（Ubuntu），Intel Xeon Gold 6330 @ 2.00 GHz，8 vCPU，
+15 GiB RAM，ext4（`/dev/sda1`，空闲 16 G）；`rustc`/`cargo` **1.100.0**，
+`--release`（`opt-level=3`、`debug=0`、无 LTO）。测量时机器为共享状态
+（其它 agent 的构建/测试同时跑），load average 约 **0.1–2.4**（8 vCPU），
+所以绝对值只看量级/线性度（同一探针隔几分钟复跑 4 次，25k 的 `scan_ms` 中位数
+3.796 / 3.830 / 3.895 / 3.965 ms，最大偏差 <5%）。
+
+```bash
+export LIBRARY_PATH=/home/dev/xkb-sysroot/root/usr/lib/x86_64-linux-gnu
+export PKG_CONFIG_PATH=/home/dev/xkb-sysroot/root/usr/lib/x86_64-linux-gnu/pkgconfig
+
+# 只跑本探针（首次无编译 1.18 s；探针本身约 0.6 s）
+cargo test --release -p menghunote-sync --test phase1a_release \
+  checkpoint_validate_scan_cost -- --ignored --nocapture
+
+# 整个 ignored 文件（另有 baseline_apply 探针；本次 2 passed、测试 66.23 s，
+# 含 storage/sync 增量重编译的整条命令 88.44 s）
+cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --nocapture
+```
+
+> 注意：`cargo test ... -- --ignored` 默认按 test harness 并行执行**两个** ignored 探针，
+> `scan_ms` 会被另一探针的 CPU 竞争抬高（实测 1k：0.153 vs 单跑的 0.076 ms；
+> 25k：3.878 vs 3.796 ms）。本节表格取**单独运行本探针**的数据。
+
+#### 8.7.3 原始输出（`target/tmp/phase1a-logs/scan-cost-run.log`）
+
+```text
+[phase1a] scan_cost setup S=1000 asset_events=143 update_events=857 asset_pct=14.3 prepare_pages=4 prepare_scan_ms=0.114 prepare_log_ms=0.096
+[phase1a] scan_cost S=1000 run=0 pages=4 scan_ms=0.083 validate_ms=0.710 log_ms=0.062 part_calls=4 part_ms=0.002
+[phase1a] scan_cost S=1000 run=1 pages=4 scan_ms=0.076 validate_ms=0.542 log_ms=0.057 part_calls=4 part_ms=0.001
+[phase1a] scan_cost S=1000 run=2 pages=4 scan_ms=0.074 validate_ms=0.514 log_ms=0.055 part_calls=4 part_ms=0.002
+[phase1a] scan_cost S=1000 pages=4 scan_ms=0.076 (median of 3; raw_scan_ms=[0.08260899999999999, 0.076162, 0.073966] log_ms_median=0.057 validate_ms_median=0.542 validate_ms_raw=[0.710135, 0.542165, 0.514101] part_calls=4 part_ms_raw=[0.001698, 0.001321, 0.001602])
+[phase1a] scan_cost setup S=5000 asset_events=715 update_events=4285 asset_pct=14.3 prepare_pages=20 prepare_scan_ms=0.450 prepare_log_ms=0.342
+[phase1a] scan_cost S=5000 run=0 pages=20 scan_ms=0.479 validate_ms=0.919 log_ms=0.344 part_calls=4 part_ms=0.002
+[phase1a] scan_cost S=5000 run=1 pages=20 scan_ms=0.440 validate_ms=0.823 log_ms=0.316 part_calls=4 part_ms=0.002
+[phase1a] scan_cost S=5000 run=2 pages=20 scan_ms=0.617 validate_ms=1.003 log_ms=0.439 part_calls=4 part_ms=0.002
+[phase1a] scan_cost S=5000 pages=20 scan_ms=0.479 (median of 3; raw_scan_ms=[0.478646, 0.440245, 0.617419] log_ms_median=0.344 validate_ms_median=0.919 validate_ms_raw=[0.918995, 0.823261, 1.003386] part_calls=4 part_ms_raw=[0.00223, 0.001847, 0.001587])
+[phase1a] scan_cost setup S=25000 asset_events=3572 update_events=21428 asset_pct=14.3 prepare_pages=98 prepare_scan_ms=3.660 prepare_log_ms=3.141
+[phase1a] scan_cost S=25000 run=0 pages=98 scan_ms=3.796 validate_ms=4.376 log_ms=3.177 part_calls=4 part_ms=0.003
+[phase1a] scan_cost S=25000 run=1 pages=98 scan_ms=3.779 validate_ms=4.356 log_ms=3.183 part_calls=4 part_ms=0.002
+[phase1a] scan_cost S=25000 run=2 pages=98 scan_ms=3.829 validate_ms=4.468 log_ms=3.197 part_calls=4 part_ms=0.002
+[phase1a] scan_cost S=25000 pages=98 scan_ms=3.796 (median of 3; raw_scan_ms=[3.796107, 3.7794470000000002, 3.829243] log_ms_median=3.183 validate_ms_median=4.376 validate_ms_raw=[4.376248, 4.35638, 4.46814] part_calls=4 part_ms_raw=[0.002683, 0.001617, 0.001777])
+```
+
+#### 8.7.4 结果
+
+| S | 事件（ASSET / UPDATE） | pages | `scan_ms` 中位数 | raw `scan_ms` | `log_ms` 中位数 | visitor ≈ | `validate_ms` 中位数 | prepare pages / `prepare_scan_ms` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 000 | 143 / 857 | 4 | **0.076 ms** | 0.074–0.083 | 0.057 ms | 0.019 ms | **0.542 ms** | 4 / 0.114 ms |
+| 5 000 | 715 / 4 285 | 20 | **0.479 ms** | 0.440–0.617 | 0.344 ms | 0.135 ms | **0.919 ms** | 20 / 0.450 ms |
+| 25 000 | 3 572 / 21 428 | 98 | **3.796 ms** | 3.779–3.829 | 3.183 ms | 0.613 ms | **4.376 ms** | 98 / 3.660 ms |
+
+读法：
+
+1. **逐事件 visitor 是线性的、常数很小**：`scan_ms - log_ms` ≈ 0.019 / 0.135 / 0.613 ms，
+   折合 **19–27 ns/事件**（25 000 条 ≈ 0.6 ms）。页数严格 = `ceil(S/256)`
+   （4 / 20 / 98）。
+2. **本探针的 `scan_ms` 主要来自 FakeRelay 取页，而不是生产 scan 的 visitor**：
+   FakeRelay 的 `log()` 每页都从 `Vec` 头 `iter().filter(seq > cursor)` 再 `take(256)`，
+   跳过的前缀随页号增长。25k / 98 页合计约 `256 × (0+1+…+97)` ≈ **1.22M 次跳过**，
+   这就是 `log_ms` 3.18 ms 的主要来源（1k/5k 分别只有约 1.5k/49k 次）。
+   真实 relay 用游标/索引取页，理想成本 O(page)，**本表的 `scan_ms` 是上界**，
+   不能按它外推真实 relay 的扫描成本。
+3. **生产口径下真正要紧的是页数 × 网络 RTT**：S = 25 000 时是 **98 次串行页请求**
+   （每页 256 条）；visitor 本身只有约 0.6 ms。FakeRelay 无网络，所以本表只能说明
+   “CPU/扫描逻辑不是瓶颈”，不能给出真实端到端延迟。
+4. **prepare 也会扫一遍同一区间**（写 pending receipt）：25k 时 `prepare_scan_ms` 3.66 ms
+   （单次），即一次 “prepare → validate” 最多访问 **2 × S** 条事件；
+   若本地账簿已完整覆盖（`missing` 为空），`ensure_coverage_proven` 直接返回、
+   不扫描（本探针未测这一档，按代码路径）。
+
+#### 8.7.5 限制（不外推）
+
+- **FakeRelay 不是真实 relay**：纯内存、无 TLS/网络/RTT/重试/真实 relay GC；
+  `log()` 每页从 `Vec` 头线性 filter（见读法 2），使 `scan_ms` 含
+  ≈`O(S²/256)` 的夹具 artifact。真实 relay 的游标分页成本未测。
+- **合成日志**：85.7% 的 UPDATE 是不含真实负载的 `publish_event`；integrated 前缀是
+  直接写 meta 的合成值（不是 engine 真实 pull/integrate 推进）；前缀内的 ASSET
+  事件不下载验证——生产里它们应由 engine 的 durable skipped-asset 记录证明，
+  本探针只借用生产代码信任的“连续前缀 = 已消费”不变量。只有尾部第 S 条 ASSET
+  是真实密文并走完整 receipt + 下载/解密/AEAD 验证。
+- **夹具是单文档小正文**：manifest/snapshot 固定成本（`validate_ms - scan_ms` ≈ 0.44–0.58 ms）
+  不随 S 缩放；真实 checkpoint 的快照导入/资产实证成本本探针只测了 1 条尾部 ASSET。
+- **没有覆盖的形状**：缺口在持久游标之前（durable skipped-asset 路径）、多个缺口、
+  ASSET 占 10–20% 之外、S < 1k / > 1M（`COVERAGE_SCAN_MAX_PAGES = 4096` 上限）、
+  relay GC 后日志不可读、真实网络抖动；均未测。
+- **页大小耦合**：256 是生产私有常量，探针里用 `ceil(S/256)` 校验页数；生产改页大小
+  时探针与本节需同步。
+- **时间噪声**：共享 8 vCPU 机器、load 0.1–2.4；5k 的第 3 轮 0.617 ms（比中位数高 29%），
+  25k 的 prepare 曾出现一次 8.8 ms 冷启动离群值。绝对值只用于量级/线性度判断。
+- 探针**未 commit**；写作用域仅 `crates/sync/tests/phase1a_release.rs` 与本文件。

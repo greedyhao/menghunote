@@ -4,6 +4,7 @@ mod support;
 
 use std::time::Duration;
 
+use loro::VersionVector;
 use support::*;
 
 use menghunote_storage::session::{
@@ -15,9 +16,10 @@ use menghunote_storage::{
     apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_state,
     begin_baseline_apply, create_note_slot, finish_baseline_apply, load_body_doc, load_head,
     reset_baseline_apply_debug, set_sync_log_id, store_inbox_verified_batch, sync_cursor_state,
-    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BodyDoc, SyncContext, UpdateRecord,
-    Value, Vault, VerifiedInboxRow, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
-    META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
+    BaselineApplyFinish, BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc,
+    StorageError, SyncContext, UpdateRecord, Value, Vault, VerifiedInboxRow,
+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
+    META_SYNC_RELAY_CURSOR, SCHEMA_VERSION,
 };
 use menghunote_text::UnicodeScalar;
 
@@ -85,14 +87,89 @@ fn meta_remote_known_count(vault: &Vault, doc_id: &str) -> i64 {
     )
 }
 
+/// 读某篇文档的远端已知 VV；没有记录返回 `None`。
+fn meta_remote_known(vault: &Vault, doc_id: &str) -> Option<VersionVector> {
+    meta_remote_known_bytes(vault, doc_id).map(|bytes| VersionVector::decode(&bytes).expect("解码"))
+}
+
+/// 读某篇文档的远端已知 VV 原始字节（用于断言「不降级」）。
+fn meta_remote_known_bytes(vault: &Vault, doc_id: &str) -> Option<Vec<u8>> {
+    let rows = vault
+        .query(
+            "SELECT value FROM meta WHERE key=?1",
+            &[Value::Text(format!("sync.remote_known_vv.{doc_id}"))],
+        )
+        .expect("meta 查询");
+    match rows.first().and_then(|row| row.first()) {
+        Some(Value::Blob(bytes)) => Some(bytes.clone()),
+        None => None,
+        other => panic!("remote_known 值异常：{other:?}"),
+    }
+}
+
+/// 注入「读旧值之后、CAS 之前 meta 被并发改写」：在 baseline_apply_docs 首次写入时
+/// 把该文档的远端已知 VV 改成别的字节（同一事务内可见，CAS 必然不命中）。
+fn install_remote_known_clobber_trigger(vault: &Vault, doc_id: &str) {
+    let sql = format!(
+        "CREATE TRIGGER remote_known_cas_race BEFORE INSERT ON baseline_apply_docs \
+         BEGIN \
+           INSERT OR REPLACE INTO meta(key,value) \
+           VALUES('sync.remote_known_vv.{doc_id}', X'DEADBEEF'); \
+         END;"
+    );
+    vault.exec(&sql, &[]).expect("安装竞态触发器");
+}
+
 fn snapshot(doc_id: &str, peer: u64, text: &str) -> Vec<u8> {
     let doc = BodyDoc::create(doc_id, peer).expect("创建基线 LoroDoc");
     doc.insert_scalars(0, text).expect("写基线正文");
     doc.export_snapshot().expect("导出基线 snapshot")
 }
 
-fn begin(vault: &Vault, s: u64, cursor: &str) {
-    begin_baseline_apply(vault, &[7; 16], s, cursor).expect("begin baseline");
+/// 预期参与集合：只声明文档（本文件里大多数用例没有资产）。
+fn expectation(docs: &[&str]) -> BaselineExpectation {
+    BaselineExpectation::new(
+        docs.iter().map(|doc_id| (*doc_id).to_owned()),
+        std::iter::empty::<[u8; 32]>(),
+    )
+}
+
+/// 预期参与集合：文档 + 资产。
+fn expectation_with_assets(docs: &[&str], assets: &[[u8; 32]]) -> BaselineExpectation {
+    BaselineExpectation::new(
+        docs.iter().map(|doc_id| (*doc_id).to_owned()),
+        assets.iter().copied(),
+    )
+}
+
+/// begin 一份**空预期集合**的 staging（只关心 cursor/journal 语义的用例）。
+fn begin(vault: &Vault, s: u64, cursor: &str) -> menghunote_storage::BaselineApplyState {
+    begin_with(vault, s, cursor, &BaselineExpectation::default())
+}
+
+/// begin 一份显式声明预期参与集合的 staging。
+fn begin_with(
+    vault: &Vault,
+    s: u64,
+    cursor: &str,
+    expected: &BaselineExpectation,
+) -> menghunote_storage::BaselineApplyState {
+    begin_baseline_apply(vault, &[7; 16], s, cursor, expected).expect("begin baseline")
+}
+
+/// 读某篇文档的 tombstone action（当前 journal）。
+fn tombstone_action(vault: &Vault, doc_id: &str) -> Option<String> {
+    let rows = vault
+        .query(
+            "SELECT action FROM baseline_apply_tombstones WHERE doc_id=?1",
+            &[Value::Text(doc_id.to_owned())],
+        )
+        .expect("tombstone 查询");
+    match rows.first().and_then(|row| row.first()) {
+        Some(Value::Text(value)) => Some(value.clone()),
+        Some(other) => panic!("tombstone action 异常：{other:?}"),
+        None => None,
+    }
 }
 
 /// 模拟"已有库"的同步水位；`None` 表示 meta 缺省。
@@ -153,7 +230,7 @@ fn baseline_merge_preserves_local_edit_and_advances_cursor() {
     let local = local_doc(&vault, "doc-1", "local");
     let snap = snapshot("doc-1", PEER_B, "remote");
 
-    begin(&vault, 5, "source-cursor");
+    begin_with(&vault, 5, "source-cursor", &expectation(&["doc-1"]));
     assert_eq!(
         baseline_apply_state(&vault)
             .expect("state")
@@ -273,7 +350,7 @@ fn batch_is_resumable_after_reopen_and_idempotent() {
     let snap_a = snapshot("doc-a", PEER_B, "a-remote");
     let snap_b = snapshot("doc-b", PEER_B, "b-remote");
 
-    begin(&vault, 9, "src");
+    begin_with(&vault, 9, "src", &expectation(&["doc-a", "doc-b"]));
     apply_baseline_batch(&vault, &[("doc-a".to_owned(), snap_a.clone())], &[]).expect("batch a");
     let cursor = sync_cursor_state(&vault).expect("cursor before finish");
     assert_eq!(cursor.received_seq, 0);
@@ -317,7 +394,7 @@ fn batch_is_resumable_after_reopen_and_idempotent() {
 fn finish_cursor_cas_conflict_does_not_advance() {
     let (_dir, vault) = fresh_vault();
     local_doc(&vault, "doc-1", "local");
-    begin(&vault, 4, "src");
+    begin_with(&vault, 4, "src", &expectation(&["doc-1"]));
     apply_baseline_batch(
         &vault,
         &[("doc-1".to_owned(), snapshot("doc-1", PEER_B, "remote"))],
@@ -881,7 +958,7 @@ fn replay_same_digest_skips_snapshot_decode() {
 #[test]
 fn tombstone_deletes_previous_baseline_doc_after_begin_clears_staging_tables() {
     let (_dir, vault) = fresh_vault();
-    begin(&vault, 10, "src1");
+    begin_with(&vault, 10, "src1", &expectation(&["doc-x"]));
     apply_baseline_batch(
         &vault,
         &[("doc-x".to_owned(), snapshot("doc-x", PEER_B, "remote body"))],
@@ -1079,4 +1156,621 @@ fn tombstone_deletes_doc_integrated_through_engine_path() {
         "后台 pull 集成来的文档在远端删除后必须 deleted"
     );
     assert_eq!(state.kept_local_edit, 0);
+}
+
+// ---------------------------------------------------------------------------
+// P1-1：finish 完整性（begin 记录预期参与集合，finish 前逐项证明）
+// ---------------------------------------------------------------------------
+
+/// 少跑一批就 finish：必须 Conflict 且一行都不写（旧实现会 Applied 并推进 S，
+/// pull 之后永久跳过这批 relay 事件）。
+#[test]
+fn finish_without_all_docs_is_conflict() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-a", "a-local");
+    local_doc(&vault, "doc-b", "b-local");
+    begin_with(&vault, 5, "src", &expectation(&["doc-a", "doc-b"]));
+
+    let state = apply_baseline_batch(
+        &vault,
+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
+        &[],
+    )
+    .expect("batch a");
+    assert_eq!(state.applied_docs, 1);
+    assert_eq!(state.expected_docs, Some(2));
+    assert!(
+        !state.finishable,
+        "预期集合未齐（doc-b 缺失）时不得声称可 finish"
+    );
+
+    assert_eq!(
+        finish_baseline_apply(&vault, 5, "baseline-cursor").expect("finish"),
+        BaselineApplyFinish::Conflict,
+        "预期集合未齐时 finish 必须 Conflict"
+    );
+
+    // 冲突时一行都不写：水位/meta/游标/journal 全部保持 begin 前状态。
+    let cursor = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor.received_seq, 0, "冲突时不得推进 received");
+    assert_eq!(cursor.integrated_seq, 0, "冲突时不得推进 integrated");
+    assert_eq!(cursor.confirmed_highwater, None, "冲突时不得写 highwater");
+    assert_eq!(relay_cursor(&vault), None, "冲突时不得写 relay cursor");
+    let journal = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
+    assert_eq!(journal.chosen_cursor, None);
+    assert_eq!(journal.applied_docs, 1, "冲突不得回滚已提交批次");
+
+    // 补齐缺失批次后必须能正常 finish（Conflict 不是永久卡死）。
+    let state = apply_baseline_batch(
+        &vault,
+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
+        &[],
+    )
+    .expect("batch b");
+    assert!(state.finishable, "两篇都到齐后必须可 finish");
+    let BaselineApplyFinish::Applied(state) =
+        finish_baseline_apply(&vault, 5, "baseline-cursor").expect("finish")
+    else {
+        panic!("补齐后 finish 必须 Applied");
+    };
+    assert_eq!(state.status, BaselineApplyStatus::Completed);
+    assert_eq!(state.applied_docs, 2);
+    let cursor = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor.received_seq, 5);
+    assert_eq!(cursor.integrated_seq, 5);
+    assert_eq!(cursor.confirmed_highwater, Some(5));
+}
+
+/// 全部分批到齐：finish 正常 Applied。
+#[test]
+fn finish_after_full_batches_is_applied() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-a", "a-local");
+    local_doc(&vault, "doc-b", "b-local");
+    begin_with(&vault, 9, "src", &expectation(&["doc-a", "doc-b"]));
+
+    let first = apply_baseline_batch(
+        &vault,
+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
+        &[],
+    )
+    .expect("batch a");
+    assert_eq!(first.expected_docs, Some(2));
+    assert!(!first.finishable);
+
+    let second = apply_baseline_batch(
+        &vault,
+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
+        &[],
+    )
+    .expect("batch b");
+    assert!(second.finishable);
+
+    let BaselineApplyFinish::Applied(state) =
+        finish_baseline_apply(&vault, 9, "baseline-cursor").expect("finish")
+    else {
+        panic!("完整批次 finish 必须 Applied");
+    };
+    assert_eq!(state.status, BaselineApplyStatus::Completed);
+    assert_eq!(state.applied_docs, 2);
+    assert_eq!(state.expected_docs, Some(2));
+    assert_eq!(state.expected_assets, Some(0));
+    assert!(!state.finishable, "completed 后不再是 finishable");
+    let cursor = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor.received_seq, 9);
+    assert_eq!(cursor.integrated_seq, 9);
+    assert_eq!(cursor.confirmed_highwater, Some(9));
+    assert_eq!(
+        relay_cursor(&vault).as_deref(),
+        Some(b"baseline-cursor".as_slice())
+    );
+}
+
+/// begin 同参数重入幂等（含顺序无关的同一集合）；同 checkpoint 换集合必须冲突，
+/// 且不得清掉已应用进度或预期集合。
+#[test]
+fn begin_idempotent_replay_keeps_expected_set() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-a", "a-local");
+    local_doc(&vault, "doc-b", "b-local");
+    begin_with(&vault, 5, "src", &expectation(&["doc-a", "doc-b"]));
+    apply_baseline_batch(
+        &vault,
+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
+        &[],
+    )
+    .expect("batch a");
+
+    // 同参数 + 同一集合（顺序不同）：幂等重入，保留进度与集合。
+    let replayed = begin_with(&vault, 5, "src", &expectation(&["doc-b", "doc-a"]));
+    assert_eq!(replayed.applied_docs, 1, "重入不得清空已应用批次");
+    assert_eq!(replayed.expected_docs, Some(2), "重入必须保留预期集合");
+    assert_eq!(replayed.source_cursor, "src");
+    assert!(!replayed.finishable);
+
+    // 同 checkpoint/S/cursor 但预期集合不同：必须冲突（不能静默沿用新集合）。
+    let error = begin_baseline_apply(&vault, &[7; 16], 5, "src", &expectation(&["doc-a"]))
+        .expect_err("同一 checkpoint 换预期集合必须冲突");
+    assert!(
+        matches!(error, StorageError::SyncConflict { .. }),
+        "应当是 SyncConflict，实际 {error:?}"
+    );
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(state.applied_docs, 1, "冲突不得清空已应用批次");
+    assert_eq!(state.expected_docs, Some(2), "冲突不得改写预期集合");
+
+    // 补齐后仍能 finish。
+    apply_baseline_batch(
+        &vault,
+        &[("doc-b".to_owned(), snapshot("doc-b", PEER_B, "b-remote"))],
+        &[],
+    )
+    .expect("batch b");
+    assert!(matches!(
+        finish_baseline_apply(&vault, 5, "baseline-cursor").expect("finish"),
+        BaselineApplyFinish::Applied(_)
+    ));
+}
+
+/// 资产少一批同样必须 Conflict（bootstrap 的资产也只能在全部到齐后 finish）。
+#[test]
+fn finish_without_all_assets_is_conflict() {
+    let (_dir, vault) = fresh_vault();
+    local_doc(&vault, "doc-1", "local");
+    let asset_a = BaselineAsset {
+        object_id: [1; 32],
+        asset_hash: [11; 32],
+        byte_len: 3,
+        media_type: Some("text/plain".to_owned()),
+        data: b"aaa".to_vec(),
+    };
+    let asset_b = BaselineAsset {
+        object_id: [2; 32],
+        asset_hash: [12; 32],
+        byte_len: 4,
+        media_type: Some("text/plain".to_owned()),
+        data: b"bbbb".to_vec(),
+    };
+    begin_with(
+        &vault,
+        4,
+        "src",
+        &expectation_with_assets(&["doc-1"], &[[1; 32], [2; 32]]),
+    );
+    apply_baseline_batch(
+        &vault,
+        &[("doc-1".to_owned(), snapshot("doc-1", PEER_B, "remote"))],
+        &[],
+    )
+    .expect("doc batch");
+    let state = apply_baseline_assets(&vault, std::slice::from_ref(&asset_a)).expect("asset a");
+    assert_eq!(state.applied_assets, 1);
+    assert_eq!(state.expected_assets, Some(2));
+    assert!(!state.finishable, "资产少一批时不得声称可 finish");
+
+    assert_eq!(
+        finish_baseline_apply(&vault, 4, "baseline-cursor").expect("finish"),
+        BaselineApplyFinish::Conflict,
+        "预期资产未齐时 finish 必须 Conflict"
+    );
+    // 一行都不写：水位/游标/journal 保持 staging。
+    let cursor = sync_cursor_state(&vault).expect("cursor");
+    assert_eq!(cursor.received_seq, 0);
+    assert_eq!(cursor.integrated_seq, 0);
+    assert_eq!(cursor.confirmed_highwater, None);
+    assert_eq!(relay_cursor(&vault), None);
+    let journal = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
+    assert_eq!(journal.chosen_cursor, None);
+    assert_eq!(journal.applied_assets, 1, "冲突不得回滚已应用资产");
+
+    let state = apply_baseline_assets(&vault, std::slice::from_ref(&asset_b)).expect("asset b");
+    assert!(state.finishable);
+    assert!(matches!(
+        finish_baseline_apply(&vault, 4, "baseline-cursor").expect("finish"),
+        BaselineApplyFinish::Applied(_)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// P1-2：tombstone 判定与 notes 软删之间的 TOCTOU
+// ---------------------------------------------------------------------------
+
+/// 判定（事务外看到无 outbox）之后、事务执行期间插进一条 outbox：事务内重判必须把
+/// action 降级为 kept_local_edit，`notes.deleted` 保持 0。
+#[test]
+fn tombstone_outbox_race_between_decision_and_transaction_keeps_note() {
+    let (_dir, vault) = fresh_vault();
+    // doc-a：本批要 merge 的基线文档；触发器挂在它的 journal 写入上。
+    local_doc(&vault, "doc-a", "a-local");
+
+    // doc-pull：普通 pull 集成来的文档（远端已知、无 outbox），判定本来会删除它。
+    seed_note(&vault, "note-pull", "doc-pull");
+    let mut session =
+        DocumentSession::open(&vault, "doc-pull", session_options(Some(SYNC_CTX))).expect("会话");
+    let delta = session
+        .apply_remote(&remote_update("doc-pull", PEER_B, "pulled body"))
+        .expect("导入远端")
+        .expect("应当产生 LiveDelta");
+    assert_eq!(delta.source, ChangeSource::Remote);
+    session.flush(FlushReason::Manual);
+    session
+        .wait_for_durable(LiveRev(1), Duration::from_secs(5))
+        .expect("远端导入必须 durable");
+    drop(session);
+    assert_eq!(count(&vault, "SELECT count(*) FROM sync_outbox", &[]), 0);
+    assert_eq!(meta_remote_known_count(&vault, "doc-pull"), 1);
+
+    // 注入竞态：docs 批的 journal 写入（先于同批 tombstone 语句）触发一条 outbox 行，
+    // 模拟"判定完成后本地编辑的 A 事务刚好提交"。
+    vault
+        .exec(
+            "CREATE TRIGGER baseline_race_outbox BEFORE INSERT ON baseline_apply_docs \
+             WHEN NEW.doc_id='doc-a' BEGIN \
+               INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,ciphertext) \
+               VALUES('race-outbox','race','doc-pull',1,1,NULL); \
+             END;",
+            &[],
+        )
+        .expect("注入竞态触发器");
+
+    begin_with(&vault, 7, "src", &expectation(&["doc-a"]));
+    let state = apply_baseline_batch(
+        &vault,
+        &[("doc-a".to_owned(), snapshot("doc-a", PEER_B, "a-remote"))],
+        &["doc-pull".to_owned()],
+    )
+    .expect("apply with raced tombstone");
+
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM sync_outbox WHERE doc_id='doc-pull'",
+            &[],
+        ),
+        1,
+        "触发器必须真的插入了 outbox（证明竞态窗口被覆盖）"
+    );
+    assert_eq!(
+        notes_deleted(&vault, "doc-pull"),
+        0,
+        "判定后被并发插入 outbox 的笔记绝不能软删"
+    );
+    assert_eq!(
+        tombstone_action(&vault, "doc-pull").as_deref(),
+        Some("kept_local_edit"),
+        "事务内重判必须把 action 降级为 kept_local_edit"
+    );
+    assert_eq!(state.kept_local_edit, 1);
+}
+
+// ---------------------------------------------------------------------------
+// P2-5：远端已知 VV 的单调性（值 CAS）与 begin 回填覆盖面
+// ---------------------------------------------------------------------------
+
+/// completed journal（finish 后 status='completed'、子表保留）在 begin 替换时
+/// 必须先回填 baseline_vv；这是旧库升级后 tombstone 不误判的关键证据。
+#[test]
+fn begin_backfills_remote_known_for_completed_journal() {
+    let (_dir, vault) = fresh_vault();
+    begin_with(&vault, 10, "src1", &expectation(&["doc-completed"]));
+    apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-completed".to_owned(),
+            snapshot("doc-completed", PEER_B, "remote body"),
+        )],
+        &[],
+    )
+    .expect("first baseline");
+    assert!(matches!(
+        finish_baseline_apply(&vault, 10, "c10").expect("finish"),
+        BaselineApplyFinish::Applied(_)
+    ));
+    let baseline_vv = meta_remote_known(&vault, "doc-completed").expect("已有远端已知 VV");
+
+    // 模拟旧版本数据：没有跨 journal 的 meta，只剩 completed journal + 子表。
+    vault
+        .exec(
+            "DELETE FROM meta WHERE key=?1",
+            &[Value::Text("sync.remote_known_vv.doc-completed".to_owned())],
+        )
+        .expect("删 meta");
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM baseline_apply_docs WHERE doc_id='doc-completed'",
+            &[]
+        ),
+        1
+    );
+
+    begin(&vault, 20, "src2");
+
+    assert_eq!(
+        meta_remote_known(&vault, "doc-completed"),
+        Some(baseline_vv),
+        "completed journal 的 baseline_vv 必须回填到 meta"
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
+        0,
+        "旧 journal 子表必须清掉"
+    );
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.baseline_s, 20);
+}
+
+/// 没有 journal 行、但残留 `baseline_apply_docs`（旧版本/异常写的孤儿行）时，
+/// begin 也必须先把 `baseline_vv` 回填到 meta，再清掉残留子表。
+#[test]
+fn begin_backfills_remote_known_without_journal_but_with_residual_docs() {
+    let (_dir, vault) = fresh_vault();
+    begin_with(&vault, 10, "src1", &expectation(&["doc-residual"]));
+    apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-residual".to_owned(),
+            snapshot("doc-residual", PEER_B, "remote body"),
+        )],
+        &[],
+    )
+    .expect("first baseline");
+    assert!(matches!(
+        finish_baseline_apply(&vault, 10, "c10").expect("finish"),
+        BaselineApplyFinish::Applied(_)
+    ));
+
+    // 模拟旧版本/异常写：journal 行丢失，但子表仍在；meta 也缺失。
+    vault
+        .exec("DELETE FROM baseline_apply", &[])
+        .expect("删 journal");
+    vault
+        .exec(
+            "DELETE FROM meta WHERE key=?1",
+            &[Value::Text("sync.remote_known_vv.doc-residual".to_owned())],
+        )
+        .expect("删 meta");
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM baseline_apply_docs WHERE applied=1",
+            &[]
+        ),
+        1,
+        "前置：残留一行已应用的 baseline_apply_docs"
+    );
+
+    begin(&vault, 20, "src2");
+
+    assert_eq!(
+        meta_remote_known_count(&vault, "doc-residual"),
+        1,
+        "没有 journal 的残留 baseline_vv 也必须回填（否则证据会被 DELETE 静默丢弃）"
+    );
+    assert_eq!(
+        meta_remote_known(&vault, "doc-residual"),
+        Some(
+            VersionVector::decode(
+                &meta_remote_known_bytes(&vault, "doc-residual").expect("回填值")
+            )
+            .expect("解码")
+        ),
+        "回填的是旧 journal 的 baseline VV"
+    );
+    assert_eq!(
+        count(&vault, "SELECT count(*) FROM baseline_apply_docs", &[]),
+        0,
+        "残留子表必须被清掉"
+    );
+    let state = baseline_apply_state(&vault)
+        .expect("state")
+        .expect("journal");
+    assert_eq!(state.status, BaselineApplyStatus::Staging);
+    assert_eq!(state.baseline_s, 20);
+}
+
+/// begin 的回填是单调的：已有 meta（普通 pull/integrate 记录的更新值）绝不被
+/// 旧 journal 的 baseline_vv 降级（`DO NOTHING`）。
+#[test]
+fn begin_backfill_never_downgrades_existing_remote_known() {
+    let (_dir, vault) = fresh_vault();
+    begin_with(&vault, 10, "src1", &expectation(&["doc-keep"]));
+    apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-keep".to_owned(),
+            snapshot("doc-keep", PEER_B, "baseline body"),
+        )],
+        &[],
+    )
+    .expect("first baseline");
+    assert!(matches!(
+        finish_baseline_apply(&vault, 10, "c10").expect("finish"),
+        BaselineApplyFinish::Applied(_)
+    ));
+
+    // 已有值比旧 journal 的 baseline VV 更大（模拟后续普通 pull 扩大了它）。
+    let mut superset = meta_remote_known(&vault, "doc-keep").expect("baseline 后已有值");
+    superset.insert(0xA1, 9);
+    vault
+        .exec(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            &[
+                Value::Text("sync.remote_known_vv.doc-keep".to_owned()),
+                Value::Blob(superset.encode()),
+            ],
+        )
+        .expect("写入更大的旧值");
+    let before = meta_remote_known_bytes(&vault, "doc-keep").expect("旧值");
+
+    vault
+        .exec("DELETE FROM baseline_apply", &[])
+        .expect("模拟无 journal 的残留子表");
+    begin(&vault, 20, "src2");
+
+    assert_eq!(
+        meta_remote_known_bytes(&vault, "doc-keep"),
+        Some(before),
+        "begin 回填绝不能把已有（更大的）远端已知 VV 降级"
+    );
+}
+
+/// 新文档（读旧值时不存在）的 CAS：事务内被并发写入抢占 → 明确 SyncConflict，
+/// 整批回滚，不覆盖任何值。
+#[test]
+fn baseline_remote_known_cas_fails_closed_for_new_doc() {
+    let (_dir, vault) = fresh_vault();
+    begin_with(&vault, 5, "src", &expectation(&["doc-cas-new"]));
+    install_remote_known_clobber_trigger(&vault, "doc-cas-new");
+
+    let error = apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-cas-new".to_owned(),
+            snapshot("doc-cas-new", PEER_B, "remote"),
+        )],
+        &[],
+    )
+    .expect_err("CAS 必须失败");
+
+    match &error {
+        StorageError::SyncConflict { context } => {
+            assert!(
+                context.contains("远端已知 VV"),
+                "错误必须点明远端已知 VV CAS：{context}"
+            );
+        }
+        other => panic!("期望 SyncConflict，实际 {other:?}"),
+    }
+    assert_eq!(
+        meta_remote_known_bytes(&vault, "doc-cas-new"),
+        None,
+        "触发器写入的 meta 必须随整批回滚"
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_docs WHERE doc_id='doc-cas-new'",
+            &[]
+        ),
+        0,
+        "整批回滚：文档行不得落库"
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM loro_updates WHERE doc_id='doc-cas-new'",
+            &[]
+        ),
+        0
+    );
+}
+
+/// 已存在文档（读旧值 `Some`）的 CAS：库中值被并发改写 → 明确 SyncConflict，
+/// 队头与远端已知 VV 都保持原值（绝不回退到本批并集）。
+#[test]
+fn baseline_remote_known_cas_fails_closed_for_existing_doc() {
+    let (_dir, vault) = fresh_vault();
+    begin_with(&vault, 5, "src1", &expectation(&["doc-cas-old"]));
+    apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-cas-old".to_owned(),
+            snapshot("doc-cas-old", PEER_B, "first"),
+        )],
+        &[],
+    )
+    .expect("first baseline");
+    assert!(matches!(
+        finish_baseline_apply(&vault, 5, "c5").expect("finish"),
+        BaselineApplyFinish::Applied(_)
+    ));
+    let before_known = meta_remote_known_bytes(&vault, "doc-cas-old").expect("已有远端已知 VV");
+    let before_head = load_head(&vault, "doc-cas-old").expect("head");
+
+    begin_with(&vault, 6, "src2", &expectation(&["doc-cas-old"]));
+    install_remote_known_clobber_trigger(&vault, "doc-cas-old");
+    let error = apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-cas-old".to_owned(),
+            snapshot("doc-cas-old", PEER_B, "second"),
+        )],
+        &[],
+    )
+    .expect_err("陈旧旧值的 CAS 必须失败");
+
+    assert!(
+        matches!(&error, StorageError::SyncConflict { context } if context.contains("doc-cas-old")),
+        "必须是带文档上下文的 SyncConflict，实际 {error:?}"
+    );
+    assert_eq!(
+        meta_remote_known_bytes(&vault, "doc-cas-old"),
+        Some(before_known),
+        "CAS 失败后已有值必须保持原样（不能变小，也不能被本批并集覆盖）"
+    );
+    assert_eq!(
+        load_head(&vault, "doc-cas-old").expect("head").head_seq,
+        before_head.head_seq,
+        "整批回滚：head 不得推进"
+    );
+}
+
+/// 正常路径是单调并集：普通 pull 已记录的远端 ops（本批快照里没有）必须保留。
+#[test]
+fn baseline_remote_known_write_unions_with_normal_pull_evidence() {
+    let (_dir, vault) = fresh_vault();
+    let mut pulled = VersionVector::new();
+    pulled.insert(0xA1, 2);
+    vault
+        .exec(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)",
+            &[
+                Value::Text("sync.remote_known_vv.doc-union".to_owned()),
+                Value::Blob(pulled.encode()),
+            ],
+        )
+        .expect("预置普通 pull 的远端已知 VV");
+
+    begin_with(&vault, 7, "src", &expectation(&["doc-union"]));
+    apply_baseline_batch(
+        &vault,
+        &[(
+            "doc-union".to_owned(),
+            snapshot("doc-union", PEER_B, "remote body"),
+        )],
+        &[],
+    )
+    .expect("baseline apply");
+
+    let known = meta_remote_known(&vault, "doc-union").expect("应用后必须有远端已知 VV");
+    assert_eq!(
+        known.get(&0xA1).copied(),
+        Some(2),
+        "普通 pull 的旧证据必须保留"
+    );
+    assert!(
+        known.get(&PEER_B).copied().unwrap_or(0) >= 1,
+        "本批快照的 VV 必须并入"
+    );
+    assert_eq!(
+        count(
+            &vault,
+            "SELECT count(*) FROM meta WHERE key='sync.remote_known_vv.doc-union'",
+            &[]
+        ),
+        1
+    );
 }

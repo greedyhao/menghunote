@@ -12,6 +12,11 @@
 //! 不涉及 relay / checkpoint 签名 / 真实下载：`S` 与 cursor 是自造的合法值；
 //! 每次都用 fresh vault，结束后 journal 一律 `completed`，不会给下一次留 staging。
 //!
+//! 第二个探针 [`checkpoint_validate_scan_cost`] 测 **checkpoint validate 的 coverage
+//! 日志扫描 O(S) 成本**：FakeRelay 构造 S = 1k / 5k / 25k 条混合日志（85.7% UPDATE +
+//! 14.3% ASSET），走真实 `CheckpointWriter::prepare → validate`（不复制 scan 实现），
+//! 只打印页数/墙钟，不 assert 时间。
+//!
 //! ```bash
 //! cargo test --release -p menghunote-sync --test phase1a_release -- --ignored --nocapture
 //! ```
@@ -20,16 +25,30 @@ mod support;
 
 use std::time::Instant;
 
-use support::{commit_local, fresh_vault, seed_doc};
+use support::{
+    commit_local, commit_with_intent, fresh_vault, publish_real_asset, seed_doc, uuid_like,
+    FakeRelay, TestRandom, EPOCH, VAULT_ID,
+};
 
 use menghunote_storage::{
     apply_baseline_batch, baseline_apply_debug_counters, baseline_apply_debug_timings,
-    baseline_apply_state, begin_baseline_apply, finish_baseline_apply, load_body_doc,
-    reset_baseline_apply_debug, sync_cursor_state, BaselineApplyDebugCounters,
-    BaselineApplyDebugTimings, BaselineApplyFinish, BaselineApplyStatus, BodyDoc, Value, Vault,
-    BASELINE_MERGE_BATCH, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
+    baseline_apply_state, begin_baseline_apply, create_note_slot, ensure_structure_row,
+    finish_baseline_apply, load_body_doc, reset_baseline_apply_debug, sync_cursor_state,
+    BaselineApplyDebugCounters, BaselineApplyDebugTimings, BaselineApplyFinish,
+    BaselineApplyStatus, BaselineExpectation, BodyDoc, Value, Vault, BASELINE_MERGE_BATCH,
+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
     META_SYNC_RECEIVED_SEQ, META_SYNC_RELAY_CURSOR,
 };
+use menghunote_sync::checkpoint::{CheckpointWriter, EmptyAssets, PreparedCheckpoint};
+use menghunote_sync::engine::RELAY_CURSOR_META;
+use menghunote_sync::genesis;
+use menghunote_sync::relay::{
+    BootstrapBundle, BootstrapLease, CheckpointLease, CheckpointPublish, CheckpointRef,
+    ObjectSubmission, PublishedCheckpoint, RelayClient, RelayLogKind, RelayLogPage, RelayState,
+    SlotRecord, SlotUpload, UpdateOutcome, UpdateSubmission,
+};
+use menghunote_sync::{DeviceId, ObjectId, SyncError};
+use menghunote_sync_proto::DeviceCertV1;
 
 /// 基线文档数（真实信任链里 docs 数量更多；这里固定 20 便于两档总量均分）。
 const DOCS: usize = 20;
@@ -216,11 +235,17 @@ fn run_probe(label: &'static str, target_bytes: usize) -> ProbeStats {
     // 3) 持闸段：begin → apply 各批 → finish。
     reset_baseline_apply_debug();
     let begin_started = Instant::now();
-    let begin_state =
-        begin_baseline_apply(&vault, &[0x51; 16], BASELINE_S, "c0-source").expect("begin baseline");
+    let expected =
+        BaselineExpectation::new(doc_ids.iter().cloned(), std::iter::empty::<[u8; 32]>());
+    let begin_state = begin_baseline_apply(&vault, &[0x51; 16], BASELINE_S, "c0-source", &expected)
+        .expect("begin baseline");
     let begin_ms = begin_started.elapsed().as_millis();
     assert_eq!(begin_state.status, BaselineApplyStatus::Staging);
-    assert!(begin_state.finishable);
+    assert_eq!(begin_state.expected_docs, Some(DOCS as u64));
+    assert!(
+        !begin_state.finishable,
+        "begin 时预期 docs 尚未应用，finishable 必须为 false"
+    );
 
     let entries: Vec<(String, Vec<u8>)> = doc_ids
         .iter()
@@ -425,5 +450,424 @@ fn phase1a_baseline_apply_gate_hold() {
     ] {
         let stats = run_probe(label, bytes);
         print_probe(&stats);
+    }
+}
+
+// ============================================================ checkpoint validate 覆盖日志扫描成本
+//
+// 任务 4 P1：只测真实 `CheckpointWriter::validate` 里 coverage 日志扫描的 O(S) 成本，
+// 不改生产 `scan_coverage_log`，也不复制它的实现。S 条日志是合成的（FakeRelay）：
+// `1..=S-1` 落在本地 integrated 连续前缀（生产代码信任的"已消费"不变量），尾部第 S 条
+// 是真实 ASSET（prepare 落 pending receipt，validate 必须下载实证）；前缀里按 1/7
+// 混入 ASSET 事件（≈14.3%，任务要求的 10–20%）。
+//
+// 口径：
+// - `pages` = validate 期间真实 `RelayClient::log` 调用次数（应从 c0 扫到 S，S/256 页）。
+// - `scan_ms` = 第一次 log 开始到最后一次 log 返回的墙钟跨度（含页间逐事件核对；
+//   不含最后一页返回之后的 256 条 visitor，误差上界 = 一页）。
+// - `validate_ms` = 整个 validate 墙钟（含 manifest/快照读回、尾部 ASSET 实证）。
+// 只打印不 assert 时间；硬断言只校验覆盖到了 S、尾部 ASSET 被真实验证、页数符合 S/256。
+
+/// 探针档位（事件总数 S）。
+const SCAN_COST_S: [usize; 3] = [1_000, 5_000, 25_000];
+/// 每档重复次数（取中位数）。
+const SCAN_COST_RUNS: usize = 3;
+/// 生产 `COVERAGE_SCAN_PAGE_LIMIT`（`crates/sync/src/checkpoint.rs` 私有常量 = 256）。
+/// 只用于校验探针确实按 S/256 页扫完整段；若生产改页大小，这里应同步更新。
+const SCAN_COST_PAGE_LIMIT: usize = 256;
+/// ASSET 事件间隔（每 7 条一条 → 14.3%）。
+const SCAN_COST_ASSET_EVERY: usize = 7;
+/// 探针正文文档 id（与 coverage 无关，只给 prepare 提供可导出的本地快照）。
+const SCAN_COST_NOTE_ID: &str = "scan-cost-note";
+
+/// 计数/计时包装：所有方法委托给 FakeRelay；只额外统计 `log()`（真实 coverage scan
+/// 发起的页请求）与 `part()`（manifest/snapshot/ASSET 读回）的调用次数与墙钟。
+///
+/// 这是**探针侧 instrumentation**，不是 scan 实现的拷贝：validate 仍走生产
+/// `CheckpointWriter::validate` → `scan_coverage_log`，wrapper 只是它调用的客户端。
+struct CountingRelay {
+    inner: FakeRelay,
+    log_calls: u64,
+    log_busy_ns: u128,
+    scan_first: Option<Instant>,
+    scan_last: Option<Instant>,
+    part_calls: u64,
+    part_busy_ns: u128,
+}
+
+impl CountingRelay {
+    fn new(inner: FakeRelay) -> Self {
+        Self {
+            inner,
+            log_calls: 0,
+            log_busy_ns: 0,
+            scan_first: None,
+            scan_last: None,
+            part_calls: 0,
+            part_busy_ns: 0,
+        }
+    }
+
+    fn reset_counters(&mut self) {
+        self.log_calls = 0;
+        self.log_busy_ns = 0;
+        self.scan_first = None;
+        self.scan_last = None;
+        self.part_calls = 0;
+        self.part_busy_ns = 0;
+    }
+
+    /// 第一次到最后一次 `log()` 返回的墙钟跨度（页扫描口径）。
+    fn scan_span_ms(&self) -> f64 {
+        match (self.scan_first, self.scan_last) {
+            (Some(first), Some(last)) => last.duration_since(first).as_secs_f64() * 1e3,
+            _ => 0.0,
+        }
+    }
+
+    /// 仅 `log()` 内部（FakeRelay 取页/克隆事件）的墙钟合计。
+    fn log_busy_ms(&self) -> f64 {
+        self.log_busy_ns as f64 / 1e6
+    }
+
+    /// `part()` 读回墙钟合计（manifest/snapshot/ASSET）。
+    fn part_busy_ms(&self) -> f64 {
+        self.part_busy_ns as f64 / 1e6
+    }
+}
+
+impl RelayClient for CountingRelay {
+    fn state(&mut self) -> Result<RelayState, SyncError> {
+        self.inner.state()
+    }
+
+    fn log(&mut self, cursor: Option<&str>, limit: u32) -> Result<RelayLogPage, SyncError> {
+        if self.scan_first.is_none() {
+            self.scan_first = Some(Instant::now());
+        }
+        let started = Instant::now();
+        let result = self.inner.log(cursor, limit);
+        self.log_busy_ns += started.elapsed().as_nanos();
+        self.log_calls += 1;
+        self.scan_last = Some(Instant::now());
+        result
+    }
+
+    fn part(&mut self, object_id: &ObjectId, part_no: u32) -> Result<Vec<u8>, SyncError> {
+        let started = Instant::now();
+        let result = self.inner.part(object_id, part_no);
+        self.part_busy_ns += started.elapsed().as_nanos();
+        self.part_calls += 1;
+        result
+    }
+
+    fn put_part(
+        &mut self,
+        object_id: &ObjectId,
+        part_no: u32,
+        envelope: &[u8],
+    ) -> Result<(), SyncError> {
+        self.inner.put_part(object_id, part_no, envelope)
+    }
+
+    fn submit_updates(
+        &mut self,
+        items: Vec<UpdateSubmission>,
+    ) -> Result<Vec<UpdateOutcome>, SyncError> {
+        self.inner.submit_updates(items)
+    }
+
+    fn submit_object(&mut self, item: ObjectSubmission) -> Result<UpdateOutcome, SyncError> {
+        self.inner.submit_object(item)
+    }
+
+    fn ack(&mut self, received_seq: u64, integrated_seq: u64, epoch: u64) -> Result<(), SyncError> {
+        self.inner.ack(received_seq, integrated_seq, epoch)
+    }
+
+    fn device_cert(&mut self, device_id: &DeviceId) -> Result<Option<DeviceCertV1>, SyncError> {
+        self.inner.device_cert(device_id)
+    }
+
+    fn put_key_slot(&mut self, upload: SlotUpload) -> Result<SlotRecord, SyncError> {
+        self.inner.put_key_slot(upload)
+    }
+
+    fn list_key_slots(&mut self) -> Result<Vec<SlotRecord>, SyncError> {
+        self.inner.list_key_slots()
+    }
+
+    fn activate_password_slot(
+        &mut self,
+        expected_slot_set_rev: u64,
+        slot_id: ObjectId,
+        signed_message: Vec<u8>,
+        signature: [u8; 64],
+    ) -> Result<u64, SyncError> {
+        self.inner
+            .activate_password_slot(expected_slot_set_rev, slot_id, signed_message, signature)
+    }
+
+    fn create_checkpoint(
+        &mut self,
+        estimated_bytes: u64,
+        epoch: Option<u64>,
+    ) -> Result<CheckpointLease, SyncError> {
+        self.inner.create_checkpoint(estimated_bytes, epoch)
+    }
+
+    fn add_checkpoint_refs(
+        &mut self,
+        checkpoint_id: [u8; 16],
+        refs: Vec<CheckpointRef>,
+    ) -> Result<u64, SyncError> {
+        self.inner.add_checkpoint_refs(checkpoint_id, refs)
+    }
+
+    fn publish_checkpoint(
+        &mut self,
+        publish: CheckpointPublish,
+    ) -> Result<PublishedCheckpoint, SyncError> {
+        self.inner.publish_checkpoint(publish)
+    }
+
+    fn bootstrap(&mut self) -> Result<BootstrapBundle, SyncError> {
+        self.inner.bootstrap()
+    }
+
+    fn renew_bootstrap_lease(&mut self, lease_id: [u8; 16]) -> Result<BootstrapLease, SyncError> {
+        self.inner.renew_bootstrap_lease(lease_id)
+    }
+}
+
+/// 一次性夹具：真实 SQLite vault + 合成 S 条日志 + 已 prepare 的 checkpoint。
+struct ScanCostFixture {
+    _dir: tempfile::TempDir,
+    vault: Vault,
+    materials: genesis::GenesisMaterials,
+    relay: CountingRelay,
+    prepared: PreparedCheckpoint,
+    asset_events: usize,
+    update_events: usize,
+    prepare_pages: u64,
+    prepare_scan_ms: f64,
+    prepare_log_ms: f64,
+}
+
+fn build_scan_cost_fixture(total_events: usize) -> ScanCostFixture {
+    assert!(
+        total_events > 1,
+        "S 至少需要一条前缀 UPDATE 与一条尾部 ASSET"
+    );
+    let (dir, vault) = fresh_vault();
+    ensure_structure_row(&vault).expect("structure 行");
+    vault
+        .set_meta(RELAY_CURSOR_META, b"c0")
+        .expect("写 relay 游标");
+    let materials = genesis::build_materials(
+        VAULT_ID,
+        [0x44; 16],
+        "pw",
+        1_700_000_000,
+        &mut TestRandom::new(0x88_14),
+    )
+    .expect("genesis 材料");
+    let mut relay = FakeRelay::new(&[]);
+    relay
+        .certs
+        .insert(materials.device_id, materials.certificate().clone());
+    vault
+        .set_meta(META_SYNC_LOG_ID, &relay.log_id)
+        .expect("写 log_id");
+
+    // 一篇真实正文：prepare 需要可导出的本地快照/head VV（与 coverage 无关）。
+    let doc = seed_doc(&vault, SCAN_COST_NOTE_ID, materials.peer_id_u64());
+    create_note_slot(
+        &vault,
+        SCAN_COST_NOTE_ID,
+        SCAN_COST_NOTE_ID,
+        SCAN_COST_NOTE_ID,
+        1_700_000_000,
+    )
+    .expect("notes 行");
+    doc.insert_scalars(0, "checkpoint coverage scan cost probe")
+        .expect("正文");
+    commit_with_intent(&vault, &doc, &uuid_like(9_001), [0x91; 32], EPOCH);
+
+    // 1..S-1 按 1/7 混入 ASSET；第 S 条是真 ASSET。前 S-1 条都属于本地
+    // integrated 连续前缀（只借生产代码信任的"已消费"不变量，不读资产），
+    // 唯一缺口是尾部 ASSET → prepare 落 pending receipt，validate 必须下载实证。
+    let mut asset_events = 0usize;
+    for seq in 1..total_events {
+        if seq % SCAN_COST_ASSET_EVERY == 0 {
+            relay.publish_event(RelayLogKind::Asset, [0x2a; 32]);
+            asset_events += 1;
+        } else {
+            relay.publish_event(RelayLogKind::Update, [0x15; 32]);
+        }
+    }
+    let (_, tail_seq) = publish_real_asset(
+        &mut relay,
+        VAULT_ID,
+        materials.device_id,
+        &materials.signing_key,
+        &materials.root,
+        b"coverage scan cost tail asset",
+        "text/plain",
+    );
+    assert_eq!(
+        tail_seq,
+        u64::try_from(total_events).expect("S 溢出 u64"),
+        "尾部 ASSET 必须恰为第 S 条日志"
+    );
+    asset_events += 1;
+    let update_events = total_events - asset_events;
+    assert!(
+        (update_events) > 0,
+        "混合日志必须至少有一条 UPDATE（实际 S={total_events}）"
+    );
+
+    let prefix = u64::try_from(total_events - 1).expect("S 溢出 u64");
+    vault
+        .set_meta(META_SYNC_INTEGRATED_SEQ, &prefix.to_be_bytes())
+        .expect("写 integrated 前缀");
+    vault
+        .set_meta(META_SYNC_RECEIVED_SEQ, &prefix.to_be_bytes())
+        .expect("写 received 前缀");
+
+    // 从这里开始的页请求才算探针成本（prepare 的 pending receipt 扫描也是 O(S)）。
+    let mut relay = CountingRelay::new(relay);
+    let prepared = {
+        let mut writer = CheckpointWriter::new(
+            &vault,
+            &mut relay,
+            VAULT_ID,
+            materials.device_id,
+            materials.signing_key.clone(),
+            materials.root.clone(),
+            materials.peer_id_u64(),
+        );
+        writer.prepare(&EmptyAssets).expect("prepare")
+    };
+    assert_eq!(
+        prepared.report.covered_seq,
+        u64::try_from(total_events).expect("S 溢出 u64")
+    );
+    assert_eq!(
+        relay.log_calls,
+        u64::try_from(total_events.div_ceil(SCAN_COST_PAGE_LIMIT)).expect("页数溢出 u64"),
+        "prepare 的 receipt 扫描应从 c0 扫满 S/256 页"
+    );
+    let prepare_pages = relay.log_calls;
+    let prepare_scan_ms = relay.scan_span_ms();
+    let prepare_log_ms = relay.log_busy_ms();
+    relay.reset_counters();
+
+    ScanCostFixture {
+        _dir: dir,
+        vault,
+        materials,
+        relay,
+        prepared,
+        asset_events,
+        update_events,
+        prepare_pages,
+        prepare_scan_ms,
+        prepare_log_ms,
+    }
+}
+
+fn median_ms(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("时间不能是 NaN"));
+    sorted[sorted.len() / 2]
+}
+
+fn run_scan_cost(total_events: usize) {
+    let mut fixture = build_scan_cost_fixture(total_events);
+    let asset_pct = fixture.asset_events as f64 * 100.0 / total_events as f64;
+    eprintln!(
+        "[phase1a] scan_cost setup S={total_events} asset_events={} update_events={} \
+         asset_pct={asset_pct:.1} prepare_pages={} prepare_scan_ms={:.3} prepare_log_ms={:.3}",
+        fixture.asset_events,
+        fixture.update_events,
+        fixture.prepare_pages,
+        fixture.prepare_scan_ms,
+        fixture.prepare_log_ms,
+    );
+
+    let mut pages = 0u64;
+    let mut part_calls = 0u64;
+    let mut raw_scan = Vec::with_capacity(SCAN_COST_RUNS);
+    let mut raw_validate = Vec::with_capacity(SCAN_COST_RUNS);
+    let mut raw_log = Vec::with_capacity(SCAN_COST_RUNS);
+    let mut raw_part = Vec::with_capacity(SCAN_COST_RUNS);
+    for run in 0..SCAN_COST_RUNS {
+        fixture.relay.reset_counters();
+        let started = Instant::now();
+        let baseline = {
+            let mut writer = CheckpointWriter::new(
+                &fixture.vault,
+                &mut fixture.relay,
+                VAULT_ID,
+                fixture.materials.device_id,
+                fixture.materials.signing_key.clone(),
+                fixture.materials.root.clone(),
+                fixture.materials.peer_id_u64(),
+            );
+            writer.validate(&fixture.prepared).expect("validate")
+        };
+        let validate_ms = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(
+            baseline.covered_seq(),
+            u64::try_from(total_events).expect("S 溢出 u64")
+        );
+        assert_eq!(
+            baseline.coverage_verified_candidates(),
+            1,
+            "尾部 ASSET 必须被真实下载验证（receipt 路径）"
+        );
+        assert_eq!(baseline.coverage_durable_assets(), 0);
+
+        let run_pages = fixture.relay.log_calls;
+        let scan_ms = fixture.relay.scan_span_ms();
+        let log_ms = fixture.relay.log_busy_ms();
+        let run_parts = fixture.relay.part_calls;
+        let part_ms = fixture.relay.part_busy_ms();
+        assert_eq!(
+            run_pages,
+            u64::try_from(total_events.div_ceil(SCAN_COST_PAGE_LIMIT)).expect("页数溢出 u64"),
+            "validate 的 coverage scan 应从 c0 扫满 S/256 页"
+        );
+        assert!(run_parts >= 1, "validate 至少读回 manifest/快照/尾部 ASSET");
+        pages = run_pages;
+        part_calls = run_parts;
+        eprintln!(
+            "[phase1a] scan_cost S={total_events} run={run} pages={run_pages} \
+             scan_ms={scan_ms:.3} validate_ms={validate_ms:.3} log_ms={log_ms:.3} \
+             part_calls={run_parts} part_ms={part_ms:.3}",
+        );
+        raw_scan.push(scan_ms);
+        raw_validate.push(validate_ms);
+        raw_log.push(log_ms);
+        raw_part.push(part_ms);
+    }
+
+    let scan_median = median_ms(&raw_scan);
+    let validate_median = median_ms(&raw_validate);
+    let log_median = median_ms(&raw_log);
+    eprintln!(
+        "[phase1a] scan_cost S={total_events} pages={pages} scan_ms={scan_median:.3} \
+         (median of {SCAN_COST_RUNS}; raw_scan_ms={raw_scan:?} log_ms_median={log_median:.3} \
+         validate_ms_median={validate_median:.3} validate_ms_raw={raw_validate:?} \
+         part_calls={part_calls} part_ms_raw={raw_part:?})"
+    );
+}
+
+#[test]
+#[ignore = "manual benchmark"]
+fn checkpoint_validate_scan_cost() {
+    for total_events in SCAN_COST_S {
+        run_scan_cost(total_events);
     }
 }

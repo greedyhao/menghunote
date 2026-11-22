@@ -17,11 +17,14 @@ use menghunote_storage::{
     advance_integrated_prefix, append_updates_with_integrated_marks, count_inbox_ready, load_head,
     mark_integrated, mark_integrated_batch, mark_skipped_event_received, set_sync_log_id,
     store_inbox_verified, store_inbox_verified_batch, sync_cursor_state, take_inbox_ready,
-    StorageError, UpdateRecord, Value, Vault, VerifiedInboxRow, META_SYNC_LOG_ID,
-    META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
+    take_inbox_ready_where, StorageError, UpdateRecord, Value, Vault, VerifiedInboxRow,
+    META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
 };
 
 const LOG_ID: [u8; 16] = [0x3a; 16];
+
+/// 另一个 incarnation（restore 迁移后当前 `sync.log_id` 可能变成它，旧行仍然 durable）。
+const OTHER_LOG_ID: [u8; 16] = [0x5b; 16];
 
 fn bind_log(vault: &Vault) {
     set_sync_log_id(vault, &LOG_ID).expect("写 sync.log_id");
@@ -854,4 +857,176 @@ fn batch_under_foreign_write_lock_fails_busy_without_partial_write() {
     );
     assert_eq!(inbox_rows(&vault).len(), 1);
     assert_eq!(received(&vault), 1);
+}
+
+// ================================ incarnation 过滤（restore 迁移 log_id 后的旧行）
+
+/// 当前 incarnation 的 ready `relay_seq`（升序；`take_inbox_ready` 已按 log/seq 排序）。
+fn ready_seqs(vault: &Vault, limit: usize) -> Vec<u64> {
+    take_inbox_ready(vault, limit)
+        .expect("读 ready")
+        .into_iter()
+        .map(|row| row.relay_seq)
+        .collect()
+}
+
+/// 直接写 `meta` 原始字节（模拟 restore 的显式迁移 / 损坏状态，绕过 Vault 校验）。
+fn write_raw_meta(vault: &Vault, key: &str, value: &[u8]) {
+    vault
+        .exec(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            &[Value::Text(key.to_owned()), Value::Blob(value.to_vec())],
+        )
+        .expect("写原始 meta");
+}
+
+/// 直接插入一条**其它 incarnation** 的 verified 行。
+///
+/// 生产入口 `store_inbox_verified*` 都先 `ensure_log_id`，跨代写入会被
+/// `SyncLogMismatch` 拒绝；这种 durable 状态只能由 restore 显式迁移 `sync.log_id`
+/// 后留下，所以测试直接用 SQL 准备，不经过被测试的过滤逻辑。
+fn insert_stale_incarnation_row(vault: &Vault, log_id: &[u8; 16], relay_seq: u64, seed: u8) {
+    vault
+        .exec(
+            "INSERT INTO sync_inbox(log_id,relay_seq,object_id,epoch,state,verified_payload) \
+             VALUES(?1,?2,?3,?4,'verified',?5)",
+            &[
+                Value::Blob(log_id.to_vec()),
+                Value::Integer(i64::try_from(relay_seq).expect("relay_seq 在 i64 内")),
+                Value::Blob(vec![seed; 32]),
+                Value::Integer(1),
+                Value::Blob(vec![seed; 16]),
+            ],
+        )
+        .expect("插入旧 incarnation 的 verified 行");
+}
+
+/// 当前 log A 有 verified 行、库里另有 log B 的 verified 行时：
+/// ready/count 只计 A；B 即使 `relay_seq <= received` 也不计入；received 前缀只按 A 推进。
+#[test]
+fn ready_and_count_only_include_current_log_incarnation() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(2, 0)).unwrap(), 2);
+    assert_eq!(received(&vault), 2);
+
+    // 旧 incarnation B 的 1..=5 仍在库里（restore 迁移 log_id 后旧行不能被静默删除）。
+    for seq in 1..=5u64 {
+        insert_stale_incarnation_row(
+            &vault,
+            &OTHER_LOG_ID,
+            seq,
+            u8::try_from(seq).expect("seq 在 u8 内"),
+        );
+    }
+    // `set_sync_log_id` 的语义未变：生产入口仍拒绝跨代写入（restore 走显式迁移）。
+    assert!(
+        matches!(
+            set_sync_log_id(&vault, &OTHER_LOG_ID),
+            Err(StorageError::SyncLogMismatch { .. })
+        ),
+        "set_sync_log_id 必须继续拒绝跨代变更"
+    );
+
+    // B 的 seq1/seq2 都 <= received(2)，但 ready/count 只能看到 A 的 1/2。
+    assert_eq!(ready_seqs(&vault, 16), vec![1, 2]);
+    assert_eq!(
+        count_inbox_ready(&vault).unwrap(),
+        2,
+        "旧 incarnation 的行即使 relay_seq<=received 也不得计入"
+    );
+
+    // A 的 seq3 落库 → received 只推进到 3，不跨 B 的 1..=5。
+    assert_eq!(
+        store_inbox_verified_batch(&vault, &[row(3, 0x33, 8)]).unwrap(),
+        1
+    );
+    assert_eq!(received(&vault), 3, "received 前缀推进不跨 incarnation");
+    assert_eq!(ready_seqs(&vault, 16), vec![1, 2, 3]);
+    assert_eq!(count_inbox_ready(&vault).unwrap(), 3);
+
+    // 状态变化同样只作用于当前 log：集成 A 的 seq1 后 B 的行仍不 ready、不影响计数。
+    mark_integrated(&vault, &LOG_ID, 1).expect("集成 A seq1");
+    assert_eq!(ready_seqs(&vault, 16), vec![2, 3]);
+    assert_eq!(count_inbox_ready(&vault).unwrap(), 2);
+}
+
+/// `take_inbox_ready_where` 走同一条底层路径：谓词只能看到当前 log 的行。
+#[test]
+fn ready_where_path_filters_other_log_incarnation() {
+    let (_dir, vault) = fresh_vault();
+    bind_log(&vault);
+    assert_eq!(store_inbox_verified_batch(&vault, &rows(3, 0)).unwrap(), 3);
+    for seq in 1..=3u64 {
+        insert_stale_incarnation_row(
+            &vault,
+            &OTHER_LOG_ID,
+            seq,
+            0xb0 + u8::try_from(seq).unwrap_or(0),
+        );
+    }
+
+    // 恒真谓词 + 足够大的 limit：旧实现会把 B 的 3 行也交进来（6 条），现在必须只有 3 条。
+    let mut observed_log_ids = Vec::new();
+    let picked = take_inbox_ready_where(&vault, 16, |row| {
+        observed_log_ids.push(row.log_id);
+        true
+    })
+    .expect("where 路径读 ready");
+    assert_eq!(
+        picked.iter().map(|row| row.relay_seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(
+        observed_log_ids.iter().all(|log_id| *log_id == LOG_ID),
+        "谓词只应看到当前 incarnation 的行，实际 {observed_log_ids:?}"
+    );
+
+    // 谓词本身的过滤仍然生效（不是把 where 语义吞掉）。
+    let picked: Vec<u64> = take_inbox_ready_where(&vault, 16, |row| row.relay_seq != 2)
+        .expect("where 过滤")
+        .into_iter()
+        .map(|row| row.relay_seq)
+        .collect();
+    assert_eq!(picked, vec![1, 3]);
+}
+
+/// `sync.log_id` 缺失 / 长度非法时的语义：
+/// - 缺失 → 空（`take`）/ 0（`count`），即新库旧行为；即使残留其它 log 的行与 received，
+///   也不能回退成"不过滤 log"；
+/// - 长度非法 → 明确 `Corrupt`（与 `sync_cursor_state` 同口径），不静默当作没有 log。
+#[test]
+fn ready_without_log_id_is_empty_and_invalid_length_is_corrupt() {
+    let (_dir, vault) = fresh_vault();
+    // 新库：没有 sync.log_id，也没有 inbox 行 → 空/0（旧实现同样返回空）。
+    assert!(take_inbox_ready(&vault, 8)
+        .expect("无 log 读 ready")
+        .is_empty());
+    assert_eq!(count_inbox_ready(&vault).expect("无 log 计数"), 0);
+
+    // 不一致的持久状态：有遗留 verified 行与 received，却没有 sync.log_id。
+    // 没有当前 incarnation 就没有可匹配的 log，ready 必须为空。
+    insert_stale_incarnation_row(&vault, &OTHER_LOG_ID, 1, 0x5b);
+    write_raw_meta(&vault, META_SYNC_RECEIVED_SEQ, &1u64.to_be_bytes());
+    assert!(
+        take_inbox_ready(&vault, 8)
+            .expect("无 log 读 ready")
+            .is_empty(),
+        "缺 sync.log_id 时不能漏出其它 incarnation 的遗留行"
+    );
+    assert_eq!(count_inbox_ready(&vault).expect("无 log 计数"), 0);
+
+    // 长度不是 16B = 损坏：显式错误，不静默当成"没有 log"。
+    write_raw_meta(&vault, META_SYNC_LOG_ID, b"short");
+    let error = take_inbox_ready(&vault, 8).expect_err("非法 log_id 长度必须报错");
+    assert!(
+        matches!(error, StorageError::Corrupt { .. }),
+        "实际 {error:?}"
+    );
+    let error = count_inbox_ready(&vault).expect_err("非法 log_id 长度必须报错");
+    assert!(
+        matches!(error, StorageError::Corrupt { .. }),
+        "实际 {error:?}"
+    );
 }

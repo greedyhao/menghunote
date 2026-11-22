@@ -263,7 +263,11 @@ impl Vault {
         self.inner.take_reconcile_required()
     }
 
-    /// 读一条 meta（键值 BLOB）；不存在返回 `None`。
+    /// 读一条 meta（键值 BLOB）；键不存在返回 `None`。
+    ///
+    /// 判定与另两个入口共享同一个 helper（`sync_meta::meta_bytes_of`）：**只认 BLOB**，
+    /// TEXT/INTEGER/REAL 都是 [`StorageError::Corrupt`]，不会静默当成"没有这条 meta"
+    /// ——否则 `sync.repack_required` / `sync.log_id` 之类持久屏障会被绕过。
     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         self.call(|reply| Command::GetMeta {
             key: key.to_owned(),
@@ -328,6 +332,10 @@ impl Vault {
     /// 低层事务命令：多条语句在同一事务里执行，`guards` 不满足则整笔回滚。
     ///
     /// 返回每条语句的影响行数（顺序与 `statements` 一致）。
+    ///
+    /// 事务以 `BEGIN IMMEDIATE` 显式开启（与批量 inbox 入口共用
+    /// [`begin_immediate`]）：写锁在事务开始就取，并发写者按 `busy_timeout` 排队，
+    /// 而不是在第一条语句处撞上"锁升级不走 busy handler"的立即失败。
     pub fn exec_transaction(
         &self,
         statements: &[Statement],
@@ -433,7 +441,8 @@ fn handle_command(conn: &Connection, command: Command) {
             let _ = reply.send(exec_transaction(conn, &statements, &guards));
         }
         Command::GetMeta { key, reply } => {
-            let _ = reply.send(get_meta(conn, &key));
+            // 与 sync_bridge / sync_meta 同一个读取 helper（只认 BLOB，其它类型报损坏）。
+            let _ = reply.send(sync_meta::read_meta_on(conn, &key));
         }
         Command::UserVersion { reply } => {
             let _ = reply.send(migrate::user_version(conn));
@@ -445,6 +454,30 @@ fn handle_command(conn: &Connection, command: Command) {
             let _ = reply.send(sync_meta::advance_consumed_prefix_on(conn, prefix));
         }
     }
+}
+
+/// 在连接上显式开启一个 **Immediate** 写事务（`BEGIN IMMEDIATE`）。
+///
+/// 为什么不用 deferred（`conn.unchecked_transaction()` 的默认行为）：
+///
+/// - deferred 的 `BEGIN` 只是登记，第一条 SELECT 拿共享锁，等到第一条写语句才尝试把
+///   共享锁升级成写锁；而 SQLite 的锁升级**不走 busy handler**——此刻若已有别的写事务
+///   在途，不会用 `busy_timeout` 等待，而是直接返回 `SQLITE_BUSY`，让调用方在"最多等
+///   5s"的预期之外立刻失败；
+/// - `BEGIN IMMEDIATE` 在事务开始就取写锁，这一步**照常**受 `busy_timeout` 约束，与
+///   ADR 0001 §3.9「每 vault 单 writer actor」的模型一致：写事务不该和别的写事务撞在
+///   升级点上。
+///
+/// 两个写事务入口都走这里，论证只写在这一处（避免注释在两个调用点各改一半而漂移）：
+///
+/// - [`exec_inbox_batch`]：先读后写，deferred 会在锁升级处失败，且读到的旧快照还会先
+///   报出误导性的 `SyncConflict`；
+/// - [`exec_transaction`]：承载 A 事务/资产/repack/finish，调用方习惯把写语句放最前，
+///   但**没有任何断言**保证这一点（以后多一条只读语句就退化成升级路径），所以同样
+///   显式 Immediate。
+fn begin_immediate(conn: &Connection) -> Result<Transaction<'_>, StorageError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    Ok(tx)
 }
 
 /// 批量 inbox 的原子执行。
@@ -463,8 +496,8 @@ fn handle_command(conn: &Connection, command: Command) {
 /// 先读后写的竞态因此被消除：快照与插入属于同一个写事务（SQLite 的单写者锁），
 /// 且一次提交只产生一次 fsync；崩溃/冲突只会留下「什么都没发生」或「行+前缀一起提交」。
 ///
-/// 事务用 **Immediate** 显式开启（而不是 deferred）：本事务先读后写，deferred 的锁升级
-/// 详见下方注释。
+/// 事务用 [`begin_immediate`] 显式开启（而不是 deferred）：本事务先读后写，deferred
+/// 的锁升级不走 busy handler，完整论证见该函数。
 fn exec_inbox_batch(
     conn: &Connection,
     mut rows: Vec<InboxBatchRow>,
@@ -495,16 +528,9 @@ fn exec_inbox_batch(
         });
     }
 
-    // 显式 **Immediate** 事务（不是 deferred）：
-    //
-    // 本事务里先读（校验 `sync.log_id`、比对 `[first_seq,last_seq]` 既有行）再写
-    // （插新行、推进 received 前缀）。Deferred 事务的 `BEGIN` 只是登记，第一条 SELECT
-    // 拿共享锁，等到第一条写语句才尝试把共享锁升级成写锁；而 SQLite 的锁升级**不走
-    // busy handler**——此刻若已有别的写事务在途，不会用 `busy_timeout` 等待，而是直接
-    // 返回 `SQLITE_BUSY`，让调用方在"最多等 5s"的预期之外立刻失败。`BEGIN IMMEDIATE`
-    // 在事务开始就取写锁（这一步照常受 `busy_timeout` 约束），与 ADR 0001 §3.9
-    // 「每 vault 单 writer actor」的模型一致：写事务不该和别的写事务撞在升级点上。
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // 事务模式与锁升级论证收在 [`begin_immediate`]：本事务先读后写，deferred 会在锁
+    // 升级处立即 SQLITE_BUSY（见该函数的注释）。
+    let tx = begin_immediate(conn)?;
     sync_meta::ensure_log_id_on(&tx, &log_id)?;
 
     let first_seq = rows.first().map_or(0, |row| row.relay_seq);
@@ -613,29 +639,6 @@ fn i64_of(value: u64) -> Result<i64, StorageError> {
     })
 }
 
-/// 读一条 meta。
-fn get_meta(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-    let mut statement = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
-    let mut rows = statement.query([key])?;
-    match rows.next()? {
-        None => Ok(None),
-        Some(row) => match row.get::<usize, Value>(0)? {
-            Value::Blob(blob) => Ok(Some(blob)),
-            Value::Text(text) => Ok(Some(text.into_bytes())),
-            other => Err(StorageError::ManifestShape {
-                column: "meta.value",
-                found: match other {
-                    Value::Null => "NULL",
-                    Value::Integer(_) => "INTEGER",
-                    Value::Real(_) => "REAL",
-                    Value::Text(_) => "TEXT",
-                    Value::Blob(_) => "BLOB",
-                },
-            }),
-        },
-    }
-}
-
 /// 执行单条写语句。
 fn exec(conn: &Connection, sql: &str, params: &[Value]) -> Result<usize, StorageError> {
     let mut statement = conn.prepare(sql)?;
@@ -665,8 +668,9 @@ fn exec_transaction(
     statements: &[Statement],
     guards: &[AffectedGuard],
 ) -> Result<Vec<usize>, StorageError> {
-    // 连接由工作线程独占，不会有嵌套事务，所以用 &self 版本的 unchecked_transaction
-    let tx = conn.unchecked_transaction()?;
+    // 连接由工作线程独占，不会有嵌套事务；事务模式与批量 inbox 共用 begin_immediate
+    // （锁升级论证见该函数），语句顺序/守卫/CAS 语义都不变。
+    let tx = begin_immediate(conn)?;
 
     // 守卫必须在**该语句执行后立刻**校验：否则后续语句可能先撞 UNIQUE/FK，
     // 把「head 被人推进了」这个真正原因盖掉（CAS 语义要求先于任何写入冲突暴露）。

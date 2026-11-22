@@ -854,7 +854,7 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   - Main 左下角改为**一行**动作（`app-root-bottom-actions`）：vault 切换器占剩余宽度 +
     紧凑「设置」按钮，两按钮同一底边/行高；`app-root-settings` / `app-root-vault-switcher`
     selector 不变，窄窗口宽度夹紧。
-  测试：app 默认 **740** / `--features dev-sync` **891** / no-default **575**；storage **239** / sync **631**；fmt/clippy 干净。
+  测试：app 默认 **740** / `--features dev-sync` **891** / no-default **575**；storage **274** / sync **634**；本轮硬化见 [`docs/notes/sync-hardening-20261121.md`](docs/notes/sync-hardening-20261121.md)。
   后续同批追加：
   - Welcome 重做 Obsidian 式仓库选择页：`welcome-vault-list` 左栏列同步实例+本地库并直接打开；
     右栏 `welcome-new-local` / `welcome-open-local` / `welcome-sync-remote`；同步远程只用一条

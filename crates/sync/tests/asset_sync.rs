@@ -3,7 +3,8 @@
 //! 覆盖 attachment-insert 缺口：A 插入并引用新资产后，普通 `sync_once`（非发布基线）
 //! 就应把 ASSET 对象增量上传，B 能取到与 A 一致的字节；第二个同步轮次不重传；
 //! 多片资产传到一半失败后从缺失片续传；checkpoint 已上传的对象被普通同步直接复用/标记；
-//! 被维护 reservation 持有的对象延后（ID_CONFLICT 不阻塞正文）。
+//! 被维护 reservation 持有的对象延后（ID_CONFLICT 不阻塞正文）；本地字节与元数据 hash
+//! 不一致时必须上抛 `LocalCorrupt`（不能伪装成可重试失败）。
 
 mod support;
 
@@ -16,6 +17,7 @@ use menghunote_storage::{
 };
 use menghunote_sync::checkpoint::asset_object_id;
 use menghunote_sync::engine::{EngineIdentity, SyncEngine};
+use menghunote_sync::SyncError;
 use menghunote_sync_proto::{cap_plain, part_count_for, ObjectType};
 
 const ASSET_MEDIA: &str = "text/plain";
@@ -401,7 +403,7 @@ fn missing_media_or_data_skips_asset_without_upload() {
 }
 
 #[test]
-fn asset_hash_mismatch_is_failed_without_uploading_wrong_bytes() {
+fn asset_hash_mismatch_raises_local_corrupt_without_uploading_wrong_bytes() {
     ensure_test_identity_wrap();
     let (_dir, vault) = fresh_vault();
     let device = Device::new(0x91);
@@ -431,12 +433,18 @@ fn asset_hash_mismatch_is_failed_without_uploading_wrong_bytes() {
     link_asset_ref(&vault, "note-tamper", &claimed, 0, 1).expect("link");
     seed_pull_state(&vault, &relay);
 
-    let report = {
+    // P2-9：本地库损坏不是可重试的网络失败，必须**上抛**让调用方看到；原实现把它
+    // 计入 `failed` 后继续，于是每轮都"重试成功"、永不报错。
+    let error = {
         let mut sync = engine(&vault, &mut relay, &device);
-        sync.sync_once().expect("正文同步不得被坏资产阻塞")
+        sync.sync_once()
+            .expect_err("本地资产 hash 与字节不一致必须上抛 LocalCorrupt")
     };
-    assert_eq!(report.assets.failed, 1);
-    assert_eq!(report.assets.uploaded, 0);
+    assert!(
+        matches!(error, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
+        "实际：{error:?}"
+    );
+    // 整轮报错也不能把错误字节传给 relay、不能落 durable 标记。
     assert!(relay.put_history.is_empty());
     assert!(marker_rows(&vault).is_empty());
 }

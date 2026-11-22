@@ -103,6 +103,34 @@ pub enum StorageError {
         actual: u64,
     },
 
+    /// 未 ACK journal 的 CAS 基准已过期：head 被别的 writer 推进了。
+    ///
+    /// journal 条目的 `PendingUpdate` 是**追加那一刻**按当时 head 导出的字节
+    /// （`end_frontier` / `end_vv` 都是那次导出的快照），**不可重算**。head 一旦前进，
+    /// 同一份字节写一万次也只会再得到一次 CAS 冲突 —— 所以这是**终态**错误，
+    /// 由 [`StorageError::requires_session_rebuild`] 显式标记：
+    ///
+    /// - **谁负责重建**：持有 live `BodyDoc` 的会话层（`session::JournalHandle` /
+    ///   `SessionDriver`）。它必须先把内存文档重放到新 head，再按新 head 重新导出增量，
+    ///   并用新 `head_seq` 造 sink（见 `crate::journal` 模块头的契约）；
+    /// - **旧条目**：不会被写入，也**不会**被静默丢弃 —— `JournalWriter::rebuild_sink`
+    ///   把它们原样交还给调用方；
+    /// - **重试**：本层自动重试次数为 0，`flush` 之后不再触碰数据库。
+    #[error(
+        "文档 {doc_id} 的未 ACK journal 基准已过期（期望 head {expected}，实际 {actual}）：\
+         {pending} 条已导出增量不可重算，必须重建 session 后重新导出；已禁止重试"
+    )]
+    JournalHeadStale {
+        /// 文档 ID。
+        doc_id: String,
+        /// 写入时使用的 CAS 基准（`loro_docs.head_seq`）。
+        expected: u64,
+        /// 库里实际看到的 head。
+        actual: u64,
+        /// 过期时 journal 里未 durable 的条数。
+        pending: usize,
+    },
+
     /// 未 ACK journal 已满：必须先 flush 再重试（背压，不允许无界增长）。
     #[error("未 ACK journal 已满（容量 {capacity} 条），拒绝新写入；请先 flush")]
     WriteBackpressure {
@@ -174,4 +202,32 @@ pub enum StorageError {
         /// 具体上下文。
         context: String,
     },
+}
+
+impl StorageError {
+    /// 是否必须**重建 session**（而不是重试）。
+    ///
+    /// 目前只有 [`Self::JournalHeadStale`]：那批 `PendingUpdate` 是按旧 head 导出的字节，
+    /// 没有任何 rebase 可能，原样重试永远不会成功。调用方必须先重建 session、重新导出
+    /// 增量（见 `crate::journal` 模块头），否则只会把失败换个地方再报一次。
+    #[must_use]
+    pub fn requires_session_rebuild(&self) -> bool {
+        matches!(self, Self::JournalHeadStale { .. })
+    }
+
+    /// 是否值得**原样重试**（只表示"条件变化后可能成功"，不表示"一定要重试"）。
+    ///
+    /// - [`Self::HeadConflict`]：store 层 CAS 冲突 —— 重读 head 后重放（sync engine 语义，
+    ///   与 journal 层的[`Self::JournalHeadStale`]不同：那里的字节可以重新导出）；
+    /// - [`Self::SnapshotBusy`]：读锁超时 —— 退避后重开快照；
+    /// - [`Self::WriteBackpressure`]：journal 满 —— 先 flush 再重试。
+    ///
+    /// 其余变体一律 `false`：盲目重试只会挂死，或把真正的损坏/配置错误掩盖成"暂时失败"。
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::HeadConflict { .. } | Self::SnapshotBusy { .. } | Self::WriteBackpressure { .. }
+        )
+    }
 }

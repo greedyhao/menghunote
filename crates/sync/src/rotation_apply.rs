@@ -28,7 +28,7 @@ use crate::{DeviceId, ObjectId, VaultId};
 use menghunote_storage::{
     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, baseline_apply_state,
     begin_baseline_apply, finish_baseline_apply, repack_required, BaselineApplyFinish,
-    BaselineApplyState, BaselineApplyStatus, BaselineAsset,
+    BaselineApplyState, BaselineApplyStatus, BaselineAsset, BaselineExpectation,
 };
 use menghunote_sync_proto::{
     activation_t_signing_input, checkpoint_signing_input, grant_package_digest, ActivationCommitV1,
@@ -307,7 +307,19 @@ pub fn apply_verified_baseline(
     payload: &BaselinePayload,
     baseline_cursor: &str,
 ) -> Result<BaselineApplyState, SyncError> {
-    begin_baseline_apply(vault, &payload.checkpoint_id, payload.baseline_s, "")?;
+    // 完整性基准：候选 checkpoint 覆盖的 docs/资产必须全部写进 journal，少一批就
+    // finish 不了（不会推进 cursor）。
+    let expected = BaselineExpectation::new(
+        payload.docs.iter().map(|(doc_id, _)| doc_id.clone()),
+        payload.assets.iter().map(|asset| asset.object_id),
+    );
+    begin_baseline_apply(
+        vault,
+        &payload.checkpoint_id,
+        payload.baseline_s,
+        "",
+        &expected,
+    )?;
     let result = (|| {
         for chunk in payload.docs.chunks(64) {
             apply_baseline_batch(vault, chunk, &[])?;

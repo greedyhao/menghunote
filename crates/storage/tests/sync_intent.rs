@@ -25,9 +25,9 @@ use menghunote_storage::session::{
 use menghunote_storage::{
     append_updates, apply_baseline_batch, begin_baseline_apply, enqueue_sync_intent,
     finish_baseline_apply, intent_message_id, intent_object_id, load_body_doc, load_head,
-    local_sync_intent, outbox_row, pending_encryption, BodyDoc, DurableSink, JournalEntry,
-    JournalOrigin, StorageError, StructureWriter, SyncContext, SyncIntent, SyncOutboxState,
-    UpdateRecord, Value, Vault, VaultJournalSink, STRUCTURE_DOC_ID,
+    local_sync_intent, outbox_row, pending_encryption, BaselineExpectation, BodyDoc, DurableSink,
+    JournalEntry, JournalOrigin, StorageError, StructureWriter, SyncContext, SyncIntent,
+    SyncOutboxState, UpdateRecord, Value, Vault, VaultJournalSink, STRUCTURE_DOC_ID,
 };
 use menghunote_text::UnicodeScalar;
 
@@ -504,7 +504,17 @@ fn remote_import_and_adopt_never_produce_intents() {
         doc.insert_scalars(0, "基线").expect("写基线");
         doc.export_snapshot().expect("导出 snapshot")
     };
-    begin_baseline_apply(&vault3, &[7; 16], 3, "cursor-1").expect("begin");
+    begin_baseline_apply(
+        &vault3,
+        &[7; 16],
+        3,
+        "cursor-1",
+        &BaselineExpectation::new(
+            std::iter::once("doc-1".to_owned()),
+            std::iter::empty::<[u8; 32]>(),
+        ),
+    )
+    .expect("begin");
     apply_baseline_batch(&vault3, &[("doc-1".to_owned(), baseline)], &[]).expect("apply");
     let _ = finish_baseline_apply(&vault3, 3, "cursor-2").expect("finish");
     assert_eq!(outbox_count(&vault3), 0, "adopt/baseline 绝不能产生 intent");

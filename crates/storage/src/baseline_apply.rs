@@ -14,11 +14,17 @@
 //!   `sync.remote_known_vv.<doc_id>`（见 [`crate::remote_known`]），跨 journal 保留，
 //!   供后续 tombstone 判定区分「远端已删的已同步文档」与「local-only 文档」。
 //! - `finish` 只做**单调**水位/cursor CAS 与 journal 状态迁移；失败不推进任何 cursor。
+//! - `begin` 记录本 checkpoint 的**预期参与集合**（覆盖到的 doc 与资产，存于既有 `meta`
+//!   单行、只本地可见）：`finish` 必须先证明集合里每一项都已 `applied=1`，才允许写任何
+//!   meta；少跑一批（或跑错集合）返回 [`BaselineApplyFinish::Conflict`]，而不是推进 S
+//!   之后让 pull 永久跳过 relay 事件。
+//! - tombstone 的 outbox 判定会在**同一写事务内**用 SQL 重判一次：判定完成后被并发写入的
+//!   outbox 行只会把 `deleted` 退化为 `kept_local_edit`，绝不误删本地编辑。
 //! - `abort` 只清 staging，不删已导入的 Loro/asset 数据，也不回滚远端已知 VV。
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use loro::VersionVector;
 use rusqlite::types::Value;
@@ -39,6 +45,21 @@ use crate::Vault;
 pub const BASELINE_MERGE_BATCH: &str = "baseline_merge";
 /// relay 页面 cursor 的 meta 键（与 sync `engine::RELAY_CURSOR_META` 对齐）。
 pub const META_SYNC_RELAY_CURSOR: &str = "sync.relay_cursor";
+/// [`BaselineExpectation`] 的持久化 meta 键（**只本地可见**；不是 schema/wire）。
+pub const META_BASELINE_EXPECTED: &str = "sync.baseline_expected";
+/// 导入后读回校验失败的持久标记（**只本地可见**；不是 schema/wire）。
+///
+/// 为什么不是 `baseline_apply.status='failed'`：schema v3 的
+/// `CHECK(status IN('staging','completed'))` 不允许新值（见
+/// `crates/storage/src/schema/v3.sql`），加状态需要 DDL/迁移，超出同步硬化 P1 的边界。
+/// 失败语义改由本 meta 键承载：journal 保持 `staging`（已导入的 Loro/资产数据全部
+/// 保留，便于诊断/重跑），但 [`begin_baseline_apply`] 见到该键一律拒绝，必须先
+/// [`abort_baseline_apply`] 清理（abort 同时删除本键）。
+pub const META_BASELINE_VERIFY_FAILED: &str = "sync.baseline_verify_failed";
+/// 预期集合编码的魔数（防止误读旧值/损坏值）。
+const EXPECTED_MAGIC: &[u8] = b"MNBASEEXP1";
+/// 失败标记编码的魔数（`magic | utf8 reason`，防止把任意 BLOB 误读成失败标记）。
+const VERIFY_FAILED_MAGIC: &[u8] = b"MNBASEVERIFYFAIL1";
 /// storage 内部构造 BodyDoc 时使用的 peer id（只影响新文档的本地 op id，不影响 import）。
 const BASELINE_PEER_ID: u64 = 1;
 
@@ -65,6 +86,12 @@ pub struct BaselineApplyDebugTimings {
     pub transaction_ns: u64,
     /// 整个 `apply_baseline_batch`。
     pub batch_total_ns: u64,
+    /// 导入后读回校验（sync 的 `verify_imported`）耗时。
+    ///
+    /// **只读指标**：不参与任何决策；由 sync 的 bootstrap 调用
+    /// [`record_baseline_verify_time`] 记录，Phase1B 的 gate_hold 报告可在同一线程
+    /// 通过 [`baseline_apply_debug_timings`] 或 [`baseline_apply_verify_ms`] 读取。
+    pub verify_ns: u64,
 }
 
 /// 基线 apply 的计数（**仅用于基准/诊断**；按线程累计，不持久化）。
@@ -112,6 +139,26 @@ pub fn baseline_apply_debug_timings() -> BaselineApplyDebugTimings {
 #[doc(hidden)]
 pub fn baseline_apply_debug_counters() -> BaselineApplyDebugCounters {
     BASELINE_DEBUG.with(|acc| acc.borrow().counters)
+}
+
+/// 记录一次导入后读回校验（sync 的 `verify_imported`）耗时。
+///
+/// **只读指标**：不参与任何决策，也不持久化；与其它分段计时一样按线程累计。
+/// Phase1B 的 gate_hold 报告可在同一线程读取 [`baseline_apply_debug_timings`] 的
+/// `verify_ns`（或 [`baseline_apply_verify_ms`]）。
+#[doc(hidden)]
+pub fn record_baseline_verify_time(elapsed: Duration) {
+    let elapsed = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    BASELINE_DEBUG.with(|acc| {
+        let mut acc = acc.borrow_mut();
+        acc.timings.verify_ns = acc.timings.verify_ns.saturating_add(elapsed);
+    });
+}
+
+/// 当前线程累计的读回校验耗时（毫秒，向下取整；只读指标，不参与决策）。
+#[doc(hidden)]
+pub fn baseline_apply_verify_ms() -> u64 {
+    baseline_apply_debug_timings().verify_ns / 1_000_000
 }
 
 fn debug_add_time<F>(field: F, started: Instant)
@@ -165,7 +212,11 @@ pub struct BaselineApplyState {
     pub applied_docs: u64,
     pub applied_assets: u64,
     pub kept_local_edit: u64,
-    /// staging 状态且没有未完成子步骤时为 true；finish 还要求 cursor CAS 通过。
+    /// begin 记录的预期文档数；没有记录（旧 journal/损坏）时为 `None`，此时不可 finish。
+    pub expected_docs: Option<u64>,
+    /// begin 记录的预期资产数；同上。
+    pub expected_assets: Option<u64>,
+    /// staging 且 begin 记录的预期集合已全部 `applied=1` 时为 true；finish 还要求 cursor CAS 通过。
     pub finishable: bool,
     /// 所选基线自带的 relay cursor；是否真正写进 `meta` 取决于 finish 的单调判断。
     pub chosen_cursor: Option<String>,
@@ -177,8 +228,124 @@ pub enum BaselineApplyFinish {
     /// 成功推进 cursor；携带 completed 状态。
     Applied(BaselineApplyState),
     NotFound,
-    /// begin 记录的水位/游标已被并发改写、S 不符或批次未完成；未修改任何行。
+    /// begin 记录的水位/游标已被并发改写、S 不符、或预期参与集合未全部应用；
+    /// 未修改任何行。
     Conflict,
+}
+
+/// `begin_baseline_apply` 记录的**预期参与集合**：本 checkpoint 覆盖的全部文档与资产。
+///
+/// 为什么需要：journal 只记录「已应用了多少」，不记录「本来应该应用哪些」。少跑一批
+/// （进程被杀、调用方漏批、fallback 选错集）时旧实现仍能 finish 并推进 S，随后普通 pull
+/// 会把这段前缀当成已消费，**永久跳过其中所有 relay 事件**。
+///
+/// 集合以单条 [`META_BASELINE_EXPECTED`] `meta` 行持久化（不新增列/表、不参与同步、不是
+/// wire）；`new` 会排序去重，因此同一集合的不同传入顺序被视为同一份预期。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BaselineExpectation {
+    docs: Vec<String>,
+    assets: Vec<[u8; 32]>,
+}
+
+impl BaselineExpectation {
+    /// 规范化（排序 + 去重）后构造。
+    pub fn new(
+        docs: impl IntoIterator<Item = String>,
+        assets: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Self {
+        let mut docs: Vec<String> = docs.into_iter().collect();
+        docs.sort_unstable();
+        docs.dedup();
+        let mut assets: Vec<[u8; 32]> = assets.into_iter().collect();
+        assets.sort_unstable();
+        assets.dedup();
+        Self { docs, assets }
+    }
+
+    /// 预期的文档 id（已排序去重）。
+    pub fn docs(&self) -> &[String] {
+        &self.docs
+    }
+
+    /// 预期的资产 object_id（已排序去重）。
+    pub fn assets(&self) -> &[[u8; 32]] {
+        &self.assets
+    }
+
+    /// 预期文档数。
+    pub fn doc_count(&self) -> u64 {
+        u64::try_from(self.docs.len()).unwrap_or(u64::MAX)
+    }
+
+    /// 预期资产数。
+    pub fn asset_count(&self) -> u64 {
+        u64::try_from(self.assets.len()).unwrap_or(u64::MAX)
+    }
+
+    /// 集合是否为空（空集合视为"begin 已显式声明无需应用任何项"）。
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty() && self.assets.is_empty()
+    }
+
+    /// 编码成单条 `meta` 值：`magic | doc_count | (len,doc)* | asset_count | oid*`（全部 BE）。
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            EXPECTED_MAGIC.len()
+                + 16
+                + self.docs.iter().map(|doc| 8 + doc.len()).sum::<usize>()
+                + self.assets.len() * 32,
+        );
+        out.extend_from_slice(EXPECTED_MAGIC);
+        out.extend_from_slice(&self.doc_count().to_be_bytes());
+        for doc in &self.docs {
+            let len = u64::try_from(doc.len()).unwrap_or(u64::MAX);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(doc.as_bytes());
+        }
+        out.extend_from_slice(&self.asset_count().to_be_bytes());
+        for asset in &self.assets {
+            out.extend_from_slice(asset);
+        }
+        out
+    }
+
+    /// 解码并校验 `encode` 的输出；任何不合法都视为本地 meta 损坏（fail-closed）。
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        let mut offset = 0usize;
+        let magic = take_expected_bytes(bytes, &mut offset, EXPECTED_MAGIC.len())?;
+        if magic != EXPECTED_MAGIC {
+            return Err(corrupt_expected("魔数不符"));
+        }
+        let doc_count = read_expected_u64(bytes, &mut offset)?;
+        let doc_count =
+            usize::try_from(doc_count).map_err(|_| corrupt_expected("doc 数超过 usize"))?;
+        // 损坏数据不得预分配过大内存。
+        let mut docs = Vec::with_capacity(doc_count.min(64));
+        for _ in 0..doc_count {
+            let len = read_expected_u64(bytes, &mut offset)?;
+            let len = usize::try_from(len).map_err(|_| corrupt_expected("doc 长度超过 usize"))?;
+            let raw = take_expected_bytes(bytes, &mut offset, len)?;
+            let doc = std::str::from_utf8(raw)
+                .map_err(|_| corrupt_expected("doc_id 不是 UTF-8"))?
+                .to_owned();
+            docs.push(doc);
+        }
+        let asset_count = read_expected_u64(bytes, &mut offset)?;
+        let asset_count =
+            usize::try_from(asset_count).map_err(|_| corrupt_expected("资产数超过 usize"))?;
+        let mut assets = Vec::with_capacity(asset_count.min(64));
+        for _ in 0..asset_count {
+            let raw = take_expected_bytes(bytes, &mut offset, 32)?;
+            let object_id: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| corrupt_expected("object_id 长度非法"))?;
+            assets.push(object_id);
+        }
+        if offset != bytes.len() {
+            return Err(corrupt_expected("尾部有多余字节"));
+        }
+        Ok(Self { docs, assets })
+    }
 }
 
 /// 一个已验证的基线资产（HMAC oid 是 relay 对象名；明文 hash 是真实 sha256）。
@@ -212,8 +379,14 @@ struct PreparedDoc {
     baseline_vv: Vec<u8>,
     expected_head: Option<HeadState>,
     update: Option<PendingUpdate>,
+    /// 读到的旧「远端已知 VV」（值 CAS 的期望值；`None` = 读时不存在）。
+    ///
+    /// 写入必须走 CAS（P2-5）：本批准备期间，普通 pull 的 A 事务完全可能已经把同一个
+    /// `sync.remote_known_vv.<doc_id>` 扩大；无条件覆盖会把它退回到本批的并集（丢失
+    /// 远端已知证据 → tombstone 误判为 local-only，只会保守保留，但证据丢了）。
+    remote_known_expected: Option<VersionVector>,
     /// 合并后的远端已知 VV（写入 `sync.remote_known_vv.<doc_id>`）。
-    remote_known: Vec<u8>,
+    remote_known_merged: VersionVector,
 }
 struct PreparedTombstone {
     doc_id: String,
@@ -227,14 +400,71 @@ struct PreparedAsset {
     statement: Option<Statement>,
 }
 
-/// 开始一次 baseline apply staging；同参数重复调用幂等，冲突参数返回 SyncConflict。
+/// 记录「baseline 导入后的读回校验失败」。
+///
+/// 只写一条本地 `meta`（BLOB：魔数 + UTF-8 原因），**不改** `baseline_apply.status`
+/// （schema v3 的 CHECK 只允许 `staging/completed`，新增 `failed` 需要 DDL/迁移）。
+/// journal 与已导入的 Loro/资产数据原样保留：CRDT merge 幂等，回滚已 merge 的数据会
+/// 丢掉本地编辑（本地 op 可能已经与基线 ops 合进同一条 update，无法原样拆分）。
+///
+/// 契约：标记存在时 [`begin_baseline_apply`] 一律拒绝；必须先 [`abort_baseline_apply`]
+/// 清理失败 journal（abort 同时删除本标记）。
+pub fn mark_baseline_verify_failed(vault: &Vault, reason: &str) -> Result<(), StorageError> {
+    let mut value = Vec::with_capacity(VERIFY_FAILED_MAGIC.len() + reason.len());
+    value.extend_from_slice(VERIFY_FAILED_MAGIC);
+    value.extend_from_slice(reason.as_bytes());
+    vault.set_meta(META_BASELINE_VERIFY_FAILED, &value)
+}
+
+/// 读失败标记的原因；没有标记返回 `None`。
+///
+/// 标记存在但编码非法（缺魔数/非 UTF-8）返回 [`StorageError::Corrupt`]，不静默当成
+/// 「没有失败」——那会让 `begin` 放行一份未知状态的 journal。
+pub fn baseline_verify_failure(vault: &Vault) -> Result<Option<String>, StorageError> {
+    let Some(bytes) = vault.get_meta(META_BASELINE_VERIFY_FAILED)? else {
+        return Ok(None);
+    };
+    let reason = bytes
+        .strip_prefix(VERIFY_FAILED_MAGIC)
+        .ok_or_else(|| StorageError::Corrupt {
+            context: format!("{META_BASELINE_VERIFY_FAILED} 编码非法（缺魔数）"),
+        })?;
+    String::from_utf8(reason.to_vec())
+        .map(Some)
+        .map_err(|_| StorageError::Corrupt {
+            context: format!("{META_BASELINE_VERIFY_FAILED} 原因不是合法 UTF-8"),
+        })
+}
+
+/// 开始一次 baseline apply staging；同参数（含预期参与集合）重复调用幂等，冲突参数返回
+/// SyncConflict。
+///
+/// `expected` 必须覆盖**本 checkpoint 的全部** docs 与资产：finish 前会拿它逐项核对
+/// `baseline_apply_docs/applied=1` 与 `baseline_apply_assets/applied=1`（见
+/// [`BaselineExpectation`]）。同一 checkpoint/S/cursor 但 `expected` 不同 → 冲突，
+/// 不会静默沿用旧集合。
+///
+/// 若存在 [`META_BASELINE_VERIFY_FAILED`] 标记（上一次导入读回校验失败），本函数**拒绝**
+/// 一切 begin（包括同参数幂等续跑），必须先 [`abort_baseline_apply`]。
 pub fn begin_baseline_apply(
     vault: &Vault,
     checkpoint_id: &[u8; 16],
     baseline_s: u64,
     source_cursor: &str,
+    expected: &BaselineExpectation,
 ) -> Result<BaselineApplyState, StorageError> {
+    // 失败标记优先于幂等/冲突判断：journal 仍是 staging（schema 不允许新 status），
+    // 但语义上已不可续跑；必须先 abort 清理失败 journal 与标记。
+    if let Some(reason) = baseline_verify_failure(vault)? {
+        return Err(StorageError::SyncConflict {
+            context: format!(
+                "baseline 导入的读回校验已失败（{META_BASELINE_VERIFY_FAILED}: {reason}）；\
+                 已 merge 的 Loro/资产数据仍保留，必须先 abort_baseline_apply 清理失败 journal"
+            ),
+        });
+    }
     let now = now_secs()?;
+    let expected_bytes = expected.encode();
     let existing = load_journal(vault)?;
     if let Some(existing) = &existing {
         if existing.status == BaselineApplyStatus::Staging
@@ -242,7 +472,16 @@ pub fn begin_baseline_apply(
             && existing.baseline_s == baseline_s
             && existing.source_cursor == source_cursor
         {
-            return state_from_journal(existing);
+            // 同参数重入必须幂等（崩溃续跑路径）；但预期集合必须对得上：
+            // 旧 journal 没有集合记录、或调用方换了集合，都不能静默继续。
+            let stored = vault.get_meta(META_BASELINE_EXPECTED)?;
+            if stored.as_deref() != Some(expected_bytes.as_slice()) {
+                return Err(StorageError::SyncConflict {
+                    context: "同一 checkpoint 的 baseline apply staging 已有另一份预期参与集合"
+                        .to_owned(),
+                });
+            }
+            return state_from_journal(vault, existing);
         }
         if existing.status == BaselineApplyStatus::Staging {
             return Err(StorageError::SyncConflict {
@@ -256,38 +495,43 @@ pub fn begin_baseline_apply(
 
     let mut statements = Vec::new();
     let mut guards = Vec::new();
-    if existing.is_some() {
-        // completed 的 journal 可以安全替换；旧 journal 子表只属于它。
-        //
-        // 但 `baseline_apply_docs.baseline_vv` 是**跨 journal 仍然有效**的
-        // 「远端已知 VV」证据：必须在删除前落到非破坏性本地 meta 里，
-        // 否则已有设备下一次快照追赶时会把远端已删文档误判成 local-only。
-        //
-        // `DO NOTHING`：已有 meta（普通 pull/integrate 记录的更新的远端已知 VV）
-        // 永远不降级；缺失时才由旧 baseline_vv 补上。
-        statements.push(Statement::new(
-            format!(
-                "INSERT INTO meta(key,value) \
-                 SELECT '{}' || doc_id, baseline_vv FROM baseline_apply_docs WHERE applied=1 \
-                 ON CONFLICT(key) DO NOTHING",
-                remote_known::META_REMOTE_KNOWN_VV_PREFIX
-            ),
-            Vec::new(),
-        ));
-        statements.push(Statement::new(
-            "DELETE FROM baseline_apply_docs",
-            Vec::new(),
-        ));
-        statements.push(Statement::new(
-            "DELETE FROM baseline_apply_tombstones",
-            Vec::new(),
-        ));
-        statements.push(Statement::new(
-            "DELETE FROM baseline_apply_assets",
-            Vec::new(),
-        ));
-        statements.push(Statement::new("DELETE FROM baseline_apply", Vec::new()));
-    }
+    // 旧 journal 子表的「远端已知 VV」证据回填 + 清理。
+    //
+    // `baseline_apply_docs.baseline_vv` 是**跨 journal 仍然有效**的「远端已知 VV」
+    // 证据：必须在删除前落到非破坏性本地 meta 里，否则已有设备下一次快照追赶时会把
+    // 远端已删文档误判成 local-only（只会保守保留，但证据丢了）。
+    //
+    // **无条件执行**（P2-5）：走到这里只可能是「没有 journal」或「completed journal」
+    // （staging 同参已幂等早退、异参已 SyncConflict 返回）。completed journal 的
+    // baseline_vv 要回填；没有 journal 但残留子表（旧版本/异常写留下的孤儿行）也必须
+    // 先回填再清掉，否则下面无条件 `DELETE` 会把证据静默丢弃。
+    //
+    // `DO NOTHING` 是单调断言：已有 meta（普通 pull/integrate 记录的更新的远端已知 VV）
+    // 永远不降级；缺失时才由旧 baseline_vv 补上。
+    statements.push(Statement::new(
+        format!(
+            "INSERT INTO meta(key,value) \
+             SELECT '{}' || doc_id, baseline_vv FROM baseline_apply_docs WHERE applied=1 \
+             ON CONFLICT(key) DO NOTHING",
+            remote_known::META_REMOTE_KNOWN_VV_PREFIX
+        ),
+        Vec::new(),
+    ));
+    // 旧 journal 子表只属于旧 journal（completed 或孤儿残留），一律清掉，
+    // 避免它们被下一轮 `apply_baseline_batch` 当成「已应用」。
+    statements.push(Statement::new(
+        "DELETE FROM baseline_apply_docs",
+        Vec::new(),
+    ));
+    statements.push(Statement::new(
+        "DELETE FROM baseline_apply_tombstones",
+        Vec::new(),
+    ));
+    statements.push(Statement::new(
+        "DELETE FROM baseline_apply_assets",
+        Vec::new(),
+    ));
+    statements.push(Statement::new("DELETE FROM baseline_apply", Vec::new()));
     let insert_index = statements.len();
     statements.push(Statement::new(
         "INSERT INTO baseline_apply(\
@@ -309,6 +553,19 @@ pub fn begin_baseline_apply(
     ));
     guards.push(AffectedGuard::exactly(insert_index, 1));
 
+    // 预期参与集合随 journal 同事务落 meta（replace 语义：completed journal 被替换时
+    // 旧集合必须一起被覆盖，否则 finish 会拿上一轮的集合核对本轮进度）。
+    let expected_index = statements.len();
+    statements.push(Statement::new(
+        "INSERT INTO meta(key,value) VALUES(?1,?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        vec![
+            Value::Text(META_BASELINE_EXPECTED.to_owned()),
+            Value::Blob(expected_bytes),
+        ],
+    ));
+    guards.push(AffectedGuard::exactly(expected_index, 1));
+
     match vault.exec_transaction(&statements, &guards) {
         Ok(_) => {}
         Err(StorageError::GuardFailed { .. }) => {
@@ -325,9 +582,10 @@ pub fn begin_baseline_apply(
 
 /// 当前 staging journal 的只读状态；没有 journal 返回 `None`。
 pub fn baseline_apply_state(vault: &Vault) -> Result<Option<BaselineApplyState>, StorageError> {
-    load_journal(vault)?
-        .map(|journal| state_from_journal(&journal))
-        .transpose()
+    match load_journal(vault)? {
+        None => Ok(None),
+        Some(journal) => state_from_journal(vault, &journal).map(Some),
+    }
 }
 
 /// 应用一批已验证的快照文档和远端 tombstone。
@@ -338,7 +596,7 @@ pub fn apply_baseline_batch(
 ) -> Result<BaselineApplyState, StorageError> {
     let journal = load_active_journal(vault)?;
     if docs.is_empty() && tombstones.is_empty() {
-        return state_from_journal(&journal);
+        return state_from_journal(vault, &journal);
     }
 
     let mut seen_docs = BTreeSet::new();
@@ -484,9 +742,10 @@ pub fn apply_baseline_batch(
             }
         }
 
-        let remote_known = match remote_known::load(vault, doc_id)? {
-            Some(existing) => remote_known::union(&existing, &baseline_vv).encode(),
-            None => baseline_vv.encode(),
+        let remote_known_expected = remote_known::load(vault, doc_id)?;
+        let remote_known_merged = match &remote_known_expected {
+            Some(existing) => remote_known::union(existing, &baseline_vv),
+            None => baseline_vv.clone(),
         };
         prepared_docs.push(PreparedDoc {
             doc_id: doc_id.clone(),
@@ -494,7 +753,8 @@ pub fn apply_baseline_batch(
             baseline_vv: baseline_vv.encode(),
             expected_head,
             update,
-            remote_known,
+            remote_known_expected,
+            remote_known_merged,
         });
         baseline_by_doc.insert(doc_id.clone(), local_extra);
     }
@@ -515,6 +775,8 @@ pub fn apply_baseline_batch(
     let now = now_secs()?;
     let mut statements = Vec::new();
     let mut guards = Vec::new();
+    // 远端已知 VV 的 CAS 守卫下标 → doc_id：GuardFailed 时用它给出明确冲突错误。
+    let mut remote_known_guards: Vec<(usize, String)> = Vec::new();
     for prepared in &prepared_docs {
         let journal_index = statements.len();
         statements.push(Statement::new(
@@ -532,17 +794,18 @@ pub fn apply_baseline_batch(
         guards.push(AffectedGuard::exactly(journal_index, 1));
 
         // 跨 journal 保留的「远端已知 VV」：本批快照的 VV 就是远端已见过的 ops。
-        // 与旧值取单调并集（旧值可能来自普通 pull/integrate 的更新远端已知集）。
+        // 与旧值取单调并集（旧值可能来自普通 pull/integrate 的更新远端已知集），
+        // 但写入必须是**值 CAS**：只有库中值仍是准备阶段读到的旧值才更新。
+        // 并发写者（普通 pull 的 A 事务）已经扩大过 → 0 行 → 整批回滚并报明确冲突，
+        // 由调用方重试；绝不把更大的值覆盖回本批的并集（P2-5）。
         let remote_index = statements.len();
-        statements.push(Statement::new(
-            "INSERT INTO meta(key,value) VALUES(?1,?2) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            vec![
-                Value::Text(remote_known::meta_key(&prepared.doc_id)),
-                Value::Blob(prepared.remote_known.clone()),
-            ],
+        statements.push(remote_known::cas_statement(
+            &prepared.doc_id,
+            prepared.remote_known_expected.as_ref(),
+            &prepared.remote_known_merged,
         ));
         guards.push(AffectedGuard::exactly(remote_index, 1));
+        remote_known_guards.push((remote_index, prepared.doc_id.clone()));
 
         let Some(update) = &prepared.update else {
             if prepared.expected_head.is_none() {
@@ -650,23 +913,42 @@ pub fn apply_baseline_batch(
     }
 
     for tombstone in &prepared_tombstones {
-        if tombstone.action == "deleted" {
-            statements.push(Statement::new(
-                "UPDATE notes SET deleted=1 WHERE body_doc_id=?1",
-                vec![Value::Text(tombstone.doc_id.clone())],
-            ));
-        }
+        // P1-2（TOCTOU）：`tombstone_can_delete` 在事务外读 outbox，判定完成后本地编辑的
+        // A 事务完全可能插进一条 `sync_outbox` 行；若仍按旧判定无条件软删，就会把刚编辑
+        // 的笔记删掉。因此最终 action 必须在**同一个写事务里**用 SQL 重判一次：
+        // 只允许 `deleted → kept_local_edit` 的降级，绝不允许 `kept → deleted` 升级。
         let index = statements.len();
         statements.push(Statement::new(
-            "INSERT INTO baseline_apply_tombstones(doc_id,action,updated_at) VALUES(?1,?2,?3) \
-             ON CONFLICT(doc_id) DO UPDATE SET action=excluded.action,updated_at=excluded.updated_at",
+            "INSERT INTO baseline_apply_tombstones(doc_id,action,updated_at) \
+             VALUES(?1, CASE WHEN EXISTS(SELECT 1 FROM sync_outbox WHERE doc_id=?1) \
+                             THEN 'kept_local_edit' ELSE ?2 END, ?3) \
+             ON CONFLICT(doc_id) DO UPDATE SET \
+               action=CASE WHEN EXISTS(SELECT 1 FROM sync_outbox WHERE doc_id=?1) \
+                           THEN 'kept_local_edit' ELSE excluded.action END, \
+               updated_at=excluded.updated_at",
             vec![
                 Value::Text(tombstone.doc_id.clone()),
                 Value::Text(tombstone.action.to_owned()),
                 Value::Integer(now),
             ],
         ));
+        // 这一句永远恰好写入 1 行（INSERT 或 DO UPDATE），是"判定已落库"的守卫：
+        // 说明事务内重判真的执行了，而不是被别的写入/约束挡掉。
         guards.push(AffectedGuard::exactly(index, 1));
+
+        if tombstone.action == "deleted" {
+            // 软删与 outbox 判定在同一事务内：只有重判仍为 `deleted`（且此刻没有
+            // outbox）才置 deleted=1。0 行是合法结果（该文档没有 notes 行，或已降级为
+            // kept_local_edit），所以这句本身不设 exactly 守卫；守卫语义在上一条。
+            statements.push(Statement::new(
+                "UPDATE notes SET deleted=1 \
+                 WHERE body_doc_id=?1 \
+                   AND NOT EXISTS(SELECT 1 FROM sync_outbox WHERE doc_id=?1) \
+                   AND EXISTS(SELECT 1 FROM baseline_apply_tombstones \
+                              WHERE doc_id=?1 AND action='deleted')",
+                vec![Value::Text(tombstone.doc_id.clone())],
+            ));
+        }
     }
 
     let journal_index = statements.len();
@@ -684,7 +966,20 @@ pub fn apply_baseline_batch(
     let transaction_started = Instant::now();
     match vault.exec_transaction(&statements, &guards) {
         Ok(_) => {}
-        Err(StorageError::GuardFailed { .. }) => {
+        Err(StorageError::GuardFailed { statement, .. }) => {
+            if let Some((_, doc_id)) = remote_known_guards
+                .iter()
+                .find(|(index, _)| *index == statement)
+            {
+                // 值 CAS 不命中：准备阶段读到的旧值已被普通 pull 的 A 事务改写。
+                // 整批已回滚（update/head/journal 都没有落库），重跑本批即可读到并集。
+                return Err(StorageError::SyncConflict {
+                    context: format!(
+                        "baseline 文档 {doc_id} 的远端已知 VV 值 CAS 失败：\
+                         并发写者已改写旧值；整批已回滚，可重试"
+                    ),
+                });
+            }
             return Err(StorageError::SyncConflict {
                 context: "baseline batch 期间 journal/doc head 已变化".to_owned(),
             });
@@ -705,7 +1000,7 @@ pub fn apply_baseline_assets(
 ) -> Result<BaselineApplyState, StorageError> {
     let journal = load_active_journal(vault)?;
     if assets.is_empty() {
-        return state_from_journal(&journal);
+        return state_from_journal(vault, &journal);
     }
 
     let mut seen_oid = BTreeSet::new();
@@ -826,6 +1121,10 @@ pub fn apply_baseline_assets(
 ///
 /// CAS 仍是"begin 时记录、finish 时校验"：任一字段在 finish 前被并发改写即返回
 /// [`BaselineApplyFinish::Conflict`]，整笔事务不写。
+///
+/// **完整性前提**（P1-1）：begin 记录在 [`META_BASELINE_EXPECTED`] 的预期参与集合必须
+/// 全部 `applied=1`。少跑一批（哪怕 status 仍是 staging）返回 Conflict；旧 journal
+/// 没有集合记录同样 Conflict（拿不到证明就不允许推进 S），绝不明知不完整还写水位。
 pub fn finish_baseline_apply(
     vault: &Vault,
     chosen_baseline_s: u64,
@@ -836,6 +1135,14 @@ pub fn finish_baseline_apply(
         Some(journal) => journal,
     };
     if journal.status != BaselineApplyStatus::Staging || journal.baseline_s != chosen_baseline_s {
+        return Ok(BaselineApplyFinish::Conflict);
+    }
+
+    // 完整性校验在任何写语句之前：拿不到 begin 的预期集合，或集合未全齐，一律 Conflict。
+    let Some(expected) = load_expected_set(vault)? else {
+        return Ok(BaselineApplyFinish::Conflict);
+    };
+    if !expected_is_complete(vault, &journal, &expected)? {
         return Ok(BaselineApplyFinish::Conflict);
     }
 
@@ -937,13 +1244,21 @@ pub fn finish_baseline_apply(
     Ok(BaselineApplyFinish::Applied(state))
 }
 
-/// 只清 staging journal（含子表）；已导入的 Loro update/资产保留。
+/// 只清 staging journal（含子表、预期参与集合与失败标记）；已导入的 Loro update/资产保留。
+///
+/// 没有 staging journal 时仍会清掉可能残留的 [`META_BASELINE_VERIFY_FAILED`]（abort 是
+/// 失败标记的唯一清理入口），并返回 `false` 表示没有 journal 可中止。
 pub fn abort_baseline_apply(vault: &Vault) -> Result<bool, StorageError> {
-    let Some(journal) = load_journal(vault)? else {
-        return Ok(false);
-    };
-    if journal.status != BaselineApplyStatus::Staging {
-        return Ok(false);
+    match load_journal(vault)? {
+        Some(journal) if journal.status == BaselineApplyStatus::Staging => {}
+        _ => {
+            // completed journal 的数据不动；只清失败标记（若存在），保持返回 false 的既有语义。
+            let _cleared = vault.exec(
+                "DELETE FROM meta WHERE key=?1",
+                &[Value::Text(META_BASELINE_VERIFY_FAILED.to_owned())],
+            )?;
+            return Ok(false);
+        }
     }
     let statements = [
         Statement::new("DELETE FROM baseline_apply_docs", Vec::new()),
@@ -952,6 +1267,17 @@ pub fn abort_baseline_apply(vault: &Vault) -> Result<bool, StorageError> {
         Statement::new(
             "DELETE FROM baseline_apply WHERE singleton=1 AND status='staging'",
             Vec::new(),
+        ),
+        // 预期集合只属于被清掉的 journal；留着会被下一次 begin 的 replace 覆盖，
+        // 但清掉可以避免"没有 journal 却有预期集合"的中间态被误读。
+        Statement::new(
+            "DELETE FROM meta WHERE key=?1",
+            vec![Value::Text(META_BASELINE_EXPECTED.to_owned())],
+        ),
+        // 失败标记随失败 journal 一起清：abort 之后才允许重新 begin。
+        Statement::new(
+            "DELETE FROM meta WHERE key=?1",
+            vec![Value::Text(META_BASELINE_VERIFY_FAILED.to_owned())],
         ),
     ];
     match vault.exec_transaction(&statements, &[AffectedGuard::exactly(3, 1)]) {
@@ -1134,6 +1460,86 @@ fn load_applied_doc_digests(vault: &Vault) -> Result<BTreeMap<String, [u8; 32]>,
         .collect()
 }
 
+/// 读 begin 记录的预期参与集合；缺失返回 `None`（旧 journal/异常，按不可 finish 处理）。
+fn load_expected_set(vault: &Vault) -> Result<Option<BaselineExpectation>, StorageError> {
+    match vault.get_meta(META_BASELINE_EXPECTED)? {
+        None => Ok(None),
+        Some(bytes) => BaselineExpectation::decode(&bytes).map(Some),
+    }
+}
+
+/// 预期集合是否已全部 `applied=1`。
+///
+/// 先比计数（每批都会更新 `applied_docs/applied_assets`，因此未齐时 O(1) 就能拒绝），
+/// 计数相等后再逐项确认集合身份：光比数量会放过"漏一篇 + 多跑一篇"的情况。计数相等
+/// 且预期项全部在已应用集合中 ⇒ 两个集合相等。
+fn expected_is_complete(
+    vault: &Vault,
+    journal: &ApplyJournal,
+    expected: &BaselineExpectation,
+) -> Result<bool, StorageError> {
+    if journal.applied_docs != expected.doc_count()
+        || journal.applied_assets != expected.asset_count()
+    {
+        return Ok(false);
+    }
+    if expected.is_empty() {
+        return Ok(true);
+    }
+    let applied_docs: BTreeSet<String> = load_applied_doc_digests(vault)?.into_keys().collect();
+    let docs_complete = expected
+        .docs()
+        .iter()
+        .all(|doc_id| applied_docs.contains(doc_id));
+    if !docs_complete {
+        return Ok(false);
+    }
+    let applied_assets = load_applied_asset_ids(vault)?;
+    Ok(expected
+        .assets()
+        .iter()
+        .all(|object_id| applied_assets.contains(object_id)))
+}
+
+/// 当前 journal 中 `applied=1` 的资产 object_id 集合。
+fn load_applied_asset_ids(vault: &Vault) -> Result<BTreeSet<[u8; 32]>, StorageError> {
+    let rows = vault.query(
+        "SELECT object_id FROM baseline_apply_assets WHERE applied=1",
+        &[],
+    )?;
+    rows.iter()
+        .map(|row| array32(row, 0, "baseline_apply_assets.object_id"))
+        .collect()
+}
+
+fn corrupt_expected(reason: &str) -> StorageError {
+    StorageError::Corrupt {
+        context: format!("meta {META_BASELINE_EXPECTED} 非法：{reason}"),
+    }
+}
+
+fn take_expected_bytes<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], StorageError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| corrupt_expected("长度溢出"))?;
+    let slice = bytes
+        .get(*offset..end)
+        .ok_or_else(|| corrupt_expected("长度越界"))?;
+    *offset = end;
+    Ok(slice)
+}
+
+fn read_expected_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, StorageError> {
+    let raw = take_expected_bytes(bytes, offset, 8)?;
+    let mut value = [0u8; 8];
+    value.copy_from_slice(raw);
+    Ok(u64::from_be_bytes(value))
+}
+
 fn load_active_journal(vault: &Vault) -> Result<ApplyJournal, StorageError> {
     let journal = load_journal(vault)?.ok_or_else(|| StorageError::SyncConflict {
         context: "没有 active baseline apply".to_owned(),
@@ -1185,7 +1591,22 @@ fn load_journal(vault: &Vault) -> Result<Option<ApplyJournal>, StorageError> {
     }))
 }
 
-fn state_from_journal(journal: &ApplyJournal) -> Result<BaselineApplyState, StorageError> {
+fn state_from_journal(
+    vault: &Vault,
+    journal: &ApplyJournal,
+) -> Result<BaselineApplyState, StorageError> {
+    let expected = load_expected_set(vault)?;
+    let (expected_docs, expected_assets) = match &expected {
+        Some(expected) => (Some(expected.doc_count()), Some(expected.asset_count())),
+        None => (None, None),
+    };
+    // finishable 必须反映**真实就绪**：仅 status=staging 不够，还要 begin 记录的预期
+    // 集合全部 applied=1（否则 finish 会 Conflict，不能对 UI/续跑逻辑谎报可完成）。
+    let finishable = journal.status == BaselineApplyStatus::Staging
+        && match &expected {
+            Some(expected) => expected_is_complete(vault, journal, expected)?,
+            None => false,
+        };
     Ok(BaselineApplyState {
         checkpoint_id: journal.checkpoint_id,
         baseline_s: journal.baseline_s,
@@ -1194,7 +1615,9 @@ fn state_from_journal(journal: &ApplyJournal) -> Result<BaselineApplyState, Stor
         applied_docs: journal.applied_docs,
         applied_assets: journal.applied_assets,
         kept_local_edit: journal.kept_local_edit,
-        finishable: journal.status == BaselineApplyStatus::Staging,
+        expected_docs,
+        expected_assets,
+        finishable,
         chosen_cursor: journal.chosen_cursor.clone(),
     })
 }

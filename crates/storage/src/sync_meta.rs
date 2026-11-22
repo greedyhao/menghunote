@@ -71,6 +71,10 @@ impl ConsumedPrefix {
 ///
 /// 与 Vault 版 [`crate::sync_bridge::set_sync_log_id`] 同语义，区别只是直接在给定连接
 /// （或事务）上执行，供批量 inbox 在同一事务里完成校验。
+///
+/// 既有值不是 BLOB 时 [`read_meta_on`] 返回 [`StorageError::Corrupt`]，本函数直接传播：
+/// 损坏的 incarnation 记录**不能**当成"尚未绑定"覆盖掉（那会让旧传代的 inbox 行混进
+/// 新一代）。
 pub(crate) fn ensure_log_id_on(conn: &Connection, log_id: &[u8; 16]) -> Result<(), StorageError> {
     match read_meta_on(conn, META_SYNC_LOG_ID)? {
         Some(existing) => {
@@ -313,16 +317,58 @@ pub(crate) fn skipped_received_key(log_id: &[u8], relay_seq: u64) -> Result<Stri
     ))
 }
 
-fn read_meta_on(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+/// `meta.value` 的**唯一**解读口径：只认 BLOB，其它 SQLite 类型一律是损坏。
+///
+/// 三个读取入口共享本函数，避免"同一份库读出两套结论"漂移：
+///
+/// - [`crate::Vault::get_meta`]（actor 线程上的命令）；
+/// - `sync_bridge::read_meta`（同步桥经 Vault 命令读取）；
+/// - 本模块的 [`read_meta_on`]（worker 独占连接 / 事务内的批量 inbox 校验）。
+///
+/// 为什么不把其它类型「当字节」或「当缺失」：
+///
+/// - **当缺失会静默绕过持久屏障**：`sync.repack_required`（轮换后必须重打包）、
+///   `sync.log_id`（incarnation 绑定）、`sync.received_seq` 这类键"读不到"就等价于
+///   "没有屏障/没有游标"，把一处损坏放大成绕过安全前置条件；
+/// - **当字节与 schema 相悖**：`meta.value` 是 `BLOB NOT NULL`（STRICT 表），能读出
+///   TEXT/INTEGER/REAL 本身就说明库被外部改坏或 schema 漂移，继续按字节解释只会让
+///   损坏值流入上层语义。
+///
+/// 正常写入路径写不出非 BLOB（STRICT 表会直接拒绝），所以这里命中的都是
+/// "库被外部改坏"的场景：宁可 fail-closed 报损坏，也不猜。
+pub(crate) fn meta_bytes_of(key: &str, value: Value) -> Result<Vec<u8>, StorageError> {
+    match value {
+        Value::Blob(bytes) => Ok(bytes),
+        other => Err(StorageError::Corrupt {
+            context: format!(
+                "meta[{key}] 应为 BLOB，实际 {}（库被外部改坏或 schema 漂移）",
+                sqlite_type_name(&other)
+            ),
+        }),
+    }
+}
+
+/// SQLite 值的类型名（只用于错误信息）。
+fn sqlite_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NULL",
+        Value::Integer(_) => "INTEGER",
+        Value::Real(_) => "REAL",
+        Value::Text(_) => "TEXT",
+        Value::Blob(_) => "BLOB",
+    }
+}
+
+/// 在给定连接（或事务）上读一条 meta；键不存在返回 `None`。
+///
+/// 类型判定走 [`meta_bytes_of`]：只认 BLOB，其它类型是 [`StorageError::Corrupt`]
+/// （不再静默当作缺失）。
+pub(crate) fn read_meta_on(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
     let mut statement = conn.prepare("SELECT value FROM meta WHERE key=?1")?;
     let mut rows = statement.query([key])?;
     match rows.next()? {
         None => Ok(None),
-        // 与旧实现同口径：只认 BLOB；其它类型视为没有该 meta。
-        Some(row) => match row.get::<usize, Value>(0)? {
-            Value::Blob(blob) => Ok(Some(blob)),
-            _ => Ok(None),
-        },
+        Some(row) => Ok(Some(meta_bytes_of(key, row.get::<usize, Value>(0)?)?)),
     }
 }
 

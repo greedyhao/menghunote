@@ -14,10 +14,11 @@ mod support;
 use support::*;
 
 use menghunote_storage::{
-    asset_bytes, baseline_apply_state, body_doc_meta, create_note_slot, ensure_structure_row,
-    insert_asset, list_all_docs, list_notes, load_body_doc, sync_cursor_state, BaselineApplyStatus,
-    BodyDoc, StructureWriter, Value, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
-    META_SYNC_RECEIVED_SEQ, STRUCTURE_DOC_ID,
+    abort_baseline_apply, asset_bytes, baseline_apply_state, baseline_verify_failure,
+    body_doc_meta, create_note_slot, ensure_structure_row, insert_asset, list_all_docs, list_notes,
+    load_body_doc, sync_cursor_state, BaselineApplyStatus, BodyDoc, StructureWriter, Value,
+    META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_RECEIVED_SEQ,
+    STRUCTURE_DOC_ID,
 };
 use menghunote_sync::bootstrap::{
     self, control_head_hash, BootstrapFault, BootstrapPins, META_BOOTSTRAP_CONTROL_HASH,
@@ -665,6 +666,103 @@ fn crash_after_assets_resumes_without_duplicate_writes() {
         Some(s.to_be_bytes().as_slice())
     );
     assert!(baseline_apply_state(&target).expect("journal").is_none());
+}
+
+#[test]
+fn verify_failure_keeps_merged_data_and_marks_journal_failed() {
+    let (_dir, source, materials) = setup();
+    let mut relay = new_relay(&materials);
+    seed_source(&source, &mut relay, &materials);
+
+    let (_target_dir, target) = fresh_vault();
+    // 目标库已有同一篇正文的本地编辑：bootstrap 必须把它与基线 merge（不是覆盖）。
+    let local_peer = materials.peer_id_u64().wrapping_add(1);
+    let local = seed_doc(&target, "note-1", local_peer);
+    local.insert_scalars(0, "本地优先编辑 ").expect("本地正文");
+    commit_local(&target, &local);
+
+    let error = bootstrap::run_with_fault(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+        BootstrapFault::VerifyVvNotCovered,
+    )
+    .expect_err("注入的读回校验失败必须冒泡");
+    assert!(
+        format!("{error}").contains("VV 未覆盖快照"),
+        "错误应来自读回校验：{error}"
+    );
+
+    // 已 merge 的 Loro 数据保留：本地编辑与基线正文都在同一条文档里。
+    let merged = load_body_doc(&target, "note-1", local_peer, None)
+        .expect("merged doc")
+        .0;
+    assert!(
+        merged.text().contains("本地优先编辑") && merged.text().contains("第一行正文"),
+        "失败不得回滚已 merge 的数据，实际={:?}",
+        merged.text()
+    );
+
+    // 水位没有推进；journal 仍是 staging（schema CHECK 只有 staging/completed），
+    // 失败语义由 meta 失败标记承载。
+    assert_no_sync_watermarks(&target);
+    let journal = baseline_apply_state(&target)
+        .expect("journal state")
+        .expect("失败后 journal 必须保留");
+    assert_eq!(journal.status, BaselineApplyStatus::Staging);
+    assert!(journal.applied_docs >= 2, "已应用批次计数应保留");
+    let reason = baseline_verify_failure(&target)
+        .expect("读失败标记")
+        .expect("校验失败必须写失败标记");
+    assert!(
+        reason.contains("VV 未覆盖快照"),
+        "标记应保留失败原因：{reason}"
+    );
+
+    // 未 abort 前 begin 一律拒绝（同 checkpoint 幂等续跑也不行）。
+    let retry = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect_err("失败标记必须阻止 begin 续跑");
+    assert!(
+        format!("{retry}").contains("abort_baseline_apply"),
+        "错误必须提示先 abort：{retry}"
+    );
+
+    // abort 清 journal + 失败标记，但保留已 merge 的 Loro 数据。
+    assert!(abort_baseline_apply(&target).expect("abort"));
+    assert!(baseline_apply_state(&target).expect("state").is_none());
+    assert!(baseline_verify_failure(&target).expect("标记").is_none());
+    let kept = load_body_doc(&target, "note-1", local_peer, None)
+        .expect("abort 后正文")
+        .0;
+    assert!(
+        kept.text().contains("本地优先编辑") && kept.text().contains("第一行正文"),
+        "abort 只清 journal，不得删已 merge 的 Loro 数据，实际={:?}",
+        kept.text()
+    );
+
+    // abort 后可以重新 begin 并成功（失败标记已清）。
+    let report = bootstrap::run(
+        &target,
+        &mut relay,
+        VAULT_ID,
+        materials.peer_id_u64(),
+        &materials.root,
+    )
+    .expect("abort 后重跑");
+    assert_eq!(
+        report.covered_seq,
+        relay.published_checkpoints[1].covered_seq
+    );
+    assert!(report.docs.iter().any(|(doc_id, _)| doc_id == "note-1"));
+    assert!(baseline_apply_state(&target).expect("state").is_none());
 }
 
 #[test]

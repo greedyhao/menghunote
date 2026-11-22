@@ -11,10 +11,11 @@ mod support;
 use support::*;
 
 use menghunote_storage::{
-    append_updates, count_inbox_ready, load_body_doc, load_head, outbox_parts, outbox_row,
-    store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, BodyDoc, StorageError,
-    SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow, APP_DOC_SCHEMA, CODEC_VERSION,
-    META_SYNC_LOG_ID, MIN_READER,
+    append_updates, asset_bytes, asset_content_hash, count_inbox_ready, create_note_slot,
+    insert_asset, link_asset_ref, load_body_doc, load_head, outbox_parts, outbox_row,
+    replace_asset_refs, store_inbox_verified_batch, sync_cursor_state, take_inbox_ready, BodyDoc,
+    StorageError, SyncOutboxState, UpdateRecord, Vault, VerifiedInboxRow, APP_DOC_SCHEMA,
+    CODEC_VERSION, META_SYNC_LOG_ID, MIN_READER,
 };
 use menghunote_sync::engine::{
     EngineConfig, EngineIdentity, IntegrateConfig, SyncEngine, RELAY_CURSOR_META,
@@ -2205,6 +2206,206 @@ fn pull_pauses_on_lagging_asset_event_epoch_before_download() {
         skipped_asset_rows(&vault).is_empty(),
         "不得写 skipped-asset 记录"
     );
+}
+
+// ============================================================ P2-9：本地资产损坏
+//
+// `upload_one_asset` 在**本地字节与元数据不一致**时返回 `LocalCorrupt`。原实现把它
+// 和网络失败一样 `report.failed += 1` 后继续，于是每轮都"重试成功"、永不报错。
+// 约定：本地库损坏不是可重试失败——扫完其余资产后**上抛**；健康资产仍要完整上传。
+
+const ASSET_MEDIA: &str = "text/plain";
+
+/// 建一篇资产测试用的 note（`loro_docs` 行 + `notes` 行；`asset_refs` 的外键要求）。
+fn seed_asset_note(vault: &Vault, note_id: &str, peer_id: u64) {
+    seed_doc(vault, note_id, peer_id);
+    create_note_slot(vault, note_id, note_id, note_id, 1_700_000_000).expect("notes 行");
+}
+
+/// 用 storage **公开 API** 构造"元数据 hash 与本地字节不一致"的损坏资产。
+///
+/// 路径：`replace_asset_refs` 先按引用建 `data IS NULL` 的元数据占位（`byte_len`/
+/// `media_type` 也是 NULL），再用 `insert_asset` 的"补全占位明文"分支写入**另一份
+/// 字节**——该分支只校验长度、不重算内容哈希。这正是真实损坏（外部写坏/恢复错
+/// 字节）在库里的形态，且不需要测试直接改 SQL。
+fn seed_corrupt_asset(vault: &Vault, note_id: &str, declared: [u8; 32], actual: &[u8]) {
+    replace_asset_refs(vault, note_id, 1, &[(declared, 0)]).expect("元数据占位 + 引用");
+    insert_asset(
+        vault,
+        &declared,
+        actual.len() as u64,
+        Some(ASSET_MEDIA),
+        actual,
+    )
+    .expect("按占位补全明文");
+}
+
+/// 健康资产：元数据与字节自洽，并被 `asset_refs` 引用（可被增量上传）。
+fn seed_healthy_asset(vault: &Vault, note_id: &str, data: &[u8]) -> [u8; 32] {
+    let hash = asset_content_hash(data);
+    insert_asset(vault, &hash, data.len() as u64, Some(ASSET_MEDIA), data).expect("insert_asset");
+    link_asset_ref(vault, note_id, &hash, 0, 1).expect("link_asset_ref");
+    hash
+}
+
+/// durable "已上传"标记（`sync.asset_uploaded.<hex object_id>`）的键列表。
+fn asset_marker_keys(vault: &Vault) -> Vec<String> {
+    vault
+        .query(
+            "SELECT key FROM meta WHERE substr(key,1,?1)=?2 ORDER BY key",
+            &[
+                menghunote_storage::Value::Integer("sync.asset_uploaded.".len() as i64),
+                menghunote_storage::Value::Text("sync.asset_uploaded.".to_owned()),
+            ],
+        )
+        .expect("读 asset 标记")
+        .iter()
+        .map(|row| match row.first() {
+            Some(menghunote_storage::Value::Text(key)) => key.clone(),
+            _ => panic!("asset 标记 key 类型非法"),
+        })
+        .collect()
+}
+
+/// 本地损坏（hash 与字节不一致）必须**上抛**，不能被计入 `failed` 后静默继续。
+#[test]
+fn corrupt_local_asset_raises_instead_of_counting_retryable_failure() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x7c);
+    let mut relay = FakeRelay::new(&[&device]);
+    seed_asset_note(&vault, "note-corrupt", device.identity.peer_id);
+
+    // 元数据声明的是 `expected-bytes-A` 的哈希，库里实际存的是 `tampered-bytes-A`
+    // （同长、不同内容），`insert_asset` 的占位补全路径不会拦住它。
+    let declared = asset_content_hash(b"expected-bytes-A");
+    let actual = b"tampered-bytes-A";
+    seed_corrupt_asset(&vault, "note-corrupt", declared, actual);
+    assert_eq!(
+        asset_bytes(&vault, declared).expect("读本地资产"),
+        Some(actual.to_vec()),
+        "夹具前提：本地确实存着与元数据 hash 不一致的字节"
+    );
+    assert_ne!(asset_content_hash(actual), declared, "夹具必须是损坏的");
+
+    let error = {
+        let mut sync = engine(&vault, &mut relay, &device);
+        sync.upload_pending_assets()
+            .expect_err("本地库损坏必须上抛，不能计入 failed 后静默继续")
+    };
+    assert!(
+        matches!(error, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
+        "必须原样上抛 LocalCorrupt（不是可重试网络失败）：{error:?}"
+    );
+    assert!(relay.put_history.is_empty(), "损坏资产不得上传任何分片");
+    assert!(relay.objects.is_empty(), "损坏资产不得提交对象");
+    assert!(
+        asset_marker_keys(&vault).is_empty(),
+        "损坏资产不得落 durable 标记"
+    );
+}
+
+/// 单个损坏资产不得阻止其余健康资产上传（扫描完再上抛），且下一轮不得静默"重试成功"。
+#[test]
+fn corrupt_asset_does_not_block_healthy_upload_but_still_raises() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x7d);
+    let mut relay = FakeRelay::new(&[&device]);
+
+    // 健康资产放在**后面**：`list_referenced_assets` 按 hash 升序，4ba7… < d6cc…，
+    // 损坏资产先被扫到——若实现改成 fail-fast，这条用例就会丢掉健康资产。
+    seed_asset_note(&vault, "note-corrupt", device.identity.peer_id);
+    seed_asset_note(&vault, "note-mixed", device.identity.peer_id);
+    let declared = asset_content_hash(b"expected-bytes-A");
+    seed_corrupt_asset(&vault, "note-corrupt", declared, b"tampered-bytes-A");
+    let healthy_data = b"healthy asset bytes";
+    let healthy = seed_healthy_asset(&vault, "note-mixed", healthy_data);
+    assert!(
+        declared < healthy,
+        "夹具顺序前提：损坏资产必须先于健康资产被扫描"
+    );
+
+    let error = {
+        let mut sync = engine(&vault, &mut relay, &device);
+        sync.upload_pending_assets()
+            .expect_err("存在本地损坏时整轮必须报错")
+    };
+    assert!(
+        matches!(error, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
+        "必须原样上抛 LocalCorrupt：{error:?}"
+    );
+
+    // 健康资产仍然完整上传：分片 + 对象提交 + durable 标记。
+    let healthy_object = menghunote_sync::checkpoint::asset_object_id(
+        &device.root,
+        &healthy,
+        healthy_data.len() as u64,
+        ASSET_MEDIA,
+    )
+    .expect("健康资产 object_id");
+    assert!(
+        relay.parts.contains_key(&(healthy_object, 0)),
+        "健康资产分片必须已上传（不能被单个损坏拦住）"
+    );
+    assert_eq!(
+        relay
+            .objects
+            .get(&healthy_object)
+            .map(|object| object.commit.object_type),
+        Some(ObjectType::Asset),
+        "健康资产必须完成对象提交"
+    );
+    let markers = asset_marker_keys(&vault);
+    assert_eq!(markers.len(), 1, "只有健康资产落 durable 标记");
+    assert!(
+        markers[0].ends_with(&menghunote_sync::ids::hex_of(&healthy_object)),
+        "标记必须属于健康资产"
+    );
+
+    // 下一轮：健康资产命中标记（不重传、不再探测 relay），损坏资产仍如实上抛。
+    let puts = relay.put_history.len();
+    let gets = relay.part_gets.len();
+    let again = {
+        let mut sync = engine(&vault, &mut relay, &device);
+        sync.upload_pending_assets()
+            .expect_err("损坏仍在，下一轮必须继续报错")
+    };
+    assert!(
+        matches!(again, SyncError::LocalCorrupt("资产字节哈希与元数据不一致")),
+        "下一轮仍必须是 LocalCorrupt：{again:?}"
+    );
+    assert_eq!(
+        relay.put_history.len(),
+        puts,
+        "健康资产命中标记后不得重传分片"
+    );
+    assert_eq!(
+        relay.part_gets.len(),
+        gets,
+        "健康资产命中标记后不得再探测 relay"
+    );
+}
+
+/// 正常路径不受影响：健康的被引用资产仍计入 `uploaded`。
+#[test]
+fn healthy_referenced_asset_is_still_counted_as_uploaded() {
+    ensure_test_identity_wrap();
+    let (_dir, vault) = fresh_vault();
+    let device = Device::new(0x7e);
+    let mut relay = FakeRelay::new(&[&device]);
+    seed_asset_note(&vault, "note-healthy", device.identity.peer_id);
+    seed_healthy_asset(&vault, "note-healthy", b"healthy asset bytes");
+
+    let report = {
+        let mut sync = engine(&vault, &mut relay, &device);
+        sync.upload_pending_assets().expect("健康资产必须正常上传")
+    };
+    assert_eq!(report.referenced, 1);
+    assert_eq!(report.uploaded, 1, "正常资产仍必须计入 uploaded");
+    assert_eq!(report.failed, 0, "不得莫名计成失败");
+    assert_eq!(report.skipped_invalid, 0);
+    assert_eq!(asset_marker_keys(&vault).len(), 1);
 }
 
 // ============================================================ Phase 0：指标 + 批量 inbox

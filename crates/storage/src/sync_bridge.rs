@@ -20,7 +20,7 @@ use crate::Vault;
 
 // 同步 `meta` 键与「连续前缀」的低层实现放在 `sync_meta`（直接跑在 `Connection` 上，
 // 这样批量 inbox 的插入与前缀推进能共用一个事务）；这里保持原有的公开路径。
-use crate::sync_meta::{skipped_received_key, ConsumedPrefix};
+use crate::sync_meta::{meta_bytes_of, skipped_received_key, ConsumedPrefix};
 pub use crate::sync_meta::{
     META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID,
     META_SYNC_RECEIVED_SEQ, META_SYNC_SKIPPED_RECEIVED_PREFIX,
@@ -157,13 +157,16 @@ pub fn local_sync_intent(
 /// 一次 flush 的连续前缀可能**混**本地编辑与远端导入（`JournalOrigin`），而
 /// remote/import/adopt **绝不能**产生出站意图（否则会把刚收到的数据再推回 relay）。
 /// 这里仍是一条 A 事务、按位置一一对应，只是允许某些位置为空。
+///
+/// `slots` 空 = 本批没有**任何**出站意图；来源标记用 [`store::OriginMarks`]
+/// （`AllLocal` / 与 records 等长的 `PerRecord`），**不再用空切片**表示「全部本地」。
 pub(crate) fn append_updates_with_intent_slots(
     vault: &Vault,
     doc_id: &str,
     expected_head_seq: u64,
     records: &[store::UpdateRecord],
     slots: &[Option<SyncIntent>],
-    remote_marks: &[bool],
+    origin: store::OriginMarks<'_>,
 ) -> Result<store::HeadState, StorageError> {
     if !slots.is_empty() && slots.len() != records.len() {
         return Err(StorageError::Corrupt {
@@ -174,22 +177,13 @@ pub(crate) fn append_updates_with_intent_slots(
             ),
         });
     }
-    if !remote_marks.is_empty() && remote_marks.len() != records.len() {
-        return Err(StorageError::Corrupt {
-            context: format!(
-                "append_updates_with_intent_slots: records={} remote_marks={} 必须一对一",
-                records.len(),
-                remote_marks.len()
-            ),
-        });
-    }
     store::append_updates_with_intent_slots(
         vault,
         doc_id,
         expected_head_seq,
         records,
         slots,
-        remote_marks,
+        origin,
     )
 }
 
@@ -370,7 +364,14 @@ pub fn append_updates_with_sync_intents(
         });
     }
     let slots: Vec<Option<SyncIntent>> = intents.iter().cloned().map(Some).collect();
-    store::append_updates_with_intent_slots(vault, doc_id, expected_head_seq, records, &slots, &[])
+    store::append_updates_with_intent_slots(
+        vault,
+        doc_id,
+        expected_head_seq,
+        records,
+        &slots,
+        store::OriginMarks::AllLocal,
+    )
 }
 
 /// 单独记录一条出站意图（调用方已确认 update 落库）。
@@ -1089,15 +1090,31 @@ pub fn store_inbox_verified_batch(
 /// 读当前已验证、且落在 durable 连续接收前缀内的 inbox 行。
 ///
 /// 依赖完整性由 sync 层判断（本 crate 不解析 Loro VV）；这里的 "ready"
-/// 指 cryptographically verified + durable + `relay_seq <= received_seq`，
-/// 不在连续前缀内的行保持 durable，等前面的缺口补齐。排序为 `(log_id, relay_seq)`。
+/// 指 cryptographically verified + durable + **属于当前 `sync.log_id`** +
+/// `relay_seq <= received_seq`，不在连续前缀内的行保持 durable，等前面的缺口补齐。
+/// 排序为 `(log_id, relay_seq)`。
+///
+/// **incarnation 过滤**（ADR 0006 §5）：`sync_inbox` 的 `log_id` 是写入时那代 relay
+/// 日志的 incarnation。restore 迁移 `sync.log_id` 后，旧 incarnation 的行仍然 durable
+/// （不能在迁移时静默删数据），但绝不能进入 ready——`relay_seq` 只在同一 incarnation
+/// 内有序，跨代比较没有意义。过滤条件里的 `log_id` 由 [`read_current_log_id`] 读出后
+/// 作为 SQL 参数绑定，不做子查询以便调用方/测试都看到同一个显式值。
+///
+/// `sync.log_id` 不存在（新库尚未绑定 relay 日志代）时返回空：没有当前 incarnation
+/// 就没有可匹配的行；新库此时 `received` 也是 0，所以与旧实现（不按 log 过滤）的结果
+/// 一致，不会把其它 incarnation 的遗留行漏出来。`sync.log_id` 存在但不是 16B →
+/// [`StorageError::Corrupt`]（与 [`sync_cursor_state`] 同口径），不静默当作"没有 log"。
 pub fn take_inbox_ready(vault: &Vault, limit: usize) -> Result<Vec<SyncInboxRow>, StorageError> {
+    let Some(log_id) = read_current_log_id(vault)? else {
+        return Ok(Vec::new());
+    };
     let received = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
     let rows = vault.query(
         "SELECT log_id,relay_seq,object_id,epoch,state,verified_payload \
-         FROM sync_inbox WHERE state='verified' AND relay_seq<=?1 \
-         ORDER BY log_id,relay_seq LIMIT ?2",
+         FROM sync_inbox WHERE log_id=?1 AND state='verified' AND relay_seq<=?2 \
+         ORDER BY log_id,relay_seq LIMIT ?3",
         &[
+            Value::Blob(log_id.to_vec()),
             Value::Integer(i64_of(received)?),
             Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
         ],
@@ -1105,16 +1122,27 @@ pub fn take_inbox_ready(vault: &Vault, limit: usize) -> Result<Vec<SyncInboxRow>
     rows.iter().map(row_to_inbox).collect()
 }
 
-/// 统计「已验证、落在 durable 连续接收前缀内、尚未集成」的 inbox 行数。
+/// 统计「已验证、属于当前 incarnation、落在 durable 连续接收前缀内、尚未集成」的行数。
 ///
 /// 语义（ADR 0012 S2b）：这些行不是"丢失"——它们要么依赖未就绪（deferred），要么被
 /// 批次预算留在本轮之后。调用方用它上报"已接收·待应用 N"，并据此判断"还有没有
 /// 可继续的工作"，而不是循环刷最早的一批。
+///
+/// 与 [`take_inbox_ready`] 同口径：只计当前 `sync.log_id` 的行，旧 incarnation 的
+/// verified 行即使 `relay_seq <= received` 也不计。`sync.log_id` 不存在返回 0
+/// （没有当前 incarnation 就没有 ready 行）；存在但长度非法 → [`StorageError::Corrupt`]。
 pub fn count_inbox_ready(vault: &Vault) -> Result<u64, StorageError> {
+    let Some(log_id) = read_current_log_id(vault)? else {
+        return Ok(0);
+    };
     let received = read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0);
     let rows = vault.query(
-        "SELECT COUNT(*) FROM sync_inbox WHERE state='verified' AND relay_seq<=?1",
-        &[Value::Integer(i64_of(received)?)],
+        "SELECT COUNT(*) FROM sync_inbox \
+         WHERE log_id=?1 AND state='verified' AND relay_seq<=?2",
+        &[
+            Value::Blob(log_id.to_vec()),
+            Value::Integer(i64_of(received)?),
+        ],
     )?;
     rows.first()
         .map(|row| u64_of(row, 0, "sync_inbox.count"))
@@ -1125,6 +1153,8 @@ pub fn count_inbox_ready(vault: &Vault) -> Result<u64, StorageError> {
 }
 
 /// 带调用方依赖判断的 ready 选择器；不满足的项保持 durable verified。
+///
+/// 底层走 [`take_inbox_ready`]，因此同样只选择当前 `sync.log_id` 的行。
 pub fn take_inbox_ready_where(
     vault: &Vault,
     limit: usize,
@@ -1270,11 +1300,20 @@ pub fn sync_cursor_state(vault: &Vault) -> Result<SyncCursorState, StorageError>
     Ok(SyncCursorState {
         received_seq: read_meta_u64(vault, META_SYNC_RECEIVED_SEQ)?.unwrap_or(0),
         integrated_seq: read_meta_u64(vault, META_SYNC_INTEGRATED_SEQ)?.unwrap_or(0),
-        log_id: read_meta(vault, META_SYNC_LOG_ID)?
-            .map(|bytes| array16_bytes(bytes, "sync.log_id"))
-            .transpose()?,
+        log_id: read_current_log_id(vault)?,
         confirmed_highwater: read_meta_u64(vault, META_SYNC_CONFIRMED_HIGHWATER)?,
     })
+}
+
+/// 读当前 relay 日志 incarnation（`sync.log_id`，BLOB 16B）。
+///
+/// - 不存在（新库/尚未绑定）：`Ok(None)`，调用方按"没有当前 incarnation"处理
+///   （ready 视为空，绝不回退成"不过滤 log"）；
+/// - 存在但不是 16B：[`StorageError::Corrupt`]，与 [`sync_cursor_state`] 的既有口径一致。
+fn read_current_log_id(vault: &Vault) -> Result<Option<[u8; 16]>, StorageError> {
+    read_meta(vault, META_SYNC_LOG_ID)?
+        .map(|bytes| array16_bytes(bytes, "sync.log_id"))
+        .transpose()
 }
 
 /// 写入 `sync.log_id`；已有不同值则拒绝（restore 必须显式迁移）。
@@ -1333,15 +1372,21 @@ pub fn mark_skipped_event_received(
     advance_received_prefix(vault)
 }
 
+/// 读一条 meta（同步桥经 Vault 命令的读取路径）。
+///
+/// 类型判定与 [`Vault::get_meta`] / `sync_meta::read_meta_on` 共用同一个 helper
+/// [`meta_bytes_of`]：**只认 BLOB**，其它类型是 [`StorageError::Corrupt`]。
+/// 这里以前把 TEXT 当"缺失"，会让 `sync.log_id` / `sync.repack_required` /
+/// `sync.received_seq` 这些持久屏障与游标被静默绕过。
 fn read_meta(vault: &Vault, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
     let rows = vault.query(
         "SELECT value FROM meta WHERE key=?1",
         &[Value::Text(key.to_owned())],
     )?;
-    Ok(rows
-        .first()
-        .and_then(|row| row.first())
-        .and_then(blob_value))
+    let Some(value) = rows.first().and_then(|row| row.first()) else {
+        return Ok(None);
+    };
+    Ok(Some(meta_bytes_of(key, value.clone())?))
 }
 
 fn read_meta_u64(vault: &Vault, key: &str) -> Result<Option<u64>, StorageError> {

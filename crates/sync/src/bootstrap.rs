@@ -5,9 +5,19 @@
 //!
 //! **可恢复导入（P1-4）**：docs/structure/assets 的写入全部经过 storage 的
 //! `baseline_apply` staging journal（`begin_baseline_apply` / `apply_baseline_batch` /
-//! `apply_baseline_assets`）。任一步失败都**不**清 journal、**不**推进任何水位；
-//! 下一次调用按同一份基线幂等续跑。只有全部实际导入并通过读回校验后，才在**一个**
+//! `apply_baseline_assets`）。下载/写入阶段任一步失败都**不**清 journal、**不**推进任何
+//! 水位；下一次调用按同一份基线幂等续跑。只有全部实际导入并通过读回校验后，才在**一个**
 //! SQLite 事务里推进 `cursor/received/integrated/confirmed_highwater`（CAS）。
+//!
+//! **读回校验失败（同步硬化 P1）**：`verify_imported` 失败时**不回滚**已 merge 的
+//! Loro/资产数据（CRDT merge 幂等；回滚会丢本地编辑），而是写一条只本地可见的
+//! `sync.baseline_verify_failed` 失败标记（storage `mark_baseline_verify_failed`）。
+//! journal 仍是 `staging`（schema 的 status CHECK 只允许 `staging/completed`，见
+//! `docs/notes/sync-hardening-20261121.md` §8），但下一次 `begin_baseline_apply` 会拒绝，
+//! 必须先 `abort_baseline_apply` 清理（abort 同时删标记，已导入数据保留）。
+//!
+//! **闸外编辑**：verify 不与编辑互斥，判定用「导出点 VV ⊆ 当前 VV」而不是相等；只有
+//! 本地没有快照之外的 op 时才逐字节比较正文（见 [`check_imported_doc`]）。
 //!
 //! **水位单调（P1-4）**：bootstrap 允许作用在已有库上，但禁止降低任何单调值：
 //! `received/integrated/highwater` 取 `max(现有, baseline S)`；已有进度时保留现有 relay
@@ -36,6 +46,7 @@
 //! `instance/log_id/epoch/control_rev/highwater` 的回退。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use loro::VersionVector;
 use sha2::{Digest, Sha256};
@@ -53,8 +64,9 @@ use crate::rotation::ManagerTransitionV1;
 use crate::upload::fetch_object;
 use menghunote_storage::{
     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch, asset_bytes,
-    baseline_apply_state, begin_baseline_apply, load_body_doc, load_structure, sync_cursor_state,
-    AffectedGuard, BaselineApplyStatus, BaselineAsset, BodyDoc, Statement, StructureDoc,
+    baseline_apply_state, begin_baseline_apply, load_body_doc, load_structure,
+    mark_baseline_verify_failed, record_baseline_verify_time, sync_cursor_state, AffectedGuard,
+    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BodyDoc, Statement, StructureDoc,
     StructureWriter, Value, Vault, APP_DOC_SCHEMA, CODEC_VERSION, META_SYNC_CONFIRMED_HIGHWATER,
     META_SYNC_INTEGRATED_SEQ, META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, MIN_READER,
     STRUCTURE_DOC_ID,
@@ -182,7 +194,13 @@ pub enum BootstrapFault {
     /// 水位事务读取当前状态之后、提交之前，模拟另一个写者改写了 relay 游标，
     /// 迫使 CAS 失败（整笔事务回滚）。
     CursorCasConflict,
+    /// 读回校验阶段注入一次「本地 VV 未覆盖快照」失败：用于验证失败标记、
+    /// `begin` 拒绝续跑与 `abort` 清理路径（不改数据库里的真实数据）。
+    VerifyVvNotCovered,
 }
+
+/// 故障注入伪造的 peer id（只在校验失败测试路径出现；不影响真实数据）。
+const VERIFY_FAULT_PEER: u64 = 0x0BAD_5EED;
 
 struct VerifiedDoc {
     doc_id: String,
@@ -1052,8 +1070,15 @@ fn apply_selected(
     let checkpoint_id = selected.checkpoint.checkpoint_id;
     let baseline_s = selected.checkpoint.covered_seq;
     let source_cursor = format!("{JOURNAL_SOURCE_PREFIX}{}", selected.checkpoint.cursor);
+    // 完整性基准：本 checkpoint 覆盖的全部文档与资产都必须出现在 apply 批里。
+    // 集合由 begin 记录，任何"少导入一批"的续跑都不会被误当成完整
+    // （rotation 的 finish 会直接 Conflict；bootstrap 的 finalize 另有逐项读回校验）。
+    let expected = BaselineExpectation::new(
+        selected.docs.iter().map(|doc| doc.doc_id.clone()),
+        selected.assets.iter().map(|asset| asset.object_id),
+    );
     reconcile_journal(vault, &checkpoint_id, baseline_s, &source_cursor)?;
-    begin_baseline_apply(vault, &checkpoint_id, baseline_s, &source_cursor)?;
+    begin_baseline_apply(vault, &checkpoint_id, baseline_s, &source_cursor, &expected)?;
 
     // body → structure → asset（structure 投影依赖正文行已存在；与旧实现的顺序一致）。
     let bodies: Vec<&VerifiedDoc> = selected
@@ -1109,7 +1134,47 @@ fn apply_selected(
         return Err(injected_fault());
     }
 
-    verify_imported(vault, peer_id, selected)
+    // 读回校验的耗时只作诊断指标（不参与决策）；失败也要记录。
+    let verify_started = Instant::now();
+    let verified = verify_imported(vault, peer_id, selected, fault);
+    record_baseline_verify_time(verify_started.elapsed());
+    match verified {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            // 不回滚已 merge 的 Loro/资产，也不改 journal.status（schema CHECK 只有
+            // staging/completed）：只写失败标记，让下一次 begin 拒绝续跑，直到 abort。
+            if let Err(mark_error) = mark_baseline_verify_failed(vault, &error.to_string()) {
+                return Err(SyncError::Storage(mark_error));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// 单篇文档的读回校验：导出点 VV ⊆ 当前本地 VV，且仅在无本地 extra 时比较正文。
+///
+/// - 方向固定为「快照/导出点 VV 必须被本地 VV 覆盖」：`actual_vv.sub_iter(local_vv)`
+///   为空才通过；**不要求相等**。导出点之后本地新增的 op 是合法编辑（verify 不与编辑
+///   互斥），相等比较会把它误判成失败；
+/// - 只有 `local_vv ⊆ actual_vv`（本地没有快照之外的 op）时，Loro 才保证本地正文等于
+///   快照正文，此时才做逐字节比较；有本地 extra 时正文必然已被合并改写，比较必然误报。
+fn check_imported_doc(
+    actual_vv: &VersionVector,
+    local_vv: &VersionVector,
+    expected_text: Option<&str>,
+    actual_text: &str,
+) -> Result<(), &'static str> {
+    if actual_vv.sub_iter(local_vv).next().is_some() {
+        return Err("bootstrap 导入后本地 VV 未覆盖快照");
+    }
+    if local_vv.sub_iter(actual_vv).next().is_none() {
+        if let Some(expected) = expected_text {
+            if expected != actual_text {
+                return Err("bootstrap 后正文与快照不一致");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 读回校验：本地 VV 必须覆盖快照、正文/结构投影/资产必须与快照一致。
@@ -1117,22 +1182,28 @@ fn verify_imported(
     vault: &Vault,
     peer_id: u64,
     selected: &SelectedBaseline,
+    fault: Option<BootstrapFault>,
 ) -> Result<Vec<(String, Option<String>)>, SyncError> {
     let mut body_texts: BTreeMap<String, String> = BTreeMap::new();
-    for doc in selected.docs.iter().filter(|doc| doc.kind == KIND_BODY) {
+    for (index, doc) in selected
+        .docs
+        .iter()
+        .filter(|doc| doc.kind == KIND_BODY)
+        .enumerate()
+    {
         let (body, head) = load_body_doc(vault, &doc.doc_id, peer_id, None)?;
         let local_vv = head.version_vector()?;
-        if doc.actual_vv.sub_iter(&local_vv).next().is_some() {
-            return Err(SyncError::Object("bootstrap 导入后本地 VV 未覆盖快照"));
-        }
+        // 测试故障注入：伪造一个「导出点有、本地没有」的 op，制造真实的 VV 未覆盖失败。
+        let actual_vv = if fault == Some(BootstrapFault::VerifyVvNotCovered) && index == 0 {
+            let mut mismatched = doc.actual_vv.clone();
+            mismatched.insert(VERIFY_FAULT_PEER, 1);
+            mismatched
+        } else {
+            doc.actual_vv.clone()
+        };
         let text = body.text();
-        // 本地没有快照之外的 op 时，正文必须与快照逐字节一致（合并过的正文由 Loro 保证）。
-        if local_vv.sub_iter(&doc.actual_vv).next().is_none() {
-            if let Some(expected) = &doc.text {
-                if expected != &text {
-                    return Err(SyncError::Object("bootstrap 后正文与快照不一致"));
-                }
-            }
+        if let Err(reason) = check_imported_doc(&actual_vv, &local_vv, doc.text.as_deref(), &text) {
+            return Err(SyncError::Object(reason));
         }
         body_texts.insert(doc.doc_id.clone(), text);
     }
@@ -1596,6 +1667,42 @@ mod tests {
             )
             .is_err(),
             "frontier 不一致必须拒绝"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_concurrent_local_edits_after_export() {
+        // 导出点（快照）VV：peer 7 有 2 个 op、peer 8 有 1 个。
+        let mut exported_vv = VersionVector::new();
+        exported_vv.insert(7, 2);
+        exported_vv.insert(8, 1);
+
+        // 导出点之后本地继续编辑：当前 VV 严格包含导出点，但不相等。
+        let mut local_vv = exported_vv.clone();
+        local_vv.insert(9, 1);
+        assert_ne!(local_vv, exported_vv);
+        check_imported_doc(
+            &exported_vv,
+            &local_vv,
+            Some("导出点正文"),
+            "导出点正文 + 本地新编辑",
+        )
+        .expect("导出点 VV ⊆ 当前 VV 时必须接受并发本地编辑（不要求相等）");
+
+        // 没有本地 extra（VV 相等）时才逐字节比较正文：不一致必须失败。
+        assert!(
+            check_imported_doc(&exported_vv, &exported_vv, Some("期望正文"), "实际正文").is_err(),
+            "无本地 extra 时正文不一致必须失败"
+        );
+        check_imported_doc(&exported_vv, &exported_vv, Some("同一正文"), "同一正文")
+            .expect("无本地 extra 且正文一致必须通过");
+
+        // 当前 VV 缺少导出点里的 op：方向不能反（不是相等/双向比较）。
+        let mut missing_vv = VersionVector::new();
+        missing_vv.insert(7, 2);
+        assert!(
+            check_imported_doc(&exported_vv, &missing_vv, Some("正文"), "正文").is_err(),
+            "导出点 VV 未被本地覆盖时必须失败"
         );
     }
 

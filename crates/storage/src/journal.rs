@@ -12,12 +12,46 @@
 //!
 //! 崩溃语义：sink 成功 = 已 durable；未 flush 的条目只在内存里，重启后自然丢掉。
 //! 因此「已 ACK 的不丢、未 ACK 的只丢连续前缀之后」由本模块与 [`crate::store`] 的 A 事务共同保证。
+//!
+//! # head 过期：可重试 vs 必须重建 session（P1-3 契约）
+//!
+//! journal 条目里的 `PendingUpdate` 是**追加那一刻**按当时 head 导出的字节
+//! （`end_frontier` / `end_vv` 是那次导出的快照），**不可重算**。如果同一文档的 head
+//! 被别的 writer 推进（同步引擎 integrate、`SessionDriver` 的 adopt、另一个 Vault
+//! 进程……），前缀的 CAS 基准（`loro_docs.head_seq`）就永远对不上：`append_updates`
+//! 每次都返回 [`StorageError::HeadConflict`]，但**同一份字节重试多少次都不会成功**。
+//! 这正是旧实现「flush 一直 HeadConflict、水位永远不前进」的卡死来源。
+//!
+//! 本模块用一条明确的二分法代替无限重试：
+//!
+//! - [`JournalWriter::flush`] 捕获 sink 的 [`StorageError::HeadConflict`]，**不重试**
+//!   （0 次），立即转成终态错误 [`StorageError::JournalHeadStale`]
+//!   （`doc_id` / `expected` / `actual` / `pending` 齐全，
+//!   [`StorageError::requires_session_rebuild`] 为 `true`）。其它错误（磁盘失败等）
+//!   原样透传 —— 那才是可重试的，journal 原样保留。
+//! - 进入 stale 之后，`flush` / `flush_all` **不再触碰数据库**，幂等地返回同一个
+//!   stale 错误；`submit` 也返回 `JournalHeadStale`（writer 已冻结，新条目必须交给
+//!   重建后的 writer）。因此调用方无论怎么轮询，都不会挂死、也不会刷屏重试。
+//! - **谁负责重建**：持有 live `BodyDoc` 的会话层（`session::JournalHandle` /
+//!   `SessionDriver`，实现在 `crate::session::flush`）。重建顺序：
+//!   ① 先停外部写并按 ADR 0012 对账（`HeadConflict` 先停外部写、验证授权、再对账，
+//!   然后才允许有界重放）；② 把 durable journal 重放到**新 head**（`load_body_doc` /
+//!   `load_head`），让内存文档与库一致；③ 用新 head 的 VV 重新导出本地意图
+//!   （`BodyDoc::pending_update`）——只有这一步得到的字节才能写；④ 用新 `head_seq`
+//!   造一个 [`VaultJournalSink`]，调用 [`JournalWriter::rebuild_sink`] 装回去。
+//! - **未 durable 的旧条目怎么办**：`rebuild_sink` 把它们**原样交还**调用方（返回值）
+//!   并从 writer 的 journal 里清空。它们**没有被写入、也没有被静默丢弃** —— 调用方
+//!   必须用 ③ 重新导出的增量覆盖这段内容；若调用方决定不要，也必须显式消费返回值
+//!   并在上层报告，不能假装成功。重建后 `durable_seq` 等于新 sink 的 CAS 基准。
+//! - **有界重试规则**：CAS 冲突在 journal 层的自动重试是 **0** 次（基准是常量，
+//!   重试不可能成功）；需要重放时由 session 层按 ADR 0012 做**有界**重放（一次），
+//!   再失败就上报告需要人工处理。本模块不提供、也不会退化成无限重试。
 
 use std::collections::VecDeque;
 
 use crate::body_doc::PendingUpdate;
 use crate::error::StorageError;
-use crate::store::UpdateRecord;
+use crate::store::{OriginMarks, UpdateRecord};
 use crate::sync_bridge::{self, SyncContext, SyncIntent};
 use crate::Vault;
 
@@ -161,6 +195,14 @@ impl PendingJournal {
         }
         Ok(())
     }
+
+    /// 取走全部未 ACK 条目。
+    ///
+    /// **只**供 [`JournalWriter::rebuild_sink`] 在 head 过期后显式交还给调用方使用：
+    /// 正常路径一律走 [`Self::ack_prefix`]，这里既不写库也不推进任何水位。
+    fn drain_all(&mut self) -> Vec<JournalEntry> {
+        self.entries.drain(..).collect()
+    }
 }
 
 /// durable 落点（生产实现见 [`VaultJournalSink`]，测试可注入慢盘/失败实现）。
@@ -168,7 +210,16 @@ pub trait DurableSink {
     /// 把一段**连续前缀**写 durable；成功返回这段里最后一条的 `seq`。
     ///
     /// 实现必须是原子的：要么整段 durable，要么什么都没写（否则会丢已 ACK 数据）。
+    ///
+    /// CAS 基准冲突必须返回 [`StorageError::HeadConflict`]（不能自己改基准硬写）：
+    /// [`JournalWriter`] 据此把 writer 判成 head 过期，而不是无限重试同一份字节。
     fn write_prefix(&mut self, entries: &[JournalEntry]) -> Result<u64, StorageError>;
+
+    /// 当前 sink 使用的 CAS 基准（= 它认为已 durable 的 `head_seq`）。
+    ///
+    /// writer 用它给 `durable_seq` 定初值，并在 [`JournalWriter::rebuild_sink`] 之后重新对齐
+    /// 水位。实现必须返回**真正用于 CAS 的**那个值，否则重建后的水位会骗人。
+    fn head_seq(&self) -> u64;
 }
 
 /// 一次 flush 的结果。
@@ -180,6 +231,28 @@ pub struct FlushReport {
     pub durable_seq: u64,
 }
 
+/// head 过期的终态记录（见模块头契约）。
+///
+/// 只要它非空，writer 就冻结：`submit` / `flush` 一律返回同一个
+/// [`StorageError::JournalHeadStale`]，直到调用方 [`JournalWriter::rebuild_sink`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleHead {
+    doc_id: String,
+    expected: u64,
+    actual: u64,
+}
+
+impl StaleHead {
+    fn to_error(&self, pending: usize) -> StorageError {
+        StorageError::JournalHeadStale {
+            doc_id: self.doc_id.clone(),
+            expected: self.expected,
+            actual: self.actual,
+            pending,
+        }
+    }
+}
+
 /// journal writer：持有 journal 与 sink，串行 flush。
 #[derive(Debug)]
 pub struct JournalWriter<S: DurableSink> {
@@ -188,29 +261,52 @@ pub struct JournalWriter<S: DurableSink> {
     max_batch: usize,
     durable_seq: u64,
     flushed_entries: u64,
+    /// 非空 = CAS 基准已过期，writer 已冻结（见模块头契约）。
+    stale: Option<StaleHead>,
 }
 
 impl<S: DurableSink> JournalWriter<S> {
     /// `max_batch` 是一次 flush 最多合并多少条（慢 I/O 时 pending 会堆到这里为止）。
+    ///
+    /// `durable_seq` 初值取 sink 的 CAS 基准（[`DurableSink::head_seq`]），
+    /// 因此空 journal 上 flush 报告的是真实水位，而不是 0。
     pub fn new(sink: S, capacity: usize, max_batch: usize) -> Self {
+        let durable_seq = sink.head_seq();
         Self {
             journal: PendingJournal::new(capacity),
             sink,
             max_batch: max_batch.max(1),
-            durable_seq: 0,
+            durable_seq,
             flushed_entries: 0,
+            stale: None,
         }
     }
 
     /// 追加一条待落库 update；满了就是背压，调用方必须 flush 后重试。
+    ///
+    /// head 过期后拒绝（返回 [`StorageError::JournalHeadStale`]）：writer 已冻结，
+    /// 新条目必须交给重建后的 writer，否则只会堆在一条永远写不动的前缀后面。
     pub fn submit(&mut self, entry: JournalEntry) -> Result<u64, StorageError> {
+        if let Some(stale) = self.stale.as_ref() {
+            return Err(stale.to_error(self.journal.pending_len()));
+        }
         self.journal.append(entry)
     }
 
     /// 把当前前缀合并成一次 sink 写；成功后裁剪 journal 并推进水位。
     ///
     /// 失败时 journal **原样保留**（sink 承诺原子），下次重试不会丢已成功部分。
+    ///
+    /// 唯一的例外是 CAS 冲突：sink 返回 [`StorageError::HeadConflict`] 时前缀字节已不可
+    /// 重放，本方法**不重试**（0 次），标记 stale 并返回
+    /// [`StorageError::JournalHeadStale`] —— 调用方必须按模块头的契约重建 session，
+    /// 而不是再 flush 一次。
     pub fn flush(&mut self) -> Result<FlushReport, StorageError> {
+        // 终态优先：stale 之后连数据库都不碰（有界重试 = 0 次）。
+        if let Some(stale) = self.stale.as_ref() {
+            return Err(stale.to_error(self.journal.pending_len()));
+        }
+
         // 先拷出前缀，避免同时借用 journal 与 sink
         let prefix: Vec<JournalEntry> = self.journal.peek_prefix(self.max_batch).to_vec();
         if prefix.is_empty() {
@@ -221,7 +317,27 @@ impl<S: DurableSink> JournalWriter<S> {
         }
 
         let entries = prefix.len();
-        let durable_seq = self.sink.write_prefix(&prefix)?;
+        let durable_seq = match self.sink.write_prefix(&prefix) {
+            Ok(seq) => seq,
+            // CAS 冲突是**终态**：前缀的 end_vv/end_frontier 是按旧 head 导出的快照，
+            // 重新导出只能由持有 live 文档的会话层做；同一份字节重试不可能成功。
+            Err(StorageError::HeadConflict {
+                doc_id,
+                expected,
+                actual,
+            }) => {
+                let stale = StaleHead {
+                    doc_id,
+                    expected,
+                    actual,
+                };
+                let error = stale.to_error(self.journal.pending_len());
+                self.stale = Some(stale);
+                return Err(error);
+            }
+            // 其它错误（磁盘失败等）原样透传：journal 原样保留，同一前缀可以重试。
+            Err(error) => return Err(error),
+        };
         self.journal.ack_prefix(entries)?;
         self.durable_seq = durable_seq;
         self.flushed_entries += entries as u64;
@@ -233,6 +349,8 @@ impl<S: DurableSink> JournalWriter<S> {
     }
 
     /// flush 直到 journal 空或没有进展（一次性排空，供关闭/手动保存用）。
+    ///
+    /// head 过期时第一拍就返回 [`StorageError::JournalHeadStale`]，不会空转。
     pub fn flush_all(&mut self) -> Result<usize, StorageError> {
         let mut total = 0;
         while self.journal.pending_len() > 0 {
@@ -243,6 +361,35 @@ impl<S: DurableSink> JournalWriter<S> {
             total += report.entries;
         }
         Ok(total)
+    }
+
+    /// writer 是否已进入「head 过期、必须重建」的终态。
+    pub fn is_stale(&self) -> bool {
+        self.stale.is_some()
+    }
+
+    /// 重建 sink：head 过期后**唯一**合法的恢复入口（见模块头契约）。
+    ///
+    /// 调用方必须先用新 head 重放 live 文档并重新导出本地意图；本方法只负责把 writer
+    /// 从 stale 拉回可用状态：
+    ///
+    /// - 把旧 journal 里未写入的条目**原样交还**（返回值），并从 journal 里清空 ——
+    ///   它们不写库、也**不被静默丢弃**；调用方要么用重新导出的增量覆盖其内容，
+    ///   要么显式报告这次丢弃；
+    /// - `durable_seq` 对齐新 sink 的 CAS 基准（[`DurableSink::head_seq`]）；
+    /// - 未处于 stale 时拒绝：还有能写的前缀就换 sink，等于把本可落库的条目丢掉。
+    pub fn rebuild_sink(&mut self, sink: S) -> Result<Vec<JournalEntry>, StorageError> {
+        if self.stale.is_none() {
+            return Err(StorageError::Corrupt {
+                context: "journal 未处于 head 过期状态，拒绝重建 sink（会丢弃仍可写入的条目）"
+                    .to_owned(),
+            });
+        }
+        let handed_back = self.journal.drain_all();
+        self.sink = sink;
+        self.stale = None;
+        self.durable_seq = self.sink.head_seq();
+        Ok(handed_back)
     }
 
     /// 未 ACK 条数。
@@ -343,7 +490,7 @@ impl DurableSink for VaultJournalSink {
                 self.head_seq,
                 &records,
                 &[],
-                &remote_marks,
+                OriginMarks::PerRecord(&remote_marks),
             )?,
             Some(ctx) => {
                 // 一 update 一意图（remote 条目为空位）；seq 必须与 A 事务写进
@@ -374,11 +521,16 @@ impl DurableSink for VaultJournalSink {
                     self.head_seq,
                     &records,
                     &slots,
-                    &remote_marks,
+                    OriginMarks::PerRecord(&remote_marks),
                 )?
             }
         };
         self.head_seq = head.head_seq;
         Ok(head.head_seq)
+    }
+
+    /// CAS 基准 = 本 sink 已 durable 的 head_seq（与固有方法 `head_seq` 同一个值）。
+    fn head_seq(&self) -> u64 {
+        self.head_seq
     }
 }

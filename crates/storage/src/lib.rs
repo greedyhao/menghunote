@@ -70,9 +70,11 @@ pub use asset_store::{
 pub use baseline_apply::{
     abort_baseline_apply, apply_baseline_assets, apply_baseline_batch,
     baseline_apply_debug_counters, baseline_apply_debug_timings, baseline_apply_state,
-    begin_baseline_apply, finish_baseline_apply, reset_baseline_apply_debug,
+    baseline_apply_verify_ms, baseline_verify_failure, begin_baseline_apply, finish_baseline_apply,
+    mark_baseline_verify_failed, record_baseline_verify_time, reset_baseline_apply_debug,
     BaselineApplyDebugCounters, BaselineApplyDebugTimings, BaselineApplyFinish, BaselineApplyState,
-    BaselineApplyStatus, BaselineAsset, BASELINE_MERGE_BATCH, META_SYNC_RELAY_CURSOR,
+    BaselineApplyStatus, BaselineAsset, BaselineExpectation, BASELINE_MERGE_BATCH,
+    META_BASELINE_EXPECTED, META_BASELINE_VERIFY_FAILED, META_SYNC_RELAY_CURSOR,
 };
 pub use body_doc::{
     BodyDoc, PendingUpdate, APP_DOC_SCHEMA, BODY_CONTAINER, CODEC_VERSION, MIN_READER,

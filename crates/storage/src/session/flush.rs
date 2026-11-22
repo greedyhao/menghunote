@@ -5,7 +5,14 @@
 //! - `flush()` 只投递一条命令就返回票据，**调用线程绝不碰 SQLite**；
 //! - 后台线程每次取 journal 的**连续前缀**，合并成一次 A 事务写 durable；
 //! - 写成功后先裁剪前缀、推进 durable 水位，再把 [`SessionEvent::Durable`] 推进事件队列；
-//! - 写失败**不裁剪、不 ACK**：同一前缀下次重试，因此「已 ACK 的部分」不会丢。
+//! - 写失败**不裁剪、不 ACK**：同一前缀下次重试，因此「已 ACK 的部分」不会丢；
+//! - **head 过期**（[`StorageError::HeadConflict`]）：同一命令内**至多**自动
+//!   `load_head` + 重建 sink 一次，并用新 CAS 基准重试**同一前缀**一次。只有新 head 的
+//!   ops 全部落在未 ACK 前缀最后一条的 `end_vv` 里（即外部推进写的是本会话 live 已知的
+//!   op）才允许重试——否则写入的 `head_vv`/`frontier` 会缺掉外部 ops，下一次
+//!   `load_body_doc` 的完整性校验直接 `Corrupt`。不满足或重建后仍失败 → **不可恢复**：
+//!   `last_write_error` 明确提示「需要重开文档」，journal 原样保留，后续 flush 立即失败、
+//!   不再碰数据库（有界重试，不无限写）。
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -14,7 +21,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::journal::{DurableSink, JournalEntry, JournalOrigin, PendingJournal, VaultJournalSink};
-use crate::store::HeadState;
+use crate::store::{load_head, HeadState};
 use crate::sync_bridge::SyncContext;
 use crate::{StorageError, Vault};
 
@@ -30,7 +37,7 @@ pub(crate) struct GateProgress {
     pub(crate) durable_through: LiveRev,
     /// 已 durable 的 head seq（外部提交的 CAS 基准）。
     pub(crate) durable_head_seq: u64,
-    /// 最近一次前缀写失败原因（成功写入后清空）。
+    /// 最近一次前缀写失败原因（成功写入后清空；不可恢复时保留「需要重开文档」提示）。
     pub(crate) last_write_error: Option<String>,
 }
 
@@ -73,6 +80,13 @@ pub(crate) struct PendingState {
     ///
     /// 外部提交闸门据此把「还在 Flushing」明确升级成 `Failed`，不静默等一个永远不来的 ACK。
     pub(crate) last_write_error: Option<String>,
+    /// 不可恢复的 flush 失败（head 过期且无法安全自动重建）。
+    ///
+    /// 一旦置位就**不再自动重试**：后续 flush 命令立即失败、不再碰数据库；journal 原样
+    /// 保留（未 ACK 的数据不丢也不会被静默丢弃），只有关闭并重开文档才能恢复。
+    /// 外部提交闸门通过 [`GateProgress::last_write_error`] 把它升级成 `Failed`，UI 可据此
+    /// 提示重开文档。
+    pub(crate) unrecoverable: Option<String>,
 }
 
 /// journal 句柄：会话侧投递命令，后台线程负责写。
@@ -109,6 +123,7 @@ impl JournalHandle {
             durable_batch: None,
             durable_through: LiveRev(0),
             last_write_error: None,
+            unrecoverable: None,
         }));
         let events: Arc<Mutex<VecDeque<SessionEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let (sender, receiver) = channel::<FlushCommand>();
@@ -305,10 +320,17 @@ fn flusher_main(
         }
 
         let mut emitted_max: Option<LiveRev> = None;
+        // P1-3：head 过期时同一命令**最多**自动重建 1 次 sink（`load_head` → 新基准 →
+        // 重试同一前缀一次）；用尽后进入不可恢复状态，不再自动重试。
+        let mut auto_rebuilt = false;
         loop {
             // 1) 取连续前缀（持锁只做内存操作，绝不在锁内写盘）
             let (entries, through, count, head_seq) = {
                 let mut guard = lock(&state);
+                // 不可恢复：后续 flush 立即失败、绝不再碰数据库（journal 原样保留）。
+                if guard.unrecoverable.is_some() {
+                    break;
+                }
                 let pending = guard.journal.pending_len();
                 if pending == 0 {
                     break;
@@ -331,11 +353,46 @@ fn flusher_main(
             }
             let written = match sink.write_prefix(&entries) {
                 Ok(seq) => seq,
-                // 不裁剪、不 ACK：同一前缀留着下次重试，已 ACK 部分不受影响。
+                // 普通写失败（磁盘/SQLite 等）：不裁剪、不 ACK，同一前缀下次重试；
                 // 同时记录失败原因：外部提交闸门据此把 "Flushing" 明确升级为 Failed。
-                Err(error) => {
+                Err(error) if !matches!(&error, StorageError::HeadConflict { .. }) => {
                     lock(&state).last_write_error = Some(error.to_string());
                     break;
+                }
+                // head 已被外部推进：同一份字节按旧 CAS 基准重试永远不会成功。
+                // 先 `load_head` 拿真实基准、有界重建 sink，再重试**同一前缀**一次。
+                Err(error) => {
+                    if auto_rebuilt {
+                        let message = reopen_message(
+                            &doc_id,
+                            lock(&state).journal.pending_len(),
+                            format!(
+                                "自动重建后再次 head 冲突（{error}），本命令的 1 次自动重建已用尽"
+                            ),
+                        );
+                        let mut guard = lock(&state);
+                        guard.last_write_error = Some(message.clone());
+                        guard.unrecoverable = Some(message);
+                        break;
+                    }
+                    auto_rebuilt = true;
+                    let pending = lock(&state).journal.pending_len();
+                    match retry_prefix_after_rebuild(
+                        &vault, &doc_id, &entries, pending, head_seq, sync,
+                    ) {
+                        RebuildOutcome::Written(seq) => seq,
+                        // 普通写失败：保持既有「同一前缀下次重试」契约，不升级成不可恢复。
+                        RebuildOutcome::Retryable(message) => {
+                            lock(&state).last_write_error = Some(message);
+                            break;
+                        }
+                        RebuildOutcome::Unrecoverable(message) => {
+                            let mut guard = lock(&state);
+                            guard.last_write_error = Some(message.clone());
+                            guard.unrecoverable = Some(message);
+                            break;
+                        }
+                    }
                 }
             };
 
@@ -406,4 +463,133 @@ fn flusher_main(
             }));
         }
     }
+}
+
+/// head 冲突后自动重建 sink 的结果（P1-3 生产接线）。
+#[derive(Debug)]
+enum RebuildOutcome {
+    /// 重建 sink 后用同一前缀重试成功；值为 durable 后的 `head_seq`。
+    Written(u64),
+    /// 不可恢复：必须关闭并重开文档（不再自动重试，也不再写库）。
+    Unrecoverable(String),
+    /// 重建后重试遇到普通写失败（磁盘/SQLite 等）：journal 保留，下一次 flush 再试。
+    Retryable(String),
+}
+
+/// `HeadConflict` 后的有界自动重建：`load_head` → 新 CAS 基准 sink → 重试同一前缀一次。
+///
+/// **为什么不是无条件重试**：journal 条目的 `PendingUpdate` 是**追加那一刻**按旧 head
+/// 导出的字节，写入 durable 的 `loro_docs.head_vv` / `head_frontier` 取自前缀最后一条的
+/// `end_*` 快照。只有新 head 的 ops 全部包含在该快照的 VV 里（即外部推进写的是本会话
+/// live 已知的 op）时，原样重试才与本会话 live 一致；否则 head 快照会缺掉外部 ops，
+/// 下一次 `load_body_doc` 的完整性校验直接 `Corrupt`。后者 fail-closed：保留 journal、
+/// 提示重开文档，绝不硬写。
+///
+/// `durable_base` 是本次写入用的 CAS 基准；新 head 必须严格大于它，回退的基准一律拒绝。
+fn retry_prefix_after_rebuild(
+    vault: &Vault,
+    doc_id: &str,
+    entries: &[JournalEntry],
+    pending: usize,
+    durable_base: u64,
+    sync: Option<SyncContext>,
+) -> RebuildOutcome {
+    let head = match load_head(vault, doc_id) {
+        Ok(head) => head,
+        Err(error) => {
+            return RebuildOutcome::Unrecoverable(reopen_message(
+                doc_id,
+                pending,
+                format!("读不到当前 head（{error}），无法重建 sink"),
+            ));
+        }
+    };
+    if head.head_seq <= durable_base {
+        return RebuildOutcome::Unrecoverable(reopen_message(
+            doc_id,
+            pending,
+            format!(
+                "库中 head 没有前进（CAS 基准 {durable_base}，读到 {}）；拒绝用回退的基准重写",
+                head.head_seq
+            ),
+        ));
+    }
+    // 空前缀在 flusher 里不可达；防御性 fail-closed，不 panic。
+    let Some(last) = entries.last() else {
+        return RebuildOutcome::Unrecoverable(reopen_message(
+            doc_id,
+            pending,
+            "未 ACK 前缀为空，无法校验 base".to_owned(),
+        ));
+    };
+    let prefix_vv = match loro::VersionVector::decode(&last.update.end_vv) {
+        Ok(vv) => vv,
+        Err(error) => {
+            return RebuildOutcome::Unrecoverable(reopen_message(
+                doc_id,
+                pending,
+                format!("未 ACK 前缀的 end_vv 解码失败（{error}）"),
+            ));
+        }
+    };
+    let head_vv = match head.version_vector() {
+        Ok(vv) => vv,
+        Err(error) => {
+            return RebuildOutcome::Unrecoverable(reopen_message(
+                doc_id,
+                pending,
+                format!("新 head 的 VV 解码失败（{error}）"),
+            ));
+        }
+    };
+    if head_vv.is_empty() {
+        return RebuildOutcome::Unrecoverable(reopen_message(
+            doc_id,
+            pending,
+            format!(
+                "新 head（head_seq {}）的 VV 为空，无法证明未 ACK 前缀与新 base 兼容",
+                head.head_seq
+            ),
+        ));
+    }
+    if !prefix_vv.includes_vv(&head_vv) {
+        return RebuildOutcome::Unrecoverable(reopen_message(
+            doc_id,
+            pending,
+            format!(
+                "库中 head 已推进到 {} 且包含本会话 live 文档未知的并发 ops；\
+                 原样重试会写坏 head_vv/frontier，已拒绝自动重建",
+                head.head_seq
+            ),
+        ));
+    }
+
+    // 同一个后台 flusher 线程内重建 sink（复用既有 Vault 写连接，不新建 journal/连接）。
+    let mut sink = VaultJournalSink::new(vault.clone(), doc_id.to_owned(), head.head_seq);
+    if let Some(sync) = sync {
+        sink = sink.with_sync_context(sync);
+    }
+    match sink.write_prefix(entries) {
+        Ok(seq) => RebuildOutcome::Written(seq),
+        Err(StorageError::HeadConflict {
+            expected, actual, ..
+        }) => RebuildOutcome::Unrecoverable(reopen_message(
+            doc_id,
+            pending,
+            format!("自动重建后再发生 head 冲突（基准 {expected}，实际 {actual}）"),
+        )),
+        Err(error) => RebuildOutcome::Retryable(format!(
+            "{doc_id} 自动重建后重试前缀失败（journal 保留，等待下次 flush）：{error}"
+        )),
+    }
+}
+
+/// 统一的「需要重开文档」失败文案：闸门/UI 只看这一个字符串就必须知道该做什么。
+fn reopen_message(doc_id: &str, pending: usize, reason: String) -> String {
+    format!(
+        "需要重开文档：{doc_id} 的未 ACK journal 无法安全自动重建（{reason}）；\
+         {pending} 条未 ACK 更新保留在当前会话 journal 中（未写入、未静默丢弃）。\
+         请关闭并重开该文档，从 durable 前缀重新加载后再继续编辑；\
+         重开前未 durable 的本地改动不会自动落库"
+    )
 }

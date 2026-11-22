@@ -170,7 +170,10 @@ pub struct PushReport {
 /// - relay 上对象已完整（例如 checkpoint/轮换/另一台设备传过）时按确定性密文逐片
 ///   校验后只做提交/落标记，不重传分片；分片缺失时只补缺失片（已 durable 的片不重传）。
 /// - 对象被其它 reservation 持有时整条资产**延后**（`deferred`），不阻塞正文/结构同步，
-///   下一轮再试；网络/单资产损坏计入 `failed`，同样不阻塞本轮。
+///   下一轮再试；relay/对象校验失败计入 `failed`，同样不阻塞本轮。
+/// - **本地库损坏**（[`SyncError::LocalCorrupt`]，例如字节长度/哈希与元数据不一致）不是
+///   可重试的网络失败：继续扫完其余健康资产后，把首个损坏原样上抛，见
+///   [`SyncEngine::upload_pending_assets`]。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AssetSyncReport {
     /// 被正文引用、有明文的资产数（本轮扫描口径）。
@@ -187,7 +190,10 @@ pub struct AssetSyncReport {
     pub reused_existing: usize,
     /// 被其它 reservation 持有、需下一轮再试的资产数。
     pub deferred: usize,
-    /// 单资产失败数（网络/校验失败；不阻塞正文同步，下一轮重试）。
+    /// 单资产 relay/对象校验失败数（不阻塞正文同步，下一轮重试）。
+    ///
+    /// **本地库损坏不计入这里**：`LocalCorrupt` 每轮重试都不会自愈，会掩盖真正的
+    /// "需要本地修复"状态，因此整轮上抛而不是伪装成可重试失败。
     pub failed: usize,
     /// 元数据不可用或空数据而跳过的资产数（不上传空资产）。
     pub skipped_invalid: usize,
@@ -1091,11 +1097,18 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
     /// 阶段 2b：**增量上传被正文引用的本地资产**（正文推送之后、拉取之前）。
     ///
     /// 顺序是刻意的（ADR 0012 的两阶段路径也复用本方法）：
-    /// - 正文/结构更新先 `push`，资产后置；单条资产失败只计入
+    /// - 正文/结构更新先 `push`，资产后置；单条资产 relay/对象校验失败只计入
     ///   [`AssetSyncReport::failed`]，**不阻塞**本轮正文交付；
     /// - 资产在 `pull` 之前完成，远端设备下一次 pull 就能同时拿到正文与 ASSET 事件；
     /// - 已有 durable 标记的资产不读字节、不发请求；relay 上已完整的对象只校验+提交，
     ///   被其它 reservation 持有的对象延后（`deferred`），下一轮重试。
+    ///
+    /// **本地库损坏上抛**：`upload_one_asset` 发现本地字节长度/哈希与元数据不一致、
+    /// 或确定性分片事实与元数据不符时返回 [`SyncError::LocalCorrupt`]。这类错误每轮
+    /// 重试都不可能自愈，必须让调用方看到（否则就是"永远重试成功、永不报错"）。
+    /// 处理方式是**继续扫完其余资产**（健康资产照常上传/落标记），最后把第一个本地
+    /// 损坏原样上抛；[`SyncError::Paused`]（全局暂停）与 [`SyncError::Storage`]
+    /// （本地库读写失败）仍**立即**上抛，语义不变。
     ///
     /// 只处理 `asset_refs` 引用得到的资产：历史孤儿不重传（`orphans_skipped` 如实上报）。
     pub fn upload_pending_assets(&mut self) -> Result<AssetSyncReport, SyncError> {
@@ -1106,6 +1119,7 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
             orphans_skipped: count_unreferenced_assets(self.vault)?,
             ..AssetSyncReport::default()
         };
+        let mut first_local_corrupt: Option<SyncError> = None;
         let assets = list_referenced_assets(self.vault)?;
         report.referenced = assets.len();
         for meta in assets {
@@ -1149,8 +1163,19 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
                 Err(error) if matches!(error, SyncError::Paused(_) | SyncError::Storage(_)) => {
                     return Err(error)
                 }
+                // 本地库损坏不是网络失败：先继续上传其余健康资产（不让单个损坏拖住
+                // 整库），最后统一上抛。计成 `failed` 会让它每轮"重试成功"、永不报错。
+                Err(error) if matches!(error, SyncError::LocalCorrupt(_)) => {
+                    if first_local_corrupt.is_none() {
+                        first_local_corrupt = Some(error);
+                    }
+                }
+                // 其余（relay/传输/对象校验）沿用既有语义：单资产失败，下一轮重试。
                 Err(_) => report.failed += 1,
             }
+        }
+        if let Some(error) = first_local_corrupt {
+            return Err(error);
         }
         Ok(report)
     }
