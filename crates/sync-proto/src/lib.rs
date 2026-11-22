@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod error;
 pub mod limits;
 pub mod records;
+mod rotation_records;
 
 pub use cde::CdeValue as CborValue;
 pub use cde::{decode as decode_cde, encode as encode_cde, CdeValue, MAX_CDE_BYTES};
@@ -33,4 +34,12 @@ pub use records::{
     HttpMethod, Kdf, ManifestAsset, ManifestDoc, ManifestV1, MessageId, ObjectCommit, ObjectId,
     ObjectRefV1, ObjectType, RelayInstanceId, Rights, RootSecretV1, Sha256, SlotDescriptorV1,
     SlotKind, SnapshotV1, UpdateV1, VaultId, X25519PublicKey,
+};
+pub use rotation_records::{
+    grant_package_digest, member_cert_digest, slot_set_digest, AbortBodyV1, ActivateBodyV1,
+    ActivationCommitV1, ApproveBodyV1, BeginBodyV1, ControlEvent, ControlKind, DeviceApproveBodyV1,
+    EpochActivated, GrantStageBodyV1, GrantsBodyV1, InviteCreateBodyV1, InvitesBodyV1,
+    MemberCertDigestInputV1, NewManagerV1, RevocationsAdded, RotationAbortBodyV1,
+    RotationActivateBodyV1, RotationBeginBodyV1, RotationRestarted, SignedControlRecord,
+    SlotActivateBodyV1, SlotSetDigestInputV1, SlotsActivateBodyV1,
 };

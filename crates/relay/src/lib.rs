@@ -17,6 +17,8 @@
 //! | [`checkpoints`] | writer lease、固定 S、refs、publish、两基线、bootstrap lease |
 //! | [`gc`] | 7 天持久计划 + §13.3 删除前摘要校验 |
 //! | [`rotations`] | freeze → 候选 epoch → staged grants → atomic activate |
+//! | [`control`] | 控制链 typed 记录（`SignedControlRecord` + `epoch.activated` 事件）|
+//! | [`management`] | §26：管理写只解析唯一 canonical body + `request_id` 幂等 |
 //! | [`verify`] | 真实验签：`sync-proto` 解 CDE + relay 算 SHA/Ed25519 |
 //! | [`wire`] | 控制面 `application/cbor` + CDE 记录适配 |
 //! | [`pairing`] | 一次性邀请 / 设备批准（PENDING → ACTIVE） |
@@ -29,6 +31,7 @@ pub mod api;
 pub mod auth;
 pub mod checkpoints;
 pub mod config;
+pub mod control;
 pub mod cursor;
 pub mod db;
 pub mod envelope;
@@ -36,6 +39,7 @@ pub mod error;
 pub mod gc;
 pub mod ids;
 pub mod log;
+pub mod management;
 pub mod objects;
 pub mod pairing;
 pub mod quota;

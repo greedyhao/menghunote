@@ -485,6 +485,278 @@ pub fn can_recycle_update(vault: &Vault, doc_id: &str, seq: u64) -> Result<bool,
     Ok(!update_referenced_by_outbox(vault, doc_id, seq)?)
 }
 
+/// `meta` 键：轮换后必须 repack outbox 的持久屏障（sync 阶段 H 写入 `b"1"`）。
+pub const META_SYNC_REPACK_REQUIRED: &str = "sync.repack_required";
+
+/// 旧 outbox 行的 CAS 键：message/epoch/整体 digest 必须同时匹配。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxKey {
+    pub message_id: String,
+    pub epoch: u64,
+    pub cipher_digest: [u8; 32],
+}
+
+/// repack 后要写入的一个 MNE1 part。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackPart {
+    pub part_no: u32,
+    pub envelope: Vec<u8>,
+    pub digest: [u8; 32],
+}
+
+/// 一条 outbox 重打包目标（保留旧行的 doc_id/seq/batch_id，只换消息元数据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackSpec {
+    pub message_id: String,
+    pub object_id: [u8; 32],
+    pub epoch: u64,
+    pub parts: Vec<RepackPart>,
+    pub cipher_digest: [u8; 32],
+}
+
+/// repack 结果；`NotFound`/`Conflict` 都保证**没有改动任何行**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepackOutcome {
+    Repacked,
+    NotFound,
+    Conflict,
+}
+
+/// candidate 里的 parts 摘要（不把 envelope 全量搬进列表）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackPartSummary {
+    pub part_no: u32,
+    pub envelope_len: usize,
+    pub digest: [u8; 32],
+}
+
+/// 一条待 repack 的旧 outbox 及其 parts 摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRepackCandidate {
+    pub message_id: String,
+    pub batch_id: String,
+    pub doc_id: String,
+    pub seq: u64,
+    pub key_epoch: u64,
+    pub object_id: Option<[u8; 32]>,
+    pub state: SyncOutboxState,
+    pub cipher_digest: Option<[u8; 32]>,
+    pub parts: Vec<RepackPartSummary>,
+}
+
+/// `sync.repack_required` 屏障读取；未知值按损坏处理，避免静默漏 repack。
+pub fn repack_required(vault: &Vault) -> Result<bool, StorageError> {
+    match vault.get_meta(META_SYNC_REPACK_REQUIRED)? {
+        None => Ok(false),
+        Some(value) if value == b"0" || value.is_empty() => Ok(false),
+        Some(value) if value == b"1" => Ok(true),
+        Some(value) => Err(StorageError::Corrupt {
+            context: format!(
+                "meta {META_SYNC_REPACK_REQUIRED} 非法值：{}",
+                String::from_utf8_lossy(&value)
+            ),
+        }),
+    }
+}
+
+/// 写 `sync.repack_required` 屏障；与 sync 现有 `vault.set_meta` 使用同一 meta 键。
+pub fn set_repack_required(vault: &Vault, required: bool) -> Result<(), StorageError> {
+    vault.set_meta(
+        META_SYNC_REPACK_REQUIRED,
+        if required { b"1" } else { b"0" },
+    )
+}
+
+/// 列出仍未 ACK（pending/encrypted/sent）、且 key_epoch 不是给定当前 epoch 的 outbox 行。
+///
+/// `encrypted` 表示 parts 已 durable 但尚未发送；换 epoch 后同样必须重包，不能漏掉。
+pub fn outbox_repack_candidates(
+    vault: &Vault,
+    current_epoch: u64,
+) -> Result<Vec<OutboxRepackCandidate>, StorageError> {
+    let rows = vault.query(
+        "SELECT message_id,batch_id,doc_id,seq,key_epoch,object_id,state,cipher_digest \
+         FROM sync_outbox WHERE state IN('pending','encrypted','sent') AND key_epoch<>?1 \
+         ORDER BY doc_id,seq,message_id",
+        &[Value::Integer(i64_of(current_epoch)?)],
+    )?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let row = row_to_outbox(row)?;
+        let parts = outbox_parts(vault, &row.message_id, row.key_epoch)?
+            .into_iter()
+            .map(|part| RepackPartSummary {
+                part_no: part.part_no,
+                envelope_len: part.envelope.len(),
+                digest: part.digest,
+            })
+            .collect();
+        out.push(OutboxRepackCandidate {
+            message_id: row.message_id,
+            batch_id: row.batch_id,
+            doc_id: row.doc_id,
+            seq: row.seq,
+            key_epoch: row.key_epoch,
+            object_id: row.object_id,
+            state: row.state,
+            cipher_digest: row.cipher_digest,
+            parts,
+        });
+    }
+    Ok(out)
+}
+
+/// 原子地把一条旧 outbox 重打包为新的 message/object/epoch/parts。
+///
+/// 先做无写入的旧行 CAS 校验；校验通过后在**同一个事务**里：
+/// 删除旧 parts → 删除旧 outbox 行 → 插入新 outbox 行 → 插入新 parts。
+/// 旧行已被 ACK、epoch/digest 不匹配或事务中途失败时，旧行与旧 parts 都保持不变。
+pub fn repack_outbox(
+    vault: &Vault,
+    old: &OutboxKey,
+    new: &RepackSpec,
+) -> Result<RepackOutcome, StorageError> {
+    validate_repack_spec(new)?;
+    if old.message_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "repack old.message_id 不能为空".to_owned(),
+        });
+    }
+
+    let old_row = outbox_row(vault, &old.message_id)?;
+    let Some(old_row) = old_row else {
+        return Ok(RepackOutcome::NotFound);
+    };
+    if old_row.state == SyncOutboxState::Acked
+        || old_row.key_epoch != old.epoch
+        || old_row.cipher_digest != Some(old.cipher_digest)
+    {
+        return Ok(RepackOutcome::Conflict);
+    }
+    // 若新旧 CAS 键完全相同，迟到的旧 ACK 仍可能命中新行；这不是一次有效的重包。
+    if new.message_id == old.message_id
+        && new.epoch == old.epoch
+        && new.cipher_digest == old.cipher_digest
+    {
+        return Ok(RepackOutcome::Conflict);
+    }
+
+    // 旧 parts 必须是连续 0..n-1；数据库损坏时不能静默搬走。
+    let old_parts = outbox_parts(vault, &old.message_id, old.epoch)?;
+    for (index, part) in old_parts.iter().enumerate() {
+        if part.part_no != index as u32 {
+            return Err(StorageError::Corrupt {
+                context: format!(
+                    "旧 outbox {}/{} parts 不连续：第 {index} 项是 {}",
+                    old.message_id, old.epoch, part.part_no
+                ),
+            });
+        }
+    }
+
+    // 同一 message_id 只能有一行；复用旧 message 时由事务内“先删后插”保证。
+    if new.message_id != old.message_id && outbox_row(vault, &new.message_id)?.is_some() {
+        return Ok(RepackOutcome::Conflict);
+    }
+
+    let mut statements = Vec::with_capacity(2 + 1 + new.parts.len());
+    statements.push(Statement::new(
+        "DELETE FROM sync_outbox_parts WHERE message_id=?1 AND epoch=?2",
+        vec![
+            Value::Blob(old.message_id.as_bytes().to_vec()),
+            Value::Integer(i64_of(old.epoch)?),
+        ],
+    ));
+    statements.push(Statement::new(
+        "DELETE FROM sync_outbox \
+         WHERE message_id=?1 AND key_epoch=?2 AND cipher_digest=?3 \
+           AND state IN('pending','encrypted','sent')",
+        vec![
+            Value::Text(old.message_id.clone()),
+            Value::Integer(i64_of(old.epoch)?),
+            Value::Blob(old.cipher_digest.to_vec()),
+        ],
+    ));
+    statements.push(Statement::new(
+        "INSERT INTO sync_outbox(message_id,batch_id,doc_id,seq,key_epoch,ciphertext,object_id,state,cipher_digest) \
+         VALUES(?1,?2,?3,?4,?5,NULL,?6,'encrypted',?7)",
+        vec![
+            Value::Text(new.message_id.clone()),
+            Value::Text(old_row.batch_id.clone()),
+            Value::Text(old_row.doc_id.clone()),
+            Value::Integer(i64_of(old_row.seq)?),
+            Value::Integer(i64_of(new.epoch)?),
+            Value::Blob(new.object_id.to_vec()),
+            Value::Blob(new.cipher_digest.to_vec()),
+        ],
+    ));
+    for part in &new.parts {
+        statements.push(Statement::new(
+            "INSERT INTO sync_outbox_parts(message_id,epoch,part_no,envelope,digest) \
+             VALUES(?1,?2,?3,?4,?5)",
+            vec![
+                Value::Blob(new.message_id.as_bytes().to_vec()),
+                Value::Integer(i64_of(new.epoch)?),
+                Value::Integer(i64::from(part.part_no)),
+                Value::Blob(part.envelope.clone()),
+                Value::Blob(part.digest.to_vec()),
+            ],
+        ));
+    }
+
+    let mut guards = vec![
+        AffectedGuard::exactly(0, old_parts.len()),
+        AffectedGuard::exactly(1, 1),
+        AffectedGuard::exactly(2, 1),
+    ];
+    guards.extend((0..new.parts.len()).map(|index| AffectedGuard::exactly(3 + index, 1)));
+
+    match vault.exec_transaction(&statements, &guards) {
+        Ok(_) => Ok(RepackOutcome::Repacked),
+        Err(StorageError::GuardFailed { .. }) => Ok(RepackOutcome::Conflict),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_repack_spec(spec: &RepackSpec) -> Result<(), StorageError> {
+    if spec.message_id.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "repack new.message_id 不能为空".to_owned(),
+        });
+    }
+    if spec.epoch == 0 {
+        return Err(StorageError::Corrupt {
+            context: "repack new.epoch 必须 >0".to_owned(),
+        });
+    }
+    if spec.parts.is_empty() {
+        return Err(StorageError::Corrupt {
+            context: "repack new.parts 不能为空".to_owned(),
+        });
+    }
+    for (index, part) in spec.parts.iter().enumerate() {
+        if part.part_no != index as u32 {
+            return Err(StorageError::Corrupt {
+                context: format!(
+                    "repack new.parts 必须从 0 连续：第 {index} 项是 {}",
+                    part.part_no
+                ),
+            });
+        }
+        if part.envelope.is_empty() {
+            return Err(StorageError::Corrupt {
+                context: format!("repack new.parts 第 {index} 片信封为空"),
+            });
+        }
+        if part.digest.len() != 32 {
+            return Err(StorageError::Corrupt {
+                context: format!("repack new.parts 第 {index} 片 digest 不是 32B"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_intent(
     message_id: &str,
     batch_id: &str,

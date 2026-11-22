@@ -226,8 +226,8 @@ fn crash_replay_after_parts_and_after_complete() {
     let commit = commit_for(&digest);
 
     // "重启"：关闭 writer 线程，重新打开同一个库（同一 FakeClock）。
-    let path = fx.cfg.db.path.clone();
-    drop(fx);
+    let path = fx.into_db_path();
+    let cleanup_path = path.clone();
     let clock = std::sync::Arc::new(relay::time::FakeClock::new(BASE_TIME));
     let db = relay::db::Db::open(relay::db::DbConfig::new(path), clock.clone()).expect("reopen");
     let vault = db.read(relay::vault::load).expect("vault");
@@ -296,4 +296,6 @@ fn crash_replay_after_parts_and_after_complete() {
         .expect("head");
     assert_eq!(head, 1, "重放不得把 head_seq 推高");
     assert_eq!(clock.now_secs(), BASE_TIME);
+    drop(db);
+    support::cleanup_db_dir(&cleanup_path);
 }

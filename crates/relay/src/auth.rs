@@ -432,8 +432,11 @@ pub struct ManagementProof<'a> {
     pub signature: &'a [u8],
 }
 
-/// 校验管理签名 + CAS（调用方已做 realm==Management 的 token 校验）。
-pub fn require_management(
+/// 只校验管理签名（**不做** `control_rev` CAS）。
+///
+/// §26：`unsigned_body` 必须是唯一 canonical body 的原始字节；签名输入由 verify hook
+/// 用 `(method,path,body)` 重新 CDE 得到，调用方不得另行拼装业务字段。
+pub fn verify_management(
     conn: &Connection,
     hook: &dyn SignatureHook,
     proof: &ManagementProof<'_>,
@@ -458,12 +461,29 @@ pub fn require_management(
             instance_id: &instance_id,
         },
     };
-    require(hook, &check, ErrorCode::ManagementRequired)?;
-    if proof.expected_control_rev != vault.control_rev {
+    require(hook, &check, ErrorCode::ManagementRequired)
+}
+
+/// 管理写的 `control_rev` CAS：期望值与 vault 当前值不一致 → 409（带当前值）。
+pub fn require_control_rev(conn: &Connection, expected: u64) -> Result<u64> {
+    let vault = vault::load(conn)?;
+    if expected != vault.control_rev {
         return Err(Error::Api(
             ApiError::new(ErrorCode::CasConflict).control_rev(vault.control_rev),
         ));
     }
+    Ok(vault.control_rev)
+}
+
+/// 校验管理签名 + CAS（保留给尚未接入 `management::run` 的调用方）。
+pub fn require_management(
+    conn: &Connection,
+    hook: &dyn SignatureHook,
+    proof: &ManagementProof<'_>,
+    unsigned_body: &[u8],
+) -> Result<()> {
+    verify_management(conn, hook, proof, unsigned_body)?;
+    require_control_rev(conn, proof.expected_control_rev)?;
     Ok(())
 }
 

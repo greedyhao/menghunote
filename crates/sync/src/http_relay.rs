@@ -27,8 +27,11 @@ use crate::cbor;
 use crate::device::{verify_signature, DeviceSigningKey};
 use crate::error::SyncError;
 use crate::relay::{
-    RelayClient, RelayLogEvent, RelayLogKind, RelayLogPage, RelayState, UpdateOutcome,
-    UpdateStatus, UpdateSubmission,
+    BootstrapBundle, BootstrapCheckpoint, BootstrapLease, CheckpointLease, CheckpointPublish,
+    CheckpointRef, CheckpointStatus, FrozenAssetPage, FrozenAssetRef, ManagerChainEntry,
+    ObjectSubmission, PublishedCheckpoint, RelayClient, RelayLogEvent, RelayLogKind, RelayLogPage,
+    RelayState, RotationBegin, RotationView, SlotRecord, SlotUpload, UpdateOutcome, UpdateStatus,
+    UpdateSubmission,
 };
 use crate::{DeviceId, ObjectId, VaultId};
 use menghunote_sync_proto::{
@@ -241,6 +244,10 @@ struct ControlState {
     epoch: u64,
     /// 只缓存 active 成员的证书。
     certs: HashMap<DeviceId, DeviceCertV1>,
+    /// §30.3 键 4：typed 控制记录 kind（旧记录为 `raw`）。
+    kinds: Vec<(u64, String)>,
+    /// active 成员证书的 digest 输入（device_id/cert/signature）。
+    member_cert_inputs: Vec<menghunote_sync_proto::MemberCertDigestInputV1>,
 }
 
 /// relay 的 HTTP 实现。
@@ -281,6 +288,33 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
     /// 已缓存的 control_rev（测试/诊断用）。
     pub fn cached_control_rev(&self) -> Option<u64> {
         self.control.as_ref().map(|control| control.control_rev)
+    }
+
+    /// §28.1：当前 active 成员证书集合 digest（SHA256(proto 字节输入)）。
+    pub fn active_member_cert_digest(&mut self) -> Result<[u8; 32], SyncError> {
+        if self.control.is_none() {
+            self.refresh_control()?;
+        }
+        let Some(control) = &self.control else {
+            return Err(SyncError::RelayWire("control 缓存为空"));
+        };
+        let input = menghunote_sync_proto::member_cert_digest(&control.member_cert_inputs);
+        Ok(Sha256::digest(&input).into())
+    }
+
+    /// rotation begin 会 bump `auth_rev` 使全部旧 token 失效；调用方必须清缓存重认证。
+    pub fn clear_auth_cache(&mut self) {
+        self.token = None;
+        self.control = None;
+    }
+
+    /// §30.3 键 4：已缓存的控制记录 `(rev, kind)`（旧记录为 `raw`）。
+    #[must_use]
+    pub fn control_kinds(&self) -> Vec<(u64, String)> {
+        self.control
+            .as_ref()
+            .map(|control| control.kinds.clone())
+            .unwrap_or_default()
     }
 
     /// 从 `GET /state` 键 14 读初始游标（relay task-86 的兜底；旧版没有该字段）。
@@ -445,6 +479,14 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
         let auth_rev = cbor::uint_field(&fields, 6)?;
         let head_seq = cbor::uint_field(&fields, 7)?;
         let gc_floor = cbor::uint_field(&fields, 8)?;
+        let current_rotation_id = cbor::opt_bytes_field(&fields, 15)?
+            .map(|bytes| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SyncError::RelayWire("state.current_rotation_id 长度非法"))
+            })
+            .transpose()?;
         if vault_id != self.config.vault_id {
             return Err(SyncError::RelayWire("state.vault_id 与本地不一致"));
         }
@@ -457,6 +499,7 @@ impl<T: HttpTransport, C: Clock> HttpRelayClient<T, C> {
             auth_rev,
             head_seq,
             gc_floor,
+            current_rotation_id,
         })
     }
 
@@ -573,6 +616,29 @@ impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
         }
     }
 
+    fn put_part_with_reservation(
+        &mut self,
+        object_id: &ObjectId,
+        part_no: u32,
+        envelope: &[u8],
+        reservation: Option<&[u8; 16]>,
+    ) -> Result<(), SyncError> {
+        let Some(reservation) = reservation else {
+            return self.put_part(object_id, part_no, envelope);
+        };
+        let path = format!(
+            "/v1/vaults/{}/objects/{}/parts/{part_no}?reservation={}",
+            base64url::encode(&self.config.vault_id),
+            base64url::encode(object_id),
+            base64url::encode(reservation)
+        );
+        let response = self.send("PUT", path, Some(CONTENT_TYPE_OCTET), envelope.to_vec())?;
+        match response.status {
+            200 | 201 => Ok(()),
+            _ => Err(error_from_response(&response)),
+        }
+    }
+
     fn submit_updates(
         &mut self,
         items: Vec<UpdateSubmission>,
@@ -608,9 +674,7 @@ impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
             let code = cbor::opt_text_field(&result, 3)?;
             let retryable = cbor::bool_field(&result, 4)?;
             let status = match status_text.as_str() {
-                "accepted" => UpdateStatus::Accepted {
-                    relay_seq: relay_seq.ok_or(SyncError::RelayWire("accepted 缺少 relay_seq"))?,
-                },
+                "accepted" => UpdateStatus::Accepted { relay_seq },
                 "duplicate" => UpdateStatus::Duplicate,
                 "failed" => UpdateStatus::Failed { code, retryable },
                 _ => return Err(SyncError::RelayWire("未知 update 结果状态")),
@@ -648,6 +712,599 @@ impl<T: HttpTransport, C: Clock> RelayClient for HttpRelayClient<T, C> {
             .and_then(|control| control.certs.get(device_id))
             .cloned())
     }
+
+    fn submit_object(&mut self, item: ObjectSubmission) -> Result<UpdateOutcome, SyncError> {
+        let entry = cbor::CdeValue::Map(vec![
+            (0, cbor::bytes(item.object_id)),
+            (1, cbor::bytes(item.signed_commit)),
+            (2, cbor::bytes(item.signature)),
+        ]);
+        let fields = self.send_cbor(
+            "POST",
+            self.vault_path("/updates"),
+            Some(vec![(0, cbor::array(vec![entry]))]),
+        )?;
+        let results = cbor::array_field(&fields, 0)?;
+        let result = results
+            .first()
+            .ok_or(SyncError::RelayWire("submit_object 响应缺少结果"))?;
+        parse_update_outcome(&cbor::value_map(result)?)
+    }
+
+    fn put_key_slot(&mut self, upload: SlotUpload) -> Result<SlotRecord, SyncError> {
+        let path = format!(
+            "{}/key-slots/{}",
+            self.vault_path(""),
+            base64url::encode(&upload.slot_id)
+        );
+        let signed = cbor::CdeValue::Map(vec![
+            (0, cbor::bytes(upload.signed_message)),
+            (1, cbor::bytes(upload.signature)),
+        ]);
+        let fields = self.send_cbor(
+            "PUT",
+            path,
+            Some(vec![
+                (0, cbor::uint(upload.epoch)),
+                (1, cbor::text(slot_kind_text(upload.kind))),
+                (2, cbor::bytes(upload.descriptor)),
+                (3, signed),
+            ]),
+        )?;
+        let slot = cbor::value_map(&cbor::field(&fields, 0)?.clone())?;
+        parse_slot_record(&slot)
+    }
+
+    fn list_key_slots(&mut self) -> Result<Vec<SlotRecord>, SyncError> {
+        let fields = self.send_cbor("GET", format!("{}/key-slots", self.vault_path("")), None)?;
+        let mut slots = Vec::new();
+        for value in cbor::array_field(&fields, 0)? {
+            slots.push(parse_slot_record(&cbor::value_map(&value)?)?);
+        }
+        Ok(slots)
+    }
+
+    fn activate_password_slot(
+        &mut self,
+        expected_slot_set_rev: u64,
+        slot_id: ObjectId,
+        signed_message: Vec<u8>,
+        signature: [u8; 64],
+    ) -> Result<u64, SyncError> {
+        let signed = cbor::CdeValue::Map(vec![
+            (0, cbor::bytes(signed_message)),
+            (1, cbor::bytes(signature)),
+        ]);
+        let fields = self.send_cbor(
+            "POST",
+            format!("{}/key-slots/password/activate", self.vault_path("")),
+            Some(vec![
+                (0, cbor::uint(expected_slot_set_rev)),
+                (1, cbor::bytes(slot_id)),
+                (2, signed),
+            ]),
+        )?;
+        cbor::uint_field(&fields, 0)
+    }
+
+    fn create_checkpoint(
+        &mut self,
+        estimated_bytes: u64,
+        epoch: Option<u64>,
+    ) -> Result<CheckpointLease, SyncError> {
+        self.create_checkpoint_with_role(estimated_bytes, epoch, None)
+    }
+
+    fn create_checkpoint_with_role(
+        &mut self,
+        estimated_bytes: u64,
+        epoch: Option<u64>,
+        role: Option<&str>,
+    ) -> Result<CheckpointLease, SyncError> {
+        let mut body = vec![(0, cbor::uint(estimated_bytes))];
+        if let Some(epoch) = epoch {
+            body.push((1, cbor::uint(epoch)));
+        }
+        if let Some(role) = role {
+            body.push((2, cbor::text(role)));
+        }
+        let fields = self.send_cbor(
+            "POST",
+            format!("{}/checkpoints", self.vault_path("")),
+            Some(body),
+        )?;
+        Ok(CheckpointLease {
+            checkpoint_id: cbor::bytes_fixed(&fields, 0)?,
+            epoch: cbor::uint_field(&fields, 1)?,
+            covered_seq: cbor::uint_field(&fields, 2)?,
+            reservation_id: cbor::bytes_fixed(&fields, 3)?,
+            expires_at: cbor::uint_field(&fields, 4)?,
+        })
+    }
+
+    fn add_checkpoint_refs(
+        &mut self,
+        checkpoint_id: menghunote_sync_proto::CheckpointId,
+        refs: Vec<CheckpointRef>,
+    ) -> Result<u64, SyncError> {
+        let entries = refs
+            .into_iter()
+            .map(|reference| {
+                cbor::CdeValue::Map(vec![
+                    (0, cbor::bytes(reference.object_id)),
+                    (1, cbor::text(reference.role.as_str())),
+                ])
+            })
+            .collect();
+        let path = format!(
+            "{}/checkpoints/{}/refs",
+            self.vault_path(""),
+            base64url::encode(&checkpoint_id)
+        );
+        let fields = self.send_cbor("POST", path, Some(vec![(0, cbor::array(entries))]))?;
+        cbor::uint_field(&fields, 0)
+    }
+
+    fn publish_checkpoint(
+        &mut self,
+        publish: CheckpointPublish,
+    ) -> Result<PublishedCheckpoint, SyncError> {
+        let path = format!(
+            "{}/checkpoints/{}/publish",
+            self.vault_path(""),
+            base64url::encode(&publish.checkpoint_id)
+        );
+        let fields = self.send_cbor(
+            "POST",
+            path,
+            Some(vec![
+                (0, cbor::uint(publish.covered_seq)),
+                (1, cbor::bytes(publish.manifest_oid)),
+                (2, cbor::bytes(publish.refs_digest)),
+                (3, cbor::bytes(publish.signed_commit)),
+                (4, cbor::bytes(publish.signature)),
+            ]),
+        )?;
+        Ok(PublishedCheckpoint {
+            checkpoint_id: cbor::bytes_fixed(&fields, 0)?,
+            epoch: cbor::uint_field(&fields, 1)?,
+            covered_seq: cbor::uint_field(&fields, 2)?,
+            published_at: cbor::uint_field(&fields, 3)?,
+        })
+    }
+
+    fn bootstrap(&mut self) -> Result<BootstrapBundle, SyncError> {
+        bootstrap_impl(self, false)
+    }
+
+    fn bootstrap_degraded(&mut self) -> Result<BootstrapBundle, SyncError> {
+        bootstrap_impl(self, true)
+    }
+
+    fn renew_bootstrap_lease(&mut self, lease_id: [u8; 16]) -> Result<BootstrapLease, SyncError> {
+        let fields = self.send_cbor(
+            "PATCH",
+            format!(
+                "{}/bootstrap-leases/{}",
+                self.vault_path(""),
+                base64url::encode(&lease_id)
+            ),
+            None,
+        )?;
+        Ok(BootstrapLease {
+            lease_id: cbor::bytes_fixed(&fields, 0)?,
+            expires_at: cbor::uint_field(&fields, 1)?,
+            floor_seq: cbor::uint_field(&fields, 2)?,
+        })
+    }
+
+    fn begin_rotation(&mut self, begin: RotationBegin) -> Result<RotationView, SyncError> {
+        let signed = cbor::CdeValue::Map(vec![
+            (0, cbor::bytes(begin.signed_body)),
+            (1, cbor::bytes(begin.signature.to_vec())),
+        ]);
+        let fields = self.send_cbor(
+            "POST",
+            self.vault_path("/rotations"),
+            Some(vec![
+                (0, signed),
+                (1, cbor::bytes(begin.request_id.to_vec())),
+                (2, cbor::uint(begin.expected_control_rev)),
+                (3, cbor::uint(begin.expected_epoch)),
+                (
+                    4,
+                    cbor::array(
+                        begin
+                            .revoke
+                            .iter()
+                            .map(|device| cbor::bytes(device.to_vec()))
+                            .collect(),
+                    ),
+                ),
+            ]),
+        )?;
+        parse_rotation_view(&fields)
+    }
+
+    fn rotation_for_request(
+        &mut self,
+        request_id: [u8; 16],
+    ) -> Result<Option<RotationView>, SyncError> {
+        let fields = self.send_cbor(
+            "GET",
+            format!(
+                "{}/rotations/current?request_id={}",
+                self.vault_path(""),
+                base64url::encode(&request_id)
+            ),
+            None,
+        )?;
+        match cbor::field(&fields, 0) {
+            Ok(_) => parse_rotation_view(&fields).map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn current_rotation(&mut self) -> Result<Option<RotationView>, SyncError> {
+        let fields = self.send_cbor(
+            "GET",
+            format!("{}/rotations/current", self.vault_path("")),
+            None,
+        )?;
+        match cbor::field(&fields, 0) {
+            Ok(_) => parse_rotation_view(&fields).map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn rotation(&mut self, rotation_id: [u8; 16]) -> Result<RotationView, SyncError> {
+        let fields = self.send_cbor(
+            "GET",
+            format!(
+                "{}/rotations/{}",
+                self.vault_path(""),
+                base64url::encode(&rotation_id)
+            ),
+            None,
+        )?;
+        parse_rotation_view(&fields)
+    }
+
+    fn management_chain(&mut self) -> Result<Vec<ManagerChainEntry>, SyncError> {
+        let fields = self.send_cbor(
+            "GET",
+            format!("{}/control?after_rev=0", self.vault_path("")),
+            None,
+        )?;
+        cbor::array_field(&fields, 5)?
+            .iter()
+            .map(parse_manager_chain_entry)
+            .collect()
+    }
+
+    fn active_member_hpke_keys(&mut self) -> Result<Vec<(DeviceId, [u8; 32])>, SyncError> {
+        if self.control.is_none() {
+            self.refresh_control()?;
+        }
+        let mut keys = self
+            .control
+            .as_ref()
+            .map(|control| {
+                control
+                    .certs
+                    .iter()
+                    .map(|(device_id, cert)| (*device_id, cert.hpke_x25519_pub))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        keys.sort_by_key(|(device_id, _)| *device_id);
+        Ok(keys)
+    }
+
+    fn rotation_assets(
+        &mut self,
+        rotation_id: [u8; 16],
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<FrozenAssetPage, SyncError> {
+        let mut path = format!(
+            "{}/rotations/{}/assets?limit={limit}",
+            self.vault_path(""),
+            base64url::encode(&rotation_id)
+        );
+        if let Some(after) = after {
+            path.push_str(&format!("&after={}", base64url::encode(&after)));
+        }
+        let fields = self.send_cbor("GET", path, None)?;
+        let assets = cbor::array_field(&fields, 0)?
+            .iter()
+            .map(parse_frozen_asset)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(FrozenAssetPage {
+            assets,
+            freeze_seq: cbor::uint_field(&fields, 1)?,
+            asset_set_digest: cbor::opt_bytes_field(&fields, 2)?
+                .map(|bytes| {
+                    bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| SyncError::RelayWire("asset_set_digest 长度非法"))
+                })
+                .transpose()?,
+            total: cbor::uint_field(&fields, 3)?,
+        })
+    }
+
+    fn checkpoint_status(
+        &mut self,
+        checkpoint_id: [u8; 16],
+    ) -> Result<CheckpointStatus, SyncError> {
+        let outer = self.send_cbor(
+            "GET",
+            format!(
+                "{}/checkpoints/{}",
+                self.vault_path(""),
+                base64url::encode(&checkpoint_id)
+            ),
+            None,
+        )?;
+        let fields = cbor::value_map(cbor::field(&outer, 0)?)?;
+        Ok(CheckpointStatus {
+            checkpoint_id: cbor::bytes_fixed(&fields, 0)
+                .map_err(|_| SyncError::RelayWire("checkpoint id 字段"))?,
+            state: cbor::text_field(&fields, 1)
+                .map_err(|_| SyncError::RelayWire("checkpoint state 字段"))?,
+            role: cbor::opt_text_field(&fields, 2)
+                .map_err(|_| SyncError::RelayWire("checkpoint role 字段"))?,
+            covered_seq: cbor::uint_field(&fields, 3)
+                .map_err(|_| SyncError::RelayWire("checkpoint covered 字段"))?,
+            manifest_object_id: cbor::opt_bytes_field(&fields, 4)?
+                .map(|bytes| {
+                    bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| SyncError::RelayWire("manifest oid 长度非法"))
+                })
+                .transpose()?,
+            refs_digest: cbor::opt_bytes_field(&fields, 5)?
+                .map(|bytes| {
+                    bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| SyncError::RelayWire("refs_digest 长度非法"))
+                })
+                .transpose()?,
+            candidate_ready: cbor::bool_field(&fields, 9).unwrap_or(false),
+            epoch: cbor::uint_field(&fields, 10).unwrap_or(0),
+        })
+    }
+}
+
+fn bootstrap_impl<T: HttpTransport, C: Clock>(
+    client: &mut HttpRelayClient<T, C>,
+    degraded: bool,
+) -> Result<BootstrapBundle, SyncError> {
+    let path = if degraded {
+        format!("{}/bootstrap?degraded=1", client.vault_path(""))
+    } else {
+        format!("{}/bootstrap", client.vault_path(""))
+    };
+    let fields = client.send_cbor("POST", path, None)?;
+    let primary = parse_bootstrap_checkpoint(cbor::field(&fields, 0)?)?;
+    let fallback = parse_bootstrap_checkpoint(cbor::field(&fields, 1)?)?;
+    let lease_id: [u8; 16] = cbor::bytes_fixed(&fields, 5)?;
+    Ok(BootstrapBundle {
+        primary,
+        fallback,
+        head_seq: cbor::uint_field(&fields, 2)?,
+        gc_floor: cbor::uint_field(&fields, 3)?,
+        epoch: cbor::uint_field(&fields, 4)?,
+        degraded: cbor::bool_field(&fields, 7).unwrap_or(false),
+        lease: BootstrapLease {
+            lease_id,
+            expires_at: cbor::uint_field(&fields, 6)?,
+            floor_seq: 0,
+        },
+    })
+}
+
+fn parse_frozen_asset(value: &cbor::CdeValue) -> Result<FrozenAssetRef, SyncError> {
+    let fields = cbor::value_map(value)?;
+    Ok(FrozenAssetRef {
+        object_id: cbor::bytes_fixed(&fields, 0)?,
+        generation: cbor::uint_field(&fields, 2)?,
+        key_epoch: cbor::uint_field(&fields, 3)?,
+        part_count: u32::try_from(cbor::uint_field(&fields, 4)?)
+            .map_err(|_| SyncError::RelayWire("frozen asset part_count 越界"))?,
+        total_plain_len: cbor::uint_field(&fields, 5)?,
+        object_digest: cbor::bytes_fixed(&fields, 6)?,
+    })
+}
+
+fn parse_manager_chain_entry(value: &cbor::CdeValue) -> Result<ManagerChainEntry, SyncError> {
+    let fields = cbor::value_map(value)?;
+    Ok(ManagerChainEntry {
+        rev: cbor::uint_field(&fields, 0)?,
+        pubkey: cbor::bytes_fixed(&fields, 1)
+            .map_err(|_| SyncError::RelayWire("management chain pubkey 长度非法"))?,
+        transition: cbor::bytes_field(&fields, 2)?,
+        old_rev: cbor::uint_field(&fields, 3)?,
+        old_signature: cbor::opt_bytes_field(&fields, 4)?
+            .map(|bytes| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SyncError::RelayWire("management old sig 长度非法"))
+            })
+            .transpose()?,
+        new_signature: cbor::opt_bytes_field(&fields, 5)?
+            .map(|bytes| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SyncError::RelayWire("management new sig 长度非法"))
+            })
+            .transpose()?,
+    })
+}
+
+fn parse_rotation_view(fields: &cbor::Fields) -> Result<RotationView, SyncError> {
+    let view = cbor::value_map(cbor::field(fields, 0)?)?;
+    Ok(RotationView {
+        rotation_id: cbor::bytes_fixed(&view, 0)?,
+        state: cbor::text_field(&view, 1)?,
+        from_epoch: cbor::uint_field(&view, 2)?,
+        to_epoch: cbor::uint_field(&view, 3)?,
+        freeze_seq: cbor::uint_field(&view, 4)?,
+        revoked_count: cbor::uint_field(&view, 5)?,
+        member_set_hash: cbor::opt_bytes_field(&view, 6)?
+            .map(|bytes| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SyncError::RelayWire("rotation member_set_hash 长度非法"))
+            })
+            .transpose()?,
+        grants_count: cbor::uint_field(&view, 7)?,
+        grants_digest: cbor::opt_bytes_field(&view, 8)?
+            .map(|bytes| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SyncError::RelayWire("rotation grants_digest 长度非法"))
+            })
+            .transpose()?,
+        published_checkpoints: cbor::uint_field(&view, 9)?,
+        control_rev: cbor::uint_field(&view, 10)?,
+        auth_rev: cbor::uint_field(&view, 11)?,
+        manager_rev: cbor::uint_field(&view, 12)?,
+        from_epoch_revoked_once: cbor::uint_field(&view, 13)? != 0,
+        freeze_asset_count: cbor::uint_field(&view, 15)?,
+        freeze_asset_digest: opt_fixed32(&view, 16, "rotation asset_set_digest")?,
+        member_cert_digest: opt_fixed32(&view, 17, "rotation member_cert_digest")?,
+        primary_checkpoint: opt_fixed16(&view, 18, "rotation primary_checkpoint")?,
+        fallback_checkpoint: opt_fixed16(&view, 19, "rotation fallback_checkpoint")?,
+        activation_commit: cbor::opt_bytes_field(&view, 20)?,
+        activated_at: cbor::opt_uint_field(&view, 21)?,
+        activated_control_rev: cbor::opt_uint_field(&view, 22)?,
+        candidate_count: cbor::array_field(&view, 23)?.len() as u64,
+        candidate_ready: cbor::uint_field(&view, 26)? != 0,
+        reservation_id: match view.iter().find(|(key, _)| *key == 25) {
+            Some((_, cbor::CdeValue::Map(fields))) => Some(cbor::bytes_fixed(fields, 0)?),
+            Some(_) => return Err(SyncError::RelayWire("rotation reservation 不是 map")),
+            None => None,
+        },
+    })
+}
+
+fn opt_fixed32(
+    fields: &cbor::Fields,
+    key: u64,
+    what: &'static str,
+) -> Result<Option<[u8; 32]>, SyncError> {
+    cbor::opt_bytes_field(fields, key)?
+        .map(|bytes| {
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| SyncError::RelayWire(what))
+        })
+        .transpose()
+}
+
+fn opt_fixed16(
+    fields: &cbor::Fields,
+    key: u64,
+    what: &'static str,
+) -> Result<Option<[u8; 16]>, SyncError> {
+    cbor::opt_bytes_field(fields, key)?
+        .map(|bytes| {
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| SyncError::RelayWire(what))
+        })
+        .transpose()
+}
+
+fn parse_bootstrap_checkpoint(value: &cbor::CdeValue) -> Result<BootstrapCheckpoint, SyncError> {
+    let fields = cbor::value_map(value)?;
+    let manifest = cbor::opt_bytes_field(&fields, 3)?
+        .ok_or(SyncError::RelayWire("bootstrap checkpoint 缺 manifest_oid"))?;
+    let manifest_oid: ObjectId = manifest
+        .as_slice()
+        .try_into()
+        .map_err(|_| SyncError::RelayWire("bootstrap manifest_oid 长度非法"))?;
+    let refs_digest = match cbor::opt_bytes_field(&fields, 4)? {
+        None => None,
+        Some(bytes) => Some(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| SyncError::RelayWire("bootstrap refs_digest 长度非法"))?,
+        ),
+    };
+    let signature = match cbor::opt_bytes_field(&fields, 7)? {
+        None => None,
+        Some(bytes) => Some(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| SyncError::RelayWire("bootstrap checkpoint 签名长度非法"))?,
+        ),
+    };
+    Ok(BootstrapCheckpoint {
+        checkpoint_id: cbor::bytes_fixed(&fields, 0)?,
+        epoch: cbor::uint_field(&fields, 1)?,
+        covered_seq: cbor::uint_field(&fields, 2)?,
+        manifest_oid,
+        refs_digest,
+        cursor: cbor::text_field(&fields, 5)?,
+        signed_commit: cbor::opt_bytes_field(&fields, 6)?,
+        signature,
+    })
+}
+
+fn slot_kind_text(kind: menghunote_sync_proto::SlotKind) -> &'static str {
+    match kind {
+        menghunote_sync_proto::SlotKind::Password => "password",
+        menghunote_sync_proto::SlotKind::Recovery => "recovery",
+    }
+}
+
+fn parse_slot_kind(text: &str) -> Result<menghunote_sync_proto::SlotKind, SyncError> {
+    match text {
+        "password" => Ok(menghunote_sync_proto::SlotKind::Password),
+        "recovery" => Ok(menghunote_sync_proto::SlotKind::Recovery),
+        _ => Err(SyncError::RelayWire("未知槽类型")),
+    }
+}
+
+fn parse_slot_record(fields: &cbor::Fields) -> Result<SlotRecord, SyncError> {
+    Ok(SlotRecord {
+        slot_id: cbor::bytes_fixed(fields, 0)?,
+        epoch: cbor::uint_field(fields, 1)?,
+        kind: parse_slot_kind(&cbor::text_field(fields, 2)?)?,
+        descriptor: cbor::bytes_field(fields, 3)?,
+        state: cbor::text_field(fields, 4)?,
+        slot_set_rev: cbor::uint_field(fields, 5)?,
+        retire_at: cbor::opt_uint_field(fields, 6)?,
+    })
+}
+
+fn parse_update_outcome(fields: &cbor::Fields) -> Result<UpdateOutcome, SyncError> {
+    let object_id: [u8; 32] = cbor::bytes_fixed(fields, 0)?;
+    let status_text = cbor::text_field(fields, 1)?;
+    let relay_seq = cbor::opt_uint_field(fields, 2)?;
+    let code = cbor::opt_text_field(fields, 3)?;
+    let retryable = cbor::bool_field(fields, 4)?;
+    let status = match status_text.as_str() {
+        "accepted" => UpdateStatus::Accepted { relay_seq },
+        "duplicate" => UpdateStatus::Duplicate,
+        "failed" => UpdateStatus::Failed { code, retryable },
+        _ => return Err(SyncError::RelayWire("未知 update 结果状态")),
+    };
+    Ok(UpdateOutcome { object_id, status })
 }
 
 fn cbor_headers() -> Vec<(String, String)> {
@@ -700,18 +1357,26 @@ fn parse_control(
     vault_id: &VaultId,
     manager_pub: Option<&[u8; 32]>,
 ) -> Result<ControlState, SyncError> {
-    let commits = cbor::array_field(fields, 0)?;
-    let control_rev = cbor::uint_field(fields, 1)?;
-    let epoch = cbor::uint_field(fields, 2)?;
+    let commits =
+        cbor::array_field(fields, 0).map_err(|_| SyncError::RelayWire("control commits"))?;
+    let control_rev =
+        cbor::uint_field(fields, 1).map_err(|_| SyncError::RelayWire("control rev"))?;
+    let epoch = cbor::uint_field(fields, 2).map_err(|_| SyncError::RelayWire("control epoch"))?;
 
     let mut prev_hash = [0u8; 32];
     let mut last_rev = 0u64;
+    let mut kinds = Vec::new();
     for commit in &commits {
-        let commit = cbor::value_map(commit)?;
-        let rev = cbor::uint_field(&commit, 0)?;
-        let stored_prev: [u8; 32] = cbor::bytes_fixed(&commit, 1)?;
-        let stored_hash: [u8; 32] = cbor::bytes_fixed(&commit, 2)?;
-        let signed_record = cbor::bytes_field(&commit, 3)?;
+        let commit =
+            cbor::value_map(commit).map_err(|_| SyncError::RelayWire("control commit map"))?;
+        let rev =
+            cbor::uint_field(&commit, 0).map_err(|_| SyncError::RelayWire("control commit rev"))?;
+        let stored_prev: [u8; 32] = cbor::bytes_fixed(&commit, 1)
+            .map_err(|_| SyncError::RelayWire("control commit prev"))?;
+        let stored_hash: [u8; 32] = cbor::bytes_fixed(&commit, 2)
+            .map_err(|_| SyncError::RelayWire("control commit hash"))?;
+        let signed_record = cbor::bytes_field(&commit, 3)
+            .map_err(|_| SyncError::RelayWire("control commit signed"))?;
         if rev != last_rev.saturating_add(1) {
             return Err(SyncError::RelayWire("控制链 rev 不连续"));
         }
@@ -733,6 +1398,10 @@ fn parse_control(
         }
         prev_hash = stored_hash;
         last_rev = rev;
+        kinds.push((
+            rev,
+            cbor::opt_text_field(&commit, 4)?.unwrap_or_else(|| "raw".to_owned()),
+        ));
     }
     if commits.is_empty() {
         if control_rev != 0 {
@@ -743,13 +1412,22 @@ fn parse_control(
     }
 
     let mut certs = HashMap::new();
-    for member in cbor::array_field(fields, 3)? {
-        let member = cbor::value_map(&member)?;
-        let device_id: [u8; 16] = cbor::bytes_fixed(&member, 0)?;
-        let certificate_bytes = cbor::bytes_field(&member, 1)?;
-        let status = cbor::text_field(&member, 2)?;
-        let sign_pk: [u8; 32] = cbor::bytes_fixed(&member, 3)?;
-        let hpke_pk: [u8; 32] = cbor::bytes_fixed(&member, 4)?;
+    let mut member_cert_inputs = Vec::new();
+    for member in
+        cbor::array_field(fields, 3).map_err(|_| SyncError::RelayWire("control members"))?
+    {
+        let member =
+            cbor::value_map(&member).map_err(|_| SyncError::RelayWire("control member map"))?;
+        let device_id: [u8; 16] =
+            cbor::bytes_fixed(&member, 0).map_err(|_| SyncError::RelayWire("control member id"))?;
+        let certificate_bytes = cbor::bytes_field(&member, 1)
+            .map_err(|_| SyncError::RelayWire("control member cert"))?;
+        let status = cbor::text_field(&member, 2)
+            .map_err(|_| SyncError::RelayWire("control member status"))?;
+        let sign_pk: [u8; 32] = cbor::bytes_fixed(&member, 3)
+            .map_err(|_| SyncError::RelayWire("control member sign_pk"))?;
+        let hpke_pk: [u8; 32] = cbor::bytes_fixed(&member, 4)
+            .map_err(|_| SyncError::RelayWire("control member hpke_pk"))?;
         let signature = cbor::opt_bytes_field(&member, 5)?;
         let cert = DeviceCertV1::decode(&certificate_bytes)
             .map_err(|_| SyncError::RelayWire("成员证书不是合法 DeviceCertV1"))?;
@@ -760,18 +1438,23 @@ fn parse_control(
         {
             return Err(SyncError::RelayWire("成员证书与成员字段不一致"));
         }
-        if let Some(signature) = signature {
+        if let Some(signature) = &signature {
             let manager_pub = manager_pub.ok_or(SyncError::Unsupported(
                 "未配置管理公钥，无法按 §17.1 校验证书",
             ))?;
-            let signature: [u8; 64] = signature
+            let signature_bytes: [u8; 64] = signature
                 .as_slice()
                 .try_into()
                 .map_err(|_| SyncError::RelayWire("证书签名不是 64 字节"))?;
             let signed_input = device_cert_signed_bytes(&cert)?;
-            verify_signature(manager_pub, &signed_input, &signature)?;
+            verify_signature(manager_pub, &signed_input, &signature_bytes)?;
         }
         if status == "active" {
+            member_cert_inputs.push(menghunote_sync_proto::MemberCertDigestInputV1 {
+                device_id,
+                certificate: certificate_bytes,
+                certificate_signature: signature,
+            });
             certs.insert(device_id, cert);
         }
     }
@@ -779,6 +1462,8 @@ fn parse_control(
         control_rev,
         epoch,
         certs,
+        kinds,
+        member_cert_inputs,
     })
 }
 
@@ -1020,6 +1705,52 @@ mod tests {
         let transport = StdTcpTransport::new("http://127.0.0.1:8080").unwrap();
         assert_eq!(transport.port, 8080);
         assert_eq!(transport.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn rotation_view_reads_section_30_3_fields() {
+        let view = cbor::CdeValue::Map(vec![
+            (0, cbor::bytes([0x41; 16].to_vec())),
+            (1, cbor::text("frozen")),
+            (2, cbor::uint(1)),
+            (3, cbor::uint(2)),
+            (4, cbor::uint(17)),
+            (5, cbor::uint(1)),
+            (7, cbor::uint(2)),
+            (8, cbor::bytes([0x42; 32].to_vec())),
+            (9, cbor::uint(0)),
+            (10, cbor::uint(3)),
+            (11, cbor::uint(4)),
+            (12, cbor::uint(5)),
+            (13, cbor::uint(0)),
+            (15, cbor::uint(7)),
+            (16, cbor::bytes([0x43; 32].to_vec())),
+            (17, cbor::bytes([0x44; 32].to_vec())),
+            (18, cbor::bytes([0x45; 16].to_vec())),
+            (19, cbor::bytes([0x46; 16].to_vec())),
+            (20, cbor::bytes(vec![0x47])),
+            (21, cbor::uint(9)),
+            (22, cbor::uint(10)),
+            (23, cbor::array(vec![cbor::CdeValue::Map(vec![]); 2])),
+            (26, cbor::uint(1)),
+        ]);
+        let fields = match cbor::CdeValue::Map(vec![(0, view)]) {
+            cbor::CdeValue::Map(fields) => fields,
+            _ => unreachable!(),
+        };
+        let parsed = parse_rotation_view(&fields).expect("rotation view");
+        assert_eq!(parsed.control_rev, 3);
+        assert_eq!(parsed.auth_rev, 4);
+        assert_eq!(parsed.manager_rev, 5);
+        assert_eq!(parsed.freeze_asset_count, 7);
+        assert_eq!(parsed.freeze_asset_digest, Some([0x43; 32]));
+        assert_eq!(parsed.member_cert_digest, Some([0x44; 32]));
+        assert_eq!(parsed.primary_checkpoint, Some([0x45; 16]));
+        assert_eq!(parsed.fallback_checkpoint, Some([0x46; 16]));
+        assert_eq!(parsed.activated_at, Some(9));
+        assert_eq!(parsed.activated_control_rev, Some(10));
+        assert_eq!(parsed.candidate_count, 2);
+        assert!(parsed.candidate_ready);
     }
 
     #[test]
@@ -1327,7 +2058,10 @@ mod tests {
                 signature: [0u8; 64],
             }])
             .unwrap();
-        assert_eq!(outcomes[0].status, UpdateStatus::Accepted { relay_seq: 5 });
+        assert_eq!(
+            outcomes[0].status,
+            UpdateStatus::Accepted { relay_seq: Some(5) }
+        );
         assert!(matches!(
             outcomes[1].status,
             UpdateStatus::Failed {

@@ -318,6 +318,34 @@ impl KeySlotV1 {
         Ok(root)
     }
 
+    /// ADR §20：KEY_SLOT 的 MNE1 密钥（password 用 Argon2 输出，recovery 用恢复种子）。
+    pub fn mne_key(
+        &self,
+        password: Option<&[u8]>,
+        recovery_seed: Option<&RecoverySeed>,
+    ) -> Result<crate::keys::Secret32, SyncError> {
+        let ikm = match self.descriptor.kind {
+            SlotKind::Password => {
+                let Kdf::Argon2id(params) = &self.descriptor.kdf else {
+                    return Err(SyncError::Descriptor("password 槽的 KDF 不是 Argon2id"));
+                };
+                let password = password.ok_or(SyncError::Unwrap)?;
+                kdf::argon2id_output(password, params)?
+            }
+            SlotKind::Recovery => {
+                let seed = recovery_seed.ok_or(SyncError::Unwrap)?;
+                crate::keys::Secret32::from_array(*seed.expose())
+            }
+        };
+        crate::keys::derive_slot_mne_key(
+            ikm.expose_slice(),
+            &self.descriptor.vault_id,
+            self.descriptor.kind,
+            self.descriptor.key_epoch,
+            &self.descriptor.slot_id,
+        )
+    }
+
     /// 槽体序列化（`nonce || ciphertext`）。
     #[must_use]
     pub fn wrapped_bytes(&self) -> Vec<u8> {

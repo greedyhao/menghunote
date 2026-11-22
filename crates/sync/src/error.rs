@@ -15,6 +15,10 @@ pub enum SyncError {
     #[error("wire 契约失败：{0}")]
     Proto(#[from] menghunote_sync_proto::ProtoError),
 
+    /// 本地文件操作失败（身份原子推广等）。
+    #[error("本地 IO 失败：{0}")]
+    Io(String),
+
     /// 口令长度越界（ADR 0006 §3：原样 UTF-8、不 trim、不规范化，1..=1024 字节）。
     #[error("口令长度必须在 {min}..={max} 字节之间（实际 {actual}）")]
     PasswordLength {

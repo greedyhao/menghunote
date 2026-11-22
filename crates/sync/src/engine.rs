@@ -161,6 +161,8 @@ pub struct SyncEngine<'a, C: RelayClient> {
     identity: EngineIdentity,
     root: RootSecretV1,
     config: EngineConfig,
+    /// 轮换阶段 A–C 冻结：禁止 push/encrypt，但 pull/integrate 仍可继续。
+    rotation_frozen: bool,
 }
 
 impl<'a, C: RelayClient> core::fmt::Debug for SyncEngine<'a, C> {
@@ -200,7 +202,18 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
             identity,
             root,
             config,
+            rotation_frozen: false,
         }
+    }
+
+    /// 轮换阶段 A：停止后续 push/encrypt（本地 A 事务编辑仍可继续）。
+    pub fn freeze_rotation(&mut self) {
+        self.rotation_frozen = true;
+    }
+
+    /// 轮换 abort/restart 后解冻。
+    pub fn thaw_rotation(&mut self) {
+        self.rotation_frozen = false;
     }
 
     /// 当前使用的 epoch 根（rotation 后由调用方替换）。
@@ -268,6 +281,9 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
 
     /// 阶段 2：上传 parts + 批量提交 + durable ACK。
     pub fn push(&mut self) -> Result<PushReport, SyncError> {
+        if self.rotation_frozen {
+            return Err(SyncError::Paused(PauseReason::RotationFrozen));
+        }
         // `encrypted` = 还没上传完；`sent` = 上次已上传但未获 ACK（必须继续提交）。
         let batch = self.config.send_batch.clamp(1, MAX_UPDATES_PER_BATCH);
         let mut rows = outbox_rows(self.vault, SyncOutboxState::Encrypted, batch)?;
@@ -413,7 +429,12 @@ impl<'a, C: RelayClient> SyncEngine<'a, C> {
                     self.ingest_update(&state.log_id, event)?;
                     report.stored += 1;
                 }
-                // asset/checkpoint/control 由 bootstrap/checkpoint 任务处理；静默跳过会
+                // 资产事件不是文档水位事件：其密文本体已由 checkpoint refs 恢复，
+                // 新设备从 S 补齐日志时直接跳过，不阻塞后续 update。
+                RelayLogKind::Asset => {
+                    report.skipped += 1;
+                }
+                // checkpoint/control 由 bootstrap/checkpoint 任务处理；静默跳过会
                 // 让 received 前缀出现洞，所以这里明确暂停。
                 _ => return Err(SyncError::Paused(PauseReason::UnsupportedEvent)),
             }

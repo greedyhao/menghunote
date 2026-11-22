@@ -91,7 +91,7 @@ fn ddl_is_strict_and_pragmas_are_pinned() {
         .db
         .read(|conn| schema::meta_text(conn, schema::META_SCHEMA_VERSION))
         .expect("meta");
-    assert_eq!(version.as_deref(), Some("3"));
+    assert_eq!(version.as_deref(), Some("9"));
 }
 
 #[test]
@@ -471,7 +471,9 @@ fn maintenance_reservation_formula_and_per_part_charging() {
     let db = fx.db.clone();
     let clock = fx.clock.clone();
     let reservation = db
-        .write_blocking(move |conn| checkpoints::create(conn, clock.as_ref(), &ctx, 300, None))
+        .write_blocking(move |conn| {
+            checkpoints::create(conn, clock.as_ref(), &ctx, 300, None, None, None)
+        })
         .expect("checkpoint reservation");
     let rid = reservation.reservation_id;
 
@@ -536,4 +538,77 @@ fn maintenance_reservation_formula_and_per_part_charging() {
         .read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM object_parts", [], |row| row.get(0))?))
         .expect("count");
     assert_eq!(parts, 1);
+}
+
+/// 控制链哈希必须**对称**：rev=1 也是 `SHA256(0^32 || signed_record)`，不是裸 `SHA256(record)`。
+#[test]
+fn control_chain_genesis_hash_uses_zero_prev_hash() {
+    let fx = Fixture::new("control-genesis-hash");
+    // (rev, prev_hash, record_hash, signed_record)
+    type ControlRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+    let rows: Vec<ControlRow> = fx
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT rev, prev_hash, record_hash, signed_record FROM control_commits
+                 ORDER BY rev ASC",
+            )?;
+            let mut out = Vec::new();
+            for row in stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })? {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .expect("control chain");
+    assert!(!rows.is_empty(), "genesis 必须写一条控制记录");
+
+    let zero = [0u8; 32];
+    let (rev, prev_hash, record_hash, signed_record) = &rows[0];
+    assert_eq!(*rev, 1);
+    assert_eq!(
+        prev_hash.as_slice(),
+        zero.as_slice(),
+        "rev=1 prev_hash 全零"
+    );
+    assert_eq!(
+        record_hash.as_slice(),
+        relay::ids::sha256_parts(&[zero.as_slice(), signed_record.as_slice()]).as_slice(),
+        "rev=1 必须与后续条目同一公式"
+    );
+    assert_ne!(
+        record_hash.as_slice(),
+        relay::ids::sha256(signed_record).as_slice(),
+        "裸 SHA256(record) 的旧式 genesis 哈希不再接受"
+    );
+
+    // 后续条目也保持同一公式（这里至少补一条 append_control）。
+    let hash1 = record_hash.clone();
+    fx.db
+        .write_blocking(|conn| {
+            relay::vault::append_control(conn, 0, b"next-record")?;
+            Ok(())
+        })
+        .expect("append control");
+    let second: (Vec<u8>, Vec<u8>) = fx
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT prev_hash, record_hash FROM control_commits WHERE rev = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .expect("second record");
+    assert_eq!(second.0, hash1, "rev=2 prev_hash 链到 rev=1");
+    assert_eq!(
+        second.1.as_slice(),
+        relay::ids::sha256_parts(&[hash1.as_slice(), b"next-record"]).as_slice()
+    );
 }

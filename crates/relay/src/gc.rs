@@ -16,6 +16,7 @@ use crate::ids::Id16;
 use crate::log;
 use crate::objects;
 use crate::quota;
+use crate::slots;
 use crate::time::{secs, Clock};
 use crate::vault;
 
@@ -33,6 +34,12 @@ pub struct GcOutcome {
     pub unhealthy: Vec<Id16>,
     /// 因为基线损坏/不足而未执行。
     pub blocked: bool,
+    /// §25.2：本次真正删除 body/parts 的过期 retiring 槽数量。
+    pub purged_slots: u64,
+    /// §28.1 条目 9：本次 prune 的旧 checkpoint 数量（清 refs、保留签名骨架）。
+    pub pruned_checkpoints: u64,
+    /// prune 后清掉 parts 的旧 epoch snapshot/manifest 对象数量。
+    pub retired_pruned_objects: u64,
 }
 
 /// 执行一次 GC（写事务内；调用方：`Db::write` 或后台 tick）。
@@ -41,6 +48,13 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
     let mut outcome = GcOutcome::default();
     quota::expire_stale_reservations(conn, now)?;
     let vault = vault::load(conn)?;
+    // §25.2：到期旧槽必须真正删行 + 删 body/parts（不依赖是否有 GC 计划）。
+    outcome.purged_slots = slots::purge_retired_slots(conn, now)?;
+    // §28.1 条目 9 / 评审 §一 10：旧 checkpoint 无根/lease 后 prune（清 refs、保留签名骨架）。
+    // 7 天密文宽限在这里执行，与旧槽 14 天期限**分开**。
+    let pruned = checkpoints::prune_retired(conn, now)?;
+    outcome.pruned_checkpoints = pruned.pruned_checkpoints;
+    outcome.retired_pruned_objects = pruned.retired_objects;
 
     // 1) 到期计划里最大的 cut_seq。
     let eligible_cut: Option<i64> = conn
@@ -51,13 +65,18 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
         )
         .unwrap_or(None);
     let Some(eligible_cut) = eligible_cut else {
+        // prune 可能删了 parts：账本必须对账后再返回。
+        if outcome.pruned_checkpoints > 0 {
+            quota::recompute(conn)?;
+        }
         return Ok(outcome);
     };
     let eligible_cut = u64::try_from(eligible_cut).map_err(|_| Error::Invariant("gc cut_seq"))?;
     outcome.cut_seq = eligible_cut;
 
     // 2) 两份最新 published 基线（含 unhealthy：损坏的基线本身必须阻止前进，而不是被跳过）。
-    let baselines = published_any_newest_first(conn, 2)?;
+    // §24.1：GC 只看 active epoch 的 committed pair；候选/aborted 永不参与。
+    let baselines = published_any_newest_first(conn, vault.active_epoch, 2)?;
     if baselines.len() < 2 {
         outcome.blocked = true;
         return Ok(outcome);
@@ -138,15 +157,22 @@ pub fn tick(conn: &Connection, clock: &dyn Clock) -> Result<GcOutcome> {
 /// 含 unhealthy 的已发布基线（GC 专用；健康过滤由调用方做，否则损坏基线会被"跳过"而非阻止）。
 pub fn published_any_newest_first(
     conn: &Connection,
+    epoch: u64,
     limit: u32,
 ) -> Result<Vec<checkpoints::CheckpointRow>> {
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id FROM checkpoints
-         WHERE state = 'published'
-         ORDER BY published_at DESC, rowid DESC LIMIT ?1",
+         WHERE state = 'published' AND epoch = ?1
+         ORDER BY published_at DESC, rowid DESC LIMIT ?2",
     )?;
     let ids: Vec<Vec<u8>> = stmt
-        .query_map([i64::from(limit.max(1))], |row| row.get::<_, Vec<u8>>(0))?
+        .query_map(
+            (
+                i64::try_from(epoch).map_err(|_| Error::Invariant("epoch"))?,
+                i64::from(limit.max(1)),
+            ),
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {

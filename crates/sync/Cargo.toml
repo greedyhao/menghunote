@@ -46,6 +46,10 @@ thiserror = "2"
 # 不新增构建负担；ADR §11 步 4 明确 sync 侧负责 Loro import 的本地 seq 分配。
 loro = "1.17.1"
 
+# checkpoint 资产对象名 = HMAC(K_asset_id, real_sha256)（ADR §2/§5）；纯 Rust，
+# hkdf 已传递依赖 hmac，这里显式声明以直接使用（不引入新传递树）。
+hmac = "0.12"
+
 [dev-dependencies]
 # 测试临时目录必须落在 CARGO_TARGET_TMPDIR（本机 cargo 子进程不能写 %TEMP%）。
 tempfile = "3"

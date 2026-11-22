@@ -392,13 +392,43 @@ pub fn rotation_slots_ready(conn: &Connection, epoch: u64) -> Result<Vec<&'stati
     Ok(issues)
 }
 
-/// 清理过期 retiring 槽（旧槽 14 天保留期到点后删除；只删槽，不删数据）。
+/// 清理过期 retiring 槽：删 `key_slots` 行 + KEY_SLOT 对象 body/parts（保留 objects 行 tombstone，
+/// 让"知道 slot_id 直接 GET"得到 410 而不是 404；§25.2）。
 pub fn purge_retired_slots(conn: &Connection, now: i64) -> Result<u64> {
-    let changed = conn.execute(
-        "DELETE FROM key_slots WHERE state = 'retiring' AND retire_at IS NOT NULL AND retire_at <= ?1",
-        [now],
+    let mut stmt = conn.prepare(
+        "SELECT slot_id FROM key_slots
+         WHERE state = 'retiring' AND retire_at IS NOT NULL AND retire_at <= ?1",
     )?;
-    Ok(changed as u64)
+    let ids: Vec<Vec<u8>> = stmt
+        .query_map([now], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in &ids {
+        conn.execute(
+            "DELETE FROM object_parts WHERE object_id = ?1",
+            [id.as_slice()],
+        )?;
+        conn.execute("DELETE FROM key_slots WHERE slot_id = ?1", [id.as_slice()])?;
+    }
+    u64::try_from(ids.len()).map_err(|_| Error::Invariant("purged slots"))
+}
+
+/// §25.2：KEY_SLOT 对象是否仍可读（active/staging，或 retiring 且未到 retire_at）。
+pub fn slot_object_readable(conn: &Connection, slot_id: &[u8; 32], now: i64) -> Result<bool> {
+    let row: Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT state, retire_at FROM key_slots WHERE slot_id = ?1",
+            [slot_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        None => false,
+        Some((state, retire_at)) => match state.as_str() {
+            "active" | "staging" => true,
+            "retiring" => retire_at.map(|at| at > now).unwrap_or(false),
+            _ => false,
+        },
+    })
 }
 
 /// slot 描述符的 context hash（KEY_SLOT 信封要求 `SHA256(CDE(descriptor))`，供测试/诊断）。
@@ -465,6 +495,37 @@ pub fn active_slots(conn: &Connection) -> Result<Vec<SlotRow>> {
 /// 密文本体只能解密旧根，泄露描述符不泄露密钥）。
 pub fn list_visible(conn: &Connection, now: i64) -> Result<Vec<SlotRow>> {
     list(conn, now)
+}
+
+/// 管理 realm 可见的 slot 列表：active / retiring + **staging**（ADR §20.2，恢复设备自批
+/// 需要读 recovery staging 槽；普通设备仍走 `list_visible`，看不到候选槽）。
+pub fn list_management(conn: &Connection, now: i64) -> Result<Vec<SlotRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT slot_id, epoch, kind, descriptor, state, slot_set_rev, retire_at
+         FROM key_slots
+         WHERE state IN ('active', 'staging')
+            OR (state = 'retiring' AND (retire_at IS NULL OR retire_at > ?1))
+         ORDER BY kind ASC, slot_set_rev DESC",
+    )?;
+    let rows = stmt.query_map([now], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (slot_id, epoch, kind, descriptor, state, rev, retire_at) = row?;
+        out.push(read_row(
+            slot_id, epoch, kind, descriptor, state, rev, retire_at,
+        )?);
+    }
+    Ok(out)
 }
 
 /// `SlotKind` 与 proto 互转（测试/客户端用）。

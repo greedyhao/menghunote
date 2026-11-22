@@ -18,6 +18,12 @@ pub use menghunote_sync_proto::AAD_DOMAIN as ENVELOPE_AAD;
 /// 设备证书签名域（ADR §17 冻结：`MN/v1/device-cert\0`）。
 pub use menghunote_sync_proto::SIGN_DEVICE_CERT_DOMAIN as DEVICE_CERT;
 
+/// ASSET 确定性 nonce 的 HKDF info 前缀（ADR §19：`MN/v1/asset-nonce\\0`）。
+pub const HKDF_ASSET_NONCE_INFO: &[u8] = b"MN/v1/asset-nonce\0";
+
+/// KEY_SLOT MNE1 密钥的 HKDF info 前缀（ADR §20：`MN/v1/key-slot\\0`）。
+pub const HKDF_KEY_SLOT_INFO: &[u8] = b"MN/v1/key-slot\0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,6 +46,8 @@ mod tests {
             ("manage", SIGN_MANAGE_DOMAIN),
             ("dpapi_entropy", DPAPI_ENTROPY_PREFIX),
             ("device_cert", DEVICE_CERT),
+            ("asset_nonce", HKDF_ASSET_NONCE_INFO),
+            ("key_slot", HKDF_KEY_SLOT_INFO),
         ];
         for (name, domain) in all {
             assert_eq!(

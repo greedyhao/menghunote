@@ -526,13 +526,13 @@ fn genesis_verifies_device_certificate_domain() {
     let open = |label: &str| {
         let path = temp_db_path(label);
         let clock = std::sync::Arc::new(FakeClock::new(BASE_TIME));
-        let db = Db::open(DbConfig::new(path), clock.clone()).expect("db");
-        (db, clock)
+        let db = Db::open(DbConfig::new(path.clone()), clock.clone()).expect("db");
+        (db, clock, path)
     };
     let cfg = std::sync::Arc::new(
         relay::RelayConfig::new(temp_db_path("pair-genesis-cfg")).with_setup_secret("setup"),
     );
-    let (db, clock) = open("pair-genesis-ok");
+    let (db, clock, ok_path) = open("pair-genesis-ok");
     let hook = std::sync::Arc::new(Ed25519Hook);
     let init = vault::InitRequest {
         vault_id,
@@ -553,7 +553,7 @@ fn genesis_verifies_device_certificate_domain() {
     }
 
     // 换设备证书（签名对不上）→ SIGNATURE_INVALID。
-    let (db, clock) = open("pair-genesis-bad-sig");
+    let (db, clock, bad_sig_path) = open("pair-genesis-bad-sig");
     let hook = std::sync::Arc::new(Ed25519Hook);
     let other = relay::verify::new_certificate(&vault_id, &device_id, &sign_pk, &hpke_pk, 1);
     let init = vault::InitRequest {
@@ -576,7 +576,7 @@ fn genesis_verifies_device_certificate_domain() {
     assert_eq!(code(&err), Some(ErrorCode::SignatureInvalid));
 
     // 证书绑定别的设备 → INVALID_REQUEST（即使签名有效）。
-    let (db, clock) = open("pair-genesis-wrong-device");
+    let (db, clock, wrong_device_path) = open("pair-genesis-wrong-device");
     let hook = std::sync::Arc::new(Ed25519Hook);
     let wrong = relay::verify::new_certificate(&vault_id, &[0x99; 16], &sign_pk, &hpke_pk, 1);
     let init = vault::InitRequest {
@@ -598,4 +598,7 @@ fn genesis_verifies_device_certificate_domain() {
     };
     assert_eq!(code(&err), Some(ErrorCode::InvalidRequest));
     let _ = auth::setup_consumed;
+    for path in [ok_path, bad_sig_path, wrong_device_path] {
+        support::cleanup_db_dir(&path);
+    }
 }

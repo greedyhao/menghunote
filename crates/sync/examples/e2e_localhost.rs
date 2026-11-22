@@ -29,9 +29,11 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use menghunote_storage::{
-    append_updates_with_sync_intents, create_body_doc, doc_updates_since, load_body_doc, load_head,
-    sync_cursor_state, BodyDoc, SyncIntent, UpdateRecord, Vault,
+    append_updates_with_sync_intents, create_body_doc, doc_updates_since, ensure_structure_row,
+    insert_asset, load_body_doc, load_head, sync_cursor_state, BodyDoc, SyncIntent, UpdateRecord,
+    Vault,
 };
+use menghunote_sync::checkpoint::{CheckpointWriter, EmptyAssets, StorageAssets};
 use menghunote_sync::device::{verify_signature, DeviceSigningKey};
 use menghunote_sync::engine::{
     AckReport, EngineIdentity, IntegrateReport, PullReport, PushReport, SyncEngine,
@@ -44,6 +46,7 @@ use menghunote_sync::random::{array, OsRandom};
 use menghunote_sync::relay::RelayClient;
 use menghunote_sync::{ids, DeviceId, VaultId};
 use menghunote_sync_proto::{Envelope, ObjectCommit};
+use sha2::{Digest, Sha256};
 
 type AnyResult<T> = Result<T, Box<dyn StdError>>;
 
@@ -139,36 +142,52 @@ fn run() -> AnyResult<()> {
         args.dir.display()
     );
 
-    let (vault_id, device_id, peer_id, signing_key, root, manager_pub, genesis_cursor) =
-        if first_run {
-            let mut transport = StdTcpTransport::new(&args.relay)?;
-            let mut rng = OsRandom;
-            let outcome = genesis::run(
-                &mut transport,
-                &args.setup_secret,
-                &args.password,
-                now_secs(),
-                &mut rng,
-            )?;
-            let identity_blob = outcome.identity.protect()?;
-            fs::write(&identity_path, &identity_blob)?;
-            fs::write(
-                &meta_path,
-                format!(
-                    "{} {}\n",
-                    ids::hex_of(&outcome.materials.vault_id),
-                    ids::hex_of(&outcome.materials.device_id)
-                ),
-            )?;
-            fs::write(
-                args.dir.join("slot-password.bin"),
-                outcome.materials.password_slot.wrapped_bytes(),
-            )?;
-            fs::write(
-                args.dir.join("slot-recovery.bin"),
-                outcome.materials.recovery_slot.wrapped_bytes(),
-            )?;
-            println!(
+    let (
+        vault_id,
+        device_id,
+        peer_id,
+        signing_key,
+        root,
+        manager_pub,
+        genesis_cursor,
+        genesis_slots,
+    ) = if first_run {
+        let mut transport = StdTcpTransport::new(&args.relay)?;
+        let mut rng = OsRandom;
+        let outcome = genesis::run(
+            &mut transport,
+            &args.setup_secret,
+            &args.password,
+            now_secs(),
+            &mut rng,
+        )?;
+        let identity_blob = outcome.identity.protect()?;
+        fs::write(&identity_path, &identity_blob)?;
+        fs::write(
+            &meta_path,
+            format!(
+                "{} {}\n",
+                ids::hex_of(&outcome.materials.vault_id),
+                ids::hex_of(&outcome.materials.device_id)
+            ),
+        )?;
+        fs::write(
+            args.dir.join("slot-password.bin"),
+            outcome.materials.password_slot.wrapped_bytes(),
+        )?;
+        fs::write(
+            args.dir.join("slot-password.desc.bin"),
+            outcome.materials.password_slot.descriptor.encode()?,
+        )?;
+        fs::write(
+            args.dir.join("slot-recovery.bin"),
+            outcome.materials.recovery_slot.wrapped_bytes(),
+        )?;
+        fs::write(
+            args.dir.join("slot-recovery.desc.bin"),
+            outcome.materials.recovery_slot.descriptor.encode()?,
+        )?;
+        println!(
                 "[e2e] genesis ok vault={} device={} instance={} log_id={} epoch={} control_rev={} auth_rev={}",
                 ids::hex_of(&outcome.materials.vault_id),
                 ids::hex_of(&outcome.materials.device_id),
@@ -178,66 +197,76 @@ fn run() -> AnyResult<()> {
                 outcome.control_rev,
                 outcome.auth_rev
             );
-            println!(
-                "[e2e] recovery code (只显示一次，请抄走)：{}",
-                outcome.materials.recovery_code.as_str()
-            );
-            println!(
-                "[e2e] device fingerprint：{}",
-                outcome.materials.fingerprint().to_hex()
-            );
-            let peer = outcome.materials.peer_id_u64();
-            let signing = outcome.materials.signing_key.clone();
-            let root = outcome.materials.root.clone();
-            let manager_pub = outcome.materials.manager_pub();
-            (
-                outcome.materials.vault_id,
-                outcome.materials.device_id,
-                peer,
-                signing,
-                root,
-                Some(manager_pub),
-                outcome.initial_cursor,
-            )
-        } else {
-            let meta = fs::read_to_string(&meta_path)?;
-            let mut parts = meta.split_whitespace();
-            let vault_id: VaultId =
-                ids::parse_hex::<16>(parts.next().ok_or("identity.meta 缺 vault_id")?)
-                    .map_err(|_| std::io::Error::other("identity.meta vault_id 非法"))?;
-            let device_id: DeviceId =
-                ids::parse_hex::<16>(parts.next().ok_or("identity.meta 缺 device_id")?)
-                    .map_err(|_| std::io::Error::other("identity.meta device_id 非法"))?;
-            let blob = fs::read(&identity_path)?;
-            let identity = menghunote_sync::identity::LocalIdentityV1::unprotect(
-                &blob, &vault_id, &device_id,
-            )?;
-            let signing = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
-            let root = RootSecretV1::new(
-                identity.vault_id,
-                identity.current_epoch,
-                identity.current_root.clone(),
-            );
-            let mut head = [0u8; 8];
-            head.copy_from_slice(&identity.peer_id.as_bytes()[..8]);
-            let peer = u64::from_be_bytes(head) & 0x7fff_ffff_ffff_ffff;
-            println!(
-                "[e2e] 已加载 DPAPI 身份 vault={} device={} epoch={} control_rev={}",
-                ids::hex_of(&identity.vault_id),
-                ids::hex_of(&identity.device_id),
-                identity.current_epoch,
-                identity.control_rev
-            );
-            (
-                identity.vault_id,
-                identity.device_id,
-                peer,
-                signing,
-                root,
-                Some(identity.pinned_manager),
-                None,
-            )
-        };
+        println!(
+            "[e2e] recovery code (只显示一次，请抄走)：{}",
+            outcome.materials.recovery_code.as_str()
+        );
+        // dev e2e：把恢复码写到目录里供 e2e_bootstrap 分离进程使用（生产不得这样做）。
+        fs::write(
+            args.dir.join("recovery-code.txt"),
+            outcome.materials.recovery_code.as_str(),
+        )?;
+        println!(
+            "[e2e] device fingerprint：{}",
+            outcome.materials.fingerprint().to_hex()
+        );
+        let peer = outcome.materials.peer_id_u64();
+        let signing = outcome.materials.signing_key.clone();
+        let root = outcome.materials.root.clone();
+        let manager_pub = outcome.materials.manager_pub();
+        (
+            outcome.materials.vault_id,
+            outcome.materials.device_id,
+            peer,
+            signing,
+            root,
+            Some(manager_pub),
+            outcome.initial_cursor,
+            Some((
+                outcome.materials.password_slot.clone(),
+                outcome.materials.recovery_slot.clone(),
+                outcome.materials.recovery_seed.clone(),
+            )),
+        )
+    } else {
+        let meta = fs::read_to_string(&meta_path)?;
+        let mut parts = meta.split_whitespace();
+        let vault_id: VaultId =
+            ids::parse_hex::<16>(parts.next().ok_or("identity.meta 缺 vault_id")?)
+                .map_err(|_| std::io::Error::other("identity.meta vault_id 非法"))?;
+        let device_id: DeviceId =
+            ids::parse_hex::<16>(parts.next().ok_or("identity.meta 缺 device_id")?)
+                .map_err(|_| std::io::Error::other("identity.meta device_id 非法"))?;
+        let blob = fs::read(&identity_path)?;
+        let identity =
+            menghunote_sync::identity::LocalIdentityV1::unprotect(&blob, &vault_id, &device_id)?;
+        let signing = DeviceSigningKey::from_seed(identity.ed25519_seed.clone());
+        let root = RootSecretV1::new(
+            identity.vault_id,
+            identity.current_epoch,
+            identity.current_root.clone(),
+        );
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&identity.peer_id.as_bytes()[..8]);
+        let peer = u64::from_be_bytes(head) & 0x7fff_ffff_ffff_ffff;
+        println!(
+            "[e2e] 已加载 DPAPI 身份 vault={} device={} epoch={} control_rev={}",
+            ids::hex_of(&identity.vault_id),
+            ids::hex_of(&identity.device_id),
+            identity.current_epoch,
+            identity.control_rev
+        );
+        (
+            identity.vault_id,
+            identity.device_id,
+            peer,
+            signing,
+            root,
+            Some(identity.pinned_manager),
+            None,
+            None,
+        )
+    };
 
     if args.genesis_only {
         println!("[e2e] --genesis-only：身份/槽已落盘，停止在联网同步之前");
@@ -256,6 +285,8 @@ fn run() -> AnyResult<()> {
     );
 
     let vault = Vault::open(&vault_path)?;
+    // 主 vault 也需要 structure 行：checkpoint 必须含 structure 快照（bootstrap 依赖）。
+    ensure_structure_row(&vault)?;
     let stored_cursor = vault
         .get_meta(RELAY_CURSOR_META)?
         .map(String::from_utf8)
@@ -394,6 +425,92 @@ fn run() -> AnyResult<()> {
         let report = engine.sync_once()?;
         print_round("重启后续写", &report);
         assert_no_echo(&vault)?;
+    }
+
+    // S7-14：初始槽 + 两份 checkpoint（空库 / 含 1 个合成资产），各自读回导入验证。
+    // 放在所有 engine 同步之后：checkpoint 对象会在 relay 日志里产生非 UPDATE 事件，
+    // v1 引擎遇到它们会按设计暂停（checkpoint 由 bootstrap 任务消费）。
+    if let Some((password_slot, recovery_slot, recovery_seed)) = genesis_slots {
+        let mut writer = CheckpointWriter::new(
+            &vault,
+            &mut client,
+            vault_id,
+            device_id,
+            signing_key.clone(),
+            root.clone(),
+            peer_id,
+        );
+        let secrets = menghunote_sync::checkpoint::SlotSecrets {
+            password: Some(args.password.as_str()),
+            recovery_seed: Some(&recovery_seed),
+        };
+        let slots = writer.upload_initial_slots(&password_slot, &recovery_slot, &secrets)?;
+        println!(
+            "[e2e] slots uploaded password_state={} active_rev={} recovery_state={}",
+            slots.password.state, slots.active_password_rev, slots.recovery.state
+        );
+    }
+
+    let empty_path = args.dir.join("empty-vault.sqlite3");
+    {
+        let empty_vault = Vault::open(&empty_path)?;
+        ensure_structure_row(&empty_vault)?;
+        let mut writer = CheckpointWriter::new(
+            &empty_vault,
+            &mut client,
+            vault_id,
+            device_id,
+            signing_key.clone(),
+            root.clone(),
+            peer_id,
+        );
+        let report = writer.create_checkpoint(&EmptyAssets)?;
+        let verified = writer.read_back(&report)?;
+        println!(
+            "[e2e] checkpoint(empty) id={} S={} docs={} assets={} verified_docs={} manifest_checked={}",
+            ids::hex_of(&report.checkpoint_id),
+            report.covered_seq,
+            report.docs.len(),
+            report.assets.len(),
+            verified.docs.len(),
+            verified.manifest_checked
+        );
+    }
+
+    let asset_data = b"real e2e asset bytes".to_vec();
+    let asset_hash: [u8; 32] = Sha256::digest(&asset_data).into();
+    insert_asset(
+        &vault,
+        &asset_hash,
+        asset_data.len() as u64,
+        Some("text/plain"),
+        &asset_data,
+    )?;
+    // e2e 的 note 只有 loro_docs 行、没有 notes 行，故不建 asset_refs（FK 指向 notes）；
+    // checkpoint 资产枚举只看 assets 表，足以验证真实资产路径。
+    {
+        let mut writer = CheckpointWriter::new(
+            &vault,
+            &mut client,
+            vault_id,
+            device_id,
+            signing_key.clone(),
+            root.clone(),
+            peer_id,
+        );
+        let report = writer.create_checkpoint(&StorageAssets)?;
+        let verified = writer.read_back(&report)?;
+        println!(
+            "[e2e] checkpoint(asset) id={} S={} docs={} assets={} verified_docs={} verified_assets={} manifest_checked={} asset_hash={}",
+            ids::hex_of(&report.checkpoint_id),
+            report.covered_seq,
+            report.docs.len(),
+            report.assets.len(),
+            verified.docs.len(),
+            verified.asset_count,
+            verified.manifest_checked,
+            ids::hex_of(&asset_hash)
+        );
     }
 
     let state = sync_cursor_state(&vault)?;

@@ -17,14 +17,21 @@ fn source_has_no_logging_calls() {
     assert!(files.len() > 10, "应当扫描到 relay 源码");
     for file in files {
         let text = std::fs::read_to_string(&file).expect("read source");
-        for forbidden in [
-            "println!",
-            "eprintln!",
-            "dbg!(",
-            "tracing::",
-            "log::info",
-            "log::warn",
-        ] {
+        // CLI 入口（src/main.rs）的职责就是往 stdout/stderr 输出；其余库模块仍禁止日志调用。
+        let is_cli = file.file_name().and_then(|name| name.to_str()) == Some("main.rs");
+        let forbidden: &[&str] = if is_cli {
+            &["dbg!(", "tracing::", "log::info", "log::warn"]
+        } else {
+            &[
+                "println!",
+                "eprintln!",
+                "dbg!(",
+                "tracing::",
+                "log::info",
+                "log::warn",
+            ]
+        };
+        for forbidden in forbidden {
             assert!(
                 !text.contains(forbidden),
                 "{} 不得包含日志调用 {forbidden}（canary 审计不允许服务端写业务日志）",

@@ -24,13 +24,15 @@ use axum::routing::{get, patch, post, put};
 use axum::Router;
 
 use crate::auth::{self, AuthContext, Realm};
-use crate::checkpoints::{self, PublishRequest};
+use crate::checkpoints::{self, CheckpointRole, PublishRequest};
 use crate::config::RelayConfig;
+use crate::control;
 use crate::db::Db;
-use crate::envelope::MAX_ASSET_ENVELOPE;
+use crate::envelope::{ObjectType, MAX_ASSET_ENVELOPE};
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::gc;
 use crate::ids::{b64url_decode, hex_lower, sha256, Hash32, Id16};
+use crate::management::{self, CanonicalBody, ManagedOutcome};
 use crate::objects;
 use crate::pairing;
 use crate::refs::RefRole;
@@ -40,6 +42,7 @@ use crate::slots::{self, SlotKind};
 use crate::vault::{self, Vault};
 use crate::wire;
 use crate::wire::{bytes as cbor_bytes, uint as cbor_uint};
+use rusqlite::OptionalExtension;
 
 /// 路由共享状态。
 pub struct AppState {
@@ -140,7 +143,31 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(activate_key_slot),
         )
         .route("/v1/vaults/{vault}/rotations", post(begin_rotation))
+        .route(
+            "/v1/vaults/{vault}/rotations/current",
+            get(get_current_rotation),
+        )
         .route("/v1/vaults/{vault}/rotations/{rotation}", get(get_rotation))
+        .route(
+            "/v1/vaults/{vault}/rotations/{rotation}/restart",
+            post(restart_rotation),
+        )
+        .route(
+            "/v1/vaults/{vault}/rotations/{rotation}/revoke-more",
+            post(revoke_more_rotation),
+        )
+        .route(
+            "/v1/vaults/{vault}/rotations/{rotation}/grants",
+            get(list_rotation_grants),
+        )
+        .route(
+            "/v1/vaults/{vault}/rotations/{rotation}/assets",
+            get(list_rotation_assets),
+        )
+        .route(
+            "/v1/vaults/{vault}/checkpoints/{checkpoint}",
+            get(get_checkpoint),
+        )
         .route(
             "/v1/vaults/{vault}/rotations/{rotation}/grants/{device}",
             put(stage_grant),
@@ -173,6 +200,16 @@ fn cbor_ok(fields: wire::Fields) -> Response {
 
 fn cbor_created(fields: wire::Fields) -> Response {
     cbor(fields, StatusCode::CREATED)
+}
+
+/// 管理写响应：首次执行用字段编码，幂等重放直接回放原响应体（字节一致）。
+fn managed_response(outcome: ManagedOutcome, status: StatusCode) -> Response {
+    match outcome {
+        ManagedOutcome::Fresh(fields) => cbor(fields, status),
+        ManagedOutcome::Replayed(body) => {
+            (status, [(header::CONTENT_TYPE, wire::CONTENT_TYPE)], body).into_response()
+        }
+    }
 }
 
 impl IntoResponse for Error {
@@ -299,6 +336,16 @@ fn require_device(state: &AppState, headers: &HeaderMap) -> Result<AuthContext> 
     let ctx = authenticate(state, headers)?;
     ctx.device_id()?;
     Ok(ctx)
+}
+
+/// ADR §22：management realm **只读**放行 `KEY_SLOT` 对象（元数据 + 分片），
+/// 让恢复设备自批时能先读槽、解出真实 epoch root 再封 grant；其他对象类型仍只 device realm。
+fn require_object_read(actor: &AuthContext, object_type: ObjectType) -> Result<()> {
+    match (actor.realm, object_type) {
+        (Realm::Device, _) => Ok(()),
+        (Realm::Management, ObjectType::KeySlot) => Ok(()),
+        _ => Err(Error::api(ErrorCode::ManagementRequired)),
+    }
 }
 
 fn require_management_realm(state: &AppState, headers: &HeaderMap) -> Result<AuthContext> {
@@ -462,6 +509,15 @@ async fn get_state(
         (13, cbor_uint(u64::try_from(available).unwrap_or(0))),
         (14, wire::text(crate::log::cursor_at(&vault, 0)?)),
     ];
+    // §28.1 条目 10（评审 §三 1）：当前正在进行的 rotation（让响应丢失的客户端先查询）。
+    if let Some(rotation) = state.db.read(crate::rotations::latest)?.filter(|rotation| {
+        matches!(
+            rotation.state,
+            crate::rotations::RotationState::Frozen | crate::rotations::RotationState::Staging
+        )
+    }) {
+        fields.push((15, cbor_bytes(rotation.rotation_id)));
+    }
     fields.sort_by_key(|(key, _)| *key);
     Ok(cbor_ok(fields))
 }
@@ -480,7 +536,7 @@ async fn get_control(
         .transpose()
         .map_err(|_| Error::api(ErrorCode::InvalidRequest))?
         .unwrap_or(0);
-    let (vault, entries, members, slot_chain) = state.db.read(move |conn| {
+    let (vault, entries, members, slot_chain, manager_chain) = state.db.read(move |conn| {
         let vault = require_vault(conn, &vault_id)?;
         let mut stmt = conn.prepare(
             "SELECT rev, prev_hash, record_hash, signed_record FROM control_commits
@@ -500,7 +556,8 @@ async fn get_control(
         let mut entries = Vec::new();
         for row in rows {
             let (rev, prev, record, signed) = row?;
-            entries.push(wire::map(vec![
+            let kind = control::kind_of(&signed).unwrap_or_else(|| "raw".to_string());
+            let mut entry = vec![
                 (
                     0,
                     cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("rev"))?),
@@ -508,7 +565,10 @@ async fn get_control(
                 (1, cbor_bytes(prev)),
                 (2, cbor_bytes(record)),
                 (3, cbor_bytes(signed)),
-            ]));
+            ];
+            // §28.1 条目 4/10：typed 控制记录（旧记录是裸 CDE → `raw`）。
+            entry.push((4, wire::text(kind)));
+            entries.push(wire::map(entry));
         }
         // 成员证书：客户端验 ObjectCommit 需要生产者当前证书（按 device_id 索引）。
         let mut member_stmt = conn.prepare(
@@ -574,7 +634,46 @@ async fn get_control(
                 ),
             ]));
         }
-        Ok((vault, entries, members, slot_chain))
+        // §27.2：管理权转换链（转换记录 + 双签），客户端逐级验证管理权。
+        let mut manager_stmt = conn.prepare(
+            "SELECT rev, pubkey, transition, old_rev, old_signature, new_signature
+             FROM manager_keys ORDER BY rev ASC",
+        )?;
+        let manager_rows = manager_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+            ))
+        })?;
+        let mut manager_chain = Vec::new();
+        for row in manager_rows {
+            let (rev, pubkey, transition, old_rev, old_sig, new_sig) = row?;
+            let mut entry = vec![
+                (
+                    0,
+                    cbor_uint(u64::try_from(rev).map_err(|_| Error::Invariant("manager rev"))?),
+                ),
+                (1, cbor_bytes(pubkey)),
+                (2, cbor_bytes(transition)),
+                (
+                    3,
+                    cbor_uint(u64::try_from(old_rev).map_err(|_| Error::Invariant("old rev"))?),
+                ),
+            ];
+            if let Some(signature) = old_sig {
+                entry.push((4, cbor_bytes(signature)));
+            }
+            if let Some(signature) = new_sig {
+                entry.push((5, cbor_bytes(signature)));
+            }
+            entry.sort_by_key(|(key, _)| *key);
+            manager_chain.push(wire::map(entry));
+        }
+        Ok((vault, entries, members, slot_chain, manager_chain))
     })?;
     Ok(cbor_ok(vec![
         (0, wire::array(entries)),
@@ -582,6 +681,7 @@ async fn get_control(
         (2, cbor_uint(vault.active_epoch)),
         (3, wire::array(members)),
         (4, wire::array(slot_chain)),
+        (5, wire::array(manager_chain)),
     ]))
 }
 
@@ -745,8 +845,15 @@ async fn post_updates(
             }
         };
         let hook = state.hook.clone();
+        let max_snapshot_bytes = state.config.max_snapshot_bytes;
         let outcome = state
             .write(move |conn, clock| {
+                let object = objects::load(conn, &object_id)?;
+                if object.object_type == ObjectType::Snapshot
+                    && object.plain_len > max_snapshot_bytes
+                {
+                    return Err(Error::api(ErrorCode::PayloadTooLarge));
+                }
                 objects::complete(
                     conn,
                     clock,
@@ -890,9 +997,18 @@ async fn get_part(
 ) -> Result<Response> {
     let vault_id = parse_id16(&vault_id)?;
     let object_id = parse_hash32(&object_id)?;
-    require_device(&state, &headers)?;
+    let actor = authenticate(&state, &headers)?;
+    let now = state.db.clock().now_secs();
     let (bytes, digest) = state.db.read(move |conn| {
         require_vault(conn, &vault_id)?;
+        // 先确认对象类型再放行（§22：management 只能读 KEY_SLOT）。
+        let object = objects::load(conn, &object_id)?;
+        require_object_read(&actor, object.object_type)?;
+        if object.object_type == ObjectType::KeySlot
+            && !crate::slots::slot_object_readable(conn, &object_id, now)?
+        {
+            return Err(Error::api(ErrorCode::Retired));
+        }
         objects::read_part(conn, &object_id, part_no)
     })?;
     let etag = format!("\"{}\"", hex_lower(&digest));
@@ -914,10 +1030,18 @@ async fn get_object(
 ) -> Result<Response> {
     let vault_id = parse_id16(&vault_id)?;
     let object_id = parse_hash32(&object_id)?;
-    require_device(&state, &headers)?;
+    let actor = authenticate(&state, &headers)?;
+    let now = state.db.clock().now_secs();
     let view = state.db.read(move |conn| {
         require_vault(conn, &vault_id)?;
-        objects::meta(conn, &object_id)
+        let view = objects::meta(conn, &object_id)?;
+        require_object_read(&actor, view.object.object_type)?;
+        if view.object.object_type == ObjectType::KeySlot
+            && !crate::slots::slot_object_readable(conn, &object_id, now)?
+        {
+            return Err(Error::api(ErrorCode::Retired));
+        }
+        Ok(view)
     })?;
     let parts = view
         .parts
@@ -971,8 +1095,13 @@ async fn complete_object(
     let commit = wire::bytes_field(&fields, 0)?;
     let signature = wire::bytes_field(&fields, 1)?;
     let hook = state.hook.clone();
+    let max_snapshot_bytes = state.config.max_snapshot_bytes;
     let outcome = state
         .write(move |conn, clock| {
+            let object = objects::load(conn, &object_id)?;
+            if object.object_type == ObjectType::Snapshot && object.plain_len > max_snapshot_bytes {
+                return Err(Error::api(ErrorCode::PayloadTooLarge));
+            }
             objects::complete(
                 conn,
                 clock,
@@ -1072,15 +1201,35 @@ async fn create_checkpoint(
     let fields = parse_body(&state, &body)?;
     let estimated_bytes = wire::uint_field(&fields, 0)?;
     let epoch = wire::opt_uint_field(&fields, 1)?;
+    // §28.1 条目 3：候选 checkpoint 的固定 role + request-id 幂等创建。
+    let role = match wire::opt_field(&fields, 2) {
+        None => None,
+        Some(wire::CdeValue::Text(text)) => {
+            Some(CheckpointRole::parse(text).ok_or_else(|| Error::api(ErrorCode::InvalidRequest))?)
+        }
+        Some(_) => return Err(Error::api(ErrorCode::InvalidRequest)),
+    };
+    let request_id = match wire::opt_field(&fields, 3) {
+        None => None,
+        Some(_) => Some(wire::id16_field(&fields, 3)?),
+    };
     let estimated_bytes =
         i64::try_from(estimated_bytes).map_err(|_| Error::api(ErrorCode::InvalidRequest))?;
     let outcome = state
         .write(move |conn, clock| {
             require_vault(conn, &vault_id)?;
-            checkpoints::create(conn, clock, &actor, estimated_bytes, epoch)
+            checkpoints::create(
+                conn,
+                clock,
+                &actor,
+                estimated_bytes,
+                epoch,
+                role,
+                request_id,
+            )
         })
         .await?;
-    Ok(cbor_created(vec![
+    let mut response = vec![
         (0, cbor_bytes(outcome.checkpoint_id)),
         (1, cbor_uint(outcome.epoch)),
         (2, cbor_uint(outcome.covered_seq)),
@@ -1089,7 +1238,12 @@ async fn create_checkpoint(
             4,
             cbor_uint(u64::try_from(outcome.reservation_expires_at).unwrap_or(0)),
         ),
-    ]))
+    ];
+    if let Some(role) = outcome.role {
+        response.push((5, wire::text(role.as_str())));
+    }
+    response.sort_by_key(|(key, _)| *key);
+    Ok(cbor_created(response))
 }
 
 async fn add_checkpoint_refs(
@@ -1183,6 +1337,14 @@ fn checkpoint_fields(checkpoint: &checkpoints::CheckpointRow, cursor: String) ->
     if let Some(digest) = checkpoint.refs_digest {
         fields.push((4, cbor_bytes(digest)));
     }
+    // §20.1：bootstrap 条目必须带 signed_commit + 生产者签名，客户端才能验 S/manifest/refs。
+    // 旧 checkpoint 两者都缺失时省略键（客户端按"无签名"拒绝，不静默通过）。
+    if let Some(commit) = &checkpoint.signed_commit {
+        fields.push((6, cbor_bytes(commit.clone())));
+    }
+    if let Some(signature) = &checkpoint.commit_signature {
+        fields.push((7, cbor_bytes(signature.clone())));
+    }
     fields.sort_by_key(|(key, _)| *key);
     wire::map(fields)
 }
@@ -1190,21 +1352,26 @@ fn checkpoint_fields(checkpoint: &checkpoints::CheckpointRow, cursor: String) ->
 async fn bootstrap(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response> {
     let vault_id = parse_id16(&vault_id)?;
     let actor = require_device(&state, &headers)?;
+    // §28.1 条目 9：显式降级读回（一基线损坏时读另一基线）；GC 仍被"两份基线"门禁挡住。
+    let allow_degraded = matches!(
+        query.get("degraded").map(String::as_str),
+        Some("1") | Some("true")
+    );
     let (vault, outcome) = state
         .write(move |conn, clock| {
             let vault = require_vault(conn, &vault_id)?;
-            checkpoints::bootstrap(conn, clock, &actor).map(|outcome| (vault, outcome))
+            checkpoints::bootstrap(conn, clock, &actor, allow_degraded)
+                .map(|outcome| (vault, outcome))
         })
         .await?;
     let primary_cursor = crate::log::cursor_at(&vault, outcome.primary.covered_seq)?;
-    let fallback_cursor = crate::log::cursor_at(&vault, outcome.fallback.covered_seq)?;
-    Ok(cbor_ok(vec![
+    let mut fields = vec![
         (0, checkpoint_fields(&outcome.primary, primary_cursor)),
-        (1, checkpoint_fields(&outcome.fallback, fallback_cursor)),
         (2, cbor_uint(outcome.head_seq)),
         (3, cbor_uint(outcome.gc_floor)),
         (4, cbor_uint(outcome.epoch)),
@@ -1213,7 +1380,14 @@ async fn bootstrap(
             6,
             cbor_uint(u64::try_from(outcome.lease.expires_at).unwrap_or(0)),
         ),
-    ]))
+        (7, wire::boolean(outcome.degraded)),
+    ];
+    if let Some(fallback) = &outcome.fallback {
+        let fallback_cursor = crate::log::cursor_at(&vault, fallback.covered_seq)?;
+        fields.push((1, checkpoint_fields(fallback, fallback_cursor)));
+    }
+    fields.sort_by_key(|(key, _)| *key);
+    Ok(cbor_ok(fields))
 }
 
 async fn renew_lease(
@@ -1242,16 +1416,16 @@ async fn renew_lease(
 #[derive(Debug)]
 struct SignedBody {
     payload: Vec<u8>,
-    payload_fields: wire::Fields,
     signature: Vec<u8>,
 }
 
+/// 设备签名的载荷包装（如 `PUT key-slots/{s}` 的槽描述符）。
+///
+/// §26 的管理写不走这里：它们用 [`CanonicalBody`] 把**业务字段唯一来源**限定在被签名 body。
 fn signed_body(fields: &wire::Fields, key: u64) -> Result<SignedBody> {
     let signed = wire::Signed::from_fields(fields, key)?;
-    let payload_fields = signed.payload_fields()?;
     Ok(SignedBody {
         payload: signed.payload,
-        payload_fields,
         signature: signed.signature,
     })
 }
@@ -1266,40 +1440,55 @@ async fn create_invite(
     let vault_id = parse_id16(&vault_id)?;
     let actor = require_management_realm(&state, &headers)?;
     let fields = parse_body(&state, &body)?;
-    let signed = signed_body(&fields, 0)?;
+    // §26：业务字段**只**从唯一 canonical body 解析（`{0: token_hash, 1: expires_at?}`）；
+    // 外层 request_id/expected_control_rev 是签名输入的一部分，不接受第二份业务载荷。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
     let request_id = wire::id16_field(&fields, 1)?;
     let expected_control_rev = wire::uint_field(&fields, 2)?;
-    let token_hash = wire::hash32_field(&signed.payload_fields, 0)?;
-    let expires_at = wire::opt_uint_field(&signed.payload_fields, 1)?
+    let token_hash = canonical.hash32(0)?;
+    let expires_at = canonical
+        .opt_u64(1)?
         .map(|value| i64::try_from(value).map_err(|_| Error::api(ErrorCode::InvalidRequest)))
         .transpose()?;
     let path = uri.path().to_string();
     let hook = state.hook.clone();
-    let invite = state
+    let scope = management::scope("invites");
+    let outcome = state
         .write(move |conn, clock| {
             require_vault(conn, &vault_id)?;
-            pairing::create_invite(
-                conn,
-                clock,
-                hook.as_ref(),
-                &actor,
-                &pairing::InviteRequest {
-                    token_hash,
-                    requested_expires_at: expires_at,
-                    expected_control_rev,
-                    request_id,
-                    path: path.clone(),
-                    unsigned_body: signed.payload.clone(),
-                    signature: signed.signature.clone(),
-                },
-            )
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2, // POST
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                let invite = pairing::create_invite(
+                    conn,
+                    clock,
+                    hook.as_ref(),
+                    &actor,
+                    &pairing::InviteRequest {
+                        token_hash,
+                        requested_expires_at: expires_at,
+                        expected_control_rev,
+                        request_id,
+                        path: path.clone(),
+                        unsigned_body: canonical.payload.clone(),
+                        signature: canonical.signature.clone(),
+                    },
+                )?;
+                Ok(vec![
+                    (0, cbor_bytes(invite.invite_id)),
+                    (1, cbor_uint(u64::try_from(invite.expires_at).unwrap_or(0))),
+                ])
+            })
         })
         .await?;
     state.notify();
-    Ok(cbor_created(vec![
-        (0, cbor_bytes(invite.invite_id)),
-        (1, cbor_uint(u64::try_from(invite.expires_at).unwrap_or(0))),
-    ]))
+    Ok(managed_response(outcome, StatusCode::CREATED))
 }
 
 async fn redeem_invite(
@@ -1348,43 +1537,64 @@ async fn approve_device(
     let device_id = parse_id16(&device_id)?;
     let actor = require_management_realm(&state, &headers)?;
     let fields = parse_body(&state, &body)?;
-    let signed = signed_body(&fields, 0)?;
-    let request_id = wire::id16_field(&fields, 1)?;
-    let expected_control_rev = wire::uint_field(&fields, 2)?;
-    let certificate = wire::bytes_field(&fields, 3)?;
-    let certificate_signature = wire::bytes_field(&fields, 4)?;
-    let grant_id = wire::id16_field(&fields, 5)?;
-    let hpke_enc = wire::key32_field(&fields, 6)?;
-    let hpke_ciphertext = wire::bytes_field(&fields, 7)?;
-    let grant_signature = wire::bytes_field(&fields, 8)?;
-    let request = pairing::ApproveRequest {
-        certificate,
-        certificate_signature,
-        grant_id,
-        hpke_enc,
-        hpke_ciphertext,
-        grant_signature,
-        expected_control_rev,
-        request_id,
-        path: uri.path().to_string(),
-        unsigned_body: signed.payload,
-        management_signature: signed.signature,
-    };
+    // §26：canonical body 的字段编号 0..=7 覆盖 approve 的全部业务输入；
+    // 外层 3..=8 是旧 wire 的镜像，出现时必须与 body 逐字节一致（否则 403）。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
+    let request_id = management::id16_field(&fields, 1, &canonical, 6)?;
+    let expected_control_rev = management::u64_field(&fields, 2, &canonical, 7)?;
+    let certificate = management::bytes_field(&fields, 3, &canonical, 0)?;
+    let certificate_signature = management::bytes_field(&fields, 4, &canonical, 1)?;
+    let grant_id = management::id16_field(&fields, 5, &canonical, 2)?;
+    let hpke_enc = management::hash32_field(&fields, 6, &canonical, 3)?;
+    let hpke_ciphertext = management::bytes_field(&fields, 7, &canonical, 4)?;
+    let grant_signature = management::bytes_field(&fields, 8, &canonical, 5)?;
+    let path = uri.path().to_string();
     let hook = state.hook.clone();
+    let scope = management::scope("device-approve");
     let outcome = state
         .write(move |conn, clock| {
             require_vault(conn, &vault_id)?;
-            pairing::approve_device(conn, clock, hook.as_ref(), &actor, &device_id, &request)
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2, // POST
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                let outcome = pairing::approve_device(
+                    conn,
+                    clock,
+                    hook.as_ref(),
+                    &actor,
+                    &device_id,
+                    &pairing::ApproveRequest {
+                        certificate,
+                        certificate_signature,
+                        grant_id,
+                        hpke_enc,
+                        hpke_ciphertext,
+                        grant_signature,
+                        expected_control_rev,
+                        request_id,
+                        path: path.clone(),
+                        unsigned_body: canonical.payload.clone(),
+                        management_signature: canonical.signature.clone(),
+                    },
+                )?;
+                Ok(vec![
+                    (0, cbor_bytes(outcome.device_id)),
+                    (1, wire::text(outcome.fingerprint)),
+                    (2, cbor_uint(outcome.epoch)),
+                    (3, cbor_uint(outcome.control_rev)),
+                    (4, cbor_bytes(outcome.certificate_signature)),
+                ])
+            })
         })
         .await?;
     state.notify();
-    Ok(cbor_ok(vec![
-        (0, cbor_bytes(outcome.device_id)),
-        (1, wire::text(outcome.fingerprint)),
-        (2, cbor_uint(outcome.epoch)),
-        (3, cbor_uint(outcome.control_rev)),
-        (4, cbor_bytes(outcome.certificate_signature)),
-    ]))
+    Ok(managed_response(outcome, StatusCode::OK))
 }
 
 fn slot_fields(slot: &slots::SlotRow) -> wire::CdeValue {
@@ -1409,11 +1619,17 @@ async fn list_key_slots(
     headers: HeaderMap,
 ) -> Result<Response> {
     let vault_id = parse_id16(&vault_id)?;
-    require_device(&state, &headers)?;
+    let actor = authenticate(&state, &headers)?;
+    // ADR §20.2：device realm 只看 active/retiring；management realm 额外看到 staging。
+    let include_staging = actor.realm == Realm::Management;
     let clock = state.db.clock_handle();
     let rows = state.db.read(move |conn| {
         require_vault(conn, &vault_id)?;
-        slots::list_visible(conn, clock.now_secs())
+        if include_staging {
+            slots::list_management(conn, clock.now_secs())
+        } else {
+            slots::list_visible(conn, clock.now_secs())
+        }
     })?;
     Ok(cbor_ok(vec![(
         0,
@@ -1472,9 +1688,12 @@ async fn activate_key_slot(
     }
     let actor = require_device(&state, &headers)?;
     let fields = parse_body(&state, &body)?;
-    let expected_slot_set_rev = wire::uint_field(&fields, 0)?;
-    let new_slot_id = wire::hash32_field(&fields, 1)?;
-    let signed = signed_body(&fields, 2)?;
+    // §26：改口令的 canonical body `{0: expected_slot_set_rev, 1: new_slot_id}` 就是
+    // **设备签名覆盖的字节**；外层 0/1 是旧 wire 的镜像，不一致 → 403。
+    // 此前设备签名覆盖任意 `signed_message`，而 CAS/slot 指针取自外层字段（可替换）。
+    let canonical = CanonicalBody::parse(&fields, 2)?;
+    let expected_slot_set_rev = management::u64_field(&fields, 0, &canonical, 0)?;
+    let new_slot_id = management::hash32_field(&fields, 1, &canonical, 1)?;
     let hook = state.hook.clone();
     let rev = state
         .write(move |conn, clock| {
@@ -1487,8 +1706,8 @@ async fn activate_key_slot(
                 &slots::PasswordActivateRequest {
                     expected_slot_set_rev,
                     new_slot_id,
-                    signed_message: signed.payload,
-                    signature: signed.signature,
+                    signed_message: canonical.payload.clone(),
+                    signature: canonical.signature.clone(),
                 },
             )
         })
@@ -1499,23 +1718,194 @@ async fn activate_key_slot(
 
 // ---------------------------------------------------------------- rotations
 
-fn rotation_fields(view: &rotations::RotationView) -> wire::CdeValue {
+/// §28.1 条目 10（评审 §三 2）：rotation view 全量字段。
+///
+/// 键 0–9 与旧客户端兼容；10+ 是本次增补：
+/// 10 control_rev, 11 auth_rev, 12 manager_rev, 13 from_epoch_revoked_once(uint 0/1),
+/// 14 freeze_asset_cutoff(=freeze_seq), 15 freeze_asset_count, 16 freeze_asset_digest,
+/// 17 member_cert_digest, 18 primary_checkpoint?, 19 fallback_checkpoint?,
+/// 20 activation_commit?, 21 activated_at?, 22 activated_control_rev?,
+/// 23 candidates[]（0 cid,1 state,2 role?,3 covered_seq,4 manifest_oid?,5 refs_digest?,
+///    6 commit_digest?,7 commit_signature?,8 health,9 readback_ready）,
+/// 24 slots[]（0 slot_id,1 kind,2 state,3 descriptor_digest,4 epoch）,
+/// 25 reservation?（0 reservation_id,1 owner_device,2 expires_at,3 reserved_bytes,
+///    4 consumed_bytes,5 state）, 26 candidate_ready(uint 0/1)。
+fn rotation_fields(
+    conn: &rusqlite::Connection,
+    now: i64,
+    view: &rotations::RotationView,
+) -> Result<wire::CdeValue> {
+    let vault = vault::load(conn)?;
+    let rotation = &view.rotation;
     let mut fields = vec![
-        (0, cbor_bytes(view.rotation.rotation_id)),
-        (1, wire::text(view.rotation.state.as_str())),
-        (2, cbor_uint(view.rotation.from_epoch)),
-        (3, cbor_uint(view.rotation.to_epoch)),
-        (4, cbor_uint(view.rotation.freeze_seq)),
-        (5, cbor_uint(view.rotation.revoked_count)),
+        (0, cbor_bytes(rotation.rotation_id)),
+        (1, wire::text(rotation.state.as_str())),
+        (2, cbor_uint(rotation.from_epoch)),
+        (3, cbor_uint(rotation.to_epoch)),
+        (4, cbor_uint(rotation.freeze_seq)),
+        (5, cbor_uint(rotation.revoked_count)),
         (7, cbor_uint(view.grants_count)),
         (8, cbor_bytes(view.grants_digest)),
         (9, cbor_uint(view.published_checkpoints)),
+        (10, cbor_uint(vault.control_rev)),
+        (11, cbor_uint(vault.auth_rev)),
+        (12, cbor_uint(vault.manager_rev)),
+        (
+            13,
+            cbor_uint(u64::from(
+                if vault::epoch_revoked_once(conn, rotation.from_epoch)? {
+                    1u8
+                } else {
+                    0u8
+                },
+            )),
+        ),
+        (14, cbor_uint(rotation.freeze_seq)),
+        (
+            15,
+            cbor_uint(objects::asset_count(
+                conn,
+                rotation.from_epoch,
+                rotation.freeze_seq,
+            )?),
+        ),
     ];
-    if let Some(hash) = view.rotation.member_set_hash {
+    if let Some(digest) = rotation.asset_set_digest {
+        fields.push((16, cbor_bytes(digest)));
+    }
+    fields.push((17, cbor_bytes(rotations::member_cert_digest(conn)?)));
+    if let Some(hash) = rotation.member_set_hash {
         fields.push((6, cbor_bytes(hash)));
     }
+    if let Some(cid) = rotation.primary_checkpoint {
+        fields.push((18, cbor_bytes(cid)));
+    }
+    if let Some(cid) = rotation.fallback_checkpoint {
+        fields.push((19, cbor_bytes(cid)));
+    }
+    if let Some(commit) = rotation.activation_commit {
+        fields.push((20, cbor_bytes(commit)));
+    }
+    if let Some(at) = rotation.activated_at {
+        fields.push((21, cbor_uint(u64::try_from(at).unwrap_or(0))));
+    }
+    if let Some(rev) = rotation.activated_control_rev {
+        fields.push((22, cbor_uint(rev)));
+    }
+    // 候选 checkpoint 元数据（activate 前是 candidate，activate 后是被指名的 published）。
+    let mut candidates = Vec::new();
+    for checkpoint in checkpoints::candidates_for_epoch(conn, rotation.to_epoch)? {
+        candidates.push(checkpoint_meta_value(conn, &checkpoint)?);
+    }
+    if candidates.is_empty() {
+        for checkpoint in checkpoints::published_newest_first_for_epoch(conn, rotation.to_epoch, 2)?
+        {
+            candidates.push(checkpoint_meta_value(conn, &checkpoint)?);
+        }
+    }
+    let candidate_ready = !candidates.is_empty()
+        && candidates.iter().all(|value| {
+            wire::value_map(value)
+                .ok()
+                .and_then(|map| wire::bool_field(&map, 9).ok())
+                .unwrap_or(false)
+        });
+    fields.push((23, wire::array(candidates)));
+    // 候选 epoch 的槽集合（slot ids + descriptor digest）。
+    let mut slots = Vec::new();
+    for slot in slots::list_management(conn, now)?
+        .into_iter()
+        .filter(|slot| slot.epoch == rotation.to_epoch)
+    {
+        slots.push(wire::map(vec![
+            (0, cbor_bytes(slot.slot_id)),
+            (1, wire::text(slot.kind.as_str())),
+            (2, wire::text(slot.state.as_str())),
+            (
+                3,
+                cbor_bytes(slots::descriptor_context_hash(&slot.descriptor)),
+            ),
+            (4, cbor_uint(slot.epoch)),
+        ]));
+    }
+    fields.push((24, wire::array(slots)));
+    // 轮换维护 reservation（owner/expiry/bytes）。
+    if let Some(reservation) = rotation_reservation_value(conn, &rotation.rotation_id)? {
+        fields.push((25, reservation));
+    }
+    fields.push((26, cbor_uint(if candidate_ready { 1 } else { 0 })));
     fields.sort_by_key(|(key, _)| *key);
-    wire::map(fields)
+    Ok(wire::map(fields))
+}
+
+/// checkpoint 元数据（candidate/GET 与 rotation view 共用）。
+fn checkpoint_meta_value(
+    conn: &rusqlite::Connection,
+    checkpoint: &checkpoints::CheckpointRow,
+) -> Result<wire::CdeValue> {
+    let mut fields = vec![
+        (0, cbor_bytes(checkpoint.checkpoint_id)),
+        (1, wire::text(checkpoint.state.as_str())),
+        (3, cbor_uint(checkpoint.covered_seq)),
+        (8, wire::text(checkpoint.health.as_str())),
+        (
+            9,
+            wire::boolean(checkpoints::candidate_ready(conn, checkpoint)?),
+        ),
+    ];
+    if let Some(role) = checkpoint.role {
+        fields.push((2, wire::text(role.as_str())));
+    }
+    if let Some(manifest) = checkpoint.manifest_oid {
+        fields.push((4, cbor_bytes(manifest)));
+    }
+    if let Some(digest) = checkpoint.refs_digest {
+        fields.push((5, cbor_bytes(digest)));
+    }
+    if let Some(commit) = &checkpoint.signed_commit {
+        fields.push((6, cbor_bytes(sha256(commit))));
+    }
+    if let Some(signature) = &checkpoint.commit_signature {
+        fields.push((7, cbor_bytes(signature.clone())));
+    }
+    fields.sort_by_key(|(key, _)| *key);
+    Ok(wire::map(fields))
+}
+
+/// 轮换 reservation 的视图（没有则 None）。
+fn rotation_reservation_value(
+    conn: &rusqlite::Connection,
+    rotation_id: &Id16,
+) -> Result<Option<wire::CdeValue>> {
+    let mut stmt = conn.prepare(
+        "SELECT reservation_id, owner_device, expires_at, reserved_bytes, consumed_bytes, state
+         FROM maintenance_reservations
+         WHERE purpose = 'rotation' AND resource_id = ?1
+         ORDER BY rowid DESC LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row([rotation_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .optional()?;
+    let Some((id, owner, expires_at, reserved, consumed, state)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(wire::map(vec![
+        (0, cbor_bytes(id)),
+        (1, cbor_bytes(owner)),
+        (2, cbor_uint(u64::try_from(expires_at).unwrap_or(0))),
+        (3, cbor_uint(u64::try_from(reserved).unwrap_or(0))),
+        (4, cbor_uint(u64::try_from(consumed).unwrap_or(0))),
+        (5, wire::text(state)),
+    ])))
 }
 
 async fn begin_rotation(
@@ -1528,11 +1918,14 @@ async fn begin_rotation(
     let vault_id = parse_id16(&vault_id)?;
     let actor = require_management_realm(&state, &headers)?;
     let fields = parse_body(&state, &body)?;
-    let signed = signed_body(&fields, 0)?;
-    let request_id = wire::id16_field(&fields, 1)?;
-    let expected_control_rev = wire::uint_field(&fields, 2)?;
-    let expected_epoch = wire::uint_field(&fields, 3)?;
-    let revoke: Vec<Id16> = wire::array_field(&fields, 4)?
+    // §26：canonical body = `{0: expected_epoch, 1: expected_control_rev, 2: request_id,
+    // 3: revoke[]}`（与 sync 客户端 `rotation::begin_body` 一致）。外层 1..=4 是旧 wire
+    // 的镜像：出现时必须与 body 逐字节一致，任一不符 → 403；执行只用 body 的值。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
+    let request_id = management::id16_field(&fields, 1, &canonical, 2)?;
+    let expected_control_rev = management::u64_field(&fields, 2, &canonical, 1)?;
+    let expected_epoch = management::u64_field(&fields, 3, &canonical, 0)?;
+    let revoke: Vec<Id16> = management::array_field(&fields, 4, &canonical, 3)?
         .into_iter()
         .map(|value| match value {
             wire::CdeValue::Bytes(bytes) => bytes
@@ -1544,29 +1937,41 @@ async fn begin_rotation(
         .collect::<Result<Vec<_>>>()?;
     let path = uri.path().to_string();
     let hook = state.hook.clone();
-    let view = state
+    let scope = management::scope("begin");
+    let outcome = state
         .write(move |conn, clock| {
             require_vault(conn, &vault_id)?;
-            rotations::begin(
-                conn,
-                clock,
-                hook.as_ref(),
-                &actor,
-                &BeginRequest {
-                    revoke: &revoke,
-                    expected_epoch,
-                    expected_control_rev,
-                    request_id,
-                    path: &path,
-                    body_sha256: sha256(&signed.payload),
-                    signed: &signed.payload,
-                    signature: &signed.signature,
-                },
-            )
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2, // POST
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                let view = rotations::begin(
+                    conn,
+                    clock,
+                    hook.as_ref(),
+                    &actor,
+                    &BeginRequest {
+                        revoke: &revoke,
+                        expected_epoch,
+                        expected_control_rev,
+                        request_id,
+                        path: &path,
+                        body_sha256: canonical.digest(),
+                        signed: &canonical.payload,
+                        signature: &canonical.signature,
+                    },
+                )?;
+                Ok(vec![(0, rotation_fields(conn, clock.now_secs(), &view)?)])
+            })
         })
         .await?;
     state.notify();
-    Ok(cbor_ok(vec![(0, rotation_fields(&view))]))
+    Ok(managed_response(outcome, StatusCode::OK))
 }
 
 async fn get_rotation(
@@ -1576,12 +1981,15 @@ async fn get_rotation(
 ) -> Result<Response> {
     let vault_id = parse_id16(&vault_id)?;
     let rotation_id = parse_id16(&rotation_id)?;
-    require_device(&state, &headers)?;
+    // §28.1 条目 10：management（恢复）也需要读 r view，不再限 device realm。
+    authenticate(&state, &headers)?;
+    let clock = state.db.clock_handle();
     let view = state.db.read(move |conn| {
         require_vault(conn, &vault_id)?;
-        rotations::view(conn, &rotation_id)
+        let view = rotations::view(conn, &rotation_id)?;
+        rotation_fields(conn, clock.now_secs(), &view)
     })?;
-    Ok(cbor_ok(vec![(0, rotation_fields(&view))]))
+    Ok(cbor_ok(vec![(0, view)]))
 }
 
 async fn stage_grant(
@@ -1595,6 +2003,11 @@ async fn stage_grant(
     let recipient = parse_id16(&device_id)?;
     let actor = require_management_realm(&state, &headers)?;
     let fields = parse_body(&state, &body)?;
+    // §26/§17.2：grant 的 canonical 字段就是本请求 map（0 grant_id / 1 hpke_enc /
+    // 2 hpke_ciphertext / 3 signed_header / 4 signature / 5 manager_rev），**没有**第二份
+    // 不透明 body；签名输入由这些字段重新构造 `GrantAadV1 || enc || SHA256(ciphertext)`，
+    // 任一所消费字段被替换都会验签失败（`verify.rs` 的 `Expectation::EpochGrant`）。
+    // relay 只信 devices 行里的收件人 HPKE 公钥，不收客户端传入的 AAD。
     let grant_id = wire::id16_field(&fields, 0)?;
     let hpke_enc: [u8; 32] = wire::key32_field(&fields, 1)?;
     let hpke_ciphertext = wire::bytes_field(&fields, 2)?;
@@ -1613,7 +2026,7 @@ async fn stage_grant(
                 signature: &signature,
                 manager_rev,
             };
-            crate::rotations::stage_grant(
+            let view = crate::rotations::stage_grant(
                 conn,
                 hook.as_ref(),
                 &actor,
@@ -1621,11 +2034,12 @@ async fn stage_grant(
                 &recipient,
                 &input,
                 clock,
-            )
+            )?;
+            rotation_fields(conn, clock.now_secs(), &view)
         })
         .await?;
     state.notify();
-    Ok(cbor_ok(vec![(0, rotation_fields(&view))]))
+    Ok(cbor_ok(vec![(0, view)]))
 }
 
 async fn activate_rotation(
@@ -1639,47 +2053,78 @@ async fn activate_rotation(
     let rotation_id = parse_id16(&rotation_id)?;
     let actor = require_management_realm(&state, &headers)?;
     let fields = parse_body(&state, &body)?;
-    let signed = signed_body(&fields, 0)?;
+    // §26/§27.2：canonical body = `{0: new_manager{0 transition,1 old_sig,2 new_sig},
+    // 1: primary_checkpoint, 2: fallback_checkpoint}`。外层 3 是 new_manager 的旧 wire
+    // 镜像，必须与 body 逐字节一致；两个 cid 只能来自被签名 body（不接受外层另行解析）。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
     let request_id = wire::id16_field(&fields, 1)?;
     let expected_control_rev = wire::uint_field(&fields, 2)?;
-    let new_manager = match wire::opt_map_field(&fields, 3)? {
+    let new_manager = match management::opt_map_field(&fields, 3, &canonical, 0)? {
         None => None,
         Some(map) => Some(NewManager {
-            rev: wire::uint_field(&map, 0)?,
-            pubkey: wire::key32_field(&map, 1)?,
-            transition: wire::bytes_field(&map, 2)?,
+            transition: wire::bytes_field(&map, 0)?,
+            old_signature: wire::opt_bytes_field(&map, 1)?,
+            new_signature: wire::opt_bytes_field(&map, 2)?,
         }),
     };
+    let primary_checkpoint = canonical.opt_id16(1)?;
+    let fallback_checkpoint = canonical.opt_id16(2)?;
+    // §28.1 条目 6：整套材料摘要（expected CAS），只从被签 body 解析。
+    let member_cert_digest = canonical.opt_hash32(3)?;
+    let grants_digest = canonical.opt_hash32(4)?;
+    let slot_set_digest = canonical.opt_hash32(5)?;
+    let asset_set_digest = canonical.opt_hash32(6)?;
     let path = uri.path().to_string();
     let hook = state.hook.clone();
+    let scope = management::scope("activate");
     let outcome = state
         .write(move |conn, clock| {
             require_vault(conn, &vault_id)?;
-            rotations::activate(
-                conn,
-                clock,
-                hook.as_ref(),
-                &actor,
-                &rotation_id,
-                &ActivateRequest {
-                    request_id,
-                    path: &path,
-                    body_sha256: sha256(&signed.payload),
-                    expected_control_rev,
-                    signed: &signed.payload,
-                    signature: &signed.signature,
-                    new_manager,
-                },
-            )
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2, // POST
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                let outcome = rotations::activate(
+                    conn,
+                    clock,
+                    hook.as_ref(),
+                    &actor,
+                    &rotation_id,
+                    &ActivateRequest {
+                        request_id,
+                        path: &path,
+                        body_sha256: canonical.digest(),
+                        expected_control_rev,
+                        signed: &canonical.payload,
+                        signature: &canonical.signature,
+                        new_manager,
+                        primary_checkpoint,
+                        fallback_checkpoint,
+                        member_cert_digest,
+                        grants_digest,
+                        slot_set_digest,
+                        asset_set_digest,
+                    },
+                )?;
+                Ok(vec![
+                    (0, cbor_uint(outcome.epoch)),
+                    (1, cbor_uint(outcome.control_rev)),
+                    (2, cbor_uint(outcome.auth_rev)),
+                    (3, cbor_bytes(outcome.member_set_hash)),
+                    (4, cbor_bytes(outcome.primary_checkpoint)),
+                    (5, cbor_bytes(outcome.fallback_checkpoint)),
+                    (6, cbor_bytes(outcome.activation_commit)),
+                ])
+            })
         })
         .await?;
     state.notify();
-    Ok(cbor_ok(vec![
-        (0, cbor_uint(outcome.epoch)),
-        (1, cbor_uint(outcome.control_rev)),
-        (2, cbor_uint(outcome.auth_rev)),
-        (3, cbor_bytes(outcome.member_set_hash)),
-    ]))
+    Ok(managed_response(outcome, StatusCode::OK))
 }
 
 async fn abort_rotation(
@@ -1693,33 +2138,373 @@ async fn abort_rotation(
     let rotation_id = parse_id16(&rotation_id)?;
     let actor = require_management_realm(&state, &headers)?;
     let fields = parse_body(&state, &body)?;
-    let signed = signed_body(&fields, 0)?;
+    // §26：abort 的 canonical body 是**空 map**（没有业务载荷）；request_id /
+    // expected_control_rev 由管理签名输入直接绑定。非空 body 属未知键 → 400。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
+    if !canonical.fields.is_empty() {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
     let request_id = wire::id16_field(&fields, 1)?;
     let expected_control_rev = wire::uint_field(&fields, 2)?;
     let path = uri.path().to_string();
     let hook = state.hook.clone();
-    let view = state
+    let scope = management::scope("abort");
+    let outcome = state
         .write(move |conn, clock| {
             require_vault(conn, &vault_id)?;
-            rotations::abort(
-                conn,
-                clock,
-                hook.as_ref(),
-                &actor,
-                &rotation_id,
-                &AbortRequest {
-                    request_id,
-                    path: &path,
-                    body_sha256: sha256(&signed.payload),
-                    expected_control_rev,
-                    signed: &signed.payload,
-                    signature: &signed.signature,
-                },
-            )
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2, // POST
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                let view = rotations::abort(
+                    conn,
+                    clock,
+                    hook.as_ref(),
+                    &actor,
+                    &rotation_id,
+                    &AbortRequest {
+                        request_id,
+                        path: &path,
+                        body_sha256: canonical.digest(),
+                        expected_control_rev,
+                        signed: &canonical.payload,
+                        signature: &canonical.signature,
+                    },
+                )?;
+                Ok(vec![(0, rotation_fields(conn, clock.now_secs(), &view)?)])
+            })
         })
         .await?;
     state.notify();
-    Ok(cbor_ok(vec![(0, rotation_fields(&view))]))
+    Ok(managed_response(outcome, StatusCode::OK))
+}
+
+async fn get_current_rotation(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    // §28.1 条目 10（评审 §三 1）：management + device 都可读，用于响应丢失后按
+    // `request_id` 找回结果（不盲重发 begin/activate）。
+    authenticate(&state, &headers)?;
+    let request_id = match query.get("request_id") {
+        None => None,
+        Some(value) => Some(parse_id16(value)?),
+    };
+    let clock = state.db.clock_handle();
+    let (view, replay) = state.db.read(move |conn| {
+        require_vault(conn, &vault_id)?;
+        let view = match rotations::latest(conn)? {
+            None => None,
+            Some(latest) => Some(rotation_fields(
+                conn,
+                clock.now_secs(),
+                &rotations::view(conn, &latest.rotation_id)?,
+            )?),
+        };
+        let replay = match request_id {
+            None => None,
+            Some(request_id) => management::lookup_any(conn, &request_id)?,
+        };
+        Ok((view, replay))
+    })?;
+    let mut fields = Vec::new();
+    if let Some(view) = view {
+        fields.push((0, view));
+    }
+    if let Some((scope, response)) = replay {
+        fields.push((1, cbor_bytes(response)));
+        fields.push((2, wire::text(scope)));
+    }
+    fields.sort_by_key(|(key, _)| *key);
+    Ok(cbor_ok(fields))
+}
+
+async fn restart_rotation(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, rotation_id)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    let rotation_id = parse_id16(&rotation_id)?;
+    let actor = require_management_realm(&state, &headers)?;
+    let fields = parse_body(&state, &body)?;
+    // §28.1 条目 7：restart 的 canonical body 为空（request_id/control_rev 由管理签名绑定）。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
+    if !canonical.fields.is_empty() {
+        return Err(Error::api(ErrorCode::InvalidRequest));
+    }
+    let request_id = wire::id16_field(&fields, 1)?;
+    let expected_control_rev = wire::uint_field(&fields, 2)?;
+    let path = uri.path().to_string();
+    let hook = state.hook.clone();
+    let scope = management::scope("restart");
+    let outcome = state
+        .write(move |conn, clock| {
+            require_vault(conn, &vault_id)?;
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2,
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                let view = rotations::restart(
+                    conn,
+                    clock,
+                    hook.as_ref(),
+                    &actor,
+                    &rotation_id,
+                    &rotations::ControlRequest {
+                        request_id,
+                        path: &path,
+                        body_sha256: canonical.digest(),
+                        expected_control_rev,
+                        signed: &canonical.payload,
+                        signature: &canonical.signature,
+                    },
+                )?;
+                Ok(vec![
+                    (0, rotation_fields(conn, clock.now_secs(), &view)?),
+                    (1, wire::boolean(true)),
+                ])
+            })
+        })
+        .await?;
+    state.notify();
+    Ok(managed_response(outcome, StatusCode::OK))
+}
+
+async fn revoke_more_rotation(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, rotation_id)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    let rotation_id = parse_id16(&rotation_id)?;
+    let actor = require_management_realm(&state, &headers)?;
+    let fields = parse_body(&state, &body)?;
+    // canonical body = `{0: revoke[]}`；外层 3 是旧 wire 镜像（必须逐字节一致）。
+    let canonical = CanonicalBody::parse(&fields, 0)?;
+    let request_id = wire::id16_field(&fields, 1)?;
+    let expected_control_rev = wire::uint_field(&fields, 2)?;
+    let revoke: Vec<Id16> = management::array_field(&fields, 3, &canonical, 0)?
+        .into_iter()
+        .map(|value| match value {
+            wire::CdeValue::Bytes(bytes) => bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::api(ErrorCode::InvalidRequest)),
+            _ => Err(Error::api(ErrorCode::InvalidRequest)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let path = uri.path().to_string();
+    let hook = state.hook.clone();
+    let scope = management::scope("revoke-more");
+    let outcome = state
+        .write(move |conn, clock| {
+            require_vault(conn, &vault_id)?;
+            let call = management::ManagementCall {
+                scope: &scope,
+                method_tag: 2,
+                path: &path,
+                request_id,
+                expected_control_rev,
+                body: &canonical,
+            };
+            management::run(conn, clock, hook.as_ref(), &call, || {
+                let outcome = rotations::revoke_more(
+                    conn,
+                    clock,
+                    hook.as_ref(),
+                    &actor,
+                    &rotation_id,
+                    &rotations::ControlRequest {
+                        request_id,
+                        path: &path,
+                        body_sha256: canonical.digest(),
+                        expected_control_rev,
+                        signed: &canonical.payload,
+                        signature: &canonical.signature,
+                    },
+                    &revoke,
+                )?;
+                Ok(vec![
+                    (0, rotation_fields(conn, clock.now_secs(), &outcome.view)?),
+                    (1, wire::boolean(outcome.restarted)),
+                    (2, cbor_uint(outcome.revoked)),
+                ])
+            })
+        })
+        .await?;
+    state.notify();
+    Ok(managed_response(outcome, StatusCode::OK))
+}
+
+/// grant 叶子 manifest 的视图（management 专用；含完整 signed_header 与包 digest）。
+fn grant_leaf_fields(grant: &rotations::GrantRow) -> wire::CdeValue {
+    let mut fields = vec![
+        (0, cbor_bytes(grant.device_id)),
+        (1, cbor_uint(grant.epoch)),
+        (2, cbor_uint(grant.manager_rev)),
+        (3, cbor_bytes(grant.hpke_enc)),
+        (4, cbor_bytes(sha256(&grant.hpke_ciphertext))),
+        (5, cbor_bytes(grant.signed_header.clone())),
+        (9, cbor_bytes(rotations::grant_package_digest(grant))),
+    ];
+    if let Some(signature) = &grant.signature {
+        fields.push((6, cbor_bytes(signature.clone())));
+    }
+    if let Some(grant_id) = grant.grant_id {
+        fields.push((7, cbor_bytes(grant_id)));
+    }
+    if let Some(activation_ref) = grant.activation_ref {
+        fields.push((8, cbor_bytes(activation_ref)));
+    }
+    fields.sort_by_key(|(key, _)| *key);
+    wire::map(fields)
+}
+
+async fn list_rotation_grants(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, rotation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    let rotation_id = parse_id16(&rotation_id)?;
+    // §28.1 条目 5 + 评审 §三 4：staged grants **仅 management** 可读。
+    require_management_realm(&state, &headers)?;
+    let (view, grants) = state.db.read(move |conn| {
+        require_vault(conn, &vault_id)?;
+        let view = rotations::view(conn, &rotation_id)?;
+        let grants = rotations::list_grants(conn, view.rotation.to_epoch)?;
+        Ok((view, grants))
+    })?;
+    let entries: Vec<wire::CdeValue> = grants.iter().map(grant_leaf_fields).collect();
+    Ok(cbor_ok(vec![
+        (0, wire::array(entries)),
+        (1, cbor_bytes(view.grants_digest)),
+        (2, cbor_uint(view.grants_count)),
+    ]))
+}
+
+async fn list_rotation_assets(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, rotation_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    let rotation_id = parse_id16(&rotation_id)?;
+    // §28.1 条目 9（评审 §三 8）：冻结时刻的 finalized 资产分页读，不依赖可回收 log。
+    authenticate(&state, &headers)?;
+    let limit: u32 = query
+        .get("limit")
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(|_| Error::api(ErrorCode::InvalidRequest))?
+        .unwrap_or(256);
+    let after = match query.get("after") {
+        None => None,
+        Some(value) => Some(parse_hash32(value)?),
+    };
+    let (rotation, refs, total) = state.db.read(move |conn| {
+        require_vault(conn, &vault_id)?;
+        let rotation = rotations::get(conn, &rotation_id)?;
+        let refs = objects::list_assets(
+            conn,
+            rotation.from_epoch,
+            rotation.freeze_seq,
+            after.as_ref(),
+            limit,
+        )?;
+        let total = objects::asset_count(conn, rotation.from_epoch, rotation.freeze_seq)?;
+        Ok((rotation, refs, total))
+    })?;
+    let entries = refs
+        .into_iter()
+        .map(|meta| {
+            wire::map(vec![
+                (0, cbor_bytes(meta.object_id)),
+                (1, cbor_uint(meta.object_type.as_u8().into())),
+                (2, cbor_uint(meta.generation)),
+                (3, cbor_uint(meta.key_epoch)),
+                (4, cbor_uint(u64::from(meta.part_count))),
+                (5, cbor_uint(meta.total_plain_len)),
+                (6, cbor_bytes(meta.object_digest)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut fields = vec![
+        (0, wire::array(entries)),
+        (1, cbor_uint(rotation.freeze_seq)),
+        (3, cbor_uint(total)),
+    ];
+    if let Some(digest) = rotation.asset_set_digest {
+        fields.push((2, cbor_bytes(digest)));
+    }
+    fields.sort_by_key(|(key, _)| *key);
+    Ok(cbor_ok(fields))
+}
+
+async fn get_checkpoint(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, checkpoint_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let vault_id = parse_id16(&vault_id)?;
+    let checkpoint_id = parse_id16(&checkpoint_id)?;
+    // §28.1 条目 3：候选 checkpoint 元数据/GET（readback-ready 与 published 分离）。
+    authenticate(&state, &headers)?;
+    let detail = state.db.read(move |conn| {
+        require_vault(conn, &vault_id)?;
+        let checkpoint = checkpoints::get(conn, &checkpoint_id)?;
+        let mut fields = vec![
+            (0, cbor_bytes(checkpoint.checkpoint_id)),
+            (1, wire::text(checkpoint.state.as_str())),
+            (3, cbor_uint(checkpoint.covered_seq)),
+            (8, wire::text(checkpoint.health.as_str())),
+            (
+                9,
+                wire::boolean(checkpoints::candidate_ready(conn, &checkpoint)?),
+            ),
+            (10, cbor_uint(checkpoint.epoch)),
+        ];
+        if let Some(role) = checkpoint.role {
+            fields.push((2, wire::text(role.as_str())));
+        }
+        if let Some(manifest) = checkpoint.manifest_oid {
+            fields.push((4, cbor_bytes(manifest)));
+        }
+        if let Some(digest) = checkpoint.refs_digest {
+            fields.push((5, cbor_bytes(digest)));
+        }
+        if let Some(commit) = &checkpoint.signed_commit {
+            fields.push((6, cbor_bytes(commit.clone())));
+        }
+        if let Some(signature) = &checkpoint.commit_signature {
+            fields.push((7, cbor_bytes(signature.clone())));
+        }
+        if let Some(published_at) = checkpoint.published_at {
+            fields.push((11, cbor_uint(u64::try_from(published_at).unwrap_or(0))));
+        }
+        fields.sort_by_key(|(key, _)| *key);
+        Ok(wire::map(fields))
+    })?;
+    Ok(cbor_ok(vec![(0, detail)]))
 }
 
 async fn latest_grant(
@@ -1737,14 +2522,27 @@ async fn latest_grant(
     let Some(grant) = grant else {
         return Err(Error::api(ErrorCode::NotFound));
     };
-    Ok(cbor_ok(vec![
+    let package_digest = rotations::grant_package_digest(&grant);
+    let mut fields = vec![
         (0, cbor_uint(grant.epoch)),
         (1, cbor_bytes(grant.device_id)),
         (2, cbor_uint(grant.manager_rev)),
         (3, cbor_bytes(grant.hpke_enc)),
-        (4, cbor_bytes(grant.hpke_ciphertext)),
-        (5, cbor_bytes(grant.signed_header)),
-    ]))
+        (4, cbor_bytes(grant.hpke_ciphertext.clone())),
+        (5, cbor_bytes(grant.signed_header.clone())),
+        (6, cbor_bytes(grant.signature.clone().unwrap_or_default())),
+        // §28.1 条目 5（评审 §三 4）：grant_id / activation_ref / 完整 leaf manifest 与包 digest。
+        (9, cbor_bytes(sha256(&grant.signed_header))),
+        (10, cbor_bytes(package_digest)),
+    ];
+    if let Some(grant_id) = grant.grant_id {
+        fields.push((7, cbor_bytes(grant_id)));
+    }
+    if let Some(activation_ref) = grant.activation_ref {
+        fields.push((8, cbor_bytes(activation_ref)));
+    }
+    fields.sort_by_key(|(key, _)| *key);
+    Ok(cbor_ok(fields))
 }
 
 // ---------------------------------------------------------------- WS /wake

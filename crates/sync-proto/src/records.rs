@@ -597,10 +597,12 @@ pub struct ManifestDoc {
     pub doc_id: String,
     pub kind: u64,
     pub generation: u64,
+    pub key_epoch: u64,
     pub vv: Vec<u8>,
     pub frontier: Vec<u8>,
     pub snapshot_object_id: ObjectId,
     pub part_count: u32,
+    pub total_plain_len: u64,
     pub object_digest: Sha256,
 }
 
@@ -616,15 +618,18 @@ impl ManifestDoc {
             (5, CdeValue::Bytes(self.snapshot_object_id.to_vec())),
             (6, CdeValue::UInt(u64::from(self.part_count))),
             (7, CdeValue::Bytes(self.object_digest.to_vec())),
+            (8, CdeValue::UInt(self.key_epoch)),
+            (9, CdeValue::UInt(self.total_plain_len)),
         ]))
     }
 
     fn from_cde(value: CdeValue) -> Result<Self, ProtoError> {
-        let fields = into_record_fields(value, 8)?;
+        let fields = into_record_fields(value, 10)?;
         let value = Self {
             doc_id: expect_text(fields[0].clone(), "ManifestDoc.doc_id")?,
             kind: expect_i64_max(fields[1].clone(), "ManifestDoc.kind")?,
             generation: expect_i64_max(fields[2].clone(), "ManifestDoc.generation")?,
+            key_epoch: expect_i64_max(fields[8].clone(), "ManifestDoc.key_epoch")?,
             vv: expect_bytes(fields[3].clone(), "ManifestDoc.vv")?,
             frontier: expect_bytes(fields[4].clone(), "ManifestDoc.frontier")?,
             snapshot_object_id: expect_bytes_n::<32>(
@@ -632,6 +637,7 @@ impl ManifestDoc {
                 "ManifestDoc.snapshot_object_id",
             )?,
             part_count: crate::cde::expect_u32(fields[6].clone(), "ManifestDoc.part_count")?,
+            total_plain_len: expect_i64_max(fields[9].clone(), "ManifestDoc.total_plain_len")?,
             object_digest: expect_bytes_n::<32>(fields[7].clone(), "ManifestDoc.object_digest")?,
         };
         value.validate()?;
@@ -654,6 +660,16 @@ impl ManifestDoc {
                 "ManifestDoc.part_count 必须 ≥1".to_owned(),
             ));
         }
+        if self.key_epoch == 0 {
+            return Err(ProtoError::Invalid(
+                "ManifestDoc.key_epoch 必须 >0".to_owned(),
+            ));
+        }
+        if self.total_plain_len == 0 {
+            return Err(ProtoError::Invalid(
+                "ManifestDoc.total_plain_len 必须 >0".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -665,7 +681,9 @@ pub struct ManifestAsset {
     pub byte_len: u64,
     pub media_type: String,
     pub object_id: ObjectId,
+    pub key_epoch: u64,
     pub part_count: u32,
+    pub total_plain_len: u64,
     pub object_digest: Sha256,
 }
 
@@ -679,17 +697,21 @@ impl ManifestAsset {
             (3, CdeValue::Bytes(self.object_id.to_vec())),
             (4, CdeValue::UInt(u64::from(self.part_count))),
             (5, CdeValue::Bytes(self.object_digest.to_vec())),
+            (6, CdeValue::UInt(self.key_epoch)),
+            (7, CdeValue::UInt(self.total_plain_len)),
         ]))
     }
 
     fn from_cde(value: CdeValue) -> Result<Self, ProtoError> {
-        let fields = into_record_fields(value, 6)?;
+        let fields = into_record_fields(value, 8)?;
         let value = Self {
             real_sha256: expect_bytes_n::<32>(fields[0].clone(), "ManifestAsset.real_sha256")?,
             byte_len: expect_i64_max(fields[1].clone(), "ManifestAsset.byte_len")?,
             media_type: expect_text(fields[2].clone(), "ManifestAsset.media_type")?,
             object_id: expect_bytes_n::<32>(fields[3].clone(), "ManifestAsset.object_id")?,
+            key_epoch: expect_i64_max(fields[6].clone(), "ManifestAsset.key_epoch")?,
             part_count: crate::cde::expect_u32(fields[4].clone(), "ManifestAsset.part_count")?,
+            total_plain_len: expect_i64_max(fields[7].clone(), "ManifestAsset.total_plain_len")?,
             object_digest: expect_bytes_n::<32>(fields[5].clone(), "ManifestAsset.object_digest")?,
         };
         value.validate()?;
@@ -708,6 +730,16 @@ impl ManifestAsset {
         if self.part_count == 0 {
             return Err(ProtoError::Invalid(
                 "ManifestAsset.part_count 必须 ≥1".to_owned(),
+            ));
+        }
+        if self.key_epoch == 0 {
+            return Err(ProtoError::Invalid(
+                "ManifestAsset.key_epoch 必须 >0".to_owned(),
+            ));
+        }
+        if self.total_plain_len == 0 {
+            return Err(ProtoError::Invalid(
+                "ManifestAsset.total_plain_len 必须 >0".to_owned(),
             ));
         }
         Ok(())

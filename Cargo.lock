@@ -4779,6 +4779,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
  "hpke",
  "loro",
  "menghunote-storage",

@@ -192,6 +192,26 @@ pub fn derive_asset_id_key(root: &RootSecretV1) -> Result<Secret32, SyncError> {
     )
 }
 
+/// ADR §20：KEY_SLOT 的 MNE1 密钥。
+///
+/// `IKM = Argon2id(password) 或 recovery_seed`；`info = "MN/v1/key-slot\0"
+/// || kind_u8 || BE64(epoch) || slot_id32`；`salt = vault_id`。
+/// 这样恢复设备在拿到 root **之前**就能解槽（其他对象类型仍用 `K_object`）。
+pub fn derive_slot_mne_key(
+    ikm: &[u8],
+    vault_id: &VaultId,
+    kind: menghunote_sync_proto::SlotKind,
+    epoch: u64,
+    slot_id: &ObjectId,
+) -> Result<Secret32, SyncError> {
+    let mut info = Vec::with_capacity(crate::domain::HKDF_KEY_SLOT_INFO.len() + 1 + 8 + 32);
+    info.extend_from_slice(crate::domain::HKDF_KEY_SLOT_INFO);
+    info.push(kind as u8);
+    info.extend_from_slice(&epoch.to_be_bytes());
+    info.extend_from_slice(slot_id);
+    crate::kdf::hkdf32(ikm, vault_id, &info)
+}
+
 /// 明文秘密的调试格式：只打印"已脱敏"，不打印任何字节。
 pub(crate) fn redacted() -> &'static str {
     "<redacted>"

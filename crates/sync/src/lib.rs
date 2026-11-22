@@ -24,7 +24,9 @@
 #![deny(unsafe_code)]
 
 pub mod base64url;
+pub mod bootstrap;
 pub mod cbor;
+pub mod checkpoint;
 pub mod device;
 pub mod domain;
 pub mod dpapi;
@@ -39,9 +41,16 @@ pub mod kdf;
 pub mod keys;
 pub mod random;
 pub mod recovery;
+pub mod recovery_enroll;
 pub mod relay;
+pub mod rotation;
+pub mod rotation_activate;
+pub mod rotation_journal;
+pub mod rotation_slots;
+pub mod rotation_stage;
 pub mod slot;
 pub mod storage_view;
+pub mod upload;
 pub mod wire;
 
 #[cfg(test)]

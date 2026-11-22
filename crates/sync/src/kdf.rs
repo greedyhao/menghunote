@@ -97,6 +97,12 @@ pub fn new_writer_params(rng: &mut impl RandomSource) -> Result<Argon2idParams, 
     Ok(writer_params(salt))
 }
 
+/// HKDF-SHA256 展开为任意长度（ADR §19 的 24B ASSET nonce 等）。
+pub fn hkdf_expand(key: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), SyncError> {
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), key);
+    hkdf.expand(info, out).map_err(|_| SyncError::Hkdf)
+}
+
 /// 计算 `Argon2id(password, params)` 的 32 字节输出。
 ///
 /// 执行顺序刻意是：**口令长度 → 参数范围 → Argon2**。参数越界时不会分配内存、

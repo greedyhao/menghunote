@@ -21,6 +21,7 @@ use crate::refs::ObjectRefMeta;
 use crate::sig::{require, Expectation, SignDomain, SignatureCheck, SignatureHook};
 use crate::time::Clock;
 use crate::vault;
+use menghunote_sync_proto as proto;
 
 /// dedup 作用域：对象完成。
 const DEDUP_OBJECT_COMPLETE: &str = "object-complete";
@@ -699,6 +700,31 @@ pub fn complete(
          WHERE object_id = ?4",
         (digest.as_slice(), commit, now, object_id.as_slice()),
     )?;
+    // §25.1：ASSET complete 同事务写不透明登记表（log 只做唤醒；GC 后枚举仍完整）。
+    if object.object_type == ObjectType::Asset {
+        let rotation_id: Option<Vec<u8>> = if is_candidate {
+            conn.query_row(
+                "SELECT rotation_id FROM rotations
+                 WHERE to_epoch = ?1 AND state IN ('frozen','staging') LIMIT 1",
+                [i64_of(object.epoch, "epoch")?],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        conn.execute(
+            "INSERT INTO asset_objects(epoch, object_id, state, finalized_seq, rotation_id)
+             VALUES (?1, ?2, 'active', ?3, ?4)
+             ON CONFLICT(epoch, object_id) DO NOTHING",
+            (
+                i64_of(object.epoch, "epoch")?,
+                object_id.as_slice(),
+                i64::try_from(relay_seq.unwrap_or(0)).map_err(|_| Error::Invariant("relay_seq"))?,
+                rotation_id.as_deref(),
+            ),
+        )?;
+    }
     let response = match relay_seq {
         Some(seq) => be64(seq).to_vec(),
         None => Vec::new(),
@@ -832,6 +858,70 @@ pub fn integrity_issues(conn: &Connection, object: &ObjectRow) -> Result<Vec<&'s
     Ok(issues)
 }
 
+/// §25.1：冻结时刻的资产集合摘要：`SHA256(CDE(sorted ObjectRefV1[ASSET]))`。
+/// 只使用不透明登记 + ObjectRefV1 元数据；真实文件 hash/MIME/长度不在 relay。
+pub fn asset_set_digest(conn: &Connection, epoch: u64, through_seq: u64) -> Result<Hash32> {
+    let mut stmt = conn.prepare(
+        "SELECT o.object_id, o.type, o.generation, o.epoch, o.part_count, o.plain_len, o.digest
+         FROM asset_objects a JOIN objects o ON o.object_id = a.object_id
+         WHERE a.epoch = ?1 AND a.state = 'active' AND a.finalized_seq <= ?2
+           AND o.state = 'complete' AND o.digest IS NOT NULL
+         ORDER BY o.object_id ASC",
+    )?;
+    let rows = stmt.query_map(
+        (i64_of(epoch, "epoch")?, i64_of(through_seq, "through_seq")?),
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+            ))
+        },
+    )?;
+    let mut refs = Vec::new();
+    for row in rows {
+        let (object_id, object_type, generation, object_epoch, part_count, plain_len, digest) =
+            row?;
+        refs.push(proto::ObjectRefV1 {
+            object_id: object_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Invariant("objects.object_id"))?,
+            object_type: proto::ObjectType::try_from(
+                u8::try_from(object_type).map_err(|_| Error::Invariant("objects.type"))?,
+            )
+            .map_err(|_| Error::Invariant("objects.type"))?,
+            generation: u64_of(generation, "objects.generation")?,
+            key_epoch: u64_of(object_epoch, "objects.epoch")?,
+            part_count: u32::try_from(part_count).map_err(|_| Error::Invariant("part_count"))?,
+            total_plain_len: u64_of(plain_len, "objects.plain_len")?,
+            object_digest: digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Invariant("objects.digest"))?,
+        });
+    }
+    let input =
+        proto::refs_digest_input(&refs).map_err(|_| Error::Invariant("asset_set_digest input"))?;
+    Ok(sha256(&input))
+}
+
+/// §25.1：某 epoch 在 `through_seq` 之前已 finalize 的资产数量（opaque 登记表口径）。
+pub fn asset_count(conn: &Connection, epoch: u64, through_seq: u64) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM asset_objects a JOIN objects o ON o.object_id = a.object_id
+         WHERE a.epoch = ?1 AND a.state = 'active' AND a.finalized_seq <= ?2
+           AND o.state = 'complete' AND o.digest IS NOT NULL",
+        (i64_of(epoch, "epoch")?, i64_of(through_seq, "through_seq")?),
+        |row| row.get(0),
+    )?;
+    u64_of(count, "asset count")
+}
+
 /// 分页列出某 epoch 在 `through_seq` 之前完成的资产（轮换复制基线用）。
 pub fn list_assets(
     conn: &Connection,
@@ -840,10 +930,12 @@ pub fn list_assets(
     after_object_id: Option<&Hash32>,
     limit: u32,
 ) -> Result<Vec<ObjectRefMeta>> {
+    // §25.1：枚举只查不透明登记表，不依赖可回收的 log（log GC 后仍完整）。
     let mut stmt = conn.prepare(
         "SELECT o.object_id, o.type, o.generation, o.epoch, o.part_count, o.plain_len, o.digest
-         FROM objects o JOIN log l ON l.object_id = o.object_id AND l.kind = 'asset'
-         WHERE o.epoch = ?1 AND l.relay_seq <= ?2 AND o.state = 'complete' AND o.digest IS NOT NULL
+         FROM asset_objects a JOIN objects o ON o.object_id = a.object_id
+         WHERE a.epoch = ?1 AND a.state = 'active' AND a.finalized_seq <= ?2
+           AND o.state = 'complete' AND o.digest IS NOT NULL
            AND (?3 IS NULL OR o.object_id > ?3)
          ORDER BY o.object_id ASC LIMIT ?4",
     )?;

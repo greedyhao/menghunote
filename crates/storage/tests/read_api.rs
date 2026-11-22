@@ -7,7 +7,7 @@ use support::*;
 use menghunote_storage::{
     append_updates, body_doc_meta, doc_exists, doc_snapshot, doc_updates_since, doc_vv, load_head,
     loro_update_base_vv, loro_update_payload, read_doc_bootstrap, read_doc_for_export,
-    store_snapshot, StorageError, UpdateRecord, APP_DOC_SCHEMA, CODEC_VERSION, MIN_READER,
+    store_snapshot, DocKind, StorageError, UpdateRecord, APP_DOC_SCHEMA, CODEC_VERSION, MIN_READER,
 };
 
 fn assert_head_conflict(error: StorageError, expected: u64, actual: u64) {
@@ -30,6 +30,8 @@ fn body_doc_meta_and_updates_match_appended_rows() {
     let doc = seed_note(&vault, "note-1", "doc-1");
 
     let empty = body_doc_meta(&vault, "doc-1").expect("meta").expect("doc");
+    assert_eq!(empty.kind, DocKind::Body);
+    assert_eq!(empty.kind, "body");
     assert_eq!(empty.generation, 1);
     assert_eq!(empty.codec_version, CODEC_VERSION);
     assert_eq!(empty.app_doc_schema, u32::try_from(APP_DOC_SCHEMA).unwrap());

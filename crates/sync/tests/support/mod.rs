@@ -15,11 +15,17 @@ use menghunote_sync::device::{DeviceHpkeKey, DeviceSigningKey};
 use menghunote_sync::engine::EngineIdentity;
 use menghunote_sync::keys::RootSecretV1;
 use menghunote_sync::relay::{
-    RelayClient, RelayLogEvent, RelayLogKind, RelayLogPage, RelayState, UpdateOutcome,
+    CheckpointLease, CheckpointPublish, CheckpointRef, CheckpointRole, CheckpointStatus,
+    FrozenAssetPage, FrozenAssetRef, ObjectSubmission, PublishedCheckpoint, RelayClient,
+    RelayLogEvent, RelayLogKind, RelayLogPage, RelayState, SlotRecord, SlotUpload, UpdateOutcome,
     UpdateStatus, UpdateSubmission,
 };
 use menghunote_sync::{DeviceId, ObjectId, VaultId};
-use menghunote_sync_proto::{DeviceCertV1, Rights};
+use menghunote_sync_proto::{
+    checkpoint_signing_input, refs_digest_input, CheckpointCommit, DeviceCertV1, ObjectRefV1,
+    ObjectType, Rights, SlotDescriptorV1, SlotKind,
+};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 pub const VAULT_ID: VaultId = [0x5a; 16];
@@ -199,6 +205,19 @@ pub struct StoredObject {
     pub signature: [u8; 64],
 }
 
+/// FakeRelay 的 checkpoint 状态。
+#[derive(Debug, Clone)]
+pub struct FakeCheckpoint {
+    pub checkpoint_id: [u8; 16],
+    pub epoch: u64,
+    pub covered_seq: u64,
+    pub data_refs: Vec<ObjectId>,
+    pub manifest_ref: Option<ObjectId>,
+    pub published: bool,
+    pub signed_commit: Option<Vec<u8>>,
+    pub signature: Option<[u8; 64]>,
+}
+
 /// 内存 relay：实现 `RelayClient`，带故障注入点。
 pub struct FakeRelay {
     pub vault_id: VaultId,
@@ -227,6 +246,28 @@ pub struct FakeRelay {
     pub tamper_signature: bool,
     /// 日志事件里的 commit 字节翻转（模拟伪造 commit）。
     pub tamper_commit: bool,
+    /// 已登记的密钥槽。
+    pub slots: HashMap<ObjectId, SlotRecord>,
+    /// 当前 checkpoint staging/已发布状态。
+    pub checkpoint: Option<FakeCheckpoint>,
+    /// 已发布 checkpoint 历史（bootstrap 取最近两份）。
+    pub published_checkpoints: Vec<FakeCheckpoint>,
+    /// 下一个 checkpoint id 计数。
+    pub next_checkpoint: u64,
+    /// Fake rotation 视图与 request_id→rotation_id 索引。
+    pub rotations: HashMap<[u8; 16], menghunote_sync::relay::RotationView>,
+    pub rotation_requests: HashMap<[u8; 16], [u8; 16]>,
+    /// 下一次 begin 已落库但响应丢失（模拟网络丢响应）。
+    pub drop_begin_response: bool,
+    /// `/control` 键 5 的管理转换链（阶段 A 校验）。
+    pub manager_chain: Vec<menghunote_sync::relay::ManagerChainEntry>,
+    /// 当前已吊销的设备（历史证书仍保留在 `certs`，用于 S 前历史导入测试）。
+    pub revoked: std::collections::HashSet<DeviceId>,
+    /// frozen 资产分页（阶段 D）。
+    pub frozen_assets: Vec<FrozenAssetRef>,
+    pub frozen_asset_digest: Option<[u8; 32]>,
+    /// 候选 checkpoint 状态（阶段 E）。
+    pub checkpoint_status: HashMap<[u8; 16], CheckpointStatus>,
 }
 
 impl FakeRelay {
@@ -255,16 +296,33 @@ impl FakeRelay {
             tamper_parts: false,
             tamper_signature: false,
             tamper_commit: false,
+            slots: HashMap::new(),
+            checkpoint: None,
+            published_checkpoints: Vec::new(),
+            next_checkpoint: 1,
+            rotations: HashMap::new(),
+            rotation_requests: HashMap::new(),
+            drop_begin_response: false,
+            manager_chain: Vec::new(),
+            revoked: std::collections::HashSet::new(),
+            frozen_assets: Vec::new(),
+            frozen_asset_digest: None,
+            checkpoint_status: HashMap::new(),
         }
     }
 
     /// 直接追加一个 asset 事件（验证"范围外事件必须暂停"）。
     pub fn publish_asset(&mut self, object_id: ObjectId) {
+        self.publish_event(RelayLogKind::Asset, object_id);
+    }
+
+    /// 发布任意类型的日志事件（用于 unsupported 分支测试）。
+    pub fn publish_event(&mut self, kind: RelayLogKind, object_id: ObjectId) {
         let seq = self.head_seq + 1;
         self.head_seq = seq;
         self.log.push(RelayLogEvent {
             relay_seq: seq,
-            kind: RelayLogKind::Asset,
+            kind,
             object_id: Some(object_id),
             epoch: self.epoch,
             event: vec![0; 32],
@@ -304,6 +362,7 @@ impl RelayClient for FakeRelay {
             auth_rev: 1,
             head_seq: self.head_seq,
             gc_floor: self.gc_floor,
+            current_rotation_id: self.rotations.keys().next().copied(),
         })
     }
 
@@ -496,7 +555,9 @@ impl RelayClient for FakeRelay {
             );
             outcomes.push(UpdateOutcome {
                 object_id,
-                status: UpdateStatus::Accepted { relay_seq },
+                status: UpdateStatus::Accepted {
+                    relay_seq: Some(relay_seq),
+                },
             });
         }
         Ok(outcomes)
@@ -518,4 +579,551 @@ impl RelayClient for FakeRelay {
     ) -> Result<Option<DeviceCertV1>, menghunote_sync::SyncError> {
         Ok(self.certs.get(device_id).cloned())
     }
+
+    fn submit_object(
+        &mut self,
+        item: ObjectSubmission,
+    ) -> Result<UpdateOutcome, menghunote_sync::SyncError> {
+        let object_id = item.object_id;
+        if let Some(code) = self.fail_submit.get(&object_id).copied() {
+            return Ok(UpdateOutcome {
+                object_id,
+                status: UpdateStatus::Failed {
+                    code: Some(code.to_owned()),
+                    retryable: false,
+                },
+            });
+        }
+        if let Some(existing) = self.objects.get(&object_id) {
+            return Ok(UpdateOutcome {
+                object_id,
+                status: if existing.commit_bytes == item.signed_commit {
+                    UpdateStatus::Duplicate
+                } else {
+                    UpdateStatus::Failed {
+                        code: Some("ID_CONFLICT".to_owned()),
+                        retryable: false,
+                    }
+                },
+            });
+        }
+        let commit = item.commit;
+        let mut hashes = Vec::new();
+        for part_no in 0..commit.part_count {
+            let Some(bytes) = self.parts.get(&(object_id, part_no)) else {
+                return Ok(UpdateOutcome {
+                    object_id,
+                    status: UpdateStatus::Failed {
+                        code: Some("INCOMPLETE".to_owned()),
+                        retryable: false,
+                    },
+                });
+            };
+            hashes.push(sha256(bytes));
+        }
+        let input = menghunote_sync_proto::object_digest_input(commit.part_count, &hashes)
+            .expect("digest input");
+        if sha256(&input) != commit.object_digest {
+            return Ok(UpdateOutcome {
+                object_id,
+                status: UpdateStatus::Failed {
+                    code: Some("ID_CONFLICT".to_owned()),
+                    retryable: false,
+                },
+            });
+        }
+        // relay 只把 UPDATE / ASSET 写进 log；SNAPSHOT/MANIFEST/KEY_SLOT 仅通过
+        // checkpoint refs 被引用（与真实 relay objects::complete 一致）。
+        let relay_seq = if matches!(commit.object_type, ObjectType::Update | ObjectType::Asset) {
+            let relay_seq = self.head_seq + 1;
+            self.head_seq = relay_seq;
+            let kind = if commit.object_type == ObjectType::Asset {
+                RelayLogKind::Asset
+            } else {
+                RelayLogKind::Update
+            };
+            self.log.push(RelayLogEvent {
+                relay_seq,
+                kind,
+                object_id: Some(object_id),
+                epoch: self.epoch,
+                event: item.signed_commit.clone(),
+                signature: Some(item.signature),
+            });
+            Some(relay_seq)
+        } else {
+            None
+        };
+        self.objects.insert(
+            object_id,
+            StoredObject {
+                commit,
+                commit_bytes: item.signed_commit,
+                signature: item.signature,
+            },
+        );
+        Ok(UpdateOutcome {
+            object_id,
+            status: UpdateStatus::Accepted { relay_seq },
+        })
+    }
+
+    fn put_key_slot(
+        &mut self,
+        upload: SlotUpload,
+    ) -> Result<SlotRecord, menghunote_sync::SyncError> {
+        let descriptor = SlotDescriptorV1::decode(&upload.descriptor)
+            .map_err(|_| relay_api("INVALID_REQUEST", false))?;
+        if descriptor.slot_id != upload.slot_id
+            || descriptor.key_epoch != upload.epoch
+            || descriptor.kind != upload.kind
+            || descriptor.vault_id != self.vault_id
+        {
+            return Err(relay_api("INVALID_REQUEST", false));
+        }
+        let Some(object) = self.objects.get(&upload.slot_id) else {
+            return Err(relay_api("INCOMPLETE", false));
+        };
+        if object.commit.object_type != ObjectType::KeySlot
+            || object.commit.key_epoch != upload.epoch
+        {
+            return Err(relay_api("INCOMPLETE", false));
+        }
+        if let Some(existing) = self.slots.get(&upload.slot_id) {
+            if existing.descriptor == upload.descriptor
+                && existing.epoch == upload.epoch
+                && existing.kind == upload.kind
+            {
+                return Ok(existing.clone());
+            }
+            return Err(relay_api("ID_CONFLICT", false));
+        }
+        let rev = self
+            .slots
+            .values()
+            .filter(|slot| slot.kind == upload.kind)
+            .map(|slot| slot.slot_set_rev)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let record = SlotRecord {
+            slot_id: upload.slot_id,
+            epoch: upload.epoch,
+            kind: upload.kind,
+            descriptor: upload.descriptor,
+            state: "staging".to_owned(),
+            slot_set_rev: rev,
+            retire_at: None,
+        };
+        self.slots.insert(upload.slot_id, record.clone());
+        Ok(record)
+    }
+
+    fn list_key_slots(&mut self) -> Result<Vec<SlotRecord>, menghunote_sync::SyncError> {
+        // 与真实 relay 一致：只返回 active / 未到期的 retiring（staging 不可见）。
+        let mut slots: Vec<SlotRecord> = self
+            .slots
+            .values()
+            .filter(|slot| slot.state == "active" || slot.state == "retiring")
+            .cloned()
+            .collect();
+        slots.sort_by_key(|slot| slot.slot_set_rev);
+        Ok(slots)
+    }
+
+    fn activate_password_slot(
+        &mut self,
+        expected_slot_set_rev: u64,
+        slot_id: ObjectId,
+        _signed_message: Vec<u8>,
+        _signature: [u8; 64],
+    ) -> Result<u64, menghunote_sync::SyncError> {
+        let current = self
+            .slots
+            .values()
+            .filter(|slot| slot.kind == SlotKind::Password && slot.state == "active")
+            .map(|slot| slot.slot_set_rev)
+            .max()
+            .unwrap_or(0);
+        if current != expected_slot_set_rev {
+            return Err(relay_api("CAS_CONFLICT", false));
+        }
+        let Some(staged) = self.slots.get(&slot_id).cloned() else {
+            return Err(relay_api("NOT_FOUND", false));
+        };
+        if staged.kind != SlotKind::Password
+            || staged.state != "staging"
+            || staged.epoch != self.epoch
+        {
+            return Err(relay_api("INCOMPLETE", false));
+        }
+        for (id, slot) in self.slots.iter_mut() {
+            if slot.kind == SlotKind::Password && slot.state == "active" {
+                slot.state = "retiring".to_owned();
+                slot.retire_at = Some(0);
+                let _ = id;
+            }
+        }
+        let next = expected_slot_set_rev + 1;
+        let entry = self.slots.get_mut(&slot_id).expect("staged slot");
+        entry.state = "active".to_owned();
+        entry.slot_set_rev = next;
+        Ok(next)
+    }
+
+    fn create_checkpoint(
+        &mut self,
+        _estimated_bytes: u64,
+        epoch: Option<u64>,
+    ) -> Result<CheckpointLease, menghunote_sync::SyncError> {
+        if self.checkpoint.as_ref().is_some_and(|cp| !cp.published) {
+            return Err(relay_api("BUSY", true));
+        }
+        let target_epoch = epoch.unwrap_or(self.epoch);
+        if target_epoch != self.epoch {
+            return Err(relay_api("EPOCH", false));
+        }
+        let mut checkpoint_id = [0u8; 16];
+        checkpoint_id[..8].copy_from_slice(&0xCFu64.to_be_bytes());
+        checkpoint_id[8..].copy_from_slice(&self.next_checkpoint.to_be_bytes());
+        self.next_checkpoint += 1;
+        let covered_seq = self.head_seq;
+        self.checkpoint = Some(FakeCheckpoint {
+            checkpoint_id,
+            epoch: target_epoch,
+            covered_seq,
+            data_refs: Vec::new(),
+            manifest_ref: None,
+            published: false,
+            signed_commit: None,
+            signature: None,
+        });
+        Ok(CheckpointLease {
+            checkpoint_id,
+            epoch: target_epoch,
+            covered_seq,
+            reservation_id: [0xCE; 16],
+            expires_at: 10_000,
+        })
+    }
+
+    fn add_checkpoint_refs(
+        &mut self,
+        checkpoint_id: [u8; 16],
+        refs: Vec<CheckpointRef>,
+    ) -> Result<u64, menghunote_sync::SyncError> {
+        let Some(checkpoint) = self.checkpoint.as_mut() else {
+            return Err(relay_api("NOT_FOUND", false));
+        };
+        if checkpoint.checkpoint_id != checkpoint_id || checkpoint.published {
+            return Err(relay_api("INVALID_STATE", false));
+        }
+        let mut inserted = 0;
+        for reference in refs {
+            let Some(object) = self.objects.get(&reference.object_id) else {
+                return Err(relay_api("INCOMPLETE", false));
+            };
+            if object.commit.key_epoch != checkpoint.epoch {
+                return Err(relay_api("EPOCH", false));
+            }
+            match reference.role {
+                CheckpointRole::Data => {
+                    if !matches!(
+                        object.commit.object_type,
+                        ObjectType::Snapshot | ObjectType::Asset
+                    ) {
+                        return Err(relay_api("INVALID_REQUEST", false));
+                    }
+                    if !checkpoint.data_refs.contains(&reference.object_id) {
+                        checkpoint.data_refs.push(reference.object_id);
+                    }
+                }
+                CheckpointRole::Manifest => {
+                    if object.commit.object_type != ObjectType::Manifest
+                        || checkpoint.manifest_ref.is_some()
+                    {
+                        return Err(relay_api("INVALID_REQUEST", false));
+                    }
+                    checkpoint.manifest_ref = Some(reference.object_id);
+                }
+            }
+            inserted += 1;
+        }
+        Ok(inserted)
+    }
+
+    fn publish_checkpoint(
+        &mut self,
+        publish: CheckpointPublish,
+    ) -> Result<PublishedCheckpoint, menghunote_sync::SyncError> {
+        let Some(checkpoint) = self.checkpoint.clone() else {
+            return Err(relay_api("NOT_FOUND", false));
+        };
+        if checkpoint.published {
+            return Err(relay_api("IMMUTABLE", false));
+        }
+        if checkpoint.covered_seq != publish.covered_seq
+            || checkpoint.manifest_ref != Some(publish.manifest_oid)
+            || checkpoint.data_refs.is_empty()
+        {
+            return Err(relay_api("INCOMPLETE", false));
+        }
+        let mut refs = Vec::new();
+        for object_id in &checkpoint.data_refs {
+            let Some(object) = self.objects.get(object_id) else {
+                return Err(relay_api("INCOMPLETE", false));
+            };
+            refs.push(ObjectRefV1 {
+                object_id: *object_id,
+                object_type: object.commit.object_type,
+                generation: object.commit.generation,
+                key_epoch: object.commit.key_epoch,
+                part_count: object.commit.part_count,
+                total_plain_len: object.commit.total_len,
+                object_digest: object.commit.object_digest,
+            });
+        }
+        let digest_input =
+            refs_digest_input(&refs).map_err(|_| relay_api("INVALID_REQUEST", false))?;
+        if sha256(&digest_input) != publish.refs_digest {
+            return Err(relay_api("CAS_CONFLICT", false));
+        }
+        let commit = CheckpointCommit::decode(&publish.signed_commit)
+            .map_err(|_| relay_api("INVALID_REQUEST", false))?;
+        if commit.vault_id != self.vault_id
+            || commit.checkpoint_id != publish.checkpoint_id
+            || commit.epoch != checkpoint.epoch
+            || commit.covered_relay_seq != checkpoint.covered_seq
+            || commit.manifest_object_id != publish.manifest_oid
+            || commit.refs_digest != publish.refs_digest
+        {
+            return Err(relay_api("INVALID_REQUEST", false));
+        }
+        let Some(cert) = self.certs.get(&commit.producer_device_id) else {
+            return Err(relay_api("REVOKED", false));
+        };
+        let input =
+            checkpoint_signing_input(&commit).map_err(|_| relay_api("INVALID_REQUEST", false))?;
+        if menghunote_sync::device::verify_signature(
+            &cert.sign_ed25519_pub,
+            &input,
+            &publish.signature,
+        )
+        .is_err()
+        {
+            return Err(relay_api("SIGNATURE_INVALID", false));
+        }
+        let _ = &mut self.checkpoint;
+        let entry = self.checkpoint.as_mut().expect("checkpoint");
+        entry.published = true;
+        entry.signed_commit = Some(publish.signed_commit.clone());
+        entry.signature = Some(publish.signature);
+        self.published_checkpoints.push(entry.clone());
+        Ok(PublishedCheckpoint {
+            checkpoint_id: publish.checkpoint_id,
+            epoch: checkpoint.epoch,
+            covered_seq: checkpoint.covered_seq,
+            published_at: 20_000,
+        })
+    }
+
+    fn bootstrap(
+        &mut self,
+    ) -> Result<menghunote_sync::relay::BootstrapBundle, menghunote_sync::SyncError> {
+        if self.published_checkpoints.len() < 2 {
+            return Err(relay_api("NO_VALID_BASELINE", false));
+        }
+        let mut sorted = self.published_checkpoints.clone();
+        sorted.sort_by_key(|checkpoint| checkpoint.covered_seq);
+        let fallback = sorted[sorted.len() - 2].clone();
+        let primary = sorted[sorted.len() - 1].clone();
+        let manifest_oid = primary
+            .manifest_ref
+            .ok_or_else(|| relay_api("NO_VALID_BASELINE", false))?;
+        Ok(menghunote_sync::relay::BootstrapBundle {
+            primary: menghunote_sync::relay::BootstrapCheckpoint {
+                checkpoint_id: primary.checkpoint_id,
+                epoch: primary.epoch,
+                covered_seq: primary.covered_seq,
+                manifest_oid,
+                refs_digest: None,
+                cursor: self.cursor_for(primary.covered_seq),
+                signed_commit: primary.signed_commit.clone(),
+                signature: primary.signature,
+            },
+            fallback: menghunote_sync::relay::BootstrapCheckpoint {
+                checkpoint_id: fallback.checkpoint_id,
+                epoch: fallback.epoch,
+                covered_seq: fallback.covered_seq,
+                manifest_oid: fallback
+                    .manifest_ref
+                    .ok_or_else(|| relay_api("NO_VALID_BASELINE", false))?,
+                refs_digest: None,
+                cursor: self.cursor_for(fallback.covered_seq),
+                signed_commit: fallback.signed_commit.clone(),
+                signature: fallback.signature,
+            },
+            head_seq: self.head_seq,
+            gc_floor: self.gc_floor,
+            epoch: self.epoch,
+            lease: menghunote_sync::relay::BootstrapLease {
+                lease_id: [0xBF; 16],
+                expires_at: 30_000,
+                floor_seq: fallback.covered_seq,
+            },
+            degraded: false,
+        })
+    }
+
+    fn renew_bootstrap_lease(
+        &mut self,
+        lease_id: [u8; 16],
+    ) -> Result<menghunote_sync::relay::BootstrapLease, menghunote_sync::SyncError> {
+        Ok(menghunote_sync::relay::BootstrapLease {
+            lease_id,
+            expires_at: 60_000,
+            floor_seq: self.gc_floor,
+        })
+    }
+
+    fn begin_rotation(
+        &mut self,
+        begin: menghunote_sync::relay::RotationBegin,
+    ) -> Result<menghunote_sync::relay::RotationView, menghunote_sync::SyncError> {
+        if begin.expected_epoch != self.epoch || begin.expected_control_rev != self.control_rev {
+            return Err(relay_api("CAS_CONFLICT", true));
+        }
+        let digest = sha256(&begin.signed_body);
+        let mut rotation_id = [0u8; 16];
+        rotation_id.copy_from_slice(&digest[..16]);
+        let view = menghunote_sync::relay::RotationView {
+            rotation_id,
+            state: "frozen".to_owned(),
+            from_epoch: self.epoch,
+            to_epoch: self.epoch + 1,
+            freeze_seq: self.head_seq,
+            revoked_count: begin.revoke.len() as u64,
+            member_set_hash: None,
+            grants_count: 0,
+            grants_digest: None,
+            published_checkpoints: 0,
+            control_rev: self.control_rev,
+            auth_rev: 1,
+            manager_rev: 1,
+            from_epoch_revoked_once: false,
+            freeze_asset_count: self.frozen_assets.len() as u64,
+            freeze_asset_digest: self.frozen_asset_digest,
+            member_cert_digest: None,
+            primary_checkpoint: None,
+            fallback_checkpoint: None,
+            activation_commit: None,
+            activated_at: None,
+            activated_control_rev: None,
+            candidate_count: 0,
+            candidate_ready: false,
+            reservation_id: None,
+        };
+        self.rotations.insert(rotation_id, view.clone());
+        self.rotation_requests.insert(begin.request_id, rotation_id);
+        if self.drop_begin_response {
+            self.drop_begin_response = false;
+            return Err(menghunote_sync::SyncError::Transport(
+                "模拟 begin 响应丢失（relay 已落库）",
+            ));
+        }
+        Ok(view)
+    }
+
+    fn rotation(
+        &mut self,
+        rotation_id: [u8; 16],
+    ) -> Result<menghunote_sync::relay::RotationView, menghunote_sync::SyncError> {
+        self.rotations
+            .get(&rotation_id)
+            .cloned()
+            .ok_or_else(|| relay_api("NOT_FOUND", false))
+    }
+
+    fn rotation_for_request(
+        &mut self,
+        request_id: [u8; 16],
+    ) -> Result<Option<menghunote_sync::relay::RotationView>, menghunote_sync::SyncError> {
+        Ok(self
+            .rotation_requests
+            .get(&request_id)
+            .and_then(|rotation_id| self.rotations.get(rotation_id))
+            .cloned())
+    }
+
+    fn management_chain(
+        &mut self,
+    ) -> Result<Vec<menghunote_sync::relay::ManagerChainEntry>, menghunote_sync::SyncError> {
+        Ok(self.manager_chain.clone())
+    }
+
+    fn active_member_hpke_keys(
+        &mut self,
+    ) -> Result<Vec<(DeviceId, [u8; 32])>, menghunote_sync::SyncError> {
+        let mut keys = self
+            .certs
+            .iter()
+            .filter(|(device_id, _)| !self.revoked.contains(*device_id))
+            .map(|(device_id, cert)| (*device_id, cert.hpke_x25519_pub))
+            .collect::<Vec<_>>();
+        keys.sort_by_key(|(device_id, _)| *device_id);
+        Ok(keys)
+    }
+
+    fn rotation_assets(
+        &mut self,
+        _rotation_id: [u8; 16],
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<FrozenAssetPage, menghunote_sync::SyncError> {
+        let start = after
+            .map(|after| {
+                self.frozen_assets
+                    .iter()
+                    .position(|asset| asset.object_id == after)
+                    .map(|index| index + 1)
+                    .unwrap_or(self.frozen_assets.len())
+            })
+            .unwrap_or(0);
+        let assets = self
+            .frozen_assets
+            .iter()
+            .skip(start)
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        Ok(FrozenAssetPage {
+            assets,
+            freeze_seq: self.head_seq,
+            asset_set_digest: self.frozen_asset_digest,
+            total: self.frozen_assets.len() as u64,
+        })
+    }
+
+    fn checkpoint_status(
+        &mut self,
+        checkpoint_id: [u8; 16],
+    ) -> Result<CheckpointStatus, menghunote_sync::SyncError> {
+        self.checkpoint_status.get(&checkpoint_id).cloned().ok_or(
+            menghunote_sync::SyncError::RelayWire("fake checkpoint 不存在"),
+        )
+    }
+}
+
+fn relay_api(code: &str, retryable: bool) -> menghunote_sync::SyncError {
+    menghunote_sync::SyncError::RelayApi {
+        code: code.to_owned(),
+        retryable,
+        current_epoch: None,
+        current_control_rev: None,
+        bootstrap_hint: None,
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }

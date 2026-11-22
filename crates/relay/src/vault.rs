@@ -85,6 +85,35 @@ fn hash32_from_blob(bytes: Vec<u8>, field: &'static str) -> Result<Hash32> {
         .map_err(|_| Error::Invariant(field))
 }
 
+/// 读已落库的 setup secret 哈希（`init` 写入）。
+pub fn setup_secret_hash(conn: &Connection) -> Result<Option<Hash32>> {
+    let value: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM relay_meta WHERE key = ?1",
+            [schema::META_SETUP_SECRET_HASH],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match value {
+        None => Ok(None),
+        Some(bytes) => {
+            Ok(Some(bytes.as_slice().try_into().map_err(|_| {
+                Error::Invariant("setup secret hash length")
+            })?))
+        }
+    }
+}
+
+/// 写入 setup secret 哈希（`init` 调用；只落哈希，不存明文）。
+pub fn store_setup_secret_hash(conn: &Connection, hash: &Hash32) -> Result<()> {
+    conn.execute(
+        "INSERT INTO relay_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (schema::META_SETUP_SECRET_HASH, hash.as_slice()),
+    )?;
+    Ok(())
+}
+
 /// 读取 vault 行；不存在返回 404。
 pub fn load(conn: &Connection) -> Result<Vault> {
     load_opt(conn)?.ok_or_else(|| Error::api(ErrorCode::NotFound))
@@ -231,6 +260,9 @@ pub fn control_head(conn: &Connection) -> Result<(u64, Hash32)> {
 
 /// 追加一条控制转换：`record_hash = SHA256(prev_hash || signed_record)`，`prev_hash` 指向上一条。
 ///
+/// 链首（rev=1，genesis 记录）也走同一公式：`prev_hash = 32 × 0x00`，因此从第一条起
+/// 客户端只需一种哈希实现，不存在"rev=1 特例"。
+///
 /// 控制链**不随密文 GC 消失**（ADR §6 末段）；`rev` 单调，客户端可从头验证。
 pub fn append_control(conn: &Connection, now: i64, signed_record: &[u8]) -> Result<u64> {
     let (prev_rev, prev_hash) = control_head(conn)?;
@@ -332,12 +364,15 @@ pub fn initialize(
         return Err(Error::api(ErrorCode::AlreadyInitialized));
     }
     // setup secret：只做哈希比较（常数时间），失败不区分"没配置/不匹配"，避免 oracle。
-    let Some(expected) = cfg.setup_secret.as_ref() else {
-        return Err(Error::api(ErrorCode::Revoked));
+    // 支持两种来源：部署注入的明文，或 `init` 阶段落库的 SHA256（进程重启后仍可用）。
+    let expected = match (cfg.setup_secret_hash, cfg.setup_secret.as_deref()) {
+        (Some(hash), _) => hash,
+        (None, Some(secret)) => sha256(secret.as_bytes()),
+        (None, None) => return Err(Error::api(ErrorCode::Revoked)),
     };
     if !ct_eq(
         sha256(req.setup_secret.as_bytes()).as_slice(),
-        sha256(expected.as_bytes()).as_slice(),
+        expected.as_slice(),
     ) {
         return Err(Error::api(ErrorCode::Revoked));
     }
@@ -374,7 +409,11 @@ pub fn initialize(
 
     let log_id = random_id16()?;
     let log_incarnation = random_id16()?;
-    let cursor_key = random_hash32()?;
+    // 部署可固定游标 HMAC key；否则 genesis 随机生成并只落库。
+    let cursor_key = match cfg.cursor_key {
+        Some(key) => key,
+        None => random_hash32()?,
+    };
 
     conn.execute(
         "INSERT INTO vault(singleton, vault_id, instance_id, log_id, log_incarnation, cursor_key,
@@ -414,13 +453,16 @@ pub fn initialize(
          VALUES (1, ?1, ?2, ?3)",
         (req.manager_pub.as_slice(), req.certificate.as_slice(), now),
     )?;
-    // 控制链第一条：prev_hash = 全零。
+    // 控制链第一条：prev_hash = 32 字节全零，record_hash **仍按同一公式**
+    // `SHA256(prev_hash || signed_record)` 计算（客户端/第三方只需实现一种哈希）。
+    let zero = [0u8; 32];
+    let genesis_hash = sha256_parts(&[zero.as_slice(), req.certificate.as_slice()]);
     conn.execute(
         "INSERT INTO control_commits(rev, prev_hash, record_hash, signed_record, created_at)
          VALUES (1, ?1, ?2, ?3, ?4)",
         (
-            [0u8; 32].as_slice(),
-            sha256(&req.certificate).as_slice(),
+            zero.as_slice(),
+            genesis_hash.as_slice(),
             req.certificate.as_slice(),
             now,
         ),
@@ -452,6 +494,24 @@ pub fn candidate_epoch(conn: &Connection) -> Result<Option<u64>> {
 }
 
 /// epoch 状态。
+/// §23.1：标记某个 epoch 在其冻结期间发生过吊销（永久事实，abort 不得清）。
+pub fn mark_epoch_revoked_once(conn: &Connection, epoch: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE epochs SET revoked_once = 1 WHERE epoch = ?1",
+        [i64_from_u64(epoch, "epoch")?],
+    )?;
+    Ok(())
+}
+
+/// §23.1：该 epoch 是否曾在其冻结期间发生过吊销；无 epoch 行按"没有"处理。
+pub fn epoch_revoked_once(conn: &Connection, epoch: u64) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT revoked_once FROM epochs WHERE epoch = ?1")?;
+    let row = stmt
+        .query_row([i64_from_u64(epoch, "epoch")?], |row| row.get::<_, i64>(0))
+        .optional()?;
+    Ok(row.unwrap_or(0) != 0)
+}
+
 pub fn epoch_state(conn: &Connection, epoch: u64) -> Result<Option<EpochState>> {
     let mut stmt = conn.prepare("SELECT state FROM epochs WHERE epoch = ?1")?;
     let row = stmt

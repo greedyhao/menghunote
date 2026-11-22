@@ -488,6 +488,7 @@ async fn revoke_mid_session_immediately_rejects_token_over_http() {
 async fn genesis_and_state_provide_initial_cursor_and_stale_cursor_is_410() {
     // 不走 Fixture：Fixture 已经初始化过 vault，这里要测 HTTP genesis 本身的响应。
     let path = temp_db_path("http-genesis-cursor");
+    let cleanup_path = path.clone();
     let clock = Arc::new(FakeClock::new(BASE_TIME));
     let cfg = Arc::new(RelayConfig::new(path).with_setup_secret("setup-secret"));
     let db = Db::open(cfg.db.clone(), clock.clone()).expect("db");
@@ -603,6 +604,9 @@ async fn genesis_and_state_provide_initial_cursor_and_stale_cursor_is_410() {
     let (status, body) = call(&app, get(&log_uri, Some(&token))).await;
     assert_eq!(status, StatusCode::GONE);
     assert_eq!(error_code(&body), "CURSOR_EXPIRED");
+    drop(app);
+    drop(db);
+    support::cleanup_db_dir(&cleanup_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -759,17 +763,18 @@ async fn control_members_expose_verifiable_certificate_signature() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_database_migrates_to_v3_with_null_certificate_signature() {
+async fn v2_database_migrates_to_latest_with_null_signatures() {
     let fx = block(|| Fixture::new("http-migrate-v2"));
     let token = block(|| fx.device_token());
     let vault_id = fx.vault_id;
-    let path = fx.cfg.db.path.clone();
     let handle = fx.db.clone();
     // 模拟 v2 库：删掉新列、版本降为 2，然后重新打开触发就地迁移。
     block(|| {
         handle
             .write_blocking(|conn| {
                 conn.execute("ALTER TABLE devices DROP COLUMN certificate_signature", [])?;
+                conn.execute("ALTER TABLE checkpoints DROP COLUMN commit_signature", [])?;
+                conn.execute("ALTER TABLE epochs DROP COLUMN revoked_once", [])?;
                 conn.execute(
                     "UPDATE relay_meta SET value = x'32' WHERE key = 'schema_version'",
                     [],
@@ -778,36 +783,53 @@ async fn v2_database_migrates_to_v3_with_null_certificate_signature() {
             })
             .expect("downgrade to v2");
     });
-    drop(fx);
+    drop(handle);
+    let path = fx.into_db_path();
+    let cleanup_path = path.clone();
 
     let clock = Arc::new(FakeClock::new(BASE_TIME));
     let cfg = Arc::new(RelayConfig::new(path).with_setup_secret("setup-secret"));
     let db = Db::open(cfg.db.clone(), clock).expect("reopen");
-    let (version, has_column, signature) = block(|| {
-        db.read(|conn| {
-            let version =
-                relay::db::schema::meta_text(conn, relay::db::schema::META_SCHEMA_VERSION)?;
-            let mut stmt = conn.prepare("PRAGMA table_info(devices)")?;
-            let columns: Vec<String> = stmt
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<std::result::Result<_, _>>()?;
-            let signature: Option<Vec<u8>> = conn.query_row(
-                "SELECT certificate_signature FROM devices WHERE device_id = ?1",
-                [[2u8; 16]],
-                |row| row.get(0),
-            )?;
-            Ok((
-                version,
-                columns
-                    .iter()
-                    .any(|column| column == "certificate_signature"),
-                signature,
-            ))
-        })
-        .expect("migration state")
-    });
-    assert_eq!(version.as_deref(), Some("3"));
-    assert!(has_column, "v2→v3 就地补列");
+    let (version, has_column, has_checkpoint_signature, has_revoked_once, signature) =
+        block(|| {
+            db.read(|conn| {
+                let version =
+                    relay::db::schema::meta_text(conn, relay::db::schema::META_SCHEMA_VERSION)?;
+                let columns_of =
+                    |table: &str| -> std::result::Result<Vec<String>, rusqlite::Error> {
+                        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+                        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                        rows.collect()
+                    };
+                let device_columns = columns_of("devices")?;
+                let checkpoint_columns = columns_of("checkpoints")?;
+                let epoch_columns = columns_of("epochs")?;
+                let signature: Option<Vec<u8>> = conn.query_row(
+                    "SELECT certificate_signature FROM devices WHERE device_id = ?1",
+                    [[2u8; 16]],
+                    |row| row.get(0),
+                )?;
+                Ok((
+                    version,
+                    device_columns
+                        .iter()
+                        .any(|column| column == "certificate_signature"),
+                    checkpoint_columns
+                        .iter()
+                        .any(|column| column == "commit_signature"),
+                    epoch_columns.iter().any(|column| column == "revoked_once"),
+                    signature,
+                ))
+            })
+            .expect("migration state")
+        });
+    assert_eq!(version.as_deref(), Some("9"));
+    assert!(has_column, "v2→v3 就地补 certificate_signature");
+    assert!(
+        has_checkpoint_signature,
+        "v3→v4 就地补 checkpoints.commit_signature"
+    );
+    assert!(has_revoked_once, "v4→v5 就地补 epochs.revoked_once");
     assert!(signature.is_none(), "旧行证书签名保持 NULL");
 
     // 旧行 NULL 时 /control 省略键 5 且不 panic。
@@ -831,4 +853,288 @@ async fn v2_database_migrates_to_v3_with_null_certificate_signature() {
         wire::opt_field(&genesis_member, 5).is_none(),
         "NULL 签名必须省略而不是 panic/写空"
     );
+    drop(app);
+    drop(db);
+    support::cleanup_db_dir(&cleanup_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_entries_carry_verifiable_commit_and_signature() {
+    let fx = block(|| Fixture::new("http-bootstrap-signed"));
+    let older = block(|| fx.publish_signed_baseline());
+    let newer = block(|| fx.publish_signed_baseline());
+    let token = block(|| fx.device_token());
+    let app = app(&fx);
+    let uri = format!("/v1/vaults/{}/bootstrap", b64(&fx.vault_id));
+
+    let (status, body) = call(&app, post_cbor(&uri, Some(&token), Vec::new())).await;
+    assert_eq!(status, StatusCode::OK);
+    let fields = cbor_response(&body);
+    let primary = wire::map_field(&fields, 0).expect("primary");
+    let fallback = wire::map_field(&fields, 1).expect("fallback");
+    let verifying =
+        ed25519_dalek::VerifyingKey::from_bytes(&fx.device_pubkey()).expect("device pubkey");
+    for (entry, expected_id) in [(&primary, newer), (&fallback, older)] {
+        assert_eq!(
+            wire::bytes_field(entry, 0)
+                .expect("checkpoint_id")
+                .as_slice(),
+            expected_id.as_slice()
+        );
+        // §20.1：键 6 = signed_commit、键 7 = 64B 生产者签名。
+        let commit_bytes = wire::bytes_field(entry, 6).expect("signed_commit key 6");
+        let signature_bytes = wire::bytes_field(entry, 7).expect("signature key 7");
+        assert_eq!(signature_bytes.len(), 64, "签名必须是 64B Ed25519");
+        let commit =
+            relay::proto::CheckpointCommit::decode(&commit_bytes).expect("decode CheckpointCommit");
+        assert_eq!(commit.checkpoint_id, expected_id);
+        assert_eq!(commit.producer_device_id, fx.device);
+        let signing_input =
+            relay::proto::checkpoint_signing_input(&commit).expect("checkpoint signing input");
+        let signature =
+            ed25519_dalek::Signature::from_slice(&signature_bytes).expect("signature encoding");
+        verifying
+            .verify_strict(&signing_input, &signature)
+            .expect("bootstrap 返回的 commit+signature 必须可验签");
+        // 客户端交叉校验：S / manifest_oid / refs_digest 必须与被签名 commit 一致。
+        assert_eq!(
+            wire::uint_field(entry, 2).expect("covered_seq"),
+            commit.covered_relay_seq
+        );
+        assert_eq!(
+            wire::bytes_field(entry, 3)
+                .expect("manifest_oid")
+                .as_slice(),
+            commit.manifest_object_id.as_slice()
+        );
+        assert_eq!(
+            wire::bytes_field(entry, 4).expect("refs_digest").as_slice(),
+            commit.refs_digest.as_slice()
+        );
+    }
+
+    // 旧 checkpoint 没有签名：键 6 保留、键 7 省略（客户端按"无签名"拒绝，不能静默通过）。
+    block(|| {
+        let handle = fx.db.clone();
+        handle
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE checkpoints SET commit_signature = NULL WHERE checkpoint_id = ?1",
+                    [older.as_slice()],
+                )?;
+                Ok(())
+            })
+            .expect("clear legacy signature");
+    });
+    let (status, body) = call(&app, post_cbor(&uri, Some(&token), Vec::new())).await;
+    assert_eq!(status, StatusCode::OK);
+    let fields = cbor_response(&body);
+    let fallback = wire::map_field(&fields, 1).expect("fallback");
+    assert_eq!(
+        wire::bytes_field(&fallback, 0)
+            .expect("checkpoint_id")
+            .as_slice(),
+        older.as_slice()
+    );
+    assert!(
+        wire::bytes_field(&fallback, 6).is_ok(),
+        "signed_commit 仍应保留"
+    );
+    assert!(
+        wire::opt_field(&fallback, 7).is_none(),
+        "无签名的旧 checkpoint 必须省略键 7"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_key_slot_object_is_410_even_when_id_is_known() {
+    let fx = block(|| Fixture::new("http-slot-expired"));
+    let slot_id = block(|| fx.put_staging_slot(relay::slots::SlotKind::Password));
+    block(|| {
+        fx.db
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE key_slots SET state = 'retiring', retire_at = ?1 WHERE slot_id = ?2",
+                    (BASE_TIME + 1, slot_id.as_slice()),
+                )?;
+                Ok(())
+            })
+            .expect("retire slot");
+    });
+    let app = app(&fx);
+    let token = block(|| fx.device_token());
+    let uri = format!("/v1/vaults/{}/objects/{}", b64(&fx.vault_id), b64(&slot_id));
+    let (status, _) = call(&app, get(&uri, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK, "retire_at 之前仍可读");
+    block(|| fx.clock.advance_secs(2));
+    let (status, body) = call(&app, get(&uri, Some(&token))).await;
+    assert_eq!(status, StatusCode::GONE, "过期槽对象 GET 必须 410");
+    let fields = cbor_response(&body);
+    assert_eq!(
+        wire::text_field(&fields, 0).expect("code"),
+        "RETIRED",
+        "错误码应是 RETIRED"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_exposes_manager_transition_with_dual_signatures() {
+    let fx = block(|| Fixture::new("http-control-manager"));
+    block(|| {
+        fx.create_object(relay::envelope::ObjectType::Update, 1, 1, 32);
+        let view = fx.begin_rotation(&[]);
+        let rotation_id = view.rotation.rotation_id;
+        let (_a, _b) = fx.publish_candidate_baselines(2);
+        let reservation = fx.rotation_reservation(&rotation_id);
+        fx.stage_candidate_slots(2, &reservation);
+        fx.stage_grant(&rotation_id, &fx.device);
+        fx.activate_rotation(&rotation_id)
+            .expect("activate with dual-signed manager");
+    });
+    let token = block(|| fx.device_token());
+    let app = app(&fx);
+    let uri = format!("/v1/vaults/{}/control?after_rev=0", b64(&fx.vault_id));
+    let (status, body) = call(&app, get(&uri, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK);
+    let fields = cbor_response(&body);
+    let chain = wire::array_field(&fields, 5).expect("manager chain");
+    assert_eq!(chain.len(), 2, "rev1 genesis + rev2 transition");
+    let entry = wire::value_map(&chain[1]).expect("rev2 entry");
+    assert_eq!(wire::uint_field(&entry, 0).expect("rev"), 2);
+    assert_eq!(wire::uint_field(&entry, 3).expect("old_rev"), 1);
+    let transition_bytes = wire::bytes_field(&entry, 2).expect("transition");
+    let transition = relay::rotations::ManagerTransition::decode(&transition_bytes)
+        .expect("manager transition cde");
+    assert_eq!(transition.new_rev, 2);
+    assert_eq!(transition.old_rev, 1);
+    assert_eq!(transition.vault_id, fx.vault_id);
+    assert!(!wire::bytes_field(&entry, 4).expect("old sig").is_empty());
+    assert!(!wire::bytes_field(&entry, 5).expect("new sig").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_slots_realm_visibility_hides_staging_from_devices() {
+    let fx = block(|| Fixture::new("http-key-slots-realm"));
+    let staging = block(|| fx.put_staging_slot(relay::slots::SlotKind::Recovery));
+    let device_token = block(|| fx.device_token());
+    let manager_token = block(|| fx.manager_token());
+    let app = app(&fx);
+    let uri = format!("/v1/vaults/{}/key-slots", b64(&fx.vault_id));
+
+    // device realm：只能看到 active / retiring。
+    let (status, body) = call(&app, get(&uri, Some(&device_token))).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = wire::array_field(&cbor_response(&body), 0).expect("slots array");
+    for entry in &entries {
+        let slot = wire::value_map(entry).expect("slot map");
+        let state = wire::text_field(&slot, 4).expect("state");
+        assert_ne!(state, "staging", "device realm 不得看到 staging");
+        assert_ne!(
+            wire::bytes_field(&slot, 0).expect("slot_id").as_slice(),
+            staging.as_slice()
+        );
+    }
+
+    // management realm：额外看到 staging（恢复设备自批要读 recovery 候选槽）。
+    let (status, body) = call(&app, get(&uri, Some(&manager_token))).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = wire::array_field(&cbor_response(&body), 0).expect("slots array");
+    let staging_entry = entries
+        .iter()
+        .map(|entry| wire::value_map(entry).expect("slot map"))
+        .find(|slot| wire::bytes_field(slot, 0).expect("slot_id").as_slice() == staging.as_slice())
+        .expect("management realm 必须看到 staging");
+    assert_eq!(
+        wire::text_field(&staging_entry, 4).expect("state"),
+        "staging"
+    );
+    assert_eq!(
+        wire::text_field(&staging_entry, 2).expect("kind"),
+        "recovery"
+    );
+    assert!(
+        !wire::bytes_field(&staging_entry, 3)
+            .expect("descriptor")
+            .is_empty(),
+        "staging 条目必须带 descriptor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn management_realm_reads_key_slot_objects_only() {
+    let fx = block(|| Fixture::new("http-object-realm"));
+    // KEY_SLOT 对象（已完成）+ 其他类型的已完成对象。
+    let slot_id = block(|| fx.put_staging_slot(relay::slots::SlotKind::Password));
+    let update_id = block(|| {
+        fx.create_object(relay::envelope::ObjectType::Update, 1, 1, 32)
+            .0
+    });
+    let snapshot_id = block(|| fx.create_data_object(relay::envelope::ObjectType::Snapshot, 64));
+    let device_token = block(|| fx.device_token());
+    let manager_token = block(|| fx.manager_token());
+    let app = app(&fx);
+    let vault = b64(&fx.vault_id);
+    let object_uri = |id: &relay::ids::Hash32| format!("/v1/vaults/{vault}/objects/{}", b64(id));
+    let part_uri =
+        |id: &relay::ids::Hash32| format!("/v1/vaults/{vault}/objects/{}/parts/0", b64(id));
+
+    // §22：management realm 可以只读 KEY_SLOT 的元数据 + 分片。
+    let (status, body) = call(&app, get(&object_uri(&slot_id), Some(&manager_token))).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&body));
+    assert_eq!(
+        wire::uint_field(&cbor_response(&body), 4).expect("object type"),
+        5,
+        "type 必须是 KEY_SLOT(5)"
+    );
+    let (status, body) = call(&app, get(&part_uri(&slot_id), Some(&manager_token))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty(), "KEY_SLOT 分片必须可读");
+
+    // 其他类型不放宽：UPDATE / SNAPSHOT → 403 MANAGEMENT_REQUIRED（元数据与分片一致）。
+    for id in [&update_id, &snapshot_id] {
+        let (status, body) = call(&app, get(&object_uri(id), Some(&manager_token))).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "management 读非 KEY_SLOT 必须 403"
+        );
+        assert_eq!(error_code(&body), "MANAGEMENT_REQUIRED");
+        let (status, body) = call(&app, get(&part_uri(id), Some(&manager_token))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error_code(&body), "MANAGEMENT_REQUIRED");
+    }
+
+    // device realm 行为不变：KEY_SLOT 仍可读（元数据 + 分片）。
+    let (status, body) = call(&app, get(&object_uri(&slot_id), Some(&device_token))).await;
+    assert_eq!(status, StatusCode::OK, "{}", error_code(&body));
+    let (status, _) = call(&app, get(&part_uri(&slot_id), Some(&device_token))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 无 token → 401。
+    let (status, body) = call(&app, get(&object_uri(&slot_id), None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error_code(&body), "UNAUTHORIZED");
+
+    // 吊销设备：旧 device token 立即失效（403 REVOKED）；management 权限不依赖设备状态，
+    // 重新签发的管理 token 仍能读 KEY_SLOT。
+    block(|| {
+        let handle = fx.db.clone();
+        let device = fx.device;
+        handle
+            .write_blocking(move |conn| relay::auth::revoke_device(conn, BASE_TIME, &device))
+            .expect("revoke fixture device");
+    });
+    let (status, body) = call(&app, get(&object_uri(&slot_id), Some(&device_token))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error_code(&body), "REVOKED");
+    let (status, body) = call(&app, get(&object_uri(&slot_id), Some(&manager_token))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "吊销推进 auth_rev，旧 token 全失效"
+    );
+    assert_eq!(error_code(&body), "REVOKED");
+    let manager_token = block(|| fx.manager_token());
+    let (status, _) = call(&app, get(&object_uri(&slot_id), Some(&manager_token))).await;
+    assert_eq!(status, StatusCode::OK, "新管理 token 仍可只读 KEY_SLOT");
 }

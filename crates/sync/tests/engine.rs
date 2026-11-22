@@ -15,7 +15,7 @@ use menghunote_storage::{
     SyncOutboxState, Vault,
 };
 use menghunote_sync::engine::{EngineIdentity, SyncEngine, RELAY_CURSOR_META};
-use menghunote_sync::relay::PauseReason;
+use menghunote_sync::relay::{PauseReason, RelayLogKind};
 use menghunote_sync::SyncError;
 use menghunote_sync_proto::{Envelope, ObjectType};
 
@@ -407,7 +407,7 @@ fn truncated_log_and_unsupported_event_keep_cursor() {
     }
     assert_eq!(cursor(&vault_a).as_deref(), Some("c0"));
 
-    relay.publish_asset([0xaa; 32]);
+    relay.publish_event(RelayLogKind::Checkpoint, [0xaa; 32]);
     {
         let mut sync = engine(&vault_a, &mut relay, &device_a);
         assert!(matches!(

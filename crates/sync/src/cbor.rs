@@ -144,10 +144,27 @@ pub fn bool_field(fields: &Fields, key: u64) -> Result<bool, SyncError> {
     }
 }
 
+/// 可选数组字段。
+pub fn opt_array_field(fields: &Fields, key: u64) -> Result<Option<Vec<CdeValue>>, SyncError> {
+    match fields.iter().find(|(field_key, _)| *field_key == key) {
+        Some((_, CdeValue::Array(values))) => Ok(Some(values.clone())),
+        Some(_) => Err(invalid()),
+        None => Ok(None),
+    }
+}
+
 /// 数组字段。
 pub fn array_field(fields: &Fields, key: u64) -> Result<Vec<CdeValue>, SyncError> {
     match field(fields, key)? {
         CdeValue::Array(values) => Ok(values.clone()),
+        _ => Err(invalid()),
+    }
+}
+
+/// 取一个 CDE bytes 值。
+pub fn value_bytes(value: &CdeValue) -> Result<Vec<u8>, SyncError> {
+    match value {
+        CdeValue::Bytes(bytes) => Ok(bytes.clone()),
         _ => Err(invalid()),
     }
 }

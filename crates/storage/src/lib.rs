@@ -34,6 +34,7 @@
 //! ```
 
 mod actor;
+mod asset_store;
 mod body_doc;
 mod connection;
 mod error;
@@ -53,6 +54,10 @@ mod sync_bridge;
 mod tree_view;
 
 pub use actor::{AffectedGuard, Row, Statement, Vault};
+pub use asset_store::{
+    asset_meta_by_hash, insert_asset, link_asset_ref, list_asset_refs, set_asset_orphan_since,
+    unlink_asset_ref, AssetRef,
+};
 pub use body_doc::{
     BodyDoc, PendingUpdate, APP_DOC_SCHEMA, BODY_CONTAINER, CODEC_VERSION, MIN_READER,
 };
@@ -70,9 +75,10 @@ pub use materialize::{
 pub use migrate::SCHEMA_VERSION;
 pub use projector::{project, trashed_notes, visible_notes, NoteView, ProjectionReport};
 pub use read_api::{
-    body_doc_meta, doc_exists, doc_snapshot, doc_updates_since, doc_vv, loro_update_base_vv,
-    loro_update_payload, read_doc_bootstrap, read_doc_for_export, BodyDocMeta, DocBootstrap,
-    DocExport, DocSnapshot, StoredLoroUpdate,
+    asset_bytes, asset_meta, body_doc_meta, doc_exists, doc_snapshot, doc_updates_since, doc_vv,
+    list_all_docs, list_assets, loro_update_base_vv, loro_update_payload, read_doc_bootstrap,
+    read_doc_for_export, AssetMeta, BodyDocMeta, DocBootstrap, DocExport, DocKind, DocMeta,
+    DocSnapshot, StoredLoroUpdate,
 };
 pub use read_snapshot::ReadSnapshot;
 pub use rusqlite::types::Value;
@@ -88,11 +94,13 @@ pub use structure_store::{ensure_structure_row, load_structure, StructureWriter}
 pub use sync_bridge::{
     allocate_local_seq_for_import, append_updates_with_sync_intents, can_recycle_update,
     enqueue_sync_intent, mark_acked, mark_inbox_quarantine, mark_integrated, mark_sent,
-    outbox_parts, outbox_row, outbox_rows, pending_encryption, pending_send,
-    set_confirmed_highwater, set_sync_log_id, store_encrypted_parts, store_inbox_verified,
-    sync_cursor_state, take_inbox_ready, take_inbox_ready_where, update_referenced_by_outbox,
+    outbox_parts, outbox_repack_candidates, outbox_row, outbox_rows, pending_encryption,
+    pending_send, repack_outbox, repack_required, set_confirmed_highwater, set_repack_required,
+    set_sync_log_id, store_encrypted_parts, store_inbox_verified, sync_cursor_state,
+    take_inbox_ready, take_inbox_ready_where, update_referenced_by_outbox, OutboxKey,
+    OutboxRepackCandidate, RepackOutcome, RepackPart, RepackPartSummary, RepackSpec,
     SyncCursorState, SyncEncryptedPart, SyncInboxRow, SyncInboxState, SyncIntent, SyncOutboxPart,
     SyncOutboxRow, SyncOutboxState, META_SYNC_CONFIRMED_HIGHWATER, META_SYNC_INTEGRATED_SEQ,
-    META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ,
+    META_SYNC_LOG_ID, META_SYNC_RECEIVED_SEQ, META_SYNC_REPACK_REQUIRED,
 };
 pub use tree_view::{list_notes, list_tree, NodeKind, TreeEntry};
