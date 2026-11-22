@@ -1,8 +1,12 @@
 # 0007 同步/加密 v1 交接（新窗口开发用）
 
 > 状态：**v0.4-sync 已由 GPT 复审 APPROVE，并打 annotated tag**（非生产，仅 localhost 开发验收）。
-> 复审锚点：`321f732`（APPROVE，无必修项）；Windows 实机复跑（DPAPI/MSVC/两条 ps1）仍待补（tag 时状态；tag 后迁移见 §2.4）。
-> 代码 HEAD：`321f732`（本文档提交另算）。本机（Linux）基线：
+> 复审锚点：整理前 `321f732`（等价新提交 `61d8de4`；APPROVE，无必修项）。
+> **Windows 实机已验证**：用户于 2026-11-13 用 `5538344` 源码包（`menghunote-v0.4-sync-5538344.zip`）实测通过；
+> 该包与 `v0.4-sync` tag 的 `crates/*/src`、`Cargo.toml/lock` **完全一致**，差异仅为 tag 后的 e2e 驱动/文档/脚本（命令细节未逐条留档）。
+> **历史整理（2026-11-13）**：`dev` 已重建为 12 个语义提交（tree 与整理前 `3c69f16`（backup tip）一致）；
+> 文中旧哈希（含 `321f732`）只在 `backup/dev-20261113` 可达，见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
+> 代码 HEAD：`61d8de4`（整理后；整理前 `321f732`）。本机（Linux）基线：
 > `cargo test --workspace --exclude menghunote-app` = **1006 passed / 0 failed**；
 > `cargo test -p menghunote-sync --all-targets` = **417 passed / 0 failed**；
 > two-round e2e `EXIT=0` 且打印 `TWO_ROUND_EXIT=0`。
@@ -12,24 +16,26 @@
 ## 1. 一句话结论
 
 原三个阻断（ASSET 来源认证、post-activation 基线消费、同一 durable E1 跨两轮 e2e）都已修复并有 Linux 真实执行证据。
-本机没有 Windows，因此 **DPAPI 路径、MSVC 构建、两条旧 PowerShell e2e 未在本机复跑**；tag 前必须按 §5 在 Windows 补跑。
+Windows 侧已由用户于 2026-11-13 用 `5538344` 包实测通过（与 tag 的产品代码一致；当时命令与计数未逐条留档，复跑命令见 §5）。
 
 ## 2. 三个阻断的落地
 
 ### 2.1 ASSET 来源认证（原 §3.1）
 
-- `5b07242`：`pull` 消费 ASSET 前真实下载全部 parts，验证每片 header/固定切片/AEAD、明文长度、data SHA256、MIME、canonical `asset_object_id`；写 durable skipped-asset v2 记录后才推进游标。
-- `2ed4d87`：阻断 A——`ObjectCommit::validate` 给 ASSET 补 64MiB 上界（与 `ObjectRefV1` 同口径），读回层改 `try_reserve` 并有界分配，engine 先验 epoch/长度再下载；恶意 `part_count=u32::MAX` 不再触发进程 abort。
-- `c4453ef`：阻断 B——checkpoint 覆盖证据必须实证：
+以下四项同属整理后的 `2c88f72`（整理前分别为 `5b07242`/`2ed4d87`/`c4453ef`/`9aa07f0`）：
+
+- pull 消费 ASSET 前真实下载全部 parts，验证每片 header/固定切片/AEAD、明文长度、data SHA256、MIME、canonical `asset_object_id`；写 durable skipped-asset v2 记录后才推进游标。
+- 阻断 A——`ObjectCommit::validate` 给 ASSET 补 64MiB 上界（与 `ObjectRefV1` 同口径），读回层改 `try_reserve` 并有界分配，engine 先验 epoch/长度再下载；恶意 `part_count=u32::MAX` 不再触发进程 abort。
+- 阻断 B——checkpoint 覆盖证据必须实证：
   - `prepare` 只产出 pending 候选，不产生成功覆盖证明；
   - `validate` 对每条候选复核完整 `ObjectCommit` 并真实下载验证；refs 内资产复用读回缓存，orphan/被替换资产也下载；缓存键含验证修订/根指纹/vault/epoch/OID/类型/generation/message/sender/parts/总长/digest，只缓存正结果；
   - 候选 epoch 的 `coverage_root`（旧 active 根）显式传入，缺根即暂停；
   - 本地 durable verified/coverage receipt 升修订（v3/v2），旧记录一律拒绝或强制重验。
-- `9aa07f0`：删除「inbox OID 属于 manifest 资产集即 proven」捷径（必须走 `actual_vv` 绑定）；relay 改写已消费 seq 从 `LocalCorrupt` 改为 `Paused(RelayHistoryRewritten)`。
+- 删除「inbox OID 属于 manifest 资产集即 proven」捷径（必须走 `actual_vv` 绑定）；relay 改写已消费 seq 从 `LocalCorrupt` 改为 `Paused(RelayHistoryRewritten)`。
 
 ### 2.2 post-activation 基线消费（原 §3.2）
 
-`bf24185`：I 阶段把「T/latest grant 对根的授权」与「当前 checkpoint 自身认证」解耦。
+`2c88f72`（整理前 `bf24185`）：I 阶段把「T/latest grant 对根的授权」与「当前 checkpoint 自身认证」解耦。
 
 - 保留全部 T 检查（双签、链逐环、control_rev/prev_hash/管理 rev、grant inclusion、根↔epoch、实例 pin）；
 - pair 内路径继续强制 T 的 commit digest 强绑定，**不得降级**；
@@ -38,7 +44,7 @@
 
 ### 2.3 同一 durable E1 跨两轮 e2e（原 §3.3，T13）
 
-`58117dc`：`crates/sync/examples/e2e_rotation_two_rounds.rs` 改为**自包含进程内 relay**（`examples/dev_relay.rs`：临时 SQLite + `FakeClock` + 仅 loopback 放行验签 hook + `127.0.0.1:0` + 独立线程 axum），不再需要 PowerShell/bash 编排，也不新增 dev HTTP 端点。
+`61d8de4`（整理前 `58117dc`）：`crates/sync/examples/e2e_rotation_two_rounds.rs` 改为**自包含进程内 relay**（`examples/dev_relay.rs`：临时 SQLite + `FakeClock` + 仅 loopback 放行验签 hook + `127.0.0.1:0` + 独立线程 axum），不再需要 PowerShell/bash 编排，也不新增 dev HTTP 端点。
 
 实际场景与断言：
 
@@ -97,7 +103,7 @@ cargo test -p menghunote-sync --all-targets           # 417 passed / 0 failed
 cargo run -p menghunote-sync --example e2e_rotation_two_rounds   # TWO_ROUND_EXIT=0
 ```
 
-Windows（tag 前必须真机复跑；本机未执行。tag 后 e2e 已去 PowerShell 化）：
+Windows（**已由用户于 2026-11-13 在 `5538344` 包实测通过**；以下命令可复跑。tag 后 e2e 已去 PowerShell 化）：
 
 ```powershell
 cargo test --all
@@ -136,7 +142,7 @@ Windows 重点：DPAPI identity 往返与跨 SID 失败语义、`dpapi.rs` 零�
 
 ## 8. 下一步顺序
 
-1. GPT 收尾复审（diff 锚点：`35757ce..HEAD`）；APPROVE 才可打 annotated tag `v0.4-sync`（非生产范围）。
+1. ~~GPT 收尾复审~~（已完成：APPROVE，tag `v0.4-sync`；整理前锚点 `321f732`，等价新提交 `61d8de4`）。
 2. Windows 实机按 §5 复跑，把结果补进本文。
 3. `task-121`（relay reservation 复用）/ `task-122`（验证修订 2 与 receipt HMAC、GC 版本门禁）。
 4. 历史/回收站 `task-115/116/117` 按 `docs/briefs/0006-history-and-trash.md` 排期。

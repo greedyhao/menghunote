@@ -321,6 +321,12 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 > 另外本机会有其它前台窗口（含 DSH GUI）抢焦点，`SetForegroundWindow` 可能"假成功"、点击打到别处——
 > 点击前用 `HWND_TOPMOST` 强制置顶；出现"点了完全没反应"先查这个，别先怀疑业务代码。
 
+> **UI 逻辑测试（2026-11-13 起）**：`cargo test -p menghunote-app --test headless_ui`
+> （`#[gpui::test]` + `TestAppContext`，真实 `AppShell` + 临时 dev vault，无窗口渲染并断言布局/状态）。
+> 它**替代不了真机**：像素、IME、DPI、真实窗口管理仍必须用 `ui_smoke.ps1` 在 Windows 上真机验。
+> Linux 跑该测试需装 `libxkbcommon-dev libxkbcommon-x11-dev`（Debian 系名），细节见
+> [`docs/notes/ui-headless-tests.md`](docs/notes/ui-headless-tests.md)。
+
 ---
 
 ## 7. 待决策清单（交给 GPT）
@@ -341,11 +347,11 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
 ## 8. 当前状态
 
 > **同步/加密 v1 交接入口（2026-11-13）**：见 [`docs/briefs/0007-sync-handoff.md`](docs/briefs/0007-sync-handoff.md)。
-> 三个阻断已修：ASSET 来源认证（`5b07242`/`2ed4d87`/`c4453ef`/`9aa07f0`）、post-activation 基线消费（`bf24185`）、
-> 同一 durable E1 跨两轮 e2e（`58117dc`，自包含进程内 relay，`TWO_ROUND_EXIT=0`）。
+> 三个阻断已修：ASSET 来源认证/覆盖实证 + post-activation + Linux 封装（`2c88f72`）；
+> 同一 durable E1 跨两轮 e2e 与三条 e2e 去脚本化（`61d8de4`）。
 > 本机（Linux）基线：`cargo test --workspace --exclude menghunote-app` = **1006 passed**；sync = **417 passed**。
-> **`v0.4-sync` 已由 GPT 复审 APPROVE（锚点 `321f732`，无必修项）并打 annotated tag**；非生产，仅 localhost 开发验收。
-> Windows 实机复跑（DPAPI/MSVC/`cargo test --all` + 三条 `cargo run -p menghunote-sync --example ...` e2e）仍待补，见 0007 §5；补验失败不提升发布，退至已知良好旧 tag 或修复后新 tag。
+> **`v0.4-sync` 已由 GPT 复审 APPROVE（锚点 `61d8de4`；整理前 `321f732`，无必修项）并打 annotated tag**；非生产，仅 localhost 开发验收。
+> **Windows 实机已由用户于 2026-11-13 在 `5538344` 包上实测通过**（产品代码与 `v0.4-sync` tag 树一致；命令/计数未逐条留档，复跑命令见 0007 §5）。
 > v0.4 **只支持修复后新建的 vault/身份**，旧开发 vault 失效（旧签名 checkpoint 无法仅靠本地版本拒绝隔离）。
 > 后置：`task-121`（relay reservation 复用）、`task-122`（`validation_version=2`/receipt HMAC/GC 版本门禁）。
 > Linux 开发适配见 ADR 0008（0600 裸主钥，安全弱于 DPAPI，不宣称等价）。
@@ -356,6 +362,10 @@ Lead 在给出"完成"结论前，必须实际执行并贴出结果。
   **`backup/dev-wip-20261111b`**（S5 两次 wip 前）。
   tag：`v0.1-slice6` = 切片 6；**`v0.2-gpui-kit`** = S2 + 引用块 + 导出 + GPUI Kit；
   **`v0.3-search`** = S4/S5 检索（P0 物化修复、单行多行摘要、大小写/整词开关、进度条、分组折叠；真机验收）。
+  **2026-11-13 历史整理**：新 `dev` 为 12 个语义提交（tree 与整理前 tip `3c69f16`（backup）逐字节一致）；
+  旧 185 个提交完整保留在 **`backup/dev-20261113`**；`v0.4-sync` tag 未改动。详见
+  [`docs/notes/history-rewrite-20261113.md`](docs/notes/history-rewrite-20261113.md)。
+  更早一次重建（2026-11-11）遗留的哈希（如 `7d95610`/`6c0c302`）见 `backup/*-wip` 分支。
   `target/`（20G）与本地 vault 不入库；**Lead review 一律看 `git diff`**，提交前必须三绿。
 - 已落盘：[`AGENTS.md`](AGENTS.md)、[`docs/briefs/0000-kickoff.md`](docs/briefs/0000-kickoff.md)、
   [`0001-storage-format.md`](docs/briefs/0001-storage-format.md)（**已作废**）、

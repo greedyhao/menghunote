@@ -1,5 +1,8 @@
 # 0005 同步/加密 v1 设计与开发计划（供 GPT 评审）
 
+> **历史留档**：本文写于 2026-11-12 历史整理前；文中哈希（如 `0b30b2e`、`2c93f6e`）只在
+> `backup/dev-20261113` 可达，见 [`docs/notes/history-rewrite-20261113.md`](../notes/history-rewrite-20261113.md)。
+
 > 状态：2026-11-12，分支 `dev`，HEAD `0b30b2e`（restart 执行链）；全仓测试在 `2c93f6e` 基线绿，之后 sync 新增 restart/repack/bugfix 在途。
 > 关联：[ADR 0006](../adr/0006-sync-v1.md)（§1–§30）、[评审 0001](../reviews/0001-rotation-security-review.md)、[ADR 0001](../adr/0001-storage-format.md)、[ADR 0003](../adr/0003-module-boundaries.md)。
 

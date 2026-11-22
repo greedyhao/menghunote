@@ -17,6 +17,14 @@ menghunote-editor = { path = "../editor" }
 menghunote-search = { path = "../search" }
 menghunote-storage = { path = "../storage" }
 
+[dev-dependencies]
+# 原生 headless UI 测试（`#[gpui::test]` + `TestAppContext`）。
+# 与主依赖**同名同包**：feature 只在测试构建里并集生效，`cargo build -p menghunote-app`
+# 的产物不包含 test-support（不引入测试平台代码）。
+gpui = { package = "gpui-kit", version = "=0.9.1", features = ["test-support"] }
+# 每个测试一个独立临时库；目录建在 `CARGO_TARGET_TMPDIR` 下（AGENTS.md §6 禁止用 %TEMP%）。
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 # 启动时读回进程 DPI 感知级别（GetThreadDpiAwarenessContext / GetDpiForSystem）。
 # 0.61 已在依赖图里（gpui 的 Windows 后端在用），特性只要 HiDpi。

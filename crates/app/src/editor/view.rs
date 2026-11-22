@@ -1392,6 +1392,8 @@ impl Render for EditorView {
             .size_full()
             .flex()
             .flex_col()
+            // 测试元数据（只读断言用）：当前打开的文档视图（`AppShell` 里只有一个）。
+            .debug_selector(|| "editor-current-doc".to_string())
             .bg(theme::window_bg())
             .font_family(theme::FONT_FAMILY)
             .text_size(px(theme::FONT_SIZE))

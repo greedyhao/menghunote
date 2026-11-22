@@ -324,6 +324,8 @@ impl Render for SearchInput {
         div()
             .w_full()
             .h(px(28.0))
+            // 测试元数据（只读断言用）：搜索输入框（存在 = 浮层已把输入挂上）。
+            .debug_selector(|| "search-input".to_string())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             // 点输入框内部不算"点空白"：拦住冒泡，别让浮层背景把手势当成关闭。

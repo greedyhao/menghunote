@@ -989,6 +989,11 @@ impl AppShell {
                 };
                 div()
                     .id(SharedString::from(format!("tree-row-{index}")))
+                    // 测试元数据：`tree-row-<先序索引>`（只读断言用，见
+                    // `docs/notes/ui-headless-tests.md`）。`index` 是结构树的先序下标
+                    // （`visible_rows` 返回的正是这组下标），**不是**渲染行号——折叠目录后
+                    // 行号会跳，树下标不会，`debug_bounds` 才能稳定查到。
+                    .debug_selector(move || format!("tree-row-{index}"))
                     .group(SharedString::from("sidebar-row"))
                     .flex()
                     .flex_row()
@@ -1028,6 +1033,13 @@ impl AppShell {
                                     .min_w(px(0.0))
                                     .overflow_hidden()
                                     .text_ellipsis()
+                                    // 选中态标记挂在这层（同一个 div 只能记一个
+                                    // `debug_selector`，行本身已占用 `tree-row-N`）。
+                                    .when(selected, |this| {
+                                        this.debug_selector(move || {
+                                            format!("tree-row-{index}-selected")
+                                        })
+                                    })
                                     .child(SharedString::from(label)),
                             )
                         },
@@ -1061,6 +1073,8 @@ impl AppShell {
             .h_full()
             .w(px(SIDEBAR_WIDTH))
             .flex_shrink_0()
+            // 测试元数据（只读断言用）：侧栏容器。
+            .debug_selector(|| "sidebar".to_string())
             .bg(theme::sidebar_bg())
             .border_r(px(1.0))
             .border_color(theme::sidebar_border())
@@ -1192,9 +1206,18 @@ impl AppShell {
         }
         let is_folder = menu.is_folder;
 
-        let item = |label: &'static str, color: gpui::Rgba, action: MenuAction| {
+        // `slot` 是**渲染顺序**下标（0 起），只用于测试 selector。
+        //
+        // 为什么不用标题做 key：`VisualTestContext::debug_bounds` 只接受
+        // `&'static str`，中文标题既不是 `'static` 也会随文案变；而渲染顺序在
+        // 每种菜单里都是固定的（目录：重命名/新建笔记/新建文件夹；笔记：重命名/删除）。
+        // 菜单项本身不挂鼠标监听：点击由遮罩的几何命中统一处理（见 `menu_hit`），
+        // selector 只是给测试读矩形用。
+        let item = |slot: usize, label: &'static str, color: gpui::Rgba, action: MenuAction| {
             div()
                 .id(SharedString::from(format!("menu-item-{}", action.label())))
+                // 测试元数据（只读断言用）：`menu-item-<渲染下标>`。
+                .debug_selector(move || format!("menu-item-{slot}"))
                 .flex()
                 .items_center()
                 .h(px(MENU_ITEM_HEIGHT))
@@ -1257,6 +1280,8 @@ impl AppShell {
                 .child(
                     div()
                         .id("context-menu")
+                        // 测试元数据（只读断言用）：右键菜单面板（遮罩不算）。
+                        .debug_selector(|| "context-menu".to_string())
                         .absolute()
                         .left(origin.x)
                         .top(origin.y)
@@ -1291,14 +1316,20 @@ impl AppShell {
                                 .text_ellipsis()
                                 .child(SharedString::from(menu.title.clone())),
                         )
-                        .child(item("重命名", theme::text_color(), MenuAction::Rename))
+                        .child(item(0, "重命名", theme::text_color(), MenuAction::Rename))
                         .when(is_folder, |this| {
-                            this.child(item("新建笔记", theme::text_color(), MenuAction::NewNote))
-                                .child(item(
-                                    "新建文件夹",
-                                    theme::text_color(),
-                                    MenuAction::NewFolder,
-                                ))
+                            this.child(item(
+                                1,
+                                "新建笔记",
+                                theme::text_color(),
+                                MenuAction::NewNote,
+                            ))
+                            .child(item(
+                                2,
+                                "新建文件夹",
+                                theme::text_color(),
+                                MenuAction::NewFolder,
+                            ))
                         })
                         .when(!is_folder, |this| {
                             // 两步确认：未确认显示「删除」，确认态显示「确认删除」（都是红色）
@@ -1307,7 +1338,7 @@ impl AppShell {
                             } else {
                                 "删除"
                             };
-                            this.child(item(label, theme::danger_text(), MenuAction::Delete))
+                            this.child(item(1, label, theme::danger_text(), MenuAction::Delete))
                         }),
                 )
                 .into_any_element(),
@@ -1323,6 +1354,8 @@ impl AppShell {
             .flex_1()
             .h_full()
             .min_w(px(0.0))
+            // 测试元数据（只读断言用）：右侧编辑器面板（空态也存在）。
+            .debug_selector(|| "editor-pane".to_string())
             .when_some(view, |this, view| this.child(view))
             .when(self.active.is_none(), |this| {
                 this.child(

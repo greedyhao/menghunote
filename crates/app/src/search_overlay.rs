@@ -736,6 +736,8 @@ impl Render for SearchOverlay {
 
         div()
             .id("search-overlay")
+            // 测试元数据（只读断言用）：浮层存在 = 打开；`debug_bounds` 为 `None` = 关闭。
+            .debug_selector(|| "search-overlay".to_string())
             .absolute()
             .inset_0()
             .flex()
@@ -828,6 +830,8 @@ impl Render for SearchOverlay {
                         let selected = self.state.borrow().selected;
                         let mut column = div()
                             .id("search-results")
+                            // 测试元数据（只读断言用）：结果列表容器（空态也在）。
+                            .debug_selector(|| "search-results".to_string())
                             .h(px(320.0))
                             .overflow_y_scroll()
                             .flex()
@@ -836,6 +840,8 @@ impl Render for SearchOverlay {
                         if empty {
                             column = column.child(
                                 div()
+                                    // 测试元数据（只读断言用）：空态占位。
+                                    .debug_selector(|| "search-empty".to_string())
                                     .text_size(px(12.0))
                                     .text_color(theme::status_bar_text())
                                     .child(SharedString::from("")),
